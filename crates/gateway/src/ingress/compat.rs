@@ -160,6 +160,26 @@ fn completion_token_ids(body: &Value) -> Option<Value> {
     })
 }
 
+/// The prompt the runtime looks up at arrival, from the request body alone:
+/// a completion's text as `raw-prompt`, or its token ids as `prompt-tokens`.
+/// Whatever a client set for either is dropped, so no client can state a
+/// cached prefix its request does not have; a chat request states neither.
+fn state_prompt(path: &str, body: &Value, props: &mut Props) {
+    props.remove(client_api::props::RAW_PROMPT);
+    props.remove(client_api::props::PROMPT_TOKENS);
+    if path != "/v1/completions" {
+        return;
+    }
+    if let Some(text) = completion_prompt(body) {
+        props.insert(
+            client_api::props::RAW_PROMPT.to_string(),
+            Value::String(text.to_string()),
+        );
+    } else if let Some(ids) = completion_token_ids(body) {
+        props.insert(client_api::props::PROMPT_TOKENS.to_string(), ids);
+    }
+}
+
 /// In order, so a later turn's text starts with an earlier one's.
 fn prompt_text(body: &Value) -> Option<String> {
     fn gather(value: &Value, text: &mut String) {
@@ -348,21 +368,7 @@ async fn relay(
         }
     };
     let mut props = props(&headers, &body);
-    if uri.path() == "/v1/completions" {
-        if !props.contains_key(client_api::props::RAW_PROMPT)
-            && let Some(text) = completion_prompt(&body)
-        {
-            props.insert(
-                client_api::props::RAW_PROMPT.to_string(),
-                Value::String(text.to_string()),
-            );
-        }
-        if !props.contains_key(client_api::props::PROMPT_TOKENS)
-            && let Some(ids) = completion_token_ids(&body)
-        {
-            props.insert(client_api::props::PROMPT_TOKENS.to_string(), ids);
-        }
-    }
+    state_prompt(uri.path(), &body, &mut props);
     let launch = Launch {
         state,
         identity: identity(&headers),
@@ -776,6 +782,28 @@ mod tests {
             assert!(path.starts_with("/v1"), "{path}");
             assert!(!inferlet.is_empty());
         }
+    }
+
+    #[test]
+    fn the_stated_prompt_comes_from_the_body_not_the_client() {
+        let faked = || -> Props {
+            serde_json::from_value(json!({
+                "raw-prompt": "a hot prefix",
+                "prompt-tokens": [1, 2, 3],
+            }))
+            .unwrap()
+        };
+        let mut props = faked();
+        state_prompt("/v1/completions", &json!({"prompt": "abc"}), &mut props);
+        assert_eq!(props.get("raw-prompt"), Some(&json!("abc")));
+        assert!(!props.contains_key("prompt-tokens"));
+        let mut props = faked();
+        state_prompt("/v1/completions", &json!({"prompt": [5, 6]}), &mut props);
+        assert_eq!(props.get("prompt-tokens"), Some(&json!([5, 6])));
+        assert!(!props.contains_key("raw-prompt"));
+        let mut props = faked();
+        state_prompt("/v1/chat/completions", &json!({"messages": []}), &mut props);
+        assert!(props.is_empty());
     }
 
     #[test]
