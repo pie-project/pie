@@ -364,8 +364,11 @@ pub struct Stepwise {
 /// pinned beside the other emitters' in `tests/eta_compiler/emitter_version.rs`.
 /// 1: every step a call of the closed set, reading its node, rung and
 /// selector from a uniform; before, each stage one module with its nodes
-/// spelled in.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 2;
+/// spelled in. 3: every function that returns a value ends on a return
+/// statement after its switch or if chain (FXC, which wgpu's DX12 path
+/// compiles through, sees no other way out of a switch whose cases all
+/// return).
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 3;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
