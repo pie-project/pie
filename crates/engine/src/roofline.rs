@@ -7,10 +7,10 @@
 //! `profile::fire::Rates`). The compute rates are measured curves, not
 //! peaks: a matmul's rate by its rows at a few widths (columns and depth;
 //! a plane of `n x k` is read at its square width `sqrt(n k)`, in `log
-//! width` between the widths measured, at the octave of rows at or below its
-//! own) and the attention's by its keys, each as the backend's own kernels
+//! width` between the widths measured, at the timed rows (half octaves) at or
+//! below its own) and the attention's by its keys, each as the backend's own kernels
 //! run it, so a kernel's waves and residency at those points are in the
-//! rate. Between octaves a matmul pays for the rows its kernel pads to its
+//! rate. Between timed rows a matmul pays for the rows its kernel pads to its
 //! tile (`ceil(m / TM) · TM`, `TM` the tile rows of the algorithm the
 //! backend runs at that shape: [`RowTile`]). The per-row ops run at their
 //! own measured bandwidth.
@@ -346,7 +346,7 @@ impl Constants {
 }
 
 /// The matmul rate a curve of rates by rows at each width states at `m`
-/// rows of an `n x k` plane: each width's curve at the octave of rows at or
+/// rows of an `n x k` plane: each width's curve at the timed rows at or
 /// below `m` (its first below that), in `log width` at `sqrt(n k)` between
 /// the widths, clamped past them.
 fn rate_on(curves: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
