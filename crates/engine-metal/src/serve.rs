@@ -291,10 +291,6 @@ pub struct Shell {
     /// The activation rung the runtime last set (`Engine::set_rung`): its
     /// carve and the live guests' terms are what the span backs.
     rung: u32,
-    /// Where the guests' batch tables start in the span's buffer, packed
-    /// under the rung's widest carve ([`Shell::lay_batches`]): fires lay
-    /// their guests' value scratch under it.
-    batch_bottom: u64,
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
@@ -1391,7 +1387,6 @@ impl PreparedLoad<'_> {
             rung: arena.floor_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
-            batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
             rs_layout,
@@ -1668,9 +1663,7 @@ impl Shell {
                 index,
                 true,
             )?;
-            // The batches lie under the rung's carve: they move with it.
             self.rung = to;
-            self.lay_batches()?;
         }
         if to >= from {
             self.rung = to;
@@ -1685,84 +1678,29 @@ impl Shell {
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
-    /// runtime counts it: the model's chunks, then one ceil over the guest
-    /// term at the lanes such a fire flies. The term is a fire's
-    /// (`engine::GuestTerm`): what the worst fire of those lanes lays for
-    /// the live (program, extents) pairs, each paying for the members the
-    /// fire gives it and nothing where it gives none.
+    /// runtime counts it: the model's chunks. Nothing guest lies in the
+    /// span: a guest program's state is its instances' and its pair's, in
+    /// `Instance` slots (`engine::Engine::guest_state`).
     fn span_for(&self, to: u32) -> Result<u64> {
         let chunk = self.pools.layout().chunk_bytes.max(1);
-        let model = self.arena.rung_reach(to).div_ceil(chunk);
-        let most = self.budgets.tokens.max_lanes;
-        let pairs: Vec<engine::FirePair> = self
-            .programs
-            .live_terms()?
-            .into_iter()
-            .map(|(facts, live)| engine::FirePair {
-                facts,
-                live: u32::try_from(live).unwrap_or(u32::MAX),
-            })
-            .collect();
-        let guests = engine::GuestTerm::new(&pairs, most).bytes(to.min(most));
-        // The batch tables stand under the carve beside the fire term: one
-        // ceil over the two, as the runtime backs them.
-        let standing = self.programs.batch_bytes();
-        Ok((model + (guests + standing).div_ceil(chunk)) * chunk)
+        Ok(self.arena.rung_reach(to).div_ceil(chunk) * chunk)
     }
 
-    /// See `Engine::standing_after`: the batch tables' bytes once an
-    /// instance of `program_id` at `extents` over `channels` is bound.
-    pub fn standing_after(
+    /// The bytes the span backs from the range's end now: the rung's
+    /// carve, and nothing guest beside it.
+    #[must_use]
+    pub fn span_covered(&self) -> u64 {
+        self.pools.covered()
+    }
+
+    /// See `Engine::guest_state`: what an instance of `program_id` at
+    /// `extents` and its pair hold in `Instance` slots.
+    pub fn guest_state(
         &self,
         program_id: engine::ProgramId,
         extents: &eta_exec::Extents,
-        channels: &[engine::ChannelId],
-    ) -> Result<u64> {
-        self.programs.standing_after(program_id, extents, channels)
-    }
-
-    /// The batch tables' bytes the live instances hold now: what a bind and
-    /// a close leave (`engine::BoundInstance::standing_guest_bytes`).
-    #[must_use]
-    pub fn standing_guest_bytes(&self) -> u64 {
-        self.programs.batch_bytes()
-    }
-
-    /// The guest region a fire whose model carve ends at `top` lays its
-    /// guests' scratch in: down to the backed span's bottom.
-    fn guest_carve(&self) -> crate::program::GuestCarve {
-        crate::program::GuestCarve::new(
-            self.arena.store().clone(),
-            self.batch_bottom,
-            self.arena.end() - self.pools.covered(),
-        )
-    }
-
-    /// Lays every guest batch under the rung's widest carve, every frame
-    /// drained first: where they lie moves with the rung, and a bind or a
-    /// close that plans or drops one packs them again.
-    fn lay_batches(&mut self) -> Result<()> {
-        self.drain()?;
-        let top = self.arena.rung_guest_top(self.rung);
-        let pools = &self.pools;
-        let bottom = self
-            .programs
-            .lay_batches(self.arena.store(), top, &|at, bytes| {
-                span_host(pools, at, bytes)
-            })?;
-        // The runtime backed the tables below the carve before the bind
-        // (`engine::Engine::standing_after`), and the span covers them:
-        // laid past it they would lie on chunks the runtime lends to state.
-        let backed = self.arena.end() - self.pools.covered();
-        if bottom < backed {
-            return Err(Fault::Ceiling {
-                what: "bytes of the backed span under the carve for the guests' batch tables",
-                need: top - bottom,
-                have: top.saturating_sub(backed),
-            });
-        }
-        self.batch_bottom = bottom;
-        Ok(())
+    ) -> Result<engine::GuestState> {
+        self.programs.guest_state(&self.pools, program_id, extents)
     }
 
     /// Raises the rung to the widest, backing its carve: what a caller that
@@ -2566,16 +2504,17 @@ impl Shell {
         channels: &[engine::ChannelId],
         instance_slots: &[u32],
         ring_slots: &[engine::RingSlots],
+        scratch: &engine::ScratchPlace,
+        pair: &engine::ScratchPlace,
     ) -> Result<engine::InstanceId> {
         let pooled = crate::program::session::Pooled {
             pools: &self.pools,
             instance: instance_slots,
             rings: ring_slots,
         };
-        #[cfg(debug_assertions)]
-        let predicted = self
-            .programs
-            .standing_after(program_id, &extents, channels)?;
+        // Its state and its pair's lie in the `Instance` slots the runtime
+        // took (`scratch`, `pair`): nothing of it in the span, nothing to
+        // back there.
         let id = self.programs.bind(
             &self.device,
             program_id,
@@ -2585,43 +2524,14 @@ impl Shell {
             device,
             channels,
             pooled,
+            scratch,
+            pair,
         )?;
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            self.programs.batch_bytes() <= predicted,
-            "a bind laid {} bytes of batch tables, past the {predicted} standing_after stated",
-            self.programs.batch_bytes()
-        );
-        // A pair the bind opens widens what the rung's fires lay under their
-        // carve: backed here, and the bind refused (`Fault::Refused`) where
-        // the system refuses the heap.
-        let backed = self
-            .span_for(self.rung)
-            .and_then(|span| self.pools.cover(span));
-        if let Err(why) = backed {
-            let _ = self.programs.close_instance(id);
-            return Err(why);
-        }
-        // A pair's first bind planned its batches: laid now, every frame
-        // drained, so no fire reads a batch where another is laid.
-        if !self.programs.batches_laid() {
-            if let Err(why) = self.lay_batches() {
-                let _ = self.programs.close_instance(id);
-                let _ = self.lay_batches();
-                return Err(why);
-            }
-        }
         if crate::diag::on().tier_trace {
-            let fire = self.programs.batch_bytes();
             eprintln!(
-                "residency: program {} bound at {extents:?}: its fires lay {} bytes a lane in \
-                 the span; the guests' batch tables take {fire} bytes of it; \
-                 the span backs {}",
-                program_id.0,
-                self.programs
-                    .fire_facts(program_id, &extents)
-                    .map_or(0, |facts| facts.a_lane),
-                self.pools.covered()
+                "residency: program {} bound at {extents:?}: its state and its pair's in \
+                 `Instance` slots ({scratch:?}, {pair:?})",
+                program_id.0
             );
         }
         Ok(id)
@@ -2637,16 +2547,6 @@ impl Shell {
             self.rebind_adapter(*id, adapter)?;
         }
         self.programs.rebind_slots(&self.pools, rebind)
-    }
-
-    /// What a fire holding lanes of `program_id` bound at `extents` lays
-    /// in the span (`Engine::fire_facts`).
-    pub fn fire_facts(
-        &self,
-        program_id: engine::ProgramId,
-        extents: &eta_exec::Extents,
-    ) -> Result<engine::FireFacts> {
-        self.programs.fire_facts(program_id, extents)
     }
 
     /// What an instance of `program_id` holds in pool slots
@@ -2702,10 +2602,6 @@ impl Shell {
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
         self.programs.close_instance(instance_id)?;
-        // The last instance of a pair drops its batches: the rest packed.
-        if !self.programs.batches_laid() {
-            self.lay_batches()?;
-        }
         Ok(())
     }
 
@@ -3405,7 +3301,7 @@ impl Shell {
         let mut refusal = None;
         for (instance, launched) in
             self.programs
-                .stage_batched(frame, &staged, &prepared.guest, prepared.arm)?
+                .stage_batched(frame, &staged, prepared.arm)?
         {
             match launched {
                 crate::program::Launched::Airborne => owed.push(instance),
@@ -3506,10 +3402,9 @@ impl Shell {
             if !self.programs.prologue_runs(attached.instance) {
                 continue;
             }
-            let carve = self.guest_carve();
             match self
                 .programs
-                .fire(&self.device, attached.instance, Stage::Prologue, &carve)?
+                .fire(&self.device, attached.instance, Stage::Prologue)?
             {
                 crate::Fired::Committed => {}
                 other => {
@@ -4934,7 +4829,6 @@ impl Shell {
         }
         let patch_seats = bound.patches;
         // The capturing lanes' score rows: each lane's reader instance's.
-        let guest = self.guest_carve();
         let (capture_seat, capture_rows) = self.lay_capture(&composition, attachments, arm)?;
         self.last_capture = capture_rows.clone();
         let bindings = FireBindings {
@@ -5029,7 +4923,6 @@ impl Shell {
         };
 
         Ok(Prepared {
-            guest,
             capture_rows,
             ends,
             lanes,
@@ -5502,8 +5395,6 @@ impl CaptureLayout {
 pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 
 pub struct Prepared<'a> {
-    /// The guest region under this fire's model carve.
-    guest: crate::program::GuestCarve,
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
     /// What the fire reports where it settles: each port-placed reporting

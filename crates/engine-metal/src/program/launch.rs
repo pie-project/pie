@@ -711,8 +711,8 @@ const LANE_TEMPORARY: &str =
 
 /// A lane's scratch extent as the generated kernels' layout word holds it:
 /// a `uint`, refused past one. A lane's base is `ulong(lane) * ulong(stride)`
-/// in every generated kernel, so a batch of lanes addresses as far as the
-/// region its scratch is taken from (`GuestCarve::take` refuses past that).
+/// in every generated kernel, so a batch of lanes addresses as far as its
+/// scratch region (`Batch::scratch_area`, laid in its pair's state).
 fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
     u32::try_from(bytes).map_err(|_| Fault::Ceiling {
         what,
@@ -1067,6 +1067,15 @@ impl Prepared {
     /// The value scratch one lane of a stage of `plan` takes in a fire at
     /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
     pub fn scratch_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u64> {
+        Ok(u64::from(Self::stride_for(plan, regions, extents)?)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN))
+    }
+
+    /// One lane's value scratch for a stage of `plan` at `extents`, as its
+    /// kernels stride it (`uint scratch_stride`): what a batch's lanes hold
+    /// a stride each of.
+    pub fn stride_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u32> {
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -1087,10 +1096,7 @@ impl Prepared {
                 )
             })?
             .total;
-        Ok(u64::try_from(total)
-            .unwrap_or(u64::MAX)
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN))
+        lane_word(LANE_SCRATCH, total)
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
@@ -2079,8 +2085,10 @@ pub struct Batch {
     lane_indices: SpanRegion,
     row_meta: SpanRegion,
     row_indices: SpanRegion,
-    /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
-    /// a stride a member, in the span's guest region.
+    /// The value scratch of every lane the batch flies, a stride a member:
+    /// laid with its tables in its pair's state ([`Batch::lay`]).
+    scratch_area: SpanRegion,
+    /// Where [`Self::scratch_area`] lies once laid.
     scratch: Option<ScratchAt>,
     addresses: SpanRegion,
     table_bytes: u64,
@@ -2149,10 +2157,17 @@ impl Batch {
     /// `rows` readout rows a lane: what a fire term states before any is
     /// laid; 0 for a stage with no grouped seat.
     #[must_use]
-    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+    pub fn bytes_for(
+        plan: &LaunchStagePlan,
+        channels: u32,
+        lanes: u32,
+        rows: u32,
+        scratch_stride: u32,
+    ) -> u64 {
         if !plan.needs.grouped_valid {
             return 0;
         }
+        let scratch = crate::arena::room(scratch_area(lanes.max(1), scratch_stride));
         let values = plan.value_types.len() as u64;
         batch_area(&batch_pieces(
             lanes.max(1),
@@ -2166,7 +2181,7 @@ impl Batch {
             rows.max(1),
             ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
             plan.fused.len(),
-        ))
+        )) + scratch
     }
 
     fn regions(&self) -> impl Iterator<Item = &SpanRegion> {
@@ -2181,6 +2196,7 @@ impl Batch {
             &self.row_meta,
             &self.row_indices,
             &self.addresses,
+            &self.scratch_area,
         ]
         .into_iter()
         .chain(&self.layouts)
@@ -2198,6 +2214,7 @@ impl Batch {
             &mut self.row_meta,
             &mut self.row_indices,
             &mut self.addresses,
+            &mut self.scratch_area,
         ]
         .into_iter()
         .chain(self.layouts.iter_mut())
@@ -2263,6 +2280,7 @@ impl Batch {
             lane_indices: next(),
             row_meta: next(),
             row_indices: next(),
+            scratch_area: SpanRegion::unplaced(scratch_area(lanes, key.scratch_stride), empty.clone()),
             scratch: None,
             addresses: next(),
             table_bytes,
@@ -2321,27 +2339,18 @@ impl Batch {
         for (words, region) in self.layout_words.iter().zip(self.layouts.iter_mut()) {
             region.write(0, &record_bytes(words))?;
         }
+        self.scratch = Some(ScratchAt {
+            buffer: self.scratch_area.view().clone(),
+            offset: self.scratch_area.at(0),
+        });
         Ok(next)
-    }
-
-    /// The value scratch a fire of `members` members takes: a stride each.
-    #[must_use]
-    pub fn scratch_bytes(&self, members: u32) -> u64 {
-        (u64::from(members) * u64::from(self.key.scratch_stride))
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN)
-    }
-
-    /// Seats this fire's value scratch at `at`.
-    pub fn seat_scratch(&mut self, at: ScratchAt) {
-        self.scratch = Some(at);
     }
 
     fn scratch(&self) -> Result<&ScratchAt> {
         self.scratch.as_ref().ok_or_else(|| {
             Fault::program(
                 "program::launch",
-                "a batch fired before its fire seated its value scratch in the span",
+                "a batch fired before its pair's state laid it (its value scratch)",
             )
         })
     }
@@ -3009,4 +3018,12 @@ mod tests {
             );
         }
     }
+}
+
+/// The value scratch a batch of `lanes` lanes holds: a stride a lane, in
+/// whole [`SCRATCH_ALIGN`]s.
+fn scratch_area(lanes: u32, stride: u32) -> u64 {
+    (u64::from(lanes) * u64::from(stride))
+        .max(SCRATCH_ALIGN)
+        .next_multiple_of(SCRATCH_ALIGN)
 }
