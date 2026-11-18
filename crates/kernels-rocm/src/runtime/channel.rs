@@ -186,6 +186,16 @@ const _: () = assert!(
     "channel::Rings: a registry is four addresses, a slot count and its padding",
 );
 
+/// Loads the kernels a guest program's wave fires (pull, bump, publish,
+/// settle) on the current device now: every load fires them once a program
+/// binds, and nothing builds after ready.
+pub fn load_wave_kernels() -> Result<(), Error> {
+    for name in ["pull_validate", "commit_bump", "scatter_publish", "settle"] {
+        kernel(FILE, &format!("::pie::channel::{name}")).load()?;
+    }
+    Ok(())
+}
+
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,

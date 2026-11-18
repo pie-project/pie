@@ -155,8 +155,8 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: CUDA_FIRE_LANES,
-        // 0: the engine takes its chip's `engine.forward_tokens`, 8192 where
-        // the profile says nothing, and fits the rungs to the card.
+        // 0: the engine lays its rungs to the model's fire top on this card
+        // and weighs its top rung among them.
         max_tokens: 0,
         buckets: Vec::new(),
         max_adapters: adapter_seats,
@@ -254,32 +254,6 @@ fn load_request(
         });
     }
     Ok(request)
-}
-
-/// The engine boot and load request `pie serve` makes for the model at
-/// `snapshot_dir` on one CUDA device under `home` when its config states
-/// nothing past the model: what `pie tune` loads to time the dense GEMM
-/// products serving runs.
-#[cfg(feature = "engine-cuda")]
-pub fn served_cuda(snapshot_dir: &Path, home: &Path) -> Result<(DeviceBoot, engine::LoadRequest)> {
-    validate_snapshot_dir(snapshot_dir)?;
-    let cache_dir = &crate::disk::engine_cache_dir(home);
-    let boot = device_boot(&CudaEngineOptions::default(), home, cache_dir, None)?;
-    let overrides = runtime::engine::load::Overrides::default();
-    let request = load_request(
-        snapshot_dir,
-        cache_dir,
-        cuda_budgets(
-            config::AdapterConfig::default().seats(),
-            None,
-            declared_context(snapshot_dir, &overrides),
-        ),
-        config::MemoryConfig::default().residency(),
-        poem_ir::Platform::Cuda,
-        u8::try_from(config::RuntimeConfig::default().frame_dispatch_depth).unwrap_or(u8::MAX),
-        &overrides,
-    )?;
-    Ok((boot, request))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -732,9 +706,8 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
             let mut boot_doc = format!(
-                "[xla]\ndevice = {}\nprewarm = {}\nprofiles = {}\n",
+                "[xla]\ndevice = {}\nprofiles = {}\n",
                 opts.device_index,
-                opts.prewarm,
                 toml::Value::String(home.join("profiles").display().to_string()),
             );
             if let Some(plugin) = &opts.plugin {

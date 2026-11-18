@@ -756,10 +756,39 @@ async fn restore(
                     roles: None,
                 },
             );
+            // Room the budget holds but nothing has freed yet: the restore
+            // waits, queued, as an admission does.
+            if matches!(error, crate::store::roles::RolesError::UnparkShort(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
+                planner.requeue_restore_roles(pid);
+                return;
+            }
+            // Its pair is on its way back with another process's restore:
+            // it goes again once that lands, its instances rebound to it.
+            if matches!(error, crate::store::roles::RolesError::PairParked(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for its pair's move");
+                planner.requeue_restore(pid);
+                return;
+            }
             planner.restore_faulted(pid, &format!("roles unpark: {error}"));
             return;
         }
     };
+    // Suspended by a bind short of guest-state room, it comes back only
+    // with room for that bind past what its own items took: else it would
+    // bind short again at once. It waits, queued, as a restore short of
+    // room for its roles.
+    if let Some(need) = planner.pending_bind(pid)
+        && stores
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.lock().unwrap().free_runs(need.run) < need.pieces)
+    {
+        abort(model, engine, Move::Restore { kv, rs, roles });
+        tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
+        planner.requeue_restore_roles(pid);
+        return;
+    }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         planner.restore_faulted(

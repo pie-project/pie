@@ -542,6 +542,8 @@ impl Rig {
                     instance_slots: Vec::new(),
                     ring_slots: Vec::new(),
                     adapter_slots: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 },
             )
             .id

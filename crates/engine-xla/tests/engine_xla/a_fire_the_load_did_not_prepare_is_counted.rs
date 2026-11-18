@@ -1,10 +1,14 @@
 //! What a served model meets worse than its load prepared is counted where
 //! the runtime reads it (`engine::live::Tally`): a fire whose program the
-//! load did not hold, once a shape; a frame the engine refuses.
-//! The shipped config, no prewarm. Skipped without a PJRT plugin.
+//! load did not hold, once a shape; a frame the engine refuses. The load
+//! builds its warm ladder before it is ready: a plain prompt is on it and
+//! compiles nothing; a masked one (a class the ladder does not walk) is a
+//! miss, counted once. Skipped without a PJRT plugin.
 
 use engine::Engine;
+use engine::fire::{Mask, Masking};
 use engine::live::Tally;
+use poem_ir::Request;
 
 use crate::common_llm::{Model, Refs, Seq, tokens};
 
@@ -18,15 +22,31 @@ fn a_fire_the_load_did_not_prepare_is_counted() {
     assert_eq!(live.tallied(Tally::Compiled), 0, "nothing served yet");
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
-    let mut fire = |model: &mut Model, slot: u32| {
+    let plain = |model: &mut Model, refs: &mut Refs, slot: u32| {
         let mut seq = Seq::new(slot);
-        let lane = seq.lane(model, &mut refs, tokens(u64::from(slot), 12, vocab));
+        let lane = seq.lane(model, refs, tokens(u64::from(slot), 12, vocab));
         model.fire(vec![lane]);
     };
-    fire(&mut model, 0);
+    plain(&mut model, &mut refs, 0);
+    assert_eq!(
+        live.tallied(Tally::Compiled),
+        0,
+        "a plain prompt's programs were built before ready"
+    );
+    let masked = |model: &mut Model, refs: &mut Refs, slot: u32| {
+        let mut seq = Seq::new(slot);
+        let word = model.facts.word(&Request::new(8, true));
+        let mut lane = seq.lane_of(model.context, word, refs, tokens(u64::from(slot), 8, vocab));
+        lane.mask = Some(Masking::Extent(Mask {
+            runs: vec![0, 4, 1, 3],
+            total: 8,
+        }));
+        model.fire(vec![lane]);
+    };
+    masked(&mut model, &mut refs, 1);
     let first = live.tallied(Tally::Compiled);
-    assert!(first > 0, "the first fire's programs were not held");
-    fire(&mut model, 1);
+    assert!(first > 0, "a masked prompt is off the ladder, and counted");
+    masked(&mut model, &mut refs, 2);
     assert_eq!(
         live.tallied(Tally::Compiled),
         first,

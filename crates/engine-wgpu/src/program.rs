@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{
-    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    Rebind, RingFacts,
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
+    RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -333,36 +333,41 @@ pub struct Plane {
 }
 
 impl Plane {
-    pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
-        if !plan.executable {
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
-                registration.program_hash,
-                plan.reject_reason.as_deref().unwrap_or("no reason given")
-            )));
-        }
+    /// A registration's last step, on the engine's thread: the program
+    /// its compile adopted (`engine_gpu::program::adopt`) gets its id and
+    /// its form is held; a compile that refused refuses here.
+    pub fn finish(
+        &mut self,
+        prepared: engine_gpu::program::Prepared,
+    ) -> Result<ProgramId, Refusal> {
+        let engine_gpu::program::Adopted { plan, form } = prepared?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
-
-        // A guest pass runs on the device whole or not at all, and this
-        // engine runs no other: a program whose stages do not lower has no
-        // form here, refused at registration by name.
-        if !self.forms.admit(id, &plan.package) {
-            let why = self
-                .forms
-                .refusal(id)
-                .map_or_else(|| "no reason given".to_owned(), ToString::to_string);
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} has no device form: {why}",
-                registration.program_hash
-            )));
-        }
+        self.forms.hold(id, form);
         tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
+    }
+
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        let bound = self.programs.get(&id).is_some_and(|plan| {
+            self.instances
+                .values()
+                .any(|instance| Arc::ptr_eq(&instance.plan, plan))
+        });
+        if bound {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        self.forms.forget(id);
+        Ok(())
     }
 
     #[must_use]
@@ -1074,8 +1079,12 @@ impl Plane {
 }
 
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        Plane::register(self, registration)
+    fn finish(&mut self, prepared: engine_gpu::program::Prepared) -> Result<ProgramId, Refusal> {
+        Plane::finish(self, prepared)
+    }
+
+    fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        Plane::close_program(self, id)
     }
 
     fn load(
@@ -1289,6 +1298,7 @@ mod registration_tests {
             },
             ..engine::program::ProgramRegistration::default()
         };
+        use engine_gpu::program::Programs as _;
         let mut plane = Plane::default();
         let refused = plane.register(&registration);
         let Err(Refusal::Program(why)) = &refused else {

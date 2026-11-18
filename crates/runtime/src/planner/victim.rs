@@ -15,7 +15,9 @@ pub(super) struct VictimSet {
     pub(super) head_pid: ProcessId,
     pub(super) deficit: Reclaim,
     /// Of `deficit.pages`, those that stand for state the head lacks: kv
-    /// that parks frees chunks any shape opens ([`super::PoolPort::rs_as_pages`]).
+    /// that parks frees chunks any shape opens ([`super::PoolPort::rs_as_pages`]),
+    /// and the runs of chunks a bind short of guest-state room asks
+    /// ([`super::PoolPort::chunks_as_pages`]).
     pub(super) rs_pages: u32,
     /// On a shared pool, the state the head lacks that `rs_pages` stands
     /// for: what a victim must park on the host to free its chunks.

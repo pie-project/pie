@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::caps::Capabilities;
 
 pub mod armed;
+pub mod check;
+pub mod rung;
+pub mod top;
+
+pub use rung::{
+    CheckFire, FireEstimate, GemmShape, NoRung, RungFacts, Terms, TopRung, TopWhy, fire_top,
+    model_class, pick, scored, shape_table, top_rung,
+};
+pub use top::{
+    Counts, Kept, Refused, choose, choose_tiled, estimate, line_of, measured_line, rectangle,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {

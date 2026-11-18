@@ -256,6 +256,12 @@ impl Forms {
         }
     }
 
+    /// Holds `program`'s form, as its registration's compile lowered it
+    /// ([`crate::program::adopt`]).
+    pub fn hold(&mut self, program: ProgramId, form: Compiled) {
+        self.compiled.insert(program, Arc::new(form));
+    }
+
     #[must_use]
     pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled>> {
         self.compiled.get(&program)

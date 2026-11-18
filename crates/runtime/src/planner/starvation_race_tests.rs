@@ -9,8 +9,8 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::inner::RESERVE_SHARE;
-use super::proc::{Proc, Residency};
+use super::inner::{RESERVE_SHARE, RestoreGate};
+use super::proc::{PendingBind, Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
 
@@ -114,6 +114,9 @@ impl PoolPort for RacePool {
     }
     fn reclaimable_idle(&self) -> u32 {
         0
+    }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
     }
     fn suspend_capable(&self) -> bool {
         self.host_total > 0
@@ -681,7 +684,7 @@ fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
             .map(
                 |key| match &inner.queue.get(key).expect("still queued").kind {
                     WaitKind::Allocation { outcome, .. } => outcome.is_some(),
-                    WaitKind::Restore { .. } => unreachable!(),
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => unreachable!(),
                 },
             )
             .collect()
@@ -1459,6 +1462,9 @@ impl PoolPort for RingPool {
     fn reclaimable_idle(&self) -> u32 {
         0
     }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
     fn suspend_capable(&self) -> bool {
         false
     }
@@ -2191,6 +2197,11 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         pid,
         || std::future::ready(bind()),
         || planner.wait_resident(pid),
+        |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
+        || None,
+        |_, _| false,
+        |_, _| false,
+        |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
     );
     tokio::pin!(decode);
     assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
@@ -2346,4 +2357,423 @@ async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
     );
     assert_eq!(d.grow_parked, 0);
     assert!(reached_eviction(&planner, key), "it went on to eviction");
+}
+
+/// A shared pool's chunks for a bind short of room: free, held by idle
+/// cache (dropped by `reclaim_idle`), or held by a resident's guest state.
+/// Chunk ids stand for kv pages one a chunk.
+struct BindRoomPool {
+    free: parking_lot::Mutex<Vec<u32>>,
+    cache: parking_lot::Mutex<Vec<u32>>,
+    total: u32,
+    host: u32,
+    /// The registered model whose kv store its victims' pages lie in.
+    model: usize,
+}
+
+impl BindRoomPool {
+    fn new(total: u32, cache: std::ops::Range<u32>, host: u32) -> Self {
+        Self {
+            free: parking_lot::Mutex::new(Vec::new()),
+            cache: parking_lot::Mutex::new(cache.collect()),
+            total,
+            host,
+            model: 0,
+        }
+    }
+
+    /// Whether `pieces` disjoint runs of `run` adjacent free ids stand.
+    fn runs_free(&self, run: u32, pieces: u32) -> bool {
+        let mut ids = self.free.lock().clone();
+        ids.sort_unstable();
+        let (mut runs, mut stretch) = (0u32, 0u32);
+        for (at, &id) in ids.iter().enumerate() {
+            stretch = if at > 0 && ids[at - 1] + 1 == id {
+                stretch + 1
+            } else {
+                1
+            };
+            if stretch == run {
+                runs += 1;
+                stretch = 0;
+            }
+        }
+        runs >= pieces
+    }
+}
+
+impl PoolPort for BindRoomPool {
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (self.free.lock().len() as u32, self.total),
+            rs: Default::default(),
+        }
+    }
+    fn host_stats(&self) -> (u32, u32) {
+        (self.host, self.host)
+    }
+    fn disk_stats(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
+        Default::default()
+    }
+    fn reclaim_idle(&self) -> u32 {
+        let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
+        let count = dropped.len() as u32;
+        self.free.lock().extend(dropped);
+        count
+    }
+    fn reclaimable_idle(&self) -> u32 {
+        self.cache.lock().len() as u32
+    }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn suspend_capable(&self) -> bool {
+        self.host > 0
+    }
+    fn locus(&self) -> (usize, usize) {
+        (self.model, 0)
+    }
+    fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
+        self.runs_free(run, pieces)
+    }
+    fn chunks_as_pages(&self, chunks: u32) -> u32 {
+        chunks
+    }
+    fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
+        None
+    }
+    fn reserve_device_up_to(&self, _count: u32) -> Vec<PhysicalKvPageId> {
+        Vec::new()
+    }
+    fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
+    fn reserve_rs(&self, _need: RsUnits) -> Option<crate::store::rs::RsGrant> {
+        Some(Default::default())
+    }
+    fn release_rs(&self, _grant: crate::store::rs::RsGrant) {}
+    fn reclaim_sharing(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        0
+    }
+    fn prepare_sweep(
+        &self,
+        _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+        _room: usize,
+        _order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        _wanted: usize,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+}
+
+/// Idle cache fills the pool: a bind short of a run of 3 chunks waits in
+/// the planner's queue, the plan drops the cache (as for a restore short
+/// of room for its roles) and serves it in what that left. No close, no
+/// park: nothing is evicted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_lands_once_idle_cache_is_dropped() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..8, 0));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    assert!(!pool.runs_free(3, 1), "the cache holds every chunk");
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1).await });
+    waited.await.expect("the wait ends").expect("served");
+    assert!(pool.cache.lock().is_empty(), "the cache was dropped for it");
+    assert!(pool.runs_free(3, 1));
+    let d = planner.diagnostics();
+    assert_eq!(d.queue.len(), 0, "off the queue");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "no process was parked"
+    );
+}
+
+/// Resident guest state fills the pool and no cache is left: the bind
+/// waits in the queue, and with the fleet stalled the plan names a
+/// resident for the planner's victim choice to park, the pages its run
+/// stands for its deficit. Once that process's chunks come back (its park
+/// landed), the bind is served. A bind of a process that is gone ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_lands_once_a_resident_is_parked() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    // The binder is the older: the resident holding the pool is a victim.
+    let (binder, holder) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, holder] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&holder).unwrap().idle = true);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        planner.diagnostics().queue.len(),
+        1,
+        "it waits in the queue"
+    );
+    assert!(!waited.is_finished());
+    assert!(planner.with_inner(|inner| inner.fleet_stalled()));
+    let set = planner.victim_set().expect("the bind is short");
+    assert_eq!(set.head_pid, binder);
+    assert_eq!(set.deficit.pages, 3, "its run of 3 chunks, as pages");
+    assert_eq!(
+        set.members
+            .iter()
+            .map(|victim| victim.pid)
+            .collect::<Vec<_>>(),
+        [holder],
+        "the planner's victim choice names the resident"
+    );
+    // The holder's park lands: its chunks are back.
+    pool.free.lock().extend(0..8);
+    planner.pages_freed();
+    waited.await.expect("the wait ends").expect("served");
+
+    let gone = ProcessId::new_v4();
+    assert!(matches!(
+        planner.wait_bind_room(gone, 3, 1).await,
+        Err(PlannerError::Cancelled)
+    ));
+}
+
+impl BindRoomPool {
+    /// Takes a free run of `run` adjacent chunks, as a bind does.
+    fn take_run(&self, run: u32) -> Option<Vec<u32>> {
+        let mut free = self.free.lock();
+        let mut ids = free.clone();
+        ids.sort_unstable();
+        let first = ids
+            .windows(run as usize)
+            .find(|window| window.windows(2).all(|pair| pair[1] == pair[0] + 1))?[0];
+        let taken: Vec<u32> = (first..first + run).collect();
+        free.retain(|id| !taken.contains(id));
+        Some(taken)
+    }
+}
+
+/// Shaped like the capped soak: many short-lived guest binds over a pool
+/// idle cache keeps filling. Each bind finds no free run, waits in the
+/// planner's queue, is served once the cache is dropped for it, takes its
+/// run, fires, and gives it back, where cache takes the chunks again.
+/// Every bind lands; none fails for room nobody was asked to free.
+#[tokio::test(flavor = "current_thread")]
+async fn short_lived_binds_over_a_cache_filled_pool_all_land() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(16, 0..16, 0));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let mut binds = Vec::new();
+    for _ in 0..96 {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let (planner, pool) = (planner.clone(), pool.clone());
+        binds.push(crate::rt::spawn(async move {
+            let run = loop {
+                if let Some(run) = pool.take_run(2) {
+                    break run;
+                }
+                planner
+                    .wait_bind_room(pid, 2, 1)
+                    .await
+                    .map_err(|why| format!("{pid}: {why}"))?;
+            };
+            for _ in 0..2 {
+                crate::rt::yield_now().await;
+            }
+            // Its process ends; idle cache takes its chunks again.
+            pool.cache.lock().extend(run);
+            planner.unregister(pid);
+            planner.pages_freed();
+            Ok::<(), String>(())
+        }));
+    }
+    for bind in binds {
+        bind.await.expect("the task ends").expect("it landed");
+    }
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "cache alone was dropped for them"
+    );
+}
+
+/// A process a bind short of guest-state room suspended comes back only
+/// with its whole need: its kv pages and the room its pending bind asks.
+/// The device has free pages (kv room, a plain restore would go) but no
+/// run of 3 free chunks: its restore waits, queued, and nothing evicts for
+/// it while the fleet runs. Once a run frees, the room event alone serves
+/// it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_suspended_for_a_bind_waits_for_the_bind_s_room_too() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Free pages, but no 3 of them adjacent.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, runner) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, runner] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Its bind asked one run of 3 chunks, and it was parked for it.
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&binder).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            binder,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    let state = |planner: &Arc<ResidencyPlanner>| {
+        planner.with_inner(|inner| inner.procs.get(&binder).unwrap().state)
+    };
+    // Control: by kv pages alone it would go now.
+    let spare = pool.chunk_stats().pages.0;
+    assert_eq!(
+        planner.with_inner(|inner| inner.restore_gate(binder, spare)),
+        RestoreGate::Serve,
+        "its kv room stands"
+    );
+    planner.pages_freed();
+    assert_eq!(state(&planner), Residency::Evicted, "not restored");
+    assert_eq!(planner.diagnostics().queue.len(), 1, "it waits, queued");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "the fleet runs: nothing parked for it"
+    );
+    // A run of 3 frees: the room event serves it.
+    pool.free.lock().extend([1, 3, 5]);
+    planner.pages_freed();
+    assert_eq!(state(&planner), Residency::Restoring, "restored now");
+    assert_eq!(planner.diagnostics().queue.len(), 0);
+}
+
+/// The over-demand stall on the RTX PRO 4500 (Qwen3-0.6B, 6 GiB, 256 x
+/// 1536 top-p): every live process waited in the queue, the head a bind
+/// short of guest-state room, and no resident had made progress since it
+/// came back, so the victim choice found none fresh. The last-resort pick
+/// counted only the head's missing kv, none for a bind, and picked nobody:
+/// nothing moved for 20 minutes. It counts the pages that free the bind's
+/// runs as the victim set does, and a younger resident is parked for it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model_with_swap(16, &[16], &[64], &[0], &[], &[0]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    // The binder is the oldest; the younger residents hold kv pages.
+    let binder = ProcessId::new_v4();
+    planner.register(binder);
+    planner.note_admitted(binder);
+    let victims: Vec<Leaving> = (0..2).map(|_| leaving(&planner, model, false)).collect();
+    // None has progressed since it came back: none is fresh.
+    planner.with_inner(|inner| {
+        for proc in inner.procs.values_mut() {
+            proc.progressed = false;
+        }
+    });
+    // Every one of them waits for room for a bind.
+    let waits: Vec<_> = std::iter::once(binder)
+        .chain(victims.iter().map(|victim| victim.pid))
+        .map(|pid| {
+            let planner = planner.clone();
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 3, 1).await })
+        })
+        .collect();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 3, "all of them wait");
+    // Every process is queued and none is fresh: the victim choice names
+    // none, and the pass falls to the last resort.
+    for _ in 0..50 {
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        planner.poke();
+        crate::rt::yield_now().await;
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the last resort parks a younger resident for the bind"
+    );
+    assert!(planner.stats.e6_relaxations.load(Ordering::Relaxed) > 0);
+    for wait in waits {
+        wait.abort();
+    }
+}
+
+/// A span walk funding a bind asks the planner for pages; its process
+/// suspended meanwhile, the planner answers at once (`Yield`). The ask is
+/// made again only once the process is resident again: asked again at once,
+/// the walk spun on its tokio worker with no await between asks, and the
+/// planner's own task, woken on that worker, never ran again (the L40S
+/// over-demand livelock: every waiter parked with pages free).
+#[tokio::test(flavor = "current_thread")]
+async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_again() {
+    use futures::FutureExt;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (pid, peer) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [pid, peer] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // A peer waits, so the ask is contended and parks rather than taking.
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            peer,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        );
+        inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+    });
+    let mut asked = Box::pin(crate::store::shared::programs::fund_with(
+        &planner, pid, pid, 2,
+    ));
+    assert!(
+        asked.as_mut().now_or_never().is_none(),
+        "a suspended process's ask came back at once, to be asked again at once"
+    );
+    let signal = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Resident;
+        proc.signal.clone()
+    });
+    signal.notify_waiters();
+    assert_eq!(asked.await, Ok(false), "resident again, it asks again");
 }

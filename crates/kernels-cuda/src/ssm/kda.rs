@@ -138,7 +138,7 @@ impl Kda {
                         ],
                         [PREP_BLOCK, 1, 1],
                     )
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
                 )
             } else {
                 Fire::at(kernel(KDA, "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>"))
@@ -159,7 +159,7 @@ impl Kda {
         let gates = if self.head_dim.is_multiple_of(4) {
             Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta_rows<::pie::bf16>")).apply(
                 Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
             )
         } else {
             Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta<::pie::bf16>")).apply(Launch::grid(
@@ -216,7 +216,7 @@ pub fn kda(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     seated(OP, state, "kda_step", true, false, false)?;
     let work = shape.work(ctx, OP, state, shape.n)?;
-    if ctx.tuning().ssm_kda_step_fused && matches!(shape.head_dim, 32 | 64 | 128) {
+    if ctx.tuning().ssm_kda_step_fused() && matches!(shape.head_dim, 32 | 64 | 128) {
         // Enough blocks to fill the device twice: each (row, head) split
         // over up to eight slices of its value rows.
         let sms = ctx.multiprocessors().unwrap_or(148);
@@ -270,7 +270,7 @@ pub fn kda(
                 [STEP_BLOCK / 2, 1, 1],
             )
             .smem(kda_shmem(shape.head_dim))
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             ArgValue::Ptr(staged.q_norm),
@@ -336,7 +336,7 @@ pub fn kda_chunked(
     f32_state(OP, state)?;
     seated(OP, state, "kda_chunked", true, true, true)?;
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
-    if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
+    if ctx.tuning().ssm_kda_chunked() && shape.head_dim == 128 {
         // The tensor-core prep reads the raw rows and forms the norms and
         // gates itself.
         let gates = KdaGates {

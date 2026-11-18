@@ -7,12 +7,12 @@ use poem_ir::Trace;
 use super::diag::Diagnostics;
 
 /// Whether a load captures its fires. Serving captures every one (`On`);
-/// the eager modes exist only in a test build (feature `test-pins`), pinned
-/// by [`Knobs::pin`], never by a profile or a config.
+/// a check of the estimate's dissection walks every fire eagerly (`Off`,
+/// [`Knobs::walked`]); the shaped mode exists only in a test build (feature
+/// `test-pins`), pinned by [`Knobs::pin`], never by a profile or a config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Graphs {
     /// Every fire launches eagerly.
-    #[cfg(feature = "test-pins")]
     Off,
     /// Fires are shaped for capture but launch eagerly.
     #[cfg(feature = "test-pins")]
@@ -26,7 +26,6 @@ impl Graphs {
     #[must_use]
     pub fn shaped(self) -> bool {
         match self {
-            #[cfg(feature = "test-pins")]
             Graphs::Off => false,
             _ => true,
         }
@@ -38,24 +37,20 @@ impl Graphs {
     }
 }
 
-/// How captured fires are kept. Serving keeps recorded bodies; the others
-/// exist only in a test build (feature `test-pins`), as [`Graphs`]' do.
+/// How captured fires are kept. Serving keeps recorded bodies; a walked
+/// load keeps none (`Off`); the shaped mode exists only in a test build
+/// (feature `test-pins`), as [`Graphs`]' does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recording {
-    #[cfg(feature = "test-pins")]
     Off,
     #[cfg(feature = "test-pins")]
     Shaped,
-    Bodies {
-        mem_megabytes: u32,
-    },
+    Bodies,
 }
 
 impl Default for Recording {
     fn default() -> Recording {
-        Recording::Bodies {
-            mem_megabytes: DEFAULT_BODIES_MEGABYTES,
-        }
+        Recording::Bodies
     }
 }
 
@@ -63,7 +58,6 @@ impl Recording {
     #[must_use]
     pub fn pad(self) -> bool {
         match self {
-            #[cfg(feature = "test-pins")]
             Recording::Off => false,
             _ => true,
         }
@@ -71,17 +65,18 @@ impl Recording {
 
     #[must_use]
     pub fn bodies(self) -> bool {
-        matches!(self, Recording::Bodies { .. })
+        matches!(self, Recording::Bodies)
     }
+}
 
-    #[must_use]
-    pub fn bodies_mem(self) -> u32 {
-        match self {
-            Recording::Bodies { mem_megabytes, .. } => mem_megabytes,
-            #[cfg(feature = "test-pins")]
-            Recording::Off | Recording::Shaped => 0,
-        }
-    }
+/// How far a load that keeps every rung ([`Knobs::every_rung`]) lays them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EveryRung {
+    /// To four times the fire top (`engine::load::check::laid_top`): the
+    /// load a check weighs its rungs by.
+    PastTop,
+    /// To these rows: a check's load sized for one kind of its fires.
+    To(u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +106,13 @@ pub struct Knobs {
     /// none, CUDA's default): an expert-parallel group whose ranks share a
     /// device wires only when its ranks' streams fit them.
     pub work_queues: Option<u32>,
+    /// Lay every rung rather than the ruling's top, keeping the rungs and
+    /// the estimate weighed ([`crate::Shell::weighed`]): what `pie tune
+    /// --check-estimate` times each rung of (`engine::load::check`).
+    pub every_rung: Option<EveryRung>,
+    /// Walk every fire eagerly, nothing captured or recorded: the check of
+    /// the estimate's dissection, which drains the device around each node.
+    pub walked: bool,
     /// A test's graph mode, and recording mode where given (none: the
     /// profile's bodies), in place of serving's captured bodies.
     #[cfg(feature = "test-pins")]
@@ -124,16 +126,18 @@ pub struct Knobs {
 
 impl Knobs {
     /// The graph and recording modes a load runs under: every fire
-    /// captured, its bodies kept up to `bodies_megabytes`; only a test
-    /// build's [`Knobs::pin`] runs otherwise.
+    /// captured, its bodies kept as the fit holds them; only a walked
+    /// load ([`Knobs::walked`]) and a test build's [`Knobs::pin`] run
+    /// otherwise.
     #[must_use]
-    pub fn modes(&self, bodies_megabytes: u32) -> (Graphs, Recording) {
-        let bodies = Recording::Bodies {
-            mem_megabytes: bodies_megabytes,
-        };
+    pub fn modes(&self) -> (Graphs, Recording) {
+        let bodies = Recording::Bodies;
         #[cfg(feature = "test-pins")]
         if let Some((graphs, recording)) = self.pin {
             return (graphs, recording.unwrap_or(bodies));
+        }
+        if self.walked {
+            return (Graphs::Off, Recording::Off);
         }
         (Graphs::On, bodies)
     }
@@ -156,8 +160,6 @@ pub enum Golden {
     Eager,
     Body,
 }
-
-pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
     pub trace: Trace,

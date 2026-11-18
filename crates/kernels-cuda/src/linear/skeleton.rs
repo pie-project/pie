@@ -1118,7 +1118,7 @@ impl Skeleton {
                 n,
                 k,
                 epi.parts,
-                tuning.gemm_skinny_rows,
+                tuning.gemm_skinny_rows(),
                 epi.span,
             ),
         }
@@ -1186,7 +1186,7 @@ impl Skeleton {
                     m,
                     n,
                     k,
-                    ctx.tuning().pdl,
+                    ctx.tuning().pdl(),
                 ),
                 Skeleton::Skinny => {
                     crate::linear::skinny::skinny(ctx, epi, w, act, ins, outs, paging, m, n, k)

@@ -333,7 +333,6 @@ pub struct Shell {
     patch_fold: u32,
     drops_patch_rows: bool,
     states_mrope: bool,
-    gathers_readout: bool,
     feeds: crate::feeds::Feeds,
 
     copies: bool,
@@ -907,11 +906,6 @@ impl PreparedLoad<'_> {
             })
         });
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
-        let gathers_readout = boot
-            .trace
-            .values
-            .iter()
-            .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
         let patch_fold = patch_fold(&boot.trace);
         let drops_patch_rows = boot
             .trace
@@ -1424,7 +1418,6 @@ impl PreparedLoad<'_> {
             patch_fold,
             drops_patch_rows,
             states_mrope,
-            gathers_readout,
             feeds,
             page_tables,
             copies: false,
@@ -2031,17 +2024,24 @@ impl Shell {
             )
         };
         // The walk's lanes name slot refs, as the runtime's do: each shape's
-        // first slot past the null chunk, inside the pool whatever the seat
-        // count (seat 0's own runs, laid shape by shape for every seat, can
-        // lie past the pool's last chunk). No kernel reads them.
+        // first slot past the engine's tables run (the null chunk and the
+        // tables, chunks 0..1+tables, are no slot's), inside the pool
+        // whatever the seat count (seat 0's own runs, laid shape by shape
+        // for every seat, can lie past the pool's last chunk). No kernel
+        // reads them.
         let layout = *self.pools.layout();
-        let first = |shape: Option<crate::store::layout::Slots>| shape.map_or(0, |s| s.per_chunk);
+        let past_tables = 1 + layout.tables;
+        let first = |shape: Option<crate::store::layout::Slots>| {
+            shape.map_or(0, |s| s.per_chunk * past_tables)
+        };
         let page_size = self.paging().page_size.max(1);
         let kv_pages = vec![first(layout.list); context.div_ceil(page_size) as usize];
         let record = vec![first(layout.fixed); layout.pieces as usize];
         let windows: Vec<Vec<u32>> = layout
             .window_lists()
-            .map(|window| vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize])
+            .map(|window| {
+                vec![window.slots.per_chunk * past_tables; context.div_ceil(window.tokens.max(1)) as usize]
+            })
             .collect();
         let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
             let per = layout.rs_tokens.max(1);
@@ -2456,7 +2456,9 @@ impl Shell {
         }
         let (offset, width, dtype) = self.plane_row(p, out.values[0])?;
         let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
-        let at = if self.gathers_readout {
+        // An output gathered at the readout rows holds the lane at its index
+        // among them; one written over every token row, at its own last row.
+        let at = if out.decl.readout {
             p.readout_first
                 .get(row.source as usize)
                 .copied()
@@ -2533,6 +2535,24 @@ impl Shell {
     #[must_use]
     pub fn program_compilations(&self) -> u64 {
         self.programs.stats().compilations
+    }
+
+    /// See `Engine::prepare_program`: the registration's plan, on this
+    /// thread; [`crate::program::Registering::compile`] builds its libraries
+    /// and pipelines on any thread, while this shell fires on.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Registering> {
+        self.programs.prepare_register(&self.device, registration)
+    }
+
+    /// See `Engine::finish_program`: the compiled registration taken in.
+    pub fn finish_program(
+        &mut self,
+        registered: crate::program::Registered,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish_register(registered)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2672,6 +2692,11 @@ impl Shell {
     ) -> Result<Option<&mut crate::program::Session>> {
         self.fence_instances(&[instance_id])?;
         Ok(self.programs.instance_mut(instance_id))
+    }
+
+    /// Releases a registered program no instance binds.
+    pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
+        self.programs.close_program(id)
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
@@ -3260,8 +3285,10 @@ impl Shell {
         lane_rows: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
-        // A lane's readout row: its gathered first, else its first named row, else its last.
-        let row_of = |lane: usize| -> Result<u32> {
+        // A lane's row of an output: for one gathered at the readout rows,
+        // its first among them; for one written over every token row, its
+        // first named row, else its last.
+        let row_of = |lane: usize, gathered: bool| -> Result<u32> {
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             if owned == 0 {
                 return Err(Fault::Ceiling {
@@ -3270,7 +3297,7 @@ impl Shell {
                     have: 0,
                 });
             }
-            if self.gathers_readout {
+            if gathered {
                 if prepared.readout_count.get(lane).copied().unwrap_or(0) == 0 {
                     return Err(Fault::Ceiling {
                         what: "readout rows in the lane an epilogue is attached to",
@@ -3402,7 +3429,7 @@ impl Shell {
         out: usize,
         at: usize,
         fire_lane: usize,
-        row_of: &dyn Fn(usize) -> Result<u32>,
+        row_of: &dyn Fn(usize, bool) -> Result<u32>,
     ) -> Result<(u64, u32, Dtype, u32)> {
         let output = &self.outputs[out];
         let name = &output.decl.name;
@@ -3432,7 +3459,12 @@ impl Shell {
                 }
                 (at_row(fire_lane as u64), width, dtype, stride)
             }
-            poem_ir::InputAxis::Row => (at_row(u64::from(row_of(at)?)), width, dtype, width),
+            poem_ir::InputAxis::Row => (
+                at_row(u64::from(row_of(at, output.decl.readout)?)),
+                width,
+                dtype,
+                width,
+            ),
             poem_ir::InputAxis::Voxel if output.grid.is_some() => {
                 let (offset, width, dtype) = self.grid_seat(prepared, at, out)?;
                 (offset, width, dtype, width)

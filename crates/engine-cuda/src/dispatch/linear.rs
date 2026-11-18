@@ -281,9 +281,9 @@ impl Run<'_> {
                 // packed rows are never written and cut; a short fire, or a
                 // chip that keeps the old forms, runs the pair.
                 let a = self.tensor(*act);
-                if self.ctx().tuning().rows_vec
+                if self.ctx().tuning().rows_vec()
                     && a.dtype == Dtype::Bf16
-                    && a.rows >= self.ctx().tuning().gemm_split_rows_from
+                    && a.rows >= self.ctx().tuning().gemm_split_rows_from()
                     && self.dense_weight(*w)
                 {
                     let weight = self.tensor(*w);
@@ -564,7 +564,7 @@ impl Run<'_> {
             } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() {
                         linear::affine::tiled::matmul
                     } else {
                         linear::affine::tiled::matmul_gemv
@@ -591,7 +591,7 @@ impl Run<'_> {
             } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() {
                         linear::affine::tiled::lm_head
                     } else {
                         linear::affine::tiled::lm_head_gemv
@@ -1056,7 +1056,7 @@ impl Run<'_> {
                     }
                     // Past them (`kernel.gemm.fp8_grouped_tc5_until`): each group on the tcgen05
                     // GEMM against its rows of the fp8 plane, no bf16 widened.
-                    if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until
+                    if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until()
                         && x.width.is_multiple_of(*groups)
                         && out.width.is_multiple_of(*groups)
                     {
@@ -1412,7 +1412,7 @@ impl Run<'_> {
             && let Some((fp8, atoms)) = self.mxfp4_fp8_bank(*bank)
         {
             let route_t = self.tensor(*routes);
-            if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from {
+            if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from() {
                 let experts = self.planes(*bank).0.rows;
                 let x = self.tensor(*x);
                 let mut out = self.tensor(*y);
@@ -1452,7 +1452,7 @@ impl Run<'_> {
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
-        if !self.ctx().tuning().moe_tc5 && linear::gemm_sm100::supported() {
+        if linear::gemm_sm100::supported() && !self.ctx().tuning().moe_tc5() {
             return Ok(false);
         }
         let (packed, y, glu) = match *glu {
@@ -1736,7 +1736,7 @@ impl Run<'_> {
         gate_add: Option<&Linear>,
     ) -> Result<bool, kernels_cuda::Error> {
         use linear::gemm_sm100::Glu;
-        if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
+        if !linear::gemm_sm100::supported() || !self.ctx().tuning().moe_tc5() {
             return Ok(false);
         }
         // The routes' norm: a scale, no residual, the down rows in, the sum's
@@ -2501,7 +2501,7 @@ impl Run<'_> {
                 if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
                     let route_t = self.tensor(routes);
                     let mut out = self.tensor(y);
-                    if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
+                    if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from()
                         && linear::moe::fp8_select_takes(x, out.width)
                     {
                         return linear::moe::select_fp8_w8a8(
@@ -2628,7 +2628,7 @@ impl Run<'_> {
         }
         // A prefill's rows W8A8 on an Ada's wide fp8 tiles, as the
         // deployment quantizes them (`kernel.gemm.fp8_wide_from`).
-        let wide_from = self.ctx().tuning().gemm_fp8_wide_from;
+        let wide_from = self.ctx().tuning().gemm_fp8_wide_from();
         if wide_from > 0
             && act.rows >= wide_from
             && atoms.width > 0
@@ -2743,8 +2743,8 @@ impl Run<'_> {
             // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
             // up to `kernel.gemm.fp8_mma_k_until` of K, `moe::dense_fp8_shape`).
             let tuning = self.ctx().tuning();
-            if act.rows <= tuning.gemm_fp8_mma_gemv_until
-                && (tuning.gemm_fp8_mma_k_until == 0 || k <= tuning.gemm_fp8_mma_k_until)
+            if act.rows <= tuning.gemm_fp8_mma_gemv_until()
+                && (tuning.gemm_fp8_mma_k_until() == 0 || k <= tuning.gemm_fp8_mma_k_until())
                 && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
             {
                 return linear::moe::matmul_grouped_fp8_with(
@@ -2817,7 +2817,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::matmul_via_dense
                 } else {
                     linear::affine::matmul
@@ -2876,7 +2876,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::lm_head_via_dense
                 } else {
                     linear::affine::lm_head

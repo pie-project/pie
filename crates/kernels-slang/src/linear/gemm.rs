@@ -60,6 +60,78 @@ pub fn lm_head(
 }
 
 /// `y = act * w^T` on bf16.
+/// The kernel a bf16 matmul of `m` rows, `n` columns and depth `k` runs
+/// on `target` under `tactic`: the pick [`act_x_wt`]'s dispatch makes
+/// (`kernel`, whose conditions [`tile_for`] repeats; a test holds the two
+/// together), and [`padded_rows`] counts by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// SPIR-V's vector kernel, eight columns a group (`k` a multiple of 8).
+    GemvV,
+    /// SPIR-V's vector kernel.
+    Gemv,
+    /// SPIR-V's cooperative-matrix tile, 64 rows.
+    Coopmat,
+    /// SPIR-V's register tile: `cols` columns at `per` a lane, 256 lanes'
+    /// rows of 8 (`256 / (cols / per) · 8` rows a tile).
+    Register { cols: u32, per: u32 },
+    /// SPIR-V's 32 x 32 tile.
+    Tiled,
+    /// WGSL's vector kernel.
+    PairsGemv,
+    /// WGSL's 16-row tile.
+    Pairs16,
+    /// WGSL's 64-row tile.
+    Pairs64,
+}
+
+impl Kernel {
+    /// The rows one tile of it computes: what a matmul's rows pad to.
+    #[must_use]
+    pub fn row_tile(self) -> u32 {
+        match self {
+            Kernel::GemvV | Kernel::Gemv | Kernel::PairsGemv => 1,
+            Kernel::Coopmat | Kernel::Pairs64 => 64,
+            Kernel::Register { cols, per } => 256 / (cols / per) * 8,
+            Kernel::Tiled => 32,
+            Kernel::Pairs16 => 16,
+        }
+    }
+}
+
+/// The kernel a matmul of `m` x `n` x `k` runs ([`Kernel`]).
+#[must_use]
+pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kernel {
+    match target {
+        Target::Spirv if m < VECTOR_MAX_ROWS && k.is_multiple_of(8) => Kernel::GemvV,
+        Target::Spirv if m < VECTOR_MAX_ROWS => Kernel::Gemv,
+        Target::Spirv if tactic.tier == Tier::Coopmat => Kernel::Coopmat,
+        // Sixty-four columns a tile at eight a lane, or thirty-two at four
+        // when that leaves none idle.
+        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
+            if n.is_multiple_of(32) && !n.is_multiple_of(64) {
+                Kernel::Register { cols: 32, per: 4 }
+            } else {
+                Kernel::Register { cols: 64, per: 8 }
+            }
+        }
+        Target::Spirv => Kernel::Tiled,
+        Target::Wgsl if m < VECTOR_MAX_ROWS => Kernel::PairsGemv,
+        Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
+        Target::Wgsl => Kernel::Pairs64,
+    }
+}
+
+/// The rows a matmul of `rows` over a `width`-wide weight computes on
+/// `target` under `tactic`: `rows` padded to the row tile of the kernel
+/// [`tile_for`] picks. What a fire's estimate counts a narrow fire's
+/// matmuls by, as it pays for the tile it under-fills.
+#[must_use]
+pub fn padded_rows(target: Target, tactic: Tactic, rows: u32, width: u32) -> u32 {
+    let tile = tile_for(target, tactic, rows, width, width).row_tile();
+    rows.div_ceil(tile).saturating_mul(tile)
+}
+
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tactic: Tactic,
@@ -279,6 +351,39 @@ mod tests {
                             "{target:?} {tier:?}: {m} rows of {n} columns over {k} pick {}, \
                              which the projection does not name",
                             picked.entrypoint
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    #[test]
+    fn the_row_tile_is_the_tile_the_dispatch_picks() {
+        // `kernel`'s grid rows a group, at every row break and width, are
+        // `tile_for`'s row tile.
+        for target in [Target::Spirv, Target::Wgsl] {
+            for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
+                let tactic = Tactic { tier };
+                for m in [1, 4, 8, 16, 47, 48, 64, 255, 256, 1024, 4096] {
+                    for (n, k) in [(1024, 1024), (96, 4096), (4096, 1000)] {
+                        let Ok(fire) = kernel(target, tactic, "test", m, n, k) else {
+                            continue;
+                        };
+                        let tile = tile_for(target, tactic, m, n, k).row_tile();
+                        let groups = fire.groups;
+                        let rows = match tile {
+                            1 => continue,
+                            _ => m.div_ceil(tile),
+                        };
+                        assert!(
+                            groups.contains(&rows),
+                            "{target:?} {tier:?} {m}x{n}x{k}: groups {groups:?}, tile {tile}"
                         );
                     }
                 }

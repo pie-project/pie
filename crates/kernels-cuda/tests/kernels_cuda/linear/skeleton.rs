@@ -231,11 +231,14 @@ fn inputs(gpu: &mut Gpu, lcg: &mut Lcg, case: Case, m: usize, n: usize) -> (Vec<
 fn each_skeleton_lands_each_epilogue_as_the_interpreter() {
     // (skeleton, rows, n, k): the gemv split over K and not (past
     // `kernel.gemv.splitk_max_n` columns), the few rows at one, a ragged
-    // few and sixteen, the skinny at a ragged few and a full tile.
+    // few and sixteen, and eight over a ragged grid wide enough to fill a
+    // device's wave at four weight rows a warp; the skinny at a ragged few
+    // and a full tile.
     #[rustfmt::skip]
     let shapes = [
         (Skeleton::Gemv, 1, 256, 512), (Skeleton::Gemv, 1, 4224, 256),
         (Skeleton::Rows, 1, 192, 512), (Skeleton::Rows, 5, 320, 1024), (Skeleton::Rows, 16, 128, 256),
+        (Skeleton::Rows, 8, 4100, 1024),
         (Skeleton::Skinny, 3, 128, 256), (Skeleton::Skinny, 64, 256, 512),
     ];
     let tuning = Tuning::DEFAULT;
@@ -459,16 +462,17 @@ fn lt_region(n: usize, gelu: bool, relu: bool, biased: bool) -> (Region, Vec<Inp
     )
 }
 
-/// cuBLASLt's own epilogue, the fused candidate the tuner times beside the
-/// skeletons and the unfused leg, lands what the anchored region states over
+/// cuBLASLt's own epilogue, at cuBLASLt's first heuristic for the product
+/// with it (what an anchored region no streaming skeleton covers runs on),
+/// lands what the anchored region states over
 /// its products as they are summed: a bias, a ReLU and a bias then a ReLU,
 /// at a decode's rows and a prefill's, within the product's sum in another
 /// order (an ulp, two over a long cancelling K; the epilogue's one rounding
 /// is the IR's), and
 /// GLM-4.7's biased banks (q, q and k and v, k and v) so. A region no
 /// cuBLASLt epilogue lands (a soft cap, a tanh GELU, a bias then one, a bias
-/// over products rounded first) is not offered to it. Through the tuner's
-/// entry a prefill's lands the same on whichever it picks.
+/// over products rounded first) is not offered to it. Through the anchored
+/// entry a prefill's lands the same.
 #[test]
 fn cublaslts_own_epilogue_lands_the_anchored_region() {
     for gelu_biased in [false, true] {
@@ -537,7 +541,8 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             let want = eval(&anchored, m, &av, &wv, &[], &given).expect("runs");
             let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
             assert_within(&what, &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
-            // And through the tuner, a prefill's rows past every skeleton.
+            // And through the anchored entry, a prefill's rows past every
+            // streaming skeleton.
             if m >= 100 {
                 let y2 = gpu.zeros(m * n * 2);
                 for _ in 0..2 {
@@ -559,7 +564,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
                 }
                 gpu.sync();
                 assert_within(
-                    &format!("{what}, on the tuner's pick"),
+                    &format!("{what}, through the anchored entry"),
                     &gpu.down::<u16>(y2, m * n),
                     &want,
                     ONE_MORE,

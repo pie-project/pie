@@ -43,39 +43,45 @@ pub fn attend_fresh(
 /// [`attend`] over the fire's readout rows (`call.q`'s rows, `readouts`
 /// naming them among the fire's tokens): each attends as the token it reads
 /// out, its cache row and lane gathered from the tokens' (`cache_rows`,
-/// `request_of_token`, fire-wide) at its row, reading what this fire
-/// appended where it can (`paged::attend_readouts`). A readout row is never
-/// a masked lane's: no mask is read.
+/// `request_of_token`, fire-wide) at its row, and so its custom mask (flag
+/// and mask row, from the plan's fire-wide tables), reading what this fire
+/// appended where it can (`paged::attend_readouts`).
 pub fn attend_readouts(
     ctx: &Ctx<'_>,
-    mut call: Paged,
+    call: Paged,
     pool: KvPool,
     appended: Option<Appended>,
     readouts: Tensor,
     cache_rows: Tensor,
     request_of_token: Tensor,
 ) -> Result<(), Error> {
-    call.masked = false;
     lower(ctx, |l| {
         let (mut call_v, pool_v) = call.try_map(&pool, |t| l.read(t))?;
         let index = l.read(readouts)?;
         let pos = l.read(cache_rows)?;
         let req = l.read(request_of_token)?;
         let rows = call_v.q.rows;
-        for (table, wide) in [
+        let mask_enabled = call_v.tables.mask_enabled;
+        let mask = call_v.tables.mask;
+        let mut tables = vec![
             (&mut call_v.tables.positions, pos),
             (&mut call_v.tables.request_of_token, req),
-        ] {
+        ];
+        if call_v.masked {
+            tables.push((&mut call_v.tables.mask_enabled, mask_enabled));
+            tables.push((&mut call_v.tables.mask, mask));
+        }
+        for (table, wide) in tables {
             let tight = kernels_xla::tensor::Landing {
                 rows,
-                width: 1,
+                width: wide.width,
                 dtype: wide.dtype,
             };
             let val = kernels_xla::gather::gather_rows(l.f(), wide, index, tight)?;
             *table = kernels_xla::tensor::Operand {
                 val,
                 rows,
-                width: 1,
+                width: wide.width,
                 dtype: wide.dtype,
             };
         }

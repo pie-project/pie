@@ -101,12 +101,6 @@ pub struct QmmSplitWideMax(pub u32);
 #[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
 pub struct PrefillCtasPerSm(pub u32);
 
-/// The most requests an eager decode serves with the static, unsplit
-/// schedule (which skips planning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.static_max_requests", constant(range(0..=65_536)), default = 512, tune = search)]
-pub struct DecodeStaticMaxRequests(pub u32);
-
 /// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
 /// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -313,7 +307,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
         .add::<PrefillCtasPerSm>()
-        .add::<DecodeStaticMaxRequests>()
         .add::<GemmSkinnyRows>()
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
@@ -368,7 +361,6 @@ pub struct Tuning {
     pub qmm_split_thin_max: u32,
     pub qmm_split_wide_max: u32,
     pub prefill_ctas_per_sm: u32,
-    pub decode_static_max_requests: u32,
     pub gemm_skinny_rows: u32,
     pub gemm_skinny_quad_from: u32,
     pub gemm_skinny_dense_rows: u32,
@@ -405,6 +397,257 @@ pub struct Tuning {
     pub compressed_replay: bool,
 }
 
+/// Accessors of [`Tuning`]'s fields by name, as CUDA's: the engine's shared
+/// dispatch reads a decision through one (CUDA's records the read; ROCm's
+/// tune does not search by read sets).
+impl Tuning {
+    #[must_use]
+    pub const fn moe_grouped(&self) -> bool {
+        self.moe_grouped
+    }
+
+    #[must_use]
+    pub const fn moe_lt_grouped(&self) -> bool {
+        self.moe_lt_grouped
+    }
+
+    #[must_use]
+    pub const fn moe_lt_mlp_from(&self) -> u32 {
+        self.moe_lt_mlp_from
+    }
+
+    #[must_use]
+    pub const fn moe_lt_tile_deep(&self) -> u32 {
+        self.moe_lt_tile_deep
+    }
+
+    #[must_use]
+    pub const fn moe_lt_tile_shallow(&self) -> u32 {
+        self.moe_lt_tile_shallow
+    }
+
+    #[must_use]
+    pub const fn moe_lt_deep_k(&self) -> u32 {
+        self.moe_lt_deep_k
+    }
+
+    #[must_use]
+    pub const fn moe_ordered_from(&self) -> u32 {
+        self.moe_ordered_from
+    }
+
+    #[must_use]
+    pub const fn mxfp4_grouped(&self) -> bool {
+        self.mxfp4_grouped
+    }
+
+    #[must_use]
+    pub const fn mxfp4_wmma(&self) -> bool {
+        self.mxfp4_wmma
+    }
+
+    #[must_use]
+    pub const fn decode_chunk_floor_tokens(&self) -> u32 {
+        self.decode_chunk_floor_tokens
+    }
+
+    #[must_use]
+    pub const fn gemv_splitk_max_n(&self) -> u32 {
+        self.gemv_splitk_max_n
+    }
+
+    #[must_use]
+    pub const fn qmm_gemm_from(&self) -> u32 {
+        self.qmm_gemm_from
+    }
+
+    #[must_use]
+    pub const fn qmm_long_rows(&self) -> u32 {
+        self.qmm_long_rows
+    }
+
+    #[must_use]
+    pub const fn qmm_split_warps_per_sm(&self) -> u32 {
+        self.qmm_split_warps_per_sm
+    }
+
+    #[must_use]
+    pub const fn qmm_split_thin_max(&self) -> u32 {
+        self.qmm_split_thin_max
+    }
+
+    #[must_use]
+    pub const fn qmm_split_wide_max(&self) -> u32 {
+        self.qmm_split_wide_max
+    }
+
+    #[must_use]
+    pub const fn prefill_ctas_per_sm(&self) -> u32 {
+        self.prefill_ctas_per_sm
+    }
+
+
+    #[must_use]
+    pub const fn gemm_skinny_rows(&self) -> u32 {
+        self.gemm_skinny_rows
+    }
+
+    #[must_use]
+    pub const fn gemm_skinny_quad_from(&self) -> u32 {
+        self.gemm_skinny_quad_from
+    }
+
+    #[must_use]
+    pub const fn gemm_skinny_dense_rows(&self) -> u32 {
+        self.gemm_skinny_dense_rows
+    }
+
+    #[must_use]
+    pub const fn gemm_skinny_batch_min_n(&self) -> u32 {
+        self.gemm_skinny_batch_min_n
+    }
+
+    #[must_use]
+    pub const fn gemm_turn_from(&self) -> u32 {
+        self.gemm_turn_from
+    }
+
+    #[must_use]
+    pub const fn gemm_turn_until(&self) -> u32 {
+        self.gemm_turn_until
+    }
+
+    #[must_use]
+    pub const fn gemm_turn_wide_until(&self) -> u32 {
+        self.gemm_turn_wide_until
+    }
+
+    #[must_use]
+    pub const fn gemm_turn_min_n(&self) -> u32 {
+        self.gemm_turn_min_n
+    }
+
+    #[must_use]
+    pub const fn moe_group_at(&self) -> u32 {
+        self.moe_group_at
+    }
+
+    #[must_use]
+    pub const fn mxfp4_grouped_reuse(&self) -> u32 {
+        self.mxfp4_grouped_reuse
+    }
+
+    #[must_use]
+    pub const fn affine_grouped(&self) -> bool {
+        self.affine_grouped
+    }
+
+    #[must_use]
+    pub const fn affine_wmma(&self) -> bool {
+        self.affine_wmma
+    }
+
+    #[must_use]
+    pub const fn affine_grouped_from(&self) -> u32 {
+        self.affine_grouped_from
+    }
+
+    #[must_use]
+    pub const fn moe_batch(&self) -> bool {
+        self.moe_batch
+    }
+
+    #[must_use]
+    pub const fn moe_batch_from(&self) -> u32 {
+        self.moe_batch_from
+    }
+
+    #[must_use]
+    pub const fn moe_batch_until(&self) -> u32 {
+        self.moe_batch_until
+    }
+
+    #[must_use]
+    pub const fn moe_dense_batch_until(&self) -> u32 {
+        self.moe_dense_batch_until
+    }
+
+    #[must_use]
+    pub const fn moe_dense_wide_from(&self) -> u32 {
+        self.moe_dense_wide_from
+    }
+
+    #[must_use]
+    pub const fn dense_batch_from(&self) -> u32 {
+        self.dense_batch_from
+    }
+
+    #[must_use]
+    pub const fn dense_batch_until(&self) -> u32 {
+        self.dense_batch_until
+    }
+
+    #[must_use]
+    pub const fn dense_batch_weight_mi(&self) -> u32 {
+        self.dense_batch_weight_mi
+    }
+
+    #[must_use]
+    pub const fn dense_batch_weight_max_mi(&self) -> u32 {
+        self.dense_batch_weight_max_mi
+    }
+
+    #[must_use]
+    pub const fn mla_absorb_q_until(&self) -> u32 {
+        self.mla_absorb_q_until
+    }
+
+    #[must_use]
+    pub const fn mla_absorb_out_from(&self) -> u32 {
+        self.mla_absorb_out_from
+    }
+
+    #[must_use]
+    pub const fn mla_absorb_out_until(&self) -> u32 {
+        self.mla_absorb_out_until
+    }
+
+    #[must_use]
+    pub const fn fp8_decode_until(&self) -> u32 {
+        self.fp8_decode_until
+    }
+
+    #[must_use]
+    pub const fn fp8_narrow_until(&self) -> u32 {
+        self.fp8_narrow_until
+    }
+
+    #[must_use]
+    pub const fn ssm_gdn_wide_from(&self) -> u32 {
+        self.ssm_gdn_wide_from
+    }
+
+    #[must_use]
+    pub const fn gemm_live_from(&self) -> u32 {
+        self.gemm_live_from
+    }
+
+    #[must_use]
+    pub const fn gemm_live_tiles(&self) -> [u32; 3] {
+        self.gemm_live_tiles
+    }
+
+    #[must_use]
+    pub const fn compressed_prefill_from(&self) -> u32 {
+        self.compressed_prefill_from
+    }
+
+    #[must_use]
+    pub const fn compressed_replay(&self) -> bool {
+        self.compressed_replay
+    }
+}
+
 impl Tuning {
     /// The registry defaults; a test holds the two equal.
     pub const DEFAULT: Tuning = Tuning {
@@ -425,7 +668,6 @@ impl Tuning {
         qmm_split_thin_max: 32,
         qmm_split_wide_max: 16,
         prefill_ctas_per_sm: 2,
-        decode_static_max_requests: 512,
         gemm_skinny_rows: 64,
         gemm_skinny_quad_from: 3,
         gemm_skinny_dense_rows: 4,
@@ -480,7 +722,6 @@ impl Tuning {
             qmm_split_thin_max: profile.get::<QmmSplitThinMax>().0,
             qmm_split_wide_max: profile.get::<QmmSplitWideMax>().0,
             prefill_ctas_per_sm: profile.get::<PrefillCtasPerSm>().0,
-            decode_static_max_requests: profile.get::<DecodeStaticMaxRequests>().0,
             gemm_skinny_rows: profile.get::<GemmSkinnyRows>().0,
             gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
             gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,
