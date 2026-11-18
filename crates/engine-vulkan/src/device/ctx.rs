@@ -185,6 +185,10 @@ pub(crate) struct Core {
     pub(crate) pinned: Option<u32>,
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
+    /// Where the device shares the host's memory and no budget says what
+    /// it has, the most the load may hold in all, read when the device
+    /// bound ([`host_ceiling`]).
+    ceiling: Option<u64>,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
@@ -229,14 +233,17 @@ impl Core {
 
     /// The device-local bytes free to this process now: the heap's budget
     /// less its usage where the driver reports them, else the heap less
-    /// every reservation (blind to other processes).
+    /// every reservation (blind to other processes); where the device
+    /// shares the host's memory, no more than the ceiling read at bind less
+    /// every reservation.
     pub(crate) fn free(&self) -> u64 {
-        match self.budget() {
+        let reserved = engine_gpu::books::process_reserved();
+        let free = match self.budget() {
             Some((budget, usage)) => budget.saturating_sub(usage),
-            None => self
-                .device_local
-                .saturating_sub(engine_gpu::books::process_reserved()),
-        }
+            None => self.device_local.saturating_sub(reserved),
+        };
+        self.ceiling
+            .map_or(free, |ceiling| free.min(ceiling.saturating_sub(reserved)))
     }
 
     /// What the driver holds for this process in the heap beside every
@@ -591,6 +598,66 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
         .fold(u64::from(storage_range), u64::min)
 }
 
+/// The most a load may hold in all where the device shares the host's
+/// memory and no memory budget says what it has: what the host's memory
+/// has available less what lmkd keeps free past it and the floor
+/// ([`engine_gpu::host_memory`]), plus what this process already holds,
+/// which that reading counts as taken. Every Android device shares it; off
+/// Android, an integrated or CPU device, or one whose largest device-local
+/// heap the host maps, without `VK_EXT_memory_budget`. A discrete card
+/// whose heap the host maps (resizable BAR) has its own memory, so it is
+/// not one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Option<u64>> {
+    if !cfg!(target_os = "android") && (memory_budget || !shares_host) {
+        return Ok(None);
+    }
+    let room = engine_gpu::host_memory::room()?;
+    let held = engine_gpu::books::process_reserved();
+    tracing::info!(
+        device = name,
+        available = room.available,
+        defended = room.defended,
+        floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
+        room = room.room,
+        held,
+        "read at bind: the device shares the host's memory, so the load takes what it has \
+         available, less what lmkd keeps free past it, less the floor"
+    );
+    Ok(Some(room.room.saturating_add(held)))
+}
+
+/// What the host can still give the process now, as [`host_ceiling`]
+/// reads it at bind.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn host_room_reader() -> engine::HostRoom {
+    // lmkd's line is read once, here, at bind; each tick reads only
+    // /proc/meminfo.
+    match engine_gpu::host_memory::reader() {
+        Ok(reader) => std::sync::Arc::new(move || {
+            reader
+                .read()
+                .map(|room| room.net())
+                .map_err(|fault| fault.to_string())
+        }),
+        Err(fault) => {
+            let why = fault.to_string();
+            std::sync::Arc::new(move || Err(why.clone()))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn host_room_reader() -> engine::HostRoom {
+    std::sync::Arc::new(|| Err("this host has no reader of its available memory".to_string()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[allow(clippy::unnecessary_wraps)]
+fn host_ceiling(_name: &str, _shares_host: bool, _memory_budget: bool) -> Result<Option<u64>> {
+    Ok(None)
+}
+
 impl Context {
     /// Binds the device `boot` names for a load that takes what it has,
     /// no more than `allowance.budget` where the operator states one.
@@ -710,6 +777,33 @@ impl Context {
         let device_exts =
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
+        // Read before the device is made, so a refusal leaves nothing to free.
+        let ceiling = {
+            // SAFETY: `physical` was enumerated from the live `instance`.
+            let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+            let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
+            let largest = heaps
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .max_by_key(|&(_, h)| h.size)
+                .map(|(at, _)| at);
+            let mapped = memory.memory_types[..memory.memory_type_count as usize]
+                .iter()
+                .any(|t| {
+                    Some(t.heap_index as usize) == largest
+                        && t.property_flags.contains(
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL
+                                | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                        )
+                });
+            let shares_host = match props.device_type {
+                vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU => true,
+                vk::PhysicalDeviceType::DISCRETE_GPU => false,
+                _ => mapped,
+            };
+            host_ceiling(&name, shares_host, memory_budget)?
+        };
         let coopmat_ext = has_extension(&device_exts, ash::khr::cooperative_matrix::NAME);
 
         let coopmat_shape = coopmat_ext && {
@@ -938,6 +1032,7 @@ impl Context {
             pinned,
             cores,
             device_local,
+            ceiling,
             heap,
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -985,6 +1080,15 @@ impl Context {
     #[must_use]
     pub fn outside(&self) -> u64 {
         self.core.outside()
+    }
+
+    /// Where the device shares the host's memory (a ceiling was read at
+    /// bind), the reader of what the host can still give the process, the
+    /// bind's reading taken afresh ([`host_ceiling`]).
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core.ceiling?;
+        Some(host_room_reader())
     }
 
     #[must_use]

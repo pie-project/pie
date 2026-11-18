@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+use engine::SAFETY_FLOOR_BYTES;
+
 use crate::error::{Fault, Result};
 
 pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
@@ -6,10 +8,6 @@ pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
 const HANDLES_PER_ARENA: u64 = 256;
-
-/// The driver's safety floor under the measured capacity: one size on
-/// every backend.
-const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
 /// The handle a flat arena's units carry: they are backed by the arena's
 /// one allocation, and own nothing to release.

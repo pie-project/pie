@@ -156,10 +156,26 @@ pub type TapSink = std::sync::Arc<dyn Fn(Tapped) + Send + Sync>;
 /// bytes)` of a host kv slot.
 pub type TapGroups = Vec<Vec<(u64, u64)>>;
 
+/// What the host can still give this process now, in bytes, read afresh on
+/// each call: for a device that shares the host's memory, what it has
+/// available less what the platform defends past that and the floor;
+/// negative by what the host is short of that line, which the process gives
+/// back. An error names the reading that could not be taken.
+pub type HostRoom = std::sync::Arc<dyn Fn() -> std::result::Result<i64, String> + Send + Sync>;
+
 pub trait Engine: Send {
     fn kind(&self) -> &'static str;
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
+        None
+    }
+
+    /// The reader of what the host can still give this process, where the
+    /// device shares the host's memory and no budget of the device's says
+    /// what it has: the runtime's governor reads it on its tick and holds
+    /// the pool within what the pool holds plus it. `None`, the default:
+    /// the device has memory of its own, sized at load.
+    fn host_room(&self) -> Option<HostRoom> {
         None
     }
 
