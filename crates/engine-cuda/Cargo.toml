@@ -65,12 +65,6 @@ device = []
 # sees it. Off, no build writes those bytes.
 test-slot-fill = []
 
-# Seats a fire's lanes' scratch last lane first in the fire's span, each
-# lane's base in the lane scratch table, so a kernel that addresses a
-# lane's scratch other than by its own base answers wrongly where a test
-# compares it. Off, lane `l`'s scratch is the `l`-th stride.
-test-lane-scatter = []
-
 # A test build's pins (`Knobs::pin`, `Knobs::dense_weights`): fires launched
 # eagerly, or a load with no weight shape. No profile or config reaches them;
 # serving captures every fire. The crate's own tests turn it on below.

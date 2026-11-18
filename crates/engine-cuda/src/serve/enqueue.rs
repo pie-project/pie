@@ -156,7 +156,6 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
-        let fire_lanes = self.fire_lanes();
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -186,7 +185,6 @@ impl Shell {
             readout_rows: &mut self.readout_rows,
             capture: self.capture.as_mut(),
             budget: &self.budget,
-            fire_lanes,
             owed: &mut self.owed,
             spare_events: &mut self.spare_events,
             airborne: &self.airborne,
@@ -257,8 +255,6 @@ struct FireCtx<'a> {
     /// Where the fire's capturing lanes write their readers' rows.
     capture: Option<&'a mut crate::scores::CaptureLayout>,
     budget: &'a Budget,
-    /// The most lanes a fire carries, as the runtime is told.
-    fire_lanes: u32,
     owed: &'a mut Owed,
     spare_events: &'a mut Vec<Event>,
     airborne: &'a Airborne,
@@ -309,11 +305,6 @@ impl Shell {
             "prepare.prologue",
             Reap::Landed,
         )?;
-        // The fire is not composed yet: its prologues lay under the carve of
-        // the smallest rung that holds its lanes, which no rung the fire is
-        // cut to lies under.
-        let lanes = attachments.len() as u64;
-        self.point_programs(lanes, lanes)?;
         let mut verdicts: Vec<(Flying, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
         for attached in &prologues {
@@ -655,18 +646,6 @@ impl FireCtx<'_> {
                 readouts: p.readout_rows.len() as u64,
             },
         )?;
-        // The fire's guests' programs lay their tables and scratch under
-        // this carve.
-        let span = super::program_span(
-            self.arena,
-            self.pools,
-            self.programs,
-            self.compiled.arena_forked.as_ref(),
-            (self.budget.max_tokens, self.fire_lanes),
-            carve_rows,
-            carve_lanes,
-        )?;
-        self.programs.set_span(span);
         self.lay_capture(p)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)

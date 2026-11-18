@@ -2211,19 +2211,6 @@ impl Pools {
         self.records.remove(&key);
     }
 
-    /// Where a fire whose carve leaves `under` bytes of the span below it
-    /// lays its guests' programs, of `term` bytes at its rung: one span,
-    /// its end and its bytes, right under the fire's own chunks and on
-    /// down through the state's last chunks. It lies in the chunks the
-    /// runtime keeps free of state at every rung the fire may be cut to.
-    /// The span is lent only where the state's chunks end where the
-    /// activation starts (`Pools::lent_bytes`), so the span is one.
-    pub fn program_span(&self, under: u64, term: u64) -> Result<(u64, u64)> {
-        let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let term = term.div_ceil(chunk) * chunk;
-        Ok((self.chunks.state_end() + self.lent_bytes(under), term))
-    }
-
     /// The whole chunks of the span under a carve that leaves `under`
     /// bytes below it, as the rungs state them lent: none where the
     /// state's chunks do not end where the activation starts
@@ -2236,14 +2223,6 @@ impl Pools {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let act = u64::from(self.chunks.act_chunks());
         (under / chunk).min(act.saturating_sub(1)) * chunk
-    }
-
-    /// The bytes of a fire's programs of `term` bytes that lie under the
-    /// state's end, where its carve leaves `under` bytes of the span.
-    #[must_use]
-    pub fn program_bytes_under_state(&self, under: u64, term: u64) -> u64 {
-        let chunk = self.chunks.layout().chunk_bytes.max(1);
-        (term.div_ceil(chunk) * chunk).saturating_sub(self.lent_bytes(under))
     }
 
     /// States the range whole to the runtime: every chunk it reserved, the
@@ -2262,12 +2241,40 @@ impl Pools {
         self.pledge();
     }
 
-    /// Backs `bytes` under the state's end for the guests' programs.
-    pub(crate) fn hold_under_state(&mut self, bytes: u64) -> Result<()> {
-        match self.chunks.hold_under_state(&mut self.pool, bytes)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
+    /// The address of a guest item of `bytes` where `item` names it, where
+    /// it lies now: a run of a role's slots ([`Pools::guest_span`]), or a
+    /// run of adjacent chunks ([`chunks::Chunks::guest_chunks`]).
+    pub fn guest_item(&self, item: crate::program::Item<'_>, bytes: u64) -> Result<u64> {
+        match item {
+            crate::program::Item::Slots(role, refs) => self.guest_span(role, refs, bytes),
+            crate::program::Item::Chunks { first, run } => {
+                self.chunks.guest_chunks(first, run, bytes)
+            }
         }
+    }
+
+    /// What a guest holding `per_instance` bytes an instance and
+    /// `per_pair` a pair, each in one piece, states (`engine::GuestState`):
+    /// the bytes, each a run of `Instance` slots where the runtime lays it
+    /// so, else one run of the adjacent chunks that hold the larger, which
+    /// a segment must hold.
+    pub fn guest_state(&self, per_instance: u64, per_pair: u64) -> Result<engine::GuestState> {
+        let layout = self.chunks.layout();
+        let chunk = layout.chunk_bytes.max(1);
+        let run =
+            u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
+        if run > layout.segment_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks of a segment a guest's state lies in, one run",
+                need: u64::from(run),
+                have: u64::from(layout.segment_chunks),
+            });
+        }
+        Ok(engine::GuestState {
+            per_instance,
+            per_pair,
+            run,
+        })
     }
 
     /// The address of a guest item of `bytes` in `refs`, slot refs of

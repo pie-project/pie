@@ -35,10 +35,25 @@ pub struct Program {
     batches: Vec<Batch>,
 }
 
+/// A (program, extents) pair bound now: its stages, and the state it holds
+/// while any instance of it is bound (`engine::GuestState::per_pair`): the
+/// room its flights lay their tables and scratch in, and the wave's tables
+/// a fire carrying it may lay there.
 #[derive(Debug)]
 struct Batch {
     extents: Extents,
     stages: Vec<Option<Prepared>>,
+    /// What the pair's state holds ([`Plane::pair_room`]).
+    room: PairRoom,
+    /// Its instances bound now.
+    bound: u32,
+    /// Where the runtime put its state ([`engine::InstanceBinding::pair`]),
+    /// and the address that is now.
+    pair: engine::ScratchPlace,
+    base: u64,
+    /// The state moved or came back since its stages last laid there: what
+    /// a lay keeps between fires is staged again.
+    stale: bool,
 }
 
 impl Program {
@@ -62,7 +77,8 @@ impl Program {
         }
     }
 
-    fn batch(&mut self, extents: Extents) -> Result<&mut Batch> {
+    /// The pair at `extents`, laid for `room` where no instance binds it.
+    fn batch(&mut self, extents: Extents, room: PairRoom) -> Result<&mut Batch> {
         if let Some(at) = self
             .batches
             .iter()
@@ -71,12 +87,48 @@ impl Program {
             return Ok(&mut self.batches[at]);
         }
         let stages = self.stages(extents)?;
-        self.batches.push(Batch { extents, stages });
+        self.batches.push(Batch {
+            extents,
+            stages,
+            room,
+            bound: 0,
+            pair: engine::ScratchPlace::None,
+            base: 0,
+            stale: true,
+        });
         Ok(self.batches.last_mut().expect("just pushed"))
     }
 
+    /// What the pair at `extents`, bound now, holds.
+    fn bound_room(&self, extents: Extents) -> Result<PairRoom> {
+        self.batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map(|batch| batch.room)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("program {} has no instance bound at {extents:?}", self.id),
+                )
+            })
+    }
+
+    /// The pair at `extents`, bound now.
+    fn bound_batch(&mut self, extents: Extents) -> Result<&mut Batch> {
+        let id = self.id;
+        self.batches
+            .iter_mut()
+            .find(|batch| batch.extents == extents)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("program {id} has no instance bound at {extents:?}"),
+                )
+            })
+    }
+
     /// The program's stages prepared for binds at `extents`: their tables
-    /// and what each lays of a fire's span. Nothing is put on the device.
+    /// and what each lays of its pair's state. Nothing is put on the device.
     fn stages(&self, extents: Extents) -> Result<Vec<Option<Prepared>>> {
         let shapes: Vec<ChannelShape> = self
             .plan
@@ -102,19 +154,20 @@ impl Program {
     }
 }
 
-/// What a fire of stages `stages` takes of the fire's span, at most
-/// `flight` lanes a flight.
-fn fire_bytes(stages: &[Option<Prepared>], flight: u32) -> FireBytes {
+/// What a flight of stages `stages` lays in its pair's state, at most
+/// `flight` lanes a flight, and the scratch each of its lanes reads: the
+/// widest launching stage's, which every stage shares
+/// ([`launch::lane_scratch`]).
+pub(crate) fn fire_bytes(stages: &[Option<Prepared>], flight: u32) -> FireBytes {
     let stages = || stages.iter().flatten();
     FireBytes {
         a_lane: stages().map(Prepared::lane_bytes).sum(),
+        scratch: stages()
+            .map(|stage| u64::from(stage.scratch_stride()))
+            .max()
+            .unwrap_or(0),
         fixed: stages().map(Prepared::fixed_bytes).sum(),
-        max_lanes: stages()
-            .map(Prepared::lane_ceiling)
-            .min()
-            .unwrap_or(u32::MAX)
-            .min(flight)
-            .max(1),
+        max_lanes: flight.max(1),
     }
 }
 
@@ -191,23 +244,8 @@ pub struct Plane {
     closing: std::collections::BTreeSet<InstanceId>,
     /// The streams a wave's program groups launch on, side by side.
     fan: fan::Fan,
-    /// Where the fire in hand lays its programs' tables and scratch: the
-    /// address their span ends at (under the fire's own activation) and
-    /// the bytes backed below it ([`Plane::set_span`]).
-    span: (u64, u64),
     /// The most lanes one fire carries: the rows of a wave's own tables.
     fire_lanes: u32,
-    /// The (program, extents) pairs bound now, what a fire of each takes
-    /// and the instances bound at it.
-    pairs: Vec<(ProgramId, Extents, FireBytes, u32)>,
-    /// What a fire takes of its span for the pairs bound now, at every
-    /// count of lanes ([`Plane::fire_term`]): built when an instance is
-    /// bound or closed ([`Plane::fit_term`]), never in a fire.
-    term: engine::GuestTerm,
-    /// How the last fire laid that span: each group's program, extents and
-    /// lanes, in order. A fire that lays it the same finds its bind-time
-    /// tables where it staged them.
-    laid: Vec<(ProgramId, Extents, u32)>,
     /// The engine's lane arenas, where a sampler's blocks meet
     /// ([`launch::Arenas`]): laid at load ([`Plane::set_arenas`]).
     arenas: launch::Arenas,
@@ -216,54 +254,84 @@ pub struct Plane {
     score_bytes: u64,
 }
 
-/// What a fire of one program at one bind's extents takes of the fire's
-/// span (`engine::Engine::fire_facts`).
+/// What a flight of one program at one bind's extents lays: every stage's
+/// tables, a lane and fixed; and the value scratch each of its lanes reads,
+/// one region its stages share ([`launch::lane_scratch`]), which lies in
+/// the lane's instance's state, not with the tables.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FireBytes {
     pub a_lane: u64,
     pub fixed: u64,
+    /// A lane's value scratch: the widest stage's.
+    pub scratch: u64,
     /// The most lanes one flight carries.
     pub max_lanes: u32,
 }
 
-/// The lanes a flight of `members` instances is laid for: the power of two
-/// over them, stated to the runtime in `engine::FireFacts::laid`
-/// (`Session::fire_facts`). The lanes laid key what a stage keeps between
-/// fires: its lane table and descriptor rows are built again, and its
-/// tables staged again, whenever the lanes differ from the last lay
-/// (`launch::Prepared::lay`, and `Plane::fly`'s `laid`). A wave whose
-/// members come and go fire by fire stays in one layout at a power of two,
-/// where the exact count would build and stage the tables every fire. The
-/// guest term counts the same lanes, here and in the runtime
-/// (`engine::GuestTerm`), so a fire never lays more than the term its rung
-/// backs.
-pub const LAID: engine::LaidLanes = engine::LaidLanes::PowerOfTwo;
-
-/// [`LAID`] over a flight's `members`.
-#[must_use]
-pub fn flight_lanes(members: u32) -> u32 {
-    u32::try_from(LAID.of(u64::from(members))).unwrap_or(u32::MAX)
-}
-
 impl FireBytes {
-    /// The bytes `lanes` lanes take.
+    /// The bytes the tables of `lanes` lanes take.
     #[must_use]
-    pub fn at(&self, lanes: u32) -> u64 {
+    pub fn tables(&self, lanes: u32) -> u64 {
         self.fixed + u64::from(lanes.min(self.max_lanes)) * self.a_lane
     }
+}
 
-    /// The same as the engine states it to the runtime
-    /// (`engine::Engine::fire_facts`), laid as [`Plane::fly`] lays a
-    /// flight's members ([`LAID`]): what the guest term is counted from on
-    /// both sides.
+/// The lanes a flight of `members` instances is laid for: the power of two
+/// over them, under the pair's own lanes. The lanes laid key what a stage
+/// keeps between fires: its lane table and descriptor rows are built
+/// again, and its tables staged again, whenever the lanes differ from the
+/// last lay (`launch::Prepared::lay`). A wave whose members come and go
+/// fire by fire stays in one layout at a power of two, where the exact
+/// count would build and stage the tables every fire.
+#[must_use]
+pub fn flight_lanes(members: u32) -> u32 {
+    members.checked_next_power_of_two().unwrap_or(u32::MAX)
+}
+
+/// What a (program, extents) pair holds while any instance of it is bound
+/// (`engine::GuestState`). The pair (`per_pair`): its stages' tables for a
+/// flight of its most lanes (each lane's scratch base among them, the
+/// grouped kernels' `lane_scratch`), and the room the wave's own tables
+/// take for a fire of the most lanes, where a fire carrying the pair may
+/// lay them. Each instance (`per_instance`): its lane's value scratch, one
+/// contiguous piece. Sized once from the load's lanes, so neither grows as
+/// instances bind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PairRoom {
+    /// What a flight of the pair lays.
+    pub flight: FireBytes,
+    /// The lanes the tables are laid for: a flight's most, no more than a
+    /// fire carries.
+    pub lanes: u32,
+    /// The room for the wave's tables, from the state's first aligned byte.
+    pub wave: u64,
+}
+
+impl PairRoom {
+    /// The pair's bytes: the wave's room and a flight's tables at
+    /// [`Self::lanes`], and the alignment its first byte may take.
     #[must_use]
-    pub fn facts(&self) -> engine::FireFacts {
-        engine::FireFacts {
-            a_lane: self.a_lane,
-            fixed: self.fixed,
-            max_lanes: self.max_lanes,
-            laid: LAID,
-        }
+    pub fn bytes(&self) -> u64 {
+        launch::SPAN_ALIGN + self.wave + self.flight.tables(self.lanes)
+    }
+
+    /// An instance's bytes: its lane's scratch, and the alignment its first
+    /// byte may take.
+    #[must_use]
+    pub fn instance_bytes(&self) -> u64 {
+        launch::SPAN_ALIGN + launch::lane_scratch(self.flight.scratch)
+    }
+
+    /// Where the wave's tables lie in a pair's state at `base`.
+    #[must_use]
+    pub fn wave_at(&self, base: u64) -> u64 {
+        base.next_multiple_of(launch::SPAN_ALIGN)
+    }
+
+    /// Where a flight's stages' tables lie in a pair's state at `base`.
+    #[must_use]
+    pub fn tables_at(&self, base: u64) -> u64 {
+        self.wave_at(base) + self.wave
     }
 }
 
@@ -322,11 +390,7 @@ impl Plane {
             flight: u32::MAX,
             closing: std::collections::BTreeSet::new(),
             fan: fan::Fan::default(),
-            span: (0, 0),
             fire_lanes: 0,
-            pairs: Vec::new(),
-            term: engine::GuestTerm::default(),
-            laid: Vec::new(),
             arenas: launch::Arenas::default(),
             score_bytes: 0,
         }
@@ -370,107 +434,38 @@ impl Plane {
     /// The most lanes one fire carries.
     pub fn set_fire_lanes(&mut self, lanes: u32) {
         self.fire_lanes = lanes;
-        self.fit_term();
     }
 
-    /// The fire in hand lays its programs in `span`: its end and the bytes
-    /// backed below it.
-    pub fn set_span(&mut self, span: (u64, u64)) {
-        if self.span != span {
-            self.laid.clear();
-        }
-        self.span = span;
-    }
-
-    /// What a fire of `program_id` bound at `extents` takes of the fire's
-    /// span: every stage's tables and scratch, a lane and fixed.
-    ///
-    /// The wave's own tables ride the same span and are stated in the
-    /// pair's `fixed`, whole: a row for every lane of the fire whatever
-    /// the flights it flies in (`Wave::lane_bytes`: 72 bytes a channel the
-    /// program names and 136 more, a member), and 320 bytes a fire for the
-    /// room they are aligned in. A fire lays that table once, whatever the
-    /// pairs in it, where the term counts it for every pair the fire
-    /// carries: an upper bound, over what the fire lays by `(pairs
-    /// carried − 1) ×` the table (14 pairs of 4 channels in a fire of 256
-    /// lanes: 13 × 108 864 bytes, 1.4 MB).
-    pub fn fire_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<FireBytes> {
+    /// What a (program, extents) pair holds while bound ([`PairRoom`]):
+    /// a flight of its most lanes, no more than a fire carries, and the
+    /// wave's tables for a fire of the most lanes at the program's
+    /// channels (`Wave::lane_bytes`: 72 bytes a channel the program names
+    /// and 136 more, a lane, and the room they are aligned in). A fire lays
+    /// its wave's tables in one pair's room, the widest of those it
+    /// carries: every lane of it names no more channels than that pair's.
+    pub fn pair_room(&self, program_id: ProgramId, extents: Extents) -> Result<PairRoom> {
         let program = self
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let mut bytes = fire_bytes(&program.stages(extents)?, self.flight);
-        let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
-        bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
-        Ok(bytes)
-    }
-
-    /// What a fire of up to `lanes` lanes takes of its span for the pairs
-    /// bound now, whichever of them its members are of: what the runtime
-    /// keeps free at a rung (`engine::Engine::fire_facts`,
-    /// `engine::GuestTerm`). A fire lays, for each pair it carries, a
-    /// flight as wide as the power of two over the pair's members in it
-    /// (`Plane::fly`), and nothing for a pair it carries none of; the term
-    /// is the worst such fire.
-    #[must_use]
-    pub fn fire_term(&self, lanes: u32) -> u64 {
-        self.term.bytes(lanes)
-    }
-
-    /// Builds the term of the pairs bound now, for fires of up to the
-    /// fire's lanes (every lane count where none is set). It runs on the
-    /// engine's thread inside the bind or close that changed a pair's
-    /// count, and builds the table only where the change shows in it: a
-    /// pair's flights grow at 1, 2 and one past each power of two, so a
-    /// wave of binds builds it a few times a pair. What a build costs is
-    /// measured in `engine::GuestTerm` (30 pairs of 256 lanes: 39 - 53 us).
-    fn fit_term(&mut self) {
-        let pairs: Vec<engine::FirePair> = self
-            .pairs
-            .iter()
-            .map(|(_, _, bytes, bound)| engine::FirePair {
-                facts: bytes.facts(),
-                live: *bound,
-            })
-            .collect();
-        let most = if self.fire_lanes == 0 {
-            u32::MAX
-        } else {
-            self.fire_lanes
+        let flight = fire_bytes(&program.stages(extents)?, self.flight);
+        let fire_lanes = match self.fire_lanes {
+            0 => self.flight,
+            lanes => lanes,
         };
-        self.term.fit(&pairs, most);
+        let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
+        Ok(PairRoom {
+            flight,
+            lanes: flight.max_lanes.min(fire_lanes).max(1),
+            wave: (lane * u64::from(fire_lanes) + fixed).next_multiple_of(launch::SPAN_ALIGN),
+        })
     }
 
-    /// An instance of `program_id` is bound at `extents`.
-    fn open_pair(&mut self, program_id: ProgramId, extents: Extents) -> Result<()> {
-        match self
-            .pairs
-            .iter_mut()
-            .find(|(program, at, _, _)| *program == program_id && *at == extents)
-        {
-            Some(pair) => pair.3 += 1,
-            None => {
-                let bytes = self.fire_bytes(program_id, extents)?;
-                self.pairs.push((program_id, extents, bytes, 1));
-            }
-        }
-        self.fit_term();
-        Ok(())
-    }
-
-    /// An instance of `program_id` bound at `extents` closed.
-    fn close_pair(&mut self, program_id: ProgramId, extents: Extents) {
-        if let Some(at) = self
-            .pairs
-            .iter()
-            .position(|(program, held, _, _)| *program == program_id && *held == extents)
-        {
-            self.pairs[at].3 -= 1;
-            if self.pairs[at].3 == 0 {
-                self.pairs.remove(at);
-            }
-            self.fit_term();
-        }
+    /// What [`Plane::pair_room`] holds: each instance's bytes and the
+    /// pair's.
+    pub fn state_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<(u64, u64)> {
+        self.pair_room(program_id, extents)
+            .map(|room| (room.instance_bytes(), room.bytes()))
     }
 
     pub fn set_shadow(&mut self, shadow: bool) {
@@ -621,11 +616,22 @@ impl Plane {
         span: Span<'_>,
         stream: *mut core::ffi::c_void,
     ) -> Result<InstanceId> {
+        let room = self.pair_room(program_id, extents)?;
         let program = self
             .programs
             .get_mut(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        program.batch(extents)?;
+        let batch = program.batch(extents, room)?;
+        // The pair's state, where the binding names it: the same on every
+        // instance of the pair, fresh where it came back.
+        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
+            .next_multiple_of(launch::SPAN_ALIGN);
+        if batch.bound == 0 || batch.pair != slots.pair {
+            let base = piece_at(&slots.pair, batch.room.bytes(), span)?;
+            batch.pair = slots.pair.clone();
+            batch.base = base;
+            batch.stale = true;
+        }
         let program = &*program;
         let held = program.held(self.score_bytes);
         let place = slots.place(&held, span)?;
@@ -649,7 +655,11 @@ impl Plane {
             }
         };
         session.resolve_on(&program.plan, geometry, device, buffers_rs);
-        self.open_pair(program_id, extents)?;
+        self.programs
+            .get_mut(&program_id)
+            .expect("just bound")
+            .bound_batch(extents)?
+            .bound += 1;
         let id = InstanceId(self.next_instance);
         self.next_instance += 1;
         self.instances.insert(
@@ -662,6 +672,7 @@ impl Plane {
                 ids: ids.to_vec(),
                 slots,
                 scores,
+                scratch,
             },
         );
         Ok(id)
@@ -686,6 +697,18 @@ impl Plane {
             let place = bound.slots.place(&held, span)?;
             bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
+            let room = program.bound_room(bound.session.extents())?;
+            bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
+                .next_multiple_of(launch::SPAN_ALIGN);
+        }
+        for program in self.programs.values_mut() {
+            for batch in program.batches.iter_mut().filter(|batch| batch.bound > 0) {
+                let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
+                if base != batch.base {
+                    batch.base = base;
+                    batch.stale = true;
+                }
+            }
         }
         Ok(())
     }
@@ -704,7 +727,24 @@ impl Plane {
         let place = slots.place(&held, span)?;
         bound.scores = held.score_at.map(|at| place.instance + at);
         bound.session.rebase(&place)?;
+        // The pair's state where the rebind names it: fresh room, whether
+        // or not where it lay before, since what another item wrote there
+        // meanwhile is staged over.
+        let extents = bound.session.extents();
+        let program_id = bound.program_id;
+        let room = program.bound_room(extents)?;
+        bound.scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
+            .next_multiple_of(launch::SPAN_ALIGN);
         bound.slots = slots;
+        let pair = bound.slots.pair.clone();
+        let batch = self
+            .programs
+            .get_mut(&program_id)
+            .expect("found above")
+            .bound_batch(extents)?;
+        batch.base = piece_at(&pair, batch.room.bytes(), span)?;
+        batch.pair = pair;
+        batch.stale = true;
         Ok(())
     }
 
@@ -920,35 +960,15 @@ impl Plane {
         if self.staged.is_empty() {
             return Ok(());
         }
-        // The wave's own tables lie first in the fire's span, its groups'
-        // under them.
-        let (end, room) = self.span;
-        // What the fire lays, down from the span's end: the bind that
-        // opened each pair backed it, so a fire past it counted wrong.
-        let mut under = end;
-        let mut lay = |bytes: u64| -> Result<u64> {
-            under = under.saturating_sub(bytes.next_multiple_of(256));
-            if end - under > room {
-                return Err(Fault::Ceiling {
-                    what: "bytes of the fire's span its guests' programs lay",
-                    need: end - under,
-                    have: room,
-                });
-            }
-            Ok(under)
-        };
-        let wave_at = lay(self.wave.bytes())?;
-        self.wave.fly(context, wave_at)?;
         let main = context.stream();
         let Plane {
             programs,
             instances,
             staged,
-            flight,
             at,
             fan,
-            laid,
             arenas,
+            wave,
             ..
         } = self;
         let arenas = *arenas;
@@ -965,8 +985,13 @@ impl Plane {
             }
         }
 
+        // Each group lays in its pair's state, its flights one after
+        // another in it, as wide as its widest; the wave's tables lie in
+        // the room the widest of the pairs keeps for them.
         let mut meet = Vec::with_capacity(groups.len());
-        for (program_id, extents, _) in &groups {
+        let mut places = Vec::with_capacity(groups.len());
+        let mut wave_at: Option<(u64, u64)> = None;
+        for (program_id, extents, members) in &groups {
             let program = programs.get_mut(program_id).ok_or_else(|| {
                 Fault::program(
                     "program::plane",
@@ -976,36 +1001,34 @@ impl Plane {
             let runs: Vec<bool> = (0..program.compiled.stages.len())
                 .map(|index| program.plan.runs_at(index, at))
                 .collect();
-            let batch = program.batch(*extents)?;
+            let batch = program.bound_batch(*extents)?;
             meet.push(
                 at_point(&mut batch.stages, &runs)
                     .iter()
                     .any(|prepared| prepared.meets_across_blocks()),
             );
-        }
-        // Each group's span, laid down from there: its flights fly one
-        // after another in it, as wide as its widest.
-        let mut laying = Vec::with_capacity(groups.len());
-        let mut places = Vec::with_capacity(groups.len());
-        for (program_id, extents, members) in &groups {
-            let program = programs.get_mut(program_id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("a staged fire names program {program_id}, which is gone"),
-                )
-            })?;
-            let bytes = fire_bytes(&program.batch(*extents)?.stages, *flight);
+            let room = batch.room;
             let lanes = flight_lanes(u32::try_from(members.len()).unwrap_or(u32::MAX))
-                .min(bytes.max_lanes)
+                .min(room.lanes)
                 .max(1);
-            laying.push((*program_id, *extents, lanes));
-            places.push((lay(bytes.at(lanes))?, lanes));
+            places.push((room.tables_at(batch.base), lanes, batch.stale));
+            batch.stale = false;
+            if wave_at.is_none_or(|(_, widest)| room.wave > widest) {
+                wave_at = Some((room.wave_at(batch.base), room.wave));
+            }
         }
-        let fresh = *laid != laying;
-        *laid = laying;
+        let (wave_base, wave_room) = wave_at.expect("a staged fire carries a group");
+        if wave.bytes() > wave_room {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pair's state a fire's wave tables lie in",
+                need: wave.bytes(),
+                have: wave_room,
+            });
+        }
+        wave.fly(context, wave_base)?;
         let streams = fan.fork(&meet, main)?;
         let flown = groups.into_iter().zip(streams).zip(places).try_for_each(
-            |(((program_id, extents, members), stream), (base, lanes))| {
+            |(((program_id, extents, members), stream), (base, lanes, fresh))| {
                 Plane::fly_group(
                     programs, instances, program_id, extents, &members, lanes, base, fresh, at,
                     arenas, stream,
@@ -1065,7 +1088,7 @@ impl Plane {
             let runs: Vec<bool> = (0..program.compiled.stages.len())
                 .map(|index| program.plan.runs_at(index, at))
                 .collect();
-            let batch = program.batch(extents)?;
+            let batch = program.bound_batch(extents)?;
             // Every stage lays, whichever run here: a stage's span is the
             // same at every point of the fire.
             let mut next = base;
@@ -1079,9 +1102,11 @@ impl Plane {
                         format!("a staged fire names instance {instance}, which is gone"),
                     )
                 })?;
+                // Every stage's lane reads its scratch at its instance's own
+                // (`launch::lane_scratch`).
                 bound
                     .session
-                    .take_lane(at_point(&mut batch.stages, &runs))?;
+                    .take_lane(at_point(&mut batch.stages, &runs), bound.scratch)?;
             }
             for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.commit_lanes(stream)?;
@@ -1213,13 +1238,15 @@ impl Plane {
             .remove(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
         release_seats(&bound.endpoints);
-        self.close_pair(bound.program_id, bound.session.extents());
-        let orphaned = !self
-            .instances
-            .values()
-            .any(|other| other.program_id == bound.program_id);
-        if orphaned && let Some(program) = self.programs.get_mut(&bound.program_id) {
-            program.batches.clear();
+        // The pair's last instance gives its state back, and the pair goes.
+        if let Some(program) = self.programs.get_mut(&bound.program_id) {
+            let extents = bound.session.extents();
+            program.batches.retain_mut(|batch| {
+                if batch.extents == extents {
+                    batch.bound = batch.bound.saturating_sub(1);
+                }
+                batch.bound > 0
+            });
         }
         Ok(())
     }
@@ -1262,25 +1289,68 @@ struct Bound {
     /// Where its lane's captured score rows lie now, for a program that
     /// reads them.
     scores: Option<u64>,
+    /// Where its lane's value scratch lies now
+    /// (`engine::InstanceBinding::scratch`, [`PairRoom::instance_bytes`]).
+    scratch: u64,
 }
 
-/// The address of a guest item of the stated bytes in the named slots of a
-/// role, where they lie now (`store::Pools::guest_span`).
-pub type Span<'a> = &'a dyn Fn(engine::chunk::SlotRole, &[u32], u64) -> Result<u64>;
+/// Where a guest item lies in the pool, as a binding names it.
+#[derive(Debug, Clone, Copy)]
+pub enum Item<'a> {
+    /// One run of a role's slots (slot refs) in one chunk.
+    Slots(engine::chunk::SlotRole, &'a [u32]),
+    /// `run` adjacent chunks from logical chunk `first`
+    /// (`engine::ScratchPlace::Chunks`).
+    Chunks { first: u32, run: u32 },
+}
+
+/// The address of a guest item of the stated bytes, where it lies now
+/// (`store::Pools::guest_span`).
+pub type Span<'a> = &'a dyn Fn(Item<'_>, u64) -> Result<u64>;
 
 /// The pool slots an instance's items lie in, as its binding names them.
 #[derive(Debug, Clone, Default)]
 pub struct Slots {
     pub instance: Vec<u32>,
     pub rings: Vec<engine::program::RingSlots>,
+    /// Where its lane's scratch lies (`engine::InstanceBinding::scratch`).
+    pub scratch: engine::ScratchPlace,
+    /// Where its pair's state lies (`engine::InstanceBinding::pair`).
+    pub pair: engine::ScratchPlace,
+}
+
+/// Where a guest state of `bytes` that lies at `place` starts now: its run
+/// of `Instance` slots, or its one run of whole chunks (each state is one
+/// piece: a lane's scratch, a pair's tables). Where none is named, the
+/// span is asked for an item of no slots (a plane with no pool lends one;
+/// a pool refuses it by name).
+fn piece_at(place: &engine::ScratchPlace, bytes: u64, span: Span<'_>) -> Result<u64> {
+    use engine::ScratchPlace;
+    match place {
+        ScratchPlace::None => span(Item::Slots(engine::chunk::SlotRole::Instance, &[]), bytes),
+        ScratchPlace::Run { first, slots } => {
+            let refs: Vec<u32> = (*first..first + slots).collect();
+            span(Item::Slots(engine::chunk::SlotRole::Instance, &refs), bytes)
+        }
+        ScratchPlace::Chunks { run, pieces } => match pieces[..] {
+            [first] => span(Item::Chunks { first, run: *run }, bytes),
+            _ => Err(Fault::program(
+                "program::plane",
+                format!(
+                    "a guest state of {bytes} bytes lies in one run of chunks, and its \
+                     binding names {} runs of {run}",
+                    pieces.len()
+                ),
+            )),
+        },
+    }
 }
 
 impl Slots {
     /// Where the items of an instance that keeps `held` lie now.
     fn place(&self, held: &Held, span: Span<'_>) -> Result<Place> {
         let instance = span(
-            engine::chunk::SlotRole::Instance,
-            &self.instance,
+            Item::Slots(engine::chunk::SlotRole::Instance, &self.instance),
             held.instance_bytes,
         )?;
         let mut rings = vec![0u64; held.ring_bytes.len()];
@@ -1299,8 +1369,10 @@ impl Slots {
                         ),
                     )
                 })?;
-            rings[ring.channel as usize] =
-                span(engine::chunk::SlotRole::Channel, &ring.slots, bytes)?;
+            rings[ring.channel as usize] = span(
+                Item::Slots(engine::chunk::SlotRole::Channel, &ring.slots),
+                bytes,
+            )?;
         }
         Ok(Place { instance, rings })
     }
@@ -1407,113 +1479,5 @@ fn release_seats(endpoints: &[Option<std::sync::Arc<Endpoint>>]) {
         if endpoint.role() == HostRole::None {
             endpoint.detach();
         }
-    }
-}
-
-#[cfg(test)]
-mod term_tests {
-    use super::*;
-
-    /// The term a rung backs for `n` bound instances is what a fire of `n`
-    /// lays, for every `n` up to the flight's lanes: the fire lays a flight
-    /// for `flight_lanes(n)` (`Plane::fly`), and the room it is checked
-    /// against is `fire_term` (`program_span`). 170 bound fly as 256.
-    #[test]
-    fn the_term_a_rung_backs_for_n_bound_is_what_a_fire_of_n_lays() {
-        assert_eq!(flight_lanes(170), 256);
-        assert_eq!(flight_lanes(33), 64);
-        // Flights of 64 lanes and of 256: waves of every width below each,
-        // and past 64 a group flying in several flights of 64.
-        for max_lanes in [64, 256] {
-            let bytes = FireBytes {
-                a_lane: 455_990,
-                fixed: 1 << 20,
-                max_lanes,
-            };
-            for n in 1..=256 {
-                let mut plane = Plane::default();
-                plane.pairs.push((ProgramId(1), Extents::default(), bytes, n));
-                plane.fit_term();
-                // What `Plane::fly` lays for a group of `n` members.
-                let lays = bytes.at(flight_lanes(n).min(bytes.max_lanes).max(1));
-                assert_eq!(
-                    plane.fire_term(256),
-                    lays,
-                    "{n} bound, flights of {max_lanes}"
-                );
-                // And what the runtime counts from the facts stated to it
-                // (`Session::fire_facts`) for `n` members.
-                let stated = bytes.facts();
-                assert_eq!(
-                    stated.bytes(u64::from(n)),
-                    lays,
-                    "{n} members as stated, flights of {max_lanes}"
-                );
-                // A narrower rung's fire carries no more lanes than it holds.
-                let narrow = flight_lanes(n.min(64)).min(bytes.max_lanes);
-                assert_eq!(
-                    plane.fire_term(64),
-                    bytes.at(narrow),
-                    "{n} bound at a 64-lane rung, flights of {max_lanes}"
-                );
-            }
-        }
-    }
-
-    /// The term is a fire's, not a pair's. Fourteen pairs with 256 bound
-    /// each, in fires of 256 lanes: a fire lays a flight for each pair it
-    /// carries, as wide as the power of two over the pair's members in it
-    /// (`Plane::fly`), so no fire lays more than the worst split of its
-    /// 256 members does, and none lays fourteen fires' worth, which the
-    /// sum over pairs set aside.
-    #[test]
-    fn many_pairs_take_what_the_worst_fire_of_them_lays() {
-        let bytes = FireBytes {
-            a_lane: 455_990,
-            fixed: 1 << 20,
-            max_lanes: 256,
-        };
-        let mut plane = Plane::default();
-        plane.set_fire_lanes(256);
-        for pair in 1..=14 {
-            plane
-                .pairs
-                .push((ProgramId(pair), Extents::default(), bytes, 256));
-        }
-        plane.fit_term();
-        // What `Plane::fly` lays for groups of these members.
-        let lays = |groups: &[u32]| -> u64 {
-            groups
-                .iter()
-                .map(|&members| bytes.at(flight_lanes(members).min(bytes.max_lanes).max(1)))
-                .sum()
-        };
-        let term = plane.fire_term(256);
-        // The worst fire: every pair carried, and the members past one
-        // each (242) given so that the flights round up the most: 129, 65,
-        // 33, 17 and 3 members lay 256, 128, 64, 32 and 4 lanes, nine
-        // pairs of one member 9: 493 lanes for 256 members.
-        let worst = [129, 65, 33, 17, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1];
-        assert_eq!(worst.iter().sum::<u32>(), 256);
-        assert_eq!(lays(&worst), 14 * (1 << 20) + 493 * 455_990);
-        assert_eq!(term, lays(&worst));
-        for split in [
-            &[256][..],
-            &[129, 127],
-            &[65, 65, 65, 61],
-            &[33, 33, 33, 33, 33, 33, 33, 25],
-            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 9],
-        ] {
-            assert!(split.iter().sum::<u32>() <= 256);
-            assert!(lays(split) <= term, "{split:?}");
-        }
-        // Pair by pair it was fourteen flights of 256: 1.65 GB for the
-        // 239 MB the worst fire lays.
-        assert_eq!(14 * bytes.at(256), 1_648_948_224);
-        assert_eq!(term, 239_483_134);
-        // A narrower rung's fire: 64 members, every pair carried.
-        let narrow = [33, 17, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
-        assert_eq!(narrow.iter().sum::<u32>(), 64);
-        assert_eq!(plane.fire_term(64), lays(&narrow));
     }
 }
