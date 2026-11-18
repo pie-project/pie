@@ -3738,6 +3738,53 @@ Decode units have many pairs (a layer's every head), so the term is a few percen
 flux2-mini's denoise has few, so its K / V placement hardly matters. That makes the annealer
 worth turning on by default for decode-unit programs once the decode path runs on the chip;
 for stream readings it barely changes the step.
+
+### P1.d: the decode units' price gap (1556, open)
+
+1556 ran Qwen3-0.6B's decode through units on the CS-3, compiled on load, stamps on, every run
+token-exact (16 / 16 against the golden):
+
+| program | PEs | price | links (term) | chip, a step | wall |
+|---|---|---|---|---|---|
+| 2 layers, off | 150 x 449 | 29,903 | 1,232 | 128-137k | 8.8 ms |
+| 2 layers, annealed | 150 x 435 | 29,903 | 487 | 130-139k | 8.8 ms |
+| 28 layers, off | 700 x 898 | 374,743 | 19,439 | 2.80-3.11M | 21 ms |
+| 28 layers, annealed | 700 x 707 | 374,743 | 8,361 | 1.42-1.50M | 17 ms |
+
+So the annealer is the default for decode-unit programs now (`Anneal::unit`, above). The
+cost model misses two things:
+- **The level.** The full program costs 7.9x its price off and 3.9x annealed. A layer costs
+  ~108k cycles off and ~51k annealed, against ~13.3k priced (6.1k early + 7.2k late).
+- **What the annealer changed.** The link term says it saves 11k cycles; the chip saved ~1.5M.
+
+What the placements show (`place::cost::stream` routed; the layouts' tiles):
+- **The K / V links are short in both.** Each attending head root (a unit's bottom CY row,
+  y 257) reaches its own column's root straight down. Off, the 16 heads of a layer stand in
+  a staircase, 1 to 16 hops; annealed, 1 to 3. KI hops in all: 3,808 off, 1,145 annealed.
+  1,500k cycles over 5,326 fewer round-trip hops would be ~280 cycles a hop, against 1548's
+  2.08. **The 2-layer program has the same staircase** (the same 1-16 hops a head), and there
+  the annealer changed nothing on the chip. So the hops are not the cause.
+- **Off is 191 rows taller.** The search's 28-layer program is 700 x 898. Its rows 707-897 hold
+  only filler PEs: no tile, no route. The annealer re-derives the height from its blocks'
+  rectangles (707). The 2-layer program's heights differ by 14 rows (449 / 435).
+- **Neither price reads the cache.** A decode step's K / V column attends over every page it
+  holds, masked (`satt.csl`'s `NE` = 48 entries a PE at 8,192 positions over 175 PEs). The
+  price's query reads the block's rows a step (1): `query_cycles` gives 1,402 cycles, where the
+  kernel's matvecs run over 48 entries (8,348 at `QUERY_ENTRY`). Priced so, the search picks
+  another program (576 x 538, 574,249 cycles): unmeasured, so not yet committed.
+
+Request p2kv (`flux2f/req/p2/p2kv.json`) separates the suspects. It runs six prebuilt programs,
+6 steps each, with every PE's stamps at steps 0 and 5 (`wafer-bench --decode --stamps <dir>`):
+- `off` and `off707` (off with its 191 filler rows cut; every tile and route the same): the
+  idle rows alone;
+- `off707` against `on`: the K / V placement at one height;
+- `on`, `d4` and `d16` (every K / V column 4 / 16 rows further down: KI hops 2,937 / 8,313):
+  the hop's slope at decode;
+- `qfix`: the search's pick once the query reads the cache.
+
+At 2.08 cycles a hop the term predicts `d4` = on + 7k, `d16` = on + 30k, `off707` = on + 11k.
+The stamps give each PE's start: whether a launch reaches the fabric's PEs at once, or a
+program's idle area delays its start.
 ### The line windows (check::hazard::lines)
 
 A **line** is a set of colours a PE takes on one input queue that its code rebinds between:
