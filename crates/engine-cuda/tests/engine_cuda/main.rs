@@ -33,6 +33,7 @@ mod guest;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
+mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;

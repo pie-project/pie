@@ -1577,8 +1577,12 @@ impl<'c> Run<'c> {
             })
     }
 
-    /// Each lane's mask word, cut to the window's lanes as `mask_indptr` is.
+    /// Each lane's mask word, cut to the window's lanes as `mask_indptr` is
+    /// (a copied window's own, gathered).
     pub(crate) fn mask_origin(&self) -> Option<Tensor> {
+        if let Some(gathered) = &self.window().gathered {
+            return gathered.mask.as_ref().map(|mask| mask.origin);
+        }
         if self.plane_base() {
             return self.fire.tables.mask_origin;
         }
@@ -1590,6 +1594,9 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn mask_indptr(&self) -> Option<Tensor> {
+        if let Some(gathered) = &self.window().gathered {
+            return gathered.mask.as_ref().map(|mask| mask.indptr);
+        }
         if self.plane_base() {
             return self.fire.tables.mask_indptr;
         }
@@ -1611,7 +1618,11 @@ impl<'c> Run<'c> {
         if self.expert.get(at).copied().unwrap_or(false) {
             return self.received(at, handle);
         }
-        if self.window().gathered.is_some() {
+        // The mask bits stay where the fire staged them: a copied window's
+        // lanes read them through their gathered offsets.
+        if self.window().gathered.is_some()
+            && !matches!(self.values[at].def, Def::Input(RuntimeInput::Mask))
+        {
             return self.compacted(id, handle);
         }
         if matches!(
@@ -2731,10 +2742,19 @@ impl<'c> Run<'c> {
             }
             let _ = write!(sink, "{at}:");
             let _ = match slot {
+                // Where the mask tables lie, a decode's as a prefill's: a
+                // copied window's are its own (`window::GatheredMask`).
                 StructSlot::Decode(p) => write!(
                     sink,
-                    "d{:?}{:?}{:?}{:?}",
-                    p.info, p.workspace, p.shape, p.window
+                    "d{:?}{:?}{:?}{:?}{:?}",
+                    p.info,
+                    p.workspace,
+                    p.shape,
+                    p.window,
+                    (
+                        p.mask_indptr.map(|table| table.ptr),
+                        p.mask_origin.map(|table| table.ptr)
+                    )
                 ),
                 StructSlot::Prefill(p) => write!(
                     sink,
@@ -2746,7 +2766,12 @@ impl<'c> Run<'c> {
                     p.total_tokens,
                     p.causal,
                     p.graph_capturable,
-                    (p.mask_indptr, p.mask_origin)
+                    // Where the mask tables lie, not how many lanes this fire
+                    // staged in them: a body reads each fire's entries.
+                    (
+                        p.mask_indptr.map(|table| table.ptr),
+                        p.mask_origin.map(|table| table.ptr)
+                    )
                 ),
                 StructSlot::Mla(p) => write!(
                     sink,

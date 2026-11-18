@@ -817,13 +817,11 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let next = std::cell::Cell::new(0usize);
     // The rows' own positions, all of request 0, no row masked.
     let positions: Vec<u32> = (0..s.rows).collect();
-    const MASK_STRIDE: u32 = 4;
     let tables = kernels_slang::attn::sdpa::Tables {
         positions: rig.words(&positions, s.rows, 1, Dtype::I32)?,
         request_of_token: rig.zeros(s.rows, 1, Dtype::I32)?,
-        mask: rig.zeros(s.rows, MASK_STRIDE, Dtype::U8)?,
-        mask_enabled: rig.zeros(s.rows, 1, Dtype::U8)?,
-        mask_stride: MASK_STRIDE,
+        mask: rig.zeros(1, 4, Dtype::U8)?,
+        mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     rig.step(

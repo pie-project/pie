@@ -157,11 +157,12 @@ pub struct CacheGeometry {
 pub struct FireTables {
     pub request_of_token: Tensor,
 
+    /// The fire's mask plane, whole: no window cuts it.
     pub mask: Tensor,
 
-    pub mask_enabled: Tensor,
-
-    pub mask_stride: u32,
+    /// Two words a row: its boundary (`mask::NONE` stating no mask) and its
+    /// offset in the plane; a window cuts them by its rows.
+    pub mask_words: Tensor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -404,6 +405,9 @@ impl<'c, B: Backend> Run<'c, B> {
             if handle.buf == self.fire.tables.request_of_token.buf {
                 return gathered.request_of_token;
             }
+            if handle.buf == self.fire.tables.mask_words.buf {
+                return gathered.mask_words;
+            }
         }
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
@@ -527,6 +531,11 @@ impl<'c, B: Backend> Run<'c, B> {
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
 
+        // The mask plane is whole in every window: its rows' entries say
+        // where their columns lie.
+        if matches!(self.values[at].def, Def::Input(RuntimeInput::Mask)) {
+            return handle;
+        }
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }

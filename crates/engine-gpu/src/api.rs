@@ -489,7 +489,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
 
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),

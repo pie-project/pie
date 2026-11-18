@@ -485,12 +485,23 @@ pub fn mla_prefill_expanded() -> Rule {
 /// A log-sum-exp attention and the sinks over its output.
 #[must_use]
 pub fn lse_sink() -> Rule {
-    let pair = |decode: bool| {
+    // The attention reads the fire's per-lane masks or none
+    // (`attn.attend` with its mask open, or not).
+    let pair = |decode: bool, masked: bool| {
         template(move |p| {
             let q = p.rows("q", W);
             let cache = p.cache("cache");
             let d = p.u32("d");
             p.free("window");
+            let mask = masked.then(|| {
+                p.value(
+                    "mask",
+                    Ty::Tensor {
+                        shape: vec![poem_ir::Dim::Tokens],
+                        dtype: poem_ir::Dtype::U8,
+                    },
+                )
+            });
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
                 both(attn::decode(
@@ -507,6 +518,7 @@ pub fn lse_sink() -> Rule {
                     None,
                     None,
                     None,
+                    mask.as_ref(),
                 ))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
@@ -519,7 +531,7 @@ pub fn lse_sink() -> Rule {
                     p.u32("kv_heads"),
                     p.f32("sm_scale"),
                     true,
-                    None,
+                    mask.as_ref(),
                     true,
                     None,
                     None,
@@ -536,7 +548,15 @@ pub fn lse_sink() -> Rule {
             p.export("o_out", &out);
         })
     };
-    Rule::new("fused.lse_sink", [pair(true), pair(false)], |m| {
+    Rule::new(
+        "fused.lse_sink",
+        [
+            pair(true, false),
+            pair(false, false),
+            pair(true, true),
+            pair(false, true),
+        ],
+        |m| {
         let Operation::Attn(attn) = m.op("o") else {
             panic!("the sinked output comes from an attention");
         };
@@ -546,7 +566,8 @@ pub fn lse_sink() -> Rule {
             head_dim: m.u32("d"),
             o_out: m.value("o_out"),
         }
-    })
+    },
+    )
 }
 
 /// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
