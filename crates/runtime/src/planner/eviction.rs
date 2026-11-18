@@ -643,6 +643,7 @@ impl ResidencyPlanner {
                 outcome,
                 notify,
                 yielded,
+                ..
             } = &mut waiter.kind
             else {
                 return ServeOutcome::Stale(rs);

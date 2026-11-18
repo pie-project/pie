@@ -37,6 +37,23 @@ fn park_allocation(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey
             notify: Arc::new(Notify::new()),
             outcome: None,
             yielded: false,
+            rise: false,
+        },
+    )
+}
+
+fn park_rise(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey {
+    inner.enqueue(
+        pid,
+        WaitKind::Allocation {
+            demand: Demand {
+                kv_pages,
+                rs: RsUnits::default(),
+            },
+            notify: Arc::new(Notify::new()),
+            outcome: None,
+            yielded: false,
+            rise: true,
         },
     )
 }
@@ -61,6 +78,38 @@ fn planner_every_case() {
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters();
+}
+
+/// A rise that cannot fire narrower is a keyed demand of its process: beside
+/// a kv waiter, the older process's ask is served first, whichever it is;
+/// no rise queues anonymously ahead of, or behind, the waiters it starves.
+fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_rise(&mut inner, pids[1], 8);
+    park_allocation(&mut inner, pids[0], 4);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older kv waiter before the younger rise");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: false, .. }
+    ));
+
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_allocation(&mut inner, pids[1], 4);
+    park_rise(&mut inner, pids[0], 8);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older rise before the younger kv waiter");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: true, .. }
+    ));
 }
 
 /// A restore whose role slots found no room is queued again, a waiter: it
