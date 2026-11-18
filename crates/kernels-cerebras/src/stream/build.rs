@@ -443,7 +443,7 @@ pub fn program_py(
         let mut built: Vec<(f64, (u32, u32, KvSplit))> = Vec::new();
         let mut applied = false;
         for group in tries.chunks(8) {
-            let tried: Vec<((u32, u32, KvSplit), R<Program>)> = std::thread::scope(|sc| {
+            let tried: Vec<((u32, u32, KvSplit), Made)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = group
                     .iter()
                     .map(|&(p, tile, kv)| {
@@ -459,7 +459,10 @@ pub fn program_py(
                 group
                     .iter()
                     .zip(hs)
-                    .map(|(&c, h)| h.join().unwrap_or_else(|_| (c, Err("panicked".into()))))
+                    .map(|(&c, h)| {
+                        h.join()
+                            .unwrap_or_else(|_| (c, Err(Unbuilt::Refused("panicked".into()))))
+                    })
                     .collect()
             });
             for (cand, r) in tried {
@@ -474,8 +477,8 @@ pub fn program_py(
                         }
                     }
                     // (a replica count no attention takes says nothing of the candidate)
-                    Err(e) if rep > 1 && e.contains("no attention's q heads split") => {}
-                    Err(e) => {
+                    Err(Unbuilt::NoReplicas(_)) => {}
+                    Err(Unbuilt::Refused(e)) => {
                         applied = true;
                         errs.push((cand.0, cand.1, e));
                     }
@@ -700,6 +703,34 @@ pub fn lower_units(
     })
 }
 
+/// Why [`program_at`] builds no program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unbuilt {
+    /// No attention's q heads split over this many K / V replicas: the count, not the
+    /// candidate, is what does not apply.
+    NoReplicas(u32),
+    /// The candidate does not build, and why.
+    Refused(String),
+}
+
+/// What [`program_at`] makes of a candidate.
+type Made = Result<Program, Unbuilt>;
+
+impl From<String> for Unbuilt {
+    fn from(why: String) -> Unbuilt {
+        Unbuilt::Refused(why)
+    }
+}
+
+impl std::fmt::Display for Unbuilt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unbuilt::NoReplicas(rep) => write!(f, "no attention's q heads split {rep} ways"),
+            Unbuilt::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
 /// [`program_upto`] at `py` row roots a unit and weight tiles of at most `tile` words, within
 /// `bounds` (`spill`: every unit's rows held over the barrier in its row store).
 #[allow(clippy::too_many_arguments)]
@@ -715,14 +746,14 @@ pub fn program_at(
     spill: bool,
     bounds: Bounds,
     rep: u32,
-) -> R<Program> {
+) -> Made {
     let prog = &shape.program;
     let name = &trace.name;
     if py == 0 || !prog.hidden.is_multiple_of(py) {
-        return Err(format!(
+        return Err(Unbuilt::Refused(format!(
             "{name}: a hidden width of {} cuts over no {py} rows",
             prog.hidden
-        ));
+        )));
     }
     let Lowered {
         class_rows,
@@ -745,7 +776,7 @@ pub fn program_at(
             }
         }
         if !any {
-            return Err(format!("{name}: no attention's q heads split {rep} ways"));
+            return Err(Unbuilt::NoReplicas(rep));
         }
     }
 
