@@ -1186,6 +1186,69 @@ impl Pools {
         Ok((view.clone(), at, runs, shape.slot_bytes))
     }
 
+    /// The contiguous pieces a guest's state lies in (`engine::ScratchPlace`):
+    /// a run of `Instance` slots in one chunk, or runs of whole chunks, each
+    /// from its first logical chunk. Each piece as the buffer it lies in,
+    /// its offset there, its offset in the pool (what host runs are asked
+    /// by) and its bytes; none for `None`.
+    pub fn guest_pieces(&self, place: &engine::ScratchPlace) -> Result<Vec<GuestPiece>> {
+        match place {
+            engine::ScratchPlace::None => Ok(Vec::new()),
+            engine::ScratchPlace::Run { first, slots } => {
+                let shape = *self.shape(super::layout::INSTANCE)?;
+                let (chunk, index) = self.place(&shape, *first)?;
+                let last = index + slots.saturating_sub(1);
+                if *slots == 0 || last >= shape.per_chunk {
+                    return Err(Fault::Residency(format!(
+                        "a guest's run of {slots} `Instance` slot(s) from ref {first} passes \
+                         its chunk of {} slots",
+                        shape.per_chunk
+                    )));
+                }
+                self.pool.admit(chunk)?;
+                let global = u64::from(chunk) * self.layout.chunk_bytes
+                    + u64::from(index) * shape.slot_bytes;
+                let (view, local) = self.pool.view_at(global);
+                Ok(vec![GuestPiece {
+                    view: view.clone(),
+                    local,
+                    global,
+                    bytes: u64::from(*slots) * shape.slot_bytes,
+                }])
+            }
+            engine::ScratchPlace::Chunks { run, pieces } => pieces
+                .iter()
+                .map(|&logical| {
+                    let physical = self.pool.physical(logical)?;
+                    for at in 0..*run {
+                        self.pool.admit(physical + at)?;
+                    }
+                    let global = u64::from(physical) * self.layout.chunk_bytes;
+                    let (view, local) = self.pool.view_at(global);
+                    Ok(GuestPiece {
+                        view: view.clone(),
+                        local,
+                        global,
+                        bytes: u64::from(*run) * self.layout.chunk_bytes,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The bytes of one `Instance` slot and the slots a chunk holds: what
+    /// the runtime places a guest's state by.
+    pub fn instance_slots(&self) -> Result<(u64, u32)> {
+        let shape = *self.shape(super::layout::INSTANCE)?;
+        Ok((shape.slot_bytes, shape.per_chunk))
+    }
+
+    /// A chunk's bytes.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.layout.chunk_bytes
+    }
+
     /// The slots of shape `id` one chunk holds.
     pub fn slots_per_chunk(&self, id: ShapeId) -> Result<u32> {
         Ok(self.shape(id)?.per_chunk)
@@ -2605,4 +2668,15 @@ mod tables_run_tests {
         let past = pools.kv_pages(&[3], None).expect("the first slot past the tables run");
         assert_eq!(past.len(), 1);
     }
+}
+
+/// One contiguous piece of a guest's state in the pool ([`Pools::guest_pieces`]).
+#[derive(Debug, Clone)]
+pub struct GuestPiece {
+    /// The buffer it lies in, and its offset there.
+    pub view: Buffer,
+    pub local: u64,
+    /// Its offset in the pool: what its host runs are asked by.
+    pub global: u64,
+    pub bytes: u64,
 }

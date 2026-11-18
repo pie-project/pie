@@ -1,6 +1,7 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_bank_past_2_gib_reads_its_last_rows;
+mod a_bound_guest_leaves_the_span_as_it_was;
 mod a_cold_registration_compiles_while_lanes_fire;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
@@ -85,3 +86,55 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
     None
 }
 mod an_unfolded_decode_is_the_folded_one;
+
+/// The guest state places the runtime takes for instance `nth` of
+/// `program` at `extents` (`engine::Engine::guest_state`), as a test lays
+/// them past its tables and rings (8 chunks past the layout's first free
+/// one): the pair's first, the same for every instance of the pair, then
+/// each instance's own, apart. Each a run of `Instance` slots where the
+/// state shares a chunk, else whole chunks. The room is committed, as the
+/// runtime commits what a bind takes.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn guest_places(
+    shell: &mut engine_metal::Shell,
+    program: engine::ProgramId,
+    extents: &eta_exec::Extents,
+    nth: u32,
+) -> (engine::ScratchPlace, engine::ScratchPlace) {
+    let state = shell.guest_state(program, extents).expect("the program's guest state");
+    let layout = shell.pool_layout();
+    let instance = layout.instance.expect("an instance shape");
+    let chunks_of = |bytes: u64| -> u32 {
+        if bytes == 0 {
+            0
+        } else if state.run == 0 {
+            1
+        } else {
+            let piece = u64::from(state.run) * layout.chunk_bytes;
+            u32::try_from(bytes.div_ceil(piece)).expect("pieces") * state.run
+        }
+    };
+    let place = |bytes: u64, chunk: u32| {
+        if bytes == 0 {
+            return engine::ScratchPlace::None;
+        }
+        if state.run == 0 {
+            return engine::ScratchPlace::Run {
+                first: chunk * instance.per_chunk,
+                slots: u32::try_from(bytes.div_ceil(instance.slot_bytes)).expect("slots"),
+            };
+        }
+        engine::ScratchPlace::Chunks {
+            run: state.run,
+            pieces: (0..chunks_of(bytes) / state.run).map(|k| chunk + k * state.run).collect(),
+        }
+    };
+    let pair_at = layout.free_chunk() + 8;
+    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.per_instance);
+    let places = (place(state.per_instance, own_at), place(state.per_pair, pair_at));
+    let end = own_at + chunks_of(state.per_instance);
+    shell
+        .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
+        .expect("the guest state's segments commit");
+    places
+}

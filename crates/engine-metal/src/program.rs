@@ -1,4 +1,5 @@
 pub mod compile;
+pub mod guest;
 pub mod held;
 pub mod launch;
 pub mod ports;
@@ -123,13 +124,15 @@ pub struct Plane {
     by_hash: BTreeMap<u64, ProgramId>,
     instances: BTreeMap<InstanceId, Bound>,
     channels: BTreeMap<ChannelId, Arc<SharedRing>>,
-    /// The tables of the lanes one fire launches together, by program,
-    /// stage, key and frame in flight: laid when a binding opens them, at
-    /// the most lanes a fire flies, never grown at a fire.
-    batches: BTreeMap<(ProgramId, usize, launch::BatchKey, usize), launch::Batch>,
-    /// Whether every batch lies where [`Plane::lay_batches`] last laid
-    /// them: false once a bind plans one or a close drops one.
-    batches_laid: bool,
+    /// The tables and value scratch of the lanes one fire launches
+    /// together, by pair, stage and frame in flight: laid in the pair's
+    /// state when its first instance binds, at the most lanes a fire flies,
+    /// never grown at a fire.
+    batches: BTreeMap<(u64, usize, usize), launch::Batch>,
+    /// The (program, extents) pairs with an instance bound: where each
+    /// one's batch sets lie (`engine::GuestState::per_pair`).
+    pairs: Vec<Pair>,
+    next_pair: u64,
     /// The most lanes one fire flies, and the frames in flight.
     lanes: u32,
     arms: usize,
@@ -162,7 +165,8 @@ impl Plane {
             instances: BTreeMap::new(),
             channels: BTreeMap::new(),
             batches: BTreeMap::new(),
-            batches_laid: true,
+            pairs: Vec::new(),
+            next_pair: 1,
             lanes: 64,
             arms: 1,
             rows: 1,
@@ -172,70 +176,53 @@ impl Plane {
         }
     }
 
-    /// The span bytes the batches of lanes launched together take; an
-    /// instance's tables and rings are all in its pool slots.
-    #[must_use]
-    pub fn batch_bytes(&self) -> u64 {
-        self.batches.values().map(launch::Batch::bytes).sum()
+    /// The batch sets a (program, extents) pair's state holds, in the order
+    /// they are laid: each grouped stage's tables a frame in flight, at the
+    /// most lanes a fire flies (`engine::GuestState::per_pair`). No lane's
+    /// value scratch lies here: each lane fires in its instance's own, by
+    /// its address in the batch's lane scratch table, so the pair's state
+    /// does not grow with the lanes' scratch.
+    fn pair_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<(usize, usize, u64)>> {
+        let _ = extents;
+        let channels = u32::try_from(program.plan.package.channels.len()).unwrap_or(u32::MAX);
+        let mut sets = Vec::new();
+        for (stage, plan) in program.compiled.plans.iter().enumerate() {
+            if !session::launches(&program.compiled, stage) || !plan.needs.grouped_valid {
+                continue;
+            }
+            let bytes = launch::Batch::bytes_for(plan, channels, self.lanes, self.rows);
+            for arm in 0..self.arms {
+                sets.push((stage, arm, bytes));
+            }
+        }
+        Ok(sets)
     }
 
-    /// The span bytes the batch tables would take once an instance of
-    /// `program_id` at `extents` over the shared `channels` is bound
-    /// (`engine::Engine::standing_after`), changing nothing. A bound
-    /// instance of the same program, extents and channels prepared the same
-    /// tables, so the binding joins its sets and adds only a frame's set it
-    /// lacks; with none such it adds every launching stage's set a frame in
-    /// flight, as a fresh key would. Never under what the bind lays: a set
-    /// it might share but cannot be shown to is counted its own.
-    pub fn standing_after(
+    /// The value scratch an instance's state holds: its widest launching
+    /// stage's, a frame in flight each, in which it fires every stage,
+    /// alone or as a lane of its pair's batch
+    /// (`engine::GuestState::per_instance`).
+    fn instance_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<u64>> {
+        let scratch = Session::scratch_for(&program.compiled, extents)?;
+        Ok(if scratch == 0 { Vec::new() } else { vec![scratch; self.arms] })
+    }
+
+    /// What an instance of `program_id` at `extents` and its pair hold in
+    /// `Instance` slots (`engine::Engine::guest_state`): its value scratch,
+    /// and the pair's batch sets. Nothing of either lies in the span.
+    pub fn guest_state(
         &self,
+        pools: &Pools,
         program_id: ProgramId,
         extents: &Extents,
-        channels: &[ChannelId],
-    ) -> Result<u64> {
+    ) -> Result<engine::GuestState> {
         let program = self
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let lanes = self.lanes.next_power_of_two();
-        let set = |stage: usize| {
-            program.compiled.plans.get(stage).map_or(0, |plan| {
-                launch::Batch::bytes_for(
-                    plan,
-                    u32::try_from(program.plan.package.channels.len()).unwrap_or(u32::MAX),
-                    lanes,
-                    self.rows,
-                )
-            })
-        };
-        let twin = self.instances.values().find(|bound| {
-            bound.program_id == program_id && bound.extents == *extents && bound.ids == channels
-        });
-        let added = match twin {
-            Some(twin) => (0..twin.session.stages())
-                .filter_map(|stage| {
-                    let key = twin.session.prepared(stage)?.batch_key()?;
-                    Some(
-                        (0..self.arms)
-                            .filter(|&arm| {
-                                !self.batches.contains_key(&(program_id, stage, key, arm))
-                            })
-                            .map(|_| set(stage))
-                            .sum::<u64>(),
-                    )
-                })
-                .sum(),
-            None => {
-                self.arms as u64
-                    * Session::batch_bytes_for(
-                        &program.compiled,
-                        program.plan.package.channels.len(),
-                        lanes,
-                        self.rows,
-                    )
-            }
-        };
-        Ok(self.batch_bytes() + added)
+        let pair: Vec<u64> = self.pair_sets(program, extents)?.iter().map(|s| s.2).collect();
+        let instance = self.instance_sets(program, extents)?;
+        Ok(guest::guest_state(&pair, &instance, room_of(pools)?))
     }
 
     #[must_use]
@@ -353,7 +340,10 @@ impl Plane {
         device: eta_ir::registry::PortMask,
         channels: &[ChannelId],
         pooled: session::Pooled<'_>,
+        scratch: &engine::ScratchPlace,
+        pair: &engine::ScratchPlace,
     ) -> Result<InstanceId> {
+        let pools = pooled.pools;
         let program = self
             .programs
             .get(&program_id)
@@ -381,6 +371,9 @@ impl Plane {
         self.instances.insert(
             id,
             Bound {
+                pair: 0,
+                scratch_place: scratch.clone(),
+                scratch: Vec::new(),
                 program_id,
                 extents,
                 session,
@@ -390,12 +383,145 @@ impl Plane {
                 ids: channels.to_vec(),
             },
         );
-        // Its batch tables are laid now, refused here rather than at a fire.
-        if let Err(why) = self.seat_batches(context, id) {
+        // Its pair's batch sets and its own scratch are laid now, in the
+        // state the runtime took for them: refused here rather than at a fire.
+        if let Err(why) = self.join_pair(context, pools, id, pair).and_then(|()| self.lay_scratch(pools, id)) {
             let _ = self.close_instance(id);
             return Err(why);
         }
         Ok(id)
+    }
+
+    /// Test builds: [`Plane::bind`] over the guest state's places the
+    /// runtime would take, runs of `Instance` slots from chunk 3 (past the
+    /// tests' tables in chunk 1 and rings in chunk 2): the pair's where it
+    /// is bound already, else a fresh one, and the instance's own.
+    #[cfg(all(test, target_vendor = "apple"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_placed(
+        &mut self,
+        context: &Context,
+        program_id: ProgramId,
+        seeds: &[(u32, Vec<u8>)],
+        extents: Extents,
+        geometry: GeometryClass,
+        device: eta_ir::registry::PortMask,
+        channels: &[ChannelId],
+        pooled: session::Pooled<'_>,
+    ) -> Result<InstanceId> {
+        let pools = pooled.pools;
+        let state = self.guest_state(pools, program_id, &extents)?;
+        let (slot, per_chunk) = pools.instance_slots()?;
+        let chunk = pools.chunk_bytes();
+        // Slots from chunk 3, and whole chunks from past every place taken.
+        let (mut slot_at, mut chunk_at) = (3 * per_chunk, 4u32);
+        for place in self
+            .pairs
+            .iter()
+            .map(|held| &held.place)
+            .chain(self.instances.values().map(|bound| &bound.scratch_place))
+        {
+            match place {
+                engine::ScratchPlace::Run { first, slots } => slot_at = slot_at.max(first + slots),
+                engine::ScratchPlace::Chunks { run, pieces } => {
+                    chunk_at = chunk_at.max(pieces.iter().max().map_or(0, |&p| p + run));
+                }
+                engine::ScratchPlace::None => {}
+            }
+        }
+        let mut take = |bytes: u64| {
+            if bytes == 0 {
+                return engine::ScratchPlace::None;
+            }
+            if state.run == 0 {
+                let slots = u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX);
+                let place = engine::ScratchPlace::Run { first: slot_at, slots };
+                slot_at += slots;
+                return place;
+            }
+            let piece = u64::from(state.run) * chunk;
+            let count = u32::try_from(bytes.div_ceil(piece)).unwrap_or(u32::MAX);
+            let pieces = (0..count).map(|k| chunk_at + k * state.run).collect();
+            chunk_at += count * state.run;
+            engine::ScratchPlace::Chunks {
+                run: state.run,
+                pieces,
+            }
+        };
+        let pair = match self
+            .pairs
+            .iter()
+            .find(|held| held.program == program_id && held.extents == extents)
+        {
+            Some(held) => held.place.clone(),
+            None => take(state.per_pair),
+        };
+        let scratch = take(state.per_instance);
+        self.bind(
+            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair,
+        )
+    }
+
+    /// Joins instance `id` to its (program, extents) pair: the pair's batch
+    /// sets planned and laid in `place` where it is the first, else checked
+    /// against the sets its stages would fire with.
+    fn join_pair(
+        &mut self,
+        context: &Context,
+        pools: &Pools,
+        id: InstanceId,
+        place: &engine::ScratchPlace,
+    ) -> Result<()> {
+        let (program, extents) = self
+            .instances
+            .get(&id)
+            .map(|bound| (bound.program_id, bound.extents))
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let held = self
+            .pairs
+            .iter_mut()
+            .find(|held| held.program == program && held.extents == extents);
+        let pair = if let Some(held) = held {
+            held.bound += 1;
+            held.id
+        } else {
+            let pair = self.next_pair;
+            self.next_pair += 1;
+            self.pairs.push(Pair {
+                id: pair,
+                program,
+                extents,
+                bound: 1,
+                place: place.clone(),
+            });
+            if let Some(bound) = self.instances.get_mut(&id) {
+                bound.pair = pair;
+            }
+            self.plan_pair(context, pair, id)?;
+            self.lay_pair(pools, pair)?;
+            return Ok(());
+        };
+        let Some(bound) = self.instances.get_mut(&id) else {
+            return Ok(());
+        };
+        bound.pair = pair;
+        for stage in 0..bound.session.stages() {
+            let Some(key) = bound.session.prepared(stage).and_then(launch::Prepared::batch_key) else {
+                continue;
+            };
+            let set = self.batches.get(&(pair, stage, 0)).map(launch::Batch::key);
+            if set != Some(key) {
+                return Err(Fault::program(
+                    "program::plane",
+                    format!(
+                        "instance {id}'s stage {stage} would fire with other batch tables than \
+                         its pair's: an instance of one (program, extents) pair prepares the \
+                         same tables"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The most lanes one fire flies, the frames in flight and the
@@ -448,35 +574,90 @@ impl Plane {
         self.rows = rows.max(1);
     }
 
-    /// Plans the batch tables instance `id`'s stages fire with, one set a
-    /// frame in flight at the most lanes a fire flies, where none is:
-    /// sized now, laid in the span by [`Plane::lay_batches`].
-    fn seat_batches(&mut self, device: &Context, id: InstanceId) -> Result<()> {
+    /// Plans the batch sets pair `pair` fires its grouped stages with, one a
+    /// stage a frame in flight at the most lanes a fire flies, from
+    /// instance `id`'s prepared stages: sized now, laid by
+    /// [`Plane::lay_pair`].
+    fn plan_pair(&mut self, device: &Context, pair: u64, id: InstanceId) -> Result<()> {
         let empty = crate::device::Buffer::zeroed(device, 0)?;
         let Some(bound) = self.instances.get_mut(&id) else {
             return Ok(());
         };
-        let program_id = bound.program_id;
-        let stages = self
-            .programs
-            .get(&program_id)
-            .map_or(0, |program| program.compiled.stages.len());
-        let lanes = self.lanes.next_power_of_two();
-        for stage in 0..stages {
+        for stage in 0..bound.session.stages() {
             let Some(prepared) = bound.session.prepared_mut(stage) else {
                 continue;
             };
-            let Some(key) = prepared.batch_key() else {
+            if prepared.batch_key().is_none() {
+                continue;
+            }
+            for arm in 0..self.arms {
+                self.batches
+                    .insert((pair, stage, arm), launch::Batch::plan(prepared, self.lanes, &empty)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lays pair `pair`'s batch sets in its state's place, each where the
+    /// rule that stated them puts it ([`guest::places`]); a set planned
+    /// past the bytes stated for it is refused by name.
+    fn lay_pair(&mut self, pools: &Pools, pair: u64) -> Result<()> {
+        let (program_id, extents, place) = self
+            .pairs
+            .iter()
+            .find(|held| held.id == pair)
+            .map(|held| (held.program, held.extents, held.place.clone()))
+            .ok_or_else(|| Fault::program("program::plane", format!("no pair {pair}")))?;
+        let program = self.programs.get(&program_id).ok_or_else(|| {
+            Fault::program("program::plane", format!("pair {pair} names program {program_id}, which is gone"))
+        })?;
+        let sets = self.pair_sets(program, &extents)?;
+        let sizes: Vec<u64> = sets.iter().map(|set| set.2).collect();
+        let pieces = pools.guest_pieces(&place)?;
+        let bytes: Vec<u64> = pieces.iter().map(|piece| piece.bytes).collect();
+        for (&(stage, arm, stated), (at, offset)) in sets.iter().zip(guest::places(&sizes, &bytes)?) {
+            let Some(batch) = self.batches.get_mut(&(pair, stage, arm)) else {
                 continue;
             };
-            for arm in 0..self.arms {
-                let slot = (program_id, stage, key, arm);
-                if !self.batches.contains_key(&slot) {
-                    self.batches
-                        .insert(slot, launch::Batch::plan(prepared, lanes, &empty)?);
-                    self.batches_laid = false;
-                }
+            if batch.bytes() > stated {
+                return Err(Fault::program(
+                    "program::plane",
+                    format!(
+                        "stage {stage}'s batch set takes {} bytes and its pair's state stated {stated}",
+                        batch.bytes()
+                    ),
+                ));
             }
+            let piece = &pieces[at];
+            batch.lay(&piece.view, piece.local + offset, &|local, len| {
+                pools.host_runs(piece.global + (local - piece.local), len)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Lays instance `id`'s value scratch, one a frame in flight, in its
+    /// state's place.
+    fn lay_scratch(&mut self, pools: &Pools, id: InstanceId) -> Result<()> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program("program::plane", format!("instance {id} names a program that is gone"))
+        })?;
+        let sizes = self.instance_sets(program, &bound.extents)?;
+        let pieces = pools.guest_pieces(&bound.scratch_place)?;
+        let bytes: Vec<u64> = pieces.iter().map(|piece| piece.bytes).collect();
+        let scratch = guest::places(&sizes, &bytes)?
+            .into_iter()
+            .map(|(at, offset)| launch::ScratchAt {
+                buffer: pieces[at].view.clone(),
+                offset: pieces[at].local + offset,
+            })
+            .collect();
+        if let Some(bound) = self.instances.get_mut(&id) {
+            bound.scratch = scratch;
         }
         Ok(())
     }
@@ -583,6 +764,16 @@ impl Plane {
         for ring in self.channels.values() {
             ring.rebind(pools)?;
         }
+        // The guests' state: the pairs' batch sets and each instance's
+        // scratch, laid again where their chunks sit now.
+        let pairs: Vec<u64> = self.pairs.iter().map(|held| held.id).collect();
+        for pair in pairs {
+            self.lay_pair(pools, pair)?;
+        }
+        let ids: Vec<InstanceId> = self.instances.keys().copied().collect();
+        for id in ids {
+            self.lay_scratch(pools, id)?;
+        }
         Ok(())
     }
 
@@ -594,13 +785,31 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                scratch,
+                pair,
                 ..
-            } => self
-                .instances
-                .get_mut(id)
-                .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
-                .session
-                .retarget(pools, instance, rings),
+            } => {
+                let bound = self
+                    .instances
+                    .get_mut(id)
+                    .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+                bound.session.retarget(pools, instance, rings)?;
+                // Its state moved with it: its scratch, and its pair's sets
+                // where the pair's place moved too. Their contents are dead
+                // between fires; the tables are written again where laid.
+                let owner = bound.pair;
+                if !matches!(scratch, engine::ScratchPlace::None) {
+                    bound.scratch_place = scratch.clone();
+                    self.lay_scratch(pools, *id)?;
+                }
+                if !matches!(pair, engine::ScratchPlace::None) {
+                    if let Some(held) = self.pairs.iter_mut().find(|held| held.id == owner) {
+                        held.place = pair.clone();
+                    }
+                    self.lay_pair(pools, owner)?;
+                }
+                Ok(())
+            }
             engine::Rebind::Channel { id, slots } => self
                 .channels
                 .get(id)
@@ -790,7 +999,6 @@ impl Plane {
         context: &Context,
         id: InstanceId,
         at: Attach,
-        carve: &GuestCarve,
     ) -> Result<Fired> {
         let bound = self
             .instances
@@ -811,56 +1019,17 @@ impl Plane {
             &program.compiled,
             &program.plan,
             at,
-            carve,
+            bound.scratch.first().cloned(),
         )
-    }
-
-    /// What a fire holding lanes of `program` bound at `extents` lays in
-    /// the span's guest region (`engine::Engine::fire_facts`): a lane's
-    /// value scratch; the tables stay the instance's and the batch's own.
-    pub fn fire_facts(&self, program: ProgramId, extents: &Extents) -> Result<engine::FireFacts> {
-        let program = self
-            .programs
-            .get(&program)
-            .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
-        // A member reading the scores out holds its lane's score rows in its
-        // instance's slots (`Plane::facts`), not in the fire's term.
-        Ok(engine::FireFacts {
-            a_lane: Session::scratch_for(&program.compiled, extents)?,
-            // Its batch tables stand beside every fire, laid once a set
-            // under the model's carve and counted at bind and close
-            // (`engine::Engine::standing_after`), not in a fire's term.
-            fixed: 0,
-            max_lanes: 0,
-            laid: engine::LaidLanes::Exact,
-        })
-    }
-
-    /// Each live (program, extents) pair's fire term, once a pair, with each
-    /// pair's live instances: no fire carries more lanes of a
-    /// pair than it has bound, as the runtime counts the term.
-    pub fn live_terms(&self) -> Result<Vec<(engine::FireFacts, u64)>> {
-        let mut pairs: Vec<((ProgramId, Extents), u64)> = Vec::new();
-        for bound in self.instances.values() {
-            let pair = (bound.program_id, bound.extents);
-            match pairs.iter_mut().find(|(seen, _)| *seen == pair) {
-                Some((_, live)) => *live += 1,
-                None => pairs.push((pair, 1)),
-            }
-        }
-        pairs
-            .iter()
-            .map(|((program, extents), live)| Ok((self.fire_facts(*program, extents)?, *live)))
-            .collect()
     }
 
     pub fn stage_batched(
         &mut self,
         frame: &mut Frame,
         ids: &[InstanceId],
-        carve: &GuestCarve,
         arm: usize,
     ) -> Result<Vec<(InstanceId, Launched)>> {
+        let arm = arm % self.arms;
         let mut results = Vec::with_capacity(ids.len());
         let mut by_program: BTreeMap<ProgramId, Vec<InstanceId>> = BTreeMap::new();
         let mut refused = false;
@@ -913,15 +1082,14 @@ impl Plane {
                 {
                     continue;
                 }
-                // Stages fire one after another: each lays its scratch from
-                // the region's top afresh.
-                let mut room = carve.clone();
-                let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
-                    BTreeMap::new();
+                // Members launched together share their pair's batch tables;
+                // every member fires in its own scratch, a frame in flight
+                // each, and a batch's lane table holds each lane's address.
+                type Group = Option<(u64, launch::BatchKey)>;
+                let mut groups: BTreeMap<Group, Vec<&mut launch::Prepared>> = BTreeMap::new();
                 // Each member's rings, by identity: members that share one
                 // are ordered through its cursor and fire one after another.
-                let mut rings_of: BTreeMap<Option<launch::BatchKey>, Vec<Vec<usize>>> =
-                    BTreeMap::new();
+                let mut rings_of: BTreeMap<Group, Vec<Vec<usize>>> = BTreeMap::new();
                 for (id, bound) in self.instances.iter_mut() {
                     if !members.contains(id) {
                         continue;
@@ -931,10 +1099,24 @@ impl Plane {
                         .iter()
                         .flatten()
                         .any(|ring| ring.attachments() > 1);
+                    let pair = bound.pair;
+                    let own = bound.scratch.get(arm).cloned();
                     let Some(prepared) = bound.session.prepared_mut(stage_index) else {
                         continue;
                     };
-                    let key = if shares { None } else { prepared.batch_key() };
+                    let key = if shares {
+                        None
+                    } else {
+                        prepared.batch_key().map(|key| (pair, key))
+                    };
+                    // A member fires in its own scratch, alone or as a lane
+                    // of its pair's batch (whose lane table holds its address).
+                    prepared.seat_scratch(own.ok_or_else(|| {
+                        Fault::program(
+                            "program::plane",
+                            format!("instance {id} fires a stage and holds no scratch"),
+                        )
+                    })?)?;
                     rings_of.entry(key).or_default().push(
                         bound
                             .shared
@@ -947,16 +1129,13 @@ impl Plane {
                 }
                 for (key, mut group) in groups {
                     let Some(key) = key else {
-                        // Each member's scratch is taken one under another.
-                        // No value is read before its step writes it, so the
-                        // scratch goes unfilled; test builds poison it.
-                        #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-                        let mark = room.mark();
-                        for prepared in group.iter_mut() {
-                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
-                        }
+                        // Each member fires in its own scratch. No value is
+                        // read before its step writes it, so the scratch goes
+                        // unfilled; test builds poison it.
                         #[cfg(target_vendor = "apple")]
-                        room.poison_since(mark, frame)?;
+                        for prepared in group.iter_mut() {
+                            prepared.poison_scratch_on(frame)?;
+                        }
                         // Members are independent (each its own scratch and
                         // rings): a stage of streamed regions fires them in
                         // one concurrent pass, step k of every member, then a
@@ -998,17 +1177,21 @@ impl Plane {
                         continue;
                     };
                     let needed = u32::try_from(group.len()).unwrap_or(u32::MAX);
-                    let slot = (program_id, stage_index, key, arm % self.arms);
+                    let (pair, key) = key;
                     let batch = self
                         .batches
-                        .get_mut(&slot)
-                        .filter(|batch| batch.lanes() >= needed)
+                        .get_mut(&(pair, stage_index, arm))
+                        .filter(|batch| batch.key() == key && batch.lanes() >= needed)
                         .ok_or(Fault::Ceiling {
-                            what: "lanes of a batch laid when its binding opened",
+                            what: "lanes of its pair's batch set, laid when its first instance bound",
                             need: u64::from(needed),
                             have: u64::from(self.lanes),
                         })?;
-                    batch.seat_scratch(room.take(batch.scratch_bytes(needed))?);
+                    let lanes: Vec<launch::ScratchAt> = group
+                        .iter()
+                        .map(|member| member.scratch_at())
+                        .collect::<Result<_>>()?;
+                    batch.seat_scratch(&lanes)?;
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
             }
@@ -1068,57 +1251,16 @@ impl Plane {
             .remove(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
         release_seats(&bound.shared);
-        // A batch no live instance fires with is dropped: the runtime no
-        // longer counts its pair's term in the span.
-        let mut live = std::collections::BTreeSet::new();
-        for bound in self.instances.values_mut() {
-            for stage in 0..bound.session.stages() {
-                if let Some(key) = bound
-                    .session
-                    .prepared_mut(stage)
-                    .and_then(|prepared| prepared.batch_key())
-                {
-                    live.insert((bound.program_id, stage, key));
-                }
+        // The pair's last instance gives its batch sets back with its state.
+        if let Some(held) = self.pairs.iter_mut().find(|held| held.id == bound.pair) {
+            held.bound = held.bound.saturating_sub(1);
+            if held.bound == 0 {
+                let pair = held.id;
+                self.pairs.retain(|held| held.id != pair);
+                self.batches.retain(|&(owner, _, _), _| owner != pair);
             }
         }
-        let before = self.batches.len();
-        self.batches
-            .retain(|&(program, stage, key, _), _| live.contains(&(program, stage, key)));
-        if self.batches.len() != before {
-            self.batches_laid = false;
-        }
         Ok(())
-    }
-
-    /// Whether every batch lies where it was last laid.
-    #[must_use]
-    pub fn batches_laid(&self) -> bool {
-        self.batches_laid
-    }
-
-    /// Lays every batch in `view` (the span's buffer) under `top`, packed
-    /// down from it, written through `host`; the caller drained every frame
-    /// that read the batches where they were. Returns where the lowest
-    /// starts.
-    pub fn lay_batches(
-        &mut self,
-        view: &crate::device::Buffer,
-        top: u64,
-        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
-    ) -> Result<u64> {
-        let total = self.batch_bytes();
-        let bottom = top.checked_sub(total).ok_or(Fault::Ceiling {
-            what: "bytes of the span under the model's carve for guest batch tables",
-            need: total,
-            have: top,
-        })?;
-        let mut at = bottom;
-        for batch in self.batches.values_mut() {
-            at = batch.lay(view, at, host)?;
-        }
-        self.batches_laid = true;
-        Ok(bottom)
     }
 
     pub fn close_program(&mut self, id: ProgramId) -> Result<()> {
@@ -1145,13 +1287,30 @@ impl Plane {
         self.cache.forget(hash);
         self.by_hash.remove(&hash);
         self.programs.remove(&id);
-        self.batches.retain(|&(program, _, _, _), _| program != id);
         Ok(())
     }
 }
 
+/// A (program, extents) pair with an instance bound: its batch sets lie in
+/// `place`, taken by the runtime at its first instance's bind and given
+/// back at its last close (`engine::GuestState::per_pair`).
+#[derive(Debug)]
+struct Pair {
+    id: u64,
+    program: ProgramId,
+    extents: Extents,
+    bound: u32,
+    place: engine::ScratchPlace,
+}
+
 #[derive(Debug)]
 struct Bound {
+    /// The pair whose batch sets its grouped stages fire with.
+    pair: u64,
+    /// Where its value scratch lies, one a frame in flight, for the stages
+    /// it fires alone (`engine::GuestState::per_instance`).
+    scratch_place: engine::ScratchPlace,
+    scratch: Vec<launch::ScratchAt>,
     program_id: ProgramId,
     /// The extents it was bound at: with the program, the pair whose fire
     /// term the runtime counts (`engine::Engine::fire_facts`).
@@ -1165,70 +1324,11 @@ struct Bound {
     ids: Vec<ChannelId>,
 }
 
-/// One fire's guest region: the span's bytes under the model's carve,
-/// handed out from the top down (`next`), never under `floor` (the backed
-/// span's bottom). A stage starts again from the top, since stages fire one
-/// after another and none reads another's scratch.
 /// Whether `plan` reads a capturing lane's score rows out.
 fn reads_scores(plan: &ExecPlan) -> bool {
     plan.outputs()
         .into_iter()
         .any(|(name, _)| matches!(name, "attn.scores" | "attn.scores.pages"))
-}
-
-#[derive(Debug, Clone)]
-pub struct GuestCarve {
-    buffer: crate::device::Buffer,
-    next: u64,
-    floor: u64,
-}
-
-impl GuestCarve {
-    #[must_use]
-    pub fn new(buffer: crate::device::Buffer, top: u64, floor: u64) -> GuestCarve {
-        GuestCarve {
-            buffer,
-            next: top,
-            floor,
-        }
-    }
-
-    /// Where the next take ends: what [`GuestCarve::poison_since`]
-    /// poisons down from.
-    #[must_use]
-    pub fn mark(&self) -> u64 {
-        self.next
-    }
-
-    /// Test builds (`test-slot-fill`): poisons everything taken since
-    /// `mark` in `frame`, the scratch of every member a stage seated one
-    /// after another, so a value read before it is written fails its test.
-    /// Elsewhere nothing: no guest value is read before it is written.
-    #[cfg(target_vendor = "apple")]
-    pub fn poison_since(&self, mark: u64, frame: &mut crate::device::ctx::Frame) -> Result<()> {
-        if mark <= self.next {
-            return Ok(());
-        }
-        launch::poison_scratch(frame, self.buffer.slab(), self.next, mark - self.next)
-    }
-
-    /// `bytes` of the region, below what was taken.
-    pub fn take(&mut self, bytes: u64) -> Result<launch::ScratchAt> {
-        let at = self
-            .next
-            .checked_sub(bytes)
-            .filter(|&at| at >= self.floor)
-            .ok_or(Fault::Ceiling {
-                what: "bytes of the span's guest region the rung backs",
-                need: bytes,
-                have: self.next.saturating_sub(self.floor),
-            })?;
-        self.next = at;
-        Ok(launch::ScratchAt {
-            buffer: self.buffer.clone(),
-            offset: at,
-        })
-    }
 }
 
 fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
@@ -1344,7 +1444,7 @@ mod tests {
             [bits(&gathered), bits(&picked), bits(&by_row), bits(&flipped)]
         };
 
-        let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         let program = plane.register(&context, &registration).expect("registers");
         let facts = plane.facts(program, &pools).expect("the program's facts");
@@ -1359,7 +1459,7 @@ mod tests {
             (index(line), bits(&line_of(0))),
         ];
         let id = plane
-            .bind(
+            .bind_placed(
                 &context,
                 program,
                 &seeds,
@@ -1397,7 +1497,7 @@ mod tests {
                 assert!(instance.publish(index(line), &bits(&line_of(salt))).expect("a put"));
             }
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue)
                 .expect("the stage fires");
             assert!(matches!(fired, Fired::Committed), "fire {salt}: {fired:?}");
             let expected = want(&mask_of(salt), &line_of(salt));
@@ -1556,6 +1656,8 @@ mod tests {
         let context = Context::bind().expect("a Metal 4 device");
         let pools = Pools::guests_only(&context, 64 << 20, 4).expect("a pool");
         let mut plane = Plane::new();
+        // One lane fires: the most a fire of this test flies.
+        plane.set_flight(1, 1, 1);
         let (mut registration, count, seeds, mask) = select_registration(vocab, cut);
         registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
         let program = plane.register(&context, &registration).expect("registers");
@@ -1563,7 +1665,7 @@ mod tests {
         let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
         let (instance, rings) = slots_for(&pools, &facts, 0);
         let id = plane
-            .bind(
+            .bind_placed(
                 &context,
                 program,
                 &seeds,
@@ -1590,18 +1692,13 @@ mod tests {
         plane
             .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
             .expect("the logits bind");
-        let carve = GuestCarve::new(
-            crate::device::Buffer::zeroed(&context, 256 << 20).expect("a guest region"),
-            256 << 20,
-            0,
-        );
         // One fire to build the pipelines, one timed.
-        let _ = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let _ = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
         let _ = plane.instance_mut(id).expect("bound").take(mask).expect("the take");
         let (channel, seed) = &seeds[0];
         plane.instance_mut(id).expect("bound").publish(*channel, seed).expect("the reseed");
         let began = std::time::Instant::now();
-        let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let fired = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
         let took = began.elapsed();
         assert!(matches!(fired, Fired::Committed), "the cut fires: {fired:?}");
         let cell = plane
@@ -1706,19 +1803,12 @@ mod tests {
     const VOCAB: u32 = 1024;
     const LANES: u32 = 2;
     const CHUNK: u64 = 16 << 20;
+    /// A test pool's chunks: the null chunk, the tables', the rings', and
+    /// what its guests' state takes past them.
+    const GUEST_CHUNKS: u32 = 24;
 
     /// The slots instance `nth` of `facts` takes: its tables from logical
     /// chunk 1, its rings from chunk 2, each instance's apart.
-    /// A guest region of its own for fires with no model carve above
-    /// them: a buffer, laid from its top.
-    fn guests(context: &Context) -> GuestCarve {
-        const BYTES: u64 = 64 << 20;
-        GuestCarve::new(
-            crate::device::Buffer::zeroed(context, BYTES).expect("a guest region"),
-            BYTES,
-            0,
-        )
-    }
 
 /// A contract case's logits as the engine seats them
     /// (`eta_compiler::contract::Case::seats`): `values`, `rows` rows of
@@ -1803,7 +1893,7 @@ mod tests {
                 launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
                 ..Default::default()
             };
-            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             // One lane, one arm, its beams' rows read out.
             plane.set_flight(1, 1, case.rows);
@@ -1815,7 +1905,7 @@ mod tests {
             let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
             let (instance, rings) = slots_for(&pools, &facts, 0);
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &case.wire_seeds(),
@@ -1837,7 +1927,7 @@ mod tests {
                 .expect("the instance binds");
             let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue)
                 .expect("the fire runs");
             assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
             let want = case.expected();
@@ -1879,7 +1969,7 @@ mod tests {
             launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
             ..Default::default()
         };
-        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         plane.set_flight(1, 1, case.rows);
         let program = plane.register(&context, &registration).expect("compiles");
@@ -1888,7 +1978,7 @@ mod tests {
         let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
         let (instance, rings) = slots_for(&pools, &facts, 0);
         let id = plane
-            .bind(
+            .bind_placed(
                 &context,
                 program,
                 &case.wire_seeds(),
@@ -1922,7 +2012,7 @@ mod tests {
             )
             .expect("a seat binds; the fire refuses it");
         let why = plane
-            .fire(&context, id, Attach::Epilogue, &guests(&context))
+            .fire(&context, id, Attach::Epilogue)
             .expect_err("a seat no read reaches is refused")
             .to_string();
         assert!(
@@ -1973,7 +2063,7 @@ mod tests {
                 launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
                 ..Default::default()
             };
-            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             plane.set_flight(1, 1, case.rows);
             let program = plane.register(&context, &registration).expect("registers");
@@ -1982,7 +2072,7 @@ mod tests {
             let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
             let (instance, rings) = slots_for(&pools, &facts, 0);
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &case.wire_seeds(),
@@ -2003,11 +2093,10 @@ mod tests {
                 )
                 .expect("binds");
             let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
-            let carve = guests(&context);
             'steps: for step in 0..STEPS {
                 let values = step_logits(case.logits.len(), step);
                 let _logits = seat_case(&context, &mut plane, id, &case, &values);
-                let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                let fired = plane.fire(&context, id, Attach::Epilogue).expect("fires");
                 assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
                 let inputs = PassInputs {
                     outputs: vec![("logits".to_string(), 0, Value::F32(values))],
@@ -2112,7 +2201,7 @@ mod tests {
                 launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
                 ..Default::default()
             };
-            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             plane.set_flight(1, 1, case.rows);
             let program = plane.register(&context, &registration).expect("registers");
@@ -2121,7 +2210,7 @@ mod tests {
             let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
             let (instance, rings) = slots_for(&pools, &facts, 0);
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &case.wire_seeds(),
@@ -2142,11 +2231,10 @@ mod tests {
                 )
                 .expect("binds");
             let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
-            let carve = guests(&context);
             'steps: for step in 0..STEPS {
                 let values = step_logits(case.logits.len(), step);
                 let _logits = seat_case(&context, &mut plane, id, &case, &values);
-                let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                let fired = plane.fire(&context, id, Attach::Epilogue).expect("fires");
                 assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
                 let inputs = PassInputs {
                     outputs: vec![("logits".to_string(), 0, Value::F32(values))],
@@ -2231,7 +2319,7 @@ mod tests {
                 launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
                 ..Default::default()
             };
-            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             plane.set_flight(1, 1, case.rows);
             let program = plane.register(&context, &registration).expect("registers");
@@ -2239,7 +2327,7 @@ mod tests {
             let ids: Vec<ChannelId> = (1..=channels.len() as u64).map(ChannelId).collect();
             let (instance, rings) = slots_for(&pools, &facts, 0);
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &case.wire_seeds(),
@@ -2262,9 +2350,8 @@ mod tests {
             let before = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
             assert_eq!(before, seed, "{}: the head cell holds the seed at bind", case.name);
             let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
-            let carve = guests(&context);
             for step in 0..3 {
-                plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                plane.fire(&context, id, Attach::Epilogue).expect("fires");
                 for &reader in &case.readers {
                     let _ = plane.instance_mut(id).expect("bound").take(reader);
                 }
@@ -2402,7 +2489,7 @@ mod tests {
             (compile::Form::Grouped, &[KernelKind::Streamed][..]),
             (compile::Form::Fused, &[KernelKind::Streamed, KernelKind::Grouped][..]),
         ] {
-            let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             let mut registration = registration.clone();
             registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
@@ -2421,7 +2508,7 @@ mod tests {
                         .collect();
                     let (instance, rings) = slots_for(&pools, &facts, nth);
                     let id = plane
-                        .bind(
+                        .bind_placed(
                             &context,
                             program,
                             &seeds,
@@ -2472,7 +2559,7 @@ mod tests {
             // Alone: each lane's stage in a frame of its own.
             for (&id, &peak) in lanes.iter().zip(&peaks) {
                 let fired = plane
-                    .fire(&context, id, Attach::Epilogue, &guests(&context))
+                    .fire(&context, id, Attach::Epilogue)
                     .expect("the stage fires");
                 assert!(matches!(fired, Fired::Committed), "{form:?} {id} fires: {fired:?}");
                 let got = take(&mut plane, id);
@@ -2481,15 +2568,9 @@ mod tests {
                 }
             }
             // Together: one stage of both lanes.
-            let area = 1u64 << 24;
-            let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
-            let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
-                Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
-            };
-            plane.lay_batches(&tables, area, &host).expect("the batches lay");
             let mut frame = context.frame().expect("a frame");
             let launched = plane
-                .stage_batched(&mut frame, &lanes, &guests(&context), 0)
+                .stage_batched(&mut frame, &lanes, 0)
                 .expect("the lanes stage");
             assert!(
                 launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
@@ -2580,7 +2661,7 @@ mod tests {
             (compile::Form::Grouped, &[KernelKind::Streamed][..]),
             (compile::Form::Fused, &[KernelKind::Streamed, KernelKind::Grouped][..]),
         ] {
-            let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
             let mut plane = Plane::new();
             let mut registration = registration.clone();
             registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
@@ -2593,7 +2674,7 @@ mod tests {
             let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
             let (instance, rings) = slots_for(&pools, &facts, 0);
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &seeds,
@@ -2619,7 +2700,7 @@ mod tests {
                 .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
                 .expect("the logits bind");
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue)
                 .expect("the stage fires");
             assert!(matches!(fired, Fired::Committed), "{form:?} fires: {fired:?}");
             let cell = plane
@@ -2641,7 +2722,7 @@ mod tests {
     #[test]
     fn closing_a_program_drops_its_batches() {
         let context = Context::bind().expect("a Metal 4 device");
-        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         let (registration, count, seeds, _) = registration();
         let program = plane
@@ -2657,7 +2738,7 @@ mod tests {
                     .collect();
                 let (instance, rings) = slots_for(&pools, &facts, lane);
                 let id = plane
-                    .bind(
+                    .bind_placed(
                         &context,
                         program,
                         &seeds,
@@ -2692,20 +2773,10 @@ mod tests {
                 id
             })
             .collect();
-        // The batches the binds planned, laid in a buffer standing for the
-        // span (the shell lays them under the rung's carve).
-        let area = 1u64 << 24;
-        let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
-        let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
-            Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
-        };
-        assert!(!plane.batches_laid(), "the binds planned batches");
-        plane
-            .lay_batches(&tables, area, &host)
-            .expect("the batches lay");
+        // The binds laid their pair's batch sets in the pair's state.
         let mut frame = context.frame().expect("a frame");
         let launched = plane
-            .stage_batched(&mut frame, &lanes, &guests(&context), 0)
+            .stage_batched(&mut frame, &lanes, 0)
             .expect("the lanes stage");
         assert!(
             launched
@@ -2718,11 +2789,9 @@ mod tests {
             plane.settle_launched(lane).expect("the lane settles");
         }
         assert!(
-            plane
-                .batches
-                .keys()
-                .any(|&(owner, _, _, _)| owner == program),
-            "two lanes of one program launch as a batch"
+            plane.pairs.iter().any(|held| held.program == program && held.bound == 2)
+                && !plane.batches.is_empty(),
+            "two lanes of one program launch as a batch, their pair's sets"
         );
         for lane in lanes {
             plane.close_instance(lane).expect("the lane closes");
@@ -2730,7 +2799,7 @@ mod tests {
         plane.close_program(program).expect("the program closes");
         assert!(
             plane.batches.is_empty(),
-            "the closed program's batches are dropped: {} left",
+            "the pair's last close gave its batch sets back: {} left",
             plane.batches.len()
         );
     }
@@ -2746,7 +2815,7 @@ mod tests {
     #[should_panic(expected = "move the same end of one shared ring")]
     fn a_stage_of_two_movers_of_one_ring_end_is_refused() {
         let context = Context::bind().expect("a Metal 4 device");
-        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         let (registration, count, seeds, token) = registration();
         let program = plane
@@ -2794,7 +2863,7 @@ mod tests {
                     })
                     .collect();
                 let id = plane
-                    .bind(
+                    .bind_placed(
                         &context,
                         program,
                         &seeds,
@@ -2835,17 +2904,9 @@ mod tests {
                 .any(|ring| ring.attachments() == 2),
             "the two lanes share their rings"
         );
-        let area = 1u64 << 24;
-        let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
-        let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
-            Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
-        };
-        plane
-            .lay_batches(&tables, area, &host)
-            .expect("the batches lay");
         let members: Vec<InstanceId> = lanes.iter().map(|(id, _)| *id).collect();
         let mut frame = context.frame().expect("a frame");
-        let _ = plane.stage_batched(&mut frame, &members, &guests(&context), 0);
+        let _ = plane.stage_batched(&mut frame, &members, 0);
     }
 
     /// An instance's tables and rings in pool slots fire as another's in
@@ -2877,7 +2938,7 @@ mod tests {
             assert_eq!(pools.parts(), 4, "a buffer a chunk");
             pools
         } else {
-            Pools::guests_only(&context, CHUNK, 4).expect("a pool")
+            Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool")
         };
         let mut plane = Plane::new();
         let (registration, _, seeds, token) = registration();
@@ -2902,7 +2963,7 @@ mod tests {
         };
         let bind = |plane: &mut Plane, pooled: session::Pooled<'_>| {
             let id = plane
-                .bind(
+                .bind_placed(
                     &context,
                     program,
                     &seeds,
@@ -2953,7 +3014,7 @@ mod tests {
             let mut tokens = Vec::new();
             for id in [own, pooled] {
                 let fired = plane
-                    .fire(&context, id, Attach::Epilogue, &guests(&context))
+                    .fire(&context, id, Attach::Epilogue)
                     .expect("the stage fires");
                 assert!(matches!(fired, Fired::Committed), "{id} fires: {fired:?}");
                 let cell = plane
@@ -3156,7 +3217,7 @@ mod tests {
         use crate::store::Pools;
         use crate::store::layout::{CHANNEL, INSTANCE};
         let context = Context::bind().expect("a Metal 4 device");
-        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         let (registration, _, seeds, token) = registration();
         let program = plane
@@ -3169,7 +3230,7 @@ mod tests {
         let mut logits =
             crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
         let id = plane
-            .bind(
+            .bind_placed(
                 &context,
                 program,
                 &seeds,
@@ -3197,7 +3258,7 @@ mod tests {
             bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
             logits.write(0, &bf16).expect("the logits write");
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue)
                 .expect("the stage fires");
             assert!(matches!(fired, Fired::Committed), "the instance fires: {fired:?}");
             let cell = plane
@@ -3337,7 +3398,7 @@ mod tests {
 
         const CHUNK: u64 = 16 << 20;
         let context = Context::bind().expect("a Metal 4 device");
-        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         // 1024 f32 lanes a cell: 4 KiB, four Channel slots' worth; capacity
         // 3, so four cells.
         let shape = ChannelShape {
@@ -3529,3 +3590,13 @@ mod rings_tests {
     }
 }
 
+
+/// How the pool places a guest's state ([`guest::Room`]).
+fn room_of(pools: &Pools) -> Result<guest::Room> {
+    let (slot_bytes, chunk_slots) = pools.instance_slots()?;
+    Ok(guest::Room {
+        slot_bytes,
+        chunk_slots,
+        chunk_bytes: pools.chunk_bytes(),
+    })
+}
