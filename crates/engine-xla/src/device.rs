@@ -294,25 +294,47 @@ impl Device {
     /// freshly built: one built after [`Device::seal`] is a fire the warm
     /// ladder missed.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
-        self.compiled_form(text, sig, true)
+        self.compiled_form(text, sig, Some(&|| String::new()))
+    }
+
+    /// [`Device::program`] for a fire, `fire` naming its shape in the miss a
+    /// build after [`Device::seal`] is.
+    pub fn program_for(
+        &self,
+        text: &str,
+        sig: Signature,
+        fire: &dyn Fn() -> String,
+    ) -> Result<Arc<Program>> {
+        self.compiled_form(text, sig, Some(fire))
     }
 
     /// The compiled form of `text` a load or a program's registration
     /// prepares ahead of every fire that takes it, from the cache or
     /// freshly built: never a ladder miss, sealed or not.
     pub fn prepare(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
-        self.compiled_form(text, sig, false)
+        self.compiled_form(text, sig, None)
     }
 
-    fn compiled_form(&self, text: &str, sig: Signature, serving: bool) -> Result<Arc<Program>> {
+    /// `serving`: a fire's program (`Some`, naming the fire), built after the
+    /// seal a ladder miss; `None` a load's or a registration's.
+    fn compiled_form(
+        &self,
+        text: &str,
+        sig: Signature,
+        serving: Option<&dyn Fn() -> String>,
+    ) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
         if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
-        if serving && let Some(live) = self.live.get() {
+        if serving.is_some()
+            && let Some(live) = self.live.get()
+        {
             live.tally(engine::live::Tally::Compiled, 1);
         }
-        if serving && self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(fire) = serving
+            && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+        {
             // Serving fires run programs the warm ladder prepared: one built
             // now is a fire the ladder missed.
             let n = self
@@ -322,6 +344,7 @@ impl Device {
             tracing::warn!(
                 bytes = text.len(),
                 misses = n,
+                fire = %fire(),
                 "xla program outside the warm ladder"
             );
             assert!(

@@ -3267,7 +3267,16 @@ impl Shell {
             slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage,
             lands, pixels,
         )?;
-        Ok((self.device.program(&text, sig)?, probed))
+        let fire = || {
+            let rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+            format!(
+                "rows {} bucket {} lanes {} lane rows {rows:?}",
+                descriptor.rows,
+                descriptor.bucket,
+                descriptor.lanes.len()
+            )
+        };
+        Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
     /// The values a trace's unweighted per-head rms norms read, with their head
