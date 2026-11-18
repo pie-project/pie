@@ -320,7 +320,7 @@ fn reg_fn(p: &TileProgram) -> String {
 }
 
 /// The image PE's ops (its interpreter's).
-const TPE_OPS: &str = include_str!("tiled_pe.csl");
+pub const TPE_OPS: &str = include_str!("tiled_pe.csl");
 
 /// `run_all` where the op table streams in: each op's words off the stream into `prog` (its
 /// first word its code and length), then the op at 0.
@@ -679,6 +679,10 @@ fn at(x: u32, y: u32) -> Coord {
 /// The emitted program.
 #[allow(clippy::too_many_lines)]
 pub fn emit(p: &TileProgram) -> R<Emitted> {
+    // (a hub loop a PE's blocking send leaves open hangs the program: refused)
+    if let Some(l) = crate::check::hazard::hub_loops(p, TPE_OPS).first() {
+        return Err(format!("{}: {l}", p.reading));
+    }
     let tb = table(p)?;
     let mut files: Vec<(String, String)> = p.modules.clone();
     files.push(("tpe.csl".into(), pe_file(p, &tb)));

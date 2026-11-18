@@ -18,6 +18,9 @@
 //!
 //! And over a GEMM-regime program's op sequence ([`lines`]), the windows a queue rebound among
 //! a line's colours (GENERIC.md, "The line windows") leaves open: H1-H3 below.
+//!
+//! And over a tiled-regime program's ops ([`hub_loops`]), the loops through its hub a PE's
+//! blocking send leaves open (its words past what the loop holds before its receive is posted).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -765,6 +768,68 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
     out
 }
 
+/// Words the hub's loop holds for certain (the routers and queues from a PE's send to the hub
+/// and back along the broadcast tree to the PE's own receive), as run: flux2-mini's tiled decode
+/// sent 32 words (its attention's keys, its norms' 8 groups) ahead of its receive on the chip,
+/// klein's norms' 32 groups on the simulator; klein's 512-word keys stalled (1552, 1555).
+pub const HUB_LOOP_WORDS: u32 = 32;
+
+/// The statements of `body` before its first that receives from `queue` (`fab.fin(<queue>`).
+fn before_receive<'a>(body: &'a str, queue: &str) -> Option<&'a str> {
+    body.find(&format!("fab.fin({queue}")).map(|at| &body[..at])
+}
+
+/// The blocking sends of `text` (a function's statements, cut at `;`: an async op's options
+/// `.{ .. }` stay with it): a fabric send (`fab.fout(`) or a forward (`fwd(`) not posted async.
+fn blocking_sends(text: &str) -> Vec<String> {
+    text.split(';')
+        .map(|f| f.trim().trim_start_matches(['{', '}', ' ', '\n']).trim())
+        .filter(|f| {
+            (f.contains("fab.fout(") || f.starts_with("fwd(") || f.contains(" fwd("))
+                && !f.contains(".async = true")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The hub's loops of a tiled-regime program `p` whose image PEs run `pe` (`emit::tiled`'s
+/// `tiled_pe.csl`), one line each: an op whose PEs send towards the hub (an all-reduce's partial
+/// sums up the rows and the last column, an attention's keys) and receive what comes back on the
+/// broadcast tree, where a PE's send blocks before its receive is posted and sends more words than
+/// the loop holds ([`HUB_LOOP_WORDS`]). The broadcast's words for that PE fill its own queue, the
+/// tree stops with it, the hub behind the tree, and the send behind the hub: the PE never reaches
+/// its receive (klein's 128² decode, its attention's 512-word keys: 1552, 1555).
+///
+/// - A norm's two all-reduces (`allreduce`): its groups' words.
+/// - An attention (`attend`): a key's words (its `[k | v]` 16-bit, a word two).
+#[must_use]
+pub fn hub_loops(p: &crate::stream::tiled::TileProgram, pe: &str) -> Vec<String> {
+    use crate::stream::tiled::TOp;
+    let blocking = |func: &str| {
+        body(pe, func)
+            .and_then(|b| before_receive(b, "q_bi"))
+            .map(blocking_sends)
+            .unwrap_or_default()
+    };
+    let (ar, at) = (blocking("allreduce"), blocking("attend"));
+    let mut out = Vec::new();
+    for (i, op) in p.ops.iter().enumerate() {
+        let (what, words, sends) = match op {
+            TOp::Norm { groups, .. } => ("a norm's all-reduce", *groups, &ar),
+            TOp::Attend { q, .. } => ("an attention's key", p.vals[q].width, &at),
+            _ => continue,
+        };
+        if words > HUB_LOOP_WORDS && !sends.is_empty() {
+            out.push(format!(
+                "op {i}: {what}, {words} words a PE sends before its receive of the broadcast is \
+                 posted (`{}`), past the {HUB_LOOP_WORDS} the hub's loop holds",
+                sends[0]
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +880,41 @@ mod tests {
         );
         assert!(h.iter().any(|l| l.contains("a data task")));
         assert!(h.iter().any(|l| l.contains("activation at startup")));
+    }
+
+    /// klein's decode in the tiled regime at a 4 x 4 latent (a 32 x 32 array), its first 19 ops
+    /// (to its attention): with the sends ahead of the broadcast's receive blocking (as emitted
+    /// before), its attention's 512-word keys are a hub loop, its norms' 32 groups none; as
+    /// emitted (the sends async), none.
+    #[test]
+    fn kleins_attention_keys_are_a_hub_loop_unless_sent_async() {
+        let t = poem_compiler::catalog::repository()
+            .parse("flux2-klein-4b-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let p = crate::stream::tiled::program_upto(
+            &t,
+            "vae.decode",
+            [1, 4, 4],
+            true,
+            Some((1, 1)),
+            None,
+            Some(19),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let pe = crate::emit::tiled::TPE_OPS;
+        assert_eq!(hub_loops(&p, pe), Vec::<String>::new(), "as emitted");
+        let blocking = pe
+            .replace(", .{ .async = true, .ut_id = ut_e }", "")
+            .replace(", .{ .async = true, .ut_id = ut_s }", "")
+            .replace(", .{ .async = true, .ut_id = ut }", "");
+        assert_ne!(blocking, pe);
+        let open = hub_loops(&p, &blocking);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(
+            open[0].starts_with("op 18: an attention's key, 512 words"),
+            "{open:?}"
+        );
     }
 
     /// flux2-mini's denoise in the GEMM regime, laid at 32 x 8 PEs, key blocks of 8 (as `m2`),

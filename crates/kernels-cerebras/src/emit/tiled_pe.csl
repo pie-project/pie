@@ -46,6 +46,18 @@ fn fwd(comptime qo: output_queue, comptime qi: input_queue, n: u16) void {
   if (n > 0) { @mov32(fab.fout(qo, n), fab.fin(qi, n)); }
 }
 
+// The hub's loop: what a PE sends towards the hub (an all-reduce's partial sums, a key) comes back
+// to it on the broadcast tree, so its receive of the broadcast is posted while it sends: the send
+// async (on its output queue's microthread), the receive blocking. A send that finished before
+// the receive was posted would need the whole of it held in the loop's routers and queues (a
+// few dozen wavelets): past that the broadcast stalls on the PE's own full queue, the hub behind
+// it, the send behind the hub.
+const ut_e = @get_ut_id(2);
+const ut_s = @get_ut_id(4);
+fn fwd_hub(comptime qo: output_queue, comptime qi: input_queue, comptime ut: ut_id, n: u16) void {
+  if (n > 0) { @mov32(fab.fout(qo, n), fab.fin(qi, n), .{ .async = true, .ut_id = ut }); }
+}
+
 // A 3 x 3 input's halo: E / W along busy rows (a block of parity ph sends while the next
 // receives, then the reverse; a PE between two busy ones forwards), then N / S whole halo rows.
 fn halo(cin: u16) void {
@@ -160,19 +172,21 @@ fn conv(a: u16) void {
 }
 
 // n words summed over the array, every PE given the sum: east along the rows, south down the
-// last column, the corner's to the hub, back from it along the broadcast tree.
+// last column, the corner's to the hub, back from it along the broadcast tree. A PE's send is the
+// hub's loop's (async, its receive of the sum posted behind it); the last column's add of its
+// row's sums blocking (none of it comes back before the column's send).
 fn allreduce(r: u16, n: u16) void {
   const d = md(r, n);
   if (X > 0) {
-    if (X + 1 < GX) { @fadds(fab.fout(q_eo, n), fab.fin(q_ei, n), d); }
+    if (X + 1 < GX) { @fadds(fab.fout(q_eo, n), fab.fin(q_ei, n), d, .{ .async = true, .ut_id = ut_e }); }
     else { @fadds(d, d, fab.fin(q_ei, n)); }
-  } else if (GX > 1) { @fmovs(fab.fout(q_eo, n), d); }
+  } else if (GX > 1) { @fmovs(fab.fout(q_eo, n), d, .{ .async = true, .ut_id = ut_e }); }
   if (X + 1 == GX) {
     if (Y > 0) {
-      if (Y + 1 < GY) { @fadds(fab.fout(q_so, n), fab.fin(q_si, n), d); }
-      else { @fadds(fab.fout(q_eo, n), fab.fin(q_si, n), d); }
-    } else if (GY > 1) { @fmovs(fab.fout(q_so, n), d); }
-    else { @fmovs(fab.fout(q_eo, n), d); }
+      if (Y + 1 < GY) { @fadds(fab.fout(q_so, n), fab.fin(q_si, n), d, .{ .async = true, .ut_id = ut_s }); }
+      else { @fadds(fab.fout(q_eo, n), fab.fin(q_si, n), d, .{ .async = true, .ut_id = ut_e }); }
+    } else if (GY > 1) { @fmovs(fab.fout(q_so, n), d, .{ .async = true, .ut_id = ut_s }); }
+    else { @fmovs(fab.fout(q_eo, n), d, .{ .async = true, .ut_id = ut_e }); }
   }
   @fmovs(d, fab.fin(q_bi, n));
 }
@@ -344,16 +358,16 @@ fn attend(a: u16) void {
           if (X == xo) {
             @fs2h(hd(0, c), md(k + e * c, c));
             @fs2h(hd(c, c), md(v + e * c, c));
-            if (X + 1 < GX) { @mov32(fab.fout(q_eo, c), h32(0, c)); }
-            else if (Y + 1 < GY) { @mov32(fab.fout(q_so, c), h32(0, c)); }
-            else { @mov32(fab.fout(q_eo, c), h32(0, c)); }
+            if (X + 1 < GX) { @mov32(fab.fout(q_eo, c), h32(0, c), .{ .async = true, .ut_id = ut_e }); }
+            else if (Y + 1 < GY) { @mov32(fab.fout(q_so, c), h32(0, c), .{ .async = true, .ut_id = ut_s }); }
+            else { @mov32(fab.fout(q_eo, c), h32(0, c), .{ .async = true, .ut_id = ut_e }); }
           } else if (X > xo) {
-            if (X + 1 < GX) { fwd(q_eo, q_ei, c); }
-            else if (Y + 1 < GY) { fwd(q_so, q_ei, c); }
-            else { fwd(q_eo, q_ei, c); }
+            if (X + 1 < GX) { fwd_hub(q_eo, q_ei, ut_e, c); }
+            else if (Y + 1 < GY) { fwd_hub(q_so, q_ei, ut_s, c); }
+            else { fwd_hub(q_eo, q_ei, ut_e, c); }
           }
         } else if (X + 1 == GX and Y > yo) {
-          if (Y + 1 < GY) { fwd(q_so, q_si, c); } else { fwd(q_eo, q_si, c); }
+          if (Y + 1 < GY) { fwd_hub(q_so, q_si, ut_s, c); } else { fwd_hub(q_eo, q_si, ut_e, c); }
         }
         @mov32(h32(0, c), fab.fin(q_bi, c));
         if (act) {
