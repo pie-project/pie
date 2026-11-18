@@ -325,8 +325,9 @@ fn unary_f(which : u32, a : u32, j : u32) -> f32 {
     case 8u: { return cos(x); }
     case 9u: { return sqrt(x); }
     case 10u: { return 1.0 / sqrt(x); }
-    default: { return x; }
+    default: {}
   }
+  return x;
 }
 
 fn unary_i(which : u32, a : u32, j : u32) -> i32 {
@@ -346,8 +347,9 @@ fn unary_i(which : u32, a : u32, j : u32) -> i32 {
     case 8u: { return i32(cos(ld_f(a, j))); }
     case 9u: { return i32(sqrt(ld_f(a, j))); }
     case 10u: { return i32(1.0 / sqrt(ld_f(a, j))); }
-    default: { return ld_i(a, j); }
+    default: {}
   }
+  return ld_i(a, j);
 }
 
 fn unary_u(which : u32, a : u32, j : u32) -> u32 {
@@ -362,8 +364,9 @@ fn unary_u(which : u32, a : u32, j : u32) -> u32 {
     case 8u: { return u32(cos(ld_f(a, j))); }
     case 9u: { return u32(sqrt(ld_f(a, j))); }
     case 10u: { return u32(1.0 / sqrt(ld_f(a, j))); }
-    default: { return ld_u(a, j); }
+    default: {}
   }
+  return ld_u(a, j);
 }
 
 fn unary_b(which : u32, a : u32, j : u32) -> bool {
@@ -415,8 +418,9 @@ fn arith_f(which : u32, x : f32, y : f32) -> f32 {
     case 3u: { return x / y; }
     case 4u: { return max(x, y); }
     case 5u: { return min(x, y); }
-    default: { return x % y; }
+    default: {}
   }
+  return x % y;
 }
 
 fn arith_i(which : u32, x : i32, y : i32) -> i32 {
@@ -427,8 +431,9 @@ fn arith_i(which : u32, x : i32, y : i32) -> i32 {
     case 3u: { if (y == 0) { return 0; } return x / y; }
     case 4u: { return max(x, y); }
     case 5u: { return min(x, y); }
-    default: { if (y == 0) { return 0; } return x % y; }
+    default: {}
   }
+  if (y == 0) { return 0; } return x % y;
 }
 
 fn arith_u(which : u32, x : u32, y : u32) -> u32 {
@@ -439,8 +444,9 @@ fn arith_u(which : u32, x : u32, y : u32) -> u32 {
     case 3u: { if (y == 0u) { return 0u; } return x / y; }
     case 4u: { return max(x, y); }
     case 5u: { return min(x, y); }
-    default: { if (y == 0u) { return 0u; } return x % y; }
+    default: {}
   }
+  if (y == 0u) { return 0u; } return x % y;
 }
 
 
@@ -498,8 +504,9 @@ fn cmp_lane(which : u32, a : u32, b : u32, i : u32) -> bool {
     case 2u: { return x == y; }
     case 3u: { return x != y; }
     case 4u: { return x < y; }
-    default: { return x <= y; }
+    default: {}
   }
+  return x <= y;
 }
 
 fn logic_op(p : u32, which : u32) {
