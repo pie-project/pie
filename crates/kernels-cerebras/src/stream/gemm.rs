@@ -836,22 +836,93 @@ fn w16(round16: bool) -> u32 {
     if round16 { BF16 } else { HALF }
 }
 
+/// Why [`placed`] refuses a shape, by what the search does next: a refusal tied to the columns
+/// ends that column count's candidates; one of a cut that does not divide evenly is the reason
+/// given last (a reason past it, the shape's own, before it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The rows do not cut evenly over the rows of PEs (or a class over the blocks).
+    Rows(String),
+    /// A value's segment does not cut evenly over the columns.
+    Segment(String),
+    /// An attention's q does not cut over the columns.
+    Q(String),
+    /// A region does not print at the columns' chunk.
+    Region(String),
+    /// Any other.
+    Other(String),
+}
+
+impl Refusal {
+    /// Its message.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Refusal::Rows(m)
+            | Refusal::Segment(m)
+            | Refusal::Q(m)
+            | Refusal::Region(m)
+            | Refusal::Other(m) => m,
+        }
+    }
+
+    /// No row count places at these columns.
+    fn ends_columns(&self) -> bool {
+        matches!(
+            self,
+            Refusal::Segment(_) | Refusal::Q(_) | Refusal::Region(_)
+        )
+    }
+
+    /// A cut that does not divide evenly (the least telling reason).
+    fn uneven(&self) -> bool {
+        matches!(self, Refusal::Segment(_) | Refusal::Rows(_))
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(m: String) -> Self {
+        Refusal::Other(m)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(m: &str) -> Self {
+        Refusal::Other(m.to_string())
+    }
+}
+
+impl From<Refusal> for String {
+    fn from(r: Refusal) -> Self {
+        match r {
+            Refusal::Rows(m)
+            | Refusal::Segment(m)
+            | Refusal::Q(m)
+            | Refusal::Region(m)
+            | Refusal::Other(m) => m,
+        }
+    }
+}
+
 /// `l` placed at `c` columns and `r` rows of PEs with `kbm` key-block members, its weight
 /// streams written, or why not.
 pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
-    let mut p = placed(l, c, r, kbm)?;
+    let mut p = placed(l, c, r, kbm).map_err(String::from)?;
     streams(&mut p)?;
     Ok(p)
 }
 
 /// [`place`] but the weight streams (their words counted, a search's candidate).
 #[allow(clippy::too_many_lines)]
-pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
+pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> Result<GemmProgram, Refusal> {
     let t = &l.trace;
     let per = l.request_rows();
     let total = per * l.batch.max(1);
     if c == 0 || r == 0 || !total.is_multiple_of(r) {
-        return Err(refuse(t, format!("{total} rows over {r} rows of PEs")));
+        return Err(Refusal::Rows(refuse(
+            t,
+            format!("{total} rows over {r} rows of PEs"),
+        )));
     }
     let tb = total / r;
     // (a PE row's rows one request's, one class's)
@@ -859,10 +930,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     for b in 0..l.batch.max(1) {
         for (ci, &(rows, _)) in l.class_rows.iter().enumerate() {
             if !rows.is_multiple_of(tb) {
-                return Err(refuse(
+                return Err(Refusal::Rows(refuse(
                     t,
                     format!("class {ci}'s {rows} rows over blocks of {tb}"),
-                ));
+                )));
             }
             row_class.extend(std::iter::repeat_n(ci, (rows / tb) as usize));
             row_req.extend(std::iter::repeat_n(b, (rows / tb) as usize));
@@ -878,10 +949,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         for (f, w) in v.segs() {
             let w = v.lwidth(f, w);
             if !w.is_multiple_of(c) {
-                return Err(refuse(
+                return Err(Refusal::Segment(refuse(
                     t,
                     format!("value %{}: a segment of {w} over {c} columns", vid.0),
-                ));
+                )));
             }
         }
     }
@@ -900,25 +971,25 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                     .find(|x| x.0 == s.q.1)
                     .map_or(0, |x| qv.lwidth(x.0, x.1));
                 let qc = chunk_of(qw, c)
-                    .ok_or_else(|| refuse(t, format!("q of {qw} columns over {c}")))?;
+                    .ok_or_else(|| Refusal::Q(refuse(t, format!("q of {qw} columns over {c}"))))?;
                 if !head_dim.is_multiple_of(qc) {
-                    return Err(refuse(
+                    return Err(Refusal::Other(refuse(
                         t,
                         format!("heads of {head_dim} over chunks of {qc} columns"),
-                    ));
+                    )));
                 }
                 band = head_dim / qc;
                 qchunk = qc;
             }
             // (a key block's keys are the dim-major tile's stride: a DSD stride is 8 bits)
             if !rq.is_multiple_of(kbm) || !(kbm * tb).is_multiple_of(band) || kbm * tb > 127 {
-                return Err(refuse(
+                return Err(Refusal::Other(refuse(
                     t,
                     format!(
                         "key blocks of {kbm} rows of PEs over {rq} ({} keys over a band of {band})",
                         kbm * tb
                     ),
-                ));
+                )));
             }
         }
     }
@@ -951,14 +1022,14 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             })
             .unwrap_or(g.region.width)
     };
-    let place_of = |g: &GReg, span: u32, columns: Option<Vec<u32>>| -> R<Place> {
+    let place_of = |g: &GReg, span: u32, columns: Option<Vec<u32>>| -> Result<Place, Refusal> {
         let ch = chunk_of(span, c)
             .filter(|ch| g.region.width.is_multiple_of(*ch))
             .ok_or_else(|| {
-                refuse(
+                Refusal::Region(refuse(
                     t,
                     format!("a region of {} over {span} / {c}", g.region.width),
-                )
+                ))
             })?;
         Ok(Place {
             chunk: ch,
@@ -985,7 +1056,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                 .collect();
             perms.dedup();
             if perms.len() > 1 {
-                return Err(refuse(t, format!("region {ri}: rows of two layouts")));
+                return Err(Refusal::Region(refuse(
+                    t,
+                    format!("region {ri}: rows of two layouts"),
+                )));
             }
             let span = span_of(&l2.vals, g);
             let perm = match perms.pop() {
@@ -1034,14 +1108,14 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             .iter()
             .find_map(|(v, f)| l2.vals[v].maps.get(f).and_then(|m| m.perm.clone()));
         let mut pr = region::print(&g.region, &place_of(&g, span, held)?)
-            .map_err(|e| refuse(t, format!("region {ri}: {e}")))?;
+            .map_err(|e| Refusal::Region(refuse(t, format!("region {ri}: {e}"))))?;
         if head {
             // a head region's row sums are its band's
             if pr.head_reduces > 0 || (pr.all_reduces > 0 && g.region.width / (span / c) != band) {
-                return Err(refuse(
+                return Err(Refusal::Region(refuse(
                     t,
                     format!("region {ri}: a head region's sums over other than its band"),
-                ));
+                )));
             }
             pr.csl = pr.csl.replace("seg.all_reduce(", "seg.head_reduce(");
         }
@@ -1064,16 +1138,16 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         let mapped = |v: &ValueId| l2.vals.get(v).is_some_and(|x| !x.maps.is_empty());
         match op {
             GOp::In { v, .. } | GOp::Out { v, .. } if mapped(v) => {
-                return Err(refuse(
+                return Err(Refusal::Other(refuse(
                     t,
                     format!("value %{}: the host's, laid out otherwise", v.0),
-                ));
+                )));
             }
             GOp::Gemm { x, .. } if mapped(x) => {
-                return Err(refuse(
+                return Err(Refusal::Other(refuse(
                     t,
                     format!("value %{}: a GEMM's input laid out otherwise", x.0),
-                ));
+                )));
             }
             GOp::Attend { sides, .. } => {
                 for sd in sides {
@@ -1081,7 +1155,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                         l2.vals[&v].maps.get(&f).and_then(|m| m.perm.clone())
                     };
                     if perm(sd.q) != perm(sd.k) || perm(sd.v).is_some() {
-                        return Err(refuse(t, "an attention's q and k laid out apart"));
+                        return Err(Refusal::Other(refuse(
+                            t,
+                            "an attention's q and k laid out apart",
+                        )));
                     }
                 }
             }
@@ -1173,10 +1250,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         let un = ysegs.len() == 1 && yv.free && !ysegs[0].1.is_multiple_of(c);
         for &(_, sw) in &ysegs {
             if !sw.is_multiple_of(c) && !un {
-                return Err(refuse(
+                return Err(Refusal::Segment(refuse(
                     t,
                     format!("value %{}: a GEMM's output segment of {sw} over {c}", y.0),
-                ));
+                )));
             }
         }
         let rows = if *lane { 1 } else { tb };
@@ -1238,7 +1315,10 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     }
     let wwords = wcol.iter().copied().max().unwrap_or(0);
     if wwords > u64::from(u32::MAX) {
-        return Err(refuse(t, "a column's weight stream past 2^32 words"));
+        return Err(Refusal::Other(refuse(
+            t,
+            "a column's weight stream past 2^32 words",
+        )));
     }
     p.wwords = wwords as u32;
     p.wcol = wcol.iter().map(|&w| w as u32).collect();
@@ -1564,7 +1644,8 @@ pub fn candidates(
         }
     }
     let mut all: Vec<(f64, GemmProgram)> = Vec::new();
-    let mut why = String::new();
+    // the reason given: its message, and whether it is a cut that does not divide evenly
+    let mut why: Option<(String, bool)> = None;
     // the columns first: a candidate's regions print at its chunk
     let mut ok_c: BTreeMap<u32, bool> = BTreeMap::new();
     for (c, r, kbm) in cands {
@@ -1574,42 +1655,42 @@ pub fn candidates(
         match placed(&l, c, r, kbm) {
             Ok(p) if p.fabric().1 > bounds.1 => {
                 ok_c.insert(c, true);
-                why = format!("{c} x {r}: {} rows of tapes past the fabric", p.tape);
+                why = Some((
+                    format!("{c} x {r}: {} rows of tapes past the fabric", p.tape),
+                    false,
+                ));
             }
             Ok(p) => {
                 ok_c.insert(c, true);
                 let mem = crate::cost::gemm::memory(&p);
-                if mem.total > crate::cost::gemm::PE_WORDS
-                    && (pin.is_none() || std::env::var_os("GEMM_ANY_MEMORY").is_none())
-                {
-                    why = if !why.is_empty()
-                        && !why.contains("segment of")
-                        && !why.contains("rows over")
-                    {
-                        why
-                    } else {
-                        format!(
-                            "{c} x {r}: {} words a PE (of {}): {mem:?}",
-                            mem.total,
-                            crate::cost::gemm::PE_WORDS
-                        )
-                    };
+                if mem.total > crate::cost::gemm::PE_WORDS {
+                    if why.as_ref().is_none_or(|w| w.1) {
+                        why = Some((
+                            format!(
+                                "{c} x {r}: {} words a PE (of {}): {mem:?}",
+                                mem.total,
+                                crate::cost::gemm::PE_WORDS
+                            ),
+                            false,
+                        ));
+                    }
                     continue;
                 }
                 all.push((crate::cost::gemm::time(&p).cycles, p));
             }
             Err(e) => {
-                if e.contains("segment of") || e.contains("region ") || e.contains("q of") {
+                if e.ends_columns() {
                     ok_c.insert(c, false);
                 }
                 // (the reason a cut that divides evenly fails, before one that does not)
-                let plain = |w: &str| w.contains("segment of") || w.contains("rows over");
-                if why.is_empty() || (plain(&why) && !plain(&e)) {
-                    why = e;
+                if why.as_ref().is_none_or(|w| w.1 && !e.uneven()) {
+                    let uneven = e.uneven();
+                    why = Some((e.into(), uneven));
                 }
             }
         }
     }
+    let why = why.map(|w| w.0).unwrap_or_default();
     Ok((all, why))
 }
 
