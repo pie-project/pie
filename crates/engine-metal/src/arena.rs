@@ -259,25 +259,6 @@ impl Arena {
         self.end
     }
 
-    /// Where a fire of `rows` lays its guests' scratch from, down: under
-    /// its own carve, at the current rung.
-    #[must_use]
-    pub fn guest_top(&self, rows: FireRows) -> u64 {
-        self.carve_top() - room(self.carve_for(rows).bytes)
-    }
-
-    /// [`Arena::guest_top`] of the widest fire a rung of `tokens` carries,
-    /// under that rung's staged regions.
-    #[must_use]
-    pub fn rung_guest_top(&self, tokens: u32) -> u64 {
-        let rows = FireRows {
-            tokens: u64::from(tokens),
-            lanes: u64::from(tokens),
-            ..FireRows::default()
-        };
-        self.scratch_at() - self.over_carve(self.index(tokens)) - room(self.carve_for(rows).bytes)
-    }
-
     /// The bytes from the span's end a fire of `rows` takes at the current
     /// rung: the plane, the rung's staged regions and its carve.
     #[must_use]
