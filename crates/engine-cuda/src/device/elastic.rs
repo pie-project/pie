@@ -134,8 +134,9 @@ impl Beside {
         #[cfg(feature = "rocm")]
         {
             // A load opens its fan's side streams before its pools, past the
-            // hardware queues HIP makes a device: its rule counts them all.
-            let areas = kernels_cuda::hip::kfd::save_areas(u32::MAX).map_err(|why| {
+            // hardware queues HIP makes a device: KFD's list counts them all,
+            // or HIP's rule, at least as many, where the list is not ours.
+            let areas = kernels_cuda::hip::kfd::held().map_err(|why| {
                 Fault::Card(format!(
                     "the flat range cannot be sized: the driver's wave save areas for this \
                      process's queues are not readable ({why})"

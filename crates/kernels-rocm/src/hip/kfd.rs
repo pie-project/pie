@@ -9,7 +9,10 @@
 //! The area a queue takes is read from KFD's topology for the device. The
 //! queues are counted by HIP's rule, in every PID namespace alike: one
 //! utility queue, a hardware queue for each stream up to HIP's limit, and a
-//! copy queue for each stream a load made one on ([`warm_copies`]). KFD's
+//! copy queue for each of the most non-null streams that ever copied at once
+//! ([`warm_copies`]; HIP pools its copy queues by kind of copy and keeps
+//! them past the streams that made them, so this counts at least as many
+//! and a reload makes none). [`held`] reads KFD's list where it can. KFD's
 //! own list of the process's queues ([`listed_queues`], readable from the
 //! host's PID namespace only) agrees with it at every count the tests hold
 //! it to.
@@ -57,8 +60,7 @@ impl core::fmt::Display for SaveAreas {
         write!(
             f,
             "{} MiB for {} queues' wave save areas ({} XCC x ({} save + {} debugger) bytes a \
-             queue; queues by HIP's rule: a utility queue, a hardware queue a stream up to \
-             GPU_MAX_HW_QUEUES, a copy queue a copying stream)",
+             queue)",
             self.bytes() >> 20,
             self.queues,
             self.xcc,
@@ -68,8 +70,20 @@ impl core::fmt::Display for SaveAreas {
     }
 }
 
-/// The save areas the current device holds for this process, which has
-/// opened at least `streams` streams on it.
+/// The save areas the current device holds for this process now: its
+/// queues as KFD lists them where that list is this process's to read, and
+/// HIP's rule over every stream otherwise ([`save_areas`]), which counts
+/// at least as many. Queues outlive the streams that made them and are
+/// handed to the next, so a load after a dropped one holds no more.
+pub fn held() -> Result<SaveAreas, String> {
+    let ruled = save_areas(u32::MAX)?;
+    Ok(listed_queues().map_or(ruled, |queues| SaveAreas { queues, ..ruled }))
+}
+
+/// The save areas the current device holds for this process by HIP's rule,
+/// which has opened at least `streams` streams on it: one utility queue, a
+/// hardware queue a stream up to `GPU_MAX_HW_QUEUES`, and the copy queues
+/// [`warm_copies`] made.
 pub fn save_areas(streams: u32) -> Result<SaveAreas, String> {
     let node = node_of_current_device()?;
     let read = |name: &str| -> Result<u64, String> {
@@ -98,8 +112,8 @@ pub fn save_areas(streams: u32) -> Result<SaveAreas, String> {
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(HIP_HW_QUEUES);
-    // Compute queues by HIP's rule, and a copy queue for each stream
-    // `warm_copies` made one on.
+    // Compute queues by HIP's rule, and the copy queues `warm_copies`'
+    // streams made, which outlive them.
     let queues = 1 + streams.min(limit) + warmed();
     Ok(SaveAreas {
         queues,
@@ -111,12 +125,37 @@ pub fn save_areas(streams: u32) -> Result<SaveAreas, String> {
 
 const PAGE: u64 = 4096;
 
-static WARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The copy queues HIP's rule counts for [`warm_copies`]: the most non-null
+/// streams it warmed at once (`most`), not the streams warmed now (`live`,
+/// by address). HIP keeps its copy queues in a small pool by kind of copy,
+/// kept past the streams that copied and handed to the next, so the rule
+/// counts at least the queues it made, and a load after a dropped one adds
+/// none.
+struct Warmed {
+    live: Vec<usize>,
+    most: u32,
+}
 
-/// The streams [`warm_copies`] made a copy queue on.
+static WARMED: std::sync::Mutex<Warmed> = std::sync::Mutex::new(Warmed {
+    live: Vec::new(),
+    most: 0,
+});
+
+fn warmed_streams() -> std::sync::MutexGuard<'static, Warmed> {
+    WARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The copy queues the streams [`warm_copies`] warmed made, which the
+/// process holds from then on.
 #[must_use]
 pub fn warmed() -> u32 {
-    WARMED.load(std::sync::atomic::Ordering::Relaxed)
+    warmed_streams().most
+}
+
+/// `stream` is destroyed: the copy queue it used stays the process's, for
+/// the next stream that copies to take.
+pub fn forget(stream: super::sys::Stream) {
+    warmed_streams().live.retain(|&live| live != stream.addr());
 }
 
 /// Makes each of `streams`' copy queue now: one host-to-device copy a stream
@@ -147,7 +186,11 @@ pub fn warm_copies(streams: &[super::sys::Stream], scratch: *mut core::ffi::c_vo
             outcome = Err(format!("a stream's first copy answered {code} / {synced}"));
             break;
         }
-        WARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut warmed = warmed_streams();
+        if !stream.is_null() && !warmed.live.contains(&stream.addr()) {
+            warmed.live.push(stream.addr());
+            warmed.most = warmed.most.max(u32::try_from(warmed.live.len()).unwrap_or(u32::MAX));
+        }
     }
     // SAFETY: allocated above, freed once.
     unsafe { super::rt::hipHostFree(host) };
