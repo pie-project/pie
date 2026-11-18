@@ -724,6 +724,11 @@ impl PreparedLoad<'_> {
 
         let mut masked = poem_ir::ClassSet::default();
         for region in compiled.template() {
+            // An arm applies the fire's masks where its attention reads them
+            // and its kernels read each row's word: the paged prefill, and the
+            // paged decode (its plain, split, mma and q8 kernels read the word
+            // once a row, and a key's bit only past the lane's boundary). A
+            // selection's or a bias's arm reads none.
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
@@ -732,13 +737,13 @@ impl PreparedLoad<'_> {
                             mask: Some(_),
                             selection: None,
                             bias: None,
-                            lse: None,
                             ..
-                        } | poem_ir::Attn::Prefill {
+                        } | poem_ir::Attn::Decode {
                             mask: Some(_),
                             selection: None,
                             bias: None,
-                            lse: Some(_),
+                            selected: None,
+                            rel: None,
                             ..
                         }
                     ))
@@ -943,7 +948,7 @@ impl PreparedLoad<'_> {
         )?;
         let page_tables = rows.tables.len();
         let arms = boot.runahead.frames().max(1);
-        let gathers = fallback::gathers(&boot.trace, &compiled, fallback::Carries::default());
+        let gathers = fallback::gathers(&boot.trace, &compiled, crate::window::CARRIES);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
