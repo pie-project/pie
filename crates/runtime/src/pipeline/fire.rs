@@ -950,7 +950,7 @@ impl RaiseFunding {
                 };
                 tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
                 let asked = tokio::select! {
-                    asked = planner.acquire(pid, quorum, demand) => asked,
+                    asked = planner.acquire_raise(pid, quorum, demand) => asked,
                     () = stop.notified() => return,
                 };
                 match asked {
