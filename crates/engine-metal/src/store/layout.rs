@@ -393,6 +393,39 @@ impl Layout {
 
     /// The chunks one working set at `pages` kv pages takes beside the null
     /// chunk: its pages, its record and one a fire writes copy-on-write.
+    /// The state room, in bytes, a pool of this layout states for
+    /// `seats` seat-addressed lanes of `pages` kv pages each and a fire's
+    /// `rows_pages` pages landing past them, fired directly with no runtime
+    /// (`pie tune --check-estimate`'s shells): their pages in list chunks and
+    /// their records' pieces in fixed chunks, at least one working set
+    /// ([`Layout::least_chunks`]). The null chunk, the tables run and that
+    /// state are rounded up to whole segments, and one more segment absorbs
+    /// what a buffer's mapped tail takes back: they all lie in bottom
+    /// segments a direct caller backs, none in the segment the activation
+    /// span starts in.
+    #[must_use]
+    pub fn shell_room(&self, seats: u32, pages: u64, rows_pages: u64) -> u64 {
+        let chunks = |slots: u64, shape: Option<Slots>| {
+            shape.map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
+        };
+        let seats = u64::from(seats);
+        let held = chunks(seats * pages + rows_pages, self.list)
+            + chunks(seats * u64::from(self.pieces), self.fixed);
+        let least = u64::from(Self::least_chunks(
+            self.chunk_bytes,
+            [
+                self.list.map_or(0, |list| list.slot_bytes),
+                self.fixed.map_or(0, |fixed| fixed.slot_bytes),
+            ],
+            self.pieces,
+            u32::try_from(pages).unwrap_or(u32::MAX),
+        ));
+        let segment = u64::from(self.segment_chunks.max(1));
+        let below = 1 + u64::from(self.tables);
+        let state = (below + held.max(least)).next_multiple_of(segment) + segment - below;
+        state * self.chunk_bytes
+    }
+
     #[must_use]
     pub fn least_chunks(chunk_bytes: u64, [list, fixed]: [u64; 2], pieces: u32, pages: u32) -> u32 {
         let chunks = |slots: u32, bytes: u64| -> u32 {
@@ -532,6 +565,34 @@ impl Layout {
             disk_kept: false,
             weights: Vec::new(),
             record_bytes: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod shell_room_tests {
+    use super::Layout;
+
+    /// A directly-fired shell's room holds its seats' pages and records and
+    /// one working set, and with the null chunk and the tables run it ends a
+    /// whole segment past a segment boundary: the state lies in bottom
+    /// segments, never in the segment the activation span starts in.
+    #[test]
+    fn a_shells_room_holds_its_seats_in_whole_bottom_segments() {
+        const CHUNK: u64 = 2 << 20;
+        // Pages of 64 KiB (32 a chunk), records of 512 KiB in 2 pieces (4 a
+        // chunk), segments of 32 chunks, 3 table chunks.
+        let layout = Layout::new(CHUNK, 4096, 32, 16, [64 << 10, 512 << 10], 2, 512, 1)
+            .expect("a layout")
+            .with_tables(3);
+        for (seats, pages, rows) in [(512u32, 1u64, 32u64), (1, 640, 640), (1, 1, 1)] {
+            let room = layout.shell_room(seats, pages, rows);
+            assert_eq!(room % CHUNK, 0, "whole chunks");
+            let state = room / CHUNK;
+            let held = (u64::from(seats) * pages + rows).div_ceil(32)
+                + (u64::from(seats) * 2).div_ceil(4);
+            assert!(state >= held + 32, "{seats} seats: {state} chunks hold {held} and a segment");
+            assert_eq!((1 + 3 + state) % 32, 0, "{seats} seats: the bottom ends on a segment");
         }
     }
 }
