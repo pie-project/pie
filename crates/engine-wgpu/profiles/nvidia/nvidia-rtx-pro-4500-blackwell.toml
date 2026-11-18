@@ -1,0 +1,21 @@
+api = 1
+
+[target]
+device = "NVIDIA RTX PRO 4500 Blackwell"
+
+[provenance]
+rates = "pie tune wgpu --rates on 2026-11-18 (pie 0.6.0, commit 2a33bd37a), NVIDIA RTX PRO 4500 Blackwell through wgpu's Vulkan backend, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, the adapter's timestamps, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there, the median rate past its weight reads; the tiled attention by keys; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over the 16 cores wgpu sizes an adapter that reports no count by (UNREPORTED_CORES: 43.4 a core is 694 workgroups for the device); operands: engine::rates' pattern. Spread over the five runs: matmul points at most 5.7% (4096 at 362 rows), attention 2.3%, launch 2.9%, copy 6.7%, per-row ops 2.0%, scan 4.6%, few-row 1.4%, workgroups a core 1.3%"
+
+[rates]
+launch_ns = 4113
+gemm_tflops_by_rows = [
+  [1024, [[256, 3.1], [362, 4.3], [512, 5.9], [724, 7.2], [1024, 9.1], [1448, 10.7], [2048, 9.1], [2896, 11.3], [4096, 11.0], [5793, 12.1], [8192, 12.0]]],
+  [2048, [[256, 5.7], [362, 7.4], [512, 9.1], [724, 10.8], [1024, 9.0], [1448, 11.4], [2048, 11.1], [2896, 12.1], [4096, 12.0], [5793, 12.3], [8192, 12.2]]],
+  [4096, [[256, 9.0], [362, 10.7], [512, 8.6], [724, 10.7], [1024, 11.0], [1448, 12.0], [2048, 11.9], [2896, 12.0], [4096, 12.3], [5793, 12.3], [8192, 12.4]]],
+]
+attn_tflops_by_keys = [[512, 1.35], [1024, 2.39], [2048, 3.08], [4096, 3.45], [8192, 3.6]]
+hbm_gbps = 772.5
+elementwise_gbps = 822.5
+scan_gelems = 71.4
+few_row_tflops = 0.99
+workgroups_per_core = 43.38

@@ -36,8 +36,13 @@ pub fn bench(
 /// its user file under `profiles` with them in place of its own.
 pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates::Rated, String> {
     let began = Instant::now();
-    let device = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
-        .map_err(|e| e.to_string())?;
+    // WebGPU reports no memory size, and the step binds no more than it
+    // lays at once (`engine::rates::step_bytes`): that is its budget.
+    let step = engine::Allowance {
+        budget: Some(engine::rates::step_bytes()),
+    };
+    let device =
+        Context::bind(&crate::api::DeviceBoot::default(), step).map_err(|e| e.to_string())?;
     let chip = device.chip();
     let (profile, _) = crate::chip::resolve(&chip, Some(profiles));
     let tuning = crate::tuning::Tuning::new(profile, device.cores())

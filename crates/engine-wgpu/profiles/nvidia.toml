@@ -1,0 +1,6 @@
+api = 1
+
+# NVIDIA adapters through wgpu: the family the device files below lie in. It
+# states nothing past the registry's defaults.
+[target]
+assumes = { vendor = "nvidia" }

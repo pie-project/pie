@@ -20,9 +20,19 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
+macro_rules! seeded {
+    ($($file:literal),* $(,)?) => {
+        pub const SEEDED: &[(&str, &str)] = &[
+            $(($file, include_str!(concat!("../profiles/", $file)))),*
+        ];
+    };
+}
+
+seeded!("nvidia.toml", "nvidia/nvidia-rtx-pro-4500-blackwell.toml");
+
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
-    seeded: &[],
+    seeded: SEEDED,
     derived: None,
 };
 
@@ -93,6 +103,29 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_checked_in_profiles_hold_together() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        SHELF
+            .check(registry(), &dir)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The checked-in card states every rate a load weighs, so it measures
+    /// none at load.
+    #[test]
+    fn the_rtx_pro_4500_states_every_rate() {
+        let d = Device {
+            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
+            vendor: "nvidia",
+            subgroup_min: Some(32),
+            cores: None,
+            f16: true,
+        };
+        let (profile, _) = resolve(&d, None);
+        assert!(profile.rates().complete(&engine_gpu::rates::KEYS));
     }
 
     #[test]

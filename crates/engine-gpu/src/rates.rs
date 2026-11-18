@@ -13,10 +13,17 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
-//! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
-//!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
-//!   longest keys, said beside it), through the kernel a served fire selects
-//!   at that shape, for `attn_tflops_by_keys`;
+//! - the same matmul at each of `engine::rates::FEW_ROWS` (4 to 256) of each
+//!   width, through the kernel serving picks at those rows, its rows padded
+//!   to that kernel's tile, for `few_row_tflops`
+//!   (`engine::rates::few_row_rate`);
+//! - its tiled prefill attention at `engine::rates::ATTN_SHAPE`'s heads over
+//!   each of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at
+//!   the longest keys, said beside it), for `attn_tflops_by_keys` (every
+//!   point past a fire's tile rows, so a served fire takes it there too);
+//! - the same kernel at one tile a head over the longest keys, against the
+//!   time the curve's rate gives its work, for `workgroups_per_core` (the
+//!   API states no occupancy; `engine::rates::workgroups_per_core`);
 //! - its rmsnorm then its swiglu at `engine::rates::ELEMENTWISE_SHAPE`, each
 //!   fire the next of `engine::rates::elementwise_sets` sets, for
 //!   `elementwise_gbps`;
@@ -54,18 +61,10 @@ use crate::serve::Serve;
 /// largest buffer the device allocates.
 pub const COPY_BYTES: u64 = 256 << 20;
 
-/// The `[rates]` keys the slang backends' estimate weighs a fire by (of
-/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
-/// choice on these backends reads them, so a load measures neither.
-pub const KEYS: [&str; 6] = [
-    "launch_ns",
-    "gemm_tflops_by_rows",
-    "attn_tflops_by_keys",
-    "hbm_gbps",
-    "elementwise_gbps",
-    "scan_gelems",
-];
+/// The `[rates]` keys the slang backends' estimate and kernel choices
+/// weigh (every one of `profile::fire::KEYS`): what a load whose profile
+/// lacks one measures.
+pub const KEYS: [&str; 8] = profile::fire::KEYS;
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -486,6 +485,36 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
+    // The few-row matmul at `engine::rates::FEW_ROWS` of each width, through
+    // the kernel serving picks at each (`tile_for`), its rows padded to that
+    // kernel's tile: `few_row_tflops` (`engine::rates::few_row_rate`).
+    let mut few = Vec::new();
+    for w in engine::rates::GEMM_WIDTHS {
+        for m in engine::rates::FEW_ROWS {
+            let tactic = tactics.gemm(tier, m);
+            let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, m, w, w).row_tile();
+            let ns = matmul_ns(&mut rig, tactic, timer, (m, w, w))?;
+            rig.release();
+            few.push(engine::rates::FewRow {
+                rows: m,
+                width: w,
+                padded: m.div_ceil(tile.max(1)) * tile.max(1),
+                ns: ns as f64,
+            });
+        }
+    }
+    let few_row =
+        engine::rates::few_row_rate(&few, launch, bytes_per_ns).ok_or_else(|| Fault::Device {
+            call: "rates",
+            why: "`[rates] few_row_tflops`: no few-row matmul took longer than its launch, so \
+                  nothing was measured"
+                .to_string(),
+        })?;
+    say(&format!(
+        "[rates]: few-row matmul ({:?} rows): {:.2} TFLOP/s",
+        engine::rates::FEW_ROWS,
+        few_row / 1e3
+    ));
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -522,6 +551,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             rate / 1e3
         ));
     }
+    let workgroups_per_core = occupancy(&mut rig, tactics, tier, timer, &attn, launch, say)?;
+    rig.release();
     let elementwise = elementwise(&mut rig, timer, launch)?;
     rig.release();
     say(&format!("[rates]: per-row ops: {elementwise:.0} GB/s"));
@@ -543,8 +574,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         hbm_gbps: Some(bytes_per_ns),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
-        few_row_tflops: None,
-        workgroups_per_core: None,
+        few_row_tflops: Some(few_row / 1e3),
+        workgroups_per_core: Some(workgroups_per_core),
     };
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
@@ -750,18 +781,7 @@ fn matmul<B: Serve>(
     (m, n, k): (u32, u32, u32),
     launch: f64,
 ) -> Result<f64> {
-    let act = rig.operand(m, k, Dtype::Bf16)?;
-    let weights = (0..weights_at(n, k))
-        .map(|_| rig.operand(n, k, Dtype::Bf16))
-        .collect::<Result<Vec<Tensor>>>()?;
-    let y = rig.zeros(m, n, Dtype::Bf16)?;
-    let next = std::cell::Cell::new(0usize);
-    rig.step(format!("matmul {m}x{n}x{k}"), None);
-    let ns = rig.each(timer, &Touched::default(), weights.len(), &|sink| {
-        let w = weights[next.get() % weights.len()];
-        next.set(next.get() + 1);
-        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
-    })?;
+    let ns = matmul_ns(rig, tactic, timer, (m, n, k))?;
     engine::rates::rate_from(
         &format!("matmul {m}x{n}x{k}"),
         ns as f64,
@@ -772,10 +792,31 @@ fn matmul<B: Serve>(
     .map_err(|why| Fault::Device { call: "rates", why })
 }
 
+/// One matmul's ns at `(m, n, k)`, each fire reading the next of its
+/// weight planes, past the last-level cache.
+fn matmul_ns<B: Serve>(
+    rig: &mut Rig<'_, B>,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    timer: Timer<'_, B>,
+    (m, n, k): (u32, u32, u32),
+) -> Result<u64> {
+    let act = rig.operand(m, k, Dtype::Bf16)?;
+    let weights = (0..weights_at(n, k))
+        .map(|_| rig.operand(n, k, Dtype::Bf16))
+        .collect::<Result<Vec<Tensor>>>()?;
+    let y = rig.zeros(m, n, Dtype::Bf16)?;
+    let next = std::cell::Cell::new(0usize);
+    rig.step(format!("matmul {m}x{n}x{k}"), None);
+    rig.each(timer, &Touched::default(), weights.len(), &|sink| {
+        let w = weights[next.get() % weights.len()];
+        next.set(next.get() + 1);
+        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+    })
+}
+
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows
 /// attending itself, causal, its kv laid in pages of [`PAGE`], through the
-/// kernel a served fire takes at that shape (the tactic at its head width,
-/// tiled or walked by [`Tactics::sdpa_tile_rows_per_request`]).
+/// tiled kernel at the tactic of its head width.
 fn attention<B: Serve, T: Tactics + ?Sized>(
     rig: &mut Rig<'_, B>,
     tactics: &T,
@@ -784,12 +825,31 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     s: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
+    let ns = attention_ns(rig, tactics, tier, timer, s, s.rows)?;
+    engine::rates::rate_from(
+        &format!("attention {}x{} d {}", s.rows, s.keys, s.head_dim),
+        ns as f64,
+        engine::rates::ATTN_DISPATCHES,
+        launch,
+        attn_flops(s),
+    )
+    .map_err(|why| Fault::Device { call: "rates", why })
+}
+
+/// One dispatch of the tiled prefill attention at `s`'s heads over
+/// `s.keys` keys of one sequence, its last `rows` rows the fire's (the
+/// sequence attending itself where `rows` is `s.rows`): its ns.
+fn attention_ns<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    s: engine::rates::AttnShape,
+    rows: u32,
+) -> Result<u64> {
     let tactic = tactics.sdpa(tier, s.head_dim);
-    // Tiled where a request's rows reach the profile's tile rows, as a
-    // served prefill takes it (one request here).
-    let tiled = s.rows >= tactics.sdpa_tile_rows_per_request();
     let kv_width = s.kv_heads * s.head_dim;
-    let o = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
+    let o = rig.zeros(rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
     let pages = s.keys.div_ceil(PAGE);
     // The sequence's pages scattered over the pool as a served one's are.
     let indices: Vec<u32> = engine::rates::attn_page_order(pages);
@@ -799,7 +859,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     // cache, as a served fire reads each layer's kv cold.
     let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(ATTN_SETS_MOST))
         .map(|_| {
-            let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
+            let q = rig.operand(rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
             let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
             let values = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
             let pool = KvPool::planes(
@@ -815,44 +875,88 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         })
         .collect::<Result<Vec<(Tensor, KvPool)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    // The rows' own positions, all of request 0, no row masked.
-    let positions: Vec<u32> = (0..s.rows).collect();
+    // The rows' own positions, the sequence's last `rows`, all of request
+    // 0, no row masked.
+    let positions: Vec<u32> = (s.keys - rows..s.keys).collect();
     const MASK_STRIDE: u32 = 4;
     let tables = kernels_slang::attn::sdpa::Tables {
-        positions: rig.words(&positions, s.rows, 1, Dtype::I32)?,
-        request_of_token: rig.zeros(s.rows, 1, Dtype::I32)?,
-        mask: rig.zeros(s.rows, MASK_STRIDE, Dtype::U8)?,
-        mask_enabled: rig.zeros(s.rows, 1, Dtype::U8)?,
+        positions: rig.words(&positions, rows, 1, Dtype::I32)?,
+        request_of_token: rig.zeros(rows, 1, Dtype::I32)?,
+        mask: rig.zeros(rows, MASK_STRIDE, Dtype::U8)?,
+        mask_enabled: rig.zeros(rows, 1, Dtype::U8)?,
         mask_stride: MASK_STRIDE,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     rig.step(
-        format!("attention {}x{} d {}", s.rows, s.keys, s.head_dim),
+        format!("attention {rows} rows x {} keys d {}", s.keys, s.head_dim),
         None,
     );
-    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
+    rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (q, pool) = &sets[next.get() % sets.len()];
         let (q, pool) = (*q, pool);
         next.set(next.get() + 1);
-        if tiled {
-            kernels_slang::attn::sdpa::prefill(
-                sink, tactic, q, &tables, pool, None, s.head_dim, scale, o, None,
-            )
-        } else {
-            kernels_slang::attn::sdpa::decode(
-                sink, tactic, q, &tables, pool, None, s.head_dim, scale, o, None, None,
-            )
-        }
+        kernels_slang::attn::sdpa::prefill(
+            sink, tactic, q, &tables, pool, None, s.head_dim, scale, o, None,
+        )
         .map_err(fault("rates: attention"))
+    })
+}
+
+/// `[rates] workgroups_per_core`, measured (the API states no occupancy):
+/// the tiled attention at one tile a head ([`engine::rates::OCCUPANCY_KEYS`]
+/// keys, the tile's rows the sequence's last), `W` its heads, timed at `t`
+/// against `t_full`, the same work at the rate the attention curve `attn`
+/// (flops a ns) states there: `S = W · t / t_full` workgroups fill the
+/// device, over its cores ([`engine::rates::workgroups_per_core`]).
+fn occupancy<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    attn: &[(u32, f64)],
+    launch: f64,
+    say: &mut dyn FnMut(&str),
+) -> Result<f64> {
+    let keys = engine::rates::OCCUPANCY_KEYS;
+    let s = engine::rates::ATTN_SHAPE.at(keys);
+    let cores = tactics.cores();
+    let tile = tactics.sdpa(tier, s.head_dim).tile().1;
+    let refused = |why: String| Fault::Device {
+        call: "rates",
+        why: format!("`[rates] workgroups_per_core`: {why}"),
+    };
+    let rate = attn
+        .iter()
+        .find(|&&(k, _)| k == keys)
+        .map(|&(_, r)| r)
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .ok_or_else(|| refused(format!("the attention curve states no rate at {keys} keys")))?;
+    // The tile walks every key; the curve's rate counts a causal walk's
+    // whole rectangle, of which its kernel computed half.
+    let full = tiled_flops(tile, keys, s.q_heads, s.head_dim) / rate;
+    let ns = attention_ns(rig, tactics, tier, timer, s, tile)? as f64 - launch;
+    let per = engine::rates::workgroups_per_core(s.q_heads, cores, ns, full).ok_or_else(|| {
+        refused(format!(
+            "one tile a head over {keys} keys took {ns:.0} ns past its launch on {cores} cores: \
+             nothing measured"
+        ))
     })?;
-    engine::rates::rate_from(
-        &format!("attention {}x{} d {}", s.rows, s.keys, s.head_dim),
-        ns as f64,
-        engine::rates::ATTN_DISPATCHES,
-        launch,
-        attn_flops(s),
-    )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    say(&format!(
+        "[rates]: occupancy: {per:.2} workgroups a core (the tiled attention, one {tile}-row \
+         tile a head of {} over {keys} keys, {cores} cores: {ns:.0} ns against {full:.0} ns at \
+         the curve's rate)",
+        s.q_heads
+    ));
+    Ok(per)
+}
+
+/// The work of `rows` rows each walking `keys` keys of the tiled attention,
+/// as the attention curve's rate counts it: `4 · rows · keys · heads ·
+/// head_dim` flops computed, twice over (the curve's rate counts a causal
+/// walk's whole rectangle, of which its kernel computed half).
+#[must_use]
+pub fn tiled_flops(rows: u32, keys: u32, heads: u32, head_dim: u32) -> f64 {
+    2.0 * 4.0 * f64::from(rows) * f64::from(keys) * f64::from(heads) * f64::from(head_dim)
 }
 
 /// The recurrent rate at [`SCAN_SHAPE`]: the causal conv over the scan's
@@ -1047,8 +1151,8 @@ fn copy_and_launch<B: Serve>(
     Ok((bytes, launch))
 }
 
-/// The attention rate of `device` at `shape` through the kernel a served
-/// fire takes there ([`attention`]'s one micro-fire): a check of the
+/// The attention rate of `device` at `shape` through the tiled kernel
+/// ([`attention`]'s one micro-fire): a check of the
 /// estimate times it beside a served fire's attention at the same shape.
 pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,

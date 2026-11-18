@@ -249,6 +249,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         Tuning::profile(self)
     }
 
+    fn cores(&self) -> u32 {
+        self.cores
+    }
+
     /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's
     /// rungs: the vector rung reads two activation rows a workgroup, which
     /// on the 4090 beat the old hand-written WGSL one-row kernel at every row

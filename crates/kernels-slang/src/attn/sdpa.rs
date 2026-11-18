@@ -505,6 +505,20 @@ pub fn selected(
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
 }
 
+impl Tactic {
+    /// The tiled kernel's lanes a row and rows a workgroup, as [`prefill`]
+    /// lays its tile: 16 lanes hold 16 rows, 32 lanes 32, 16 or 8.
+    #[must_use]
+    pub fn tile(&self) -> (u32, u32) {
+        match (self.tile_lanes, self.tile_rows) {
+            (..=16, _) => (16, 16),
+            (_, 32..) => (32, 32),
+            (_, 16..=31) => (32, 16),
+            _ => (32, 8),
+        }
+    }
+}
+
 /// Query rows tiled `tactic.tile_rows` a workgroup of one head, each attending
 /// its request's cached keys, causal; with `lse`, each row's base-2 LSE.
 pub fn prefill(
@@ -521,12 +535,7 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
     let shape = shape(OP, q, pool, window, head_dim)?;
-    let (lanes, tile) = match (tactic.tile_lanes, tactic.tile_rows) {
-        (..=16, _) => (16, 16),
-        (_, 32..) => (32, 32),
-        (_, 16..=31) => (32, 16),
-        _ => (32, 8),
-    };
+    let (lanes, tile) = tactic.tile();
     // A pool of one segment (every page in it) runs the `_seg1` form, which
     // reads it with no copy of the loads a segment; a commit of another
     // segment forgets every recording, so a fire's form follows its pool.
