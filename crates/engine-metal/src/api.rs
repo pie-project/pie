@@ -205,6 +205,18 @@ const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
+/// Bounds what the load tells (`FireLimits`) to the fires it walks: its top
+/// rung, as the ruling bounded it (`crate::top::bounded`). A rung of so
+/// many tokens walks no wider fire, and the runtime lifts its largest rung
+/// to the limit told: told wider, it packs fires the walk refuses.
+fn told_within(budgets: &mut LoadBudgets, served: &Budget) {
+    if served.max_tokens < budgets.max_tokens {
+        budgets.max_tokens = served.max_tokens;
+        budgets.max_lanes = budgets.max_lanes.min(served.max_lanes);
+        budgets.buckets.clone_from(&served.buckets);
+    }
+}
+
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
 fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
@@ -592,6 +604,7 @@ impl Engine for Metal {
             );
         }
 
+        told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
         // move kv and rs slots within the same DRAM: one is seated only
@@ -1526,4 +1539,42 @@ fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyTex
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, text);
+}
+
+#[cfg(test)]
+mod told {
+    use super::*;
+
+    /// A load whose ruling picks a top rung under the asked fire tells that
+    /// rung's tokens as its widest fire, and its lanes and buckets as the
+    /// rung walks them; one ruled at what it asked tells what it asked.
+    #[test]
+    fn the_told_limit_is_the_ruled_top_rung() {
+        let asked = LoadBudgets {
+            max_lanes: 2048,
+            max_tokens: 4096,
+            buckets: vec![1, 64, 512, 2048, 4096],
+            ..LoadBudgets::default()
+        };
+        let baked = Budget {
+            max_lanes: asked.max_lanes,
+            max_tokens: asked.max_tokens,
+            buckets: asked.buckets.clone(),
+            max_adapters: 0,
+            readouts_per_lane: 1,
+        };
+        for top in [1024, 512, 64] {
+            let served = crate::top::bounded(&baked, top);
+            let mut told = asked.clone();
+            told_within(&mut told, &served);
+            assert_eq!(told.max_tokens, top, "the told widest fire is the ruled top rung");
+            assert_eq!(told.max_lanes, top.min(asked.max_lanes));
+            assert_eq!(told.buckets, served.buckets);
+            assert!(told.buckets.iter().all(|&rows| rows <= top));
+        }
+        let mut told = asked.clone();
+        told_within(&mut told, &crate::top::bounded(&baked, asked.max_tokens));
+        assert_eq!(told.max_tokens, asked.max_tokens);
+        assert_eq!(told.max_lanes, asked.max_lanes);
+    }
 }
