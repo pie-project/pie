@@ -1168,6 +1168,29 @@ impl Pools {
         Ok((view, at, host, slot_bytes))
     }
 
+    /// Bytes `[at, at + bytes)` from the start of slot ref `slot` of shape
+    /// `id` (inside its chunk): the buffer they lie in, their byte offset
+    /// there, and their host runs `(from, len, address)`, one a placement
+    /// heap they cross (a chunk, and a slot in it, may cross a heap's end;
+    /// the view holds them in one span either way).
+    pub fn span_runs(
+        &self,
+        id: ShapeId,
+        slot: u32,
+        at: u64,
+        bytes: u64,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>)> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, slot)?;
+        let global = u64::from(chunk) * self.layout.chunk_bytes
+            + u64::from(index) * shape.slot_bytes
+            + at;
+        self.pool.admit(chunk)?;
+        let runs = self.pool.host_runs(global, bytes)?;
+        let (view, offset) = self.pool.view_at(global);
+        Ok((view.clone(), offset, runs))
+    }
+
     /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
     /// there, its bytes' host runs `(from, len, address)` (one a heap they
     /// cross) and its bytes.
