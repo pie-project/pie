@@ -93,6 +93,19 @@ const fn rope_anchor() -> u32 {
     n
 }
 
+/// Most runs a static select is printed as (DSD moves, a run each), else its two mask tables
+/// and three operations over the chunk.
+const SELECT_RUNS: usize = 32;
+
+/// A DSD operand as `operand` prints it (a buffer, a parameter row, a table), not a scalar.
+fn is_dsd(x: &str) -> bool {
+    ["B", "IN", "T_"].iter().any(|p| {
+        x.strip_prefix(p).is_some_and(|r| {
+            !r.is_empty() && r.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    })
+}
+
 /// Most DSD moves a rotation's cos / sin gather is printed as (else a scalar loop over the
 /// slot table).
 const SLOT_RUNS: usize = 8;
@@ -885,6 +898,23 @@ impl Printer<'_> {
                     let pick = if self.host[&cnd][0] != 0.0 { a } else { b };
                     let s = self.operand(pick)?;
                     let _ = writeln!(self.body, "  @fmovs({d}, {s});");
+                } else if let Some(runs) = self.select_runs(cnd)
+                    && let (xa, xb) = (self.operand(a)?, self.operand(b)?)
+                    && is_dsd(&xa)
+                    && is_dsd(&xb)
+                {
+                    // a static condition of few runs (a NeoX head's halves, a partial
+                    // rotation's rest): each run moved from its side, no mask tables
+                    for (e, n, hold) in runs {
+                        let src = if hold { &xa } else { &xb };
+                        if *src == d {
+                            continue;
+                        }
+                        let _ = writeln!(
+                            self.body,
+                            "  @fmovs(@increment_dsd_offset(@set_dsd_length({d}, {n}), {e}, f32), @increment_dsd_offset(@set_dsd_length({src}, {n}), {e}, f32));"
+                        );
+                    }
                 } else {
                     let m = self.mask(cnd, false);
                     let nm = self.mask(cnd, true);
@@ -942,7 +972,36 @@ impl Printer<'_> {
                             })
                     });
                 if !swap && !halves && per.is_none() {
-                    return refuse(format!("op {k}: a gather other than a pair's mate"));
+                    // mates each within its own chunk, the pattern differing chunk to chunk (a
+                    // replicated K / V head's half a head a root, its rotated half on one root
+                    // and its rest on the other): a scalar gather by the chunk's own index table
+                    let s = self.row_of(src)?;
+                    let arr = s
+                        .strip_prefix('B')
+                        .map(|n| format!("b{n}"))
+                        .or_else(|| s.strip_prefix("IN").map(|n| format!("in{n}")));
+                    let within = idx
+                        .iter()
+                        .enumerate()
+                        .all(|(e, &m)| m as usize / c == e / c);
+                    let (Some(arr), true) = (arr, within) else {
+                        return refuse(format!("op {k}: a gather other than a pair's mate"));
+                    };
+                    let name = format!("g{v}");
+                    self.tables.push(Table {
+                        name: name.clone(),
+                        u16: true,
+                        of_chunk: idx
+                            .chunks(c)
+                            .map(|ch| ch.iter().map(|&m| (m as usize % c) as f32).collect())
+                            .collect(),
+                    });
+                    let _ = writeln!(
+                        self.body,
+                        "  {{ var e: u16 = 0; while (e < C) : (e += 1) {{ b{dst}[e] = {arr}[T_{name}_a[e]]; }} }}"
+                    );
+                    self.vals.insert(v, Val::Buf(dst));
+                    return Ok(());
                 }
                 let s = self.row_of(src)?;
                 if let Some(per) = per {
@@ -1037,6 +1096,36 @@ impl Printer<'_> {
             users.get(v).is_none_or(|us| us.iter().all(inside)) && !self.region.results.contains(v)
         });
         keep
+    }
+
+    /// A static bool row's runs `(e, n, holds)` over a chunk, the same for every chunk, at most
+    /// [`SELECT_RUNS`] of them (else `None`: its masks).
+    fn select_runs(&self, v: ValueId) -> Option<Vec<(usize, usize, bool)>> {
+        let c = self.c() as usize;
+        let row = self.host.get(&v)?;
+        let chunks: Vec<&[f32]> = row.chunks(c).collect();
+        let first = chunks.first()?;
+        if first.len() != c
+            || chunks.iter().any(|k| {
+                k.iter()
+                    .zip(first.iter())
+                    .any(|(x, y)| (*x != 0.0) != (*y != 0.0))
+            })
+        {
+            return None;
+        }
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        for (e, &x) in first.iter().enumerate() {
+            let h = x != 0.0;
+            match runs.last_mut() {
+                Some((_, n, hh)) if *hh == h => *n += 1,
+                _ => runs.push((e, 1, h)),
+            }
+            if runs.len() > SELECT_RUNS {
+                return None;
+            }
+        }
+        Some(runs)
     }
 
     /// A static bool row's mask (1 where it holds), or its complement.
@@ -1304,7 +1393,7 @@ impl Printer<'_> {
             let n = t.of_chunk.iter().map(Vec::len).max().unwrap_or(1).max(1);
             let ty = if t.u16 { "u16" } else { "f32" };
             let _ = writeln!(s, "var T_{}_a = @zeros([{n}]{ty});", t.name);
-            if t.name != "rot" && t.name != "rng" && t.name != "slot" {
+            if !t.u16 && t.name != "rot" && t.name != "rng" {
                 let _ = writeln!(
                     s,
                     "const T_{0} = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{C}} -> T_{0}_a[i] }});",
