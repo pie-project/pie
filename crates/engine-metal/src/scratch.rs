@@ -634,7 +634,7 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                     .then_some(budget.max_tokens)
             });
         let Some(rows) = rows else { continue };
-        if !fallback::copyable_mask(trace, compiled, &region.mask) {
+        if !fallback::copyable_mask(trace, compiled, &region.mask, fallback::Carries::default()) {
             continue;
         }
         let Some((ins, outs)) = fallback::operands(&trace.nodes, region) else {
