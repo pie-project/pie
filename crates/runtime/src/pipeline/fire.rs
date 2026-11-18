@@ -868,62 +868,73 @@ const RUNG_WANT_FROM: usize = 16;
 /// once the raise lands.
 const PIECES_AHEAD: usize = 2;
 
-/// A pass's ask for the activation rung funded as a planner waiter: the
-/// room the raise lacks is asked of the planner under the pass's process,
-/// so it is freed as any waiter's pages are (idle cache, processes moved to
-/// the host, the policy's victims); once granted the room is given back and
-/// the rung raised. Runs beside the pass, which keeps firing at the rung it
-/// has, until the raise lands, the pass is through (dropped) or the planner
-/// refuses (`failed`).
+/// A pass's ask for the activation rung, raised from free room: where the
+/// raise lacks chunks that kv holds (the span a lowered rung lent among
+/// them), it asks no planner, since a rise funded as a kv demand would wait
+/// among the waiters it starves, or ahead of them; it says it waits for
+/// room ([`RaiseFunding::waits_for_room`]), the pass fires at the rung held,
+/// and the rise is taken once the pool gives room back (its room signal,
+/// [`crate::store::slots::SlotPool::room_watch`]). Runs beside the pass
+/// until the raise lands or the pass is through (dropped); `failed` says
+/// what refused the rise, where anything does.
 struct RaiseFunding {
     stop: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     failed: Arc<Mutex<Option<String>>>,
+    /// The rise is short of free room: the pass fires at the rung held.
+    short: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RaiseFunding {
     fn start(
         shared: crate::store::shared::Shared,
         engine: usize,
-        pid: uuid::Uuid,
-        quorum: uuid::Uuid,
         rows: u32,
-        epoch_now: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
+        let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let funding = Self {
             stop: stop.clone(),
             stopped: stopped.clone(),
             failed: failed.clone(),
+            short: short.clone(),
         };
         crate::rt::spawn(async move {
-            let Some(planner) = crate::planner::planner_of(pid) else {
-                tracing::debug!(%pid, "a raise's funding finds no planner");
-                return;
-            };
             let target = crate::store::shared::cap_for(&shared, rows);
+            let says = |waits: bool| {
+                if short.swap(waits, std::sync::atomic::Ordering::AcqRel) != waits {
+                    // The pass reads it at its next cut.
+                    crate::store::shared::rung_changed(engine);
+                }
+            };
             // A step with nothing to do waits on the rung's next change (a
-            // raise, a copy, the cap, room freed), armed at its top, or the
-            // stop.
+            // raise, a copy, the cap), on room given back where the rise is
+            // short of it, or on the stop; each armed before it looks.
             while !stopped.load(std::sync::atomic::Ordering::Acquire) {
                 let watch = crate::store::shared::rung_watch(engine);
                 tokio::pin!(watch);
                 watch.as_mut().enable();
+                let room = shared.lock().unwrap().pool().room_watch();
                 crate::store::shared::raise_now(&shared, engine, rows);
                 if crate::store::shared::fire_cap(engine) >= target {
+                    says(false);
                     return;
                 }
                 // Quoted at the rung the raise is taken at: the one the
                 // engine holds where that is wider
                 // (`SharedPool::raise_at`).
-                let pages = {
+                let quote = {
                     let pool = shared.lock().unwrap();
                     let goal = pool.rung_for(rows);
-                    pool.raise_at(goal).map(|at| pool.raise_short(at).1)
+                    pool.raise_at(goal).map(|at| {
+                        let (chunks, _) = pool.raise_short(at);
+                        let spc = pool.list().map_or(1, |list| list.slots_per_chunk.max(1));
+                        (chunks, pool.pool().held_in_span(at).saturating_mul(spc))
+                    })
                 };
-                let Some(pages) = pages else {
+                let Some((chunks, held)) = quote else {
                     // The engine holds a rung the guest terms no longer
                     // fit: the walk brings it down first, and tells the
                     // rung.
@@ -934,67 +945,35 @@ impl RaiseFunding {
                     }
                     continue;
                 };
-                if pages == 0 {
+                if chunks == 0 {
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it, and
                     // tells the rung.
+                    says(false);
                     tokio::select! {
                         () = &mut watch => {}
                         () = stop.notified() => return,
                     }
                     continue;
                 }
-                let demand = crate::planner::Demand {
-                    kv_pages: pages,
-                    rs: crate::store::rs::RsUnits::default(),
-                };
-                tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
-                let asked = tokio::select! {
-                    asked = planner.acquire(pid, quorum, demand) => asked,
+                // Short of free room: the chunks the rise lacks are kv's.
+                // The pass fires at the rung held, and the rise is asked
+                // again only once the pool gives room back.
+                if !short.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::debug!(
+                        engine,
+                        rows,
+                        chunks,
+                        held,
+                        "a rise waits for room: {held} pages held by kv"
+                    );
+                }
+                says(true);
+                crate::store::shared::ask_walk(engine);
+                tokio::select! {
+                    () = room.given() => {}
+                    () = &mut watch => {}
                     () = stop.notified() => return,
-                };
-                match asked {
-                    Ok(crate::planner::Acquired::Granted(grant)) => {
-                        // The room is given back and the rung takes it at
-                        // once, the state in its span moved down first,
-                        // before the pass's own pieces open it again.
-                        // Given back first: its pages go back through the
-                        // pool's own lock.
-                        drop(grant);
-                        let mover = crate::store::shared::programs::LaneMover {
-                            engine,
-                            epoch_now: &epoch_now,
-                        };
-                        let taken = crate::store::shared::programs::take_raise(
-                            &shared,
-                            |pool| pool.rung_for(rows),
-                            &mover,
-                        )
-                        .await;
-                        if let Err(error) = taken {
-                            tracing::error!(engine, %error, "a raise's copy was refused");
-                            *failed.lock().unwrap() = Some(error);
-                            crate::store::shared::rung_changed(engine);
-                            return;
-                        }
-                        crate::store::shared::raise_now(&shared, engine, rows);
-                    }
-                    Ok(crate::planner::Acquired::Requote) => {
-                        tracing::debug!(engine, "a raise's room is quoted again");
-                    }
-                    Ok(crate::planner::Acquired::Yield) => {
-                        tracing::debug!(engine, "a raise's process yields");
-                        tokio::select! {
-                            _ = planner.wait_resident(pid) => {}
-                            () = stop.notified() => return,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(engine, %error, "a raise's room is refused");
-                        *failed.lock().unwrap() = Some(error.to_string());
-                        crate::store::shared::rung_changed(engine);
-                        return;
-                    }
                 }
             }
         });
@@ -1003,6 +982,12 @@ impl RaiseFunding {
 
     fn failed(&self) -> Option<String> {
         self.failed.lock().unwrap().clone()
+    }
+
+    /// Whether the rise is short of free room: the pass fires at the rung
+    /// held until room is given back.
+    fn waits_for_room(&self) -> bool {
+        self.short.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1051,21 +1036,20 @@ struct RungAsk {
     pid: uuid::Uuid,
     /// Held (the walker cuts nothing under it) until dropped.
     want: crate::store::shared::RungWant,
-    /// The room the rung lacks for it, asked of the planner beside the
-    /// pass; `None` where fires may take the rows now.
+    /// The raise the rung lacks for it, taken beside the pass from free
+    /// room; `None` where fires may take the rows now.
     funding: Option<RaiseFunding>,
 }
 
 /// Asks the rung on `engine` for the `rows` a fire of a pass of `own` rows
 /// takes ([`RungAsk`]; `None`: a lone row the cap covers): the rung is
 /// raised at once where nothing moves, a cap the walker lowered behind a
-/// rung still up is lifted back, and what the raise lacks is funded under
-/// the pass's process.
+/// rung still up is lifted back, and what the raise lacks is waited for
+/// beside the pass ([`RaiseFunding`]).
 fn ask_rung(
     stores: &crate::store::registry::Stores,
     engine: usize,
     pid: uuid::Uuid,
-    quorum: uuid::Uuid,
     own: usize,
     rows: u32,
 ) -> Option<RungAsk> {
@@ -1079,14 +1063,7 @@ fn ask_rung(
     let funding = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
         (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
-            || {
-                let kv = stores.kv.clone();
-                RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
-                    crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
-                        kv.current_epoch()
-                    })
-                })
-            },
+            || RaiseFunding::start(shared.clone(), engine, rows),
         )
     });
     Some(RungAsk {
@@ -1120,6 +1097,15 @@ impl RungAsk {
             ),
         )
         .await
+    }
+
+    /// Whether the rise is short of free room, so the pass fires at the rung
+    /// held: read before each piece is cut and submitted, never learnt by
+    /// a wide fire refused.
+    fn fires_at_held_rung(&self) -> bool {
+        self.funding
+            .as_ref()
+            .is_some_and(RaiseFunding::waits_for_room)
     }
 
     /// The ask stands until `last`, the pass's last fire, settles; its
@@ -3895,7 +3881,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // What its fires take of the rung: a lone row carrying more than
         // itself asks as a wider pass does.
         let taken = rows_total.max(carried as usize);
-        let rung_ask = ask_rung(&stores, engine, pid, quorum_pipeline_id, taken, wanted);
+        let rung_ask = ask_rung(&stores, engine, pid, taken, wanted);
         let mut cut_at = crate::store::shared::fire_cap(engine);
         let mut cuts = pass_pieces(
             &full,
@@ -3924,7 +3910,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let (wanted, rung_ask) = if widest > wanted {
             // The wider ask stands before the narrower goes.
             let taken = taken.max(widest as usize);
-            let wider = ask_rung(&stores, engine, pid, quorum_pipeline_id, taken, widest);
+            let wider = ask_rung(&stores, engine, pid, taken, widest);
             drop(rung_ask);
             (widest, wider)
         } else {
@@ -4006,7 +3992,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 // the raised rung once it lands.
                 // A framed piece waits only on a frame already whole.
                 let ahead = PIECES_AHEAD.max(frame_size);
-                if at >= ahead && wanted > cut_at {
+                // A rise short of free room lands only once kv gives room
+                // back: the pass fires at the rung held, and holds back no
+                // piece for it.
+                let held = rung_ask.as_ref().is_some_and(RungAsk::fires_at_held_rung);
+                if at >= ahead && wanted > cut_at && !held {
                     let behind = submitted[at - ahead].clone();
                     // The piece behind settling or the cap rising, each its
                     // own event.
@@ -5304,7 +5294,6 @@ async fn fire_device_geometry<C: FireContext>(
         &stores,
         ws.engine,
         pid,
-        quorum_pipeline_id,
         rows as usize,
         rows,
     );
@@ -6454,7 +6443,7 @@ mod rung_wait_tests {
         let pid = uuid::Uuid::new_v4();
         crate::store::shared::set_fire_cap_for_test(ENGINE, 1);
         // One row a lane: the lane count holds it; it asks nothing.
-        assert!(super::ask_rung(&stores, ENGINE, pid, pid, 1, 1).is_none());
+        assert!(super::ask_rung(&stores, ENGINE, pid, 1, 1).is_none());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
 
         let raise = tokio::spawn(async {
@@ -6463,7 +6452,7 @@ mod rung_wait_tests {
             assert_eq!(crate::store::shared::wanted_rows(ENGINE), 2);
             crate::store::shared::set_fire_cap_for_test(ENGINE, 2);
         });
-        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2).expect("two rows ask");
+        let ask = super::ask_rung(&stores, ENGINE, pid, 2, 2).expect("two rows ask");
         tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(2))
             .await
             .expect("no indefinite wait")
@@ -6504,7 +6493,7 @@ mod rung_wait_tests {
         assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
 
         // A two-row pass is cut and its fire staged under that cap.
-        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2)
+        let ask = super::ask_rung(&stores, ENGINE, pid, 2, 2)
             .expect("two rows ask whatever the cap");
         assert_eq!(ask.wait(2).await, Ok(()));
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
@@ -6539,6 +6528,77 @@ mod rung_wait_tests {
             grow.walk_rung().await;
         }
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+    }
+
+    /// The 500-concurrent wedge (MI300X, Qwen3-0.6B, an empty host tier):
+    /// the walk lowered the rung to one row and the span it lent filled
+    /// with kv, admitted against a device total that counted the lent
+    /// chunks as kv's; a wide pass then asked the rung back, and its raise
+    /// waited in the planner's queue as a kv demand among the waiters it
+    /// would starve, with nothing left to discard. The total counts no
+    /// lent chunk now, and a rise short of free room asks no planner: the
+    /// pass fires at the rung held, decided before it is submitted, and
+    /// the rung rises on the pool's room signal once kv gives chunks back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rise_short_of_lent_room_fires_at_the_held_rung_and_rises_once_kv_frees() {
+        const ENGINE: usize = 71;
+        // 16 chunks, the null chunk, the largest rung's activation 8 (8..16),
+        // the smallest's 2 (14..16): a lowered rung lends 8..14.
+        let stores = super::unfolded_tests::pool_with_rungs(vec![(1, 2), (512, 8)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        let pid = uuid::Uuid::new_v4();
+        let list = {
+            let mut pool = shared.lock().unwrap();
+            pool.steers(ENGINE);
+            pool.lower_rung(1).expect("nothing lies in the span");
+            pool.list().expect("a kv list").pool
+        };
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 1);
+
+        // One count of the kv pages, the lent chunks in none: what the
+        // facts state (16 chunks less the null one and the largest rung's
+        // 8, a page a chunk) is what the planner's total reports.
+        let room = shared.lock().unwrap().room();
+        assert_eq!(room.list_slots, 16 - 1 - 8, "{room:?}");
+        assert_eq!(room.lent_chunks, 6, "{room:?}");
+
+        // kv takes every free slot, the lent chunks among them.
+        let held = {
+            let mut pool = shared.lock().unwrap();
+            let free = pool.pool().available(list);
+            assert_eq!(free, 16 - 1 - 2, "a grant may use the lent chunks");
+            pool.take_refs(list, free).expect("free slots")
+        };
+
+        // A wide pass asks the rung back. The room is all kv's, so its
+        // rise waits for room, and the pass is cut at the rung held before
+        // anything is submitted: a piece of the held width fires at once.
+        let ask = super::ask_rung(&stores, ENGINE, pid, 512, 512).expect("a wide ask");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::store::shared::rung_wait_until(ENGINE, || ask.fires_at_held_rung()),
+        )
+        .await
+        .expect("the rise says it waits for room");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(1)).await,
+            Ok(Ok(())),
+            "a piece of the held width never waits on the rise"
+        );
+
+        // kv gives its chunks back: the rung rises on the room signal.
+        shared.lock().unwrap().give_refs(list, &held);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::store::shared::rung_wait_until(ENGINE, || {
+                crate::store::shared::fire_cap(ENGINE) >= 512
+            }),
+        )
+        .await
+        .expect("the rung rises once kv frees");
+        assert!(!ask.fires_at_held_rung());
+        drop(ask);
     }
 }
 
@@ -9198,7 +9258,7 @@ mod unfolded_tests {
             assert_eq!(crate::store::shared::wanted_rows(ENGINE), 25);
             crate::store::shared::set_fire_cap_for_test(ENGINE, 32);
         });
-        let ask = ask_rung(&stores, ENGINE, pid, pid, rows as usize, rows).expect("it asks");
+        let ask = ask_rung(&stores, ENGINE, pid, rows as usize, rows).expect("it asks");
         tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(rows))
             .await
             .expect("no indefinite wait")
@@ -9231,7 +9291,7 @@ mod unfolded_tests {
         for carried in [0, 1] {
             let decode = FireRows { own: 1, carried };
             let rows = decode.ask();
-            assert!(ask_rung(&stores, ENGINE, pid, pid, rows as usize, rows).is_none());
+            assert!(ask_rung(&stores, ENGINE, pid, rows as usize, rows).is_none());
         }
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
@@ -9260,7 +9320,7 @@ mod unfolded_tests {
         let pid = uuid::Uuid::new_v4();
         crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
         let rows = few.ask();
-        let ask = ask_rung(&stores, ENGINE, pid, pid, rows as usize, rows)
+        let ask = ask_rung(&stores, ENGINE, pid, rows as usize, rows)
             .expect("a row carrying twelve asks as twelve rows do");
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 12);
         drop(ask);
