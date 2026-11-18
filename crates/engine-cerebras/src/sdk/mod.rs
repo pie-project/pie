@@ -711,52 +711,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// [`Runtime::memcpy_h2d_rowbcast`] without waiting: queued ahead of
-    /// later calls, `data` kept until [`Runtime::wait_pending`].
-    pub fn memcpy_h2d_rowbcast_nonblock(
-        &mut self,
-        symbol: &str,
-        data: Vec<u32>,
-        rect: Rect,
-        elems_per_pe: usize,
-        data_type: DataType,
-    ) -> Result<()> {
-        let id = self.rpc.id(symbol, RpcKind::Var)?;
-        let expected = (rect.h.max(0) as usize) * elems_per_pe;
-        if data.len() != expected {
-            return Err(Error::Size {
-                symbol: symbol.into(),
-                expected,
-                actual: data.len(),
-            });
-        }
-        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
-            Error::MissingSymbol(
-                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
-                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
-            )
-        })?;
-        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, true);
-        let mut task = Task::empty();
-        // SAFETY: data moves into `pending` and lives until the task is waited on.
-        unsafe {
-            (rowbcast)(
-                &mut task,
-                self.this(),
-                id,
-                data.as_ptr() as *mut c_void,
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                elems_per_pe as i32,
-                &opts,
-            )
-        };
-        self.pending.push((task, data));
-        Ok(())
-    }
-
     /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
     /// waiting: the copy is queued ahead of later calls, and
     /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.
@@ -792,22 +746,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Launches `name` with `args` without waiting (see
-    /// [`Runtime::memcpy_h2d_nonblock`]).
-    pub fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> Result<()> {
-        self.rpc.id(name, RpcKind::Func)?;
-        let name_s = CxxString::new(name);
-        let args = args.to_vec();
-        let vec = CxxVecU32::borrow(&args);
-        let opts = MemcpyOptions::new(false, 0, 0, true);
-        let mut task = Task::empty();
-        // SAFETY: mirrors are live for the call; the arguments stay alive in
-        // `pending` until the task is waited on.
-        unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
-        self.pending.push((task, args));
-        Ok(())
-    }
-
     /// Waits for and releases every nonblocking call made so far.
     pub fn wait_pending(&mut self) {
         for (mut task, _words) in std::mem::take(&mut self.pending) {
@@ -839,14 +777,4 @@ impl Drop for Runtime {
         unsafe { (self.api().runtime_dtor)(self.this()) };
         // The artifacts object has no exported destructor; its two strings leak.
     }
-}
-
-/// Reinterprets `f32` values as the `u32` words the copy calls take.
-pub fn f32_words(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// Reinterprets copied-back words as `f32`.
-pub fn words_f32(v: &[u32]) -> Vec<f32> {
-    v.iter().map(|x| f32::from_bits(*x)).collect()
 }

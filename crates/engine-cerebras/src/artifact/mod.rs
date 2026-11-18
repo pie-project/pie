@@ -61,11 +61,6 @@ impl Weights {
     }
 }
 
-/// A compiled wafer program: one with an artifact.
-pub fn is_artifact_program(program: &Path) -> bool {
-    program.join(ARTIFACT).join("program.json").exists()
-}
-
 /// The artifact of the compiled program at `program`.
 pub fn read(program: &Path) -> R<Artifact> {
     let dir = program.join(ARTIFACT);

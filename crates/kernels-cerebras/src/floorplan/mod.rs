@@ -200,12 +200,6 @@ impl UnitShape {
         self.cols_of(ColRole::Moe).is_some()
     }
 
-    /// Whether the rows come in runs of different dims or roles.
-    #[must_use]
-    pub fn row_roles(&self) -> bool {
-        self.row_runs.len() > 1
-    }
-
     /// The weight rows of the attention row runs.
     pub fn attn_rows(&self) -> impl Iterator<Item = u32> + '_ {
         self.row_runs

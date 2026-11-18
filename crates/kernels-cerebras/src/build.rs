@@ -16,7 +16,7 @@
 //! and after [`link`]: `out/` (cslc's: the PE images, `out.json`) and `out/artifact/`, the
 //! program the engine opens.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -242,9 +242,4 @@ impl ProgramKey {
         let hex = blake3::hash(text.as_bytes()).to_hex()[..16].to_string();
         Ok(ProgramKey { hex, parts })
     }
-}
-
-/// The directory a program of `key` lives in under `root` (`p-<key>`).
-pub fn program_dir(root: &Path, key: &ProgramKey) -> PathBuf {
-    root.join(format!("p-{}", key.hex))
 }
