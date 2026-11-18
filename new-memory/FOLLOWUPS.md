@@ -117,3 +117,14 @@ unchanged (±0.1%). Within the 2% gate, so it lands as it is. Ablations, 12 pair
 Each is within the ±1% the pairs spread, so no one part carries the cost. The candidate if it ever matters: tokenize
 once, by having the lookup hash the ids the process's own prompt tokenization (or the gateway's, for ids it has)
 produces, instead of tokenizing `raw-prompt` again at arrival.
+
+## F16. Metal's capacity reading counts driver caches that shrink
+
+Metal sizes its pool at load as the working set less this process, less every
+other process's GPU memory (the AGX driver's IORegistry "Alloc system memory"
+less our currentAllocatedSize), less the floor (sc/mac-wired-room). At load the
+reading includes driver caches that shrink once serving starts (3.1 GiB at load
+against ~0.64 GiB during a run on the M1 Max), so the capacity comes out ~22.4
+GiB where 24 GiB was measured safe. Read the cache component apart (or at a
+settled point), never adjust it by a factor.
+
