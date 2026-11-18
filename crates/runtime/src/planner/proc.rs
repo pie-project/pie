@@ -66,6 +66,15 @@ pub(super) struct Proc {
     /// is short, and the pages that frees. It waits, queued, for a
     /// completion, a commit or an eviction to free them, never failed for it.
     pub(super) roles_short: Option<PendingBind>,
+    /// The need its restore last went again on because its runs stood free
+    /// ([`Step::EvictForRoles`](super::plan)): came back short with the
+    /// same need, the need understates what its unpark takes.
+    pub(super) roles_free_retry: Option<(u32, u32)>,
+    /// A need known to understate its unpark: its runs stood free and the
+    /// unpark was short all the same. Free runs of it are no reason to go
+    /// again; room is made for it (idle cache, a grow, the chunks'
+    /// occupants) until its restore lands.
+    pub(super) roles_free_short: Option<(u32, u32)>,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside
@@ -131,6 +140,8 @@ impl Proc {
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
             roles_short: None,
+            roles_free_retry: None,
+            roles_free_short: None,
             bind_room: None,
         }
     }

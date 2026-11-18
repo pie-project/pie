@@ -229,9 +229,26 @@ impl ResidencyPlanner {
                 }
                 Step::EvictForRoles { need: (run, pieces) } => {
                     // Its runs stand free (a completion or a commit gave
-                    // them back): it goes again.
-                    if self.port.guest_room_free(run, pieces) {
-                        self.with_inner(|inner| inner.roles_retry_head());
+                    // them back): it goes again, once a need. Short again
+                    // with the same need, the need understates its unpark
+                    // (Mac Pro's M5 livelock: free runs of it stood, every
+                    // unpark came back short, 20M times, and nothing was
+                    // ever reclaimed or moved); then room is made for it.
+                    let understated = self.with_inner(|inner| {
+                        inner.unmet_head().is_some_and(|(_, waiter)| {
+                            inner.procs.get(&waiter.pid).is_some_and(|proc| {
+                                proc.roles_free_short == Some((run, pieces))
+                            })
+                        })
+                    });
+                    if !understated && self.port.guest_room_free(run, pieces) {
+                        self.with_inner(|inner| {
+                            let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
+                            if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {
+                                proc.roles_free_retry = Some((run, pieces));
+                            }
+                            inner.roles_retry_head();
+                        });
                         continue;
                     }
                     // Idle cache holds chunks too: one set goes, and the
