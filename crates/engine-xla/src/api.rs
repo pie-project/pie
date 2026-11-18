@@ -945,7 +945,7 @@ impl Engine for Xla {
                 .collect();
             shell.copy_slots(&pairs).map_err(fault)?;
         }
-        Ok(engine::completion::copy_landed_placeholder())
+        Ok(shell.copies_landed())
     }
 
     /// The pool is fixed at load: one segment, committed whole.
@@ -1044,10 +1044,10 @@ impl Engine for Xla {
                     "token runs move within the device; between tiers a slot moves whole".into(),
                 ));
             }
-            return shell
+            shell
                 .copy_tier(copy.shape, from, to, &copy.slots)
-                .map_err(fault)
-                .map(|()| engine::completion::copy_landed_placeholder());
+                .map_err(fault)?;
+            return Ok(shell.copies_landed());
         }
         let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
             .slots
@@ -1056,7 +1056,7 @@ impl Engine for Xla {
             .collect();
         shell.copy_slots(&pairs).map_err(fault)?;
         if copy.runs.is_empty() {
-            return Ok(engine::completion::copy_landed_placeholder());
+            return Ok(shell.copies_landed());
         }
         if shell.pools().kv_shape() != Some(copy.shape) {
             return Err(Error::Unsupported {
@@ -1075,7 +1075,8 @@ impl Engine for Xla {
                 tokens: r.tokens,
             })
             .collect();
-        shell.copy_kv(&runs).map_err(fault).map(|()| engine::completion::copy_landed_placeholder())
+        shell.copy_kv(&runs).map_err(fault)?;
+        Ok(shell.copies_landed())
     }
 }
 
