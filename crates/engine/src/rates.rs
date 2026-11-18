@@ -236,6 +236,117 @@ pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
     ((chain_ns - one_ns) / f64::from(n.max(1))).max(0.0)
 }
 
+/// The first rate of `rates` stated with no measurement behind it: a value
+/// at or below zero, or not finite (a timing that settled at nothing), by
+/// its key and where. A launch of 0 ns is a measurement (a launch the work
+/// hides); nothing divides by it. Such a rate is refused by name wherever rates are
+/// read ([`rates_at_load`], `crate::roofline::Constants::of`): nothing
+/// divides by it.
+#[must_use]
+pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)> {
+    let bad = |v: f64| !(v.is_finite() && v > 0.0);
+    let point = |key: &'static str, unit: &str, curve: &[(u32, f64)]| {
+        curve
+            .iter()
+            .find(|&&(_, v)| bad(v))
+            .map(|&(at, v)| (key, format!("at {at} {unit} as {v}")))
+    };
+    if let Some(widths) = &rates.gemm_tflops_by_rows {
+        for (w, curve) in widths {
+            if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(found) = rates
+        .attn_tflops_by_keys
+        .as_deref()
+        .and_then(|curve| point("attn_tflops_by_keys", "keys", curve))
+    {
+        return Some(found);
+    }
+    for (key, v) in [
+        ("hbm_gbps", rates.hbm_gbps),
+        ("elementwise_gbps", rates.elementwise_gbps),
+        ("scan_gelems", rates.scan_gelems),
+    ] {
+        if let Some(v) = v.filter(|&v| bad(v)) {
+            return Some((key, format!("as {v}")));
+        }
+    }
+    None
+}
+
+/// The side of the cube the warm-up's size walk ([`warm_side`]) times
+/// first, and the one after it: the walk's first growth is theirs.
+pub const WARM_PROBE: u32 = 1024;
+
+/// The side of the warm-up's cube matmul (`side x side x side`), walked up
+/// by doubling with a real fire timed at each size (`time(side)`, ns):
+/// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
+/// while its fire, estimated from the last one timed by the growth the last
+/// two measured (their time ratio, carried forward: not the flops' ratio),
+/// fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it is with no
+/// bound stated (nothing is walked then). The margin is the measurement's:
+/// no factor stands under the bound. A phone whose GPU faults a submission
+/// past its watchdog (KGSL's ~2 s) warms on a cube whose fire fits it.
+pub fn warm_side<E>(
+    max_submit: Option<std::time::Duration>,
+    mut time: impl FnMut(u32) -> Result<f64, E>,
+) -> Result<u32, E> {
+    let Some(cap) = max_submit else {
+        return Ok(WARM_SHAPE.0);
+    };
+    let bound = cap.as_nanos() as f64;
+    let mut before = time(WARM_PROBE / 2)?;
+    let mut last = time(WARM_PROBE)?;
+    let mut side = WARM_PROBE;
+    if last > bound {
+        return Ok(WARM_PROBE / 2);
+    }
+    while side < WARM_SHAPE.0 {
+        let growth = last / before.max(f64::MIN_POSITIVE);
+        if last * growth > bound {
+            break;
+        }
+        let next = time(side * 2)?;
+        if next > bound {
+            break;
+        }
+        (before, last, side) = (last, next, side * 2);
+    }
+    Ok(side)
+}
+
+/// The bytes an attention of `shape` moves at least: its queries read and
+/// its output written (each row a query element a head), and its keys' and
+/// values' cells read once.
+#[must_use]
+pub fn attn_bytes(shape: AttnShape) -> f64 {
+    let q = 2.0 * f64::from(shape.rows) * f64::from(shape.q_heads * shape.head_dim) * 2.0;
+    let kv = 2.0 * f64::from(shape.keys) * f64::from(shape.kv_heads * shape.head_dim) * 2.0;
+    q + kv
+}
+
+/// The keys of [`ATTN_KEYS`] the attention curve is timed at on a device
+/// whose ridge is `ridge` (its matmul peak, flops a ns, over its bandwidth,
+/// bytes a ns): from the narrowest whose shape ([`ATTN_SHAPE`] at it) is
+/// compute-bound there (its flops a byte at least the ridge) on, so the
+/// rate is the kernel's compute, not its reads; the widest where none is.
+/// The matmul curve's points play no part.
+#[must_use]
+pub fn attn_keys(ridge: f64) -> Vec<u32> {
+    let bound = |keys: u32| {
+        let s = ATTN_SHAPE.at(keys);
+        attn_flops(s) / attn_bytes(s) >= ridge
+    };
+    let from = ATTN_KEYS
+        .iter()
+        .position(|&k| bound(k))
+        .unwrap_or(ATTN_KEYS.len() - 1);
+    ATTN_KEYS[from..].to_vec()
+}
+
 /// The matmul every backend's rates step warms the device with before it
 /// times anything ([`warm_up`]): the widest the grid times, `m x n x k`.
 pub const WARM_SHAPE: (u32, u32, u32) = (8192, 8192, 8192);
@@ -767,6 +878,12 @@ pub fn rates_at_load(
         rates: measured,
         unsettled,
     } = measure(max_submit)?;
+    if let Some((key, why)) = unmeasured(&measured) {
+        return Err(format!(
+            "the device's rates step measured `[rates] {key}` {why}: nothing weighs a fire by \
+             it, and no rate is divided by"
+        ));
+    }
     let rates = stated.over(measured);
     if !rates.missing().is_empty() {
         return Err(format!(
@@ -996,6 +1113,112 @@ mod tests {
             saved_text(Some(rows), &measured, &how),
             "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
+    }
+
+    #[test]
+    fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
+        let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
+        let path = dir.join("vulkan/user/card-x.toml");
+        let check = |_: &str| Ok(());
+        let save = SaveTo {
+            path: path.clone(),
+            provenance: ("rates", "\"measured at load\"".to_string()),
+            check: &check,
+        };
+        let zero = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 150.0)]),
+            ..all()
+        };
+        let err = rates_at_load(
+            chip(profile::fire::Rates::default()),
+            Some(save),
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: zero,
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`[rates] attn_tflops_by_keys` at 512 keys as 0"),
+            "{err}"
+        );
+        assert!(!path.exists(), "a refused rate was saved");
+        // Stated in a profile, it is refused by the same key: the roofline
+        // divides by none of it.
+        let stated = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+            ..all()
+        };
+        assert_eq!(
+            crate::roofline::Constants::of(&stated).err(),
+            Some("attn_tflops_by_keys")
+        );
+        let nan = profile::fire::Rates {
+            hbm_gbps: Some(f64::NAN),
+            ..all()
+        };
+        assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The warm-up's cube walks up while its next fire, estimated from the
+    /// last by the growth the last two measured, fits the device's bound on
+    /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
+    /// KGSL's ~2 s watchdog.
+    #[test]
+    fn the_warm_up_cube_walks_up_while_its_next_fire_fits_the_bound() {
+        let kgsl = Some(std::time::Duration::from_secs(2));
+        // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
+        let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(cubic(s))
+        })
+        .unwrap();
+        assert_eq!(side, 8192);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
+        // A device slowing past the flops' growth (each doubling 10x, as a
+        // clock sinking under its power cap): 4096^3 at 300 ms, the next
+        // estimated at 3 s, past the bound: it is never fired.
+        let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(sinking(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+        // No bound stated: the widest, nothing timed.
+        let side = warm_side(None, |_| -> Result<f64, ()> {
+            panic!("timed with no bound")
+        });
+        assert_eq!(side, Ok(WARM_SHAPE.0));
+        // The probe itself past the bound: the cube under it.
+        assert_eq!(warm_side(kgsl, |_| Ok::<f64, ()>(3e9)), Ok(WARM_PROBE / 2));
+    }
+
+    /// The attention curve's keys are where its shape is compute-bound on
+    /// the device (its flops a byte past the ridge), from the device's own
+    /// matmul peak and bandwidth: never where a matmul lattice stopped.
+    #[test]
+    fn the_attention_keys_are_compute_bound_and_their_own() {
+        let intensity = |keys: u32| {
+            let s = ATTN_SHAPE.at(keys);
+            attn_flops(s) / attn_bytes(s)
+        };
+        // A ridge every point clears: the whole curve.
+        assert_eq!(attn_keys(1.0), ATTN_KEYS.to_vec());
+        // A ridge past 512 keys' intensity: from the first past it.
+        let ridge = (intensity(512) + intensity(1024)) / 2.0;
+        assert_eq!(attn_keys(ridge), ATTN_KEYS[1..].to_vec());
+        // None compute-bound: the widest alone, never nothing.
+        assert_eq!(attn_keys(f64::MAX), vec![ATTN_KEYS[ATTN_KEYS.len() - 1]]);
     }
 
     #[test]

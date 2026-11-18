@@ -71,6 +71,11 @@ impl Constants {
     /// matmul pads nothing until [`Constants::with_row_tile`] states its
     /// backend's tile.
     pub fn of(rates: &profile::fire::Rates) -> Result<Constants, &'static str> {
+        // A rate at or below zero is no rate: refused by its key, as an
+        // unstated one is, so nothing divides by it.
+        if let Some((key, _)) = crate::rates::unmeasured(rates) {
+            return Err(key);
+        }
         let flops = |curve: &Vec<(u32, f64)>| -> Vec<(u32, f64)> {
             curve.iter().map(|&(x, t)| (x, t * 1e3)).collect()
         };

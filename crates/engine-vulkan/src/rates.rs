@@ -21,6 +21,20 @@ pub fn provenance(device: &str) -> (&'static str, String) {
     )
 }
 
+/// The bound the platform states on one GPU submission, which the rates
+/// step holds each of its frames (and its warm-up's cube) within: on
+/// Android, KGSL's GPU fault timeout of 2 s (source: Qualcomm's msm KGSL
+/// kernel driver, whose dispatcher faults a GPU submission still running
+/// past it and resets the context; the Adreno 840's warm-up of ~1.57 s a
+/// submit ran just under it); none stated elsewhere yet. Until the device's
+/// limits derive it from the platform's watchdog (device-limits-2), it is
+/// this input.
+#[cfg(target_os = "android")]
+pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> =
+    Some(std::time::Duration::from_secs(2));
+#[cfg(not(target_os = "android"))]
+pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> = None;
+
 /// `tuning` with every roofline constant stated
 /// (`engine::rates::rates_at_load`, every engine's rule): as its layers
 /// state them where they state them all; else `device`'s own, measured
@@ -75,7 +89,14 @@ pub fn measure_saying(
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, None, say)
+    engine_gpu::rates::measure_saying::<Api, _>(
+        device,
+        tuning,
+        tier,
+        &timer,
+        STATED_SUBMIT_BOUND,
+        say,
+    )
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic
