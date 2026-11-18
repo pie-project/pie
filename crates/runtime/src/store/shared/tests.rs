@@ -10,6 +10,7 @@ use ::engine::fire::Lane;
 
 use super::*;
 use crate::governor::Retarget;
+use crate::scheduler::worker::PoolOp;
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -264,7 +265,7 @@ fn walk_segments(
                 }
                 pool.committed(prefix);
             }
-            Some(SegmentMove::Evacuate { evacuation }) => {
+            Some(SegmentMove::Evacuate { evacuation, .. }) => {
                 let _ = engine.evacuate(&evacuation);
                 return Retarget::Reached;
             }
@@ -1437,4 +1438,91 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
     };
     crate::pipeline::fire::rs::apply_shared(&mut req, Some(&stateless), None);
     assert_eq!(req.lanes[0].record, ::engine::LaneRecord::Unstated);
+}
+
+/// An evacuation the engine refuses copied nothing, so the pool takes it
+/// back whole: every chunk lies where it lay, in the pool's table as in the
+/// engine's, the segment stays committed and mapped, nothing is released,
+/// and the answer is short of the target, never reached. An evacuation the
+/// engine takes later goes through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_evacuation_is_taken_back_whole_and_a_later_one_goes_through() {
+    use crate::governor::PoolTarget;
+
+    let mut pool = pool();
+    pool.committed(6);
+    let records = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.give_records(&records[..16]);
+    let kept = &records[16..];
+    let placed = |pool: &SharedPool| -> Vec<Vec<u32>> {
+        kept.iter()
+            .map(|&id| {
+                pool.record_slots(id)
+                    .iter()
+                    .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+                    .collect()
+            })
+            .collect()
+    };
+    let before = placed(&pool);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(FakeEngine {
+        prefix: 6,
+        refuse: true,
+        ..FakeEngine::new()
+    }));
+    let lane = engine.clone();
+    let mut grow = SharedGrow::new(0, 9401, shared.clone()).with_lane(move |op| {
+        let mut engine = lane.lock().unwrap();
+        match op {
+            PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+            PoolOp::ReleaseSegments(prefix) => engine.release_segments(prefix),
+            PoolOp::CommitSegments(prefix) => engine.commit_segments(prefix),
+            other => panic!("no {other:?} in this walk"),
+        }
+        .map_err(Into::into)
+    });
+    // Every logical chunk lies where the engine has it.
+    let agree = |shared: &Shared, engine: &FakeEngine| {
+        let pool = shared.lock().unwrap();
+        for (logical, &physical) in pool.pool().chunk_table().iter().enumerate() {
+            assert_eq!(
+                engine.table.physical(logical as u32),
+                Some(physical),
+                "logical chunk {logical}"
+            );
+        }
+        pool.pool().check();
+    };
+
+    assert_eq!(grow.retarget(6), Retarget::Moving { held: 8 });
+    grow.walk().await;
+    {
+        let engine = engine.lock().unwrap();
+        assert!(engine.calls.is_empty(), "nothing copied, nothing released");
+        agree(&shared, &engine);
+    }
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.mapped_segments(), 8);
+        assert_eq!(pool.draining_segments(), 0);
+        assert_eq!(pool.pool().segments().state(5), SegmentState::Committed);
+        assert_eq!(placed(&pool), before, "every record where it was");
+    }
+    assert_eq!(grow.retarget(6), Retarget::NoRoom { held: 8 });
+
+    // The engine takes the next: segment 5 goes, and segment 4 finds no
+    // room left.
+    engine.lock().unwrap().refuse = false;
+    grow.walk().await;
+    {
+        let engine = engine.lock().unwrap();
+        assert!(matches!(engine.calls[0], Call::Evacuate(_)), "{:?}", engine.calls);
+        assert_eq!(engine.calls[1..], [Call::Release(5)]);
+        agree(&shared, &engine);
+    }
+    assert_eq!(shared.lock().unwrap().mapped_segments(), 7);
+    assert_eq!(grow.retarget(6), Retarget::NoRoom { held: 7 });
 }

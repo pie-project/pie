@@ -512,6 +512,7 @@ impl SharedGrow {
         loop {
             let goal = self.goal();
             let (current, retired) = self.epochs();
+            let mut evacuating = None;
             let step = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -534,7 +535,13 @@ impl SharedGrow {
                     return;
                 }
                 Some(SegmentMove::Commit { prefix }) => PoolOp::CommitSegments(prefix),
-                Some(SegmentMove::Evacuate { evacuation }) => PoolOp::Evacuate(evacuation),
+                Some(SegmentMove::Evacuate {
+                    evacuation,
+                    applied,
+                }) => {
+                    evacuating = Some(applied);
+                    PoolOp::Evacuate(evacuation)
+                }
                 Some(SegmentMove::Release { prefix }) => PoolOp::ReleaseSegments(prefix),
                 Some(SegmentMove::CommitSpan { n }) => PoolOp::CommitSpan(n),
                 Some(SegmentMove::ReleaseSpan { n }) => PoolOp::ReleaseSpan(n),
@@ -549,7 +556,6 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
-            let evacuating = matches!(op, PoolOp::Evacuate(_));
             match (self.lane)(self.engine, op).await {
                 Ok(()) => {
                     // A segment mapped: what was promised a waiter is
@@ -585,10 +591,17 @@ impl SharedGrow {
                     if span.is_some() {
                         self.shared.lock().unwrap().block_span_commit(true);
                     }
+                    // A refused evacuation copied nothing: the pool takes it
+                    // back, and what the segment holds has no room to go to
+                    // until the engine takes one.
+                    if let Some(applied) = &evacuating {
+                        self.shared.lock().unwrap().evacuation_refused(applied);
+                        self.no_room.store(true, Ordering::Release);
+                    }
                     return;
                 }
             }
-            if evacuating {
+            if evacuating.is_some() {
                 // The engine took the copy and waits it out before it
                 // gives the segment back: the segment drains once the
                 // fires handed out by now retire, at once on an idle pool.

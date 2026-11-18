@@ -2108,6 +2108,44 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Takes back `evacuation`, applied with [`Self::apply_evacuation`] and
+    /// refused by the engine before its copy: each moved chunk goes back to
+    /// where it lay (the engine's table never changed), held still or let
+    /// go since, and the segment is committed again, its free chunks open.
+    pub fn undo_evacuation(&mut self, evacuation: &Evacuation) {
+        let segment = evacuation.segment;
+        if !matches!(
+            self.segments.state(segment),
+            SegmentState::Draining { .. }
+        ) {
+            return;
+        }
+        self.segments.set_state(segment, SegmentState::Committed);
+        for step in evacuation.moves.iter().rev() {
+            if self.logical_to_physical[step.logical as usize] != step.to {
+                continue;
+            }
+            let back = ChunkMove {
+                logical: step.logical,
+                from: step.to,
+                to: step.from,
+            };
+            if self.chunks[step.logical as usize].shape == NO_SHAPE {
+                // Let go since: two free chunks change places.
+                let displaced = self.physical_to_logical[back.to as usize];
+                self.logical_to_physical[back.logical as usize] = back.to;
+                self.logical_to_physical[displaced as usize] = back.from;
+                self.physical_to_logical[back.to as usize] = back.logical;
+                self.physical_to_logical[back.from as usize] = displaced;
+            } else {
+                self.move_chunk(back);
+            }
+        }
+        for chunk in self.segments.range(segment) {
+            self.reopen(chunk);
+        }
+    }
+
     /// The draining segment planned to wait past `epoch` waits on it
     /// instead: the engine took its copy with the fires through `epoch`
     /// handed out, the last that may read its chunks.

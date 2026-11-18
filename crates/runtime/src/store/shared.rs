@@ -666,9 +666,13 @@ pub enum SegmentMove {
     /// Back segments `0..prefix` (`commit_segments(prefix)`); the pool hands
     /// out their chunks once the engine has, [`SharedPool::committed`].
     Commit { prefix: u32 },
-    /// Copy `evacuation` (applied in the pool already), ahead of the next
-    /// fire; [`SharedPool::moved`] once the engine has it.
-    Evacuate { evacuation: EngineEvacuation },
+    /// Copy `evacuation` (`applied` in the pool already), ahead of the
+    /// next fire; [`SharedPool::evacuated`] once the engine took it,
+    /// [`SharedPool::evacuation_refused`] where it refused it.
+    Evacuate {
+        evacuation: EngineEvacuation,
+        applied: Evacuation,
+    },
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
@@ -2112,6 +2116,7 @@ impl SharedPool {
                 self.apply_evacuation(&evacuation, epoch);
                 Some(SegmentMove::Evacuate {
                     evacuation: engine_moves(&evacuation.moves),
+                    applied: evacuation,
                 })
             }
             SegmentState::Uncommitted => None,
@@ -2202,6 +2207,14 @@ impl SharedPool {
     /// an idle pool, at once.
     pub fn evacuated(&mut self, current: u64) {
         self.pool.drains_through(current);
+    }
+
+    /// The engine refused `evacuation` ([`Self::next_move`]'s, applied in
+    /// the pool already) before its copy: its table never changed, so the
+    /// pool's goes back to it. Every moved chunk lies where it lay, and the
+    /// segment is committed and mapped again; nothing of it is released.
+    pub fn evacuation_refused(&mut self, evacuation: &Evacuation) {
+        self.pool.undo_evacuation(evacuation);
     }
 
     fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {
