@@ -86,6 +86,9 @@ struct Job {
     end: u64,
     /// The ring's host address.
     ring: usize,
+    /// The runtime's copy this batch ends, resolved once its bytes are in
+    /// their slots (CONTRACT-BC 23); a dropped job fails it.
+    copy: Option<engine::completion::CopyLanding>,
 }
 
 /// What the landing thread reports back.
@@ -312,8 +315,12 @@ impl HostTier {
         spans: &mut Vec<(u64, u64, usize)>,
         moves: &mut Vec<(usize, usize, usize)>,
         landed: &mut Option<Event>,
+        copy: Option<engine::completion::CopyLanding>,
     ) -> Result<()> {
         if spans.is_empty() {
+            if let Some(copy) = copy {
+                copy.landed();
+            }
             return Ok(());
         }
         // A move to the device reads its slots into the ring on the swap
@@ -363,6 +370,7 @@ impl HostTier {
             moves: if to_host { moves } else { Vec::new() },
             end: self.head,
             ring,
+            copy,
         };
         spans.clear();
         self.send
@@ -378,11 +386,13 @@ impl HostTier {
     /// Copies each `(device address, tier offset, bytes)` into the tier on
     /// `swap`, behind what it has enqueued. Returns the event the last copy
     /// lands at on the stream (a fire naming one of the device slots waits
-    /// on it); the bytes reach the tier on the landing thread.
+    /// on it); the bytes reach the tier on the landing thread, which then
+    /// resolves `copy`.
     pub fn to_host(
         &mut self,
         swap: *mut core::ffi::c_void,
         slots: &[(u64, u64, usize)],
+        copy: engine::completion::CopyLanding,
     ) -> Result<Option<Event>> {
         let (_, ring) = self.ring();
         let (mut spans, mut moves, mut landed) = (Vec::new(), Vec::new(), None);
@@ -391,23 +401,25 @@ impl HostTier {
             let at = {
                 let (spans, moves, landed) = (&mut spans, &mut moves, &mut landed);
                 self.take(len, &mut |tier: &mut Self| {
-                    tier.send_batch(swap, true, spans, moves, landed)
+                    tier.send_batch(swap, true, spans, moves, landed, None)
                 })?
             };
             spans.push((ring + at as u64, device, len));
             moves.push((at, offset, len));
         }
-        self.send_batch(swap, true, &mut spans, &mut moves, &mut landed)?;
+        self.send_batch(swap, true, &mut spans, &mut moves, &mut landed, Some(copy))?;
         Ok(landed)
     }
 
     /// Copies each `(tier offset, device address, bytes)` to the device on
     /// `swap`, once every batch writing those slots has landed. Returns the
-    /// event the last copy lands at on the stream.
+    /// event the last copy lands at on the stream; the landing thread
+    /// resolves `copy` once it has.
     pub fn to_device(
         &mut self,
         swap: *mut core::ffi::c_void,
         slots: &[(u64, u64, usize)],
+        copy: engine::completion::CopyLanding,
     ) -> Result<Option<Event>> {
         let chunk_bytes = self.chunk_bytes.max(1);
         self.wait_for(
@@ -422,13 +434,13 @@ impl HostTier {
             let at = {
                 let (spans, moves, landed) = (&mut spans, &mut moves, &mut landed);
                 self.take(len, &mut |tier: &mut Self| {
-                    tier.send_batch(swap, false, spans, moves, landed)
+                    tier.send_batch(swap, false, spans, moves, landed, None)
                 })?
             };
             spans.push((device, ring + at as u64, len));
             moves.push((at, offset, len));
         }
-        self.send_batch(swap, false, &mut spans, &mut moves, &mut landed)?;
+        self.send_batch(swap, false, &mut spans, &mut moves, &mut landed, Some(copy))?;
         Ok(landed)
     }
 
@@ -463,13 +475,20 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, base: usize) {
         shared.moved.notify_all();
         return;
     }
-    while let Ok(job) = jobs.recv() {
+    while let Ok(mut job) = jobs.recv() {
         let settled = job.landed.0.settle();
         if let Err(why) = &settled {
+            let what = format!("a host tier move did not land: {why}");
+            if let Some(copy) = job.copy.take() {
+                copy.failed(&what);
+            }
             let mut landed = shared.landed.lock().expect("the landing state");
-            landed.fault = Some(format!("a host tier move did not land: {why}"));
+            landed.fault = Some(what);
         } else {
             land_moves(&job.moves, job.ring, base);
+            if let Some(copy) = job.copy.take() {
+                copy.landed();
+            }
         }
         drop(job.landed);
         let mut landed = shared.landed.lock().expect("the landing state");

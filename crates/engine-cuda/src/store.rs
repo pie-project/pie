@@ -4159,6 +4159,12 @@ impl Pools {
     /// is given: behind what `stream` has enqueued (the fires that wrote
     /// the slots), beside the fires after, of which one that names a slot it
     /// holds waits for it ([`Pools::fence_swaps`]).
+    ///
+    /// `copy` resolves once the copy has landed (CONTRACT-BC 23): a move
+    /// through the host tier on its landing thread, one between the host
+    /// tier and the slot file here. A move between the device and the slot
+    /// file lands with `stream`'s work: its `copy` comes back for the
+    /// caller to resolve behind that.
     pub fn copy_tier_slots(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -4167,9 +4173,11 @@ impl Pools {
         from: Tier,
         to: Tier,
         pairs: &[(u32, u32)],
-    ) -> Result<()> {
+        copy: engine::completion::CopyLanding,
+    ) -> Result<Option<engine::completion::CopyLanding>> {
         if pairs.is_empty() || from == to {
-            return Ok(());
+            copy.landed();
+            return Ok(None);
         }
         let kind = Self::kind_of(shape)?;
         let bytes = self
@@ -4236,9 +4244,9 @@ impl Pools {
                     have: 0,
                 })?;
                 let landed = if to_host {
-                    tier.to_host(lane, &slots)?
+                    tier.to_host(lane, &slots, copy)?
                 } else {
-                    tier.to_device(lane, &slots)?
+                    tier.to_device(lane, &slots, copy)?
                 };
                 if let (Some(landed), Some(_)) = (landed, swap) {
                     self.swaps.push(Swap {
@@ -4252,7 +4260,7 @@ impl Pools {
                         wide: kind != Kind::List,
                     });
                 }
-                Ok(())
+                Ok(None)
             }
             (Tier::Device, Tier::Disk) | (Tier::Disk, Tier::Device) => {
                 self.fence_all_swaps(stream)?;
@@ -4263,7 +4271,8 @@ impl Pools {
                     .unzip();
                 self.through_disk(stream, to_disk, &disk, |pools, at| {
                     pools.chunks.span(kind, device[at], 0, bytes)
-                })
+                })?;
+                Ok(Some(copy))
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
                 let to_disk = to == Tier::Disk;
@@ -4278,9 +4287,14 @@ impl Pools {
                     .into_iter()
                     .map(|slot| self.tier_offset(kind, slot))
                     .collect::<Result<Vec<u64>>>()?;
-                self.host_through_disk(to_disk, &disk, &host, len)
+                self.host_through_disk(to_disk, &disk, &host, len)?;
+                copy.landed();
+                Ok(None)
             }
-            _ => Ok(()),
+            _ => {
+                copy.landed();
+                Ok(None)
+            }
         }
     }
 

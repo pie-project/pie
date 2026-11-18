@@ -497,6 +497,36 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves, windowed)
     }
 
+    /// Resolves `copy` once what `stream` has enqueued is done (CONTRACT-BC
+    /// 23), as a fire's settlement is answered: an event past the copy,
+    /// the notify stream behind it, and the landing on that stream's host
+    /// thread. Where that cannot be posted, the device is waited out (so
+    /// nothing of the copy is in flight) and the fault answered.
+    pub fn land_after(
+        &self,
+        stream: *mut core::ffi::c_void,
+        copy: engine::completion::CopyLanding,
+    ) -> Result<()> {
+        let posted = (|| {
+            let past = crate::device::graph::Event::new()?;
+            past.record(stream)?;
+            past.wait(self.device.notify_stream())?;
+            self.device.host_fn(Box::new(move || copy.landed()))
+        })();
+        if posted.is_err() {
+            let _ = self.device.synchronize();
+        }
+        posted
+    }
+
+    /// A copy just enqueued on the compute stream, resolved once it has
+    /// landed ([`Self::land_after`]).
+    pub fn landed_on_stream(&self) -> Result<engine::CopyCompletion> {
+        let (landing, landed) = engine::completion::copy_in_flight();
+        self.land_after(self.device.stream(), landing)?;
+        Ok(landed)
+    }
+
     /// Lays every fire's arena at the span's start, no smaller rung stated:
     /// what expert parallelism seats its buffers by.
     pub fn drop_rungs(&mut self) {
@@ -1043,6 +1073,12 @@ impl Shell {
     #[must_use]
     pub fn stream(&self) -> *mut core::ffi::c_void {
         self.device.stream()
+    }
+
+    /// The stream tier moves ride beside the fires (CONTRACT-BC 22).
+    #[must_use]
+    pub fn swap_stream(&self) -> *mut core::ffi::c_void {
+        self.device.swap_stream()
     }
 
     /// Instance `instance_id`, what has landed settled: a take reads only
