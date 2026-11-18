@@ -389,6 +389,8 @@ pub fn stream_programs(
         .map_err(io(&cache.root))?;
     let mut names = Vec::new();
     let mut hasher = blake3::Hasher::new();
+    // the annealer, where the config asks (its placement in the files hashed below)
+    kernels_cerebras::place::anneal::enable(cfg.wafer.anneal.unwrap_or(0), 1, false);
     // the readings' programs chosen together: each one's regime and shape, the cheapest request
     // (the schedule's steps of the denoiser) of those that place together on the fabric
     let wanted = stream::wanted(trace, rows, voxels, schedule_steps(trace));
@@ -577,6 +579,7 @@ pub fn unit_program(
         .tempdir_in(&cache.root)
         .map_err(io(&cache.root))?;
     let dir = stage.path().join("decode");
+    kernels_cerebras::place::anneal::enable(0, 1, false);
     let compile = |at: u32, b: u32| {
         let _ = std::fs::remove_dir_all(&dir);
         stream::compile_decode(trace, at, b, true, None, &dir)
@@ -628,7 +631,11 @@ pub fn unit_program(
             best.1
         }
     };
-    compile(at, lanes)?;
+    // the annealer for the program kept alone, where the config asks
+    kernels_cerebras::place::anneal::enable(cfg.wafer.anneal.unwrap_or(0), 1, false);
+    let kept = compile(at, lanes);
+    kernels_cerebras::place::anneal::enable(0, 1, false);
+    kept?;
     let mut hasher = blake3::Hasher::new();
     let mut files = walk(&dir)?;
     files.sort();

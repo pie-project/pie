@@ -67,6 +67,9 @@ pub struct Wafer {
     /// A stream reading's rows a class a step (a diffusion poem's text, context and latent
     /// rows), its programs compiled for: [`DEFAULT_STREAM_ROWS`] unless stated.
     pub stream_rows: Option<u32>,
+    /// The annealing placer's moves after the search for a stream or unit program (kernels-
+    /// cerebras `place::anneal`: the K / V columns placed by the link term): off unless stated.
+    pub anneal: Option<u64>,
 }
 
 /// The rows a class a stream program is compiled for when `[cerebras.wafer] stream_rows` is

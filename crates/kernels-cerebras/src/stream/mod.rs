@@ -369,6 +369,9 @@ fn write_stream(
     out: &std::path::Path,
     gold: Option<&std::path::Path>,
 ) -> R<()> {
+    // (the annealer's placement where it is enabled: GENERIC.md, "Free placement")
+    let annealed = crate::place::anneal::maybe(p)?;
+    let p = annealed.as_ref().map_or(p, |(q, _)| q);
     let e = crate::emit::stream::emit(p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
@@ -427,6 +430,11 @@ pub fn compile_decode(
         false,
         crate::floorplan::stream::Bounds::system(),
     )?;
+    // (the annealer's placement where it is enabled: GENERIC.md, "Free placement")
+    let p = match crate::place::anneal::maybe(&p)? {
+        Some((q, _)) => q,
+        None => p,
+    };
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {

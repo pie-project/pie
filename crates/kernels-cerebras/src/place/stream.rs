@@ -125,6 +125,44 @@ pub fn relay(prog: &Program, s: Stream) -> R<Program> {
     })
 }
 
+/// [`relay`] for a stream whose units sit anywhere (the annealer's): the row stream's wires
+/// stated by their ends (each gap's row `j` from one unit's CX root `j` to the next's) and
+/// routed with the K / V links, in place of the band layout's straight rows and wraps.
+pub fn relay_routed(prog: &Program, s: Stream) -> R<Program> {
+    let mut wiring = s.wiring();
+    let rows = super::anneal::row_stream_links(&wiring);
+    let py = s.py as usize;
+    if rows.len() != py * s.path.len().saturating_sub(1) {
+        return Err(format!(
+            "place: {} row stream wires for {} gaps of {py} rows",
+            rows.len(),
+            s.path.len().saturating_sub(1)
+        ));
+    }
+    for (n, &li) in rows.iter().enumerate() {
+        let (k, j) = (n / py, (n % py) as u32);
+        let (a, b) = (&s.units[s.path[k]], &s.units[s.path[k + 1]]);
+        // (a next unit right after the last on its rows keeps the band's straight row)
+        if a.y == b.y && b.x == a.x + a.cols() + 1 {
+            continue;
+        }
+        if let Link::Path(p) = &mut wiring.links[li] {
+            p.pts = vec![a.cx(j), b.cx(j)];
+        }
+    }
+    let mut floor = s.floor();
+    super::route::fill_layout(&mut floor, &mut wiring)?;
+    let palette = Palette::allocate(Vec::new(), &floor, &wiring)?;
+    let fabric = Fabric::lay(&floor, &wiring, &palette)?;
+    fabric.validate(&floor)?;
+    Ok(Program {
+        stream: s,
+        palette,
+        fabric,
+        ..prog.clone()
+    })
+}
+
 /// `prog` with every K / V column moved `dy` rows down from where it is (the units where they
 /// are, the fabric grown to hold it), its links routed: a placement differing from `prog`'s
 /// in its K / V columns alone (the link term's chip calibration).
