@@ -97,3 +97,13 @@ The guest-state line (0da550eb6) states guest scratch as Instance-slot state
 through `Engine::guest_state`, but keeps `Engine::fire_facts` and the fire's
 guest term as they were: each engine moves its scratch from the term into
 `guest_state` when its half ports. The term goes once no engine states it.
+
+## F15. Copies retire on a watermark of their own
+
+The kv store retires fire and copy epochs on one watermark (the oldest
+epoch still open), so an eviction's or restore's copy in flight holds back
+every slot later fires let go. A separate copy watermark (slots stamp a fire
+epoch and a copy epoch, each freed by its own) would return those slots as
+their own fires land. Measured on the L40S over-demand gate after the
+frame's own-epoch stamp: the fence costs −1.6% against b736a99fd, which this
+would cut further.
