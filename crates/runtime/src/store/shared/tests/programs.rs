@@ -332,7 +332,8 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     {
         let mut pool = shared.lock().unwrap();
         pool.give_records(&all[..all.len() / 2]);
-        pool.pool_mut().retire_through(u64::MAX);
+        pool.pool_mut()
+            .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     }
     planner.granted.notify_one();
     wait.await.unwrap().unwrap();
@@ -560,7 +561,8 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     {
         let mut pool = shared.lock().unwrap();
         pool.give_records(&all[..all.len() / 2]);
-        pool.pool_mut().retire_through(u64::MAX);
+        pool.pool_mut()
+            .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     }
     let where_before: Vec<u32> = {
         let pool = shared.lock().unwrap();
@@ -724,7 +726,8 @@ async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
         .take_records(pool.records_available() as usize)
         .unwrap();
     pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     let kept = all[all.len() / 2..].to_vec();
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
@@ -1249,7 +1252,8 @@ async fn a_growth_at_a_standing_rung_over_state_sends_the_copy_alone() {
     assert!(!lent.is_empty(), "state in the lent span");
     // Room below for what a wider span moves out.
     pool.give_records(&below[..below.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let sent = engine.calls.len();
     let shared: Shared = Arc::new(Mutex::new(pool));

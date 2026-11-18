@@ -361,9 +361,9 @@ impl SubmissionCompletion {
     pub fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
-            SubmissionCompletionKind::Copy(landed) => {
-                landed.check().map(|landed| landed.map_err(anyhow::Error::from))
-            }
+            SubmissionCompletionKind::Copy(landed) => landed
+                .check()
+                .map(|landed| landed.map_err(anyhow::Error::from)),
             SubmissionCompletionKind::Pending(pending) => {
                 if pending.state.closed.load(Ordering::Acquire) {
                     return Some(pending.state.close_error());
@@ -1187,7 +1187,12 @@ mod tests {
         assert!(!ran.load(Ordering::Acquire), "a lease went under the frame");
         assert!(!frame.is_settled());
 
-        settlements.settled(engine::FrameId(1), 0, &engine::StepOutcome::default(), &broker);
+        settlements.settled(
+            engine::FrameId(1),
+            0,
+            &engine::StepOutcome::default(),
+            &broker,
+        );
         assert!(ran.load(Ordering::Acquire), "its hooks run once it lands");
         assert!(
             matches!(fire.state.result(), Some(Err(_))),
@@ -1219,7 +1224,12 @@ mod tests {
         );
         drop(fire);
         assert!(!ran.load(Ordering::Acquire), "a hook ran under the frame");
-        settlements.settled(engine::FrameId(1), 0, &engine::StepOutcome::default(), &broker);
+        settlements.settled(
+            engine::FrameId(1),
+            0,
+            &engine::StepOutcome::default(),
+            &broker,
+        );
         assert!(ran.load(Ordering::Acquire), "its hooks run once it lands");
     }
 

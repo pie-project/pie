@@ -1501,7 +1501,11 @@ impl Roles {
             }
             for part in &item.parts {
                 if let Some(shape) = self.shapes.of(part.role) {
-                    pool.touch_pool(shape.pool, part.refs.iter().copied(), epoch);
+                    pool.touch_pool(
+                        shape.pool,
+                        part.refs.iter().copied(),
+                        crate::store::slots::Touch::Fire(epoch),
+                    );
                 }
             }
         }

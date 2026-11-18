@@ -163,7 +163,8 @@ fn a_span_segment_goes_back_once_the_rung_is_raised_past_it() {
     assert_eq!(pool.pool().span_to_release(), None);
     // Room below, the rung raised past segment 7: its state moves down.
     pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     let evacuation = pool.plan_raise(2048).unwrap();
     assert!(!evacuation.moves.is_empty());
     engine
@@ -177,7 +178,8 @@ fn a_span_segment_goes_back_once_the_rung_is_raised_past_it() {
     );
     // Not while the fire carrying the copy may still read the old chunks.
     assert_eq!(pool.pool().span_to_release(), None);
-    pool.pool_mut().retire_through(10);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(10));
     assert_eq!(pool.pool().span_to_release(), Some(0));
     assert_eq!(
         walk_segments(&mut pool, 6, 11, &mut engine),
@@ -277,7 +279,8 @@ fn a_refused_raise_is_taken_back() {
         .take_records(pool.records_available() as usize)
         .unwrap();
     pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     let kept = &all[all.len() / 2..];
     let before = state_chunks(&pool, kept);
     let evacuation = pool.plan_raise(2048).unwrap();
@@ -579,7 +582,8 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
     {
         let mut pool = shared.lock().unwrap();
         pool.give_records(&all);
-        pool.pool_mut().retire_through(u64::MAX);
+        pool.pool_mut()
+            .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     }
     raise_now(&shared, ENGINE, 300);
     assert_eq!(shared.lock().unwrap().rung(), 2048);

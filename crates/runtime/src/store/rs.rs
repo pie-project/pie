@@ -593,6 +593,8 @@ impl RsStore {
             Some(&oldest) => oldest.saturating_sub(1),
             None => u64::MAX,
         };
+        // The rs store's epochs are its fires' alone: one watermark.
+        let completed = crate::store::slots::Epochs::both(completed);
         self.slots.retire_through(completed);
         self.pages.retire_through(completed);
         for pool in &mut self.window_pools {
@@ -712,7 +714,8 @@ impl RsStore {
 
     fn recycle(&mut self, ids: Vec<RsSlotId>, epoch: u64) {
         for id in ids {
-            self.device_pool(id).recycle_after_epoch(vec![id], epoch);
+            self.device_pool(id)
+                .recycle_after_epoch(vec![id], crate::store::slots::Epochs::both(epoch));
         }
     }
 

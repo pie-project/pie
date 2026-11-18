@@ -9791,14 +9791,20 @@ mod landing_tests {
         let named = taken.pop().expect("a page");
         let epoch = FireEpoch::begin(model, 0, &stores, owner);
         let seq = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.current_epoch());
-        let list = stores.shared.as_ref().unwrap().lock().unwrap().list().unwrap().id;
-        stores
+        let list = stores
             .shared
             .as_ref()
             .unwrap()
             .lock()
             .unwrap()
-            .touch(list, [named.0], seq);
+            .list()
+            .unwrap()
+            .id;
+        stores.shared.as_ref().unwrap().lock().unwrap().touch(
+            list,
+            [named.0],
+            crate::store::slots::Touch::Fire(seq),
+        );
         let fire = crate::engine::WorkItemCompletion::deferred_with_guard(None);
         epoch.retire_on(&fire);
         // The owner lets the page go while the fire still runs.

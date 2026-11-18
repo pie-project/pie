@@ -25,7 +25,7 @@ use crate::policy::{By, Event};
 use crate::rt::Instant;
 use crate::store::chunks::{ShapePool, ShapeRun};
 use crate::store::pool::Pool;
-use crate::store::slots::ShapeKind;
+use crate::store::slots::{Epochs, ShapeKind};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KvStoreError {
@@ -171,7 +171,7 @@ pub struct KvStore {
     /// latest of its path's nodes, not after every fire in flight: a waiter
     /// short of a prompt's pages waited behind ~1600 handed-out epochs (a
     /// second) for cache last read long before ([`Self::fence_of`]).
-    node_epochs: HashMap<NodeId, u64>,
+    node_epochs: HashMap<NodeId, Epochs>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
     owners: HashMap<ProcessId, usize>,
@@ -181,7 +181,11 @@ pub struct KvStore {
     page_size: u32,
     log_seq: u64,
     seq: u64,
-    outstanding: BTreeSet<u64>,
+    /// The fires' epochs still open.
+    fires: BTreeSet<u64>,
+    /// The copies' epochs still open: a watermark of their own, so a copy
+    /// in flight holds back only what it names.
+    copies: BTreeSet<u64>,
     /// The engine's shared pool and its host tier, whose slots wait on
     /// these epochs: a slot let go is handed out again only once the last
     /// fire or copy that touched it retires ([`SlotPool::touch`]), so each
@@ -436,7 +440,8 @@ impl KvStore {
             page_size: 0,
             log_seq: 0,
             seq: 0,
-            outstanding: BTreeSet::new(),
+            fires: BTreeSet::new(),
+            copies: BTreeSet::new(),
             fenced: Vec::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
             cached: Arc::new(tokio::sync::Notify::new()),
@@ -633,16 +638,19 @@ impl KvStore {
     /// [`Self::settle`].
     pub fn begin_fire(&mut self) -> u64 {
         self.seq += 1;
-        self.outstanding.insert(self.seq);
+        self.fires.insert(self.seq);
         self.seq
     }
 
     /// Opens the epoch of a copy about to be handed to the engine: as a
     /// fire's, closed by [`Self::settle`], once the copy has landed (not
-    /// once it is enqueued). The slots it names are touched at it, so a
-    /// slot let go while the copy runs waits for it.
+    /// once it is enqueued), but retired on the copies' own watermark. The
+    /// slots it names are touched at it, so a slot let go while the copy
+    /// runs waits for it, and one it does not name does not.
     pub fn begin_copy(&mut self) -> u64 {
-        self.begin_fire()
+        self.seq += 1;
+        self.copies.insert(self.seq);
+        self.seq
     }
 
     /// The pools whose slots wait on this store's epochs: an engine's
@@ -652,24 +660,33 @@ impl KvStore {
     }
 
     pub fn retire_idle(&mut self) {
-        let retired = self.retired_through();
+        let retired = self.watermarks();
         self.pool.retire_through(retired);
         for pool in &self.fenced {
             pool.lock().unwrap().pool_mut().retire_through(retired);
         }
     }
 
-    /// The fires' and copies' epochs still open, and the oldest of them:
-    /// what everything let go behind it waits on.
+    /// The fires' and copies' epochs still open, and the oldest of them.
     pub fn open_epochs(&self) -> (usize, Option<u64>) {
-        (self.outstanding.len(), self.outstanding.first().copied())
+        let oldest = match (self.fires.first(), self.copies.first()) {
+            (Some(&fire), Some(&copy)) => Some(fire.min(copy)),
+            (fire, copy) => fire.or(copy).copied(),
+        };
+        (self.fires.len() + self.copies.len(), oldest)
     }
 
-    /// The last epoch every fire through which has retired.
-    pub fn retired_through(&self) -> u64 {
-        self.outstanding
-            .first()
-            .map_or(self.seq, |&oldest| oldest.saturating_sub(1))
+    /// How far fires and copies have each retired: the epoch below the
+    /// oldest of each still open, or the last handed out where none is.
+    pub fn watermarks(&self) -> Epochs {
+        let below = |open: &BTreeSet<u64>| {
+            open.first()
+                .map_or(self.seq, |&oldest| oldest.saturating_sub(1))
+        };
+        Epochs {
+            fire: below(&self.fires),
+            copy: below(&self.copies),
+        }
     }
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
@@ -680,9 +697,9 @@ impl KvStore {
 
     /// Stamps the nodes on `node`'s path: a fire handed out through `epoch`
     /// may read their pages.
-    fn stamp_path(&mut self, node: NodeId, epoch: u64) {
+    fn stamp_path(&mut self, node: NodeId, epoch: Epochs) {
         for node in self.table.lineage(node) {
-            let stamp = self.node_epochs.entry(node).or_insert(0);
+            let stamp = self.node_epochs.entry(node).or_default();
             *stamp = (*stamp).max(epoch);
         }
     }
@@ -690,16 +707,15 @@ impl KvStore {
     /// The epoch after which the pages an idle entry ending at `terminal`
     /// holds alone may go back: the latest stamp on its path, at most
     /// `epoch` (now). Stamps every fire has retired through are dropped.
-    fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
-        let retired = self.retired_through();
-        self.node_epochs.retain(|_, stamp| *stamp > retired);
+    fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> Epochs {
+        let retired = self.watermarks();
+        self.node_epochs.retain(|_, stamp| !retired.covers(*stamp));
         self.table
             .lineage(terminal)
             .iter()
             .filter_map(|node| self.node_epochs.get(node).copied())
-            .max()
-            .unwrap_or(0)
-            .min(epoch)
+            .fold(Epochs::default(), Epochs::max)
+            .min(Epochs::both(epoch))
     }
 
     fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
@@ -886,8 +902,10 @@ impl KvStore {
             moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
         }
         let freed = moves.len();
-        self.pool
-            .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
+        self.pool.recycle_after_epoch(
+            moves.into_iter().map(|(_, gpu, _)| gpu).collect(),
+            Epochs::fire(epoch),
+        );
         // With no fire in flight the epoch has retired already: the pages
         // are free now, not at a next fire that may wait on them.
         self.retire_idle();
@@ -1558,9 +1576,11 @@ impl KvStore {
             .table
             .insert_cached(after, backings, token_hashes, page_hashes);
         self.table.lease_cache_root(node);
-        // The copy filling its pages is handed out with the fires after now.
+        // The copy filling its pages is handed out with the fires after now:
+        // its epoch is not known yet, so the pages wait on the fires and
+        // copies alike through the next.
         let now = self.current_epoch().saturating_add(1);
-        self.stamp_path(node, now);
+        self.stamp_path(node, Epochs::both(now));
         // An entry's pages are its path's, from token 0: the prefix it was
         // grafted below as well as its own.
         let pages = self.table.path_len(node);
@@ -1648,7 +1668,7 @@ impl KvStore {
     pub fn release_reader(&mut self, pin: ReaderPin) {
         let freed = self.table.unpin_terminals(&pin.nodes);
         let epoch = self.current_epoch();
-        self.recycle_backings(freed, epoch);
+        self.recycle_backings(freed, Epochs::fire(epoch));
         self.retire_idle();
     }
 
@@ -1781,7 +1801,7 @@ impl KvStore {
         // Its fires through `epoch` may still read what its path holds,
         // whatever stays cached of it.
         if let Ok(Some(terminal)) = self.table.terminal(ws) {
-            self.stamp_path(terminal, epoch);
+            self.stamp_path(terminal, Epochs::fire(epoch));
         }
         if self.keeps {
             self.keep_sealed_prefix(ws);
@@ -1794,7 +1814,7 @@ impl KvStore {
             self.hints.remove(&owner);
         }
         let freed = self.table.release_working_set_backings(ws);
-        self.recycle_backings(freed, epoch);
+        self.recycle_backings(freed, Epochs::fire(epoch));
         self.flat.remove(&ws);
         self.note_cached();
     }
@@ -2049,7 +2069,9 @@ impl KvStore {
         }
     }
 
-    fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
+    /// Device pages go back once what `epoch` names retires (a shared
+    /// pool's slot after the last copy that named it there, too).
+    fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: Epochs) {
         let mut resident = Vec::new();
         let mut swapped = Vec::new();
         for backing in backings {
@@ -2368,7 +2390,7 @@ impl KvStore {
         }
 
         self.seq += 1;
-        self.outstanding.insert(self.seq);
+        self.fires.insert(self.seq);
         Ok(KvPreparedWrite {
             ws,
             targets,
@@ -2431,20 +2453,23 @@ impl KvStore {
         if mapping_changed {
             self.refresh_flat(ws);
         }
-        self.recycle_backings(freed, seq);
+        self.recycle_backings(freed, Epochs::fire(seq));
 
         Ok(seq)
     }
 
     pub fn cancel_prepared(&mut self, prepared: KvPreparedWrite) {
         self.pool
-            .recycle_after_epoch(prepared.allocated, prepared.seq);
-        self.outstanding.remove(&prepared.seq);
+            .recycle_after_epoch(prepared.allocated, Epochs::fire(prepared.seq));
+        self.fires.remove(&prepared.seq);
         self.retire_idle();
     }
 
+    /// Closes the fire's or the copy's epoch `seq`.
     pub fn settle(&mut self, seq: u64) {
-        self.outstanding.remove(&seq);
+        if !self.fires.remove(&seq) {
+            self.copies.remove(&seq);
+        }
         self.retire_idle();
     }
 
@@ -2954,7 +2979,7 @@ impl KvStore {
     }
 
     fn end_move(&mut self, freed: Vec<KvPageBacking>) {
-        self.recycle_backings(freed, self.current_epoch());
+        self.recycle_backings(freed, Epochs::fire(self.current_epoch()));
         self.retire_idle();
         self.moved.notify_waiters();
     }

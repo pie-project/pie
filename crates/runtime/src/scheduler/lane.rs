@@ -207,23 +207,27 @@ fn touch_frame(
         fires.clone().all(|fire| fire.kv_epoch() > 0),
         "a fire reached the lane with no epoch of its own"
     );
-    let epoch = fires.map(crate::engine::WorkItemCompletion::kv_epoch).max().unwrap_or(0);
+    let epoch = fires
+        .map(crate::engine::WorkItemCompletion::kv_epoch)
+        .max()
+        .unwrap_or(0);
+    let touch = crate::store::slots::Touch::Fire(epoch);
     {
         let mut pool = shared.lock().unwrap();
         let rs_list = pool.rs_list().map(|shape| shape.id);
         for lane in submitted.steps.iter().flat_map(|step| &step.lanes) {
             for (shape, refs) in &lane.tables {
-                pool.touch(*shape, refs.iter().copied(), epoch);
+                pool.touch(*shape, refs.iter().copied(), touch);
             }
             for (shape, pairs) in lane.record.pieces().iter().chain(&lane.slot_copies) {
-                pool.touch(*shape, pairs.iter().flatten().copied(), epoch);
+                pool.touch(*shape, pairs.iter().flatten().copied(), touch);
             }
             if let (Some(rs_list), ::engine::RsVerb::Buffer { pages, .. }) = (rs_list, &lane.rs) {
-                pool.touch(rs_list, pages.iter().copied(), epoch);
+                pool.touch(rs_list, pages.iter().copied(), touch);
             }
             for snapshot in &lane.rs_snapshots {
                 for (shape, refs) in &snapshot.fixed {
-                    pool.touch(*shape, refs.iter().copied(), epoch);
+                    pool.touch(*shape, refs.iter().copied(), touch);
                 }
             }
         }
@@ -273,46 +277,55 @@ impl CopyEpoch {
         plan: &PreLaunchCopy,
     ) -> Self {
         use ::engine::transfer::MemoryDomain;
-        let seq = crate::store::registry::with_kv_lock(kv, "copy-epoch", |kv| kv.begin_copy());
         let pool_of = |domain: MemoryDomain| match domain {
             MemoryDomain::LocalDisk => None,
             MemoryDomain::HostPinned => host,
             _ => device,
         };
-        match plan {
-            PreLaunchCopy::Slots(copy) => {
-                let src = copy
-                    .slots
-                    .iter()
-                    .map(|&(src, _)| src)
-                    .chain(copy.runs.iter().map(|run| run.src));
-                if let Some(pool) = pool_of(copy.src) {
-                    pool.lock().unwrap().touch(copy.shape, src, seq);
+        // Opened and touched under the store's lock: a slot it names is let
+        // go either before the copy (and not named) or after it is touched,
+        // never between, now that a copy fences only what it names.
+        let seq = crate::store::registry::with_kv_lock(kv, "copy-epoch", |kv| {
+            let seq = kv.begin_copy();
+            let touch = crate::store::slots::Touch::Copy(seq);
+            match plan {
+                PreLaunchCopy::Slots(copy) => {
+                    let src = copy
+                        .slots
+                        .iter()
+                        .map(|&(src, _)| src)
+                        .chain(copy.runs.iter().map(|run| run.src));
+                    if let Some(pool) = pool_of(copy.src) {
+                        pool.lock().unwrap().touch(copy.shape, src, touch);
+                    }
+                    let dst = copy
+                        .slots
+                        .iter()
+                        .map(|&(_, dst)| dst)
+                        .chain(copy.runs.iter().map(|run| run.dst));
+                    if let Some(pool) = pool_of(copy.dst) {
+                        pool.lock().unwrap().touch(copy.shape, dst, touch);
+                    }
                 }
-                let dst = copy
-                    .slots
-                    .iter()
-                    .map(|&(_, dst)| dst)
-                    .chain(copy.runs.iter().map(|run| run.dst));
-                if let Some(pool) = pool_of(copy.dst) {
-                    pool.lock().unwrap().touch(copy.shape, dst, seq);
-                }
-            }
-            PreLaunchCopy::Kv(copy) => {
-                for (domain, refs) in [(copy.src, &copy.src_page_ids), (copy.dst, &copy.dst_page_ids)]
-                {
-                    if let Some(pool) = pool_of(domain) {
-                        let mut pool = pool.lock().unwrap();
-                        if let Some(list) = pool.list() {
-                            pool.touch_pool(list.pool, refs.iter().copied(), seq);
+                PreLaunchCopy::Kv(copy) => {
+                    for (domain, refs) in [
+                        (copy.src, &copy.src_page_ids),
+                        (copy.dst, &copy.dst_page_ids),
+                    ] {
+                        if let Some(pool) = pool_of(domain) {
+                            let mut pool = pool.lock().unwrap();
+                            if let Some(list) = pool.list() {
+                                pool.touch_pool(list.pool, refs.iter().copied(), touch);
+                            }
                         }
                     }
                 }
+                // A state copy names the rs store's ids, which fence on its
+                // own epochs.
+                PreLaunchCopy::State(_) => {}
             }
-            // A state copy names the rs store's ids, which fence on its
-            // own epochs.
-            PreLaunchCopy::State(_) => {}
-        }
+            seq
+        });
         Self {
             kv: Arc::clone(kv),
             seq,

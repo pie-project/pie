@@ -1923,7 +1923,8 @@ async fn a_guest_bind_waiting_for_fenced_room_binds_as_the_fire_retires() {
     assert!(long_engine.borrow().bindings.is_empty());
 
     // The fire retires: the run is free, the pool tells, and it binds there.
-    device.lock().unwrap().pool_mut().retire_through(5);
+    device.lock().unwrap().pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(5));
     let std::task::Poll::Ready(bound) = futures::poll!(wait.as_mut()) else {
         panic!("the retire did not wake it: room came free and no one was told");
     };
@@ -1959,7 +1960,8 @@ fn a_pair_s_state_waits_on_the_fires_of_its_instances() {
     assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty(), "the pair is closed");
     // Untouched, the pair's two chunks came free here, under the fire.
     assert_eq!(free(), before, "the pair's chunks wait on the fire naming it");
-    device.lock().unwrap().pool_mut().retire_through(5);
+    device.lock().unwrap().pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(5));
     assert_eq!(
         free(),
         before + 3,
