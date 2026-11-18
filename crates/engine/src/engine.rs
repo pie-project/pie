@@ -206,7 +206,7 @@ pub trait Engine: Send {
     /// backend's compiled guest code), without registering any: the
     /// runtime's prewarm of the programs its standard samplers register,
     /// before ready, so a registration of one of them builds nothing
-    /// (`crate::live::Tally::BuiltAfterReady`). The default builds nothing.
+    /// (`crate::live::Tally::BuiltAtRegister`). The default builds nothing.
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
         let _ = registrations;
         Ok(())

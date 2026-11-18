@@ -955,7 +955,7 @@ impl Engine for Metal {
         // load's prewarm did not prepare.
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltInFire, built);
             tracing::warn!(
                 program = registration.program_hash,
                 regions = built,
@@ -1000,7 +1000,7 @@ impl Engine for Metal {
         // ready that compiled guest code is one the prewarm did not prepare.
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltInFire, built);
             tracing::warn!(
                 program = id.0,
                 regions = built,

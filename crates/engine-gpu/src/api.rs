@@ -275,7 +275,7 @@ impl<B: Host> Gpu<B> {
     /// Counts the pipelines built after ready, by a frame's fires or a bind:
     /// the load built every kernel pipeline its walks named and every guest
     /// step's, so each one built since is one it did not prepare
-    /// ([`engine::live::Tally::BuiltAfterReady`]).
+    /// ([`engine::live::Tally::BuiltInFire`]).
     /// And the steps a backend that keeps recordings walked to keep: a shape
     /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
     /// And the steps walked and kept by no recording: each ran eagerly. On a
@@ -290,7 +290,7 @@ impl<B: Host> Gpu<B> {
             .map_or_else(Vec::new, Shell::built_serving);
         // A kernel is built once, so each is named once.
         for kernel in built {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, 1);
+            self.live.tally(engine::live::Tally::BuiltInFire, 1);
             tracing::error!(
                 engine = B::KIND,
                 kernel,
@@ -306,7 +306,7 @@ impl<B: Host> Gpu<B> {
         let guest = self.programs.built_serving();
         if guest > self.guest_built {
             self.live.tally(
-                engine::live::Tally::BuiltAfterReady,
+                engine::live::Tally::BuiltInFire,
                 guest - self.guest_built,
             );
             self.guest_built = guest;

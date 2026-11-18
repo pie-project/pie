@@ -907,6 +907,13 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// Whether the load's arming sealed the bodies: from then on a fire is
+    /// a serving one.
+    #[must_use]
+    pub fn bodies_sealed(&self) -> bool {
+        self.map.sealed()
+    }
+
     /// Drops every recorded body and what was refused, unsealed: what the
     /// bodies captured (a kernel chosen for where a weight lay) no longer
     /// holds, and the lattice is armed again.

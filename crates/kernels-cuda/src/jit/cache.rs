@@ -125,6 +125,7 @@ pub(crate) fn load(root: &Root, instantiation: &str) -> Result<Resolved, Fault> 
         // SAFETY: as above: `module` is loaded, and unloaded once here.
         unsafe { dr::cuModuleUnload(module) };
     })?;
+    crate::tally::built();
     Ok(Resolved {
         module,
         function,

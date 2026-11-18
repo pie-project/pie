@@ -101,6 +101,16 @@ impl Shell {
     where
         Self: 'a,
     {
+        let built = kernels_cuda::tally::counts().built;
+        let settled = self.settle_fire(enqueued, done);
+        self.count_built_in_fire(built);
+        settled
+    }
+
+    fn settle_fire<'a>(&mut self, enqueued: Enqueued<'a>, done: Option<Done>) -> Result<Settled>
+    where
+        Self: 'a,
+    {
         let Enqueued {
             mut prepared,
             launches: _,
