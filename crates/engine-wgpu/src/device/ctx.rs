@@ -500,6 +500,8 @@ impl Context {
         let max_buffer = limits
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size);
+        #[cfg(feature = "test-limits")]
+        let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
