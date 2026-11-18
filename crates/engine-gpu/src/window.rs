@@ -288,7 +288,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && fallback::copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask, fallback::Carries::default())
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;

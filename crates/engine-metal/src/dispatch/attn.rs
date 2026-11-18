@@ -159,8 +159,9 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
-                // A lane stating a mask never reaches `attn.decode` here: its
-                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                // The fire's masks, as its decode plan binds them
+                // (`attn.plan_decode`): each row's word, a lane stating none
+                // reading every key.
                 mask: _,
                 q,
                 plan,
@@ -239,8 +240,9 @@ impl Run<'_> {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
-                // A lane stating a mask never reaches `attn.decode` here: its
-                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                // A selection's arm reads no per-lane mask: a lane stating
+                // one on a class reading it in no other arm is refused
+                // (`Fault::MaskUnread`).
                 mask: _,
                 q,
                 plan,
@@ -277,7 +279,10 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // A selection's arm reads no per-lane mask: a lane stating
+                // one on a class reading it in no other arm is refused
+                // (`Fault::MaskUnread`).
+                mask: _,
                 bias: None,
                 floor: None,
                 causal: true,
@@ -329,7 +334,9 @@ impl Run<'_> {
                 o,
                 selection: None,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor
+                // stays 0, as in the plain arms.
+                floor: _,
                 selected: None,
                 rel: None,
                 lse: None,
@@ -362,7 +369,9 @@ impl Run<'_> {
                 lse: Some(lse),
                 selection: None,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor
+                // stays 0, as in the plain arms.
+                floor: _,
                 selected: None,
                 rel: None,
             } if mask.is_some() || !*causal => attn::arbiter::masked_lse(
@@ -381,8 +390,9 @@ impl Run<'_> {
                 self.tuning(),
             ),
             Attn::Decode {
-                // A lane stating a mask never reaches `attn.decode` here: its
-                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                // The fire's masks, as its decode plan binds them
+                // (`attn.plan_decode`): each row's word, a lane stating none
+                // reading every key.
                 mask: _,
                 q,
                 plan,

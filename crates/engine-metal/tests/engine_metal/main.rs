@@ -9,6 +9,7 @@ mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_device_fold_lane_states_its_own_fold;
 mod a_kv_only_lane_reports_its_device_fold;
+mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_load_walks_its_score_capturing_forms;
 mod a_recurrent_load_walks_its_pipelines;
 mod a_device_placed_kv_write_lands_in_its_buffer;

@@ -1271,7 +1271,7 @@ impl<B: Serve> Shell<B> {
 
         let arms = boot.runahead.frames().max(1);
 
-        let gathers = fallback::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled, fallback::Carries::default());
 
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
