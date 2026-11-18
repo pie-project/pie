@@ -32,6 +32,9 @@ pub struct PlannerStats {
     /// Walks that ended without the grow they promised
     /// ([`super::ResidencyPlanner::no_grow`]).
     pub no_grows: AtomicU64,
+    /// Plans that waited on pages arriving (let go under device work in
+    /// flight) rather than moving a process out.
+    pub arrival_waits: AtomicU64,
     pub host_swap_exhaustions: AtomicU64,
     pub host_swap_unblocks: AtomicU64,
     pub d2h_pages: AtomicU64,

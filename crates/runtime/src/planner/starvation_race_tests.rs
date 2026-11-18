@@ -40,6 +40,8 @@ struct RacePool {
     /// `RegistryPool`'s does: the waiter registered short, then promised a
     /// grow only where the walk's next step maps a segment.
     grow: Option<crate::store::shared::SharedGrow>,
+    /// Pages let go under device work in flight (`device_arriving`).
+    arriving: AtomicU32,
 }
 
 impl RacePool {
@@ -53,6 +55,7 @@ impl RacePool {
             host_total: 0,
             rs_model: None,
             grow: None,
+            arriving: AtomicU32::new(0),
         }
     }
 
@@ -80,6 +83,9 @@ impl RacePool {
 }
 
 impl PoolPort for RacePool {
+    fn device_arriving(&self) -> u32 {
+        self.arriving.load(Ordering::SeqCst)
+    }
     fn grow(&self, need: Demand) -> bool {
         let Some(grow) = &self.grow else {
             return false;
@@ -2346,4 +2352,73 @@ async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
     );
     assert_eq!(d.grow_parked, 0);
     assert!(reached_eviction(&planner, key), "it went on to eviction");
+}
+
+/// A page let go under a fire or copy in flight is arriving: a head whose
+/// need it covers waits for that landing, woken by it, rather than moving
+/// another process out. (On MI300X the fence alone had slots come back
+/// later, and the planner evicted for pages about to land: ~1.9x evictions
+/// and restores.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_covered_by_arriving_pages_waits_for_them_instead_of_evicting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::with_swap(4, 64));
+    pool.arriving.store(1, Ordering::SeqCst);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, running) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let key = planner.with_inner(|inner| {
+        for pid in [head, running] {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+        }
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    planner.plan();
+    assert!(
+        !reached_eviction(&planner, key),
+        "a head the arriving page covers went on to an eviction plan"
+    );
+    assert_eq!(planner.stats.arrival_waits.load(Ordering::Relaxed), 1);
+
+    // The work lands: its page is free, and its settling wakes the plan.
+    pool.arriving.store(0, Ordering::SeqCst);
+    pool.refill_after_stall(1, 0);
+    planner.pages_freed();
+    assert_eq!(planner.stats.serves.load(Ordering::Relaxed), 1, "served on the landing");
+    assert!(!reached_eviction(&planner, key));
+}
+
+/// With nothing of the fleet in flight, what is let go under an epoch has
+/// nothing that lands it: the head does not wait on it.
+#[tokio::test(flavor = "current_thread")]
+async fn arriving_pages_do_not_hold_a_stalled_fleet() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::with_swap(4, 64));
+    pool.arriving.store(1, Ordering::SeqCst);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.with_inner(|inner| {
+        let mut proc = Proc::new(inner.next_seq);
+        inner.next_seq += 1;
+        proc.admitted = true;
+        inner.procs.insert(head, proc);
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    planner.plan();
+    assert_eq!(planner.stats.arrival_waits.load(Ordering::Relaxed), 0);
 }

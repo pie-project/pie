@@ -3043,6 +3043,12 @@ impl KvStore {
         self.pool.available()
     }
 
+    /// Device pages let go that wait only on a fire or copy in flight: they
+    /// come back, each as the work naming it lands.
+    pub fn arriving_pages(&self) -> usize {
+        self.pool.arriving()
+    }
+
     pub fn note_short(&mut self, pages: u32) {
         self.short_pages = self.short_pages.max(pages);
         self.pool.wait(u64::from(self.short_pages));

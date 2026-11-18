@@ -1611,6 +1611,16 @@ impl SlotPool {
         self.pending.values().map(Vec::len).sum()
     }
 
+    /// Slots of `shape` let go and waiting on a fire: arriving, each as the
+    /// fire it waits on lands.
+    pub fn pending_of(&self, shape: ShapeId) -> u64 {
+        self.pending
+            .values()
+            .flatten()
+            .filter(|slot| self.chunks[slot.chunk as usize].shape == shape)
+            .count() as u64
+    }
+
     fn locate(&mut self, slot: Slot) -> (&mut ShapeState, usize) {
         let meta = self.chunks[slot.chunk as usize];
         assert!(meta.shape != NO_SHAPE, "{slot:?} lies in a free chunk");

@@ -180,6 +180,12 @@ impl ResidencyPlanner {
                     ) {
                         return true;
                     }
+                    // Pages let go under device work in flight come back
+                    // as it lands, and its settling plans again: a head
+                    // they cover waits for them rather than moving anyone.
+                    if self.arrivals_cover(count) {
+                        return false;
+                    }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle(count) {

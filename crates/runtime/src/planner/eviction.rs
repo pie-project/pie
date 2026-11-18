@@ -431,6 +431,7 @@ impl ResidencyPlanner {
 
     pub(super) fn supply_stalled(&self) -> bool {
         let (free, _) = self.port.device_stats();
+        let arriving = self.port.device_arriving();
         self.with_inner(|inner| {
             let accum = inner.accum.len() as u32;
             if inner.kill_in_flight() {
@@ -439,7 +440,10 @@ impl ResidencyPlanner {
             if inner.unmet_head().is_none() {
                 return false;
             }
-            let expected = inner.expected_reclaim().pages;
+            // Arriving pages land with the work in flight; a stalled fleet
+            // has none that lands.
+            let arriving = if inner.fleet_stalled() { 0 } else { arriving };
+            let expected = inner.expected_reclaim().pages + arriving;
             let supply = free + accum + expected;
             if inner.queued_quantum() > supply {
                 return true;
@@ -449,6 +453,19 @@ impl ResidencyPlanner {
                     .unmet_head()
                     .is_some_and(|(_, head)| head.kv_need() > accum + expected)
         })
+    }
+
+    /// Whether pages arriving (let go, waiting only on device work in
+    /// flight) cover `missing`: the head waits for their landing. Not once
+    /// the fleet has stalled, where nothing of it is in flight to land.
+    pub(super) fn arrivals_cover(&self, missing: u32) -> bool {
+        let arriving = self.port.device_arriving();
+        if arriving < missing || self.is_wedged() {
+            return false;
+        }
+        self.stats.arrival_waits.fetch_add(1, Ordering::Relaxed);
+        ptrace!("plan waits on arriving pages missing={missing} arriving={arriving}");
+        true
     }
 
     pub(super) fn is_wedged(&self) -> bool {
