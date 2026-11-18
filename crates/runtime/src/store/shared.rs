@@ -319,9 +319,18 @@ pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
 /// is cut at the raised width from its first piece. A cap the walker
 /// lowered behind a rung still up is lifted back to it.
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
+    // Read before the pool's lock: the planner reads the pool under its own.
+    let waits = planner_demand_waits(0, engine);
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
     let goal = pool.rung_for(rows);
+    // A throughput raise is ordered after every process demand waiting for
+    // room: while one waits it takes no room ([`SharedPool::demand_waits`]).
+    if pool.demand_waits(waits)
+        && pool.pool().act_chunks(goal) > pool.pool().act_reserved()
+    {
+        return;
+    }
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -360,6 +369,15 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         set_fire_cap(engine, cap);
     }
     drop(pool);
+}
+
+/// Whether a process's demand waits for room on the planner of `model`'s
+/// `engine` (a kv allocation, a restore or a guest bind short of room; a
+/// rise is ordered among them by its own key, not counted). Read before
+/// the pool's lock is taken: the planner reads the pool under its own.
+#[must_use]
+pub fn planner_demand_waits(model: usize, engine: usize) -> bool {
+    crate::planner::planner_for(model, engine).is_some_and(|planner| planner.demand_waits())
 }
 
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
@@ -2216,6 +2234,17 @@ impl SharedPool {
     #[must_use]
     pub fn guest_head(&self) -> Option<(u32, u32)> {
         self.guest_head
+    }
+
+    /// Whether a process's demand waits for room on this pool: a guest
+    /// bind's head here, or (`planner`, read before this pool's lock,
+    /// [`planner_demand_waits`]) a kv allocation or restore. A throughput
+    /// raise (one only cuttable passes want) takes no room while one does,
+    /// and the rung walk lowers toward the narrowest rung the admitted work
+    /// needs, giving room back.
+    #[must_use]
+    pub fn demand_waits(&self, planner: bool) -> bool {
+        planner || self.guest_head.is_some()
     }
 
     /// Whether a refused `commit_span` waits for room to be freed.
