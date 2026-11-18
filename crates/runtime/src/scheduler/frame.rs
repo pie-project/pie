@@ -249,12 +249,20 @@ impl FramePolicy {
         self.batch_tokens = tokens;
     }
 
-    /// Fires are cut to `rows` of the activation rung now: a lane whose
-    /// next frame holds a wider fire (cut under a cap since lowered) is
-    /// left out of the frames sealed from here, its frame kept whole until
-    /// the cap is back; every fire of a frame sealed goes.
+    /// The engine holds a rung of `rows` now: a lane whose next frame
+    /// holds a wider fire is left out of the frames sealed from here, its
+    /// frame kept whole until the rung is back; every fire of a frame
+    /// sealed goes. A fire cut under a cap lowered since still goes while
+    /// the engine holds the rung it was cut for: the rung is not lowered
+    /// under a fire queued (the scheduler's grant).
     pub fn cap_fires(&mut self, rows: usize) {
         self.fire_cap = rows;
+    }
+
+    /// The rows of the rung the engine holds, as [`Self::cap_fires`] set.
+    #[must_use]
+    pub fn fire_cap(&self) -> usize {
+        self.fire_cap
     }
 
     /// The widest rung rows a sealed frame still to go takes; 0 where none

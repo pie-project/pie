@@ -214,6 +214,13 @@ impl ResidencyPlanner {
             Parked::Entry(key, notify) => {
                 self.stats.parks.fetch_add(1, Ordering::Relaxed);
                 ptrace!("park key={:?} pid={} kv={:?}", key, pid, demand.kv_pages);
+                if ahead {
+                    tracing::info!(
+                        %pid,
+                        pages = demand.kv_pages,
+                        "an owed raise waits for room ahead of every other waiter"
+                    );
+                }
                 crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
                 let mut registration = WaitRegistration {
                     planner: self,
