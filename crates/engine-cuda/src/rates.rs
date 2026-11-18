@@ -293,6 +293,7 @@ mod on_device {
         fn burst(
             &self,
             rounds: usize,
+            sets: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
             let turn = engine::rates::Rotation::default();
@@ -301,6 +302,7 @@ mod on_device {
             let k = engine::rates::warmed_frames(
                 None,
                 None,
+                u32::try_from(sets).unwrap_or(u32::MAX),
                 |k| self.time(&mut || fire(k as usize)),
                 |why| why,
             )?
@@ -514,7 +516,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
+        let ns = clock.burst(ROUNDS, sets, &mut |i| {
+            fire(i).map_err(say("the per-row ops"))
+        })?;
         engine::rates::rate_from(
             "per-row ops",
             ns,
@@ -616,7 +620,7 @@ mod on_device {
                 )
             };
             lay(held, || fire(0))?;
-            let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
+            let ns = clock.burst(ROUNDS, planes, &mut |i| fire(i).map_err(say("the matmul")))?;
             engine::rates::rate_from(
                 &format!("matmul {m}x{n}x{k}"),
                 ns,
@@ -769,7 +773,7 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
+        let ns = clock.burst(ROUNDS, sets, &mut |i| fire(i).map_err(say("the attention")))?;
         engine::rates::rate_from(
             &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
             ns,
@@ -863,7 +867,7 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
+        let ns = clock.burst(ROUNDS, sets, &mut |i| fire(i).map_err(say("the scan")))?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,
@@ -876,7 +880,7 @@ mod on_device {
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
-        let ns = clock.burst(ROUNDS, &mut |_| {
+        let ns = clock.burst(ROUNDS, 1, &mut |_| {
             crate::device::copy_d2d(stream, into.ptr(), from.ptr(), COPY_BYTES)
                 .map_err(say("the copy"))
         })?;
@@ -917,7 +921,7 @@ mod on_device {
             let exec = graph
                 .instantiate(stream)
                 .map_err(say("the launch's graph"))?;
-            clock.burst(LAUNCH_ROUNDS, &mut |_| {
+            clock.burst(LAUNCH_ROUNDS, 1, &mut |_| {
                 exec.launch(stream).map_err(say("the launch's graph"))
             })
         };

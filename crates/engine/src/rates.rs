@@ -480,19 +480,52 @@ pub fn timed_frames<E>(
     })
 }
 
+/// Every one of the `sets` operand sets a point's fires rotate through,
+/// touched once on the device and untimed: `sets` fires in all, in one
+/// frame, or in frames of as many as fit under `max_submit` where the
+/// device states a bound on one submission. A set the device has never
+/// read costs its first fire far more than a warm one (on an M5 Pro a
+/// 256 x 1024 x 1024 matmul over 384 fresh 2 MiB planes ran 112 us a fire
+/// against 25 us once they had been read), so a point whose timed fires
+/// fall on sets no fire has touched yet times that first touch, not the
+/// kernel.
+pub fn touch_sets<E>(
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    let mut left = sets.max(1);
+    let one = frame(1)?;
+    left -= 1;
+    let per = max_submit.map_or(left, |cap| {
+        ((cap.as_nanos() as f64 / one.max(1.0)) as u32).max(1)
+    });
+    while left > 0 {
+        let n = per.min(left);
+        frame(n)?;
+        left -= n;
+    }
+    Ok(())
+}
+
 /// A timed point's frames, the one rule for every point every engine
-/// times: their length settled by [`timed_frames`], then frames of that
-/// length run until their rate stops moving ([`warm_up`]'s rule), so the
-/// point is timed at the clock it holds under its own load, never in a
-/// state an earlier point or an idle gap left behind. Before this every
-/// point but the memory-bound ones went untimed by it, and on an M5 Pro a
+/// times: every operand set it rotates through touched once
+/// ([`touch_sets`]), their length settled by [`timed_frames`], then frames
+/// of that length run until their rate stops moving ([`warm_up`]'s rule),
+/// so the point is timed at the clock it holds under its own load over
+/// sets the device has read before, never in a state an earlier point, an
+/// idle gap or a fresh allocation left behind. Before this every point but
+/// the memory-bound ones went untimed by it, and on an M5 Pro a
 /// few-microsecond matmul read about 5 or about 34 TFLOP/s run to run.
+/// `sets` is the rotation's length (1 where nothing rotates).
 pub fn warmed_frames<E>(
     max_submit: Option<std::time::Duration>,
     estimate_ns: Option<f64>,
+    sets: u32,
     mut frame: impl FnMut(u32) -> Result<f64, E>,
     refuse: impl FnOnce(String) -> E,
 ) -> Result<Frames, E> {
+    touch_sets(max_submit, sets, &mut frame)?;
     let frames = timed_frames(max_submit, estimate_ns, &mut frame, refuse)?;
     let k = frames.fires;
     warm_up(|| frame(k).map(|ns| f64::from(k) / ns.max(f64::MIN_POSITIVE)))?;
@@ -958,12 +991,81 @@ mod tests {
         let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
         assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
         calls.set(0);
-        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        let frames = super::warmed_frames(None, None, 1, frame, |why| why).expect("it settles");
         let settled_at = calls.get();
         assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
         // The next frame of that length reads the fast state.
         let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
         assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
+    }
+
+    /// A point whose fires are slow on any operand set the device has not
+    /// read yet, its rotation longer than the frames its doublings settle
+    /// in: warmed_frames touches every set first, so the point is timed
+    /// over touched sets only, at their rate. (On an M5 Pro a 256 x 1024 x
+    /// 1024 matmul over 384 fresh planes read about 5 or about 30 TFLOP/s
+    /// run to run, by whether its timed fires fell on planes read before.)
+    #[test]
+    fn a_point_is_timed_only_over_sets_the_device_has_touched() {
+        const SETS: usize = 384;
+        // A fire on a set read before takes 1 ns, its first one 20 ns.
+        let rig =
+            |touched: &std::cell::RefCell<Vec<bool>>, turn: &super::Rotation, k: u32| -> f64 {
+                (0..k)
+                    .map(|_| {
+                        let at = turn.next(SETS);
+                        if std::mem::replace(&mut touched.borrow_mut()[at], true) {
+                            1.0
+                        } else {
+                            20.0
+                        }
+                    })
+                    .sum()
+            };
+        let touched = std::cell::RefCell::new(vec![false; SETS]);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> { Ok(rig(&touched, &turn, k)) };
+        let frames =
+            super::warmed_frames(None, None, SETS as u32, frame, |why| why).expect("it settles");
+        assert!(touched.borrow().iter().all(|&t| t), "every set was touched");
+        assert_eq!(
+            frames.per_fire_ns, 1.0,
+            "the point settles at the touched sets' rate"
+        );
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the timed frames read touched sets only");
+        // Untouched (the doublings alone), the point times first touches:
+        // the case this rule closes.
+        let fresh = std::cell::RefCell::new(vec![false; SETS]);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> { Ok(rig(&fresh, &turn, k)) };
+        let untouched =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            untouched.per_fire_ns, 20.0,
+            "untouched, the doublings time first touches"
+        );
+    }
+
+    /// The touch keeps each of its frames under the device's bound on one
+    /// submission, and still covers every set once.
+    #[test]
+    fn the_touch_keeps_under_the_submission_bound() {
+        let fires = std::cell::Cell::new(0u32);
+        let longest = std::cell::Cell::new(0u32);
+        let mut frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            longest.set(longest.get().max(k));
+            Ok(f64::from(k) * 1000.0)
+        };
+        super::touch_sets(Some(std::time::Duration::from_micros(10)), 95, &mut frame)
+            .expect("it touches");
+        assert_eq!(fires.get(), 95, "every set touched once");
+        assert!(
+            longest.get() <= 10,
+            "no frame past the bound ({} fires)",
+            longest.get()
+        );
     }
 
     use super::*;

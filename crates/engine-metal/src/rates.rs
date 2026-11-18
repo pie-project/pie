@@ -203,6 +203,7 @@ impl Bench<'_> {
     /// matmul 26% apart run to run on an M1 Max, 20 ms within 0.25%).
     fn timed(
         &self,
+        sets: usize,
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
         let turn = engine::rates::Rotation::default();
@@ -210,6 +211,7 @@ impl Bench<'_> {
         let k = engine::rates::warmed_frames(
             None,
             None,
+            u32::try_from(sets).unwrap_or(u32::MAX),
             |k| self.frame_of(&turn, encode, k).map(|s| s * 1e9),
             |why| why,
         )?
@@ -243,7 +245,7 @@ impl Bench<'_> {
         // Each repeat reads the next weight: serving streams a layer's from
         // memory, and one weight repeated would sit in the system cache,
         // by a share that changes run to run (2x at m = 16 on an M5 Pro).
-        let seconds = self.timed(&|sink, at_k| {
+        let seconds = self.timed(weights.len(), &|sink, at_k| {
             gemm::matmul(
                 sink,
                 self.tuning,
@@ -286,7 +288,7 @@ impl Bench<'_> {
             ));
             held.extend([x, normed, packed, y]);
         }
-        let seconds = self.timed(&|sink, at| {
+        let seconds = self.timed(sets.len(), &|sink, at| {
             let (x, normed, packed, y) = sets[at as usize % sets.len()];
             kernels_metal::elemwise::norm::rmsnorm(sink, x, wt, 1e-6, normed)?;
             kernels_metal::linear::mlp::swiglu(sink, packed, width, y)
@@ -370,7 +372,7 @@ impl Bench<'_> {
         let indptr = self.tensor(&q_indptr, 2, 1, Dtype::I32)?;
         let o = self.tensor(&out, rows, q_heads * d, Dtype::Bf16)?;
         let scale = 1.0 / (d as f32).sqrt();
-        let seconds = self.timed(&|sink, at| {
+        let seconds = self.timed(sets_of.len(), &|sink, at| {
             let (q, page_indices) = sets_of[at as usize % sets_of.len()];
             attn::arbiter::prefill(
                 sink,
@@ -445,7 +447,7 @@ impl Bench<'_> {
         let weight = self.tensor(&weight, channels, CONV, Dtype::Bf16)?;
         let gates = self.tensor(&gates, TOKENS, 2 * HEADS, Dtype::F32)?;
         let y = self.tensor(&y, TOKENS, HEADS * DV, Dtype::F32)?;
-        let seconds = self.timed(&|sink, _| {
+        let seconds = self.timed(1, &|sink, _| {
             ssm::causal_conv1d_chunked(sink, x, weight, &pool, CONV, 1, convolved)?;
             ssm::gated_delta_chunked(
                 sink,
@@ -524,7 +526,7 @@ impl Bench<'_> {
         );
         // One dispatch of the chain, timed back to back: each reads the
         // output of the one before.
-        let link = self.timed(&|sink, i| {
+        let link = self.timed(2, &|sink, i| {
             let (from, into) = if i % 2 == 0 { (at, yt) } else { (yt, at) };
             gemm::matmul(sink, self.tuning, from, wt, into)
         })?;
@@ -538,7 +540,7 @@ impl Bench<'_> {
                 self.tensor(&wa, 32 * n, 32, Dtype::Bf16)?,
                 self.tensor(&wy, 32 * n, 32, Dtype::Bf16)?,
             );
-            let one = self.timed(&|sink, _| gemm::matmul(sink, self.tuning, wat, wt, wyt))?;
+            let one = self.timed(1, &|sink, _| gemm::matmul(sink, self.tuning, wat, wt, wyt))?;
             gaps.push((
                 n,
                 engine::rates::launch_from(link * 1e9 * f64::from(n), one * 1e9, n),
