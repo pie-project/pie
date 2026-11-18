@@ -482,6 +482,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     if let Some(planner) = crate::planner::planner_of(ctx.id()) {
         planner.note_admitted(ctx.id());
     }
+    crate::store::waiting::left(ctx.id());
     crate::policy::report(crate::policy::Event::Started(ctx.id()));
 }
 
@@ -880,6 +881,7 @@ impl Process {
         // below orders by its key.
         let props = arrival.props.clone();
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
+        crate::store::waiting::arrived(process_id, &props);
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
         if let Some(planner) = crate::planner::planner_of(process_id) {
@@ -1052,6 +1054,7 @@ impl Process {
                 (Err(_), true, _) | (_, false, By::Host) => Outcome::Failed,
                 (_, false, By::Client | By::Policy) => Outcome::Cancelled,
             };
+            crate::store::waiting::left(self.client_pid);
             crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());

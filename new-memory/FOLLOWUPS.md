@@ -105,3 +105,15 @@ room of `max_lanes` key and page rows that a fire lays its capturing lanes'
 rows in, per_pair (`engine_gpu::guest::state`). Score rows in each
 instance's own room (the capture kernels launched once per pool segment
 over per-lane bases) are a later step.
+
+## F15. Arrival-prefix lookup: the last ~1.3% of max throughput
+
+sc/plex11-arrival-prefix-2 (d69302d31) costs max output −1.31% against b736a99fd: 95% CI −2.19..−0.43, median
+−1.17%, over 39 strictly alternated pairs (Qwen3-8B, A6000, 500 requests at the most rate, no policy). TPOT is
+unchanged (±0.1%). Within the 2% gate, so it lands as it is. Ablations, 12 pairs each, against the same base:
+- `waiting::arrived` returning at once (no tokenizing, lookup or report): +1.9 ± 0.9%
+- the gateway stating no `raw-prompt` (so the runtime looks nothing up): +1.2 ± 1.2%
+- the store recording no changed page keys: about −1.3% (an earlier round)
+Each is within the ±1% the pairs spread, so no one part carries the cost. The candidate if it ever matters: tokenize
+once, by having the lookup hash the ids the process's own prompt tokenization (or the gateway's, for ids it has)
+produces, instead of tokenizing `raw-prompt` again at arrival.
