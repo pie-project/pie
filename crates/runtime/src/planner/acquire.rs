@@ -106,11 +106,32 @@ impl ResidencyPlanner {
         quorum_id: ProcessId,
         demand: Demand,
     ) -> Result<Acquired, PlannerError> {
-        let acquired = self.acquire_inner(pid, quorum_id, demand).await;
+        let acquired = self.acquire_inner(pid, quorum_id, demand, false).await;
         if matches!(acquired, Ok(Acquired::Granted(_))) {
             self.note_peak(pid, demand);
         }
         acquired
+    }
+
+    /// `pid`'s ask of `pages` kv pages for an activation rise that cannot
+    /// fire narrower (a piece no cut brings under the rung held, a
+    /// program's fire term): a keyed demand, served in the requester's key
+    /// order like any, its grant given back at once for the rise to take.
+    /// The requester's own pages in the span are moved by the rise, never
+    /// freed, so they weigh in no hog or overcommit check, and a pool
+    /// whose rise cannot seat what one process holds was refused at load
+    /// (its largest rung beside one sequence at the context).
+    pub async fn acquire_rise(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        quorum_id: ProcessId,
+        pages: u32,
+    ) -> Result<Acquired, PlannerError> {
+        let demand = Demand {
+            kv_pages: pages,
+            rs: crate::store::rs::RsUnits::default(),
+        };
+        self.acquire_inner(pid, quorum_id, demand, true).await
     }
 
     async fn acquire_inner(
@@ -118,12 +139,13 @@ impl ResidencyPlanner {
         pid: ProcessId,
         quorum_id: ProcessId,
         demand: Demand,
+        rise: bool,
     ) -> Result<Acquired, PlannerError> {
         if let Some(grant) = self.grant_now(pid, demand) {
             return Ok(Acquired::Granted(grant));
         }
         let (_, kv_total) = self.port.device_stats();
-        if demand.kv_pages > kv_total {
+        if demand.kv_pages > kv_total && !rise {
             if let Some(room) = self.port.room() {
                 return Err(PlannerError::PastPool {
                     need: demand.kv_pages,
@@ -186,6 +208,7 @@ impl ResidencyPlanner {
                     notify: notify.clone(),
                     outcome: None,
                     yielded: false,
+                    rise,
                 },
             );
             Parked::Entry(key, notify)
@@ -270,20 +293,26 @@ impl ResidencyPlanner {
         }
     }
 
-    async fn await_signal(&self, signal: &Notify, settled: impl Fn() -> bool) {
+    /// Sleeps until what a non-resident process waits on changes: its own
+    /// residency (`signal`, told as it is evicted, restored, rolled back or
+    /// gone), or the policy answering pressure with nothing freed, the
+    /// event its short restore gives up on ([`Self::restore_expired`]).
+    /// No clock: a planner poke for another process, or the shortfall
+    /// standing, does not wake it. (On a 100 ms re-report it woke each
+    /// waiter ten times a second while it stayed evicted.)
+    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        let answered = crate::policy::pressure::answered();
+        tokio::pin!(answered);
+        answered.as_mut().enable();
         if settled() {
             return;
         }
-        // A restore short of room the policy must make says so again while
-        // it waits, as a parked allocation does.
-        if crate::rt::time::timeout(crate::policy::pressure::AGAIN, notified)
-            .await
-            .is_err()
-        {
-            self.report_short();
+        tokio::select! {
+            () = &mut notified => {}
+            () = &mut answered => {}
         }
     }
 
@@ -372,7 +401,7 @@ impl ResidencyPlanner {
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            self.await_signal(&signal, || self.is_resident(pid)).await;
+            Self::await_residency_change(&signal, || self.is_resident(pid)).await;
             if let Some(error) = self.restore_expired(pid) {
                 tracing::warn!(%pid, %error, "planner: a short restore gives up");
                 return Err(error);
@@ -472,7 +501,28 @@ impl ResidencyPlanner {
             match served {
                 None => return Err(PlannerError::Cancelled),
                 Some(true) => return Ok(()),
-                Some(false) => notified.await,
+                Some(false) => {
+                    // Room that comes free or moves (the rung lowered or
+                    // raised, a segment committed, guest state given back)
+                    // has the planner quote the waiting head again, not only
+                    // its own serve: it never waits on room that is there.
+                    let (model, engine) = self.port.locus();
+                    let rung = crate::store::shared::rung_watch(engine);
+                    let given = crate::store::registry::try_get(model, engine)
+                        .and_then(|stores| stores.roles)
+                        .map(|roles| roles.lock().unwrap().room_watch());
+                    let given = async move {
+                        match given {
+                            Some(watch) => watch.freed().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        () = notified => {}
+                        () = rung => self.poke(),
+                        () = given => self.poke(),
+                    }
+                }
             }
         }
     }

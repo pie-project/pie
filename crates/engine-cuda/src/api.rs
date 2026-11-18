@@ -61,6 +61,12 @@ pub struct Cuda {
     next_fire: u64,
     next_frame: u64,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
+    /// The channels each live instance was bound on (`binding.channels`).
+    attached: BTreeMap<InstanceId, Vec<ChannelId>>,
+    /// Channels closed while an instance was still bound on them: kept
+    /// registered, slots and all, so a rebind of their ring is served,
+    /// until the last of those instances closes ([`Engine::close_channel`]).
+    closing: std::collections::BTreeSet<ChannelId>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
@@ -88,6 +94,8 @@ impl Cuda {
             next_fire: 1,
             next_frame: 1,
             channels: BTreeMap::new(),
+            attached: BTreeMap::new(),
+            closing: std::collections::BTreeSet::new(),
             sink: None,
             tap_sink: None,
             pending: None,
@@ -153,6 +161,20 @@ impl Cuda {
             endpoint.rebase(at);
         }
         Ok(())
+    }
+
+    /// Whether a live instance is bound on channel `id`.
+    fn bound_on(&self, id: ChannelId) -> bool {
+        self.attached
+            .values()
+            .any(|channels| channels.contains(&id))
+    }
+
+    /// Whether channel `id` is registered on this engine: open, or closed
+    /// with an instance still bound on it.
+    #[must_use]
+    pub fn has_channel(&self, id: ChannelId) -> bool {
+        self.channels.contains_key(&id)
     }
 
     pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
@@ -1255,6 +1277,12 @@ impl Engine for Cuda {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
+        if let Some(id) = binding.channels.iter().find(|id| self.closing.contains(id)) {
+            return Err(Error::Program(format!(
+                "channel {id} is closed: it is kept only for the instances already bound \
+                 on it, and a new instance cannot bind on it"
+            )));
+        }
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -1294,6 +1322,9 @@ impl Engine for Cuda {
         if let Some(bound) = bound {
             self.adapters.insert(id, bound);
         }
+        if !binding.channels.is_empty() {
+            self.attached.insert(id, binding.channels.clone());
+        }
         Ok(BoundInstance {
             id,
             program: binding.program,
@@ -1311,11 +1342,27 @@ impl Engine for Cuda {
         // CUDA lays its guests' tables in their pairs' state, which the
         // runtime holds: it keeps none standing.
         shell.close_program_instance(id).map_err(fault)?;
+        // A closed channel this was the last instance on is released now.
+        for channel in self.attached.remove(&id).unwrap_or_default() {
+            if self.closing.contains(&channel) && !self.bound_on(channel) {
+                self.closing.remove(&channel);
+                self.channels.remove(&channel);
+            }
+        }
         Ok(0)
     }
 
+    /// Closes channel `id`. With an instance still bound on it, the channel
+    /// is only marked closing: its registration and slots stay, and a
+    /// rebind of its ring is served, until the last such instance closes
+    /// ([`Engine::close_channel`]).
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.channels.remove(&id);
+        if self.bound_on(id) {
+            self.closing.insert(id);
+        } else {
+            self.closing.remove(&id);
+            self.channels.remove(&id);
+        }
         Ok(())
     }
 
