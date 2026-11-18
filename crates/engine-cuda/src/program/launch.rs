@@ -782,7 +782,14 @@ fn temporary_bytes(plan: &LaunchStagePlan, descriptors: &[ValueDesc], blocks: &[
 }
 
 /// The bytes a block of `region` keeps in the temporary area: what its
-/// kernel does, by the emitter that writes it.
+/// kernel does, by the emitter that writes it. This is the SIMT emitter's
+/// published need, and it stands alone: the shared whole-value floor
+/// (`eta_exec::stage_temporaries`, 16 B an element of the widest value) is
+/// a figure for kernels that sort or reduce a whole value in the area,
+/// which no SIMT kernel does past what is counted here (a select keeps its
+/// candidates in shared memory, a sampler in the engine's lane arenas, an
+/// order block two rows of indices), and it would lay a top-p lane its
+/// vocabulary's 16 B an element where its kernels keep none.
 fn block_temporary(
     plan: &LaunchStagePlan,
     descriptors: &[ValueDesc],
@@ -2112,15 +2119,22 @@ mod tests {
         };
         let reduces =
             |tag: u8| matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN);
-        let vocab = shipped::QWEN_VOCAB;
         let mut stated_some = 0;
         let mut stated_none = 0;
-        for (name, traced) in shipped::all(vocab) {
+        // Short vectors (where a kernel's fixed state is widest against its
+        // value's) and the shipped vocabulary.
+        let programs = [16, 64, 255, 900, shipped::QWEN_VOCAB]
+            .into_iter()
+            .flat_map(|vocab| shipped::all(vocab).into_iter().map(move |p| (vocab, p)));
+        for (vocab, (name, traced)) in programs {
             let (stages, package) = shipped::compiled(&traced, vocab);
             let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
                 panic!("{name}: one stage");
             };
             let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let laid = lay_out(plan, &descriptors)
+                .unwrap_or_else(|why| panic!("{name} over {vocab}: {why}"));
+            let blocks = region_blocks(plan, &descriptors);
             assert_eq!(stage.fused.regions.len(), plan.fused.len());
             for (index, (region, lowered)) in
                 stage.fused.regions.iter().zip(&plan.fused).enumerate()
@@ -2149,7 +2163,18 @@ mod tests {
                 assert_eq!(
                     !names.is_empty(),
                     stated != 0,
-                    "{name}: region {index} ({:?}): {stated} bytes a block stated, named by {names:#?}",
+                    "{name} over {vocab}: region {index} ({:?}): {stated} bytes a block stated, \
+                     named by {names:#?}",
+                    lowered.kind
+                );
+                // Each of the region's blocks is handed at least what it
+                // keeps: the stride `launch_region` cuts the area into.
+                let rows = u64::from(blocks[index].max(1));
+                let stride = (laid.temporary_bytes / rows) & !(SCRATCH_ALIGN - 1);
+                assert!(
+                    stride >= stated,
+                    "{name} over {vocab}: region {index} ({:?}): a block keeps {stated} bytes \
+                     and is handed {stride}",
                     lowered.kind
                 );
                 if stated == 0 {
