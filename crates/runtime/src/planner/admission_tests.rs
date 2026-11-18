@@ -25,11 +25,15 @@ impl PoolPort for SizedPool {
             rs: Default::default(),
         }
     }
-    fn working_set_pages(&self, pids: &[ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[ProcessId]) -> super::pool::WorkingSetPages {
         let sizes = self.sizes.lock();
-        pids.iter()
-            .map(|pid| sizes.get(pid).copied().unwrap_or(0))
-            .sum()
+        super::pool::WorkingSetPages {
+            resident: pids
+                .iter()
+                .map(|pid| sizes.get(pid).copied().unwrap_or(0))
+                .sum(),
+            ..Default::default()
+        }
     }
     fn host_stats(&self) -> (u32, u32) {
         (0, 0)

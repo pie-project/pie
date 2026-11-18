@@ -2107,7 +2107,9 @@ impl KvPageTable {
     /// and the pages each has reserved past those it maps (its next step).
     /// A page parked below the device takes none until it comes back; a
     /// working set the table no longer knows takes none.
-    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
+    /// `(resident, reserved)`: the mapped pages on the device, and those
+    /// reserved past the mapped.
+    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> (usize, usize) {
         let mut locations = FxHashSet::default();
         let mut unmapped = 0u64;
         for &ws in working_sets {
@@ -2119,7 +2121,7 @@ impl KvPageTable {
                 locations.insert(location);
             });
         }
-        locations
+        let resident = locations
             .into_iter()
             .filter(|location| {
                 matches!(
@@ -2127,8 +2129,8 @@ impl KvPageTable {
                     Ok(KvPageBacking::Resident(_))
                 )
             })
-            .count()
-            .saturating_add(usize::try_from(unmapped).unwrap_or(usize::MAX))
+            .count();
+        (resident, usize::try_from(unmapped).unwrap_or(usize::MAX))
     }
 
     fn locations(

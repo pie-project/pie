@@ -1198,7 +1198,8 @@ impl ResidencyPlanner {
                 .collect()
         });
         !running.is_empty()
-            && self.port.working_set_pages(&running) >= u64::from(self.port.device_stats().1)
+            && self.port.working_set_pages(&running).total()
+                >= u64::from(self.port.device_stats().1)
     }
 
     pub fn admits(&self, pid: ProcessId, admitted: &[ProcessId]) -> bool {
@@ -1224,11 +1225,32 @@ impl ResidencyPlanner {
         }
         running.push(pid);
         // Read off the planner's lock: the working sets take the stores'.
-        let need = self
-            .port
-            .working_set_pages(&running)
-            .saturating_add(next_step);
-        need <= u64::from(self.port.device_stats().1)
+        let parts = self.port.working_set_pages(&running);
+        let need = parts.total().saturating_add(next_step);
+        let (free, total) = self.port.device_stats();
+        let fits = need <= u64::from(total);
+        if !fits && tracing::enabled!(target: "pie::admission", tracing::Level::DEBUG) {
+            let own = self.port.working_set_pages(&[pid]);
+            tracing::debug!(
+                target: "pie::admission",
+                %pid,
+                running = running.len() - 1,
+                total,
+                need,
+                resident = parts.resident,
+                reserved = parts.reserved,
+                state = parts.state,
+                roles = parts.roles,
+                next_step,
+                own_resident = own.resident,
+                own_reserved = own.reserved,
+                own_roles = own.roles,
+                free,
+                idle = self.port.reclaimable_idle(),
+                "refused for room"
+            );
+        }
+        fits
     }
 
     /// The hold `pid` keeps on its place here past its exit (see

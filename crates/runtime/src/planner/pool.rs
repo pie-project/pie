@@ -18,6 +18,28 @@ pub struct ChunkStats {
     pub rs: (RsUnits, RsUnits),
 }
 
+/// The device pages working sets take, by part ([`PoolPort::working_set_pages`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkingSetPages {
+    /// Their kv pages on the device, each shared page once.
+    pub resident: u64,
+    /// Their kv pages reserved past those mapped: their next step.
+    pub reserved: u64,
+    /// Their state.
+    pub state: u64,
+    /// Their instances' slots (tables, rings, guest state).
+    pub roles: u64,
+}
+
+impl WorkingSetPages {
+    pub fn total(&self) -> u64 {
+        self.resident
+            .saturating_add(self.reserved)
+            .saturating_add(self.state)
+            .saturating_add(self.roles)
+    }
+}
+
 pub trait PoolPort: Send + Sync + 'static {
     /// The device's chunks by shape.
     fn chunk_stats(&self) -> ChunkStats;
@@ -102,9 +124,9 @@ pub trait PoolPort: Send + Sync + 'static {
     /// set parked below the device takes none until it comes back. Pages are the room's
     /// unit: what is not kv counts as the pages it keeps out of the pool.
     /// What admission weighs ([`super::ResidencyPlanner::admits`]).
-    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> WorkingSetPages {
         let _ = pids;
-        0
+        WorkingSetPages::default()
     }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
@@ -294,9 +316,9 @@ impl PoolPort for RegistryPool {
         u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
-    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> WorkingSetPages {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
-            return 0;
+            return WorkingSetPages::default();
         };
         let kv_sets: HashSet<_> = pids
             .iter()
@@ -308,7 +330,8 @@ impl PoolPort for RegistryPool {
                 )
             })
             .collect();
-        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-working-sets", |kv| {
+        let (resident, reserved) =
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-working-sets", |kv| {
             kv.working_set_pages(&kv_sets)
         });
         let rs = pids.iter().fold(RsUnits::default(), |sum, &pid| {
@@ -324,10 +347,12 @@ impl PoolPort for RegistryPool {
             let chunks = roles.div_ceil(room.chunk_bytes.max(1));
             self.chunks_as_pages(u32::try_from(chunks).unwrap_or(u32::MAX))
         });
-        u64::try_from(kv)
-            .unwrap_or(u64::MAX)
-            .saturating_add(u64::from(self.rs_as_pages(rs)))
-            .saturating_add(u64::from(roles))
+        WorkingSetPages {
+            resident: resident as u64,
+            reserved: reserved as u64,
+            state: u64::from(self.rs_as_pages(rs)),
+            roles: u64::from(roles),
+        }
     }
 
     fn reclaim_idle(&self) -> u32 {
