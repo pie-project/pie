@@ -1216,6 +1216,37 @@ impl Plane {
         bound.session.settle_launched(&program.plan)
     }
 
+    /// The attached instances of a buffer the harvest waited on, settled:
+    /// where it completed (`completed`), each epilogue's verdict, one that
+    /// did not commit faulting its own lanes (returned with why); where the
+    /// device refused it, each instance's pass is abandoned, its lanes
+    /// failed once by the buffer's refusal, and the instance stages its
+    /// next pass as if this one had settled. Left airborne, a refused
+    /// buffer's instance refused every later fire ("already has a pass
+    /// airborne").
+    pub fn settle_flight<L: Clone>(
+        &mut self,
+        attached: &[(InstanceId, L)],
+        completed: bool,
+        refused: impl Fn(&crate::Fired, InstanceId) -> Fault,
+    ) -> Vec<(L, InstanceId, String)> {
+        let mut faulted = Vec::new();
+        for (instance, lanes) in attached {
+            if !completed {
+                self.abandon_launched(*instance);
+                continue;
+            }
+            let outcome = self.settle_launched(*instance).and_then(|fired| match fired {
+                crate::Fired::Committed => Ok(()),
+                other => Err(refused(&other, *instance)),
+            });
+            if let Err(fault) = outcome {
+                faulted.push((lanes.clone(), *instance, fault.to_string()));
+            }
+        }
+        faulted
+    }
+
     pub fn abandon_launched(&mut self, id: InstanceId) {
         if let Some(bound) = self.instances.get_mut(&id) {
             bound.session.abandon_launched();
@@ -2821,6 +2852,80 @@ mod tests {
             answers.iter().all(|&(_, got)| got == 3),
             "the cell `eq(col, 3)` holds at is cell 3 in every form: {answers:?}"
         );
+    }
+
+    /// A batched pass whose command buffer the device refused (as for
+    /// memory) fails its lanes once and leaves each instance able to stage
+    /// again: the harvest abandons the refused buffer's passes
+    /// (`Plane::settle_flight`). Left airborne, every later fire of these
+    /// instances was refused "already has a pass airborne".
+    #[test]
+    fn a_refused_buffer_s_instances_stage_their_next_pass() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, count, seeds, _) = registration();
+        let program = plane.register(&context, &registration).expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let logits =
+            crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
+        let lanes: Vec<InstanceId> = (0..LANES)
+            .map(|lane| {
+                let ids: Vec<ChannelId> = (1..=count as u64)
+                    .map(|c| ChannelId(c + 1000 * u64::from(lane)))
+                    .collect();
+                let (instance, rings) = slots_for(&pools, &facts, lane);
+                let id = plane
+                    .bind_placed(
+                        &context,
+                        program,
+                        &seeds,
+                        Extents {
+                            row_count: 1,
+                            sampled_rows: 1,
+                            query_len: 1,
+                            ..Extents::default()
+                        },
+                        GeometryClass::Host,
+                        PortMask::NONE,
+                        &ids,
+                        session::Pooled {
+                            pools: &pools,
+                            instance: &instance,
+                            rings: &rings,
+                        },
+                    )
+                    .expect("the lane binds");
+                plane
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                    .expect("the logits bind");
+                id
+            })
+            .collect();
+        let attached: Vec<(InstanceId, u32)> = lanes.iter().map(|&id| (id, 0)).collect();
+        let refused = |fired: &crate::Fired, instance: InstanceId| {
+            Fault::program("test", format!("{instance}: {fired:?}"))
+        };
+        // Staged, and its buffer refused by the device: dropped unrun.
+        {
+            let mut frame = context.frame().expect("a frame");
+            let launched = plane.stage_batched(&mut frame, &lanes, 0).expect("the lanes stage");
+            assert!(launched.iter().all(|(_, l)| matches!(l, Launched::Airborne)));
+        }
+        let faulted = plane.settle_flight(&attached, false, refused);
+        assert!(faulted.is_empty(), "the refusal fails the lanes, not their verdicts");
+        // The instances stage again, and this pass lands and settles.
+        let mut frame = context.frame().expect("a frame");
+        let launched = plane
+            .stage_batched(&mut frame, &lanes, 0)
+            .expect("a refused buffer's instances stage their next pass");
+        assert!(launched.iter().all(|(_, l)| matches!(l, Launched::Airborne)), "{launched:?}");
+        frame.commit().expect("the frame lands");
+        let faulted = plane.settle_flight(&attached, true, refused);
+        assert!(faulted.is_empty(), "{faulted:?}");
+        for lane in lanes {
+            plane.close_instance(lane).expect("the lane closes");
+        }
     }
 
     /// A program that launched its lanes together leaves no batch behind

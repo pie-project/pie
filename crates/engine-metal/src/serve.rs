@@ -3149,22 +3149,12 @@ impl Shell {
         let waited = flight.pending.wait();
         // Each attached instance's epilogue, settled once the buffer
         // completed: one that did not commit faults its own lanes alone,
-        // and the rest of the step commits.
-        let mut faulted = Vec::new();
-        if waited.is_ok() {
-            for (instance, lanes) in &flight.attached {
-                let outcome = self
-                    .programs
-                    .settle_launched(*instance)
-                    .and_then(|fired| match fired {
-                        crate::Fired::Committed => Ok(()),
-                        other => Err(refused(&other, *instance)),
-                    });
-                if let Err(fault) = outcome {
-                    faulted.push((lanes.clone(), *instance, fault.to_string()));
-                }
-            }
-        }
+        // and the rest of the step commits. A buffer the device refused
+        // fails its lanes once (the sink hears why), and its instances
+        // stage their next pass: none is left airborne.
+        let faulted = self
+            .programs
+            .settle_flight(&flight.attached, waited.is_ok(), refused);
         // The sink hears the fire here, the buffer complete and its
         // epilogues settled, before the harvest returns.
         if let Some(told) = flight.told.as_ref() {
