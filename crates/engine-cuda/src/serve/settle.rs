@@ -13,9 +13,10 @@ pub(crate) struct Readback {
     /// not laid out by clips of its own.
     pub(crate) names: Vec<String>,
     pub(crate) lanes: Vec<Option<(String, kernels_cuda::Tensor)>>,
-    pub(crate) last_row: Vec<u32>,
-    pub(crate) first_row: Vec<u32>,
-    pub(crate) lane_rows: Vec<u32>,
+    /// Each lane's rows of its output's plane, in the order its readout
+    /// names them: readout-gathered outputs at the lane's readout indices,
+    /// row outputs at its own token rows.
+    pub(crate) rows: Vec<Vec<u32>>,
     pub(crate) pixels: Option<PixelsReadback>,
 }
 
@@ -321,7 +322,7 @@ impl Shell {
             return Ok(());
         };
 
-        let lanes = readback.last_row.len();
+        let lanes = readback.rows.len();
         let mut taken = vec![Vec::new(); lanes];
         let mut counts = vec![0u32; lanes];
         let mut raw = Vec::new();
@@ -338,24 +339,25 @@ impl Shell {
             };
             raw.clear();
             raw.resize(width * element, 0);
-            let owned = readback.lane_rows[lane];
-            if owned == 0 || logits.width == 0 {
+            let planned = &readback.rows[lane];
+            let Some(&last) = planned.last() else {
+                continue;
+            };
+            if logits.width == 0 {
                 continue;
             }
             let chosen: Vec<u32> = match want.get(lane) {
-                None | Some(Readout::Last) => vec![readback.last_row[lane]],
+                None | Some(Readout::Last) => vec![last],
                 Some(Readout::None) => Vec::new(),
                 Some(Readout::Rows(rows)) => {
-                    if rows.len() as u32 > owned {
+                    if rows.len() > planned.len() {
                         return Err(Fault::Ceiling {
                             what: "rows in the lane a readout names",
                             need: rows.len() as u64,
-                            have: u64::from(owned),
+                            have: planned.len() as u64,
                         });
                     }
-                    (0..rows.len() as u32)
-                        .map(|i| readback.first_row[lane] + i)
-                        .collect()
+                    planned[..rows.len()].to_vec()
                 }
             };
             let mut values = Vec::with_capacity(chosen.len() * width);
