@@ -2372,6 +2372,9 @@ struct BindRoomPool {
     host: u32,
     /// The registered model whose kv store its victims' pages lie in.
     model: usize,
+    /// The process whose state holds the chunks, if one does
+    /// ([`PoolPort::chunk_occupants`]): each chunk of the pool, whole.
+    occupant: parking_lot::Mutex<Option<ProcessId>>,
 }
 
 impl BindRoomPool {
@@ -2382,6 +2385,7 @@ impl BindRoomPool {
             total,
             host,
             model: 0,
+            occupant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -2444,6 +2448,24 @@ impl PoolPort for BindRoomPool {
     }
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
+    }
+    fn chunk_occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
+        let Some(occupant) = *self.occupant.lock() else {
+            return super::pool::ChunkMap::default();
+        };
+        if !pids.contains(&occupant) {
+            return super::pool::ChunkMap::default();
+        }
+        super::pool::ChunkMap {
+            held: (0..self.total)
+                .map(|chunk| super::pool::ChunkHeld {
+                    chunk,
+                    used: 1,
+                    by: vec![(occupant, 1)],
+                })
+                .collect(),
+            free: Vec::new(),
+        }
     }
     fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
         None
@@ -2820,4 +2842,73 @@ fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
     assert_eq!(members(&planner), vec![waiting], "waiting at a bind, it yields");
     planner.set_bind_waiting(waiting, false);
     assert!(members(&planner).is_empty(), "past its wait, it no longer does");
+}
+
+/// AMD's 500-concurrent wedge: a bind short of room waited for the fleet
+/// to stall before the planner moved anyone for it, as a restore does, and
+/// with the other processes decoding it never stalled: no eviction was
+/// planned for the bind, ever. A bind is new demand: with a process still
+/// decoding (the fleet not stalled), the planner evicts the occupants of
+/// the chunks the bind could take, here the idle process holding them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, holder, decoding) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, holder, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&holder).unwrap().idle = true);
+    *pool.occupant.lock() = Some(holder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        !planner.with_inner(|inner| inner.fleet_stalled()) || planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "a process decodes beside the bind"
+    );
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the planner moves the chunks' occupant for the bind, the fleet decoding"
+    );
+    waited.abort();
+}
+
+/// AMD's wedge, its second half: once the rung was lowered (its segments
+/// given back) no bind was quoted again for two minutes, the room there
+/// and the head waiting on its own serve. Room that moves now has the
+/// planner quote the waiting head again: a rung change alone, nothing told
+/// the planner, serves the bind in the room it left.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let binder = ProcessId::new_v4();
+    planner.register(binder);
+    planner.note_admitted(binder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waited.is_finished(), "no room, no victim: it waits");
+    // The rung comes down: its chunks are free, and only the rung says so.
+    pool.free.lock().extend(0..8);
+    crate::store::shared::rung_changed(pool.locus().1);
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if waited.is_finished() {
+            break;
+        }
+    }
+    assert!(waited.is_finished(), "quoted again on the rung's move, and served");
+    waited.await.expect("the wait ends").expect("served");
 }
