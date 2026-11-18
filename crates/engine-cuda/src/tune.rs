@@ -601,6 +601,81 @@ mod eight_lanes {
     }
 }
 
+/// A served model's logits, gathered at the readout rows, read back at each
+/// lane's own row in a fire mixing a prompt between decodes: each lane's
+/// last row is the one it answers alone. Run by hand on a served model:
+/// `PIE_CONTRACT_ARTIFACT=<.zt> PIE_CONTRACT_DEPLOYMENT=<row>`.
+#[cfg(all(test, feature = "cuda"))]
+mod mixed_readout {
+    use super::*;
+
+    #[test]
+    #[ignore = "a readout check run by hand on a served model"]
+    fn a_prompt_beside_three_decodes_reads_each_lanes_own_row() {
+        let (Some(artifact), Some(deployment)) = (
+            std::env::var_os("PIE_CONTRACT_ARTIFACT"),
+            std::env::var("PIE_CONTRACT_DEPLOYMENT").ok(),
+        ) else {
+            eprintln!("skipping: PIE_CONTRACT_ARTIFACT / PIE_CONTRACT_DEPLOYMENT unset");
+            return;
+        };
+        let (mut shell, trace) = load(
+            Path::new(&artifact),
+            &deployment,
+            crate::Knobs::default(),
+            |trace| Shape {
+                slots: 8,
+                budget: poem_compiler::Budget::new(4, 0),
+                patches: patches(trace, 4),
+                page_size: 16,
+                context: 1024,
+            },
+        )
+        .expect("the model loads");
+        let word = |n: usize| trace.facts.word(&poem::Request::new(n as u32, false));
+        let prompt = |salt: u32, n: u32| -> Vec<u32> {
+            (0..n).map(|i| 1000 + (i * 7919 + salt * 104_729) % 20_000).collect()
+        };
+        for slot in 0..8 {
+            shell.open(slot).expect("a slot opens");
+        }
+        // Decoding lanes in slots 0..3 (twins 4..7, but for the prompt's 3 / 7).
+        for (slot, salt) in [(0, 0), (4, 0), (1, 1), (5, 1), (2, 2), (6, 2)] {
+            let tokens = prompt(salt, 96);
+            shell
+                .fire(&[crate::Lane { slot, word: word(tokens.len()), tokens: &tokens }])
+                .expect("a prompt fires");
+        }
+        let fresh = prompt(9, 40);
+        let next = [[11u32], [12], [13]];
+        let mixed = shell
+            .fire(&[
+                crate::Lane { slot: 0, word: word(1), tokens: &next[0] },
+                crate::Lane { slot: 3, word: word(fresh.len()), tokens: &fresh },
+                crate::Lane { slot: 1, word: word(1), tokens: &next[1] },
+                crate::Lane { slot: 2, word: word(1), tokens: &next[2] },
+            ])
+            .expect("the mixed fire serves");
+        let alone: Vec<Vec<f32>> = [(4u32, &next[0][..]), (7, &fresh[..]), (5, &next[1][..]), (6, &next[2][..])]
+            .iter()
+            .map(|&(slot, tokens)| {
+                shell
+                    .fire(&[crate::Lane { slot, word: word(tokens.len()), tokens }])
+                    .expect("a lane fires alone")
+                    .swap_remove(0)
+            })
+            .collect();
+        for (lane, (a, b)) in alone.iter().zip(&mixed).enumerate() {
+            let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let top = |row: &[f32]| {
+                row.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(at, _)| at)
+            };
+            println!("{deployment}: lane {lane} worst {worst} top {} / {}", top(a), top(b));
+            assert!(worst < 0.5, "lane {lane}'s last row is not its own ({worst})");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
