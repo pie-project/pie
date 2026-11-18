@@ -106,7 +106,7 @@ Cerebras and CPU do not fit the table. Cerebras: every wafer array is static and
 
 ## 5. Knobs, constants and heuristics that size device memory
 
-Config keys still live: `device_memory_share`, `device_kv_budget`, `host_kv_budget`, `disk_kv_budget`, `max_context`, `max_forward_tokens`, `max_forward_requests`, `bodies_mem`, `working_set_percent` (50), `window_spare`, `gemm_workspace_mb`, `[xla] headroom / seat_tokens / prewarm`, `[wgpu] device_memory`, `[cerebras.wafer] preset`.
+Config keys still live (crates/worker/src/config.rs `MemoryConfig`, config/backend.rs): `[engine] max_context`; `[engine.memory] budget_device`, `kv_device_tokens`, `budget_host`, `budget_disk`, `disk_path`, `disk_persistent`, `governor_backoff`, `governor_release_idle`; `[xla] device_headroom`, `seat_tokens`. The keys this list named earlier (`device_memory_share`, `device_kv_budget`, `host_kv_budget`, `disk_kv_budget`, `max_forward_tokens`, `max_forward_requests`, `bodies_mem`, `working_set_percent`, `window_spare`, `gemm_workspace_mb`, `[wgpu] device_memory`, `[xla] headroom / prewarm`) are gone and refused as unknown fields; `host_kv_budget` / `disk_kv_budget` survive only as the engines' internal names for `budget_host` / `budget_disk`.
 
 Rules: halve forward tokens until the arena fits (floor 1024 on CUDA, 512 on Metal); one sequence takes at most half the room; bodies get a quarter with a 512 MiB floor and a 1/20 stretch; fp8 shadow only under free/8; XLA prescale and tied copy only when weights are under 5/8 of HBM; voxel fit uses half the remainder (Vulkan/wgpu, XLA); safety floor `min(128 MiB, total/10)`; XLA headroom HBM/16.
 
