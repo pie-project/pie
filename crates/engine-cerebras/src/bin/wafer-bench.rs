@@ -64,7 +64,7 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir | .zt> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
-                     [--stamps 1] [--anneal <moves a block>]";
+                     [--stamps 1 | <dir>] [--anneal <moves a block>]";
 
 /// A headless slice's rows against the golden's: relative L2 and cosine (bf16 weights and
 /// activations against HF's f32).
@@ -486,6 +486,11 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        // (`--stamps <dir>`: each step's stamps too, every PE's three words, as `--reading`
+        // saves them; `--stamps 1` the cycles alone)
+        if let Some(dir) = get.get("stamps").filter(|d| d.as_str() != "1") {
+            save_tsc(&mut rt, &reading, dir, gs)?;
+        }
         // the program's own argmax (its head roots'), against the logits read back
         let on_wafer = engine_cerebras::reading::Fabric::argmax(&mut rt, &reading)?;
         let back = reading.rows_back(&got)?;
