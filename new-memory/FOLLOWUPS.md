@@ -139,3 +139,23 @@ guests (2d52e0715), ABBA ×3 medians, on the L40S: greedy −0.9% / +0.3% and to
 all inside the round-to-round spread: a dead heat. If a device shows a cost, the
 first lever is the config in a uniform buffer of its own, outside the segment.
 
+## F18. The chunk fence does not land; reuse-after-release needs a test, not a watermark
+
+The fence (sc/np-fence-layer → sc/mac-wedge-fence b0bd6869c) returned a released
+slot only once the oldest open epoch passed the fire / copy that last named it.
+Mac Pro's M5 over-demand (64 requests, ×6 per build, rotated, on the wedge + seam
+base): every run of all three builds served 64 / 64 with 0 faults; wall medians
+no-fence 2c4cfb7c6 47.1 s (643.9 tok/s), fence b0bd6869c 69.7 s (474.3,
++48% wall), F16 a726af4f6 (copies on their own watermark) 67.8 s (489.4, +44%).
+The pool held 300–970 of 1932 pages "arriving" with the oldest epoch 400–500
+behind: epoch-wide retirement is the cost, and F16 recovered ~3%. Neither lands.
+
+The hazard the fence was for is real: on 7f544bab1 (before the wedge line),
+Metal over-demand page-faulted in 2 of 3 runs (kIOGPUCommandBufferCallbackErrorPageFault,
+45 / 64 and 47 / 64 served) when a released slot was handed out while a fire
+still named it; the M5 runs above show 0 faults on the current no-fence line.
+So: (1) a test that a slot released while a fire naming it is in flight is never
+handed out before that fire completes, on every engine, in the fake engine and
+on Metal; (2) if it fails, a per-page release on that page's own fire / copy
+completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
+
