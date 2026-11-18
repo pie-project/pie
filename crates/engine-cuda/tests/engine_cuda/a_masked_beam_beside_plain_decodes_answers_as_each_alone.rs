@@ -64,7 +64,9 @@ impl ForwardHybrid for Micro {
     }
 }
 
-fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
+/// The shell over `lanes` lanes a fire, each with a slot pair and one
+/// slot more.
+fn shell(trace: poem::Trace, path: &Path, graphs: Graphs, lanes: u32) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let shell = Shell::load(Boot {
         voxels: None,
@@ -72,11 +74,11 @@ fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
         trace,
         contract: &contract,
         checkpoint: path,
-        budget: Budget::new(LANES, 64),
+        budget: Budget::new(lanes, 64),
         patches: None,
         page_size: PAGE,
         context: 256,
-        slots: 2 * LANES + 1,
+        slots: 2 * lanes + 1,
         kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
@@ -116,7 +118,7 @@ fn serve(graphs: Graphs) {
     let trace = trace_hybrid("mask-data-micro", &Micro { mask: true }, Platform::Cuda);
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 2207).write(dir.path());
-    let mut shell = shell(trace.clone(), &path, graphs);
+    let mut shell = shell(trace.clone(), &path, graphs, LANES);
     let pages: Vec<Vec<u32>> = (0..2 * LANES + 1)
         .map(|slot| {
             let per = 256 / PAGE;
@@ -280,7 +282,7 @@ fn a_mask_adds_no_body() {
         let trace = trace_hybrid("mask-data-micro", &Micro { mask }, Platform::Cuda);
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = Weights::random(&trace, 2207).write(dir.path());
-        let shell = shell(trace, &path, Graphs::On);
+        let shell = shell(trace, &path, Graphs::On, LANES);
         let stats = shell.body_stats();
         (stats.census.bodies, stats.tally.armed_at_load)
     };
@@ -297,6 +299,19 @@ fn a_mask_adds_no_body() {
 /// not: a lane stating none reads through the masked arms as the plain ones.
 #[test]
 fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
+    maskless_through_masked_arms(LANES);
+}
+
+/// As [`a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones`]
+/// on a load of one lane a fire: every fire's mask entries (one lane stating
+/// none) are the ones the load's arming fires staged before the load zeroed
+/// the workspace, and the first fire served copies them again.
+#[test]
+fn a_lone_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
+    maskless_through_masked_arms(1);
+}
+
+fn maskless_through_masked_arms(lanes: u32) {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
@@ -305,7 +320,7 @@ fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
         let trace = trace_hybrid("mask-data-micro", &Micro { mask }, Platform::Cuda);
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = Weights::random(&trace, 2207).write(dir.path());
-        let mut shell = shell(trace.clone(), &path, Graphs::On);
+        let mut shell = shell(trace.clone(), &path, Graphs::On, lanes);
         let pages: Vec<u32> = (0..256 / PAGE).collect();
         let word = |rows: u32| trace.facts.word(&Request::new(rows, false));
         shell.open(0).expect("a slot opens");
@@ -328,6 +343,7 @@ fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
         let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         let span = b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
         eprintln!("step {step}: worst {worst} of a span {span}");
+        assert!(a.iter().all(|x| x.is_finite()), "step {step}: the masked arms answer a non-finite logit");
         assert!(worst <= span * 1e-2, "step {step}: the masked arms answer otherwise ({worst})");
     }
 }

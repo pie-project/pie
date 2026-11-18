@@ -604,11 +604,13 @@ pub struct Inputs {
     /// attention: a body captured over them reads each fire's at the same
     /// addresses.
     group_masks: Option<GroupMasksAt>,
+    /// The window boundaries the device holds ([`restage`]).
     staged_windows: Vec<u8>,
-    /// The mask offsets and words the device holds, as the last fire staged
-    /// them: a fire whose lanes' entries are the same (every lane's "none"
-    /// step after step) copies none.
-    staged_mask_tables: Vec<u8>,
+    /// The mask offsets and the mask words the device holds ([`restage`]):
+    /// a fire whose lanes' entries are the same (every lane's "none" step
+    /// after step) copies neither.
+    staged_mask_indptr: Vec<u8>,
+    staged_mask_origin: Vec<u8>,
 }
 
 /// The slab's group-mask stretches: stretch `i` (the load's `i`th ragged
@@ -846,7 +848,8 @@ impl Inputs {
             mask_runs,
             group_masks,
             staged_windows: Vec::new(),
-            staged_mask_tables: Vec::new(),
+            staged_mask_indptr: Vec::new(),
+            staged_mask_origin: Vec::new(),
             plan_values: grants.len(),
             plans: Vec::new(),
             grants,
@@ -871,9 +874,14 @@ impl Inputs {
     }
 
     /// The slab lies at `base` from here on: a run of the activation's
-    /// span the load holds backed and zeroed, of [`Inputs::bytes`].
+    /// span the load holds backed and zeroed, of [`Inputs::bytes`]. It holds
+    /// no table a fire staged before (a size-only walk's, or one the zeroing
+    /// cleared), so the next fire copies each.
     pub fn lay(&mut self, base: u64) {
         self.store.lay(base);
+        self.staged_windows.clear();
+        self.staged_mask_indptr.clear();
+        self.staged_mask_origin.clear();
         self.grant_at(base);
     }
 
@@ -1424,6 +1432,7 @@ impl Inputs {
         let packing_places: Vec<PackingAt> = self.packings.clone();
         let rs_at = self.rs;
         let stream = device.stream();
+        let capturing = crate::device::alloc::is_capturing(stream);
         // The run tables hold a run a lane.
         let fed = token_injects.len().max(mask_injects.len()) as u64;
         if fed > u64::from(self.max_lanes) {
@@ -1439,7 +1448,8 @@ impl Inputs {
             inject_runs,
             mask_runs,
             staged_windows,
-            staged_mask_tables,
+            staged_mask_indptr,
+            staged_mask_origin,
             ..
         } = self;
         let host = staging[slot.at() as usize].host();
@@ -1455,13 +1465,8 @@ impl Inputs {
         // SAFETY: the slot's pinned bytes, written for this fire by write_host.
         let window_bytes =
             unsafe { std::slice::from_raw_parts(host.add(at_windows as usize), windows * 4) };
-        if crate::device::alloc::is_capturing(stream) {
-            staged_windows.clear();
+        if restage(staged_windows, window_bytes, capturing) {
             copy(at_windows, windows * 4)?;
-        } else if staged_windows.as_slice() != window_bytes {
-            copy(at_windows, windows * 4)?;
-            staged_windows.clear();
-            staged_windows.extend_from_slice(window_bytes);
         }
         if let Some(bounds) = qo_absolute {
             copy(at_qo_absolute, *bounds * 4)?;
@@ -1487,15 +1492,11 @@ impl Inputs {
                     std::slice::from_raw_parts(host.add(at_mask_origin as usize), origin_len),
                 )
             };
-            let held = staged_mask_tables.len() == indptr_len + origin_len
-                && staged_mask_tables[..indptr_len] == *indptr
-                && staged_mask_tables[indptr_len..] == *origin;
-            if crate::device::alloc::is_capturing(stream) || !held {
+            if restage(staged_mask_indptr, indptr, capturing) {
                 copy(at_mask_indptr, indptr_len)?;
+            }
+            if restage(staged_mask_origin, origin, capturing) {
                 copy(at_mask_origin, origin_len)?;
-                staged_mask_tables.clear();
-                staged_mask_tables.extend_from_slice(indptr);
-                staged_mask_tables.extend_from_slice(origin);
             }
         }
         let mut packings = Vec::with_capacity(packing_places.len());
@@ -1698,6 +1699,21 @@ impl Inputs {
             snapshots: kernels_cuda::Snapshots::NONE,
         }
     }
+}
+
+/// Whether a fire copies a table whose bytes are `bytes`, keeping `held` as
+/// the bytes the device holds for it. A copy captured into a graph lands
+/// only when the graph runs, so it leaves nothing held: the next fire copies
+/// the table again.
+fn restage(held: &mut Vec<u8>, bytes: &[u8], capturing: bool) -> bool {
+    if !capturing && held.as_slice() == bytes {
+        return false;
+    }
+    held.clear();
+    if !capturing {
+        held.extend_from_slice(bytes);
+    }
+    true
 }
 
 fn i32s(ptr: u64, rows: u32) -> Tensor {
