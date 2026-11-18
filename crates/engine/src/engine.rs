@@ -397,7 +397,9 @@ pub trait Engine: Send {
     }
 
     /// Gives back every segment at and past `segments`. The runtime has
-    /// evacuated their chunks and waited out every frame that named them.
+    /// evacuated their chunks and waited out every frame that named them;
+    /// an [`Self::evacuate`] copy that still reads them, the engine waits
+    /// out here.
     fn release_segments(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Err(self.unsupported("release_segments"))
@@ -448,7 +450,10 @@ pub trait Engine: Send {
 
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
-    /// before the next fire; the slot refs the runtime holds stand.
+    /// before the next fire; the slot refs the runtime holds stand. The
+    /// copy has a completion of its own, which [`Self::release_segments`]
+    /// waits on before the evacuated segment goes: the runtime waits on no
+    /// later fire for it, so an idle engine's segment goes too.
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))

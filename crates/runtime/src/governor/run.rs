@@ -449,7 +449,7 @@ impl Steer {
         let answer = pool.retarget(segments);
         let mapped = pool.mapped();
         match answer {
-            Retarget::Reached => {
+            Retarget::Reached | Retarget::Moving { .. } => {
                 if self.short.take().is_some() {
                     signal(Signal::Eased);
                 }
@@ -462,7 +462,7 @@ impl Steer {
                         held_segments = held,
                         target_segments = segments,
                         draining_segments = mapped.draining,
-                        "the pool maps more than its target and cannot give the rest back yet: state with no room to evacuate into, or drained segments waiting on their fire; tier pressure to the policy"
+                        "the pool maps more than its target and has no room to evacuate into: what is left is live or idle cache only the policy can shed; tier pressure to the policy"
                     );
                 }
                 if self.short != Some(held) {

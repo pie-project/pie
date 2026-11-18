@@ -2108,13 +2108,13 @@ impl SlotPool {
         Ok(())
     }
 
-    /// Every draining segment waits on the fire at `epoch` too, where it
-    /// waited on an earlier one: the fire known, once the engine took the
-    /// evacuation, to come after its copy.
-    pub fn fence_drains(&mut self, epoch: u64) {
+    /// The draining segment planned to wait past `epoch` waits on it
+    /// instead: the engine took its copy with the fires through `epoch`
+    /// handed out, the last that may read its chunks.
+    pub fn drains_through(&mut self, epoch: u64) {
         for segment in 0..self.segments.count() {
             if let SegmentState::Draining { until } = self.segments.state(segment)
-                && until < epoch
+                && until > epoch
             {
                 self.segments
                     .set_state(segment, SegmentState::Draining { until: epoch });
