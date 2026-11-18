@@ -179,10 +179,9 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // WGSL's kernels publish no temporary need past the whole-value rule.
     let stepping = Stepping::of(plan);
     let launches = stepping
-        .launches(&descriptors, &[])
+        .launches(&descriptors, wgsl::TEMPORARY_NEEDS)
         .map_err(|why| format!("a guest pass's temporaries are refused: {why}"))?;
     let mut scratch = lay_out(plan, &descriptors, &launches)
         .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
