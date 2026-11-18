@@ -1541,7 +1541,10 @@ impl BatchScheduler {
             // bind's guest term narrowed the fit, or the walk lowered) still
             // goes at the rung the engine was told, which is not lowered
             // under it. Once nothing queued, sealed or in flight is wider
-            // than the cap, the pool may lower its rung.
+            // than the cap, the pool may lower its rung. A suspended
+            // process's queued fires do not hold it back: they ride no frame
+            // until it resumes, and then go at the rung the engine holds or
+            // wait, queued, for the raise their rows ask.
             let held = (crate::store::shared::engine_rows(engine_id) as usize)
                 .min(limits.max_forward_tokens);
             frame_policy.cap_fires(held);
@@ -1549,12 +1552,7 @@ impl BatchScheduler {
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
                 && frame_policy.sealed_widest() <= cap as usize
-                && pending.items.iter().all(|item| match item {
-                    QueuedItem::Launch(launch) => {
-                        launch.request.request.rung_rows() <= cap as usize
-                    }
-                    _ => true,
-                })
+                && Self::queued_within(&pending, &frame_policy, cap as usize)
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -2705,6 +2703,19 @@ impl BatchScheduler {
         true
     }
 
+    /// Whether every queued launch whose process is not suspended takes no
+    /// more than `cap` rows of its rung: what the grant of a lower waits
+    /// on beside what is sealed and in flight.
+    fn queued_within(pending: &PendingQueue, policy: &FramePolicy, cap: usize) -> bool {
+        pending.items.iter().all(|item| match item {
+            QueuedItem::Launch(launch) => {
+                launch.request.request.rung_rows() <= cap
+                    || launch.process_id.is_some_and(|pid| policy.is_suspended(pid))
+            }
+            _ => true,
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the worker loop's state, borrowed piece by piece on purpose: six of \
@@ -3327,6 +3338,80 @@ mod tests {
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
         a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
+        a_suspended_process_s_wide_queued_fire_does_not_hold_a_lower_back();
+    }
+
+    /// A process suspended with a wide fire queued (cut under a cap since
+    /// cut for binders' guest terms) holds no lower back: the grant counts
+    /// only what can ride a frame. Resumed, its fire is queued again and
+    /// asks its rung: the grant waits on it, and the frame policy seals it
+    /// once the rung the engine holds covers it, so it completes.
+    fn a_suspended_process_s_wide_queued_fire_does_not_hold_a_lower_back() {
+        let pid = ProcessId::from_u128(77);
+        let mut pending = PendingQueue::default();
+        BatchScheduler::queue_attempt(
+            &mut pending,
+            PendingRequest {
+                lora_program: false,
+                logical_fire_id: 31,
+                request: fire_of(0..1, 64),
+                instance_id: ::engine::InstanceId(7),
+                completion: crate::engine::WorkItemCompletion::new(1, 0),
+                process_id: Some(pid),
+                pipeline_id: Some(pid),
+                prelaunch_copy: None,
+                prelaunch_state_copy: None,
+                frame: Some(FrameStamp {
+                    lane: pid,
+                    seq: 0,
+                    slot: 0,
+                    fires: 1,
+                }),
+            },
+        );
+        let mut policy = FramePolicy::new(1, 4096, 4096, None);
+        policy.on_fire_reading(
+            FrameStamp {
+                lane: pid,
+                seq: 0,
+                slot: 0,
+                fires: 1,
+            },
+            Some(pid),
+            31,
+            64,
+            1,
+            1,
+            64,
+        );
+        assert!(
+            !BatchScheduler::queued_within(&pending, &policy, 16),
+            "control: the wide fire holds the lower to 16 back"
+        );
+        policy.on_process_suspend(pid);
+        assert!(
+            BatchScheduler::queued_within(&pending, &policy, 16),
+            "suspended, it holds nothing back: the lower is granted"
+        );
+        // Resumed under the lowered rung: it waits, queued, asking its rows.
+        policy.on_process_resume(pid);
+        assert!(!BatchScheduler::queued_within(&pending, &policy, 16));
+        policy.cap_fires(16);
+        let queued: frame::QueuedFireIds = [31].into_iter().collect();
+        assert!(
+            !matches!(
+                policy.plan_dispatch(&queued, &HashSet::new(), false, Instant::now()),
+                FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 31)
+            ),
+            "not past the rung the engine holds"
+        );
+        // The raise its rows ask lands: it is sealed and goes.
+        policy.cap_fires(64);
+        let plan = policy.plan_dispatch(&queued, &HashSet::new(), false, Instant::now());
+        assert!(
+            matches!(&plan, FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 31)),
+            "the raise landed: it goes ({plan:?})"
+        );
     }
 
     /// The lane refuses by name a step whose token rows (or lanes) pass the
