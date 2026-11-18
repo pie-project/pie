@@ -411,6 +411,14 @@ impl Device {
                     what: "compile",
                     why: e.to_string(),
                 })?;
+                // A registration's program (prepared after the seal) built
+                // rather than loaded: allowed, counted.
+                if serving.is_none()
+                    && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(live) = self.live.get()
+                {
+                    live.tally(engine::live::Tally::BuiltAtRegister, 1);
+                }
                 tracing::info!(
                     bytes = text.len(),
                     ms = started.elapsed().as_millis() as u64,

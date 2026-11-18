@@ -59,16 +59,22 @@ pub enum Tally {
     /// guest region's module). The rule is that every one serving can
     /// reach is built before ready, so this reads 0.
     BuiltAfterReady,
+    /// A guest program's own program compiled at its registration (not
+    /// loaded from a disk cache): registration is the program's ready, so
+    /// this is allowed, and counted so a cold cache shows (a warm one reads
+    /// 0 here). Never a build inside a fire.
+    BuiltAtRegister,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 6] = [
+    pub const ALL: [Tally; 7] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
         Tally::BuiltAfterReady,
+        Tally::BuiltAtRegister,
     ];
 
     /// Its name in the model status.
@@ -81,6 +87,7 @@ impl Tally {
             Tally::Refused => "refused",
             Tally::Eager => "eager",
             Tally::BuiltAfterReady => "built_after_ready",
+            Tally::BuiltAtRegister => "built_at_register",
         }
     }
 }
