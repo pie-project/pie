@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+use eta_compiler::codegen::lane_scratch::LaneScratch;
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
@@ -20,7 +21,14 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 19;
+const FUSED_ARITY: usize = 18;
+
+/// The spans of a stage's cells ([`Prepared::cells`]): five intrinsic
+/// tables, the pending flags, the row tables and the lane scratch table.
+const CELLS: usize = 8;
+
+/// The cell that holds the lane scratch table.
+const LANE_SCRATCH_CELL: usize = 7;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
@@ -652,11 +660,16 @@ pub struct Prepared {
     offsets_host: Vec<u8>,
     scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
-    /// offsets), pending flags and row tables, one span staged in one copy
-    /// a commit (`cell_at` their offsets, `cells_host` its image).
+    /// offsets), pending flags, row tables and lane scratch table, one span
+    /// staged in one copy a commit (`cell_at` their offsets, `cells_host`
+    /// its image).
     cells: u64,
-    cell_at: [usize; 7],
+    cell_at: [usize; CELLS],
     cells_host: Vec<u8>,
+    /// Each lane's scratch base, the device address the grouped kernels
+    /// read at their `lane_scratch` parameter
+    /// ([`eta_compiler::codegen::lane_scratch::LANE_SCRATCH`]).
+    lane_scratch_host: Vec<u64>,
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
     intrinsic_widths_host: Vec<u32>,
@@ -943,8 +956,9 @@ impl Prepared {
             offsets_host,
             scratch: 0,
             cells: 0,
-            cell_at: [0; 7],
+            cell_at: [0; CELLS],
             cells_host: Vec::new(),
+            lane_scratch_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
             intrinsic_modes_host: Vec::new(),
             intrinsic_widths_host: Vec::new(),
@@ -993,6 +1007,7 @@ impl Prepared {
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
             + u64::from(self.row_words) * size_of::<u64>() as u64
+            + LaneScratch::bytes(1)
     }
 
     /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
@@ -1097,6 +1112,7 @@ impl Prepared {
         self.intrinsic_offsets_host.resize(words, 0u32);
         let rows = self.row_words as usize * lanes as usize;
         self.row_pointers_host.resize(rows, 0u64);
+        self.lane_scratch_host.resize(lanes as usize, 0u64);
         let pending = (self.channel_count as usize * lanes as usize).max(1);
         let mut cell_at = 0usize;
         for (cell, bytes) in [
@@ -1107,6 +1123,7 @@ impl Prepared {
             words * size_of::<u32>(),
             pending,
             rows * size_of::<u64>(),
+            LaneScratch::bytes(lanes) as usize,
         ]
         .into_iter()
         .enumerate()
@@ -1184,6 +1201,17 @@ impl Prepared {
         self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
         let words = self.row_words as usize;
         self.row_pointers_host[lane as usize * words..(lane as usize + 1) * words].fill(0);
+        // The lane's scratch: the fire's span holds the lanes' scratch
+        // `scratch_stride` apart, lane `l`'s from the `l`-th. A build with
+        // `test-lane-scatter` seats them last lane first, so a kernel that
+        // finds a lane's scratch other than by its own base answers wrongly.
+        let place = if cfg!(feature = "test-lane-scatter") {
+            self.lanes - 1 - lane
+        } else {
+            lane
+        };
+        self.lane_scratch_host[lane as usize] =
+            self.scratch + u64::from(place) * u64::from(self.scratch_stride);
         self.filled += 1;
         Ok(lane)
     }
@@ -1222,6 +1250,8 @@ impl Prepared {
         image[at[5]..at[6]].fill(0);
         let rows = slice_bytes(&self.row_pointers_host);
         image[at[6]..at[6] + rows.len()].copy_from_slice(&rows);
+        let bases = slice_bytes(&self.lane_scratch_host);
+        image[at[LANE_SCRATCH_CELL]..at[LANE_SCRATCH_CELL] + bases.len()].copy_from_slice(&bases);
         crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
@@ -1339,9 +1369,8 @@ impl Prepared {
             .ptr(self.descriptors)
             .ptr(self.params)
             .ptr(self.offsets)
-            .ptr(self.scratch)
+            .ptr(self.cell(LANE_SCRATCH_CELL))
             .u32(self.value_count)
-            .u32(self.scratch_stride)
             .u32(self.temporary_offset)
             .ptr(self.cell(5))
             .ptr(self.cell(0))
@@ -1560,15 +1589,22 @@ impl Prepared {
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each no shorter than its dummy bytes.
+            // Every place a lane's scratch is seated at
+            // ([`Prepared::stage_lane`]).
+            let places = if cfg!(feature = "test-lane-scatter") {
+                self.lanes
+            } else {
+                self.filled
+            };
+            // SAFETY: the scratch holds `lanes` places `scratch_stride`
+            // apart, each no shorter than its dummy bytes.
             let code = unsafe {
                 dr::cuMemsetD2D32Async(
                     self.scratch,
                     self.scratch_stride as usize,
                     SCRATCH_POISON,
                     (SCRATCH_DUMMY_BYTES / 4) as usize,
-                    self.filled as usize,
+                    places as usize,
                     stream.cast(),
                 )
             };
