@@ -146,11 +146,19 @@ impl Shell {
             // Every lane rung whose prompts (two rows at least, a decode's
             // one) fit the rows: a burst of short prompts fires many at once
             // (c64: 64 prompt tails of 3 rows in 256 rows compiled mid-run).
-            for &n in buckets.iter().filter(|&&n| n >= 2 && n <= lanes_cap) {
-                if b / n >= 2 {
-                    // `n - 1` lanes and the padding lane the rest takes (two
-                    // or three lanes pad to four).
-                    shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
+            for &p in buckets.iter().filter(|&&p| p >= 2 && p <= lanes_cap) {
+                // the prompt counts that reach every form rung `p` pads to:
+                // one short of it with the padding lane the rest takes, and
+                // at it, filling the rows exactly (two prompts of 8 rows in
+                // 16 fire as they are, `canonical_pads`)
+                for n in lane_counts(p) {
+                    if b / n >= 2 {
+                        let mut lanes = vec![fresh(prefill, b / n); n as usize];
+                        if n < p {
+                            lanes.pop();
+                        }
+                        shapes.push(lanes);
+                    }
                 }
             }
         }
@@ -296,13 +304,12 @@ impl Shell {
             // (a fire reads out no more rows than the load's store holds)
             let store = self.readout_store_rows().unwrap_or(u32::MAX);
             if plain(self, drafts) && plain(self, window) {
-                let counts = |p: u32| {
-                    let mut ns = vec![p / 2 + 1, p.saturating_sub(1), p];
-                    ns.retain(|&n| n >= 1 && n <= p);
-                    ns.sort_unstable();
-                    ns.dedup();
-                    ns
-                };
+                self.draft_depth = depth;
+                self.drafting = [drafts, window]
+                    .iter()
+                    .filter_map(|&w| classes.class_of(w & classes.mask))
+                    .collect();
+                let counts = lane_counts;
                 parts.push(("draft windows", shapes.len()));
                 for &p in buckets.iter().filter(|&&p| p <= lanes_cap) {
                     for n in counts(p) {
@@ -398,6 +405,7 @@ impl Shell {
             s = started.elapsed().as_secs(),
             "xla warm ladder compiled"
         );
+        self.laddered = fired > 0;
         Ok(fired)
     }
 
@@ -686,4 +694,15 @@ fn warm_part<'a>(parts: &[(&'a str, usize)], at: usize) -> &'a str {
         .rev()
         .find(|(_, from)| *from <= at)
         .map_or("decode", |(name, _)| name)
+}
+
+/// The lane counts that reach every form a fire padded to lane rung `p`
+/// takes (`canonical_pads`): at the rung, one short of it, and just past
+/// half of it.
+fn lane_counts(p: u32) -> Vec<u32> {
+    let mut ns = vec![p / 2 + 1, p.saturating_sub(1), p];
+    ns.retain(|&n| n >= 1 && n <= p);
+    ns.sort_unstable();
+    ns.dedup();
+    ns
 }
