@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use eta_compiler::codegen::lane_scratch::LaneScratch;
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
+use eta_compiler::codegen::metal::StepNodes;
 use eta_exec::{Launch, Launches, Layout, TooLarge};
 use eta_exec::{
     Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape, NO_TICKET,
@@ -12,28 +13,52 @@ use eta_exec::{
 };
 
 /// The stage as Metal runs it, region by region as each was compiled: a
-/// streamed region's launches are its runs of steps as the emitter
-/// published their nodes, so a value whose last reader has run gives its
-/// bytes to the next; any other form runs its region as one dispatch, one
-/// launch. Every value a region names takes bytes (Metal's streamed form
-/// writes them all), and the temporary area is as wide as the widest
-/// value's elements, below it the select's reserve as before.
+/// streamed region's launches are its steps as the emitter published their
+/// nodes, each dispatched after the one before it, so a value whose last
+/// reader's last step has run gives its bytes to one a later step writes,
+/// and a view no step computes takes no bytes (its readers read its
+/// source's); any other form runs its region as one dispatch, one launch.
+/// Every other value a region names takes bytes (Metal's streamed form
+/// writes them all); the temporary area is what each region's kernel
+/// publishes it takes ([`temporary_needs`]), below it the select's reserve
+/// as before.
 fn launches<'a>(
     plan: &'a LaunchStagePlan,
     regions: &'a [Region],
     descriptors: &[ValueDesc],
 ) -> std::result::Result<Launches<'a>, eta_exec::TemporaryRefused> {
+    let published: Vec<Option<&StepNodes>> = (0..plan.fused.len())
+        .map(|index| {
+            regions
+                .iter()
+                .find(|compiled| compiled.region_index as usize == index)
+                .filter(|compiled| compiled.form == Form::Streamed)
+                .map(|compiled| &*compiled.launches)
+        })
+        .collect();
+    published_launches(plan, &published, descriptors)
+}
+
+/// [`launches`] from what each region of `plan` published: a streamed
+/// region's step lists (empty where it is one launch), `None` for a region
+/// of another form.
+pub(crate) fn published_launches<'a>(
+    plan: &'a LaunchStagePlan,
+    published: &[Option<&'a StepNodes>],
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Launches<'a>, eta_exec::TemporaryRefused> {
     let mut each = Vec::new();
+    let mut idle = Vec::new();
     for (index, region) in plan.fused.iter().enumerate() {
-        let groups = regions
-            .iter()
-            .find(|compiled| compiled.region_index as usize == index)
-            .filter(|compiled| compiled.form == Form::Streamed && !compiled.launches.is_empty())
-            .map(|compiled| compiled.launches.as_slice());
-        if let Some(groups) = groups {
-            // The streamed form dispatches its steps one after another; a
-            // run of steps that shares a node is one launch.
-            each.extend(groups.iter().map(|nodes| Launch {
+        let published = published
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|published| !published.steps.is_empty());
+        if let Some(published) = published {
+            // The streamed form dispatches its steps one after another, a
+            // launch a step; a node two steps compute lies in both.
+            each.extend(published.steps.iter().map(|nodes| Launch {
                 nodes,
                 stepwise: false,
                 blocks: 1,
@@ -41,6 +66,7 @@ fn launches<'a>(
                 row_alias: None,
                 held: Vec::new(),
             }));
+            idle.extend_from_slice(&published.views);
         } else {
             each.push(Launch {
                 nodes: &region.nodes,
@@ -49,46 +75,92 @@ fn launches<'a>(
             });
         }
     }
+    let hollow = idle
+        .iter()
+        .flat_map(|&node| results_of(plan, node))
+        .collect();
+    let streamed: Vec<usize> = (0..plan.fused.len())
+        .filter(|&index| published.get(index).copied().flatten().is_some())
+        .collect();
     Ok(Launches {
         each,
+        idle,
+        hollow,
         // Held clear below the temporary area as the whole-value layout held
         // it: a one-row select keeps its state there.
         reserve: eta_exec::SELECT_RESERVE,
-        temporary: eta_exec::stage_temporaries(descriptors, &temporary_needs(plan, regions))?,
+        temporary: eta_exec::stage_temporaries(descriptors, &temporary_needs(plan, &streamed))?,
         ..Launches::default()
     })
 }
 
 /// What each streamed region's kernel takes of a lane's temporary area, as
 /// Metal's emitter publishes it: a top-k's histograms and candidates a row
-/// of its input, or each select's state below the reductions' planes. The
-/// other forms take the whole-value rule alone.
+/// of its input, or each select's state below the reductions' planes, for
+/// the regions `streamed` names. The other forms take the whole-value rule
+/// alone.
 pub(crate) fn temporary_needs(
     plan: &LaunchStagePlan,
-    regions: &[Region],
+    streamed: &[usize],
 ) -> Vec<eta_exec::TemporaryNeed> {
     use eta_compiler::codegen::metal::{streamed_temporary_need, streamed_topk_temporary_need};
-    regions
+    streamed
         .iter()
-        .filter(|region| region.form == Form::Streamed)
-        .map(|region| {
-            let index = region.region_index as usize;
+        .map(|&index| {
             streamed_topk_temporary_need(plan, index)
                 .unwrap_or_else(|| streamed_temporary_need(plan, index))
         })
         .collect()
 }
 
+/// The values node `node` of `plan` results in.
+fn results_of(plan: &LaunchStagePlan, node: u32) -> std::ops::Range<u32> {
+    let base: u32 = plan
+        .ops
+        .iter()
+        .take(node as usize)
+        .map(|op| u32::from(op.result_count))
+        .sum();
+    let count = plan
+        .ops
+        .get(node as usize)
+        .map_or(0, |op| u32::from(op.result_count));
+    base..base + count
+}
+
 /// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
 /// offsets, `FireFacts::a_lane` and the stride all read, the same at
-/// every call.
+/// every call. A view takes its source's offset.
 fn layout_of(
     plan: &LaunchStagePlan,
     regions: &[Region],
     descriptors: &[ValueDesc],
 ) -> std::result::Result<Layout, String> {
     let launches = launches(plan, regions, descriptors).map_err(|why| why.to_string())?;
-    eta_exec::lay_out(plan, descriptors, &launches).map_err(|why: TooLarge| format!("{why:?}"))
+    lay_out_launches(plan, &launches, descriptors).map_err(|why: TooLarge| format!("{why:?}"))
+}
+
+/// The layout [`layout_of`] takes, over `run`: a view's offset its
+/// source's.
+pub(crate) fn lay_out_launches(
+    plan: &LaunchStagePlan,
+    run: &Launches<'_>,
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Layout, TooLarge> {
+    let mut laid = eta_exec::lay_out(plan, descriptors, run)?;
+    for &node in &run.idle {
+        let Some(&source) = plan.ops.get(node as usize).and_then(|op| op.args.first()) else {
+            continue;
+        };
+        for result in results_of(plan, node) {
+            if let Some(&at) = laid.values.get(source as usize)
+                && let Some(slot) = laid.values.get_mut(result as usize)
+            {
+                *slot = at;
+            }
+        }
+    }
+    Ok(laid)
 }
 use eta_ir::Dtype;
 use eta_ir::op::tags;

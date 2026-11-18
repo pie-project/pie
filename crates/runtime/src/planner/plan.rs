@@ -186,15 +186,25 @@ impl ResidencyPlanner {
                         self.serve_bind_room(key);
                         continue;
                     }
-                    // As a restore short of room for its roles: idle cache
-                    // first, one set or a sweep, and it looks again in what
-                    // that left; then, the fleet stalled, a resident is
-                    // parked for it by the planner's victim choice.
+                    // Idle cache first, one set or a sweep, and it looks
+                    // again in what that left; then residents are moved for
+                    // it by the planner's victim choice, as for an
+                    // allocation: a bind is new demand, not a restore, and
+                    // it is funded whether or not the fleet has stalled (a
+                    // fleet that keeps decoding never stalls, and the bind
+                    // waited behind it for good).
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
-                    if !self.with_inner(|inner| inner.fleet_stalled()) {
-                        return false;
+                    // A grow the walk will make holds its runs: it waits on
+                    // that, moving no one. Only where none is coming (the
+                    // governor's target reached) are residents moved.
+                    let need = Demand {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: RsUnits::default(),
+                    };
+                    if self.wait_on_grow(no_grow, need) {
+                        return true;
                     }
                     true
                 }
