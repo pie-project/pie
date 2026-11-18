@@ -84,13 +84,22 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
-    // Every rung of the lattice a prompt of the load's context holds is a
-    // candidate: the fire top (`engine::load::fire_top`) is chosen among
-    // them below, the context and memory its only bounds. A check's load
-    // sized for one kind of its fires lays the rungs to their rows.
+    // The most rows one prompt lays: its context, where the model keeps a
+    // lane's rows (kv or recurrent state); a model that keeps none (a
+    // diffusion transformer's plan) bounds a lane's rows by nothing the
+    // context sizes, only by the rows the load states. Every rung of the
+    // lattice to it is a candidate: the fire top (`engine::load::fire_top`)
+    // is chosen among them below, that bound and memory its only bounds. A
+    // check's load sized for one kind of its fires lays the rungs to their
+    // rows.
+    let prompt_rows = if boot.trace.caches.is_empty() && boot.budget.max_tokens > 0 {
+        boot.budget.max_tokens
+    } else {
+        boot.context.max(1)
+    };
     let lattice_top = match boot.knobs.every_rung {
         Some(super::EveryRung::To(rows)) => rows,
-        _ => boot.context.max(1),
+        _ => prompt_rows,
     };
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = lattice_top;
@@ -389,7 +398,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let top = crate::top::choose(
             &rungs,
             after_weights,
-            boot.context,
+            prompt_rows,
             &chip.rates(),
             Some(row_tile.clone()),
             device.name(),
