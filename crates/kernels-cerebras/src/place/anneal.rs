@@ -10,7 +10,8 @@
 //! - **Moves:** translate a block (a step scaled by the temperature), swap two units' origins,
 //!   relocate a K / V column next to one of its block's units.
 //! - **Energy:** the link term's estimate (the row stream's gaps once a step, every attending
-//!   row's K / V round trip, at [`super::cost::HOP`] a hop, Manhattan), plus a penalty a PE
+//!   unit's K / V round trips once a step, at [`super::cost::KV_HOP`] a hop, Manhattan; the
+//!   gaps at [`super::cost::HOP`]), plus a penalty a PE
 //!   of overlap or past the fabric. The program's own price reads no position, so it is the
 //!   same constant before and after.
 //! - **Determinism:** a seeded generator and a budget of moves a block ([`Anneal`]): a budget's
@@ -132,14 +133,13 @@ enum Term {
     /// The row stream from unit block `a` to `b` (their CX roots, the same row), once a step.
     Gap { a: usize, b: usize, wires: u32 },
     /// A unit's head root (column `col` of block `u`) to a K / V column's root (block `k`),
-    /// there and back, `rows` a step.
+    /// there and back, once a step ([`super::cost::KV_HOP`] a hop).
     Trip {
         u: usize,
         col: u32,
         /// The head root's offset below the block's origin.
         down: u32,
         k: usize,
-        rows: u32,
     },
 }
 
@@ -180,16 +180,10 @@ impl Model {
                 };
                 hop * (f64::from(dx + dy) + turn)
             }
-            Term::Trip {
-                u,
-                col,
-                down,
-                k,
-                rows,
-            } => {
+            Term::Trip { u, col, down, k } => {
                 let (cx, cy) = (at[u].x + 1 + col, at[u].y + down);
                 let d = cx.abs_diff(at[k].x) + cy.abs_diff(at[k].y);
-                hop * 2.0 * f64::from(d) * f64::from(rows)
+                super::cost::KV_HOP * 2.0 * f64::from(d)
             }
         }
     }
@@ -716,7 +710,6 @@ fn model(
                 col: s.units[u].col(kc.head),
                 down: s.units[u].rows(),
                 k: kv_block[k],
-                rows: p.units[u].unit.rows,
             });
         }
     }

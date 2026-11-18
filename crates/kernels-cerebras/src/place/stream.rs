@@ -261,6 +261,29 @@ mod tests {
         rep.ok().unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// The link term against the chip (1548): flux2-mini's denoise with its K / V columns 300
+    /// and 600 rows down cost +14,719 and +30,578 cycles a step over the columns in place (two
+    /// runs of it, 1,238,575 and 1,239,325). The term's change is within 5% of each.
+    #[test]
+    fn the_link_term_meets_the_chip() {
+        let t = trace("flux2-mini-bf16-kv-bf16");
+        let s = crate::stream::shape_of(&t, "denoise", 16).unwrap();
+        let p = crate::stream::build::program(&t, s, true).unwrap();
+        let base = super::super::cost::stream(&super::relay(&p, p.stream.clone()).unwrap())
+            .unwrap()
+            .cycles;
+        for (dy, chip) in [(300, 14_719.0), (600, 30_578.0)] {
+            let q = super::kv_moved(&p, dy).unwrap();
+            let lq = super::super::cost::stream(&q).unwrap();
+            let d = lq.cycles - base;
+            eprintln!(
+                "K / V {dy} rows down: the term {d:+.0} ({:+.0} hops), the chip {chip:+.0}",
+                d / super::super::cost::KV_HOP
+            );
+            assert!((d - chip).abs() <= 0.05 * chip, "{dy}: {d} vs {chip}");
+        }
+    }
+
     /// The placer pinned to a stream program's own placement reproduces it: flux2-mini's
     /// denoise (one band, and three bands in a fabric 38 wide) and Qwen3-0.6B's decode units.
     #[test]

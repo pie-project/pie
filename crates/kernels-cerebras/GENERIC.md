@@ -3673,8 +3673,54 @@ Where it stops:
   default.
 - **minimax-sim:** it needs G1's unpushed lowering; on origin its units overflow a PE before
   any placement.
-- **The calibration:** every gain above is the link term's. 1539 measures whether a row's
-  K / V round trip costs what the term says.
+- **The calibration:** every gain above is the link term's as it was (a row's round trip a
+  row, at 2 cycles a hop). 1548 measured it, below.
+
+### P1.d: the link term on the chip (1548)
+
+1548 ran flux2-mini's denoise (stream regime, 16 rows a class, 57 x 62) on the CS-3: fxm1's own
+program as the control, then the same program rebuilt with its K / V columns 0 / 300 / 600 rows
+below their units, and the 0 again. All five runs agree with the golden, with identical latents.
+
+| run | step 0 | step 1 | step 1 over kv0 (mean of two) |
+|---|---|---|---|
+| fxm1 (control) | 2,202,343 | 1,238,400 | -550 |
+| kv0 | 9,102,087 | 1,238,575 | |
+| kv300 | 9,588,867 | 1,253,669 | +14,719 |
+| kv600 | 10,015,068 | 1,269,528 | +30,578 |
+| kv0 again | 9,028,694 | 1,239,325 | |
+
+- **The steady state (step 1)** pays each (unit, K / V column) pair's round trip once a step,
+  the pairs one after another. flux2-mini has 12 such pairs, so moving the columns 300 rows adds
+  7,200 hops of round trips: 2.04 cycles a hop, and 2.12 at 600 rows. `place::cost::KV_HOP` is
+  2.08, their mean: the term says +14,976 and +29,952 (+1.7%, -2.0%;
+  `place::stream::tests::the_link_term_meets_the_chip`). The rows pipeline. The per-row model
+  said +153,600 / +307,200 (10x too much), a single trip +1,200 / +2,400 (12x too little). The
+  fitted hop is the simulator's `CHAIN_HOP` (2) within 4%. The fill's hop stays `CHAIN_HOP`:
+  1548 did not move units, so it says nothing of the fill.
+- **What it does not settle:** every unit of this program has 16 or 32 rows, so whether a pair's
+  cost grows with its rows is unmeasured. A rerun at 64 rows a class would tell.
+- **Step 0's excess is not the placement.** In kv0's step 0, every compute PE (`cx`, `cy`, `w`)
+  ends within 40 cycles of where fxm1's does. The excess is a constant +6.9M cycles on the
+  K / V column PEs and their helpers alone (`kp_*`, `kr_*`, `hp_3`, `hp_7`): PEs whose end waits
+  on the host. The step's host side shows the same gap (d2h 12.8 ms against 3.6 ms; wall 12.7
+  ms against 3.5). Step 1 is the same in every run. The program differs from fxm1's only in
+  `ops/satt.csl` (G1.8's paged code, off here), and its 149 static arrays are fxm1's word for
+  word. So the extra time is the host's first step on the `--statics` path, not the device.
+
+**Pricing again with the fitted term** (2000 moves a block, K / V columns only):
+
+| program | links: search's -> kept | of the price |
+|---|---|---|
+| qwen3-sim units | 145 -> 54 | -0.31% |
+| Qwen3-0.6B units | 19,105 -> 8,019 | -2.96% |
+| flux2-mini denoise (64 rows) | 995 -> 487 | -0.013% |
+| klein denoise (64 rows) | 113,495 -> 113,295 (laid and kept) | -0.001% |
+
+Decode units have many pairs (a layer's every head), so the term is a few percent of their step.
+flux2-mini's denoise has few, so its K / V placement hardly matters. That makes the annealer
+worth turning on by default for decode-unit programs once the decode path runs on the chip;
+for stream readings it barely changes the step.
 ## G4: column-side segments, a weight PE's memory, a root's scratch pool
 
 ### G4.1 The column roots' segment all-reduce

@@ -5,9 +5,12 @@
 //! A stream program's step pays its wires twice over:
 //! - **the fill**: the row stream crosses each gap between consecutive units once a step before
 //!   the last unit has its first row (the longest wire of each gap: the slowest row);
-//! - **each attending row**: a unit's head root sends a row's q / k / v down to its K / V
-//!   column's root and takes the attention back; a row waits on it, so its round trip (the
-//!   longer head's) is paid a row.
+//! - **each K / V round trip**: a unit's head root sends a row's q / k / v down to its K / V
+//!   column's root and takes the attention back. The rows pipeline: the chip pays each (unit,
+//!   K / V column) pair's round trip once a step, the pairs one after another, at [`KV_HOP`] a
+//!   hop, not once a row (chip calibration 1548: flux2-mini's 12 pairs, their K / V columns
+//!   0 / 300 / 600 rows down, +14,719 / +30,578 cycles a step: 2.04 / 2.12 cycles a hop; the
+//!   per-row model said +153,600 / +307,200, a single trip +1,200 / +2,400).
 //!
 //! Congestion is reported (the fabric edges two wires between blocks cross, the colours they
 //! share there) but not priced: what an edge's words cost is the calibration's to say.
@@ -23,6 +26,11 @@ type R<T> = Result<T, String>;
 /// Cycles a wire's hop (the stream regime's row chain's, fitted on the simulator:
 /// [`crate::cost::stream::CHAIN_HOP`]).
 pub const HOP: f64 = crate::cost::stream::CHAIN_HOP;
+
+/// Cycles a hop of a K / V round trip, each (unit, column) pair's paid once a step (fitted on
+/// the chip, 1548: the two moved placements' 2.04 and 2.12, their mean; the row chain's
+/// [`HOP`], fitted on the simulator, is 2).
+pub const KV_HOP: f64 = 2.08;
 
 /// A unit's attention round trip: its rows a step, the hops there and back (its longest head).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -103,10 +111,8 @@ pub fn stream(p: &Program) -> R<Links> {
         }
     }
     let fill = HOP * f64::from(fill_hops.iter().sum::<u32>());
-    let attention: f64 = trips
-        .iter()
-        .map(|t| HOP * f64::from(t.hops) * f64::from(t.rows))
-        .sum();
+    // (every unit's every K / V column: its round trip once a step)
+    let attention = KV_HOP * f64::from(kv.values().sum::<u32>());
     let shared: Vec<u32> = edges.values().copied().filter(|&n| n > 1).collect();
     Ok(Links {
         fill_hops,
