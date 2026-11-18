@@ -151,7 +151,6 @@ impl Run<'_> {
                 }
                 // The fire's mask offsets and words, where it staged them: a
                 // decode reading the masks finds each request's here.
-                #[cfg(not(feature = "rocm"))]
                 let built = plan::DecodePlan {
                     mask_indptr: self.mask_indptr(),
                     mask_origin: self.mask_origin(),
@@ -1484,13 +1483,8 @@ impl Run<'_> {
 
 impl Run<'_> {
     /// The fire's mask bits an attention applies, where its op reads them
-    /// (the plan binds each request's offset and word). ROCm's kernels apply
-    /// none: its classes take no lane stating a mask
-    /// (`exports::masked_classes`), and its arms run maskless.
+    /// (the plan binds each request's offset and word).
     pub(crate) fn applied_masks(&self, mask: Option<poem_ir::ValueId>) -> Option<kernels_cuda::Tensor> {
-        if cfg!(feature = "rocm") {
-            return None;
-        }
         mask.map(|mask| self.tensor(mask))
     }
 

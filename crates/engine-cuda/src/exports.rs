@@ -71,9 +71,7 @@ fn mask_reader(op: &poem_ir::Operation) -> Option<&poem_ir::Attn> {
 }
 
 /// Whether this backend's kernel for `attn` (which reads the masks) applies
-/// each lane's: a selection's and a relative bias's arms read none, nor any
-/// on ROCm, whose decode and prefill read no mask (they never did: its
-/// prefill refused one), so its classes take no lane stating one.
+/// each lane's: a selection's and a relative bias's arms read none.
 fn applies_mask(attn: &poem_ir::Attn) -> bool {
     match attn {
         poem_ir::Attn::Prefill {
@@ -85,7 +83,7 @@ fn applies_mask(attn: &poem_ir::Attn) -> bool {
             selection: None,
             bias: None,
             ..
-        } => cfg!(not(feature = "rocm")),
+        } => true,
         _ => false,
     }
 }
