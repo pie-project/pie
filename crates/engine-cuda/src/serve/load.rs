@@ -409,6 +409,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             device.name(),
             &counts,
         )?;
+        // Which pricing the estimate gave the dense matmuls, said once: the
+        // waves of the kernels hipBLASLt states, or the measured curve as
+        // timed and why its solutions went unread.
+        #[cfg(feature = "rocm")]
+        eprintln!(
+            "engine-cuda: the matmuls weighed by {}",
+            kernels_cuda::hip::lt_kernel::pricing()
+        );
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(

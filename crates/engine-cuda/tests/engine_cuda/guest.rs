@@ -233,8 +233,10 @@ pub fn alone_span(_: engine_cuda::program::Item<'_>, bytes: u64) -> engine_cuda:
     Ok(Box::leak(Box::new(buffer)).ptr())
 }
 
-/// A plane with no pool: each pair's state lies in a buffer of its own
-/// ([`alone_span`]), the test process's until it ends.
+/// A plane with no pool: each pair's tables and each instance's scratch lie
+/// in a buffer of their own as long as the plane states them
+/// ([`alone_span`], `ProgramPlane::pair_room`), the test process's until it
+/// ends.
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
     alone_plane_fenced().0
 }

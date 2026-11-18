@@ -226,6 +226,24 @@ impl Plane {
     }
 }
 
+/// A staged fire's groups: each program at each extents it was staged at,
+/// with its instances, in staging order.
+fn staged_groups(
+    staged: &[(ProgramId, Extents, InstanceId)],
+) -> Vec<(ProgramId, Extents, Vec<InstanceId>)> {
+    let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
+    for (program_id, extents, instance) in staged {
+        match groups
+            .iter_mut()
+            .find(|(pid, ext, _)| pid == program_id && ext == extents)
+        {
+            Some((_, _, members)) => members.push(*instance),
+            None => groups.push((*program_id, *extents, vec![*instance])),
+        }
+    }
+    groups
+}
+
 #[derive(Debug)]
 pub struct Plane {
     cache: Cache,
@@ -974,16 +992,7 @@ impl Plane {
         let arenas = *arenas;
         let at = *at;
 
-        let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
-        for (program_id, extents, instance) in staged.iter() {
-            match groups
-                .iter_mut()
-                .find(|(pid, ext, _)| pid == program_id && ext == extents)
-            {
-                Some((_, _, members)) => members.push(*instance),
-                None => groups.push((*program_id, *extents, vec![*instance])),
-            }
-        }
+        let groups = staged_groups(staged);
 
         // Each group lays in its pair's state, its flights one after
         // another in it, as wide as its widest; the wave's tables lie in

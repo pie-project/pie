@@ -372,7 +372,7 @@ pub fn hipblaslt() -> Result<&'static Hipblaslt, String> {
 
 /// Where to look for a ROCm library: the loader's own search first, then
 /// `$ROCM_PATH/lib`, then the default install root.
-fn open_library(name: &str) -> Result<libloading::Library, String> {
+pub(crate) fn open_library(name: &str) -> Result<libloading::Library, String> {
     let mut tried = Vec::new();
     let mut candidates = vec![PathBuf::from(name)];
     if let Some(root) = std::env::var_os("ROCM_PATH") {

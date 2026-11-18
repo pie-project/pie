@@ -86,9 +86,30 @@ pub const GEMM_WIDTHS: [u32; 3] = [1024, 2048, 4096];
 /// The widest of [`GEMM_WIDTHS`].
 pub const GEMM_WIDTH: u32 = GEMM_WIDTHS[GEMM_WIDTHS.len() - 1];
 
-/// The rows the matmul curve is timed at: the lattice's octaves a fire's
-/// prompt reaches, 256 to 8192.
-pub const GEMM_ROWS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+/// The rows the matmul curve is timed at: half octaves (steps of √2,
+/// rounded) from 256 to 8192 rows, the reach of a fire's prompt. An
+/// octave-spaced curve can sit in a library's dips between octaves (an
+/// MI300X's hipBLASLt at width 4096: 523 TFLOP/s at 2048 rows, 599 at
+/// 2896, 556 at 4096), so the shapes between them would be priced from
+/// its dips.
+pub const GEMM_ROWS: [u32; 11] = half_octaves(256);
+
+/// `N` rows at steps of √2 from `from`, rounded to the nearest row: the
+/// even steps `from` doubled, the odd ones those times √2.
+const fn half_octaves<const N: usize>(from: u32) -> [u32; N] {
+    let mut rows = [0; N];
+    let mut i = 0;
+    while i < N {
+        let octave = from << (i / 2);
+        rows[i] = if i % 2 == 0 {
+            octave
+        } else {
+            (octave as f64 * std::f64::consts::SQRT_2 + 0.5) as u32
+        };
+        i += 1;
+    }
+    rows
+}
 
 /// The keys (and rows) the attention curve is timed at.
 pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
@@ -306,45 +327,120 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     None
 }
 
+/// How a rates step admits its frames under the device's bound on one
+/// submission (`max_submit`, where it states one), every engine's rule:
+/// a frame is estimated from its fire's last measured time, and admitted
+/// where that estimate times [`Admission::worst`] fits the bound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub bound: Option<std::time::Duration>,
+    /// Whether the device's clock has settled: the warm-up's rotations
+    /// agreed ([`warm_up`], by [`settle`]'s rule). Frames before it measure
+    /// the clock's ramp, not an estimate's error.
+    pub settled: bool,
+    /// The largest ratio of a settled frame's time to its estimate seen,
+    /// never below 1: a measurement, over every settled frame carrying its
+    /// estimate up, no decay and no window.
+    pub worst: f64,
+}
+
+impl Admission {
+    #[must_use]
+    pub fn new(bound: Option<std::time::Duration>) -> Admission {
+        Admission {
+            bound,
+            settled: false,
+            worst: 1.0,
+        }
+    }
+
+    /// Whether a frame estimated at `estimate_ns` fits the bound at the
+    /// worst ratio seen (always, with no bound or no estimate).
+    #[must_use]
+    pub fn fits(&self, estimate_ns: Option<f64>) -> bool {
+        match (self.bound, estimate_ns) {
+            (Some(cap), Some(e)) => e * self.worst <= cap.as_nanos() as f64,
+            _ => true,
+        }
+    }
+
+    /// The fires a frame of `count` holds at `per_fire_ns` a fire: `count`
+    /// halved until the frame fits; `None` where not even one fire does
+    /// (the shape is past the bound, refused by name).
+    #[must_use]
+    pub fn fires(&self, count: u32, per_fire_ns: Option<f64>) -> Option<u32> {
+        let mut n = count.max(1);
+        loop {
+            if self.fits(per_fire_ns.map(|p| p * f64::from(n))) {
+                return Some(n);
+            }
+            if n == 1 {
+                return None;
+            }
+            n /= 2;
+        }
+    }
+
+    /// A frame landed: `took_ns` against its `estimate_ns`, carried up
+    /// from a frame of no more fires (`upward`). Only a settled device's
+    /// frames move the worst ratio.
+    pub fn landed(&mut self, estimate_ns: Option<f64>, took_ns: f64, upward: bool) {
+        if let Some(e) = estimate_ns.filter(|&e| e > 0.0)
+            && self.settled
+            && upward
+        {
+            self.worst = self.worst.max(took_ns / e);
+        }
+    }
+}
+
 /// The side of the cube the warm-up's size walk ([`warm_side`]) times
 /// first, and the one after it: the walk's first growth is theirs.
 pub const WARM_PROBE: u32 = 1024;
 
 /// The side of the warm-up's cube matmul (`side x side x side`), walked up
-/// by doubling with a real fire timed at each size (`time(side)`, ns):
+/// by doubling with a real fire timed at each size (`time(side, estimate)`,
+/// ns; `estimate` the walk's own for that fire, none for the two probes):
 /// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
 /// while its fire, estimated from the last one timed by the growth the last
 /// two measured (their time ratio, carried forward: not the flops' ratio),
-/// fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it is with no
-/// bound stated (nothing is walked then). The margin is the measurement's:
-/// no factor stands under the bound. A phone whose GPU faults a submission
-/// past its watchdog (KGSL's ~2 s) warms on a cube whose fire fits it.
+/// times `worst`, fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it
+/// is with no bound stated (nothing is walked then). `worst` starts at the
+/// caller's worst ratio of a measured time over its estimate (1 for none)
+/// and rises to each walked fire's measured time over the walk's estimate
+/// of it where that is more: the estimate's own error, measured, stands
+/// under the bound; no factor is tuned. Returns the side and the worst
+/// ratio seen. A phone whose GPU faults a submission past its watchdog
+/// warms on a cube whose fire fits it.
 pub fn warm_side<E>(
     max_submit: Option<std::time::Duration>,
-    mut time: impl FnMut(u32) -> Result<f64, E>,
-) -> Result<u32, E> {
+    mut worst: f64,
+    mut time: impl FnMut(u32, Option<f64>) -> Result<f64, E>,
+) -> Result<(u32, f64), E> {
     let Some(cap) = max_submit else {
-        return Ok(WARM_SHAPE.0);
+        return Ok((WARM_SHAPE.0, worst));
     };
     let bound = cap.as_nanos() as f64;
-    let mut before = time(WARM_PROBE / 2)?;
-    let mut last = time(WARM_PROBE)?;
+    let mut before = time(WARM_PROBE / 2, None)?;
+    let mut last = time(WARM_PROBE, None)?;
     let mut side = WARM_PROBE;
-    if last > bound {
-        return Ok(WARM_PROBE / 2);
+    if last * worst > bound {
+        return Ok((WARM_PROBE / 2, worst));
     }
     while side < WARM_SHAPE.0 {
         let growth = last / before.max(f64::MIN_POSITIVE);
-        if last * growth > bound {
+        let estimate = last * growth;
+        if estimate * worst > bound {
             break;
         }
-        let next = time(side * 2)?;
-        if next > bound {
+        let next = time(side * 2, Some(estimate))?;
+        worst = worst.max(next / estimate.max(f64::MIN_POSITIVE));
+        if next * worst > bound {
             break;
         }
         (before, last, side) = (last, next, side * 2);
     }
-    Ok(side)
+    Ok((side, worst))
 }
 
 /// The bytes an attention of `shape` moves at least: its queries read and
@@ -1089,12 +1185,19 @@ mod tests {
             let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
             Ok(per * f64::from(k))
         };
-        let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
-        assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
+        let settled =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            settled.per_fire_ns, 10.0,
+            "the doublings alone settle in the slow state"
+        );
         calls.set(0);
         let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
         let settled_at = calls.get();
-        assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
+        assert!(
+            settled_at > SLOW + 1,
+            "the warm-up ran past the slow state ({settled_at} frames)"
+        );
         // The next frame of that length reads the fast state.
         let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
         assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
@@ -1355,6 +1458,44 @@ mod tests {
         );
     }
 
+    /// A cold frame before the clock settles moves nothing: the 840's walk
+    /// at 2048^3 took 23.4 ms against 12.3 ms estimated while its clock
+    /// ramped, and held every admission after it 1.9x high.
+    #[test]
+    fn a_cold_frame_does_not_inflate_later_admissions() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.landed(Some(12.33e6), 23.43e6, true);
+        assert_eq!(a.worst, 1.0);
+        // The attention's frame of 4 at 274 ms each fits at 1096 ms.
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(4));
+        // Settled: its frames count, the largest ratio kept.
+        a.settled = true;
+        a.landed(Some(100e6), 104e6, true);
+        a.landed(Some(100e6), 101e6, true);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+        // A frame carried down (from more fires to fewer) holds its own
+        // submit: it moves nothing.
+        a.landed(Some(1e6), 3e6, false);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+    }
+
+    /// A frame that does not fit halves its fires until it does; only a
+    /// single fire past the bound is refused.
+    #[test]
+    fn a_frame_that_does_not_fit_halves_its_fires() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.settled = true;
+        a.worst = 1.9;
+        // 4 fires of 274 ms: 2083 ms at 1.9x; 2 fit (1042 ms).
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(2));
+        assert_eq!(a.fires(16, Some(100e6)), Some(8));
+        // One fire past the bound: refused.
+        assert_eq!(a.fires(4, Some(1.2e9)), None);
+        // No estimate yet, or no bound: the frame as asked.
+        assert_eq!(a.fires(4, None), Some(4));
+        assert_eq!(Admission::new(None).fires(4, Some(1e12)), Some(4));
+    }
+
     /// The warm-up's cube walks up while its next fire, estimated from the
     /// last by the growth the last two measured, fits the device's bound on
     /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
@@ -1365,19 +1506,19 @@ mod tests {
         // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
         let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
         let mut timed = Vec::new();
-        let side = warm_side(kgsl, |s| {
+        let (side, worst) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
             Ok::<f64, ()>(cubic(s))
         })
         .unwrap();
-        assert_eq!(side, 8192);
+        assert_eq!((side, worst), (8192, 1.0));
         assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
         // A device slowing past the flops' growth (each doubling 10x, as a
         // clock sinking under its power cap): 4096^3 at 300 ms, the next
         // estimated at 3 s, past the bound: it is never fired.
         let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
         let mut timed = Vec::new();
-        let side = warm_side(kgsl, |s| {
+        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
             Ok::<f64, ()>(sinking(s))
         })
@@ -1385,12 +1526,33 @@ mod tests {
         assert_eq!(side, 4096);
         assert_eq!(timed, vec![512, 1024, 2048, 4096]);
         // No bound stated: the widest, nothing timed.
-        let side = warm_side(None, |_| -> Result<f64, ()> {
+        let side = warm_side(None, 1.0, |_, _| -> Result<f64, ()> {
             panic!("timed with no bound")
         });
-        assert_eq!(side, Ok(WARM_SHAPE.0));
+        assert_eq!(side, Ok((WARM_SHAPE.0, 1.0)));
         // The probe itself past the bound: the cube under it.
-        assert_eq!(warm_side(kgsl, |_| Ok::<f64, ()>(3e9)), Ok(WARM_PROBE / 2));
+        assert_eq!(
+            warm_side(kgsl, 1.0, |_, _| Ok::<f64, ()>(3e9)),
+            Ok((WARM_PROBE / 2, 1.0))
+        );
+        // The walk's own estimate low by 1.3x at 4096 (its fire 1.3x the
+        // growth's): the worst ratio seen is 1.3, and 8192, estimated from
+        // 4096's growth, stands past a 1.5 s bound under it: never fired.
+        let mut timed = Vec::new();
+        let lagging = |side: u32| match side {
+            512 => 0.29e6,
+            1024 => 2.34e6,
+            2048 => 18.75e6,
+            _ => 150e6 * 1.3,
+        };
+        let (side, worst) = warm_side(Some(std::time::Duration::from_millis(1500)), 1.0, |s, _| {
+            timed.push(s);
+            Ok::<f64, ()>(lagging(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert!((worst - 1.3).abs() < 0.01, "{worst}");
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
     }
 
     /// The attention curve's keys are where its shape is compute-bound on
@@ -1656,6 +1818,10 @@ mod tests {
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
         assert!(GEMM_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            GEMM_ROWS,
+            [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]
+        );
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
         assert!(elementwise_sets() >= 2);
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
