@@ -1058,7 +1058,7 @@ fn decode_eager_against_body_probe() {
                     let q = q();
                     let mut o = gpu.zeros(lanes, c.q_heads * c.head_dim, Dtype::Bf16);
                     let us = gpu.time(200, || {
-                        attn::decode(&ctx, q, &built, &cache.pool, None, c.head_dim, 0.0, &mut o)
+                        attn::decode(&ctx, q, &built, &cache.pool, None, c.head_dim, 0.0, &mut o, None)
                             .unwrap();
                     });
                     line.push_str(&format!(
