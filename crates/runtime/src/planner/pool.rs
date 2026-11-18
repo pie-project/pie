@@ -501,7 +501,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_sweep(keep, room, order, wanted)
+            kv.prepare_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()
@@ -519,7 +519,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_tail_sweep(keep, room, order, wanted)
+            kv.prepare_tail_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()

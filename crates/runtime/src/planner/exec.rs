@@ -509,7 +509,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         tracing::warn!(pid = %pid, %error, "planner: host to disk spill failed");
     }
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
-        kv.prepare_suspend(&working_sets)
+        kv.prepare_suspend(&working_sets, crate::policy::retention::Installed)
     });
     let kv = match prepared {
         Ok(kv) => kv,
