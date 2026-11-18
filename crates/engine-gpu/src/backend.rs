@@ -295,6 +295,10 @@ pub trait Tactics: std::fmt::Debug {
         bound.div_ceil(tile) * tile
     }
 
+    /// The compute units the device states (its cores, CUs or SMs): what
+    /// `[rates] workgroups_per_core` is counted over.
+    fn cores(&self) -> u32;
+
     fn sdpa_tile_rows_per_request(&self) -> u32 {
         self.profile()
             .get::<crate::tuning::SdpaTileRowsPerRequest>()

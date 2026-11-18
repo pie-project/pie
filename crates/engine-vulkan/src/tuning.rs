@@ -345,6 +345,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         Tuning::profile(self)
     }
 
+    fn cores(&self) -> u32 {
+        self.limits.cores
+    }
+
     fn qmm_ladder(
         &self,
         rows: u32,

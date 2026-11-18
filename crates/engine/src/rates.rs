@@ -28,13 +28,15 @@
 //! - `few_row_tflops`: a bf16 matmul at decode-shaped rows, 4 to 256, on
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
-//!   reads no longer bind it. Measured on every backend.
+//!   reads no longer bind it, at [`FEW_ROWS`] ([`few_row_rate`]). Measured
+//!   on every backend.
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
 //!   measured where its API hides it (Vulkan, wgpu, Metal): one workgroup
-//!   a head of a kernel at its compute-bound shape, its time against the
-//!   same work at the rate its full curve states ([`workgroups_per_core`]).
+//!   a head of a kernel at its compute-bound shape ([`OCCUPANCY_KEYS`]), its
+//!   time against the same work at the rate its full curve states
+//!   ([`workgroups_per_core`]).
 //!
 //! Each backend's estimate weighs a fire by the keys it names
 //! ([`rates_at_load`]'s `keys`, of `profile::fire::KEYS`); a rate measured
@@ -110,6 +112,68 @@ const fn half_octaves<const N: usize>(from: u32) -> [u32; N] {
     }
     rows
 }
+
+/// The rows `few_row_tflops` is timed at: the decode-shaped octaves, 4 to
+/// [`GEMM_ROWS`]' first, at each of [`GEMM_WIDTHS`] (n = k), through the
+/// kernel serving picks at each.
+pub const FEW_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
+
+/// One timed point of the few-row matmul: `rows` of a `width x width`
+/// bf16 plane, the rows its kernel's tile pads them to, and one fire's ns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FewRow {
+    pub rows: u32,
+    pub width: u32,
+    pub padded: u32,
+    pub ns: f64,
+}
+
+impl FewRow {
+    /// The flops its kernel computes: its padded rows' (two a
+    /// multiply-add).
+    #[must_use]
+    pub fn flops(&self) -> f64 {
+        gemm_flops(self.padded, self.width, self.width)
+    }
+
+    /// The bytes of its weight plane, read once.
+    #[must_use]
+    pub fn plane_bytes(&self) -> f64 {
+        2.0 * f64::from(self.width) * f64::from(self.width)
+    }
+}
+
+/// `few_row_tflops` (flops a ns) from [`FEW_ROWS`]' points: each point's
+/// compute is bound where its time less its launch passes its plane's read
+/// at `bytes_per_ns` by more than [`AGREEMENT`], and the rate is the median
+/// of those points' padded flops over their time less the launch. Where no
+/// point is bound by its compute, the fastest any point computed at (a
+/// bound below the kernel's rate, its reads hiding the rest). `None` where
+/// no point leaves a time past its launch: nothing measured.
+#[must_use]
+pub fn few_row_rate(points: &[FewRow], launch_ns: f64, bytes_per_ns: f64) -> Option<f64> {
+    let rate = |p: &FewRow| {
+        let left = p.ns - launch_ns;
+        (left > 0.0).then(|| p.flops() / left)
+    };
+    let mut bound: Vec<f64> = points
+        .iter()
+        .filter(|p| p.ns - launch_ns > p.plane_bytes() / bytes_per_ns * (1.0 + AGREEMENT))
+        .filter_map(rate)
+        .collect();
+    let found = if bound.is_empty() {
+        points.iter().filter_map(rate).max_by(f64::total_cmp)
+    } else {
+        bound.sort_by(f64::total_cmp);
+        Some(bound[bound.len() / 2])
+    };
+    found.filter(|r| r.is_finite() && *r > 0.0)
+}
+
+/// The keys one tile a head walks where `workgroups_per_core` is measured
+/// ([`workgroups_per_core`]): the attention curve's longest, so the walk,
+/// not its setup, sets the time, at a rate the curve states.
+pub const OCCUPANCY_KEYS: u32 = ATTN_KEYS[ATTN_KEYS.len() - 1];
 
 /// The keys (and rows) the attention curve is timed at.
 pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
@@ -1110,12 +1174,19 @@ mod tests {
             let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
             Ok(per * f64::from(k))
         };
-        let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
-        assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
+        let settled =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            settled.per_fire_ns, 10.0,
+            "the doublings alone settle in the slow state"
+        );
         calls.set(0);
         let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
         let settled_at = calls.get();
-        assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
+        assert!(
+            settled_at > SLOW + 1,
+            "the warm-up ran past the slow state ({settled_at} frames)"
+        );
         // The next frame of that length reads the fast state.
         let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
         assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
@@ -1565,6 +1636,35 @@ mod tests {
         };
         assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The few-row rate is the median of the points its compute binds, its
+    /// rows padded to its tile; where reads bind every point, the fastest.
+    #[test]
+    fn the_few_row_rate_is_its_compute_bound_points_median() {
+        // 1 TB/s; a 32-row tile at 4 flops a ns past a 900 ns launch.
+        let at = |rows: u32, width: u32, ns: f64| FewRow {
+            rows,
+            width,
+            padded: rows.div_ceil(32) * 32,
+            ns,
+        };
+        let compute = |rows: u32, w: u32| 900.0 + gemm_flops(rows.div_ceil(32) * 32, w, w) / 4.0;
+        let read = |w: u32| 900.0 + 2.0 * f64::from(w) * f64::from(w) / 1000.0;
+        let points: Vec<FewRow> = [1024u32, 4096]
+            .into_iter()
+            .flat_map(|w| FEW_ROWS.map(|rows| at(rows, w, compute(rows, w).max(read(w)))))
+            .collect();
+        let r = few_row_rate(&points, 900.0, 1000.0).unwrap();
+        assert!((r - 4.0).abs() < 1e-9, "{r}");
+        // Reads bind every point (a bandwidth no point passes): the fastest
+        // any point computed at.
+        let slow = [at(4, 4096, 100_900.0), at(64, 4096, 200_900.0)];
+        let r = few_row_rate(&slow, 900.0, 1.0).unwrap();
+        assert_eq!(r, gemm_flops(64, 4096, 4096) / 200_000.0);
+        // No time past the launch: nothing measured.
+        assert_eq!(few_row_rate(&[at(4, 1024, 800.0)], 900.0, 1000.0), None);
+        assert_eq!(few_row_rate(&[], 900.0, 1000.0), None);
     }
 
     /// The RTX PRO 4500's tiled attention at one workgroup a head: 264
