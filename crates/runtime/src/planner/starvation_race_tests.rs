@@ -2994,3 +2994,42 @@ async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
     );
     waited.abort();
 }
+
+/// An evicted process's gate sleeps until its own residency changes: the
+/// planner poked for others, room freed, and time passing (it re-reported
+/// a standing shortfall every 100 ms, waking each waiter ten times a
+/// second) wake it not once. Its restore wakes it, once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (pid, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [pid, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    let p = planner.clone();
+    let gate = crate::rt::spawn(async move { p.wait_resident(pid).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        planner.poke();
+        planner.pages_freed();
+    }
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(!gate.is_finished(), "still evicted");
+    assert_eq!(
+        planner.stats.gate_parks.load(Ordering::Relaxed),
+        1,
+        "parked once, woken by nothing of its own"
+    );
+    let signal = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Resident;
+        proc.signal.clone()
+    });
+    signal.notify_waiters();
+    gate.await.expect("the gate ends").expect("resident");
+    assert_eq!(planner.stats.gate_parks.load(Ordering::Relaxed), 1);
+}

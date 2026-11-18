@@ -293,20 +293,26 @@ impl ResidencyPlanner {
         }
     }
 
-    async fn await_signal(&self, signal: &Notify, settled: impl Fn() -> bool) {
+    /// Sleeps until what a non-resident process waits on changes: its own
+    /// residency (`signal`, told as it is evicted, restored, rolled back or
+    /// gone), or the policy answering pressure with nothing freed, the
+    /// event its short restore gives up on ([`Self::restore_expired`]).
+    /// No clock: a planner poke for another process, or the shortfall
+    /// standing, does not wake it. (On a 100 ms re-report it woke each
+    /// waiter ten times a second while it stayed evicted.)
+    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        let answered = crate::policy::pressure::answered();
+        tokio::pin!(answered);
+        answered.as_mut().enable();
         if settled() {
             return;
         }
-        // A restore short of room the policy must make says so again while
-        // it waits, as a parked allocation does.
-        if crate::rt::time::timeout(crate::policy::pressure::AGAIN, notified)
-            .await
-            .is_err()
-        {
-            self.report_short();
+        tokio::select! {
+            () = &mut notified => {}
+            () = &mut answered => {}
         }
     }
 
@@ -395,7 +401,7 @@ impl ResidencyPlanner {
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            self.await_signal(&signal, || self.is_resident(pid)).await;
+            Self::await_residency_change(&signal, || self.is_resident(pid)).await;
             if let Some(error) = self.restore_expired(pid) {
                 tracing::warn!(%pid, %error, "planner: a short restore gives up");
                 return Err(error);
