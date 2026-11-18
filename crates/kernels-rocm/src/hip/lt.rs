@@ -303,28 +303,52 @@ impl Plan {
 }
 
 /// The waves the heuristic's first algorithm for `s` fills on the current
-/// device, as hipBLASLt states them for it (`wavesCount`: its workgroups
-/// over those the device holds at once of its kernel), planning the shape
-/// as a launch of it would. `None` where hipBLASLt offers no algorithm, or
-/// states no waves.
-pub fn waves(s: Shape) -> Result<Option<f64>, Refused> {
+/// device: its workgroups (the tiles of the macro tile hipBLASLt's logic
+/// states for that algorithm's solution, times its split of K) over those
+/// the device holds at once (its compute units times the workgroups of that
+/// kernel one holds, by HIP's occupancy calculator; [`super::lt_kernel`]).
+/// hipBLASLt 1.4 states no `wavesCount` itself.
+///
+/// A solution that leaves its split of K to the launch (`globalSplitU` -1)
+/// splits only a problem of less than a wave (rocprofv3 on gfx942: 96 tiles
+/// launched three slices each; 256 to 1728 tiles launched one), so from a
+/// wave its split is one and below it the waves are not stated: `Ok(None)`,
+/// as where hipBLASLt offers no algorithm. `Err` where the solution could
+/// not be read, and why ([`super::lt_kernel::pricing`] states it).
+pub fn waves(s: Shape) -> Result<Option<f64>, String> {
     const CALL: &str = "hipblasLtMatmulAlgoGetHeuristic";
-    let lt = library(CALL)?;
-    let mut devices = registry().lock().expect("lock poisoned");
-    let dev = device_of(lt, &mut devices)?;
-    let handle = dev.handle;
-    let plan = match dev.plans.get(&s) {
-        Some(plan) => plan,
-        None => {
-            let plan = Plan::build(lt, handle, s)?;
-            crate::tally::built();
-            dev.plans.entry(s).or_insert(plan)
+    let lt = library(CALL).map_err(|e| e.to_string())?;
+    let ordinal = current_device();
+    let mut algo = {
+        let mut devices = registry().lock().expect("lock poisoned");
+        let dev = device_of(lt, &mut devices).map_err(|e| e.to_string())?;
+        let handle = dev.handle;
+        let plan = match dev.plans.get(&s) {
+            Some(plan) => plan,
+            None => {
+                let plan = Plan::build(lt, handle, s).map_err(|e| e.to_string())?;
+                crate::tally::built();
+                dev.plans.entry(s).or_insert(plan)
+            }
+        };
+        match plan {
+            Some(plan) => plan.algo.algo,
+            None => return Ok(None),
         }
     };
-    Ok(plan
-        .as_ref()
-        .map(|plan| f64::from(plan.algo.waves))
-        .filter(|&w| w.is_finite() && w > 0.0))
+    let super::lt_kernel::Stated { solution, resident } =
+        super::lt_kernel::stated(ordinal, &mut algo)?;
+    let [rows, cols] = solution.tile;
+    let tiles =
+        u64::from(s.n.div_ceil(rows)) * u64::from(s.m.div_ceil(cols)) * u64::from(s.groups.max(1));
+    let cus = super::multiprocessors(ordinal.unsigned_abs()).map_err(|e| e.to_string())?;
+    let held = u64::from(cus) * u64::from(resident);
+    let slices = match solution.split {
+        Some(split) => u64::from(split),
+        None if tiles >= held => 1,
+        None => return Ok(None),
+    };
+    Ok(Some((tiles * slices) as f64 / held as f64))
 }
 
 /// Enqueues `y = x · wᵀ (+ bias)` on `stream`. `Ok(false)` when hipBLASLt
