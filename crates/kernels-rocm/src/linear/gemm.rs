@@ -8,6 +8,33 @@ use super::dense;
 #[cfg(feature = "rocm")]
 use dtype::Dtype;
 
+/// The workgroups (blocks) of the skinny kernel, ROCm's few-rows kernel,
+/// walking a plain bf16 product of `m x n x k` (`m` up to its 8 rows) one
+/// compute unit of the current device holds at once, at its launch's
+/// threads and LDS: HIP's occupancy calculator
+/// (`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`) over the kernel's
+/// registers and LDS against the compute unit's.
+pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32, Error> {
+    const OP: &str = "linear.few_rows_occupancy";
+    let (m, n, k) = (
+        count(OP, "the rows", m)?,
+        count(OP, "the columns", n)?,
+        count(OP, "the contraction", k)?,
+    );
+    #[cfg(feature = "rocm")]
+    {
+        super::gemv::skinny_resident_blocks(ctx, m, n, k)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, m, n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The most rows ROCm's few-rows kernel (the skinny kernel) walks.
+pub const FEW_ROWS: u32 = 8;
+
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, None, y)
 }

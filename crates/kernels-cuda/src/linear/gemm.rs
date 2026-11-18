@@ -18,6 +18,39 @@ pub use cublas::tile_rows;
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
+/// The workgroups (blocks) of the few-rows kernel serving runs a plain bf16
+/// product of `m x n x k` on (the rows skeleton, `m` up to its
+/// [`crate::linear::skeleton::ROWS_M`]) one multiprocessor of the current
+/// device holds at once, at its launch's threads: the driver's occupancy
+/// calculator (`cuOccupancyMaxActiveBlocksPerMultiprocessor`) over the
+/// kernel's registers and shared memory against the multiprocessor's.
+pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32, Error> {
+    const OP: &str = "linear.few_rows_occupancy";
+    let _ = ctx;
+    if !(1..=FEW_ROWS).contains(&m) {
+        return Err(crate::jit::refuse(
+            OP,
+            format!("the few-rows kernel takes 1..={FEW_ROWS} rows, not {m}"),
+        ));
+    }
+    #[cfg(feature = "cuda")]
+    {
+        crate::linear::gemv::rows_resident_blocks(
+            count(OP, "the rows", m)?,
+            count(OP, "the columns", n)?,
+            count(OP, "the contraction", k)?,
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The most rows CUDA's few-rows kernel (the rows skeleton) takes.
+pub const FEW_ROWS: u32 = crate::linear::skeleton::ROWS_M;
+
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
 }

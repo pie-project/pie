@@ -9,6 +9,7 @@ pub mod error;
 pub mod gather;
 pub mod jit;
 pub mod linear;
+pub mod roofline;
 pub mod runtime;
 pub mod sampling;
 pub mod seat;

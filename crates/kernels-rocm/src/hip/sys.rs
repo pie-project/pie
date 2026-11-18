@@ -150,6 +150,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipMemSetAccess(ptr: *mut c_void, bytes: usize, desc: *const MemAccessDesc, count: usize) -> HipError;
     fn hipMemGetAllocationGranularity(granularity: *mut usize, prop: *const MemAllocationProp, option: c_int) -> HipError;
     fn hipFuncGetAttribute(value: *mut c_int, attr: c_int, function: Function) -> HipError;
+    fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(blocks: *mut c_int, function: Function, block: c_int, shared_bytes: usize) -> HipError;
 });
 
 table!(Hiprtc from "libhiprtc.so" {
