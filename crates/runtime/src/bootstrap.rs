@@ -514,6 +514,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
     if let Some(d) = engine_configs.first() {
+        // What the planner admits against on a shared pool (its total,
+        // `SharedPool::room`), beside the facts' count: the two count the
+        // same pages, the span a lowered rung lends in neither; said once
+        // here so they cannot part silently.
+        let (planner_pages, lent_chunks) = arena_stores
+            .first()
+            .and_then(|stores| stores.shared.as_ref())
+            .map_or((d.chunks.kv_device_pages(), 0), |shared| {
+                let room = shared.lock().unwrap().room();
+                (u64::from(room.list_slots), room.lent_chunks)
+            });
+        if planner_pages != d.chunks.kv_device_pages() {
+            tracing::warn!(
+                facts_pages = d.chunks.kv_device_pages(),
+                planner_pages,
+                "the planner's kv total is not the engine's: the pinned weights or the \
+                 pool's ceiling take the difference"
+            );
+        }
         let shared = crate::store::shared::SharedPool::states_shared(&d.chunks);
         // A shared pool states its tiers in chunks, not in the page fields
         // its engine leaves at 0.
@@ -537,12 +556,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         if tiers.is_empty() {
             tracing::warn!(
                 device_pages = d.chunks.kv_device_pages(),
+                planner_pages,
+                lent_chunks,
                 "no host or disk kv tier: pie cannot compute kv again, so kv \
                  pressure restarts processes"
             );
         } else if shared {
             tracing::info!(
                 device_pages = d.chunks.kv_device_pages(),
+                planner_pages,
+                lent_chunks,
                 host_chunks = host,
                 disk_chunks = disk,
                 chunk_bytes = d.chunks.chunk_bytes,
@@ -551,6 +574,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         } else {
             tracing::info!(
                 device_pages = d.chunks.kv_device_pages(),
+                planner_pages,
                 host_pages = host,
                 disk_pages = disk,
                 "{tiers}"

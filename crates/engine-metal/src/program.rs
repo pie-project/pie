@@ -1850,7 +1850,12 @@ mod tests {
             let mut streamed = 0;
             for (stage, plan) in compiled.plans.iter().enumerate() {
                 let regions = &compiled.stages[stage].regions;
-                let needs = launch::temporary_needs(plan, regions);
+                let streamed: Vec<usize> = regions
+                    .iter()
+                    .filter(|region| region.form == compile::Form::Streamed)
+                    .map(|region| region.region_index as usize)
+                    .collect();
+                let needs = launch::temporary_needs(plan, &streamed);
                 for (region, need) in regions
                     .iter()
                     .filter(|region| region.form == compile::Form::Streamed)

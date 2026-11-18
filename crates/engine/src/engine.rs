@@ -326,9 +326,11 @@ pub trait Engine: Send {
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that
-    /// reads them, which must address the new slots. The default does
-    /// nothing: an engine that states no `Instance` or `Channel` shape is
-    /// never asked.
+    /// reads them, which must address the new slots. A channel closed with
+    /// an instance still bound on it is still registered
+    /// ([`Engine::close_channel`]): its rebind is served like an open one's.
+    /// The default does nothing: an engine that states no `Instance` or
+    /// `Channel` shape is never asked.
     fn rebind_slots(&mut self, rebind: Rebind) -> Result<()> {
         let _ = rebind;
         Ok(())
@@ -349,12 +351,25 @@ pub trait Engine: Send {
 
     /// Closes instance `id`: the engine's standing guest bytes after the
     /// close ([`Engine::standing_after`]), less any set no live instance
-    /// shares any more.
+    /// shares any more. A closed channel this was the last instance bound
+    /// on is released with it ([`Engine::close_channel`]): once this
+    /// returns, the runtime gives the channel's `Channel` slots back.
     fn close_instance(&mut self, id: InstanceId) -> Result<u64> {
         let _ = id;
         Err(self.unsupported("close_instance"))
     }
 
+    /// Closes channel `id`. With no instance bound on it, the channel and
+    /// its endpoint are released now. With an instance still bound on it,
+    /// the channel is only closing: its registration, endpoint and ring
+    /// stay, every instance bound on it keeps reading and writing it, a
+    /// [`Engine::rebind_slots`] of its ring (the runtime parked and
+    /// restored it with those instances) is served as an open channel's,
+    /// and an evacuation that moves its slots rebases it; no new instance
+    /// binds on it. The last such instance's [`Engine::close_instance`]
+    /// releases it. The runtime keeps the channel's `Channel` slots owned
+    /// until then, and gives them back only after that close returns, so
+    /// the engine never addresses slots the runtime handed elsewhere.
     fn close_channel(&mut self, id: ChannelId) -> Result<()> {
         let _ = id;
         Err(self.unsupported("close_channel"))
