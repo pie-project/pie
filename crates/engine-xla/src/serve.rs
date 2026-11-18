@@ -1703,9 +1703,12 @@ impl Shell {
                 || seated.mask.is_some()
                 || seated.adapter.is_some()
                 || seated.kv_less
-                || seated.readout.is_some_and(|r| r.len() != 1)
+                // a lane reads its last row, or every row (a drafting lane's
+                // window or prompt)
+                || seated.readout.is_some_and(|r| {
+                    r.len() != 1 && !r.iter().copied().eq(0..seated.lane.tokens.len() as u32)
+                })
                 || !seated.inputs.is_empty()
-                || seated.writes.is_some()
             {
                 return None;
             }
@@ -2372,7 +2375,34 @@ impl Shell {
         if let Some(&last) = readout_rows.last() {
             readout_rows.resize((want as usize).max(readout_rows.len()), last);
         }
-        self.readouts.insert(readout_rows.len() as u32);
+        // A fire whose lanes read more than their last row, padded, lands
+        // its real lanes' readouts alone, in lane order: its padding lanes'
+        // rows (a row each) are read out and dropped, so the planes hold no
+        // more than the runtime's cut lets the real lanes read
+        // (`ReadoutFacts::store_rows`).
+        let compacts = lanes[..real]
+            .iter()
+            .any(|s| s.readout.is_some_and(|r| r.len() > 1))
+            && composition
+                .lanes()
+                .iter()
+                .any(|row| row.source as usize >= real);
+        let mut plane_layout = readout_layout.clone();
+        let readout_pick = compacts.then(|| {
+            let mut pick: Vec<i32> = Vec::new();
+            for (source, &(first, count)) in readout_layout.iter().enumerate() {
+                plane_layout[source] = (pick.len() as u32, count);
+                pick.extend((first..first + count).map(|at| at as i32));
+            }
+            let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, pick.len() as u32);
+            if let Some(&last) = pick.last() {
+                pick.resize((want as usize).max(pick.len()), last);
+            }
+            pick
+        });
+        let plane_rows = readout_pick.as_ref().map_or(readout_rows.len(), Vec::len) as u32;
+        self.readouts.insert(plane_rows);
+        let readout_pick = readout_pick.map(|pick| inputs.i32s(handles, &pick, 1));
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         // Tokens a guest pass put on the device: the pool row and lane the
         // fire gathers each from (row `-1`: the host's own).
@@ -2633,9 +2663,9 @@ impl Shell {
             readouts,
         };
         let slots = self.slots(fire_rows);
-        let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
+        let planes = self.planes(&composition, &slots, plane_rows)?;
         // The host readers' readout rows, gathered apart after the fire.
-        let host = self.host_table(&composition, &planes, &readout_layout, lanes, real);
+        let host = self.host_table(&composition, &planes, &plane_layout, lanes, real);
         if let Some(table) = &host {
             let plane = &planes[table.plane];
             self.gather_shapes.insert((plane.rows, plane.width));
@@ -2667,6 +2697,7 @@ impl Shell {
             cache_rows: cache_rows_t,
             readout_rows: readout_t,
             readout_indptr,
+            readout_pick,
             adapter_routes: adapter_t,
             adapter_planes,
             mrope_positions: mrope_t,
@@ -2927,7 +2958,7 @@ impl Shell {
             &composition,
             &planes,
             buffers,
-            (&readout_rows, &readout_layout),
+            (&readout_rows, &readout_layout, &plane_layout),
             &pixels,
             real,
             host,
@@ -3157,7 +3188,7 @@ impl Shell {
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
         buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
-        (readout_rows, readout_layout): (&[i32], &[(u32, u32)]),
+        (readout_rows, readout_layout, plane_layout): (&[i32], &[(u32, u32)], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,
         host: Option<(HostTable, crate::pjrt::Buffer)>,
@@ -3175,13 +3206,17 @@ impl Shell {
                 continue;
             }
             let (first, count) = readout_layout[source];
+            let (on_plane, _) = plane_layout[source];
             for (p, plane) in planes.iter().enumerate() {
                 let out = &self.exports[plane.export];
                 if !out.classes.contains(row.class as usize) {
                     continue;
                 }
                 seats[source][p] = Some(match out.decl.axis {
-                    _ if out.decl.readout => Seat { first, count },
+                    _ if out.decl.readout => Seat {
+                        first: on_plane,
+                        count,
+                    },
                     InputAxis::Row => Seat {
                         first: row.row_offset,
                         count: row.rows,
@@ -3316,6 +3351,7 @@ impl Shell {
             .with_stage(stage)
             .with_tuning(self.tuning);
         let place = At::new();
+        let pick = bindings.readout_pick;
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
         // The tokens a guest pass put in the pool, gathered over the host's
         // stand-ins before anything reads them (a read of the pool: no
@@ -3386,6 +3422,10 @@ impl Shell {
         } else {
             Some(tracer.value(readout_t)?)
         };
+        let pick = match pick {
+            Some(t) => Some((tracer.value(t)?, i64::from(t.rows))),
+            None => None,
+        };
         let mut extras = Vec::new();
         let mut landed: Vec<u16> = Vec::new();
         for plane in planes {
@@ -3406,6 +3446,15 @@ impl Shell {
                             let ids = f.reshape(ids, &[n])?;
                             f.take_rows(whole, ids)?
                         }
+                    };
+                    // the real lanes' readouts alone, where the fire drops
+                    // its padding lanes'
+                    let picked = match (readout, pick) {
+                        (true, Some((at, m))) => {
+                            let at = f.reshape(at, &[m])?;
+                            f.take_rows(picked, at)?
+                        }
+                        _ => picked,
                     };
                     // f32 comes back faster than bf16: the device relayouts a
                     // bf16 plane on its way to a row-major host buffer.
