@@ -142,6 +142,8 @@ pub struct StatedKv {
     pub tokens: u64,
     pub page_tokens: u32,
     pub pages: u64,
+    /// The recurrent records sized beside the pages: one a slot.
+    pub records: u32,
     pub kv_chunks: u32,
     pub weight_chunks: u32,
     pub chunk_bytes: u64,
@@ -160,6 +162,7 @@ impl StatedKv {
             tokens,
             page_tokens: paging.page_size,
             pages,
+            records: paging.slots,
             kv_chunks: chunks_at(layout, paging, pages, paging.slots),
             weight_chunks: u32::try_from(layout.weight_chunks()).unwrap_or(u32::MAX),
             chunk_bytes: layout.chunk_bytes,
@@ -176,36 +179,42 @@ impl StatedKv {
         u64::from(self.chunks()).saturating_mul(self.chunk_bytes)
     }
 
-    /// Refuses the load where the `room` the card has for the pool
-    /// cannot hold these chunks.
-    fn admit(&self, room: u64) -> Result<()> {
-        if self.bytes() > room {
-            return Err(self.short(room, None));
+    /// Refuses the load where the `room` the card has for the pool cannot
+    /// hold `backing`, what backing these chunks takes of it
+    /// ([`Pools::backing_bytes`]) in the range's map units of `unit`.
+    fn admit(&self, room: u64, backing: u64, unit: u64) -> Result<()> {
+        if backing > room {
+            return Err(self.short(room, backing, unit, None));
         }
         Ok(())
     }
 
     /// The refusal of a pool that cannot be these chunks: `room` bytes
-    /// were what the card had for it, and `fits` the pages it held where
-    /// the fit got that far.
-    fn short(&self, room: u64, fits: Option<u64>) -> Fault {
+    /// were what the card had for it, `backing` what backing the chunks
+    /// takes of it in map units of `unit`, and `fits` the pages it held
+    /// where the fit got that far.
+    fn short(&self, room: u64, backing: u64, unit: u64, fits: Option<u64>) -> Fault {
         let mib = |bytes: u64| bytes >> 20;
         let held = fits.map_or(String::new(), |fits| {
             format!(", where it backs {fits} pages")
         });
         Fault::Residency(format!(
             "`[engine.memory] kv_device_tokens = {}` asks {} kv pages of {} tokens: {} chunks \
-             of {} MiB for them and the shapes every sequence binds beside them, and {} for \
-             the weights held whole, {} MiB in all; the device has {} MiB for the pool {} once \
-             the weight tier, the fires and the graph bodies are down{held}. State fewer \
-             tokens or a larger `budget_device`.",
+             of {} bytes for them and the shapes every sequence binds beside them, and {} for \
+             the weights held whole, {} bytes in all, which the device backs in {} bytes (its \
+             map units of {} MiB); the device has {} bytes ({} MiB) for the pool {} once the \
+             weight tier, the fires and the graph bodies are down{held}. State fewer tokens or \
+             a larger `budget_device`.",
             self.tokens,
             self.pages,
             self.page_tokens,
             self.kv_chunks,
-            mib(self.chunk_bytes),
+            self.chunk_bytes,
             self.weight_chunks,
-            mib(self.bytes()),
+            self.bytes(),
+            backing,
+            mib(unit),
+            room,
             mib(room),
             crate::device::card::bound(),
         ))
@@ -254,6 +263,24 @@ pub fn holds(
         bodies => bodies,
     };
     Ok((bodies, programs.min(spare - bodies)))
+}
+
+/// What the card has left to grow the pool's range by, in whole pages of
+/// `page`: its `free` bytes past the activation's span still to back
+/// (`unbacked`) and what is `held` beside the pool, counted once.
+fn growth_room(free: u64, unbacked: u64, held: u64, page: u64) -> u64 {
+    free.saturating_sub(unbacked.saturating_add(held)) / page.max(1)
+}
+
+/// What a pool takes of the card's room (`live`: free bytes and what the
+/// range backs, past the fires' `activation`) where backing it grows the
+/// range by `growth` pages of `page` beside the `backed` bytes it holds:
+/// the claim [`growth_room`] leaves exactly that growth for, once the card
+/// holds its claim and everything past it is held for others.
+fn claim_of(growth: u64, page: u64, backed: u64, activation: u64) -> u64 {
+    growth
+        .saturating_mul(page.max(1))
+        .saturating_add(backed.saturating_sub(activation))
 }
 
 /// The largest token budget at or under `max_tokens`, halving toward
@@ -370,15 +397,17 @@ pub fn declared_context_that_fits(
     trace: &Trace,
     page_size: u32,
     declared: u32,
-    max_tokens: u32,
     allowance: engine::Allowance,
     weights: u64,
 ) -> Result<u32> {
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
+    // A sequence as it is held between fires: a windowed row its window
+    // alone; a fire's rows past it are the activations' half, weighed per
+    // rung once the rung is ruled (`window_fire_bytes`).
     let one = |pages: u32| -> Result<u64> {
-        let paging = Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?
-            .windowed(window, max_tokens);
+        let paging =
+            Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     let ceiling = load_ceiling(allowance, false)?;
@@ -408,12 +437,13 @@ pub fn declared_context_that_fits(
 /// may take (the operator's `host` bytes shared by `ranks`, else half of
 /// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
 /// default), never under two of a one-page sequence's slots
-/// ([`host::staging_ring`]). `None` where no tier is stated.
+/// ([`host::staging_ring`]). A sequence moves between steps, as it is held
+/// between fires: a windowed row its window alone, no fire's rows past it
+/// (`Paging::held`). `None` where no tier is stated.
 pub fn staging_ring_for(
     trace: &Trace,
     page_size: u32,
     context: u32,
-    max_tokens: u32,
     host: Option<u64>,
     ranks: u32,
 ) -> Result<Option<u64>> {
@@ -427,8 +457,7 @@ pub fn staging_ring_for(
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
     let one = |tokens: u32| -> Result<u64> {
-        let paging =
-            Paging::of(page_size, tokens.max(page_size), 1, 1)?.windowed(window, max_tokens);
+        let paging = Paging::of(page_size, tokens.max(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     Ok(Some(host::staging_ring(
@@ -1296,16 +1325,28 @@ impl Pools {
         let weights =
             u32::try_from(self.weight_pool_bytes() / layout.chunk_bytes.max(1)).unwrap_or(u32::MAX);
         let kv_chunks = chunks.saturating_sub(if weights <= chunks { weights } else { 0 });
-        let (mut fits, mut over) = (1, self.ceiling.saturating_add(1));
-        while over - fits > 1 {
-            let mid = fits + (over - fits) / 2;
-            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
-                fits = mid;
-            } else {
-                over = mid;
-            }
+        pages_in(layout, &self.paging, kv_chunks, 0, 1, self.ceiling)
+    }
+
+    /// What backing the pool's first `chunks` chunks takes of the card, as
+    /// the fit counts the room it grows by: the pages the range would back
+    /// for them anew (whole map units of its segments as `placed` lays
+    /// them, [`chunks::Chunks::growth_for`]), beside what it backs already
+    /// but for the `activation` bytes of it that are the fires'. A flat
+    /// range is one allocation in chunk-sized pieces: exactly their bytes.
+    fn backing_bytes(&self, chunks: u32, placed: bool, activation: u64) -> Result<u64> {
+        if !elastic::mapped_on_demand() {
+            return Ok(self.chunk_bytes(chunks));
         }
-        fits
+        let growth = self
+            .chunks
+            .growth_for(chunks, placed.then_some(self.contiguous))?;
+        Ok(claim_of(
+            growth,
+            self.pool.page_bytes(),
+            self.chunks.backed_bytes(),
+            activation,
+        ))
     }
 
     /// Pledges the pool the chunks the runtime is stated, beside what its
@@ -1403,12 +1444,15 @@ impl Pools {
     /// programs beside it.
     /// Errs with what the card has past the claim where that is under the
     /// bodies' measured figure ([`holds`]).
+    /// `stated` is what backing a stated pool's chunks takes of the card
+    /// ([`Pools::backing_bytes`]): its claim, in place of their bytes.
     fn working_set(
         &self,
         pages: u64,
         bodies: u64,
         programs: u64,
         live: u64,
+        stated: Option<u64>,
     ) -> core::result::Result<WorkingSet, u64> {
         let slots = u32::from(self.has_state());
         let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
@@ -1421,8 +1465,8 @@ impl Pools {
         // allowance never turns weights that fit into weights that stream.
         // A card short of that streams them (the runtime's call).
         let whole = need.saturating_add(self.weight_pool_bytes());
-        let claim = self
-            .budget
+        let claim = stated
+            .or(self.budget)
             .unwrap_or(if live >= whole.saturating_add(programs) {
                 whole
             } else {
@@ -1543,13 +1587,31 @@ impl Pools {
         } else {
             self.chunks.activation_bytes()
         };
-        let live = self
-            .pool
-            .spare_bytes(0)?
+        // The card's free bytes, read once: the room and what backing the
+        // chunks fitted may grow by are counted from the same figure.
+        let free = self.pool.spare_bytes(0)?;
+        let live = free
             .saturating_add(self.chunks.backed_bytes())
             .saturating_sub(activation);
+        // The activation's span no fire has backed yet, still to come out
+        // of what the card has free while the bodies arm.
+        let unbacked = if settled {
+            0
+        } else {
+            self.chunks.activation_unheld_bytes()
+        };
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
+        // A stated pool claims what backing its chunks takes of the card,
+        // counted as the growth below counts it, not their bytes alone.
+        let stated = match self.stated_kv {
+            Some(kv) => Some(self.backing_bytes(
+                kv.chunks(),
+                placed,
+                activation.saturating_sub(unbacked),
+            )?),
+            None => None,
+        };
         // One working set at the declared context beside the null chunk:
         // its kv pages, its windowed pages and its recurrent record.
         let mut one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
@@ -1559,7 +1621,7 @@ impl Pools {
         // fit does.
         if self.declared && !settled {
             let seats = |pages: u64| {
-                let Ok(set) = self.working_set(pages, bodies, programs, live) else {
+                let Ok(set) = self.working_set(pages, bodies, programs, live, stated) else {
                     return false;
                 };
                 set.programs >= programs
@@ -1599,7 +1661,7 @@ impl Pools {
             room,
             limit,
         } = self
-            .working_set(one_slot, bodies, programs, live)
+            .working_set(one_slot, bodies, programs, live, stated)
             .map_err(|spare| {
                 Fault::Residency(format!(
                     "the card does not hold this deployment's graph bodies: {resident}; past \
@@ -1610,8 +1672,8 @@ impl Pools {
                 ))
             })?;
         let held = programs.saturating_add(bodies);
-        if let Some(kv) = self.stated_kv {
-            kv.admit(room)?;
+        if let (Some(kv), Some(backing)) = (self.stated_kv, stated) {
+            kv.admit(room, backing, self.chunks.map_unit())?;
         } else if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
@@ -1654,13 +1716,10 @@ impl Pools {
         // the activation still to back and what is held for the bodies.
         let fitted = if elastic::mapped_on_demand() {
             let page = self.pool.page_bytes().max(1);
-            let unbacked = if settled {
-                0
-            } else {
-                self.chunks.activation_unheld_bytes()
-            };
-            let have = (self.pool.spare_bytes(0)? / page)
-                .saturating_sub(unbacked.saturating_add(held).div_ceil(page));
+            // In whole pages of what is left, counted once: pages of each
+            // part rounded apart would come a page short of a claim that
+            // is exactly its growth.
+            let have = growth_room(free, unbacked, held, page);
             let mut fitted = fitted;
             while fitted > least {
                 let growth = self
@@ -1710,20 +1769,23 @@ impl Pools {
             }
             1
         };
-        let (mut fits, mut over) = (floor, self.ceiling.saturating_add(1));
-        while over - fits > 1 {
-            let mid = fits + (over - fits) / 2;
-            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
-                fits = mid;
-            } else {
-                over = mid;
-            }
-        }
+        // A stated pool's pages are counted beside the records it was
+        // sized with, as [`StatedKv::of`] counted them.
+        let records = self.stated_kv.map_or(0, |kv| kv.records);
+        let fits = pages_in(
+            layout,
+            &self.paging,
+            kv_chunks,
+            records,
+            floor,
+            self.ceiling,
+        );
         // A pool stated for more than this fit holds keeps the pages of
         // what it stated: the runtime names them, and a count that moved
         // under live tables would not be the one they were laid by.
         if let Some(kv) = self.stated_kv.filter(|kv| kv.pages != fits) {
-            return Err(kv.short(room, Some(fits)));
+            let backing = stated.unwrap_or(kv.bytes());
+            return Err(kv.short(room, backing, self.chunks.map_unit(), Some(fits)));
         }
         if self.stated.is_none() {
             self.paging.pages = fits;
@@ -4919,6 +4981,29 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }
 
+/// The most kv pages, from `floor` up to `ceiling`, that `kv_chunks`
+/// chunks hold beside the shapes every working set binds and `slots`
+/// records ([`chunks_at`]).
+fn pages_in(
+    layout: &layout::Layout,
+    paging: &Paging,
+    kv_chunks: u32,
+    slots: u32,
+    floor: u64,
+    ceiling: u64,
+) -> u64 {
+    let (mut fits, mut over) = (floor, ceiling.saturating_add(1));
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if chunks_at(layout, paging, mid, slots) <= kv_chunks {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fits
+}
+
 /// The guest shapes: `Instance` and `Channel`.
 const GUEST_SHAPES: u64 = 2;
 
@@ -5185,6 +5270,153 @@ mod tests {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
         a_slot_copy_names_the_guest_shapes();
         stated_tokens_are_exactly_their_pages_beside_the_other_shapes();
+        stated_tokens_are_backed_whole_at_every_seat_count();
+    }
+
+    // Qwen3-0.6B, `kv_device_tokens = 16384`, 16 seats, on the A6000: the
+    // pool was sized for 1024 pages (117 chunks) and the fit backed 1017,
+    // and 16000 tokens backed 990 of 1000; Qwen3-8B, 53853 tokens, backed
+    // 3344 of 3366 pages (424 chunks of 18 MiB). The claim was the chunks'
+    // bytes while the room it left them was counted in the range's map
+    // units, and in pages of each part rounded apart, so the growth of
+    // backing them came past it and the fit gave up chunks. The claim is
+    // what backing them grows the range by, and the room counted once: what
+    // the pool is sized for is what it backs.
+    fn stated_tokens_are_backed_whole_at_every_seat_count() {
+        const MIB: u64 = 1 << 20;
+        // A kv page of 16 bf16 tokens' keys and values over 8 heads of 128.
+        let kv_page = |layers: u64| layers * 2 * 8 * 128 * 16 * 2;
+        // Qwen3-0.6B (28 layers), nine pages a chunk, with a recurrent
+        // record of 3 MiB in two pieces so the records the seats take are
+        // chunks too; Qwen3-8B (36 layers), eight pages a chunk of 18 MiB,
+        // dense.
+        let small = kv_page(28);
+        let large = kv_page(36);
+        let cases: [(&str, u64, u64, bool, &[u32], &[u64]); 2] = [
+            (
+                "Qwen3-0.6B",
+                small,
+                9 * small + 4096,
+                true,
+                &[1, 4, 16, 32],
+                &[16_000, 16_384],
+            ),
+            ("Qwen3-8B", large, 8 * large, false, &[0, 1, 16], &[53_853]),
+        ];
+        let mut short_before = 0;
+        for (model, page_bytes, chunk, record, seat_counts, token_counts) in cases {
+            let shape = |id, tokens, slot_bytes: u64| layout::SlotShape {
+                id,
+                tokens,
+                slot_bytes,
+                per_chunk: u32::try_from(chunk / slot_bytes).expect("a count"),
+                grain: slot_bytes,
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            };
+            let layout = layout::Layout {
+                chunk_bytes: chunk,
+                segment_chunks: 4,
+                list: Some(shape(layout::LIST, 16, page_bytes)),
+                windows: Vec::new(),
+                fixed: record.then(|| layout::FixedShape {
+                    slot: shape(layout::FIXED, 0, 3 * MIB / 2),
+                    pieces: 2,
+                    rows: Vec::new(),
+                    tables: Vec::new(),
+                }),
+                rs: None,
+                instance: shape(layout::INSTANCE, 0, layout::INSTANCE_SLOT),
+                channel: shape(layout::CHANNEL, 0, layout::CHANNEL_SLOT),
+                rows: Vec::new(),
+                experts: Vec::new(),
+            };
+            // Ranges mapped in units no multiple of the chunk: the last unit
+            // of a pool reaches past its last chunk.
+            for unit in [32 * MIB, 64 * MIB] {
+                for &seats in seat_counts {
+                    for &tokens in token_counts {
+                        let at = format!(
+                            "{model}, {seats} seats, {tokens} tokens, units of {} MiB",
+                            unit >> 20
+                        );
+                        if stated_backs_what_it_asks(&layout, unit, seats, tokens, &at) {
+                            short_before += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(short_before > 0, "the chunks' bytes alone came short");
+    }
+
+    /// Asserts a pool of `tokens` stated tokens beside `seats` records, in
+    /// a range mapped in units of `unit`, is backed whole by the fit's
+    /// arithmetic; returns whether its chunks' bytes alone came short.
+    fn stated_backs_what_it_asks(
+        layout: &layout::Layout,
+        unit: u64,
+        seats: u32,
+        tokens: u64,
+        at: &str,
+    ) -> bool {
+        const MIB: u64 = 1 << 20;
+        const PAGE: u64 = elastic::LOGICAL_PAGE_BYTES;
+        let units = |bytes: u64| bytes.div_ceil(unit) * unit;
+        let paging = Paging::of(16, 4096, seats, 1).expect("a paging");
+        let kv = StatedKv::of(layout, &paging, tokens);
+        // The pages its chunks hold are the pages asked, counted as the fit
+        // counts them: beside the same records.
+        assert_eq!(
+            pages_in(layout, &paging, kv.kv_chunks, kv.records, 1, kv.pages),
+            kv.pages,
+            "{at}"
+        );
+        assert!(
+            pages_in(layout, &paging, kv.kv_chunks - 1, kv.records, 1, kv.pages) < kv.pages,
+            "{at}: a chunk fewer holds fewer"
+        );
+        // A fit before arming: the activation's span (a held prefix backed,
+        // the rest still to back) and the null chunk's unit backed; the
+        // bodies hold every byte past the claim; the card has GiBs free
+        // past what the range backs.
+        let activation = 40 * MIB;
+        let unheld = 24 * MIB;
+        let backed = unit + (activation - unheld);
+        let free = 24 * 1024 * MIB + 12_345;
+        let programs = 96 * MIB;
+        let live = free + backed - activation;
+        let growth = (units(kv.bytes()) - unit) / PAGE;
+        let claim = claim_of(growth, PAGE, backed, activation - unheld);
+        for bodies in [MEASURING, 512 * MIB] {
+            let (bodies, programs) =
+                holds(claim, live, bodies, programs).expect("the card holds them");
+            let room = live - bodies - programs;
+            assert!(
+                kv.admit(room, claim, unit).is_ok(),
+                "{at}: the claim is admitted"
+            );
+            let have = growth_room(free, unheld, bodies + programs, PAGE);
+            assert!(growth <= have, "{at}: backing every chunk stated fits");
+            if bodies == MEASURING {
+                assert_eq!(growth, have, "{at}: and is all it was held");
+            }
+        }
+        // A card short of the claim refuses by the key, with what backing
+        // takes.
+        let refused = kv
+            .admit(claim - 1, claim, unit)
+            .expect_err("a byte short refuses");
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("backs in {claim} bytes")),
+            "{refused}"
+        );
+        // Claimed as the chunks' bytes, the same pool came short.
+        let (bodies, programs) = holds(kv.bytes(), live, MEASURING, programs).expect("held");
+        growth > growth_room(free, unheld, bodies + programs, PAGE)
     }
 
     // `kv_device_tokens` sized from outside the fit missed the list's
@@ -5244,8 +5476,10 @@ mod tests {
         assert_eq!((past.pages, past.kv_chunks), (3249, 1 + 2 + 465));
         // The load is refused by the key's name a byte short of the room,
         // and admitted at it.
-        assert!(kv.admit(kv.bytes()).is_ok());
-        let refused = kv.admit(kv.bytes() - 1).expect_err("a byte short refuses");
+        assert!(kv.admit(kv.bytes(), kv.bytes(), CHUNK).is_ok());
+        let refused = kv
+            .admit(kv.bytes() - 1, kv.bytes(), CHUNK)
+            .expect_err("a byte short refuses");
         assert!(
             refused.to_string().contains("kv_device_tokens = 51968")
                 && refused.to_string().contains("3248 kv pages"),
