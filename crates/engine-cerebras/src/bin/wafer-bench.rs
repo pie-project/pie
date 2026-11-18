@@ -59,7 +59,7 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
                      --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
-                     [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir> \
+                     [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir | .zt> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
                      [--stamps 1]";
@@ -280,7 +280,7 @@ fn stamped(
     }))
 }
 
-/// `--reading <decode program> --program <out> --checkpoint <dir> --decode <golden.json>`: a
+/// `--reading <decode program> --program <out> --checkpoint <dir | .zt> --decode <golden.json>`: a
 /// decode step through the units (GENERIC.md G1) token by token: each step its token's entries
 /// (the host's ops: the embedding, the positions), its K / V PEs told its position, a launch,
 /// the logits back and their argmax; the golden's tokens fed (teacher-forced), each step past the
@@ -345,14 +345,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     let ckpt =
         std::fs::canonicalize(need("checkpoint")?).map_err(|e| format!("--checkpoint: {e}"))?;
     let t0 = std::time::Instant::now();
-    let d = poem_compiler::catalog::repository()
-        .parse(&reading.model)
-        .ok_or_else(|| format!("{}: no such deployment", reading.model))?;
-    let source =
-        checkpoint::file::snapshot::open(&ckpt).map_err(|e| format!("{}: {e}", ckpt.display()))?;
-    let contract = d
-        .contract(&source, poem_ir::Platform::Cerebras)
-        .map_err(|e| format!("the import contract of {}: {e}", reading.model))?;
+    // (a stamped artifact's own planes, or a raw checkpoint's through the import contract: the
+    // runtime's reading)
+    let contract = poem_compiler::catalog::repository().contract_for(&trace, &ckpt)?;
     let landed = engine_cerebras::prepare::land(&trace, &contract, &ckpt)?;
     let of = |name: &str, count: usize| engine_cerebras::prepare::plane(&landed, name, count);
     let mut weights = engine_cpu::Forward::new(trace.clone(), None, &of)?;

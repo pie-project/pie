@@ -1,10 +1,11 @@
 //! `wafer-stage`: the checkpoint cut a load makes, made outside the engine (to stage it ahead of a
 //! chip session, or compare it): a catalog deployment's trace planned as a load plans it, its
-//! checkpoint landed through the import contract and cut into the plan's tiles; or a plan
-//! already made over params already landed (a test checkpoint's, under the trace's names).
+//! checkpoint (a stamped `.zt`, or a raw one through the import contract) landed as the runtime
+//! reads it and cut into the plan's tiles; or a plan already made over params already landed (a
+//! test checkpoint's, under the trace's names).
 //!
 //! ```text
-//! wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--preset <name>]
+//! wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> [--preset <name>]
 //!             [--set K=V,...] [--positions N]
 //! wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>
 //! ```
@@ -18,7 +19,7 @@ use kernels_cerebras::plan::Plan;
 use kernels_cerebras::target::{self, Ask};
 use kernels_cerebras::tiles;
 
-const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir> --out <dir> \
+const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> \
                      [--preset <name>] [--set K=V,...] [--positions N]\n       \
                      wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>";
 
@@ -66,11 +67,8 @@ fn run() -> Result<(), String> {
                     .transpose()?,
             };
             let plan = target::plan(&trace, &ask)?.plan;
-            let source = checkpoint::file::snapshot::open(&checkpoint)
-                .map_err(|e| format!("{}: {e}", checkpoint.display()))?;
-            let contract = d
-                .contract(&source, poem_ir::Platform::Cerebras)
-                .map_err(|e| format!("the import contract of {model}: {e}"))?;
+            let contract =
+                poem_compiler::catalog::repository().contract_for(&trace, &checkpoint)?;
             (plan, land(&trace, &contract, &checkpoint)?)
         }
     };

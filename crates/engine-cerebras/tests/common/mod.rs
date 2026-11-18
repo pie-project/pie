@@ -428,11 +428,7 @@ pub fn contract_for(
     trace: &Trace,
     path: &Path,
 ) -> Result<checkpoint::contract::ModelContract, String> {
-    let src = checkpoint::file::snapshot::open(path).map_err(|e| e.to_string())?;
-    poem_compiler::catalog::deployment(&trace.name)
-        .ok_or_else(|| format!("no catalog deployment {}", trace.name))?
-        .contract(&src, trace.platform)
-        .map_err(|e| format!("{e:?}"))
+    poem_compiler::catalog::repository().contract_for(trace, path)
 }
 
 pub fn npy(rows: usize, width: usize, v: &[f32]) -> Vec<u8> {
