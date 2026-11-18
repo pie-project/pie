@@ -427,9 +427,10 @@ fn fa2_prefill_with(
             params.maybe_mask_origin = origin.ptr;
         }
     }
-    // Unsplit rows land their sinks in the kernel's epilogue (no sink pass after).
-    let sunk = sinks
-        .filter(|s| s.dtype == o.dtype && !plan.info.split_kv && mask.is_none() && rel.is_none());
+    // Unsplit rows land their sinks in the kernel's epilogue (no sink pass
+    // after), the masked arm's as the plain one's: a lane stating no mask
+    // answers there what it answers in the plain arm.
+    let sunk = sinks.filter(|s| s.dtype == o.dtype && !plan.info.split_kv && rel.is_none());
     if let Some(s) = sunk {
         params.maybe_sinks = s.ptr;
     }
