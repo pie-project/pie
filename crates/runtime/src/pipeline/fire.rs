@@ -886,11 +886,7 @@ struct RaiseFunding {
 }
 
 impl RaiseFunding {
-    fn start(
-        shared: crate::store::shared::Shared,
-        engine: usize,
-        rows: u32,
-    ) -> Self {
+    fn start(shared: crate::store::shared::Shared, engine: usize, rows: u32) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
@@ -1062,9 +1058,8 @@ fn ask_rung(
     let want = crate::store::shared::want_rows(engine, rows);
     let funding = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
-        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
-            || RaiseFunding::start(shared.clone(), engine, rows),
-        )
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
+            .then(|| RaiseFunding::start(shared.clone(), engine, rows))
     });
     Some(RungAsk {
         engine,
@@ -5290,13 +5285,7 @@ async fn fire_device_geometry<C: FireContext>(
         return Ok(Err(refusal));
     }
     let rows = counted.ask();
-    let rung_ask = ask_rung(
-        &stores,
-        ws.engine,
-        pid,
-        rows as usize,
-        rows,
-    );
+    let rung_ask = ask_rung(&stores, ws.engine, pid, rows as usize, rows);
     if let Some(ask) = rung_ask.as_ref()
         && let Err(refusal) = ask.wait(rows).await
     {
@@ -6493,8 +6482,8 @@ mod rung_wait_tests {
         assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
 
         // A two-row pass is cut and its fire staged under that cap.
-        let ask = super::ask_rung(&stores, ENGINE, pid, 2, 2)
-            .expect("two rows ask whatever the cap");
+        let ask =
+            super::ask_rung(&stores, ENGINE, pid, 2, 2).expect("two rows ask whatever the cap");
         assert_eq!(ask.wait(2).await, Ok(()));
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
         ask.until_settled(&fire);

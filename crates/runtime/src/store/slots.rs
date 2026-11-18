@@ -528,8 +528,7 @@ pub struct RoomGiven {
 
 impl RoomGiven {
     fn give(&self) {
-        self.gives
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.notify.notify_waiters();
     }
 }
