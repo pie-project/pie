@@ -887,6 +887,13 @@ impl Engine for Cuda {
         }
     }
 
+    /// Every registration: a device channel's ring in its `Channel` slots,
+    /// a host one's in the mirror it publishes.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

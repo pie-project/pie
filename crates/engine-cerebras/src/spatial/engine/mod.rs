@@ -378,6 +378,13 @@ impl Engine for Spatial {
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// Every registration: its ring on the host, mirrored where the host
+    /// reads or writes it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

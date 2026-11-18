@@ -986,6 +986,13 @@ impl Engine for Metal {
         self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
     }
 
+    /// A device channel's ring is a shared ring in its `Channel` slots; a
+    /// channel the host reads or writes is the runtime's, each instance
+    /// holding its own ring of it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        registration.host_role == eta_ir::container::HostRole::None
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

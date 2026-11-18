@@ -259,6 +259,20 @@ pub trait Engine: Send {
         Ok(0)
     }
 
+    /// Whether [`Engine::register_channel`] takes `registration`: the
+    /// engine then holds the channel's ring (in its `Channel` slots, or
+    /// itself, as a host mirror), and an instance bound on the channel
+    /// reads that ring. `false` where it answers `Unsupported`: the runtime
+    /// keeps the channel alone, and each instance holds its own ring in
+    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
+    /// registration, asked before anything of a bind is taken, so a bind
+    /// that registers a channel takes its instance's rings by it. The
+    /// default holds none, as the default `register_channel` takes none.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        false
+    }
+
     /// The `Channel` slots a registered channel's ring takes, asked before
     /// [`Engine::register_channel`]. `None`: the engine keeps the ring
     /// itself.

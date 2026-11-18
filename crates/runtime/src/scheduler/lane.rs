@@ -859,6 +859,7 @@ impl Lane {
                     }
                 };
                 let roles = roles_of(engine_idx);
+                let held = crate::store::roles::held_by(&**engine, &plans);
                 // Everything it takes of the pool first, its rings, its
                 // guest state, its tables: a bind short of room is answered
                 // so before it registers anything, and waits for room
@@ -867,7 +868,7 @@ impl Lane {
                     roles.as_ref(),
                     &mut **engine,
                     &bind.binding,
-                    |id| channels.engine_registered(id) || plans.iter().any(|plan| plan.id == id),
+                    |id| channels.engine_registered(id) || held.contains(&id),
                 )
                 .and_then(|taken| {
                     match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {

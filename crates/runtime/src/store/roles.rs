@@ -1762,6 +1762,22 @@ pub fn take_rings(
     Ok(rings)
 }
 
+/// The channels of `plans`, registered by the bind they come with, whose
+/// rings the engine holds ([`Engine::holds_channel`]): with the channels
+/// it holds registered already, what a bind's `registered` names
+/// ([`take_bind`]). A channel the engine leaves to the runtime is each
+/// instance's own ring, registered by this bind or not.
+///
+/// [`Engine::holds_channel`]: ::engine::Engine::holds_channel
+#[must_use]
+pub fn held_by(engine: &dyn Engine, plans: &[ChannelRegistration]) -> Vec<ChannelId> {
+    plans
+        .iter()
+        .filter(|plan| engine.holds_channel(plan))
+        .map(|plan| plan.id)
+        .collect()
+}
+
 /// Gives back rings taken for registrations that will not happen.
 pub fn untake_rings(roles: Option<&RolesHandle>, rings: Vec<Option<TakenRing>>) {
     if let Some(roles) = roles {
@@ -1825,8 +1841,9 @@ pub fn bind_instance(
 /// Everything a bind of `binding` takes of the pool, before the bind
 /// registers anything: its guest state ([`Roles::take_guest`]), then its
 /// tables, its own rings and its adapter ([`Roles::take_instance`]); a
-/// ring of a channel `registered` names (registered, or to be by this
-/// bind) is the channel's. Short of room a budget holds, the bind is
+/// ring of a channel `registered` names (registered with the engine, or
+/// to be by this bind where the engine holds it: [`held_by`]) is the
+/// channel's. Short of room a budget holds, the bind is
 /// answered [`RolesError::BindShort`] and waits for it with nothing to
 /// roll back. `None` where no roles are kept.
 pub fn take_bind(

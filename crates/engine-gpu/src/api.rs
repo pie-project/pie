@@ -832,6 +832,13 @@ where
         ))
     }
 
+    /// Every registration: a ring the device keeps in its `Channel` slots
+    /// or on the host.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

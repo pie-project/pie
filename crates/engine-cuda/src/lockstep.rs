@@ -746,6 +746,12 @@ impl Engine for Rank {
         }
     }
 
+    /// As the CUDA engine it steps.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,
