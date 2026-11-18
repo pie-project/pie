@@ -110,6 +110,8 @@ Config keys still live (crates/worker/src/config.rs `MemoryConfig`, config/backe
 
 Rules: halve forward tokens until the arena fits (floor 1024 on CUDA, 512 on Metal); one sequence takes at most half the room; bodies get a quarter with a 512 MiB floor and a 1/20 stretch; fp8 shadow only under free/8; XLA prescale and tied copy only when weights are under 5/8 of HBM; voxel fit uses half the remainder (Vulkan/wgpu, XLA); safety floor `min(128 MiB, total/10)`; XLA headroom HBM/16.
 
+Chosen number (governor `yield`, 2026-11-18): the OS memory-pressure reading is the OS's own continuous figure where it has one (Linux / Android PSI `some avg10` / 100; macOS `1 - kern.memorystatus_level / 100`). Only the macOS fallback, used where `kern.memorystatus_level` cannot be read, is a mapping we chose: `kern.memorystatus_vm_pressure_level` has three steps (normal 1, warn 2, critical 4) and reads as `log2(level) / log2(4)`, i.e. 0 / ½ / 1, because three steps cannot say more and the midpoint is the least-assuming place for warn (`engine::pressure::macos_level`).
+
 Fixed sizes: activation rungs 256 / 1024 / 4096; chunk 16 MiB (CUDA, ROCm, XLA target) or 4 MiB (Vulkan/wgpu); segments 64 MiB (Metal), 1 GiB (CUDA), a quarter of the pool (Vulkan/wgpu); default state slots 256; attention workspace grant at least 64 MiB float + 1 MiB int; slab grain 8 MiB / 256 KiB; hipBLASLt workspace 128 MiB; rocBLAS grouped cap 512 MiB; staged experts cap 1.5 GiB; recycle shelf 8 GiB; device heap 256 MiB chunks; Vulkan staging 256 MiB; upload batches 64 MiB; guest scratch cap 4 GiB; ring cap 64; rs replay 16; rs snapshots 4.
 
 ## 6. Defects and risks found along the way

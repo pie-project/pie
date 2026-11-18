@@ -455,17 +455,22 @@ fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Rea
         );
         return None;
     }
-    let system = Reader::of_this_system();
+    let mut system = Reader::of_this_system();
     let limits = steer.governor().limits();
-    match &system {
-        Some(system) => tracing::info!(
-            engine,
-            yields = yields.share(),
-            source = system.source().name(),
-            floor_mib = limits.floor >> 20,
-            budget_mib = limits.hard_limit >> 20,
-            "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure)"
-        ),
+    match &mut system {
+        Some(system) => {
+            let pressure = system.read();
+            tracing::info!(
+                engine,
+                yields = yields.share(),
+                source = system.source().name(),
+                pressure,
+                floor_mib = limits.floor >> 20,
+                budget_mib = limits.hard_limit >> 20,
+                target_mib = limits.target(yields, pressure) >> 20,
+                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure)"
+            );
+        }
         None => tracing::info!(
             engine,
             yields = yields.share(),

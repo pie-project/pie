@@ -82,10 +82,18 @@ pub enum Source {
     /// `some avg10` share of wall time in which at least one task stalled
     /// on memory, a percentage over a hundred ([`psi_some_avg10`]).
     Psi,
-    /// macOS: `kern.memorystatus_vm_pressure_level`, the level the
+    /// macOS: `kern.memorystatus_level`, the kernel's own continuous
+    /// reading of the memory available, a percentage (xnu
+    /// bsd/kern/kern_memorystatus.c, `memorystatus_level`; what Activity
+    /// Monitor's memory pressure graph shows as its complement). The
+    /// reading is `1 - level / 100` ([`macos_available`]).
+    MacosAvailable,
+    /// macOS where `kern.memorystatus_level` cannot be read:
+    /// `kern.memorystatus_vm_pressure_level`, the level the
     /// `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` dispatch source reports
-    /// (<https://developer.apple.com/documentation/dispatch/dispatch_source_type_memorypressure>),
-    /// on its own three-step scale ([`macos_level`]).
+    /// (<https://developer.apple.com/documentation/dispatch/dispatch_source_type_memorypressure>).
+    /// It has three steps, so the reading is a chosen mapping
+    /// ([`macos_level`], stated in new-memory/DEVICE-MEMORY-INVENTORY.md).
     MacosLevel,
     /// A test hook: the file `PIE_PRESSURE_FILE` names holds the reading,
     /// a number in `0..=1`, so a test can induce pressure mid-run.
@@ -106,7 +114,10 @@ impl Source {
             return Some(Source::File(path.into()));
         }
         if cfg!(target_os = "macos") {
-            return Some(Source::MacosLevel);
+            if Source::MacosAvailable.read().is_ok() {
+                return Some(Source::MacosAvailable);
+            }
+            return Source::MacosLevel.read().is_ok().then_some(Source::MacosLevel);
         }
         Source::Psi.read().is_ok().then_some(Source::Psi)
     }
@@ -116,6 +127,7 @@ impl Source {
     pub const fn name(&self) -> &'static str {
         match self {
             Source::Psi => "Linux PSI /proc/pressure/memory, some avg10",
+            Source::MacosAvailable => "macOS kern.memorystatus_level, 1 - available / 100",
             Source::MacosLevel => "macOS kern.memorystatus_vm_pressure_level",
             Source::File(_) => "PIE_PRESSURE_FILE",
         }
@@ -130,7 +142,7 @@ impl Source {
     pub const fn period(&self) -> Option<Duration> {
         match self {
             Source::Psi => Some(Duration::from_secs(2)),
-            Source::MacosLevel | Source::File(_) => None,
+            Source::MacosAvailable | Source::MacosLevel | Source::File(_) => None,
         }
     }
 
@@ -148,7 +160,14 @@ impl Source {
                 psi_some_avg10(&text)
                     .ok_or_else(|| format!("{} states no `some avg10`", Self::PSI))
             }
-            Source::MacosLevel => macos::level().and_then(|level| {
+            Source::MacosAvailable => {
+                macos::sysctl_u32(macos::AVAILABLE).and_then(|level| {
+                    macos_available(level).ok_or_else(|| {
+                        format!("kern.memorystatus_level is {level}, not a percentage")
+                    })
+                })
+            }
+            Source::MacosLevel => macos::sysctl_u32(macos::LEVEL).and_then(|level| {
                 macos_level(level).ok_or_else(|| {
                     format!("kern.memorystatus_vm_pressure_level is {level}, not a level")
                 })
@@ -185,15 +204,23 @@ const NORMAL: u32 = 1;
 const WARN: u32 = 2;
 const CRITICAL: u32 = 4;
 
-/// A macOS pressure level as a reading on the kernel's own three-step
-/// scale: normal `0`, warn half way, critical `1`; `None` for a value the
-/// kernel does not state.
+/// `kern.memorystatus_level` (percent available) as a reading: `1 -
+/// level / 100`; `None` past 100.
+#[must_use]
+pub fn macos_available(level: u32) -> Option<f64> {
+    (level <= 100).then(|| 1.0 - f64::from(level) / 100.0)
+}
+
+/// The fallback's pressure level as a reading in `0..=1`. The levels are
+/// bits (normal 1, warn 2, critical 4), and the reading is a chosen mapping
+/// on them, `log2(level) / log2(CRITICAL)` (normal 0, warn 1/2, critical
+/// 1): three steps cannot say more. `None` for a value that is not one.
 #[must_use]
 pub const fn macos_level(level: u32) -> Option<f64> {
     match level {
-        NORMAL => Some(0.0),
-        WARN => Some(0.5),
-        CRITICAL => Some(1.0),
+        NORMAL | WARN | CRITICAL => {
+            Some(level.trailing_zeros() as f64 / CRITICAL.trailing_zeros() as f64)
+        }
         _ => None,
     }
 }
@@ -201,37 +228,48 @@ pub const fn macos_level(level: u32) -> Option<f64> {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod macos {
-    /// `kern.memorystatus_vm_pressure_level`, read without a dispatch
-    /// queue to run on: the value the dispatch source's events carry.
-    pub(super) fn level() -> Result<u32, String> {
-        let mut level: u32 = 0;
+    pub(super) const AVAILABLE: &std::ffi::CStr = c"kern.memorystatus_level";
+    pub(super) const LEVEL: &std::ffi::CStr = c"kern.memorystatus_vm_pressure_level";
+
+    /// A `u32` sysctl by name.
+    pub(super) fn sysctl_u32(name: &std::ffi::CStr) -> Result<u32, String> {
+        let mut value: u32 = 0;
         let mut size = std::mem::size_of::<u32>();
-        // SAFETY: the name is a nul-terminated literal and `level` holds
-        // `size` bytes; the kernel writes at most that.
+        // SAFETY: `name` is nul-terminated and `value` holds `size` bytes;
+        // the kernel writes at most that, and says how much it did.
         let status = unsafe {
             libc::sysctlbyname(
-                c"kern.memorystatus_vm_pressure_level".as_ptr(),
-                (&raw mut level).cast(),
+                name.as_ptr(),
+                (&raw mut value).cast(),
                 &raw mut size,
                 std::ptr::null_mut(),
                 0,
             )
         };
-        if status == 0 {
-            Ok(level)
-        } else {
-            Err(format!(
-                "kern.memorystatus_vm_pressure_level: {}",
+        if status != 0 {
+            return Err(format!(
+                "{}: {}",
+                name.to_string_lossy(),
                 std::io::Error::last_os_error()
-            ))
+            ));
         }
+        if size != std::mem::size_of::<u32>() {
+            return Err(format!(
+                "{}: {size} bytes, not a u32",
+                name.to_string_lossy()
+            ));
+        }
+        Ok(value)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod macos {
-    pub(super) fn level() -> Result<u32, String> {
-        Err("kern.memorystatus_vm_pressure_level is macOS's".into())
+    pub(super) const AVAILABLE: &str = "kern.memorystatus_level";
+    pub(super) const LEVEL: &str = "kern.memorystatus_vm_pressure_level";
+
+    pub(super) fn sysctl_u32(name: &str) -> Result<u32, String> {
+        Err(format!("{name} is macOS's"))
     }
 }
 
@@ -276,6 +314,14 @@ mod tests {
         assert_eq!(psi_some_avg10("some avg10=lots\n"), None);
         assert_eq!(psi_some_avg10("some avg60=1.00 total=1\n"), None);
         assert_eq!(psi_some_avg10("some avg10=-1.00 avg60=0.00\n"), None);
+    }
+
+    #[test]
+    fn macos_available_memory_reads_as_its_complement() {
+        assert_eq!(macos_available(100), Some(0.0));
+        assert_eq!(macos_available(25), Some(0.75));
+        assert_eq!(macos_available(0), Some(1.0));
+        assert_eq!(macos_available(101), None);
     }
 
     #[test]
