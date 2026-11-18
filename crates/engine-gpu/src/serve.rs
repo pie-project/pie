@@ -324,6 +324,14 @@ struct Fitted<B: Serve> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// The completion of a copy nothing of which is in flight: one that copied
+/// nothing, or whose frame was committed and waited on before it answers.
+fn nothing_in_flight() -> engine::CopyCompletion {
+    let (landing, completion) = engine::completion::copy_in_flight();
+    landing.landed();
+    completion
+}
+
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -1778,14 +1786,30 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Copies token runs between kv pages (slot refs of the kv list).
-    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
+    /// The completion resolves once the copy's submission has landed.
+    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<engine::CopyCompletion> {
         if moves.is_empty() {
-            return Ok(());
+            return Ok(nothing_in_flight());
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_kv(&mut frame, moves)?;
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
+        self.graft_copy(frame)
+    }
+
+    /// Submits a copy's own `frame` behind every frame before it and keeps
+    /// it as the grafted frame [`Shell::drain`] waits on; its completion
+    /// resolves from that submission's landing, the same handler a fire's
+    /// frame runs (a fence watcher, a queue's work-done callback): landed,
+    /// or failed by the fault that ended it. Its submission carries nothing
+    /// but the copy, so no fire's landing stands in for it.
+    fn graft_copy(&mut self, frame: B::Frame) -> Result<engine::CopyCompletion> {
+        let (landing, completion) = engine::completion::copy_in_flight();
+        let on_done: crate::backend::OnDone = Box::new(move |fault| match fault {
+            None => landing.landed(),
+            Some(why) => landing.failed(format!("{} copy's submission faulted: {why}", B::NAME)),
+        });
+        self.grafted = Some(frame.commit_async(Some(on_done))?);
+        Ok(completion)
     }
 
     /// Unstated `budget`: `seats` sequences at `context` and at least the
@@ -1852,9 +1876,12 @@ impl<B: Serve> Shell<B> {
 
     /// See `Engine::copy_slots`: on the device in queue order; to or from
     /// the host chunks or the slot file once every frame has landed.
-    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+    /// The completion resolves once the copy has landed: a device copy's
+    /// from its submission's landing; one to or from the host or the slot
+    /// file has, once this returns.
+    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<engine::CopyCompletion> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(nothing_in_flight());
         }
         let on_device = B::is_device(copy.src) && B::is_device(copy.dst);
         if !on_device {
@@ -1863,11 +1890,10 @@ impl<B: Serve> Shell<B> {
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&self.device, &mut frame, copy)?;
         if on_device {
-            self.grafted = Some(frame.commit_async(None)?);
-        } else {
-            frame.commit()?;
+            return self.graft_copy(frame);
         }
-        Ok(())
+        frame.commit()?;
+        Ok(nothing_in_flight())
     }
 
     /// See `Engine::read_tier_slots`: every frame and copy lands first.

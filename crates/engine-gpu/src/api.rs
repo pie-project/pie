@@ -872,7 +872,6 @@ where
         self.loaded_mut()?
             .copy_slots(copy)
             .map_err(fault)
-            .map(|()| engine::completion::copy_landed_placeholder())
     }
 
     fn read_tier_slots(
@@ -1195,7 +1194,6 @@ where
         self.loaded_mut()?
             .copy_kv(&moves)
             .map_err(fault)
-            .map(|()| engine::completion::copy_landed_placeholder())
     }
 }
 
