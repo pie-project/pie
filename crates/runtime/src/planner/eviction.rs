@@ -228,10 +228,28 @@ impl ResidencyPlanner {
             let pids: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
             self.port.chunk_occupants(&pids)
         });
-        let (candidates, wanted) =
+        let (candidates, wanted, occupants) =
             chunk_picks(candidates, victims.deficit, shape, map.as_ref());
-        let (picks, unhostable) =
+        let (mut picks, unhostable) =
             self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
+        // An occupant with no kv or state to move (only guest scratch,
+        // given back at its park) quotes nothing and is no pick by pages:
+        // it is one all the same, or its chunk does not empty.
+        for pid in occupants {
+            if !picks.iter().any(|&(picked, _)| picked == pid) && !unhostable.contains(&pid) {
+                picks.push((pid, Reclaim::default()));
+            }
+        }
+        if let Some((run, pieces)) = shape {
+            tracing::debug!(
+                run,
+                pieces,
+                picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+                chunks = ?map.as_ref().map(|map| (map.held.len(), map.free.len())),
+                "planner: a bind short of whole chunks: the occupants of the cheapest it could \
+                 take, or none qualified (every chunk holds a slot no candidate moves)"
+            );
+        }
         if !unhostable.is_empty() {
             self.with_inner(|inner| {
                 for pid in &unhostable {
@@ -648,7 +666,7 @@ fn chunk_picks(
     deficit: Reclaim,
     shape: Option<(u32, u32)>,
     map: Option<&super::pool::ChunkMap>,
-) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim) {
+) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim, Vec<ProcessId>) {
     let occupants = shape
         .zip(map)
         .and_then(|((run, pieces), map)| map.cheapest_runs(run, pieces))
@@ -663,8 +681,9 @@ fn chunk_picks(
                 pages: u32::MAX,
                 rs: deficit.rs,
             },
+            occupants,
         ),
-        None => (candidates, deficit),
+        None => (candidates, deficit, Vec::new()),
     }
 }
 
@@ -736,14 +755,16 @@ mod chunk_picks_tests {
             held: vec![held(1, 5, &[(1, 5)]), held(3, 3, &[(3, 3)])],
             free: vec![],
         };
-        let (picked, wanted) = chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
+        let (picked, wanted, occupants) =
+            chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
+        assert_eq!(occupants, vec![pid(3)]);
         assert_eq!(picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(), vec![pid(3)]);
         assert_eq!(wanted.pages, u32::MAX, "every occupant is picked");
-        let (kept, same) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
+        let (kept, same, _) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
         assert_eq!(kept.len(), 3);
         assert_eq!(same, deficit);
         let none = ChunkMap::default();
-        let (kept, same) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
+        let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
         assert_eq!((kept.len(), same), (3, deficit), "no chunk empties: as before");
     }
 }

@@ -1801,3 +1801,85 @@ async fn a_guest_head_waiting_on_a_commit_that_does_not_come_is_served_by_the_pl
     assert!(matches!(polled, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
     assert_eq!(device.lock().unwrap().pool().prefix_segments(), prefix, "no commit came");
 }
+
+/// The pools of `facts` with no host tier below the device (AMD's repro:
+/// budget_host a few MiB, no host chunks).
+fn pools_no_host(facts: ChunkFacts) -> Pools {
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles = Roles::new(&device, None).expect("the pool states an Instance shape");
+    Pools {
+        device,
+        roles: Arc::new(Mutex::new(roles)),
+    }
+}
+
+/// AMD's freeze, its root: with no host tier a park moved nothing, so a
+/// parked process kept its guest scratch on the device and Instance chunks
+/// filled with idle scratch no kv eviction could free. Scratch is dead
+/// between fires: a park now gives it back whatever lies below (the live
+/// tables stay where they lie), a new bind lands in the room it left, and
+/// the restore takes fresh scratch in its class and is rebound to it
+/// before its next fire.
+#[test]
+fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fresh() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    bind_or_leave(&roles, &mut other_engine, other, 999).expect_err("short of a run");
+
+    // The first process parks, no host tier below: its scratch comes back.
+    let (parked, id) = bound[0];
+    park(&roles, parked);
+    assert!(device.lock().unwrap().pool().free_chunk_runs(4) >= 1, "its run of 4 is free");
+    assert!(!roles.lock().unwrap().holds_guest_state(holder(parked)));
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the new bind lands");
+
+    // The new bind leaves; the parked process restores, taking fresh
+    // scratch in its class, and is told where before its next fire.
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room for it")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(parked));
+    let Some(Rebind::Instance { id: rebound, scratch, .. }) = stale
+        .iter()
+        .find(|rebind| matches!(rebind, Rebind::Instance { .. }))
+        .cloned()
+    else {
+        panic!("its instance is rebound: {stale:?}");
+    };
+    assert_eq!(rebound, id);
+    assert_ne!(scratch, ScratchPlace::None, "fresh scratch, laid");
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// The Instance chunks parking a process empties: per chunk, the slots of
+/// its dead parts (guest scratch) on the device, its live tables never;
+/// after its park, none.
+#[test]
+fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
+    let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 2, 1, 0);
+    bind_as(&roles, &mut engine, program, 1).unwrap();
+    bind_as(&roles, &mut engine, program, 2).unwrap();
+    let slots = roles.lock().unwrap().guest_chunk_slots(&[holder(1)]);
+    let total: u32 = slots.iter().map(|&(_, _, n)| n).sum();
+    assert_eq!(total, 2 * SPC, "its run of two whole chunks");
+    assert!(slots.iter().all(|&(_, by, _)| by == holder(1)));
+    assert_eq!(slots.len(), 2, "two chunks");
+    park(&roles, 1);
+    assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
+}
