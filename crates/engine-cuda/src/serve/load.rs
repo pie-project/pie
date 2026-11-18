@@ -1843,8 +1843,8 @@ impl Shell {
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
 
-    /// Where a guest's sampler meets across its blocks: the most blocks one
-    /// of its launches runs, at the plane's flight on this device.
+    /// Where a guest's sampler meets across its blocks: the most lanes'
+    /// spans one of its launches lays, at the plane's flight on this device.
     fn lane_arenas_bytes(&self) -> u64 {
         crate::program::launch::Arenas::bytes_for(
             self.programs.flight(),
