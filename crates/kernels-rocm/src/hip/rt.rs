@@ -459,6 +459,7 @@ pub unsafe fn hipStreamCreateWithFlags(stream: *mut Stream, flags: c_uint) -> Hi
 }
 
 pub unsafe fn hipStreamDestroy(stream: Stream) -> HipError {
+    super::kfd::forget(stream);
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipStreamDestroy)(stream) },
