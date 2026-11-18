@@ -2398,6 +2398,7 @@ impl Batch {
 
     /// This fire's lanes' scratch, one a member: refused where the fire
     /// seated other than `count` lanes.
+    #[cfg(target_vendor = "apple")]
     fn lanes_scratch(&self, count: u32) -> Result<&[ScratchAt]> {
         if self.scratch.len() as u64 != u64::from(count) {
             return Err(Fault::program(
