@@ -117,6 +117,14 @@ pub trait Context<B: Backend> {
     /// measured now; zero where the device does not say.
     fn outside(&self) -> u64;
 
+    /// The reader of what the host can still give this process, where the
+    /// device shares the host's memory and no budget of the device's says
+    /// what it has ([`engine::Engine::host_room`]). `None`, the default:
+    /// the device has memory of its own.
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        None
+    }
+
     /// The bytes of the capacity neither a reservation nor the driver holds.
     fn left(&self) -> u64 {
         self.capacity()

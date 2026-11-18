@@ -39,8 +39,8 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone, StepOutcome,
-    TapGroups, TapSink, Tapped,
+    CompletionSink, Engine, HostRoom, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone,
+    StepOutcome, TapGroups, TapSink, Tapped,
 };
 pub use error::{Error, Result};
 pub use fire::{
@@ -49,6 +49,7 @@ pub use fire::{
     RsVerb, Serves, Step,
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use memory::SAFETY_FLOOR_BYTES;
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,
     InstanceBinding, InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration,
