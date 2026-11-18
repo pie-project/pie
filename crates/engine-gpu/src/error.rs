@@ -360,8 +360,8 @@ impl fmt::Display for Fault {
             Self::MaskUnread { lane, word } => write!(
                 f,
                 "lane {lane} states an attention mask and its word {word:#x} reads it in no \
-                 arm this engine applies a mask in: here `attn.decode`, a selection's and a \
-                 bias's arms read no per-lane mask"
+                 arm this engine applies a mask in: here a relative bias's and a per-head \
+                 selection's arms read no per-lane mask"
             ),
             Self::Adapterless { lane } => write!(
                 f,
