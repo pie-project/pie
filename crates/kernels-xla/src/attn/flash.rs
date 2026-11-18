@@ -332,10 +332,14 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
     };
     let any = |array: Vec<i64>| any_of(array, Elem::Bf16);
-    let mut prefetch = vec![vec![nb], vec![nb], vec![nb], vec![nb], vec![old.np]];
+    // Only each row block's ranges (and its mask flag) are prefetched: the
+    // page list and the rows' mask flags and shifts are copied into SMEM in
+    // the steps that read them, so a fire with no older keys and no flagged
+    // row pays nothing for them.
+    let mut prefetch = vec![vec![nb], vec![nb], vec![nb], vec![nb]];
     let mask_at = prefetch.len();
     if old.mask.is_some() {
-        prefetch.extend([vec![r], vec![r], vec![nb]]);
+        prefetch.push(vec![nb]);
     }
     let planes = match src {
         Src::Plain { slots } => vec![any(vec![slots, wk]), any(vec![slots, wv])],
@@ -356,8 +360,15 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         scratch.push(MTy::Ref(vec![2, per_blk, hk, 128], Elem::U32, Space::Vmem));
         scratch.push(MTy::Ref(vec![2, per_blk, hv, 128], Elem::U32, Space::Vmem));
     }
+    // the page list in SMEM, and its copy's semaphore
+    let pscratch_at = scratch.len();
+    scratch.push(MTy::Ref(vec![old.np], Elem::I32, Space::Smem));
+    scratch.push(MTy::Sem(vec![1]));
     let mscratch_at = scratch.len();
     if old.mask.is_some() {
+        // a flagged row block's rows' flags and shifts, in SMEM
+        scratch.push(MTy::Ref(vec![bq], Elem::I32, Space::Smem));
+        scratch.push(MTy::Ref(vec![bq], Elem::I32, Space::Smem));
         // a flagged row block's mask columns for an older block, a row's a
         // tile of its own (copied row by row), and their copies' semaphore
         scratch.push(MTy::Ref(vec![bq, 1, bk], Elem::I32, Space::Vmem));
@@ -378,8 +389,12 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
     ];
     ins.extend(planes);
+    let pages_at = ins.len();
+    ins.push(any_of(vec![old.np], Elem::I32));
     let plane_at = ins.len();
     if let Some(w) = old.mask {
+        ins.push(any_of(vec![r], Elem::I32));
+        ins.push(any_of(vec![r], Elem::I32));
         ins.push(any_of(vec![r, w], Elem::I32));
     }
     let k = Kernel {
@@ -411,7 +426,11 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             Src::Plain { .. } => (blk.ins[7], blk.ins[8]),
             Src::Pooled { .. } => (blk.ins[7], blk.ins[7]),
         };
-        let opk = blk.grid.prefetch[4];
+        let (opk, psem, pages_in) = (
+            blk.scratch[pscratch_at],
+            blk.scratch[pscratch_at + 1],
+            blk.ins[pages_at],
+        );
         let packed = match src {
             Src::Pooled { .. } => Some((blk.scratch[7], blk.scratch[8])),
             Src::Plain { .. } => None,
@@ -419,12 +438,12 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         let masked = old.mask.map(|_| {
             let pre = &blk.grid.prefetch;
             (
+                (blk.ins[plane_at], blk.ins[plane_at + 1]),
+                (blk.scratch[mscratch_at], blk.scratch[mscratch_at + 1]),
                 pre[mask_at],
-                pre[mask_at + 1],
-                pre[mask_at + 2],
-                blk.ins[plane_at],
-                blk.scratch[mscratch_at],
-                blk.scratch[mscratch_at + 1],
+                blk.ins[plane_at + 2],
+                blk.scratch[mscratch_at + 2],
+                blk.scratch[mscratch_at + 3],
             )
         });
         let (o_ref, mo_ref, lo_ref) = (blk.outs[0], blk.outs[1], blk.outs[2]);
@@ -465,6 +484,15 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             b.maxsi(c, zero)
         };
         let nold = count(b, olo, ohi)?;
+        // The page list, where the block reads older keys at all.
+        let has_old = b.cmpi(ICmp::Sgt, nold, zero)?;
+        b.when(has_old, |b| {
+            let z = b.i32(0);
+            let sem = b.ref_slice(psem, &[z], &[1])?;
+            let sem = b.ref_squeeze(sem)?;
+            b.dma_start(pages_in, opk, sem)?;
+            b.dma_wait(sem, pages_in, opk)
+        })?;
         let nfresh = count(b, lo, hi)?;
         let steps = b.addi(nold, nfresh)?;
         let older = |b: &mut Body, t: V| -> Built<V> { b.cmpi(ICmp::Slt, t, nold) };
@@ -649,7 +677,9 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             // A flagged row block's older block: each flagged row's mask
             // columns (its lane's positions are the block's rows less its
             // shift, a whole 128) gate its keys, as the walk's mask does.
-            if let Some((en_ref, shift_ref, flag_ref, plane, mt, msem)) = masked {
+            if let Some(((en_in, shift_in), (en_ref, shift_ref), flag_ref, plane, mt, msem)) =
+                masked
+            {
                 let flag = b.load(flag_ref, &[i])?;
                 let z = b.i32(0);
                 let any = b.cmpi(ICmp::Ne, flag, z)?;
@@ -666,14 +696,20 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
                     let one = b.i32(1);
                     let sem = b.ref_slice(msem, &[z], &[1])?;
                     let sem = b.ref_squeeze(sem)?;
+                    // the block's rows' flags and shifts, into SMEM
+                    for (from, to) in [(en_in, en_ref), (shift_in, shift_ref)] {
+                        let src = b.ref_slice(from, &[row0], &[bq])?;
+                        b.dma_start(src, to, sem)?;
+                        b.dma_wait(sem, src, to)?;
+                    }
                     for wait in [false, true] {
                         b.for_range(z, bqv, one, |b, x| {
                             let row = b.addi(row0, x)?;
-                            let en = b.load(en_ref, &[row])?;
+                            let en = b.load(en_ref, &[x])?;
                             let z = b.i32(0);
                             let on = b.cmpi(ICmp::Ne, en, z)?;
                             b.when(on, |b| {
-                                let sh = b.load(shift_ref, &[row])?;
+                                let sh = b.load(shift_ref, &[x])?;
                                 let at = b.subi(v0, sh)?;
                                 let edge = b.i32(BK);
                                 let at = b.addi(at, edge)?;
@@ -1238,47 +1274,44 @@ fn older(
     let klo = f.select(reads, klo, none)?;
     let khi = f.add(shift, p0)?;
     let khi = f.select(reads, khi, none)?;
-    // Each virtual page's plane page: lane `l`'s `j`-th from its first at
-    // `base[l] + j`, every other one the sink.
+    // Each virtual page's table page: its owner is the lane whose room
+    // starts last at or before it (rooms lie in rank order, one after
+    // another, each at least a block), its page that lane's `v - base`-th
+    // from its first, `-1` past the lane's pages. A search over the lanes
+    // and a gather, not a scatter (XLA's scatter runs its updates one by
+    // one on a TPU).
     let np = round_up(
         lanes * (round_up(pages, 128 / ps) + 2 * (128 / ps)),
         BK / ps,
     );
-    let lp = [lanes, pages];
-    let j = f.iota(Elem::I32, &lp, 1);
-    let l = f.iota(Elem::I32, &lp, 0);
-    let bb = f.broadcast(base, &lp, &[0])?;
-    let fb = f.broadcast(first, &lp, &[0])?;
-    let nl = f.broadcast(np_l, &lp, &[0])?;
-    let v = f.add(bb, j)?;
-    let valid = f.compare(Cmp::Lt, j, nl)?;
-    let pix = f.add(fb, j)?;
+    let rstart = f.sub(base, lead)?;
+    let vl = [np, lanes];
+    let v = f.iota(Elem::I32, &vl, 0);
+    let rs = f.broadcast(rstart, &vl, &[1])?;
+    let at_or_before = f.compare(Cmp::Le, rs, v)?;
+    let li = f.iota(Elem::I32, &vl, 1);
+    let rank_key = with_i(f, rs, lanes, Func::mul)?;
+    let rank_key = f.add(rank_key, li)?;
+    let none_key = f.like_i(rank_key, -1);
+    let cand = f.select(at_or_before, rank_key, none_key)?;
+    let best = f.reduce(cand, &[1], Fold::Max)?;
+    let owner = with_i(f, best, lanes, Func::rem)?;
+    let owner = super::paged::clamp_i(f, owner, 0, lanes - 1)?;
+    let v1 = f.iota(Elem::I32, &[np], 0);
+    let owner_base = super::paged::take(f, base, owner)?;
+    let j = f.sub(v1, owner_base)?;
+    let cnt = super::paged::take(f, np_l, owner)?;
+    let ge = cmp_i(f, Cmp::Ge, j, 0)?;
+    let lt = f.compare(Cmp::Lt, j, cnt)?;
+    let valid = f.and(ge, lt)?;
+    let owner_first = super::paged::take(f, first, owner)?;
+    let pix = f.add(owner_first, j)?;
     let pix = super::paged::clamp_i(f, pix, 0, pages - 1)?;
-    let row = with_i(f, l, pages, Func::mul)?;
+    let row = with_i(f, owner, pages, Func::mul)?;
     let at = f.add(row, pix)?;
     let raw = super::paged::take(f, geom.pt, at)?;
-    // an unread entry lands past the list, each at its own index
-    let flat = f.add(row, j)?;
-    let past = with_i(f, flat, np, Func::add)?;
-    let idx = f.select(valid, v, past)?;
-    let m = lanes * pages;
-    let idx = f.reshape(idx, &[m, 1])?;
-    let page = f.reshape(raw, &[m])?;
-    let list = f.const_i(Elem::I32, -1, &[np]);
-    let pages = f.scatter_hinted(
-        list,
-        idx,
-        page,
-        &crate::hlo::ScatterDims {
-            update_window_dims: vec![],
-            inserted_window_dims: vec![0],
-            scatter_dims_to_operand_dims: vec![0],
-            index_vector_dim: 1,
-            ..crate::hlo::ScatterDims::default()
-        },
-        crate::hlo::Combine::Set,
-        true,
-    )?;
+    let unread = f.like_i(raw, -1);
+    let pages = f.select(valid, raw, unread)?;
     Ok(Older {
         pages,
         klo,
@@ -1369,7 +1402,7 @@ fn run(
         mask: mask.map(|(_, cols)| f.dims(cols)[1]),
     };
     let kern = kernel(s, vmem_cap, &pages)?;
-    let mut operands = vec![lo_blk, hi_blk, olo, ohi, old.pages];
+    let mut operands = vec![lo_blk, hi_blk, olo, ohi];
     if let Some((en, _)) = mask {
         // each row block's flag: any flagged row
         let on = cmp_i(f, Cmp::Ne, en, 0)?;
@@ -1377,7 +1410,7 @@ fn run(
         let on = pad_rows(f, on, 0)?;
         let on = f.reshape(on, &[nb, bq])?;
         let blk = f.reduce(on, &[1], Fold::Max)?;
-        operands.extend([en, old.shift, blk]);
+        operands.push(blk);
     }
     operands.extend([q2, ap.k, ap.v, klo, khi, okl, okh]);
     match s.src {
@@ -1388,7 +1421,10 @@ fn run(
         },
         Src::Plain { .. } => operands.extend([planes.0, planes.1]),
     }
-    operands.extend(mask.map(|(_, cols)| cols));
+    operands.push(old.pages);
+    if let Some((en, cols)) = mask {
+        operands.extend([en, old.shift, cols]);
+    }
     let out = kern.call(f, &operands)?;
     let o = f.reshape(out[0], &[r, h.kvh, h.g, h.dv])?;
     // The max and sum come a row per head.
@@ -1430,7 +1466,7 @@ mod tests {
             2 * 8,
             "one copy of each turn"
         );
-        assert!(c.module.contains("scratch_operands = 7 : i64"));
+        assert!(c.module.contains("scratch_operands = 9 : i64"));
         assert!(
             c.module.contains("vector<256x512xf32>"),
             "scores keyed on the sublanes"
@@ -1487,13 +1523,13 @@ mod tests {
             mask: None,
         };
         let c = kernel(&s, 110 << 20, &old).unwrap();
-        assert!(c.module.contains("scratch_operands = 9 : i64"));
+        assert!(c.module.contains("scratch_operands = 11 : i64"));
         assert!(
             c.module.contains("memref<2x16x64x128xi32")
                 || c.module.contains("memref<2x16x64x128xui32")
         );
-        // five prefetched (one page list, each plane's page by its map in
-        // the kernel), seven blocks and the pool
-        assert_eq!(c.operands.len(), 5 + 8);
+        // four prefetched, seven blocks, the pool and the page list (copied
+        // into SMEM where a block reads older keys)
+        assert_eq!(c.operands.len(), 4 + 9);
     }
 }
