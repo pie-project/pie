@@ -249,8 +249,6 @@ pub struct Toggles {
     pub chunk_floor_tokens: u32,
 
     pub prefill_ctas_per_sm: u32,
-
-    pub static_max_requests: u32,
 }
 
 impl Toggles {
@@ -259,7 +257,6 @@ impl Toggles {
         Self {
             chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
-            static_max_requests: tuning.decode_static_max_requests,
         }
     }
 }
@@ -329,36 +326,26 @@ pub fn plan_decode(
     let window_left = window_left(OP, window)?;
 
     let _ = window_left;
-    let built =
-        if sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles) {
-            sched_decode::static_nonsplit(
-                OP,
-                shape.num_requests,
-                live,
-                shape.page_size,
-                enable_cuda_graph,
-                workspace.int_bytes,
-            )?
-        } else {
-            let req = sched_decode::Request {
-                kv_indptr,
-                batch_size: shape.num_requests,
-                live,
-                num_qo_heads: shape.num_q_heads,
-                gqa_group_size: shape.group_size(),
-                page_size: shape.page_size,
-                head_dim: shape.head_dim,
-                enable_cuda_graph,
-                chunk_floor_tokens: toggles.chunk_floor_tokens,
-            };
-            sched_decode::plan(
-                OP,
-                &req,
-                max_grid_size,
-                workspace.int_bytes,
-                workspace.float_bytes,
-            )?
-        };
+    // An eager decode plans as a body does: its keys split while the
+    // lanes' head groups leave the grid unfilled (`sched_decode::estimate`).
+    let req = sched_decode::Request {
+        kv_indptr,
+        batch_size: shape.num_requests,
+        live,
+        num_qo_heads: shape.num_q_heads,
+        gqa_group_size: shape.group_size(),
+        page_size: shape.page_size,
+        head_dim: shape.head_dim,
+        enable_cuda_graph,
+        chunk_floor_tokens: toggles.chunk_floor_tokens,
+    };
+    let built = sched_decode::plan(
+        OP,
+        &req,
+        max_grid_size,
+        workspace.int_bytes,
+        workspace.float_bytes,
+    )?;
 
     Ok(DecodePlan {
         info: built.info,

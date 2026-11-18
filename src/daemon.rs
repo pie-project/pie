@@ -9,7 +9,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing_subscriber::EnvFilter;
 
 use crate::args::{GlobalArgs, Origin, config_path_or};
 
@@ -196,7 +195,7 @@ fn read_config(spec: &BootSpec, global: &GlobalArgs) -> Result<String> {
 }
 
 fn init_tracing(log_level: &str) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = runtime::bootstrap::log_filter(log_level);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -253,7 +252,8 @@ fn render(start: Instant, component: &str, version: &str) -> String {
          pie_build_info{{component=\"{component}\",version=\"{version}\"}} 1\n\
          # HELP pie_uptime_seconds Seconds since process start.\n\
          # TYPE pie_uptime_seconds gauge\n\
-         pie_uptime_seconds {uptime}\n"
+         pie_uptime_seconds {uptime}\n{waiting}",
+        waiting = runtime::store::waiting::metrics(),
     )
 }
 

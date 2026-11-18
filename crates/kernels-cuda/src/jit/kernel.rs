@@ -137,3 +137,49 @@ impl PartialEq for Kernel {
 }
 
 impl Eq for Kernel {}
+
+#[cfg(feature = "cuda")]
+impl Kernel {
+    /// The blocks of `threads` threads and `smem` dynamic shared bytes of
+    /// this kernel one multiprocessor of the current device holds at once:
+    /// the driver's occupancy calculator over the kernel's registers and
+    /// shared memory against the multiprocessor's
+    /// (`cuOccupancyMaxActiveBlocksPerMultiprocessor`), loading the kernel
+    /// first.
+    #[allow(unsafe_code)]
+    pub fn resident_blocks(&'static self, threads: u32, smem: u32) -> Result<u32, crate::Error> {
+        use cudarc::driver::sys as dr;
+        const OP: &str = "jit.occupancy";
+        let function = self.resolve().map_err(|fault| fault.at(OP))?.function;
+        let mut blocks: i32 = 0;
+        // SAFETY: `function` is this kernel's live handle on the current
+        // device; `blocks` is a local out-pointer.
+        let code = unsafe {
+            dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &raw mut blocks,
+                function,
+                i32::try_from(threads).unwrap_or(i32::MAX),
+                smem as usize,
+            )
+        };
+        if code != dr::CUresult::CUDA_SUCCESS {
+            return Err(Fault::Device {
+                call: "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                code: code as i32,
+            }
+            .at(OP));
+        }
+        u32::try_from(blocks)
+            .ok()
+            .filter(|&b| b > 0)
+            .ok_or_else(|| {
+                crate::jit::refuse(
+                    OP,
+                    format!(
+                        "`{}` seats {blocks} blocks of {threads} threads a multiprocessor",
+                        self.name
+                    ),
+                )
+            })
+    }
+}

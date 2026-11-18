@@ -205,6 +205,18 @@ const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
+/// Bounds what the load tells (`FireLimits`) to the fires it walks: its top
+/// rung, as the ruling bounded it (`crate::top::bounded`). A rung of so
+/// many tokens walks no wider fire, and the runtime lifts its largest rung
+/// to the limit told: told wider, it packs fires the walk refuses.
+fn told_within(budgets: &mut LoadBudgets, served: &Budget) {
+    if served.max_tokens < budgets.max_tokens {
+        budgets.max_tokens = served.max_tokens;
+        budgets.max_lanes = budgets.max_lanes.min(served.max_lanes);
+        budgets.buckets.clone_from(&served.buckets);
+    }
+}
+
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
 fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
@@ -545,6 +557,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
+                    top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
                 let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
@@ -591,6 +604,7 @@ impl Engine for Metal {
             );
         }
 
+        told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
         // move kv and rs slots within the same DRAM: one is seated only
@@ -1008,27 +1022,29 @@ impl Engine for Metal {
         self.loaded()?.program_facts(program).map_err(fault)
     }
 
-    fn fire_facts(
+    /// A guest program's state: its instances' value scratch and its
+    /// pair's batch sets, in `Instance` slots. Nothing of it lies in the
+    /// span, so Metal states no fire term (`Engine::fire_facts`' default)
+    /// and no standing bytes (`Engine::standing_after`'s).
+    fn guest_state(
         &self,
         program: ProgramId,
-        extents: &engine::BindExtents,
-    ) -> EngineResult<engine::FireFacts> {
+        at: &engine::BindExtents,
+    ) -> EngineResult<engine::GuestState> {
         self.loaded()?
-            .fire_facts(
-                program,
-                &eta_exec::Extents {
-                    row_count: extents.row_count,
-                    token_count: extents.token_count,
-                    sampled_rows: extents.sampled_rows,
-                    query_len: extents.query_len,
-                    key_len: extents.key_len,
-                },
-            )
+            .guest_state(program, &extents(at))
             .map_err(fault)
     }
 
     fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
         self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
+    }
+
+    /// A device channel's ring is a shared ring in its `Channel` slots; a
+    /// channel the host reads or writes is the runtime's, each instance
+    /// holding its own ring of it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        registration.host_role == eta_ir::container::HostRole::None
     }
 
     fn ring_facts(
@@ -1088,9 +1104,10 @@ impl Engine for Metal {
                 &binding.channels,
                 &binding.instance_slots,
                 &binding.ring_slots,
+                &binding.scratch,
+                &binding.pair,
             )
             .map_err(fault)?;
-        let standing_guest_bytes = shell.standing_guest_bytes();
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
@@ -1106,18 +1123,8 @@ impl Engine for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
-            standing_guest_bytes,
+            standing_guest_bytes: 0,
         })
-    }
-
-    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
-        self.loaded()?
-            .standing_after(
-                binding.program,
-                &extents(&binding.extents),
-                &binding.channels,
-            )
-            .map_err(fault)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
@@ -1125,7 +1132,7 @@ impl Engine for Metal {
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
         shell.close_program_instance(id).map_err(fault)?;
-        Ok(shell.standing_guest_bytes())
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
@@ -1532,4 +1539,42 @@ fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyTex
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, text);
+}
+
+#[cfg(test)]
+mod told {
+    use super::*;
+
+    /// A load whose ruling picks a top rung under the asked fire tells that
+    /// rung's tokens as its widest fire, and its lanes and buckets as the
+    /// rung walks them; one ruled at what it asked tells what it asked.
+    #[test]
+    fn the_told_limit_is_the_ruled_top_rung() {
+        let asked = LoadBudgets {
+            max_lanes: 2048,
+            max_tokens: 4096,
+            buckets: vec![1, 64, 512, 2048, 4096],
+            ..LoadBudgets::default()
+        };
+        let baked = Budget {
+            max_lanes: asked.max_lanes,
+            max_tokens: asked.max_tokens,
+            buckets: asked.buckets.clone(),
+            max_adapters: 0,
+            readouts_per_lane: 1,
+        };
+        for top in [1024, 512, 64] {
+            let served = crate::top::bounded(&baked, top);
+            let mut told = asked.clone();
+            told_within(&mut told, &served);
+            assert_eq!(told.max_tokens, top, "the told widest fire is the ruled top rung");
+            assert_eq!(told.max_lanes, top.min(asked.max_lanes));
+            assert_eq!(told.buckets, served.buckets);
+            assert!(told.buckets.iter().all(|&rows| rows <= top));
+        }
+        let mut told = asked.clone();
+        told_within(&mut told, &crate::top::bounded(&baked, asked.max_tokens));
+        assert_eq!(told.max_tokens, asked.max_tokens);
+        assert_eq!(told.max_lanes, asked.max_lanes);
+    }
 }

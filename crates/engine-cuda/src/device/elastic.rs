@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+use engine::SAFETY_FLOOR_BYTES;
+
 use crate::error::{Fault, Result};
 
 pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
@@ -6,10 +8,6 @@ pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
 const HANDLES_PER_ARENA: u64 = 256;
-
-/// The driver's safety floor under the measured capacity: one size on
-/// every backend.
-const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
 /// The handle a flat arena's units carry: they are backed by the arena's
 /// one allocation, and own nothing to release.
@@ -134,8 +132,9 @@ impl Beside {
         #[cfg(feature = "rocm")]
         {
             // A load opens its fan's side streams before its pools, past the
-            // hardware queues HIP makes a device: its rule counts them all.
-            let areas = kernels_cuda::hip::kfd::save_areas(u32::MAX).map_err(|why| {
+            // hardware queues HIP makes a device: KFD's list counts them all,
+            // or HIP's rule, at least as many, where the list is not ours.
+            let areas = kernels_cuda::hip::kfd::held().map_err(|why| {
                 Fault::Card(format!(
                     "the flat range cannot be sized: the driver's wave save areas for this \
                      process's queues are not readable ({why})"
@@ -558,6 +557,9 @@ impl Arena {
         if self.base != 0 {
             return Ok(());
         }
+        // Read only where a device allocates (its refusal names the pool).
+        #[cfg(not(feature = "device"))]
+        let _ = pool;
         #[cfg(feature = "device")]
         {
             use crate::device::rt;

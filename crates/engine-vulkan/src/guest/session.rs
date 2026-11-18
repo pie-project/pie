@@ -16,6 +16,11 @@ use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
     BINDINGS, StageTables, groups_for, stage_tables, step_stride, step_uniforms,
 };
+use engine_gpu::guest::state::{GuestLayout, Side};
+
+/// Where an instance's or its pair's state lies
+/// ([`engine_gpu::guest::state::Placed`]).
+pub type Pair = engine_gpu::guest::state::Placed<crate::device::Api>;
 
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
@@ -310,7 +315,9 @@ struct Stage {
     /// in `TABLE_BINDINGS` order.
     tables: [Held; 4],
 
-    heap: Buffer,
+    /// Its heap ([`engine_gpu::guest::state`]): the side whose state it
+    /// lies in, its first byte there and its bytes.
+    heap: (Side, u64, u64),
 
     staging: Buffer,
 
@@ -441,6 +448,13 @@ pub struct Session {
 
     status: Buffer,
     stages: Vec<Stage>,
+    /// The instance's state and its pair's ([`engine_gpu::guest::state`]),
+    /// which its stages' heaps and the pair's score room lie in, their
+    /// contents dead between fires.
+    instance: Pair,
+    pair: Pair,
+    /// The score room's first byte in the pair's state and its bytes.
+    scores: Option<(u64, u64)>,
     pool: vk::DescriptorPool,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -468,7 +482,7 @@ impl std::fmt::Debug for Session {
             .field("stages", &self.stages.len())
             .field(
                 "heap",
-                &self.stages.iter().map(|s| s.heap.bytes()).sum::<u64>(),
+                &self.stages.iter().map(|s| s.heap.2).sum::<u64>(),
             )
             .finish()
     }
@@ -486,6 +500,8 @@ impl Session {
         kept: Kept,
         channels: Vec<engine::channel::ChannelId>,
         tables: &Tables<'_>,
+        [instance, pair]: [Pair; 2],
+        layout: &GuestLayout,
     ) -> Result<Session> {
         if code.len() != plans.len() {
             return Err(Fault::Program {
@@ -535,10 +551,37 @@ impl Session {
                 ),
             });
         }
-        for (((plan, lowered), resolved), args) in plans.iter().zip(code).zip(resolved).zip(args) {
+        if layout.stages.len() != plans.len()
+            || resolved
+                .iter()
+                .zip(&layout.stages)
+                .any(|(stage, &(_, _, bytes))| stage.scratch != bytes)
+            || instance.bytes() < layout.instance
+            || pair.bytes() < layout.pair
+        {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "a guest's state of {} bytes an instance and {} its pair lays heaps {:?}, \
+                     and these {} stage(s) take {:?}",
+                    instance.bytes(),
+                    pair.bytes(),
+                    layout.stages,
+                    plans.len(),
+                    resolved.iter().map(|stage| stage.scratch).collect::<Vec<_>>()
+                ),
+            });
+        }
+        for ((((plan, lowered), resolved), args), &heap) in plans
+            .iter()
+            .zip(code)
+            .zip(resolved)
+            .zip(args)
+            .zip(&layout.stages)
+        {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
-                device, plan, lowered, resolved, tables, library, args,
+                device, plan, lowered, resolved, tables, library, args, heap,
             )?);
         }
 
@@ -581,6 +624,9 @@ impl Session {
             _library: Arc::clone(library),
             slots: tables.slots.to_vec(),
             run,
+            instance,
+            pair,
+            scores: layout.scores,
             kept,
             channels,
             airborne: std::collections::VecDeque::new(),
@@ -615,7 +661,8 @@ impl Session {
     /// the sets: at construction none has run, and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
         let d = &self.core.device;
-        for stage in &self.stages {
+        for (at, stage) in self.stages.iter().enumerate() {
+            let (heap, base) = self.heap_at(at)?;
             let [descs, params, offs, cfg] = &stage.tables;
             let whole = |buffer: &Buffer| (buffer.slab().buffer, 0, buffer.bytes());
             let held = |held: &Held| (held.buffer().slab().buffer, held.offset(), held.bytes());
@@ -624,7 +671,10 @@ impl Session {
                 (held(descs), vk::DescriptorType::STORAGE_BUFFER),
                 (held(params), vk::DescriptorType::STORAGE_BUFFER),
                 (held(offs), vk::DescriptorType::STORAGE_BUFFER),
-                (whole(&stage.heap), vk::DescriptorType::STORAGE_BUFFER),
+                (
+                    (heap.slab().buffer, base, stage.heap.2),
+                    vk::DescriptorType::STORAGE_BUFFER,
+                ),
                 (held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
                 (
                     (
@@ -667,8 +717,9 @@ impl Session {
         Ok(())
     }
 
-    /// Points the stages' sets at the chunks their tables' slots sit in
-    /// now, after an evacuation; the passes on the queue land first.
+    /// Points the stages' sets at the chunks their tables' slots and the
+    /// pair's state sit in now, after an evacuation; the passes on the
+    /// queue land first.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
         self.settle()?;
         for stage in &mut self.stages {
@@ -676,12 +727,53 @@ impl Session {
                 table.rebind(pools)?;
             }
         }
+        self.instance.rebind(pools)?;
+        self.pair.rebind(pools)?;
         self.write_sets()
     }
 
+    /// Stage `stage`'s heap: the segment buffer it lies in, and its first
+    /// byte there.
+    fn heap_at(&self, stage: usize) -> Result<(&Buffer, u64)> {
+        let stage = self.stages.get(stage).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("stage {stage} is past this package's {}", self.stages.len()),
+        })?;
+        let (side, at, _) = stage.heap;
+        let place = match side {
+            Side::Instance => &self.instance,
+            Side::Pair => &self.pair,
+        };
+        let (buffer, base) = place.span().ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("a stage's heap on the {side:?}'s side, which keeps no state"),
+        })?;
+        Ok((buffer, base + at))
+    }
+
+    /// The pair's score room, where its program reads captured scores.
+    #[must_use]
+    pub fn scores(&self) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        let (at, bytes) = self.scores?;
+        let (buffer, base) = self.pair.span()?;
+        Some(engine_gpu::serve::DeviceCell {
+            buffer: buffer.clone(),
+            at: base + at,
+            bytes,
+        })
+    }
+
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they
-    /// lie in, in order), whose bytes the runtime copied there.
-    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+    /// lie in, in order), whose bytes the runtime copied there, and the
+    /// instance's state and its pair's to `scratch` and `pair`, fresh room
+    /// whose contents are dead.
+    pub fn retarget(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        slots: &[u32],
+        scratch: &engine::program::ScratchPlace,
+        pair: &engine::program::ScratchPlace,
+    ) -> Result<()> {
         if slots.len() != self.slots.len() {
             return Err(Fault::Program {
                 at: "guest::session",
@@ -709,6 +801,8 @@ impl Session {
             }
         }
         self.slots = slots.to_vec();
+        self.instance.retarget(pools, scratch)?;
+        self.pair.retarget(pools, pair)?;
         self.write_sets()
     }
 
@@ -727,9 +821,11 @@ impl Session {
         ))
     }
 
+    /// Stage `stage`'s heap: the segment buffer it lies in and its first
+    /// byte there.
     #[must_use]
-    pub fn heap(&self, stage: usize) -> Option<&Buffer> {
-        self.stages.get(stage).map(|stage| &stage.heap)
+    pub fn heap(&self, stage: usize) -> Option<(&Buffer, u64)> {
+        self.heap_at(stage).ok()
     }
 
     pub fn stage_in(&mut self, stage: usize, value: u32, bytes: &[u8]) -> Result<()> {
@@ -755,12 +851,15 @@ impl Session {
         Ok(())
     }
 
-    pub fn flush(&mut self, frame: &mut Frame, stage: usize) -> Result<()> {
-        let Some(stage) = self.stages.get_mut(stage) else {
+    pub fn flush(&mut self, frame: &mut Frame, at_stage: usize) -> Result<()> {
+        let Some(stage) = self.stages.get_mut(at_stage) else {
             return Ok(());
         };
-        for (at, len) in stage.dirty.drain(..) {
-            frame.copy(&stage.staging, at, &stage.heap, at, len)?;
+        let dirty: Vec<(u64, u64)> = stage.dirty.drain(..).collect();
+        let (heap, base) = self.heap_at(at_stage)?;
+        let staging = &self.stages[at_stage].staging;
+        for (at, len) in dirty {
+            frame.copy(staging, at, heap, base + at, len)?;
         }
         Ok(())
     }
@@ -770,8 +869,8 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        let stage = &self.stages[stage];
-        frame.copy(&stage.heap, at, &stage.landing, at, len)
+        let (heap, base) = self.heap_at(stage)?;
+        frame.copy(heap, base + at, &self.stages[stage].landing, at, len)
     }
 
     /// Copies `value` into the device's cell for `channel`, in place of a
@@ -808,7 +907,8 @@ impl Session {
             });
         }
         let (into, into_at) = cell.span();
-        frame.copy(&self.stages[stage].heap, at, into, into_at, len)?;
+        let (heap, base) = self.heap_at(stage)?;
+        frame.copy(heap, base + at, into, into_at, len)?;
         cell.live = true;
         Ok(())
     }
@@ -846,7 +946,8 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        frame.copy(&self.stages[stage].heap, at, into, at, len)
+        let (heap, base) = self.heap_at(stage)?;
+        frame.copy(heap, base + at, into, at, len)
     }
 
     /// The device's fault word, for a pass that lands on another thread.
@@ -934,13 +1035,8 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        frame.copy(
-            &cell.buffer,
-            cell.at,
-            &self.stages[stage].heap,
-            at,
-            len.min(cell.bytes),
-        )?;
+        let (heap, base) = self.heap_at(stage)?;
+        frame.copy(&cell.buffer, cell.at, heap, base + at, len.min(cell.bytes))?;
         Ok(true)
     }
 
@@ -1085,6 +1181,7 @@ impl StepArgs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
@@ -1093,6 +1190,7 @@ fn build_stage(
     tables: [Held; 4],
     library: &Library,
     args: &StepArgs,
+    heap: (Side, u64, u64),
 ) -> Result<Stage> {
     let _ = plan;
     let StageTables {
@@ -1106,7 +1204,6 @@ fn build_stage(
         .iter()
         .map(|step| library.pipeline(device, step.call))
         .collect::<Result<Vec<_>>>()?;
-    let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let staging = Buffer::with(
         device,
         scratch,

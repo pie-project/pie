@@ -104,6 +104,9 @@ pub(super) fn bind_reader(
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
     let channel = layout.channel.expect("a channel shape");
+    // Counted from the first chunk no slot holds: past the engine's tables
+    // run, which no slot names, and the seats' runs.
+    let chunk = layout.free_chunk() + chunk - 1;
     let first = chunk * instance.per_chunk;
     let slots: Vec<u32> = (first..first + facts.instance.slots).collect();
     let mut next = (chunk + 2) * channel.per_chunk;
@@ -119,22 +122,26 @@ pub(super) fn bind_reader(
             }
         })
         .collect();
+    let extents = eta_exec::Extents {
+        row_count: rows,
+        token_count: rows,
+        sampled_rows: 1,
+        query_len: rows,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) = crate::guest_places(shell, program, &extents, chunk);
     let id = shell
         .bind_program(
             program,
             &[],
-            eta_exec::Extents {
-                row_count: rows,
-                token_count: rows,
-                sampled_rows: 1,
-                query_len: rows,
-                ..eta_exec::Extents::default()
-            },
+            extents,
             GeometryClass::Host,
             PortMask::NONE,
             &[engine::ChannelId(0x5c0f_0000 + u64::from(chunk))],
             &slots,
             &rings,
+            &scratch,
+            &pair,
         )
         .expect("the reader binds");
     (id, slots, rings)
@@ -204,7 +211,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
             // them, the old ones blanked from a slot nothing wrote (the
             // chunk's last), the instance rebound there.
             let fresh: Vec<u32> = slots.iter().map(|&s| s + slots.len() as u32).collect();
-            let blank = 2 * instance.per_chunk - 1;
+            let blank = (shell.pool_layout().free_chunk() + 1) * instance.per_chunk - 1;
             assert!(
                 fresh.last() < Some(&blank),
                 "the fresh run and the blank slot lie apart"
@@ -230,6 +237,8 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
                     instance: fresh,
                     rings: rings.clone(),
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 })
                 .expect("the reader rebinds");
         }

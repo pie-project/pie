@@ -455,7 +455,7 @@ impl fmt::Display for Refused {
             Refused::NoRates { device, key } => write!(
                 f,
                 "device {device} has no rates in its profile for this model: `[rates] {key}` is \
-                 unstated, so nothing weighs its top rung; `pie tune <backend> --rates` measures \
+                 unstated (or stated at nothing), so nothing weighs its top rung; `pie tune <backend> --rates` measures \
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
@@ -493,13 +493,34 @@ pub fn choose_tiled(
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
-    let mut estimate = estimate(counts, rates).map_err(|key| Refused::NoRates {
+    choose_shaped(rungs, live, context, rates, device, counts, |c| {
+        Ok(match &row_tile {
+            Some(tile) => c.with_row_tile(tile.clone()),
+            None => c,
+        })
+    })
+}
+
+/// [`choose_tiled`] with the backend's kernels laid on the estimate's
+/// constants by `shape` (its tile rows, its few-rows kernel): the key it
+/// refuses by where the device's profile states none.
+pub fn choose_shaped(
+    rungs: &[RungFacts],
+    live: u64,
+    context: u32,
+    rates: &profile::fire::Rates,
+    device: &str,
+    counts: &Counts,
+    shape: impl FnOnce(
+        crate::roofline::Constants,
+    ) -> Result<crate::roofline::Constants, &'static str>,
+) -> Result<(TopRung, FireEstimate), Refused> {
+    let refused = |key| Refused::NoRates {
         device: device.to_owned(),
         key,
-    })?;
-    if let Some(tile) = row_tile {
-        estimate.rates = estimate.rates.with_row_tile(tile);
-    }
+    };
+    let mut estimate = estimate(counts, rates).map_err(refused)?;
+    estimate.rates = shape(estimate.rates).map_err(refused)?;
     let top = super::rung::fire_top(rungs, live, &estimate, context).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
@@ -629,6 +650,7 @@ mod tests {
             hbm_gbps: Some(100.0),
             elementwise_gbps: Some(50.0),
             scan_gelems: None,
+            ..profile::fire::Rates::default()
         }
     }
 
@@ -756,8 +778,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \
-             attn_tflops_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
-             --rates` measures it"
+             attn_tflops_by_keys` is unstated (or stated at nothing), so nothing weighs its top \
+             rung; `pie tune <backend> --rates` measures it"
+        );
+        // A rate that settled at nothing is refused by the same name, never
+        // divided by.
+        let zero = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 4.0)]),
+            ..self::rates()
+        };
+        let err = choose(&rungs, 1 << 33, u32::MAX, &zero, "Card X", &counts()).unwrap_err();
+        assert!(
+            err.to_string().contains("`[rates] attn_tflops_by_keys`"),
+            "{err}"
         );
     }
 

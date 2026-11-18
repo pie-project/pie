@@ -520,6 +520,22 @@ impl Lcg {
 
 pub const TOLERANCE: f32 = 3.0e-2;
 
+/// A roofline for the selects that price their legs, as a load's profile
+/// states one: the RTX Spark's measured rates, rounded. A test that checks
+/// what a leg answers runs it by name; one through the priced select asks
+/// only that the leg it takes answers.
+pub fn roof() -> kernels_cuda::tuning::Roof {
+    kernels_cuda::tuning::Roof::stated(kernels_cuda::tuning::RoofRates {
+        launch_ns: 700.0,
+        bytes_per_ns: 264.0,
+        gemm_by_rows: vec![
+            (1024, vec![(256, 32_000.0), (1024, 72_000.0), (8192, 74_000.0)]),
+            (2048, vec![(256, 54_000.0), (1024, 85_000.0), (8192, 83_000.0)]),
+            (4096, vec![(256, 28_000.0), (1024, 89_000.0), (8192, 83_000.0)]),
+        ],
+    })
+}
+
 /// The registry's tuning with the tcgen05 selects on, as
 /// B200's profile has them.
 pub const TC5: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {

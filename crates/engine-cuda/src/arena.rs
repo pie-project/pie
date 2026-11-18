@@ -142,7 +142,12 @@ impl Arena {
     }
 
     #[must_use]
-    pub fn slots(&self, pools: &Pools, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
+    pub fn slots(
+        &self,
+        pools: &Pools,
+        map: &ArenaMap,
+        rows: poem_compiler::FireRows,
+    ) -> Result<SlotTable> {
         carve(pools.activation_base(), map, rows)
     }
 
@@ -159,7 +164,7 @@ impl Arena {
         map: &ArenaMap,
         forked: bool,
         rows: poem_compiler::FireRows,
-    ) -> SlotTable {
+    ) -> Result<SlotTable> {
         if self.rungs.is_empty() {
             return self.slots(pools, map, rows);
         }
@@ -231,16 +236,30 @@ impl Arena {
 }
 
 #[must_use]
-pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
+/// `map`'s slots for a fire of `rows`, each value's rectangle at its
+/// place. A rectangle past the bytes the map laid its slot for is refused
+/// by name before anything is written: a carve wider than the layout (more
+/// rows, more lanes) would land its rows in a neighbour's value.
+pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> Result<SlotTable> {
     let mut cells: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        cells.push(
-            rect(map, value, rows)
-                .map(|rect| Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)),
-        );
+        let Some(rect) = rect(map, value, rows) else {
+            cells.push(None);
+            continue;
+        };
+        let laid = map.placements[map.root(value).0 as usize].bytes();
+        if rect.bytes > laid {
+            return Err(Fault::Overcarved {
+                value: value.0,
+                rows: rect.rows,
+                need: rect.bytes,
+                laid,
+            });
+        }
+        cells.push(Some(Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)));
     }
-    SlotTable(cells)
+    Ok(SlotTable(cells))
 }
 
 #[cfg(test)]
@@ -268,7 +287,8 @@ mod tests {
             0,
             &compiled.arena,
             poem_compiler::FireRows::text_only(64, 4),
-        );
+        )
+        .expect("a fire at the arena's own ceilings carves");
         for handle in slots.0.iter().flatten() {
             let end = handle.ptr
                 + handle.elements() * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
@@ -278,5 +298,39 @@ mod tests {
                 compiled.arena.bytes
             );
         }
+    }
+
+    /// A fire carved at twice the lanes the arena was laid for (a body's
+    /// lane capacity against `max_lanes`-laid slots) is refused by name
+    /// before a slot is handed out, not written past its value's slot into
+    /// its neighbour's: two lane values, the second laid right after the
+    /// first, as `m`'s two halves were.
+    #[test]
+    fn a_carve_past_the_laid_lanes_is_refused() {
+        use poem_compiler::arena::{Placement, RowExpr};
+        const MAX_LANES: u64 = 8;
+        let lane_value = |offset: u64| Placement::Arena {
+            offset,
+            bytes: MAX_LANES * 64 * 4,
+            rows: RowExpr::Lanes,
+            width: 64,
+            dtype: poem_ir::Dtype::F32,
+        };
+        let laid = MAX_LANES * 64 * 4;
+        let map = ArenaMap {
+            placements: vec![lane_value(0), lane_value(laid)],
+            spans: vec![None, None],
+            live_in: vec![poem_ir::ClassSet::default(); 2],
+            bytes: 2 * laid,
+        };
+        let refused = carve(0, &map, poem_compiler::FireRows::text_only(64, 2 * MAX_LANES))
+            .expect_err("twice the laid lanes");
+        assert!(
+            matches!(refused, Fault::Overcarved { value: 0, rows: 16, need, laid: at } if need == 2 * at),
+            "{refused}"
+        );
+        let slots = carve(0, &map, poem_compiler::FireRows::text_only(64, MAX_LANES))
+            .expect("the laid lanes carve");
+        assert_eq!(slots.0.iter().flatten().count(), 2);
     }
 }

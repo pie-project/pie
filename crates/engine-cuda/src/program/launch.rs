@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+use eta_compiler::codegen::lane_scratch::LaneScratch;
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
@@ -20,23 +21,41 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 19;
+const FUSED_ARITY: usize = 18;
+
+/// The spans of a stage's cells ([`Prepared::cells`]): five intrinsic
+/// tables, the pending flags, the row tables and the lane scratch table.
+const CELLS: usize = 8;
+
+/// The cell that holds the lane scratch table.
+const LANE_SCRATCH_CELL: usize = 7;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
 /// fire runs as many as the device holds at once with its lanes, from one.
 pub const LANE_SAMPLER_BLOCKS: u32 = 16;
-/// A sampler block's arena: a barrier word's line, two exchange buffers and
-/// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
-const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
+/// A sampler block's arena: a barrier word's line and two exchange buffers.
+const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576;
+
+/// A sampler lane's gather buffers, after its blocks' arenas: two of 512
+/// gathered elements (`M1_FAST_GATHER`) for each of the
+/// [`LANE_SAMPLER_BLOCKS`] homes a lane's gathers spread over, however few
+/// blocks the lane runs on (`M1_LANE_GATHERS`).
+const LANE_SAMPLER_GATHERS: u64 = LANE_SAMPLER_BLOCKS as u64 * 2 * 512 * 8;
 
 /// What a sampler block's arena takes of the lane arenas, a block to the next.
 fn lane_arena_stride() -> u64 {
     LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN)
 }
 
+/// What a sampler lane on `blocks` blocks takes of the lane arenas, a lane to
+/// the next (`M1_LANE_SPAN`).
+fn lane_span(blocks: u32) -> u64 {
+    u64::from(blocks) * lane_arena_stride() + LANE_SAMPLER_GATHERS
+}
+
 /// The engine's lane arenas: where a sampler's blocks meet, laid once at
-/// load for the most blocks a fire's sampler launch runs (lanes run their
+/// load for the most lanes' spans a fire's sampler launch lays (lanes run their
 /// launches one after another on the fire's main stream, `fan::Fan::fork`).
 /// They are no lane's: a lane's scratch holds none of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,19 +67,14 @@ pub struct Arenas {
 
 impl Arenas {
     /// The bytes they take for flights of up to `flight` lanes on a device
-    /// of `units` multiprocessors: the most blocks one launch runs, its
-    /// lanes times the blocks each is given (`launch_region`).
+    /// of `units` multiprocessors: the most one launch lays, its lanes'
+    /// spans on the blocks each is given (`launch_region`).
     #[must_use]
     pub fn bytes_for(flight: u32, units: u32) -> u64 {
-        // Past the units a lane takes one block, so the widest flight runs
-        // the most; under them a lane's blocks share the units.
-        let flight = flight.max(1);
-        let under = (1..=flight.min(units.max(1)))
-            .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
+        (1..=flight.max(1))
+            .map(|filled| u64::from(filled) * lane_span(lane_blocks(units, filled)))
             .max()
-            .unwrap_or(0);
-        let past = if flight > units { u64::from(flight) } else { 0 };
-        under.max(past) * lane_arena_stride()
+            .unwrap_or(0)
     }
 }
 
@@ -639,7 +653,7 @@ pub struct Cursor {
 }
 #[derive(Debug)]
 pub struct Prepared {
-    /// Where this stage's tables and scratch lie in the fire's span, laid
+    /// Where this stage's tables and scratch lie in its pair's state, laid
     /// by [`Prepared::lay`]: each an address in it.
     table: u64,
     table_host: Vec<u8>,
@@ -650,13 +664,17 @@ pub struct Prepared {
     params_host: Vec<u8>,
     offsets: u64,
     offsets_host: Vec<u8>,
-    scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
-    /// offsets), pending flags and row tables, one span staged in one copy
-    /// a commit (`cell_at` their offsets, `cells_host` its image).
+    /// offsets), pending flags, row tables and lane scratch table, one span
+    /// staged in one copy a commit (`cell_at` their offsets, `cells_host`
+    /// its image).
     cells: u64,
-    cell_at: [usize; 7],
+    cell_at: [usize; CELLS],
     cells_host: Vec<u8>,
+    /// Each lane's scratch base, the device address the grouped kernels
+    /// read at their `lane_scratch` parameter
+    /// ([`eta_compiler::codegen::lane_scratch::LANE_SCRATCH`]).
+    lane_scratch_host: Vec<u64>,
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
     intrinsic_widths_host: Vec<u32>,
@@ -688,12 +706,23 @@ pub struct Prepared {
     bindings: Vec<u32>,
 }
 
-/// What every span of a stage starts a whole number of in the fire's span.
-const SPAN_ALIGN: u64 = 256;
+/// What every span of a stage starts a whole number of in its pair's state.
+pub const SPAN_ALIGN: u64 = 256;
 
-/// The spans a stage lays: its params, offsets, table, descriptors, scratch
-/// and cells.
-const SPANS: u64 = 6;
+/// The spans a stage lays: its params, offsets, table, descriptors and
+/// cells.
+const SPANS: u64 = 5;
+
+/// The value scratch a lane of stages whose widest lane scratch is
+/// `stride` bytes holds: one region every stage's lane lies at. A program's
+/// stages run one after another on one stream, each over values it writes
+/// before it reads them, and none reads another's scratch: what passes
+/// between stages passes through channels. So the stages share one
+/// region, as wide as the widest, and none lays its own.
+#[must_use]
+pub fn lane_scratch(stride: u64) -> u64 {
+    stride.max(SCRATCH_ALIGN).next_multiple_of(SPAN_ALIGN)
+}
 
 #[must_use]
 pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
@@ -753,7 +782,14 @@ fn temporary_bytes(plan: &LaunchStagePlan, descriptors: &[ValueDesc], blocks: &[
 }
 
 /// The bytes a block of `region` keeps in the temporary area: what its
-/// kernel does, by the emitter that writes it.
+/// kernel does, by the emitter that writes it. This is the SIMT emitter's
+/// published need, and it stands alone: the shared whole-value floor
+/// (`eta_exec::stage_temporaries`, 16 B an element of the widest value) is
+/// a figure for kernels that sort or reduce a whole value in the area,
+/// which no SIMT kernel does past what is counted here (a select keeps its
+/// candidates in shared memory, a sampler in the engine's lane arenas, an
+/// order block two rows of indices), and it would lay a top-p lane its
+/// vocabulary's 16 B an element where its kernels keep none.
 fn block_temporary(
     plan: &LaunchStagePlan,
     descriptors: &[ValueDesc],
@@ -941,10 +977,10 @@ impl Prepared {
             params_host: records_bytes(&records),
             offsets: 0,
             offsets_host,
-            scratch: 0,
             cells: 0,
-            cell_at: [0; 7],
+            cell_at: [0; CELLS],
             cells_host: Vec::new(),
+            lane_scratch_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
             intrinsic_modes_host: Vec::new(),
             intrinsic_widths_host: Vec::new(),
@@ -981,25 +1017,33 @@ impl Prepared {
             + 6 * 16
     }
 
-    /// The bytes each lane adds: its record and channel slots, its
-    /// descriptor row, its scratch and its intrinsic and pending cells.
+    /// The bytes each lane adds to the stage's tables: its record and
+    /// channel slots, its descriptor row and its intrinsic and pending
+    /// cells. Its value scratch is its instance's ([`Prepared::scratch_stride`],
+    /// [`lane_scratch`]).
     #[must_use]
     pub fn lane_bytes(&self) -> u64 {
         let words = self.pitch as u64;
         LANE_RECORD_BYTES
             + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
             + self.descriptor_row.len().max(1) as u64
-            + u64::from(self.scratch_stride)
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
             + u64::from(self.row_words) * size_of::<u64>() as u64
+            + LaneScratch::bytes(1)
     }
 
-    /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
-    /// and returns where its bytes end. `fresh`: the span was laid
-    /// otherwise since this stage last lay here, so the tables no lane
-    /// changes are staged again. Nothing is kept there between fires: a
-    /// span is the fire's.
+    /// A lane's value scratch: what the kernels step `dispatch_lane` by.
+    #[must_use]
+    pub const fn scratch_stride(&self) -> u32 {
+        self.scratch_stride
+    }
+
+    /// Lays this stage's tables for `lanes` lanes in its pair's state from
+    /// `at` up (its lanes' scratch is each one's instance's,
+    /// [`Prepared::stage_lane`]), and returns where its tables end. `fresh`: the
+    /// state moved or came back since this stage last lay there, so the
+    /// tables no lane changes are staged again.
     pub fn lay(
         &mut self,
         extents: Extents,
@@ -1010,14 +1054,6 @@ impl Prepared {
     ) -> Result<u64> {
         self.filled = 0;
         let lanes = lanes.max(1);
-        let total = u64::from(self.scratch_stride) * u64::from(lanes);
-        if total > eta_exec::SCRATCH_MAX_BYTES {
-            return Err(Fault::Ceiling {
-                what: "a wave's fused-region scratch",
-                need: total,
-                have: eta_exec::SCRATCH_MAX_BYTES,
-            });
-        }
         let mut next = at.next_multiple_of(SPAN_ALIGN);
         let mut take = |bytes: usize| {
             let here = next;
@@ -1085,10 +1121,6 @@ impl Prepared {
                 .collect();
         }
 
-        self.scratch = take(
-            (self.scratch_stride as usize * lanes as usize)
-                .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256)),
-        );
         let words = self.pitch * lanes as usize;
         self.intrinsic_bases_host.resize(words, 0u64);
         self.intrinsic_modes_host.resize(words, 0u32);
@@ -1097,6 +1129,7 @@ impl Prepared {
         self.intrinsic_offsets_host.resize(words, 0u32);
         let rows = self.row_words as usize * lanes as usize;
         self.row_pointers_host.resize(rows, 0u64);
+        self.lane_scratch_host.resize(lanes as usize, 0u64);
         let pending = (self.channel_count as usize * lanes as usize).max(1);
         let mut cell_at = 0usize;
         for (cell, bytes) in [
@@ -1107,6 +1140,7 @@ impl Prepared {
             words * size_of::<u32>(),
             pending,
             rows * size_of::<u64>(),
+            LaneScratch::bytes(lanes) as usize,
         ]
         .into_iter()
         .enumerate()
@@ -1127,7 +1161,15 @@ impl Prepared {
         Ok(next)
     }
 
-    pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
+    /// Stages the next lane: its tables' rows, and `scratch`, its
+    /// instance's value scratch, in the lane scratch table.
+    pub fn stage_lane(
+        &mut self,
+        rings: &Rings,
+        cursors: &[Cursor],
+        commit: u64,
+        scratch: u64,
+    ) -> Result<u32> {
         let lane = self.filled;
         if lane >= self.lanes {
             return Err(Fault::program(
@@ -1184,6 +1226,8 @@ impl Prepared {
         self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
         let words = self.row_words as usize;
         self.row_pointers_host[lane as usize * words..(lane as usize + 1) * words].fill(0);
+        // The lane's scratch: its instance's own, where it lies now.
+        self.lane_scratch_host[lane as usize] = scratch;
         self.filled += 1;
         Ok(lane)
     }
@@ -1222,6 +1266,8 @@ impl Prepared {
         image[at[5]..at[6]].fill(0);
         let rows = slice_bytes(&self.row_pointers_host);
         image[at[6]..at[6] + rows.len()].copy_from_slice(&rows);
+        let bases = slice_bytes(&self.lane_scratch_host);
+        image[at[LANE_SCRATCH_CELL]..at[LANE_SCRATCH_CELL] + bases.len()].copy_from_slice(&bases);
         crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
@@ -1339,9 +1385,8 @@ impl Prepared {
             .ptr(self.descriptors)
             .ptr(self.params)
             .ptr(self.offsets)
-            .ptr(self.scratch)
+            .ptr(self.cell(LANE_SCRATCH_CELL))
             .u32(self.value_count)
-            .u32(self.scratch_stride)
             .u32(self.temporary_offset)
             .ptr(self.cell(5))
             .ptr(self.cell(0))
@@ -1361,12 +1406,12 @@ impl Prepared {
             .copied()
             .unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
-        // with the fire's lanes (its blocks wait on one another), each over
-        // its own arena of the engine's; the lanes' barrier words start at
-        // zero.
+        // with the fire's lanes (its blocks wait on one another), in its own
+        // span of the engine's lane arenas: its blocks' arenas and its
+        // gather buffers; the lanes' barrier words start at zero.
         let rows = if sampler {
             let rows = lane_blocks(device_units(), self.filled).min(rows);
-            let need = u64::from(self.filled) * u64::from(rows) * lane_arena_stride();
+            let need = u64::from(self.filled) * lane_span(rows);
             if need > arenas.bytes {
                 return Err(Fault::Ceiling {
                     what: "bytes of the engine's lane arenas a fire's samplers meet in",
@@ -1374,7 +1419,7 @@ impl Prepared {
                     have: arenas.bytes,
                 });
             }
-            self.zero_barriers(arenas, u64::from(rows) * lane_arena_stride(), stream)?;
+            self.zero_barriers(arenas, lane_span(rows), stream)?;
             rows
         } else {
             rows
@@ -1403,16 +1448,6 @@ impl Prepared {
     #[must_use]
     pub fn meets_across_blocks(&self) -> bool {
         self.samplers.iter().any(|&sampler| sampler)
-    }
-
-    #[must_use]
-    pub fn lane_ceiling(&self) -> u32 {
-        if self.scratch_stride == 0 {
-            return u32::MAX;
-        }
-        u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
-            .unwrap_or(u32::MAX)
-            .max(1)
     }
 
     #[must_use]
@@ -1560,23 +1595,25 @@ impl Prepared {
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each no shorter than its dummy bytes.
-            let code = unsafe {
-                dr::cuMemsetD2D32Async(
-                    self.scratch,
-                    self.scratch_stride as usize,
-                    SCRATCH_POISON,
-                    (SCRATCH_DUMMY_BYTES / 4) as usize,
-                    self.filled as usize,
-                    stream.cast(),
-                )
-            };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                return Err(Fault::Device {
-                    call: "cuMemsetD2D32Async",
-                    code: code as i32,
-                });
+            for &scratch in &self.lane_scratch_host[..self.filled as usize] {
+                // SAFETY: each lane's scratch, its instance's, is no shorter
+                // than its dummy bytes.
+                let code = unsafe {
+                    dr::cuMemsetD2D32Async(
+                        scratch,
+                        SCRATCH_DUMMY_BYTES as usize,
+                        SCRATCH_POISON,
+                        (SCRATCH_DUMMY_BYTES / 4) as usize,
+                        1,
+                        stream.cast(),
+                    )
+                };
+                if code != dr::CUresult::CUDA_SUCCESS {
+                    return Err(Fault::Device {
+                        call: "cuMemsetD2D32Async",
+                        code: code as i32,
+                    });
+                }
             }
         }
         #[cfg(not(feature = "device"))]
@@ -1937,6 +1974,33 @@ mod tests {
     /// the temporary area's share of it; and what it was while the rows a
     /// scan of the model's row leaves unwritten, and the reshapes read as
     /// their sources, held bytes.
+    /// A program's stages share one lane scratch region, as wide as the
+    /// widest stage's: they run one after another on one stream and none
+    /// reads another's scratch, so a lane holds the widest, never the sum.
+    #[test]
+    fn a_lanes_stages_share_one_scratch_region() {
+        let vocab = shipped::QWEN_VOCAB;
+        let stages: Vec<Option<Prepared>> = shipped::all(vocab)
+            .iter()
+            .map(|(_, traced)| {
+                let package = shipped::package(traced, vocab);
+                let shapes: Vec<ChannelShape> =
+                    package.channels.iter().map(ChannelShape::of).collect();
+                Some(Prepared::build(&package.plans[0], &shapes, Extents::default()).expect("builds"))
+            })
+            .collect();
+        let strides: Vec<u64> = stages
+            .iter()
+            .flatten()
+            .map(|stage| u64::from(stage.scratch_stride()))
+            .collect();
+        let widest = *strides.iter().max().expect("a stage");
+        assert!(strides.iter().sum::<u64>() > widest, "{strides:?}");
+        let bytes = crate::program::fire_bytes(&stages, 128);
+        assert_eq!(bytes.scratch, widest, "{strides:?}");
+        assert!(lane_scratch(bytes.scratch) >= widest);
+    }
+
     #[test]
     fn a_shipped_programs_scratch_a_lane() {
         const WAS: [u64; 6] = [
@@ -1959,7 +2023,7 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 1_368_576, 0),
+                ("top-p", 9_312_512, 1_976_064, 0),
                 ("top-k + top-p", 9_616_896, 2_812_672, 76_032),
                 ("gumbel-max", 5_512_960, 1_792, 0),
                 ("greedy", 3_688_704, 768, 0),
@@ -2055,15 +2119,22 @@ mod tests {
         };
         let reduces =
             |tag: u8| matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN);
-        let vocab = shipped::QWEN_VOCAB;
         let mut stated_some = 0;
         let mut stated_none = 0;
-        for (name, traced) in shipped::all(vocab) {
+        // Short vectors (where a kernel's fixed state is widest against its
+        // value's) and the shipped vocabulary.
+        let programs = [16, 64, 255, 900, shipped::QWEN_VOCAB]
+            .into_iter()
+            .flat_map(|vocab| shipped::all(vocab).into_iter().map(move |p| (vocab, p)));
+        for (vocab, (name, traced)) in programs {
             let (stages, package) = shipped::compiled(&traced, vocab);
             let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
                 panic!("{name}: one stage");
             };
             let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let laid = lay_out(plan, &descriptors)
+                .unwrap_or_else(|why| panic!("{name} over {vocab}: {why}"));
+            let blocks = region_blocks(plan, &descriptors);
             assert_eq!(stage.fused.regions.len(), plan.fused.len());
             for (index, (region, lowered)) in
                 stage.fused.regions.iter().zip(&plan.fused).enumerate()
@@ -2092,7 +2163,18 @@ mod tests {
                 assert_eq!(
                     !names.is_empty(),
                     stated != 0,
-                    "{name}: region {index} ({:?}): {stated} bytes a block stated, named by {names:#?}",
+                    "{name} over {vocab}: region {index} ({:?}): {stated} bytes a block stated, \
+                     named by {names:#?}",
+                    lowered.kind
+                );
+                // Each of the region's blocks is handed at least what it
+                // keeps: the stride `launch_region` cuts the area into.
+                let rows = u64::from(blocks[index].max(1));
+                let stride = (laid.temporary_bytes / rows) & !(SCRATCH_ALIGN - 1);
+                assert!(
+                    stride >= stated,
+                    "{name} over {vocab}: region {index} ({:?}): a block keeps {stated} bytes \
+                     and is handed {stride}",
                     lowered.kind
                 );
                 if stated == 0 {
@@ -2178,10 +2260,11 @@ mod tests {
         );
     }
 
-    /// The kernel steps a block's arena as the launcher lays the lane
-    /// arenas, and they hold the most blocks a launch runs.
+    /// The kernel steps a block's arena and a lane's span as the launcher
+    /// lays the lane arenas, and they hold every lane a launch runs, its
+    /// gather buffers with it however few blocks it runs on.
     #[test]
-    fn the_lane_arenas_hold_every_launch_s_blocks() {
+    fn the_lane_arenas_hold_every_launch_s_lanes() {
         let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
         let stage = &stage[0];
         let region = stage
@@ -2193,18 +2276,24 @@ mod tests {
         let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
             .expect("the sampler emits");
         assert!(source.contains("g.stride = M1_LANE_ARENA_STRIDE;"));
+        assert!(source.contains("M1_LANE_SPAN(lane_blocks)"));
         assert_eq!(
             lane_arena_stride(),
-            (64 + 2 * 24_576 + 2 * 512 * 8 + 255) & !255,
+            (64 + 2 * 24_576 + 255) & !255,
             "the kernel's M1_LANE_ARENA_STRIDE"
         );
+        assert_eq!(
+            LANE_SAMPLER_GATHERS,
+            16 * 2 * 512 * 8,
+            "the kernel's M1_LANE_GATHERS"
+        );
         for (units, flight) in [(142, 128), (304, 256), (1, 1), (8, 4), (20, 32)] {
-            let most = (1..=flight)
-                .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
-                .max()
-                .unwrap();
-            assert_eq!(Arenas::bytes_for(flight, units), most * lane_arena_stride());
-            assert!(most <= u64::from(units.max(flight)));
+            for filled in 1..=flight {
+                assert!(
+                    u64::from(filled) * lane_span(lane_blocks(units, filled))
+                        <= Arenas::bytes_for(flight, units)
+                );
+            }
         }
     }
 

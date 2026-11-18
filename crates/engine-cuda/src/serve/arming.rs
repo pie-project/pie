@@ -108,9 +108,10 @@ pub(super) struct Arming {
     /// stops arming there.
     capped: bool,
     /// What the device's free memory fell by across each composition's
-    /// fires, less what the pool backed in that window, summed: what the
-    /// captures took, and nothing the pool, serving or the runtime took
-    /// between them. None where free memory cannot be read.
+    /// capturing fire, less what the pool backed in that window, summed:
+    /// what the captures took, and nothing the pool, serving, the runtime
+    /// or a first launch's process-wide loads took around them. None where
+    /// free memory cannot be read.
     took: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
@@ -1573,13 +1574,21 @@ impl Shell {
         }
         let owned = self.synthetic_lanes_with(&lanes, &media);
         self.armed_body = None;
-        let free_before = crate::device::free_bytes();
-        let backed_before = self.pools.backed_bytes();
+        // What the composition's capture took: the free bytes the device lost
+        // across the fire that captured it (the last one run), less what the
+        // pool backed then. The warm fires before it are walks: a kernel's
+        // first launch there loads what the process keeps for every load
+        // after (code objects, a library's kernels, the runtime's queues),
+        // which no load's bodies hold, so a load's figure counts none of it
+        // and does not depend on which load of the process ran first.
+        let (mut free_before, mut backed_before) = (None, 0);
         let idle = matches!(target, BodySynth::Idle);
         for _ in 0..record::WARM_FIRES {
             if idle {
                 self.at_bucket(bucket);
             }
+            free_before = crate::device::free_bytes();
+            backed_before = self.pools.backed_bytes();
             let fired = self.fire_synthetic(&owned);
             let landed = self.device.synchronize();
             if let Err(why) = fired.and(landed) {
@@ -1600,9 +1609,10 @@ impl Shell {
             }
         }
         self.arm_cold = false;
-        // What the pool backed across the window (a mapped range backs the
-        // activation's holds and segments as the fires first touch them) is
-        // the pool's, not the capture's; a flat range, allocated, backs none.
+        // What the pool backed across the capture's fire (a mapped range
+        // backs the activation's holds and segments as the fires first touch
+        // them) is the pool's, not the capture's; a flat range, allocated,
+        // backs none.
         let pool_grew = self.pools.backed_bytes().saturating_sub(backed_before);
         st.took = st
             .took

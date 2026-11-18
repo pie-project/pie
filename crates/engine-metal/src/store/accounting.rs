@@ -1,8 +1,8 @@
 use crate::error::{Fault, Result};
 
-/// What the driver is left beside everything a load places: the safety
-/// floor under the measured capacity (the user's decision, every backend).
-pub const DRIVER_FLOOR: u64 = 64 << 20;
+/// What the driver is left beside everything a load places: the user's
+/// stated safety margin ([`engine::SAFETY_FLOOR_BYTES`]).
+pub use engine::SAFETY_FLOOR_BYTES as DRIVER_FLOOR;
 
 /// What a load may place on the device: the working set Metal recommends
 /// for this process, less what the device already held for it when the

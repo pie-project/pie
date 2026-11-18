@@ -33,6 +33,23 @@
 //!   `engine::rates::elementwise_sets` sets.
 //! - `scan_gelems`: the causal conv and the chunked gated delta scan at
 //!   [`SCAN_SHAPE`].
+//! - `few_row_tflops`: the plain product of [`FEW_ROWS`] (the few-rows
+//!   kernel's most rows: the rows skeleton's 16 on CUDA, the skinny
+//!   kernel's 8 on ROCm) over one `engine::rates::GEMM_WIDTH`-square weight
+//!   plane through `linear::gemm::matmul`, the kernel serving picks there,
+//!   its flops (its kernel pads no row) over its time. The plane is not
+//!   rotated: after the first fire its 32 MiB is read from the last-level
+//!   cache, so the weight reads no longer bind it and the time is the
+//!   kernel's compute.
+//! - `workgroups_per_core`: derived, not timed: the blocks of that same
+//!   kernel, at that shape, one multiprocessor (compute unit) holds at
+//!   once, as the device's occupancy calculator states it for the kernel's
+//!   block size, registers and shared memory
+//!   (`cuOccupancyMaxActiveBlocksPerMultiprocessor` on CUDA,
+//!   `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` on ROCm;
+//!   `linear::gemm::few_rows_resident_blocks`). Nothing multiplies it: the
+//!   device's full-rate workgroups are it times the multiprocessors
+//!   (`engine::roofline::Constants::full_rate_workgroups`).
 //!
 //! Every float operand the matmul, attention and scan read is
 //! `engine::rates::operand_pattern` repeated, not zeros: some devices run a
@@ -40,8 +57,12 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
 use profile::fire::Rates;
+
+/// The `[rates]` keys this backend's estimate weighs a fire by (of
+/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
+pub const KEYS: [&str; 8] = profile::fire::KEYS;
 
 /// The `[provenance]` entry a measurement of `device`'s rates writes beside
 /// them (`engine::rates::provenance`): how this backend measured them.
@@ -50,13 +71,16 @@ pub fn provenance(device: &str) -> (&'static str, String) {
     let how = format!(
         "{device}; the matmul through {}'s first heuristic algorithm, each rate a burst on the \
          stream doubled until it settles, timed by events, the median of 5 (the launch of 15); \
-         operands: engine::rates' pattern; at {}",
+         the few-rows rate on {FEW_ROWS} rows over one cached {w}-square plane; \
+         workgroups_per_core the few-rows kernel's resident blocks a multiprocessor by the \
+         occupancy calculator; operands: engine::rates' pattern; at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
             "cuBLASLt"
         },
-        engine::rates::build_commit()
+        engine::rates::build_commit(),
+        w = engine::rates::GEMM_WIDTH,
     );
     engine::rates::provenance("cuda", &how)
 }
@@ -108,13 +132,17 @@ fn ensure_by(
         check: &check,
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, save, Some(room), None, |_max_submit| {
+    engine::rates::rates_at_load(chip, &KEYS, save, Some(room), None, |_max_submit| {
         Ok(engine::rates::Measured {
             rates: measure(&measure_chip)?,
             unsettled: false,
         })
     })
 }
+
+/// The rows `few_row_tflops` is timed at: the most the backend's few-rows
+/// kernel takes (`linear::gemm::FEW_ROWS`).
+pub const FEW_ROWS: u32 = kernels_cuda::linear::gemm::FEW_ROWS;
 
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;
@@ -273,51 +301,34 @@ mod on_device {
         /// the measurement (one counter across every burst of it,
         /// `engine::rates::Rotation`, so a burst reads the next operand
         /// sets, never the first again): a burst of `k` launches, `k`
-        /// doubled until a launch's time settles
-        /// (`engine::rates::timed_frames`; CUDA states no bound on one
-        /// submission), the median of `rounds` after a warm burst, over its
-        /// launches.
+        /// doubled until a launch's time settles, then such bursts until
+        /// their rate stops moving (`engine::rates::warmed_frames`; CUDA
+        /// states no bound on one submission), the median of `rounds` after
+        /// a warm burst, over its launches.
         fn burst(
             &self,
             rounds: usize,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
-            self.burst_of(rounds, false, once)
-        }
-
-        /// [`Clock::burst`] for a memory-bound op: before it is timed, its
-        /// own bursts warm the device until their rate stops moving
-        /// (`engine::rates::warm_up`'s rule): the DVFS level sustained
-        /// serving sees, not the one an idle device starts at.
-        fn burst_warmed(
-            &self,
-            rounds: usize,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
-            self.burst_of(rounds, true, once)
-        }
-
-        fn burst_of(
-            &self,
-            rounds: usize,
-            warm: bool,
+            touched: &Touched,
+            sets: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
             let turn = engine::rates::Rotation::default();
             let mut fire = |k: usize| (0..k).try_for_each(|_| once(turn.next(usize::MAX)));
+            // Its sets touched once, by the first burst over them.
+            engine::rates::touch_once(
+                touched,
+                None,
+                u32::try_from(sets).unwrap_or(u32::MAX),
+                &mut |k| self.time(&mut || fire(k as usize)),
+            )?;
             self.time(&mut || fire(1))?;
-            let k = engine::rates::timed_frames(
+            let k = engine::rates::warmed_frames(
                 None,
                 None,
                 |k| self.time(&mut || fire(k as usize)),
                 |why| why,
             )?
             .fires as usize;
-            if warm {
-                engine::rates::warm_up(|| {
-                    self.time(&mut || fire(k)).map(|ns| k as f64 / ns.max(1.0))
-                })?;
-            }
             self.time(&mut || fire(k))?;
             let mut times = (0..rounds)
                 .map(|_| self.time(&mut || fire(k)))
@@ -458,6 +469,13 @@ mod on_device {
         let elementwise = elementwise(device.ctx(), &clock, &random, &mut held, gap)?;
         let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
         let bytes = copy(stream, &clock, gap)?;
+        let (few_row, resident) = few_rows(device.ctx(), &clock, &random, &mut held, gap)?;
+        eprintln!(
+            "[rates]: the few-rows kernel at {FEW_ROWS} x {w} x {w}: {:.1} TFLOP/s, {resident} \
+             blocks a multiprocessor",
+            few_row / 1e3,
+            w = engine::rates::GEMM_WIDTH
+        );
         device.synchronize().map_err(say("the device"))?;
         eprintln!(
             "[rates]: the step held at most {} MiB of device buffers ({} MiB of slabs at its end)",
@@ -484,6 +502,8 @@ mod on_device {
                 hbm_gbps: Some(tenth(bytes)),
                 elementwise_gbps: Some(tenth(elementwise)),
                 scan_gelems: Some(tenth(scan)),
+                few_row_tflops: Some(tenth(few_row / 1e3)),
+                workgroups_per_core: Some(f64::from(resident)),
             },
             attn_by_dim,
         })
@@ -525,7 +545,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the per-row ops"))
+        })?;
         engine::rates::rate_from(
             "per-row ops",
             ns,
@@ -573,6 +595,8 @@ mod on_device {
         n: u32,
         k: u32,
         weights: Vec<Buffer>,
+        /// The planes touched once, by the first matmul over them.
+        touched: Touched,
         act: Option<Buffer>,
         y: Option<Buffer>,
         rows: u32,
@@ -587,6 +611,7 @@ mod on_device {
                 n,
                 k,
                 weights,
+                touched: Touched::default(),
                 act: None,
                 y: None,
                 rows: 0,
@@ -627,7 +652,9 @@ mod on_device {
                 )
             };
             lay(held, || fire(0))?;
-            let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
+            let ns = clock.burst(ROUNDS, &self.touched, planes, &mut |i| {
+                fire(i).map_err(say("the matmul"))
+            })?;
             engine::rates::rate_from(
                 &format!("matmul {m}x{n}x{k}"),
                 ns,
@@ -780,7 +807,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the attention"))
+        })?;
         engine::rates::rate_from(
             &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
             ns,
@@ -874,7 +903,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the scan"))
+        })?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,
@@ -884,10 +915,51 @@ mod on_device {
         )
     }
 
+    /// The few-rows kernel's rate (flops a ns) and the blocks of it a
+    /// multiprocessor holds at once: the plain product of [`FEW_ROWS`] over
+    /// one `GEMM_WIDTH`-square plane, the same plane every fire (its reads
+    /// from the last-level cache after the first, so its compute binds);
+    /// the occupancy is the device's calculator's for that kernel.
+    fn few_rows(
+        ctx: &Ctx,
+        clock: &Clock,
+        random: &Random,
+        held: &mut Vec<Buffer>,
+        gap: f64,
+    ) -> Result<(f64, u32), String> {
+        let (m, w) = (FEW_ROWS, engine::rates::GEMM_WIDTH);
+        let act = random.operand(m as usize * w as usize * 2)?;
+        let weight = random.operand(w as usize * w as usize * 2)?;
+        let y = zeroed(m as usize * w as usize * 2)?;
+        let fire = || {
+            kernels_cuda::linear::gemm::matmul(
+                ctx,
+                Tensor::new(act.ptr(), m, w, Dtype::Bf16),
+                Tensor::new(weight.ptr(), w, w, Dtype::Bf16),
+                &mut Tensor::new(y.ptr(), m, w, Dtype::Bf16),
+            )
+        };
+        lay(held, fire)?;
+        // Its one plane is its own set, touched by its first burst.
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
+            fire().map_err(say("the few-rows matmul"))
+        })?;
+        let rate = engine::rates::rate_from(
+            &format!("few-rows matmul {m}x{w}x{w}"),
+            ns,
+            engine::rates::GEMM_DISPATCHES,
+            gap,
+            engine::rates::gemm_flops(m, w, w),
+        )?;
+        let resident = kernels_cuda::linear::gemm::few_rows_resident_blocks(ctx, m, w, w)
+            .map_err(say("the few-rows kernel's occupancy"))?;
+        Ok((rate, resident))
+    }
+
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |_| {
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
             crate::device::copy_d2d(stream, into.ptr(), from.ptr(), COPY_BYTES)
                 .map_err(say("the copy"))
         })?;
@@ -928,7 +1000,7 @@ mod on_device {
             let exec = graph
                 .instantiate(stream)
                 .map_err(say("the launch's graph"))?;
-            clock.burst(LAUNCH_ROUNDS, &mut |_| {
+            clock.burst(LAUNCH_ROUNDS, &Touched::default(), 1, &mut |_| {
                 exec.launch(stream).map_err(say("the launch's graph"))
             })
         };
@@ -995,6 +1067,8 @@ mod ensure_tests {
             hbm_gbps: Some(600.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
+            few_row_tflops: Some(20.0),
+            workgroups_per_core: Some(4.0),
         }
     }
 
@@ -1006,7 +1080,10 @@ mod ensure_tests {
         let facts = crate::chip::facts(8, 9, 142);
         let room = engine::rates::step_bytes();
         let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
-        assert!(!chip.rates().complete(), "no file states this card's rates");
+        assert!(
+            !chip.rates().complete(&KEYS),
+            "no file states this card's rates"
+        );
         let mut times = 0;
         let first = ensure_by(chip, device, &facts, Some(&home), room, |_| {
             times += 1;

@@ -161,6 +161,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget.max_tokens =
             crate::api::on_lattice(&engine, lattice_top, boot.budget.max_tokens);
     }
+    // A fire carries a row a lane at least: lanes past its rows are fired as
+    // waves of as many as it has rows for.
+    boot.budget.max_lanes = boot.budget.max_lanes.min(boot.budget.max_tokens);
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
         boot.budget.max_tokens,
@@ -303,8 +306,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         patches: boot.patches.clone(),
         voxels: voxels.clone(),
     };
+    // A rung's fire carries a row a lane at least: its lanes are the asked
+    // lanes it has rows for, as the refit's rungs are.
     let budget_at = |tokens: u32| {
         let mut budget = boot.budget.clone();
+        budget.max_lanes = budget.max_lanes.min(tokens);
         budget.max_tokens = tokens;
         let mut buckets: Vec<u32> = stated_buckets
             .iter()
@@ -394,16 +400,23 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             |rows| rows,
         );
         let counts = crate::top::counts(&boot.trace)?;
-        let row_tile = crate::top::row_tile(&chip);
-        let top = crate::top::choose(
+        let (top, estimate) = crate::top::choose(
             &rungs,
             after_weights,
             prompt_rows,
             &chip.rates(),
-            Some(row_tile.clone()),
+            crate::top::shape(&chip)?,
             device.name(),
             &counts,
         )?;
+        // Which pricing the estimate gave the dense matmuls, said once: the
+        // waves of the kernels hipBLASLt states, or the measured curve as
+        // timed and why its solutions went unread.
+        #[cfg(feature = "rocm")]
+        eprintln!(
+            "engine-cuda: the matmuls weighed by {}",
+            kernels_cuda::hip::lt_kernel::pricing()
+        );
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(
@@ -414,18 +427,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        weighed = engine::load::estimate(&counts, &chip.rates())
-            .ok()
-            .map(|mut estimate| {
-                estimate.rates = estimate.rates.with_row_tile(row_tile);
-                estimate
-            })
-            .map(|estimate| crate::top::Weighed {
-                rungs: rungs.clone(),
-                estimate,
-                live: after_weights,
-                fire_top: top.tokens,
-            });
+        weighed = Some(crate::top::Weighed {
+            rungs: rungs.clone(),
+            estimate,
+            live: after_weights,
+            fire_top: top.tokens,
+        });
         let widest = crate::top::widest(&rungs).unwrap_or(top.tokens);
         match boot.knobs.every_rung {
             None => top.tokens,
@@ -1653,9 +1660,9 @@ impl Shell {
                 .arena
                 .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
         }
-        // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::fire_facts`):
-        // nothing is held for them here.
+        // A program's fires lay their tables and scratch in its pairs'
+        // state, which the runtime takes in `Instance` slots at bind
+        // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
@@ -1838,8 +1845,8 @@ impl Shell {
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
 
-    /// Where a guest's sampler meets across its blocks: the most blocks one
-    /// of its launches runs, at the plane's flight on this device.
+    /// Where a guest's sampler meets across its blocks: the most lanes'
+    /// spans one of its launches lays, at the plane's flight on this device.
     fn lane_arenas_bytes(&self) -> u64 {
         crate::program::launch::Arenas::bytes_for(
             self.programs.flight(),

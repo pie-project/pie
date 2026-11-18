@@ -8,8 +8,6 @@ device = "NVIDIA GeForce RTX 4090"
 gemm.heuristics = 4  # 1.5% faster end to end
 # mla.expanded_from = 40960 reset to its default: the tune timed it 1.4% faster on gpt-oss-20b,
 # which never reads it here (MLA attention; it has none): the win was noise.
-# moe.group_at = 3 reset to its default: the tune timed it 1.4% faster on gpt-oss-20b,
-# which never reads it here (bf16 expert banks; its experts are MXFP4): the win was noise.
 qmm.split_thin_max = 16  # 1.0% faster end to end
 qmm.split_warps_per_sm = 36  # 1.0% faster end to end
 sdpa.merge_warp = true  # 1.4% faster end to end
@@ -37,8 +35,6 @@ elemwise.rows_vec = true
 sdpa.pool_mma = true
 sdpa.selected_mma = true
 sdpa.compressed_replay = true
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 

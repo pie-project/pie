@@ -60,6 +60,8 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             if proc.state == Residency::Evicting {
                 proc.state = Residency::Resident;
+                // Never parked: its bind goes again as it stands.
+                proc.bind_room = None;
             }
             Some(proc.signal.clone())
         });
@@ -106,6 +108,8 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             if proc.state == Residency::Evicting {
                 proc.state = Residency::Resident;
+                // Never parked: its bind goes again as it stands.
+                proc.bind_room = None;
             }
             Some(proc.signal.clone())
         });
@@ -146,6 +150,9 @@ impl ResidencyPlanner {
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
+            proc.roles_short = false;
+            // Back with room for it: the bind goes again.
+            proc.bind_room = None;
             Some(proc.signal.clone())
         });
         crate::scheduler::worker::notify_process_resume(pid);
@@ -183,6 +190,28 @@ impl ResidencyPlanner {
         } else {
             self.poke();
         }
+    }
+
+    /// The guest-state room the bind that suspended `pid` asks, while
+    /// that bind is pending ([`super::proc::Proc::bind_room`]).
+    pub(super) fn pending_bind(&self, pid: ProcessId) -> Option<super::proc::PendingBind> {
+        self.with_inner(|inner| inner.procs.get(&pid)?.bind_room)
+    }
+
+    /// `pid`'s restore found no device room for its parked role slots, which
+    /// a budget holds: it is queued again, a waiter like any admission, and
+    /// served once a completion frees room or an eviction makes it
+    /// ([`super::proc::Proc::roles_short`]). No failure.
+    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId) {
+        self.stats
+            .restore_roles_short
+            .fetch_add(1, Ordering::Relaxed);
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.roles_short = true;
+            }
+        });
+        self.requeue_restore(pid);
     }
 
     /// More of `pid`'s pages were swapped out since its restore was quoted:

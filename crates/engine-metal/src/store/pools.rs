@@ -559,10 +559,12 @@ pub struct Pools {
     /// Every state row's segment table, one after another, in the tables
     /// run.
     maps: Option<crate::inputs::Region>,
-    /// Each buffer's address less the first's, one ulong a buffer, in the
-    /// tables run, where the range spans more than one: what kernels reach
-    /// a page in another buffer by (`kv_page.h`'s `pie_fc_part_table`).
-    deltas: Option<crate::inputs::Region>,
+    /// Each buffer's address less the first's, one ulong a buffer, where
+    /// the range spans more than one: what kernels reach a page in another
+    /// buffer by (`kv_page.h`'s `pie_fc_part_table`). A buffer of its own,
+    /// outside the pool: fixed for the load, so nothing written into the
+    /// pool can move a page.
+    deltas: Option<Buffer>,
     /// Where the next of the engine's own tables lies in the tables run
     /// (`Reserved::Tables`), and where the run ends: range byte offsets.
     table_run: (u64, u64),
@@ -676,6 +678,41 @@ impl Pools {
         Ok(pools)
     }
 
+    /// A pool of `chunks` chunks of `chunk_bytes`, in segments of `segment`
+    /// chunks, holding a kv list of `list_bytes` slots and nothing else,
+    /// every segment committed: under [`super::pool::cap_parts`], a buffer a
+    /// segment. For tests of how kernels reach pages past the first buffer.
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn listed_over(
+        device: &Context,
+        chunk_bytes: u64,
+        chunks: u32,
+        segment: u32,
+        list_bytes: u64,
+        tables: u32,
+    ) -> Result<Pools> {
+        let mut layout = Layout::new(chunk_bytes, chunks, segment, 16, [list_bytes, 0], 1, 0, 0)?;
+        layout.tables = tables;
+        let rows = Rows {
+            rows: Vec::new(),
+            chunk_bytes,
+            list_bytes,
+            tokens: 16,
+            fixed_bytes: 0,
+            pieces: 1,
+            windows: Vec::new(),
+            tables: Vec::new(),
+            bands: Vec::new(),
+            rs: None,
+            kv_rows: Vec::new(),
+            state_rows: Vec::new(),
+        };
+        let paging = super::kv::Paging::of(16, 256, 1, 1)?;
+        let mut pools = Pools::reserve(device, rows, layout, paging)?;
+        pools.commit_segments(chunks.div_ceil(segment))?;
+        Ok(pools)
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size.
     pub fn reserve(device: &Context, rows: Rows, layout: Layout, paging: Paging) -> Result<Pools> {
         let mut pool = Pool::reserve(
@@ -748,7 +785,10 @@ impl Pools {
 
     /// Writes the buffers' delta table where the range spans more than one
     /// and pages a shape (kv list, window lists, rs list) kernels reach
-    /// through it; a state row reaches the buffers through its own map.
+    /// through it; a state row reaches the buffers through its own map. The
+    /// table is fixed for the load and every buffer-1 page is reached
+    /// through it, so it lies in a buffer of its own, outside the pool: no
+    /// write into the pool's chunks, stray or not, can move a page.
     fn write_deltas(&mut self, device: &Context) -> Result<()> {
         let paged = self.layout.list.is_some()
             || self.layout.rs.is_some()
@@ -762,9 +802,9 @@ impl Pools {
             .iter()
             .flat_map(|delta| delta.to_le_bytes())
             .collect();
-        let mut region = self.run_table(device, words.len() as u64)?;
-        region.write(0, &words)?;
-        self.deltas = Some(region);
+        let mut table = Buffer::zeroed(device, words.len() as u64)?;
+        table.write(0, &words)?;
+        self.deltas = Some(table);
         Ok(())
     }
 
@@ -772,9 +812,7 @@ impl Pools {
     /// spans more than one buffer.
     #[must_use]
     pub fn delta_table(&self) -> Option<u64> {
-        self.deltas.as_ref().map(|region| {
-            crate::device::alloc::slab_address(region.view().slab()).wrapping_add(region.at(0))
-        })
+        self.deltas.as_ref().and_then(|table| table.address_at(0))
     }
 
     /// Writes each state row's segment table: the bank is the whole pool,
@@ -832,21 +870,17 @@ impl Pools {
         Ok(())
     }
 
-    /// The tables run's bytes the state maps of `state_rows` state rows and
-    /// the buffers' delta table take where the range spans at most `parts`
-    /// buffers: what a load counts into the run before it lays it.
+    /// The tables run's bytes the state maps of `state_rows` state rows take
+    /// where the range spans at most `parts` buffers: what a load counts into
+    /// the run before it lays it. (The buffers' delta table lies in a buffer
+    /// of its own, [`Pools::delta_table`].)
     #[must_use]
     pub fn map_bytes(state_rows: usize, parts: usize) -> u64 {
         let maps = match state_rows {
             0 => 0,
             rows => crate::arena::room(rows as u64 * super::state_map_bytes(parts)),
         };
-        let deltas = if parts > 1 {
-            crate::arena::room(parts as u64 * 8)
-        } else {
-            0
-        };
-        maps + deltas
+        maps
     }
 
     /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written
@@ -1089,6 +1123,17 @@ impl Pools {
             });
         }
         let physical = self.pool.physical(chunk)?;
+        // Chunks 1..1+tables are the engine's own (`Reserved::Tables`): a
+        // kv page, a copy's end or a held table that named one would land
+        // on the delta table, the state maps or the bank tables.
+        let tables = 1..1 + self.layout.tables;
+        if tables.contains(&chunk) || tables.contains(&physical) {
+            return Err(Fault::Residency(format!(
+                "slot ref {slot} of shape {} lies in chunk {chunk} (physical {physical}), \
+                 inside the engine's tables run (chunks {}..{}), which no slot names",
+                shape.id, tables.start, tables.end
+            )));
+        }
         self.pool.clear_of_carve(chunk, physical)?;
         Ok((physical, index))
     }
@@ -1139,6 +1184,69 @@ impl Pools {
         let runs = self.pool.host_runs(global, shape.slot_bytes)?;
         let (view, at) = self.pool.view_at(global);
         Ok((view.clone(), at, runs, shape.slot_bytes))
+    }
+
+    /// The contiguous pieces a guest's state lies in (`engine::ScratchPlace`):
+    /// a run of `Instance` slots in one chunk, or runs of whole chunks, each
+    /// from its first logical chunk. Each piece as the buffer it lies in,
+    /// its offset there, its offset in the pool (what host runs are asked
+    /// by) and its bytes; none for `None`.
+    pub fn guest_pieces(&self, place: &engine::ScratchPlace) -> Result<Vec<GuestPiece>> {
+        match place {
+            engine::ScratchPlace::None => Ok(Vec::new()),
+            engine::ScratchPlace::Run { first, slots } => {
+                let shape = *self.shape(super::layout::INSTANCE)?;
+                let (chunk, index) = self.place(&shape, *first)?;
+                let last = index + slots.saturating_sub(1);
+                if *slots == 0 || last >= shape.per_chunk {
+                    return Err(Fault::Residency(format!(
+                        "a guest's run of {slots} `Instance` slot(s) from ref {first} passes \
+                         its chunk of {} slots",
+                        shape.per_chunk
+                    )));
+                }
+                self.pool.admit(chunk)?;
+                let global = u64::from(chunk) * self.layout.chunk_bytes
+                    + u64::from(index) * shape.slot_bytes;
+                let (view, local) = self.pool.view_at(global);
+                Ok(vec![GuestPiece {
+                    view: view.clone(),
+                    local,
+                    global,
+                    bytes: u64::from(*slots) * shape.slot_bytes,
+                }])
+            }
+            engine::ScratchPlace::Chunks { run, pieces } => pieces
+                .iter()
+                .map(|&logical| {
+                    let physical = self.pool.physical(logical)?;
+                    for at in 0..*run {
+                        self.pool.admit(physical + at)?;
+                    }
+                    let global = u64::from(physical) * self.layout.chunk_bytes;
+                    let (view, local) = self.pool.view_at(global);
+                    Ok(GuestPiece {
+                        view: view.clone(),
+                        local,
+                        global,
+                        bytes: u64::from(*run) * self.layout.chunk_bytes,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The bytes of one `Instance` slot and the slots a chunk holds: what
+    /// the runtime places a guest's state by.
+    pub fn instance_slots(&self) -> Result<(u64, u32)> {
+        let shape = *self.shape(super::layout::INSTANCE)?;
+        Ok((shape.slot_bytes, shape.per_chunk))
+    }
+
+    /// A chunk's bytes.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.layout.chunk_bytes
     }
 
     /// The slots of shape `id` one chunk holds.
@@ -1480,6 +1588,7 @@ impl Pools {
     pub fn part_slabs(&self) -> Vec<crate::device::alloc::Slab> {
         (1..self.pool.parts())
             .map(|at| self.pool.part_view(at).slab().clone())
+            .chain(self.deltas.as_ref().map(|table| table.slab().clone()))
             .collect()
     }
 
@@ -1537,6 +1646,13 @@ impl Pools {
     /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
     pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.pool.read(offset, into)
+    }
+
+    /// `from` written at `offset` of the pool's buffer, on the host; for a
+    /// test that lays bytes it then reads back.
+    #[cfg(test)]
+    pub fn write_span(&mut self, offset: u64, from: &[u8]) -> Result<()> {
+        self.pool.write(offset, from)
     }
 
     /// Backs the range's top `bytes` for a fire's carve ([`Pool::cover`]).
@@ -2032,14 +2148,27 @@ impl Pools {
         self.pool.commit_segments(segments)
     }
 
-    /// Backs the segments the seat runs lie in: what a caller firing
-    /// directly asks.
-    pub fn commit_seats(&mut self) -> Result<()> {
-        let chunks = self.layout.free_chunk();
-        let segments = chunks
-            .div_ceil(self.layout.segment_chunks.max(1))
-            .min(self.pool.segments());
-        self.pool.commit_segments(segments)
+    /// Backs the segments the seat runs lie in, and those a fire's `kv`
+    /// list slots and `state` fixed slots reach past them: what a caller
+    /// firing directly asks, with no runtime committing ahead of it.
+    pub fn commit_seats(&mut self, kv: u32, state: u32) -> Result<()> {
+        let reach = |slots: u32, shape: Option<crate::store::layout::Slots>| {
+            shape.map_or(0, |shape| slots.div_ceil(shape.per_chunk.max(1)))
+        };
+        let chunks = self
+            .layout
+            .free_chunk()
+            .max(reach(kv, self.layout.list))
+            .max(reach(state, self.layout.fixed));
+        let segments = chunks.div_ceil(self.layout.segment_chunks.max(1));
+        // The bottom grows to the segment the span starts in; state past it
+        // lies in that segment, which the span's commit lends to state.
+        let bottom = self.pool.segments() - self.pool.span_segments();
+        self.pool.commit_segments(segments.min(bottom))?;
+        if segments > bottom {
+            self.pool.commit_span(self.pool.span_segments())?;
+        }
+        Ok(())
     }
 
     /// The bottom run of segments backed for state.
@@ -2463,4 +2592,98 @@ impl Pools {
                 .any(|slot| seats.contains(&(slot / cache.shape.per_chunk.max(1))))
         })
     }
+}
+
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod delta_table_tests {
+    use super::Pools;
+    use crate::device::Context;
+
+    const CHUNK: u64 = 16 << 20;
+
+    /// The buffers' delta table, through which every kernel reaches a kv
+    /// page past the first buffer, lies in a buffer of its own: no pool
+    /// buffer holds its address, it holds the buffers' deltas, and every
+    /// byte of the pool overwritten leaves it as it was. Laid in the pool's
+    /// tables run it was overwritten on the M5 (bf16 rows where the deltas
+    /// belong), and every buffer-1 kv write landed elsewhere.
+    #[test]
+    fn the_delta_table_lies_outside_the_pool_and_survives_any_write_into_it() {
+        let device = Context::bind().expect("a Metal 4 device");
+        super::super::pool::cap_parts(CHUNK);
+        let pools = Pools::listed_over(&device, CHUNK, 4, 1, CHUNK / 4, 0);
+        super::super::pool::cap_parts(0);
+        let mut pools = pools.expect("a pool");
+        assert_eq!(pools.parts(), 4, "a buffer a chunk");
+        let table = pools.delta_table().expect("a kv list over four buffers has a delta table");
+        let want = pools.deltas();
+        assert!(want.iter().skip(1).any(|&delta| delta != 0), "the buffers lie apart: {want:x?}");
+        let held = |pools: &Pools| -> Vec<u64> {
+            let mut bytes = vec![0u8; want.len() * 8];
+            pools
+                .deltas
+                .as_ref()
+                .expect("the table")
+                .read(0, &mut bytes)
+                .expect("the table reads");
+            bytes
+                .chunks_exact(8)
+                .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+                .collect()
+        };
+        assert_eq!(held(&pools), want, "the table holds the buffers' deltas");
+        for at in 0..pools.parts() {
+            let view = pools.pool.part_view(at);
+            let base = crate::device::alloc::slab_address(view.slab());
+            assert!(
+                !(base..base + view.bytes()).contains(&table),
+                "buffer {at} of the pool holds the delta table"
+            );
+        }
+        // Every byte of the pool, overwritten with bf16 rows.
+        let rows = vec![0x87u8, 0x3e, 0x3b, 0xbe].repeat((CHUNK / 4) as usize);
+        for chunk in 0..4u64 {
+            pools.pool.write(chunk * CHUNK, &rows).expect("a chunk overwritten");
+        }
+        assert_eq!(held(&pools), want, "no write into the pool moves a page");
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tables_run_tests {
+    use super::Pools;
+    use crate::device::Context;
+    use crate::error::Fault;
+
+    const CHUNK: u64 = 16 << 20;
+
+    /// Chunks 1..1+tables are the engine's: a kv page, a copy's end or a
+    /// held table naming one is refused where its slot is placed, by name,
+    /// and the first slot past the run is placed as any other.
+    #[test]
+    fn a_slot_in_the_tables_run_is_refused_where_it_is_placed() {
+        let device = Context::bind().expect("a Metal 4 device");
+        let pools = Pools::listed_over(&device, CHUNK, 8, 8, CHUNK, 2).expect("a pool");
+        for chunk in 1..3u32 {
+            let refused = pools.kv_pages(&[chunk], None).err();
+            assert!(
+                matches!(&refused, Some(Fault::Residency(why)) if why.contains("tables run")),
+                "chunk {chunk}: {refused:?}"
+            );
+        }
+        let past = pools.kv_pages(&[3], None).expect("the first slot past the tables run");
+        assert_eq!(past.len(), 1);
+    }
+}
+
+/// One contiguous piece of a guest's state in the pool ([`Pools::guest_pieces`]).
+#[derive(Debug, Clone)]
+pub struct GuestPiece {
+    /// The buffer it lies in, and its offset there.
+    pub view: Buffer,
+    pub local: u64,
+    /// Its offset in the pool: what its host runs are asked by.
+    pub global: u64,
+    pub bytes: u64,
 }

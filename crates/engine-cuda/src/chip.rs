@@ -662,8 +662,6 @@ mod tests {
                         mxfp4_mma_until: defaults.mxfp4_mma_until(),
                         nvfp4_mma_from: defaults.nvfp4_mma_from(),
                         nvfp4_mma_until: defaults.nvfp4_mma_until(),
-                        bf16_mma_from: defaults.bf16_mma_from(),
-                        bf16_mma_until: defaults.bf16_mma_until(),
                         selected_mma: defaults.selected_mma(),
                         gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until(),
                         mla_dense_short: defaults.mla_dense_short(),
@@ -680,10 +678,6 @@ mod tests {
                 assert_eq!(
                     (tuning.mxfp4_mma_from(), tuning.mxfp4_mma_until()),
                     (28, 16_777_216)
-                );
-                assert_eq!(
-                    (tuning.bf16_mma_from(), tuning.bf16_mma_until()),
-                    (16, 65536)
                 );
             } else {
                 // The 99 KiB and A100 families take the two-launch gated
@@ -1079,14 +1073,15 @@ mod tests {
                     index_mma: defaults.index_mma(),
                     index_radix: defaults.index_radix(),
                     decode_grouped_prefill_from: defaults.decode_grouped_prefill_from(),
-                    bf16_mma_from: defaults.bf16_mma_from(),
-                    bf16_mma_until: defaults.bf16_mma_until(),
                     mxfp4_fp8_from: defaults.mxfp4_fp8_from(),
                     ssm_kda_chunked: defaults.ssm_kda_chunked(),
                     decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse(),
                     decode_grouped_prefill_window: defaults.decode_grouped_prefill_window(),
                     fa2_live: defaults.fa2_live(),
                     compressed_replay: defaults.compressed_replay(),
+                    // The L40S's file states its measured rates; the
+                    // roofline is the device's, not a decision.
+                    roof: defaults.roof,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1111,8 +1106,6 @@ mod tests {
                     || (spec.id == "kernel.elemwise.rows_vec" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.merge_warp" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.pool_mma" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "kernel.moe.bf16_mma_from" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "kernel.moe.bf16_mma_until" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
                     || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))

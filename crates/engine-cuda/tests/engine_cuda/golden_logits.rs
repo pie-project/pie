@@ -941,7 +941,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         resident("before it is seated");
     }
     let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, CONTEXT, host, 1)
+    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, host, 1)
         .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
         .expect("the staging ring pins");
     shell
