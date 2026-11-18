@@ -444,10 +444,24 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
+/// Refuses a load on a target with no native wgpu backend: macOS, unless
+/// `wgpu-metal` is on (a large first submission on wgpu's Metal backend never
+/// completes).
+fn native() -> Result<()> {
+    if cfg!(all(target_os = "macos", not(feature = "wgpu-metal"))) {
+        return Err(Fault::NoDevice {
+            detail: "engine type wgpu has no backend on macOS in this build; use type = \"metal\""
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl Context {
     /// The device `boot` names, of which a load takes what it states it
     /// has, or `allowance.budget` where stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
+        native()?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)

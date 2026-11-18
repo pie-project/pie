@@ -29,14 +29,15 @@ tracing = "0.1"
 
 naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
 
-# Native builds run on wgpu's Vulkan backend off Apple, DX12 on Windows and
-# Metal on Apple; each backend's native handles state the device memory.
+# Native builds run on wgpu's Vulkan backend off Apple and DX12 on Windows;
+# each backend's native handles state the device memory. macOS has no wgpu
+# backend unless `wgpu-metal` is on: on wgpu's Metal backend a large first
+# submission never completes, so a load there is refused by name.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
     "dx12",
-    "metal",
 ], optional = true }
 
 # wgpu's Vulkan backend, off Apple.
@@ -48,6 +49,7 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_Graphics_Dxgi",
 ], optional = true }
 
+# Read for the device memory under `wgpu-metal` only.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
@@ -75,10 +77,12 @@ wgpu = [
     "dep:naga",
     "dep:ash",
     "dep:windows",
-    "dep:objc2-metal",
     "kernels-slang/wgsl",
     "kernels-slang/probe",
 ]
+# wgpu's Metal backend, off by default: a large first submission on it never
+# completes. Without it a wgpu load on macOS is refused by name.
+wgpu-metal = ["wgpu", "wgpu/metal", "dep:objc2-metal"]
 
 [lints]
 workspace = true

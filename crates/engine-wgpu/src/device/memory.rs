@@ -23,6 +23,7 @@ pub enum Source {
     /// `IDXGIAdapter3::QueryVideoMemoryInfo`'s local segment `Budget`.
     DxgiLocal,
     /// `MTLDevice.recommendedMaxWorkingSetSize`.
+    #[cfg(feature = "wgpu-metal")]
     MetalWorkingSet,
 }
 
@@ -33,6 +34,7 @@ impl fmt::Display for Source {
             Source::VulkanBudget(heap) => write!(f, "VK_EXT_memory_budget heap {heap}"),
             Source::VulkanHeap(heap) => write!(f, "Vulkan heap {heap} size"),
             Source::DxgiLocal => write!(f, "DXGI QueryVideoMemoryInfo local"),
+            #[cfg(feature = "wgpu-metal")]
             Source::MetalWorkingSet => write!(f, "MTLDevice recommendedMaxWorkingSetSize"),
         }
     }
@@ -101,7 +103,7 @@ fn read(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
         wgpu::Backend::Vulkan => vulkan(adapter),
         #[cfg(windows)]
         wgpu::Backend::Dx12 => dx12(adapter),
-        #[cfg(target_vendor = "apple")]
+        #[cfg(all(target_vendor = "apple", feature = "wgpu-metal"))]
         wgpu::Backend::Metal => metal(adapter),
         other => Err(format!(
             "the {} backend reports no memory size",
@@ -164,7 +166,7 @@ fn dx12(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
     })
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "wgpu-metal"))]
 fn metal(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
     use objc2_metal::MTLDevice as _;
     // SAFETY: the native adapter is only read, and the guard is dropped
@@ -228,6 +230,7 @@ mod tests {
             line(Source::DxgiLocal),
             "device memory: 16.0 GiB from DXGI QueryVideoMemoryInfo local"
         );
+        #[cfg(feature = "wgpu-metal")]
         assert_eq!(
             line(Source::MetalWorkingSet),
             "device memory: 16.0 GiB from MTLDevice recommendedMaxWorkingSetSize"
