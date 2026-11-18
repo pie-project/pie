@@ -304,7 +304,7 @@ fn loading() -> std::sync::MutexGuard<'static, ()> {
 /// seat a lane.
 pub fn load_lanes(fixture: &Fixture, page: u32, context: u32, lanes: u32, tokens: u32) -> Option<Shell> {
     let _alone = loading();
-    let device = DeviceBoot::default();
+    let device = crate::gpu::device_boot();
     let residency = allowed(&device, engine::load::Residency::default())?;
     let boot = Boot {
         budget: Budget::new(lanes, tokens),
@@ -336,7 +336,7 @@ fn load_alone(
 ) -> Option<Shell> {
     let device = DeviceBoot {
         chunk_bytes: chunk,
-        ..DeviceBoot::default()
+        ..crate::gpu::device_boot()
     };
     let residency = allowed(&device, residency)?;
     Some(
@@ -606,7 +606,7 @@ fn a_hybrid_load_lays_the_seats_its_widest_seat_addressed_fire_asks_for() {
     let list = laid.list.expect("the hybrid pages its attention rows");
     let asked = SEATS * (2 + laid.seat_chunks()) * list.per_chunk;
     let _alone = loading();
-    let device = DeviceBoot::default();
+    let device = crate::gpu::device_boot();
     let Some(residency) = allowed(
         &device,
         engine::load::Residency {
@@ -657,7 +657,7 @@ fn a_served_hybrid_load_lays_the_seats_its_own_fires_take() {
     // The runs of `SEATS` seats: more than the naming walk's.
     let laid = *shell.pools().layout();
     drop(shell);
-    let device = DeviceBoot::default();
+    let device = crate::gpu::device_boot();
     let Some(residency) = allowed(
         &device,
         engine::load::Residency {
@@ -770,7 +770,7 @@ fn every_rung_fires_what_the_load_built(model: &str) {
 /// kernels, the same bound and the same classes the kernels refuse.
 fn every_rung_names_what_the_largest_names(model: &str) {
     let fixture = fixture(model, None);
-    let device = DeviceBoot::default();
+    let device = crate::gpu::device_boot();
     let _alone = loading();
     let Some(residency) = allowed(&device, engine::load::Residency::default()) else {
         return;
@@ -1146,7 +1146,7 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     ) else {
         return;
     };
-    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&crate::gpu::device_boot());
     // The prefills take the top rung; the decodes after them two lanes.
     let mut fed: [Vec<u32>; 2] = prompts();
     let mut held = [0u32; 2];
