@@ -323,11 +323,14 @@ fn the_arena_holds_no_score_row() {
 /// planes): the attention mass a key of the load's context, summed over the
 /// layers and averaged over the query heads, and that summed a kv page of
 /// the load's own (its chunk recipe's, not the boot's). A fire of 256 lanes,
-/// one capturing, lays that lane's rows alone.
+/// one capturing, lays that lane's rows alone. The load's fire top is a
+/// rung a prompt of its context holds (`engine::load::fire_top`), and a
+/// lane carries a token, so the context holds the fire's 261 tokens: at a
+/// smaller one the load carries fewer lanes than the fire asks.
 #[test]
 fn the_score_rows_are_the_oracles() {
     const LANES: u32 = 256;
-    const CONTEXT: u32 = 64;
+    const CONTEXT: u32 = 512;
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
     let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, LANES, 512) else {
