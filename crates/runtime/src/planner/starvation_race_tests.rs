@@ -1814,7 +1814,11 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
                 _ => break,
             }
         }
-        shared.lock().unwrap().pool_mut().retire_through(epoch);
+        shared
+            .lock()
+            .unwrap()
+            .pool_mut()
+            .retire_through(crate::store::slots::Epochs::both(epoch));
         // The fires the served prompts ran retire: what their windows moved
         // past is free, as a retiring fire tells the planner.
         planner.pages_freed();
@@ -2406,7 +2410,11 @@ async fn a_head_covered_by_arriving_pages_waits_for_them_instead_of_evicting() {
     pool.arriving.store(0, Ordering::SeqCst);
     pool.refill_after_stall(1, 0);
     planner.pages_freed();
-    assert_eq!(planner.stats.serves.load(Ordering::Relaxed), 1, "served on the landing");
+    assert_eq!(
+        planner.stats.serves.load(Ordering::Relaxed),
+        1,
+        "served on the landing"
+    );
     assert!(!reached_eviction(&planner, key));
 }
 
@@ -2659,9 +2667,16 @@ async fn a_bind_short_of_room_waits_for_arriving_chunks_before_dropping_cache() 
             break;
         }
     }
-    assert!(planner.stats.arrival_waits.load(Ordering::Relaxed) > 0, "it waits on them");
+    assert!(
+        planner.stats.arrival_waits.load(Ordering::Relaxed) > 0,
+        "it waits on them"
+    );
     assert!(!waited.is_finished());
-    assert_eq!(pool.cache.lock().len(), 8, "no cache dropped for chunks on their way");
+    assert_eq!(
+        pool.cache.lock().len(),
+        8,
+        "no cache dropped for chunks on their way"
+    );
     // The work lands: its chunks are free, and its settling plans again.
     pool.arriving.store(0, Ordering::SeqCst);
     pool.free.lock().extend(8..11);

@@ -23,7 +23,9 @@ use ::engine::chunk::{
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
 use super::shared::{Shared, SharedPool, TokenShape};
-use super::slots::{Demand, Holder, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape};
+use super::slots::{
+    Demand, Epochs, Holder, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
+};
 
 /// The holder a store's own allocations are taken under: the store's
 /// table, which refcounts them, holds each id it hands out.
@@ -55,8 +57,9 @@ pub struct ShapePool<I> {
     capacity: u32,
     /// One past the highest id there may be.
     ids_end: u32,
-    /// Ids let go, each batch waiting on the fire at its epoch.
-    pending: Vec<(u64, Vec<I>)>,
+    /// Ids let go, each batch waiting on the fires and copies at its
+    /// epochs.
+    pending: Vec<(Epochs, Vec<I>)>,
     id: PhantomData<I>,
 }
 
@@ -270,11 +273,19 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
-    /// `ids` go back once the fire at `epoch` retires.
-    pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
-        if !ids.is_empty() {
-            self.pending.push((epoch, ids));
+    /// `ids` go back once the fires and copies `after` names retire. A
+    /// shared pool's slot then waits on the last copy that named it there
+    /// as well ([`SlotPool::release`]); a pinned shape's own pool, which no
+    /// copy touches, waits here on every copy through the later epoch.
+    pub fn recycle_after_epoch(&mut self, ids: Vec<I>, after: Epochs) {
+        if ids.is_empty() {
+            return;
         }
+        let after = match self.slots {
+            Backing::Own(_) => Epochs::both(after.fire.max(after.copy)),
+            Backing::Shape(..) | Backing::Records(_) => after,
+        };
+        self.pending.push((after, ids));
     }
 
     /// `ids`, which no fire has touched, go back now.
@@ -282,10 +293,12 @@ impl<I: PoolId> ShapePool<I> {
         self.give_back(&ids);
     }
 
-    pub fn retire_through(&mut self, epoch: u64) {
+    /// Every fire through `retired.fire` and copy through `retired.copy`
+    /// has landed: the ids that waited on them go back.
+    pub fn retire_through(&mut self, retired: Epochs) {
         let mut i = 0;
         while i < self.pending.len() {
-            if self.pending[i].0 <= epoch {
+            if retired.covers(self.pending[i].0) {
                 let (_, ids) = self.pending.swap_remove(i);
                 self.give_back(&ids);
             } else {

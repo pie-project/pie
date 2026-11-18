@@ -12,9 +12,12 @@
 //! fullest partly filled chunk first, so few chunks stay partly filled.
 //!
 //! A slot whose last holder lets go is not handed out again until the fire
-//! that last touched it retires (as [`super::pool::Pool::recycle_after_epoch`]
-//! and [`super::pool::Pool::retire_through`]); a chunk whose slots are all
-//! back is free again.
+//! and the copy that last touched it have landed (as
+//! [`super::chunks::Pool::recycle_after_epoch`] and [`SlotPool::retire_through`]):
+//! fires and copies retire on watermarks of their own ([`Epochs`]), so a
+//! copy in flight holds back only the slots it names, and a slot only fires
+//! named goes back as they land. A chunk whose slots are all back is free
+//! again.
 //!
 //! Budget: `reserved + state chunks + act_chunks(rung) <= committed <= total`.
 //!
@@ -58,6 +61,76 @@ pub const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 const NONE: u32 = u32::MAX;
 const NO_SHAPE: ShapeId = ShapeId::MAX;
 const WORD: u32 = u64::BITS;
+
+/// A pair of epochs of one store's sequence, a fire's and a copy's: what a
+/// slot let go waits on (the last fire and the last copy that named it), or
+/// how far each has retired (every fire through `fire`, every copy through
+/// `copy`, has landed). Fires and copies take their epochs from one
+/// sequence, so each watermark is the epoch below the oldest of its kind
+/// still open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Epochs {
+    pub fire: u64,
+    pub copy: u64,
+}
+
+impl Epochs {
+    /// Waits on the fires through `epoch`, and on no copy.
+    #[must_use]
+    pub const fn fire(epoch: u64) -> Self {
+        Self {
+            fire: epoch,
+            copy: 0,
+        }
+    }
+
+    /// The same epoch for both: what waits on (or has retired) every fire
+    /// and copy through it.
+    #[must_use]
+    pub const fn both(epoch: u64) -> Self {
+        Self {
+            fire: epoch,
+            copy: epoch,
+        }
+    }
+
+    /// Whether everything `stamp` waits on has retired by these watermarks.
+    #[must_use]
+    pub const fn covers(self, stamp: Self) -> bool {
+        stamp.fire <= self.fire && stamp.copy <= self.copy
+    }
+
+    /// Each the later.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            fire: self.fire.max(other.fire),
+            copy: self.copy.max(other.copy),
+        }
+    }
+
+    /// Each the earlier.
+    #[must_use]
+    pub fn min(self, other: Self) -> Self {
+        Self {
+            fire: self.fire.min(other.fire),
+            copy: self.copy.min(other.copy),
+        }
+    }
+
+    /// The epoch through which fires and copies alike have retired.
+    #[must_use]
+    pub fn through(self) -> u64 {
+        self.fire.min(self.copy)
+    }
+}
+
+/// What names a slot at an epoch: a fire, or a copy ([`SlotPool::touch_held`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Touch {
+    Fire(u64),
+    Copy(u64),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeKind {
@@ -315,6 +388,17 @@ struct SlotRefs {
     cache: u32,
     /// The last fire that touched the slot.
     touched: u64,
+    /// The last copy that touched the slot.
+    copied: u64,
+}
+
+impl SlotRefs {
+    fn stamp(&mut self, touch: Touch) {
+        match touch {
+            Touch::Fire(epoch) => self.touched = self.touched.max(epoch),
+            Touch::Copy(epoch) => self.copied = self.copied.max(epoch),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -515,6 +599,8 @@ pub struct SlotPool {
     open: Bits,
     /// Physical chunks a rung evacuation moved state off, kept closed until
     /// the fire that carries the copy retires, by that fire's epoch.
+    /// Keyed by an epoch of either kind: each waits on fires and copies
+    /// alike ([`Epochs::through`]).
     fences: BTreeMap<u64, Vec<u32>>,
     fenced: Bits,
     /// No chunk at or past this physical id is opened: the engine binds
@@ -523,8 +609,13 @@ pub struct SlotPool {
     segments: Segments,
     /// Chunks opened for a shape.
     held: u32,
-    pending: BTreeMap<u64, Vec<Slot>>,
-    retired: u64,
+    /// Slots let go and waiting on a fire, by its epoch, each with the copy
+    /// it waits on next (`0`: none).
+    pending: BTreeMap<u64, Vec<(Slot, u64)>>,
+    /// Slots let go whose fires have retired, waiting on a copy, by its
+    /// epoch.
+    pending_copies: BTreeMap<u64, Vec<Slot>>,
+    retired: Epochs,
     holders: HashMap<Holder, u64>,
     waiters: HashMap<u64, (ShapeId, u64)>,
     /// Runs of adjacent chunks taken whole ([`Self::acquire_chunk_runs`])
@@ -536,6 +627,17 @@ pub struct SlotPool {
     /// back, at once or as the fire it waited on retires, and a fenced
     /// chunk reopened. The one source a wait for room reads.
     given: std::sync::Arc<RoomGiven>,
+}
+
+/// Takes the entries of `map` at or below `through`, every one at `MAX`.
+fn through_epoch<V>(map: &mut BTreeMap<u64, V>, through: u64) -> BTreeMap<u64, V> {
+    match through.checked_add(1) {
+        Some(after) => {
+            let later = map.split_off(&after);
+            std::mem::replace(map, later)
+        }
+        None => std::mem::take(map),
+    }
 }
 
 impl SlotPool {
@@ -596,7 +698,8 @@ impl SlotPool {
             segments,
             held: 0,
             pending: BTreeMap::new(),
-            retired: 0,
+            pending_copies: BTreeMap::new(),
+            retired: Epochs::default(),
             holders: HashMap::new(),
             waiters: HashMap::new(),
             runs: HashMap::new(),
@@ -1293,7 +1396,7 @@ impl SlotPool {
             self.free_chunks(),
             self.committed_chunks(),
             self.total,
-            self.pending.values().map(Vec::len).sum::<usize>(),
+            self.pending_slots(),
         )
     }
 
@@ -1673,13 +1776,12 @@ impl SlotPool {
         }
     }
 
-    /// Notes that a fire at `epoch` touches `slots`: once let go, they wait
-    /// for it.
-    pub fn touch(&mut self, slots: &[Slot], epoch: u64) {
+    /// Notes that a fire or a copy (`touch`) names `slots`: once let go,
+    /// they wait for it.
+    pub fn touch(&mut self, slots: &[Slot], touch: Touch) {
         for &slot in slots {
             let (state, at) = self.locate(slot);
-            let refs = &mut state.refs[at];
-            refs.touched = refs.touched.max(epoch);
+            state.refs[at].stamp(touch);
         }
     }
 
@@ -1687,8 +1789,13 @@ impl SlotPool {
     /// `r % per_chunk` of chunk `r / per_chunk`), each where it is handed
     /// out for that shape; a ref naming nothing handed out (a stale one, or
     /// the null chunk's) is passed over. One pass a ref: a fire touches
-    /// every slot its lanes name.
-    pub fn touch_held(&mut self, shape: ShapeId, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+    /// every slot its lanes name, a copy every slot it reads or writes.
+    pub fn touch_held(
+        &mut self,
+        shape: ShapeId,
+        refs: impl IntoIterator<Item = u32>,
+        touch: Touch,
+    ) {
         let Some(state) = self.shapes.get_mut(shape as usize) else {
             return;
         };
@@ -1717,21 +1824,19 @@ impl SlotPool {
             if state.free[word] & (1 << (index % WORD)) != 0 {
                 continue;
             }
-            let refs = &mut state.refs[(frame * spc + index) as usize];
-            if refs.touched < epoch {
-                refs.touched = epoch;
-            }
+            state.refs[(frame * spc + index) as usize].stamp(touch);
         }
     }
 
     /// Drops `holder`'s reference on each of `slots`. A slot no one holds
-    /// any more is handed out again once the later of `epoch` and the last
-    /// fire that touched it retires.
+    /// any more is handed out again once the later of the fire at `epoch`
+    /// and the last fire that touched it has retired, and the last copy
+    /// that touched it has: a copy that never named it holds it back not
+    /// at all.
     pub fn release(&mut self, holder: Holder, slots: &[Slot], epoch: u64) {
         let live = holder.is_live();
         let mut immediate = Vec::new();
-        // Let go slots by the epoch they wait on; few epochs per call.
-        let mut waiting: Vec<(u64, Vec<Slot>)> = Vec::new();
+        let mut waiting: Vec<(Slot, Epochs)> = Vec::new();
         for &slot in slots {
             let (state, at) = self.locate(slot);
             let was = state.refs[at];
@@ -1746,13 +1851,14 @@ impl SlotPool {
             state.refs[at] = now;
             state.reclassify(was, now);
             if now.live + now.cache == 0 {
-                let after = now.touched.max(epoch);
-                if after <= self.retired {
+                let after = Epochs {
+                    fire: now.touched.max(epoch),
+                    copy: now.copied,
+                };
+                if self.retired.covers(after) {
                     immediate.push(slot);
-                } else if let Some((_, batch)) = waiting.iter_mut().find(|(at, _)| *at == after) {
-                    batch.push(slot);
                 } else {
-                    waiting.push((after, vec![slot]));
+                    waiting.push((slot, after));
                 }
             }
         }
@@ -1766,22 +1872,32 @@ impl SlotPool {
                 self.holders.remove(&holder);
             }
         }
-        for (after, batch) in waiting {
-            match self.pending.entry(after) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(batch);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().extend(batch);
-                }
-            }
+        for (slot, after) in waiting {
+            self.file_let_go(slot, after);
         }
         for slot in immediate {
             self.give_back(slot);
         }
     }
 
-    /// Every fire through `epoch` has retired: what waited on them is free.
+    /// Files `slot`, let go, under the watermark it waits on now: the fire
+    /// first, then the copy; neither left, it goes back.
+    fn file_let_go(&mut self, slot: Slot, after: Epochs) {
+        if after.fire > self.retired.fire {
+            self.pending
+                .entry(after.fire)
+                .or_default()
+                .push((slot, after.copy));
+        } else if after.copy > self.retired.copy {
+            self.pending_copies
+                .entry(after.copy)
+                .or_default()
+                .push(slot);
+        } else {
+            self.give_back(slot);
+        }
+    }
+
     /// The chunks fenced until `from` stay fenced until `to` instead.
     pub fn refence(&mut self, from: u64, to: u64) {
         if let Some(chunks) = self.fences.remove(&from) {
@@ -1789,15 +1905,18 @@ impl SlotPool {
         }
     }
 
-    pub fn retire_through(&mut self, epoch: u64) {
-        self.retired = self.retired.max(epoch);
-        let later = self.fences.split_off(&(epoch.saturating_add(1)));
-        let mut due = std::mem::replace(&mut self.fences, later);
-        if epoch == u64::MAX {
-            due.append(&mut self.fences);
-        }
+    /// Every fire through `retired.fire` and every copy through
+    /// `retired.copy` has landed: what waited on them is free, each slot as
+    /// the last of the fire and the copy it waits on lands, and a fenced
+    /// chunk once both have through its epoch.
+    pub fn retire_through(&mut self, retired: Epochs) {
+        self.retired = self.retired.max(retired);
+        let through = self.retired.through();
         let mut reopened = false;
-        for chunk in due.into_values().flatten() {
+        for chunk in through_epoch(&mut self.fences, through)
+            .into_values()
+            .flatten()
+        {
             self.fenced.clear(chunk);
             self.reopen(chunk);
             reopened = true;
@@ -1805,16 +1924,13 @@ impl SlotPool {
         if reopened {
             self.given.tell();
         }
-        let later = self.pending.split_off(&(epoch.saturating_add(1)));
-        let due = std::mem::replace(&mut self.pending, later);
-        if epoch == u64::MAX {
-            // split_off(MAX) leaves MAX itself behind.
-            let rest = std::mem::take(&mut self.pending);
-            for slot in rest.into_values().flatten() {
-                self.give_back(slot);
-            }
+        // A slot whose fire landed waits on its copy next, or goes back.
+        let fires = through_epoch(&mut self.pending, self.retired.fire);
+        for (slot, copy) in fires.into_values().flatten() {
+            self.file_let_go(slot, Epochs { fire: 0, copy });
         }
-        for slot in due.into_values().flatten() {
+        let copies = through_epoch(&mut self.pending_copies, self.retired.copy);
+        for slot in copies.into_values().flatten() {
             self.give_back(slot);
         }
     }
@@ -1825,17 +1941,20 @@ impl SlotPool {
         std::sync::Arc::clone(&self.given)
     }
 
-    /// Slots let go and waiting on a fire.
+    /// Slots let go and waiting on a fire or a copy.
     pub fn pending_slots(&self) -> usize {
-        self.pending.values().map(Vec::len).sum()
+        self.pending.values().map(Vec::len).sum::<usize>()
+            + self.pending_copies.values().map(Vec::len).sum::<usize>()
     }
 
-    /// Slots of `shape` let go and waiting on a fire: arriving, each as the
-    /// fire it waits on lands.
+    /// Slots of `shape` let go and waiting on a fire or a copy: arriving,
+    /// each as what it waits on lands.
     pub fn pending_of(&self, shape: ShapeId) -> u64 {
         self.pending
             .values()
             .flatten()
+            .map(|(slot, _)| slot)
+            .chain(self.pending_copies.values().flatten())
             .filter(|slot| self.chunks[slot.chunk as usize].shape == shape)
             .count() as u64
     }
@@ -1891,6 +2010,7 @@ impl SlotPool {
                     live: u32::from(live),
                     cache: u32::from(!live),
                     touched: 0,
+                    copied: 0,
                 };
                 let now = *refs;
                 state.reclassify(was, now);
@@ -1923,6 +2043,7 @@ impl SlotPool {
                 live: u32::from(live),
                 cache: u32::from(!live),
                 touched: 0,
+                copied: 0,
             };
             let now = *refs;
             state.reclassify(was, now);
@@ -2224,11 +2345,11 @@ impl SlotPool {
             return Err(SegmentError::Held { segment, held });
         }
         match self.segments.state(segment) {
-            SegmentState::Draining { until } if until > self.retired => {
+            SegmentState::Draining { until } if until > self.retired.through() => {
                 Err(SegmentError::Draining {
                     segment,
                     until,
-                    retired: self.retired,
+                    retired: self.retired.through(),
                 })
             }
             SegmentState::Draining { .. } => {
@@ -2459,10 +2580,10 @@ mod tests {
     #[derive(Default)]
     struct Model {
         held: HashMap<Holder, Vec<Slot>>,
-        /// Let go, and the epoch it waits on.
-        pending: HashMap<Slot, u64>,
-        retired: u64,
-        touched: HashMap<Slot, u64>,
+        /// Let go, and the fire and copy epochs it waits on.
+        pending: HashMap<Slot, Epochs>,
+        retired: Epochs,
+        touched: HashMap<Slot, Epochs>,
     }
 
     impl Model {
@@ -2511,8 +2632,9 @@ mod tests {
                                 );
                                 if let Some(&after) = model.pending.get(&slot) {
                                     assert!(
-                                        after <= model.retired,
-                                        "{slot:?} reused before epoch {after}"
+                                        model.retired.covers(after),
+                                        "{slot:?} reused before {after:?} (retired {:?})",
+                                        model.retired
                                     );
                                     model.pending.remove(&slot);
                                 }
@@ -2549,25 +2671,43 @@ mod tests {
                     pool.release(holder, &gone, at);
                     for slot in gone {
                         if model.refs(slot) == (0, 0) {
-                            let after = at.max(model.touched.get(&slot).copied().unwrap_or(0));
+                            let after = Epochs::fire(at)
+                                .max(model.touched.get(&slot).copied().unwrap_or_default());
                             model.pending.insert(slot, after);
                         }
                     }
                 }
                 8 => {
-                    // A fire touches some held slots.
+                    // A fire or a copy touches some held slots.
                     let mut slots: Vec<Slot> = model.held.values().flatten().copied().collect();
                     slots.sort();
                     slots.dedup();
                     slots.retain(|_| rng.below(3) == 0);
-                    pool.touch(&slots, epoch);
+                    let (touch, stamp) = if rng.below(2) == 0 {
+                        (Touch::Fire(epoch), Epochs::fire(epoch))
+                    } else {
+                        (
+                            Touch::Copy(epoch),
+                            Epochs {
+                                fire: 0,
+                                copy: epoch,
+                            },
+                        )
+                    };
+                    pool.touch(&slots, touch);
                     for slot in slots {
-                        model.touched.insert(slot, epoch);
+                        let was = model.touched.get(&slot).copied().unwrap_or_default();
+                        model.touched.insert(slot, was.max(stamp));
                     }
                     epoch += 1;
                 }
                 9 => {
-                    let through = epoch.saturating_sub(rng.below(4));
+                    // Each watermark on its own, the fires' or the copies'
+                    // ahead by turns.
+                    let through = Epochs {
+                        fire: epoch.saturating_sub(rng.below(4)),
+                        copy: epoch.saturating_sub(rng.below(4)),
+                    };
                     pool.retire_through(through);
                     model.retired = model.retired.max(through);
                 }
@@ -2649,7 +2789,7 @@ mod tests {
         for (holder, slots) in std::mem::take(&mut model.held) {
             pool.release(holder, &slots, epoch);
         }
-        pool.retire_through(u64::MAX);
+        pool.retire_through(Epochs::both(u64::MAX));
         assert_eq!(pool.state_chunks(), 0);
         assert_eq!(pool.demand(), Demand::default());
         pool.check();

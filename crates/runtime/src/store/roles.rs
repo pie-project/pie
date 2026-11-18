@@ -179,7 +179,9 @@ pub enum RolesError {
     /// bind needing guest room waits behind it, in arrival order, and
     /// takes none ahead of it ([`Roles::take_guest`]). It binds again once
     /// the head binds or leaves ([`Roles::leave_guest_queue`]).
-    #[error("a guest bind waits for room ahead of this one (process {head}); this one waits behind it")]
+    #[error(
+        "a guest bind waits for room ahead of this one (process {head}); this one waits behind it"
+    )]
     GuestQueued { head: Holder },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
@@ -206,7 +208,9 @@ pub fn waits_for_room(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<RolesError>(),
         Some(
-            RolesError::BindShort(_) | RolesError::GuestGrow { .. } | RolesError::GuestQueued { .. }
+            RolesError::BindShort(_)
+                | RolesError::GuestGrow { .. }
+                | RolesError::GuestQueued { .. }
         )
     )
 }
@@ -924,7 +928,10 @@ impl Roles {
     /// the head, the pool no longer counts its need, and the next bind is
     /// told to look again: the one place a waiter leaves.
     pub fn leave_guest_queue(&mut self, holder: Holder) {
-        let head = self.guest_queue.front().is_some_and(|(queued, _)| *queued == holder);
+        let head = self
+            .guest_queue
+            .front()
+            .is_some_and(|(queued, _)| *queued == holder);
         self.guest_queue.retain(|(queued, _)| *queued != holder);
         if head {
             // The next head's need counts at once: the walk commits for it,
@@ -953,7 +960,9 @@ impl Roles {
     /// not its turn yet ([`Self::turn_watch`]).
     #[must_use]
     pub fn waits_turn(&self, holder: Holder) -> bool {
-        self.guest_queue.front().is_some_and(|(head, _)| *head != holder)
+        self.guest_queue
+            .front()
+            .is_some_and(|(head, _)| *head != holder)
             && self.queued(holder)
     }
 
@@ -1544,7 +1553,11 @@ impl Roles {
             }
             for part in &item.parts {
                 if let Some(shape) = self.shapes.of(part.role) {
-                    pool.touch_pool(shape.pool, part.refs.iter().copied(), epoch);
+                    pool.touch_pool(
+                        shape.pool,
+                        part.refs.iter().copied(),
+                        crate::store::slots::Touch::Fire(epoch),
+                    );
                 }
             }
         }
@@ -1593,8 +1606,7 @@ impl Roles {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
-        if item.open || !item.attached.is_empty() || item.pending > 0 || item.tier == Tier::Moving
-        {
+        if item.open || !item.attached.is_empty() || item.pending > 0 || item.tier == Tier::Moving {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
@@ -2361,7 +2373,10 @@ where
             continue;
         }
         if let Some(RolesError::GuestGrow {
-            prefix, run, room: short, ..
+            prefix,
+            run,
+            room: short,
+            ..
         }) = error.downcast_ref::<RolesError>()
         {
             let (prefix, run) = (*prefix, *run);

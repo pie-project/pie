@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::policy::pressure::{self, Tier};
 use crate::store::registry;
 use crate::store::shared::SharedGrow;
-use crate::store::slots::SlotPool;
+use crate::store::slots::{Epochs, SlotPool};
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
@@ -81,12 +81,14 @@ impl SlotAccess for EnginePool {
     /// on fires that have retired is free first. With no stores, no fire
     /// reads them.
     fn with_slots(&mut self, f: &mut dyn FnMut(&mut SlotPool, u64)) {
-        let (epoch, retired) =
-            registry::try_get(self.model, self.engine).map_or((0, u64::MAX), |stores| {
+        let (epoch, retired) = registry::try_get(self.model, self.engine).map_or(
+            (0, Epochs::both(u64::MAX)),
+            |stores| {
                 registry::with_kv_lock(&stores.kv, "weights", |kv| {
-                    (kv.current_epoch(), kv.retired_through())
+                    (kv.current_epoch(), kv.watermarks())
                 })
-            });
+            },
+        );
         if let Some(shared) = &self.shared {
             let mut pool = shared.shared().lock().unwrap();
             pool.pool_mut().retire_through(retired);

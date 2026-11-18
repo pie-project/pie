@@ -643,10 +643,10 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     assert_eq!(window_live(&shared), (0, 0), "every reference back");
 }
 
+mod fence;
 mod programs;
 mod span;
 mod tiers;
-mod fence;
 
 /// What a grow waiter is short of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -852,7 +852,8 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     );
     assert!(pool.plan_raise(2048).is_err());
     pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     assert_eq!(pool.raise_short(2048), (0, 0));
     let evacuation = pool.plan_raise(2048).unwrap();
     assert!(!evacuation.moves.is_empty(), "the span's state moves down");
@@ -1145,7 +1146,8 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
         .take_records(pool.records_available() as usize)
         .unwrap();
     pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(u64::MAX));
     let evacuation = pool.plan_raise(2048).unwrap();
     assert!(!evacuation.moves.is_empty(), "state in the span moves down");
     pool.raise_applied(&evacuation).unwrap();
@@ -1157,7 +1159,8 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
         .unwrap();
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
     // No fire retires the fence while the copy is the engine's.
-    pool.pool_mut().retire_through(1_000_000);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(1_000_000));
     let moved_off: Vec<u32> = evacuation.moves.iter().map(|step| step.from).collect();
     let shared: Shared = Arc::new(Mutex::new(pool));
     crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
@@ -1170,7 +1173,8 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
     let mut pool = shared.lock().unwrap();
     pool.raise_copied(1_000_001);
     assert_eq!(pool.copying(), None);
-    pool.pool_mut().retire_through(1_000_001);
+    pool.pool_mut()
+        .retire_through(crate::store::slots::Epochs::both(1_000_001));
     let _ = moved_off;
 }
 

@@ -1220,7 +1220,11 @@ fn slots_a_park_still_copies_are_not_bound_until_the_copy_lands() {
             })
             .count()
     };
-    assert_eq!(still_out(&device), 3, "the instance's tables wait for the copy");
+    assert_eq!(
+        still_out(&device),
+        3,
+        "the instance's tables wait for the copy"
+    );
     // Another process binds now: its tables are elsewhere.
     let other = bind(&roles, &mut engine, Vec::new(), 2);
     let others: Vec<u32> = roles
@@ -1361,7 +1365,13 @@ fn a_bind_over_a_gone_item_is_refused_by_name() {
         "{refused}"
     );
     assert!(refused.to_string().contains("gone"), "{refused}");
-    assert!(roles.lock().unwrap().slots(Owner::Instance(InstanceId(41))).is_empty());
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Instance(InstanceId(41)))
+            .is_empty()
+    );
     assert!(held(&device) <= before, "the bind's slots went back");
 }
 

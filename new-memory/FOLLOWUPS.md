@@ -118,12 +118,3 @@ Each is within the ±1% the pairs spread, so no one part carries the cost. The c
 once, by having the lookup hash the ids the process's own prompt tokenization (or the gateway's, for ids it has)
 produces, instead of tokenizing `raw-prompt` again at arrival.
 
-## F16. Copies retire on a watermark of their own
-
-The kv store retires fire and copy epochs on one watermark (the oldest
-epoch still open), so an eviction's or restore's copy in flight holds back
-every slot later fires let go. A separate copy watermark (slots stamp a fire
-epoch and a copy epoch, each freed by its own) would return those slots as
-their own fires land. Measured on the L40S over-demand gate after the
-frame's own-epoch stamp: the fence costs −1.6% against b736a99fd, which this
-would cut further.

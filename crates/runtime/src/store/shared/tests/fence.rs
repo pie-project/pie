@@ -3,6 +3,9 @@
 //! touches the slots it names at it, a copy's epoch closing when the
 //! engine's `CopyCompletion` resolves (landed), not when it is enqueued.
 //! A copy still in flight cannot write into a slot handed to a new owner.
+//! Fires and copies retire on watermarks of their own: a copy in flight
+//! holds back only the slots it names, and one a fire and a copy both
+//! named waits on both.
 
 use ::engine::chunk::SlotCopy;
 use ::engine::completion::copy_in_flight;
@@ -14,6 +17,7 @@ use crate::scheduler::worker::PreLaunchCopy;
 use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::{KvPageBacking, PhysicalKvPageId};
 use crate::store::registry::{Stores, shared_stores};
+use crate::store::slots::Touch;
 
 const DEVICE: MemoryDomain = MemoryDomain::CudaDevice(0);
 
@@ -57,7 +61,11 @@ fn a_slot_let_go_under_a_copy_is_not_handed_out_until_the_copy_lands() {
         shape: LIST,
         src: DEVICE,
         dst: MemoryDomain::HostPinned,
-        slots: device_refs.iter().copied().zip(host_refs.iter().copied()).collect(),
+        slots: device_refs
+            .iter()
+            .copied()
+            .zip(host_refs.iter().copied())
+            .collect(),
         runs: Vec::new(),
     };
     let epoch = CopyEpoch::open_on(
@@ -74,7 +82,10 @@ fn a_slot_let_go_under_a_copy_is_not_handed_out_until_the_copy_lands() {
     shared.lock().unwrap().give_refs(list, &device_refs);
     retire(&stores);
     for &slot_ref in &device_refs {
-        assert!(out(&shared, slot_ref), "ref {slot_ref} handed out under the copy");
+        assert!(
+            out(&shared, slot_ref),
+            "ref {slot_ref} handed out under the copy"
+        );
     }
     let taken = shared.lock().unwrap().take_refs(list, 1).unwrap();
     assert!(
@@ -84,7 +95,10 @@ fn a_slot_let_go_under_a_copy_is_not_handed_out_until_the_copy_lands() {
 
     landing.landed();
     for &slot_ref in &device_refs {
-        assert!(!out(&shared, slot_ref), "ref {slot_ref} back once the copy landed");
+        assert!(
+            !out(&shared, slot_ref),
+            "ref {slot_ref} back once the copy landed"
+        );
     }
     shared.lock().unwrap().give_refs(list, &taken);
     host.lock().unwrap().give_refs(list, &host_refs);
@@ -100,7 +114,10 @@ fn a_slot_waits_for_its_own_last_epoch_not_the_newest() {
     let (own, later) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
         (kv.begin_fire(), kv.begin_fire())
     });
-    shared.lock().unwrap().touch(LIST, refs.iter().copied(), own);
+    shared
+        .lock()
+        .unwrap()
+        .touch(LIST, refs.iter().copied(), Touch::Fire(own));
     shared.lock().unwrap().give_refs(list, &refs);
     retire(&stores);
     assert!(out(&shared, refs[0]), "its fire still runs");
@@ -232,7 +249,11 @@ fn copy_list(stores: &Stores, host_refs: &[u32], refs: &[u32]) -> CopyEpoch {
             shape: LIST,
             src: DEVICE,
             dst: MemoryDomain::HostPinned,
-            slots: refs.iter().copied().zip(host_refs.iter().copied()).collect(),
+            slots: refs
+                .iter()
+                .copied()
+                .zip(host_refs.iter().copied())
+                .collect(),
             runs: Vec::new(),
         }),
     )
@@ -249,12 +270,15 @@ fn a_copy_the_engine_refuses_holds_nothing() {
     let epoch = copy_list(&stores, &host_refs, &refs);
     shared.lock().unwrap().give_refs(list, &refs);
     retire(&stores);
-    assert!(out(&shared, refs[0]), "fenced while the copy is being handed over");
+    assert!(
+        out(&shared, refs[0]),
+        "fenced while the copy is being handed over"
+    );
     // The engine's `copy_slots` answered Err: the lane drops the epoch.
     drop(epoch);
     assert!(!out(&shared, refs[0]), "a refused copy holds nothing");
     let (current, retired) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-        (kv.current_epoch(), kv.retired_through())
+        (kv.current_epoch(), kv.watermarks().through())
     });
     assert_eq!(current, retired, "no epoch is left open");
     host.lock().unwrap().give_refs(list, &host_refs);
@@ -278,4 +302,116 @@ fn a_copy_whose_landing_is_dropped_closes_its_epoch() {
     assert!(matches!(landed.check(), Some(Err(_))), "it failed");
     assert!(!out(&shared, refs[0]), "and holds nothing");
     host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+fn with_kv<T>(stores: &Stores, f: impl FnOnce(&mut crate::store::kv::KvStore) -> T) -> T {
+    crate::store::registry::with_kv_lock(&stores.kv, "test", f)
+}
+
+/// A copy in flight (an eviction's, say) holds back no slot it does not
+/// name: a slot only fires named goes back as its fire lands, the copy
+/// still running, while the slot the copy reads waits for the copy.
+#[test]
+fn a_copy_in_flight_holds_back_no_slot_only_fires_named() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let copied = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let fired = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    // The copy opens first: older than the fire, its epoch is the oldest
+    // still open.
+    let epoch = copy_list(&stores, &host_refs, &copied);
+    let (landing, landed) = copy_in_flight();
+    epoch.retire_on(&landed);
+    let fire = with_kv(&stores, |kv| kv.begin_fire());
+    shared
+        .lock()
+        .unwrap()
+        .touch(LIST, fired.iter().copied(), Touch::Fire(fire));
+    shared.lock().unwrap().give_refs(list, &fired);
+    shared.lock().unwrap().give_refs(list, &copied);
+    retire(&stores);
+    assert!(out(&shared, fired[0]), "its fire still runs");
+    with_kv(&stores, |kv| kv.settle(fire));
+    assert!(
+        !out(&shared, fired[0]),
+        "back as its fire lands, though an older copy is still in flight"
+    );
+    assert!(out(&shared, copied[0]), "the copy still reads it");
+    landing.landed();
+    assert!(!out(&shared, copied[0]), "back once the copy landed");
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+/// A kv page let go while an eviction's copy of other pages is in flight
+/// goes back to the store as the fire that read it lands: it waits on a
+/// copy only where one named it.
+#[test]
+fn a_kv_page_let_go_under_an_unrelated_copy_comes_back_with_its_fires() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let copied = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let epoch = copy_list(&stores, &host_refs, &copied);
+    let (landing, landed) = copy_in_flight();
+    epoch.retire_on(&landed);
+    let (pages, fire) = with_kv(&stores, |kv| {
+        let pages = kv.reserve_device_pages(1).unwrap();
+        (pages, kv.begin_fire())
+    });
+    shared
+        .lock()
+        .unwrap()
+        .touch(LIST, pages.iter().map(|page| page.0), Touch::Fire(fire));
+    let before = with_kv(&stores, |kv| {
+        let before = kv.available_pages();
+        kv.release_device_reservation(pages.clone());
+        assert_eq!(kv.available_pages(), before, "fenced while its fire runs");
+        before
+    });
+    with_kv(&stores, |kv| kv.settle(fire));
+    assert!(
+        !out(&shared, pages[0].0),
+        "back with its fire, the copy in flight"
+    );
+    with_kv(&stores, |kv| {
+        assert_eq!(kv.available_pages(), before + 1);
+    });
+    landing.landed();
+    shared.lock().unwrap().give_refs(list, &copied);
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+/// A slot a fire and a copy both named waits on both, whichever lands
+/// first.
+#[test]
+fn a_slot_a_fire_and_a_copy_both_named_waits_on_both() {
+    for copy_first in [true, false] {
+        let (shared, host, stores) = fenced();
+        let list = list_pool(&shared);
+        let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+        let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+        let fire = with_kv(&stores, |kv| kv.begin_fire());
+        shared
+            .lock()
+            .unwrap()
+            .touch(LIST, refs.iter().copied(), Touch::Fire(fire));
+        let epoch = copy_list(&stores, &host_refs, &refs);
+        let (landing, landed) = copy_in_flight();
+        epoch.retire_on(&landed);
+        shared.lock().unwrap().give_refs(list, &refs);
+        retire(&stores);
+        assert!(out(&shared, refs[0]));
+        if copy_first {
+            landing.landed();
+            assert!(out(&shared, refs[0]), "its fire still runs");
+            with_kv(&stores, |kv| kv.settle(fire));
+        } else {
+            with_kv(&stores, |kv| kv.settle(fire));
+            assert!(out(&shared, refs[0]), "the copy still reads it");
+            landing.landed();
+        }
+        assert!(!out(&shared, refs[0]), "back once both landed");
+        host.lock().unwrap().give_refs(list, &host_refs);
+    }
 }

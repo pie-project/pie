@@ -57,7 +57,7 @@ impl KvLifecycle {
             // pages of each process that finished stood off the pool while
             // unrelated fires ran, and the prompt that took its place waited
             // that long to be seated (Qwen3-8B c256: 0.8 to 2 s, main 6 ms).
-            let epoch = kv.retired_through();
+            let epoch = kv.watermarks().fire;
             kv.release_working_set(self.id, epoch);
             kv.retire_idle();
         });

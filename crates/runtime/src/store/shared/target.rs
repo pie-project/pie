@@ -12,6 +12,7 @@ use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
 use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
+use crate::store::slots::Epochs;
 
 #[derive(Clone)]
 pub struct SharedGrow {
@@ -189,7 +190,7 @@ impl SharedGrow {
                     cap,
                     super::rung_granted(self.engine),
                     current,
-                    retired,
+                    retired.through(),
                 );
                 // A raise is taken in the hold it was planned in: no slot is
                 // handed out between, and the engine's copy follows.
@@ -447,12 +448,12 @@ impl SharedGrow {
         self.wake.notify_one();
     }
 
-    /// The fire epochs of the engine's stores: the last handed out, and
-    /// the last retired.
-    fn epochs(&self) -> (u64, u64) {
-        registry::try_get(self.model, self.engine).map_or((0, u64::MAX), |stores| {
+    /// The epochs of the engine's stores: the last handed out, and how far
+    /// fires and copies have each retired.
+    fn epochs(&self) -> (u64, Epochs) {
+        registry::try_get(self.model, self.engine).map_or((0, Epochs::both(u64::MAX)), |stores| {
             registry::with_kv_lock(&stores.kv, "shared-grow", |kv| {
-                (kv.current_epoch(), kv.retired_through())
+                (kv.current_epoch(), kv.watermarks())
             })
         })
     }
