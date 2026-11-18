@@ -75,6 +75,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::outside(self)
     }
 
+    fn shares_host_memory(&self) -> bool {
+        Context::shares_host_memory(self)
+    }
+
     fn left(&self) -> u64 {
         Context::left(self)
     }

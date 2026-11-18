@@ -550,10 +550,6 @@ impl Shell {
         })
     }
 
-    /// Device pools' worth of host kv the unstated default seats at most
-    /// ([`Self::seat_host_kv`]).
-    pub const HOST_POOLS: u64 = 4;
-
     /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
     /// first used, behind the staging `ring` the load pinned before it
     /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
@@ -590,20 +586,39 @@ impl Shell {
         let page_tokens = u64::from(self.pools.paging().page_size.max(1));
         let seated = u64::from(rows) * row
             + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
-        // Unstated, the default takes at most half of what the host leaves
-        // free: workers sharing a host each seat theirs as they boot, and
-        // the first must not take the room the next one needs. And at most
-        // [`Self::HOST_POOLS`] device pools: pinned pages cost the driver ~0.2 s a GiB
-        // to give back when this process dies, holding every other process
-        // on the host meanwhile (128 GiB pinned: ~25 s), and an agent trace
-        // that suspends whole programs for long tool waits peaked at 1.7
-        // pools; the disk tier takes what is past it.
-        let free = crate::weights::available_memory() / ranks;
+        // Unstated, the shared rule ([`engine::host::default_host_kv`]):
+        // a device pool's worth up to the seats, at most
+        // [`engine::host::HOST_POOLS`] pools, within half of what the host
+        // can give.
         let budget = match stated {
-            Some(bytes) => (bytes / ranks).min(free),
-            None => whole
-                .max(seated.min(whole.saturating_mul(Self::HOST_POOLS)))
-                .min(free / 2),
+            Some(bytes) => (bytes / ranks).min(crate::weights::available_memory() / ranks),
+            None => {
+                let host = crate::weights::host_memory();
+                let kv = engine::host::default_host_kv(
+                    &host,
+                    whole,
+                    seated,
+                    u32::try_from(ranks).unwrap_or(u32::MAX),
+                );
+                let group = host.cgroup;
+                eprintln!(
+                    "engine-cuda: the host kv tier is {} MiB, derived from what the host can \
+                     give: MemAvailable {} MiB, cgroup max / current / reclaimable {} MiB, \
+                     {} MiB free past the floor, {} MiB held back for other loads, a device \
+                     pool {} MiB, its seats {} MiB",
+                    kv.budget >> 20,
+                    host.available >> 20,
+                    group.map_or_else(
+                        || "none".to_string(),
+                        |g| format!("{} / {} / {}", g.max >> 20, g.current >> 20, g.reclaimable >> 20)
+                    ),
+                    kv.free >> 20,
+                    kv.held_back >> 20,
+                    whole >> 20,
+                    seated >> 20,
+                );
+                kv.budget
+            }
         };
         // Both from the one budget, pinned as they are first touched: the
         // shelf a load does not move through costs nothing.

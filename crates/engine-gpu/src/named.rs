@@ -63,6 +63,7 @@ pub struct Facts {
     outside: u64,
     table_align: u64,
     tier: kernels_slang::Tier,
+    shares_host: bool,
     books: Arc<Books>,
 }
 
@@ -78,6 +79,7 @@ impl Facts {
             outside: device.outside().saturating_add(device.books().device()),
             table_align: B::table_align(device),
             tier: B::tier(device),
+            shares_host: device.shares_host_memory(),
             books: Arc::new(Books::apart()),
         }
     }
@@ -106,6 +108,10 @@ impl<B: Serve> Context<Named<B>> for Facts {
 
     fn outside(&self) -> u64 {
         self.outside
+    }
+
+    fn shares_host_memory(&self) -> bool {
+        self.shares_host
     }
 
     fn books(&self) -> &Books {

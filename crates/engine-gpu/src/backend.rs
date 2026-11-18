@@ -125,6 +125,11 @@ pub trait Context<B: Backend> {
         None
     }
 
+    /// Whether the device's memory is the host's (an integrated, a CPU or
+    /// any Android device): a host kv tier would only move kv within the
+    /// same RAM, so such a load seats none unless one is stated.
+    fn shares_host_memory(&self) -> bool;
+
     /// The bytes of the capacity neither a reservation nor the driver holds.
     fn left(&self) -> u64 {
         self.capacity()
