@@ -444,10 +444,24 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
+/// Whether this target has a native wgpu backend: Apple has none, as wgpu's
+/// Metal backend hangs in the attention kernels.
+fn native() -> Result<()> {
+    if cfg!(target_vendor = "apple") {
+        return Err(Fault::NoDevice {
+            detail: "engine type wgpu has no backend on macOS yet (wgpu's Metal \
+                     backend hangs in the attention kernels): use type = \"metal\""
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl Context {
     /// The device `boot` names, of which a load takes what it states it
     /// has, or `allowance.budget` where stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
+        native()?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)

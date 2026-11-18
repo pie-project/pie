@@ -22,8 +22,6 @@ pub enum Source {
     VulkanHeap(usize),
     /// `IDXGIAdapter3::QueryVideoMemoryInfo`'s local segment `Budget`.
     DxgiLocal,
-    /// `MTLDevice.recommendedMaxWorkingSetSize`.
-    MetalWorkingSet,
 }
 
 impl fmt::Display for Source {
@@ -33,7 +31,6 @@ impl fmt::Display for Source {
             Source::VulkanBudget(heap) => write!(f, "VK_EXT_memory_budget heap {heap}"),
             Source::VulkanHeap(heap) => write!(f, "Vulkan heap {heap} size"),
             Source::DxgiLocal => write!(f, "DXGI QueryVideoMemoryInfo local"),
-            Source::MetalWorkingSet => write!(f, "MTLDevice recommendedMaxWorkingSetSize"),
         }
     }
 }
@@ -101,8 +98,6 @@ fn read(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
         wgpu::Backend::Vulkan => vulkan(adapter),
         #[cfg(windows)]
         wgpu::Backend::Dx12 => dx12(adapter),
-        #[cfg(target_vendor = "apple")]
-        wgpu::Backend::Metal => metal(adapter),
         other => Err(format!(
             "the {} backend reports no memory size",
             other.to_str()
@@ -164,19 +159,6 @@ fn dx12(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
     })
 }
 
-#[cfg(target_vendor = "apple")]
-fn metal(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
-    use objc2_metal::MTLDevice as _;
-    // SAFETY: the native adapter is only read, and the guard is dropped
-    // before `adapter` is.
-    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Metal>() }
-        .ok_or("the Metal adapter has no native handle")?;
-    Ok(Reading {
-        bytes: hal.raw_device().recommendedMaxWorkingSetSize(),
-        source: Source::MetalWorkingSet,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,10 +209,6 @@ mod tests {
         assert_eq!(
             line(Source::DxgiLocal),
             "device memory: 16.0 GiB from DXGI QueryVideoMemoryInfo local"
-        );
-        assert_eq!(
-            line(Source::MetalWorkingSet),
-            "device memory: 16.0 GiB from MTLDevice recommendedMaxWorkingSetSize"
         );
     }
 
