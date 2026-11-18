@@ -143,7 +143,7 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
             b.laid(&ctx, |ctx| {
                 moe::select_mxfp4_w4a8(ctx, x, mx, sc, r, &mut y, gran, RES)
             })
-            .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
+            .map(took)
         }
         (K::Mx, _) => b.laid(&ctx, |ctx| {
             moe::matmul_select_quant(ctx, x, mx, sc, None, r, &mut y, SEAT, RES)
@@ -304,7 +304,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
         // Hopper's wide slice (128 routes, two warpgroups) on gpt-oss's K.
         (K::MxBias, mma, [8, 400, 4, 192, 2880], t, alpha, 8),
-        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
+        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere no arm):
         // by route over a partial 256-row tile, its GLU under scales past
         // f16's range, V4-Flash's leg, a few routes under a live window.
         (K::Mx, w4a8, [8, 400, 4, 320, 1024], f, None, 0),
@@ -363,7 +363,9 @@ fn the_routed_selects_answer_the_routed_dot() {
                 (kind, d, [8, 70, 3, 256, 512], f, None, 0), (kind, d, [8, 5, 3, 256, 512], f, None, 1)]);
         }
     }
-    // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
+    // The tcgen05 arms are Blackwell's and W4A8's block-scaled mma.sync
+    // sm_120a's; elsewhere their cases have no arm.
+    cases.retain(|case| w4a8_here() || case.1.mxfp4_w4a8_from == 0);
     cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
     // Each tcgen05 case again with a swapped launch's units dealt evenly.
     let even = cases
