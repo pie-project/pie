@@ -2024,17 +2024,24 @@ impl Shell {
             )
         };
         // The walk's lanes name slot refs, as the runtime's do: each shape's
-        // first slot past the null chunk, inside the pool whatever the seat
-        // count (seat 0's own runs, laid shape by shape for every seat, can
-        // lie past the pool's last chunk). No kernel reads them.
+        // first slot past the engine's tables run (the null chunk and the
+        // tables, chunks 0..1+tables, are no slot's), inside the pool
+        // whatever the seat count (seat 0's own runs, laid shape by shape
+        // for every seat, can lie past the pool's last chunk). No kernel
+        // reads them.
         let layout = *self.pools.layout();
-        let first = |shape: Option<crate::store::layout::Slots>| shape.map_or(0, |s| s.per_chunk);
+        let past_tables = 1 + layout.tables;
+        let first = |shape: Option<crate::store::layout::Slots>| {
+            shape.map_or(0, |s| s.per_chunk * past_tables)
+        };
         let page_size = self.paging().page_size.max(1);
         let kv_pages = vec![first(layout.list); context.div_ceil(page_size) as usize];
         let record = vec![first(layout.fixed); layout.pieces as usize];
         let windows: Vec<Vec<u32>> = layout
             .window_lists()
-            .map(|window| vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize])
+            .map(|window| {
+                vec![window.slots.per_chunk * past_tables; context.div_ceil(window.tokens.max(1)) as usize]
+            })
             .collect();
         let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
             let per = layout.rs_tokens.max(1);

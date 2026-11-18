@@ -689,8 +689,10 @@ impl Pools {
         chunks: u32,
         segment: u32,
         list_bytes: u64,
+        tables: u32,
     ) -> Result<Pools> {
-        let layout = Layout::new(chunk_bytes, chunks, segment, 16, [list_bytes, 0], 1, 0, 0)?;
+        let mut layout = Layout::new(chunk_bytes, chunks, segment, 16, [list_bytes, 0], 1, 0, 0)?;
+        layout.tables = tables;
         let rows = Rows {
             rows: Vec::new(),
             chunk_bytes,
@@ -1121,6 +1123,17 @@ impl Pools {
             });
         }
         let physical = self.pool.physical(chunk)?;
+        // Chunks 1..1+tables are the engine's own (`Reserved::Tables`): a
+        // kv page, a copy's end or a held table that named one would land
+        // on the delta table, the state maps or the bank tables.
+        let tables = 1..1 + self.layout.tables;
+        if tables.contains(&chunk) || tables.contains(&physical) {
+            return Err(Fault::Residency(format!(
+                "slot ref {slot} of shape {} lies in chunk {chunk} (physical {physical}), \
+                 inside the engine's tables run (chunks {}..{}), which no slot names",
+                shape.id, tables.start, tables.end
+            )));
+        }
         self.pool.clear_of_carve(chunk, physical)?;
         Ok((physical, index))
     }
@@ -2516,7 +2529,7 @@ mod delta_table_tests {
     fn the_delta_table_lies_outside_the_pool_and_survives_any_write_into_it() {
         let device = Context::bind().expect("a Metal 4 device");
         super::super::pool::cap_parts(CHUNK);
-        let pools = Pools::listed_over(&device, CHUNK, 4, 1, CHUNK / 4);
+        let pools = Pools::listed_over(&device, CHUNK, 4, 1, CHUNK / 4, 0);
         super::super::pool::cap_parts(0);
         let mut pools = pools.expect("a pool");
         assert_eq!(pools.parts(), 4, "a buffer a chunk");
@@ -2551,5 +2564,32 @@ mod delta_table_tests {
             pools.pool.write(chunk * CHUNK, &rows).expect("a chunk overwritten");
         }
         assert_eq!(held(&pools), want, "no write into the pool moves a page");
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tables_run_tests {
+    use super::Pools;
+    use crate::device::Context;
+    use crate::error::Fault;
+
+    const CHUNK: u64 = 16 << 20;
+
+    /// Chunks 1..1+tables are the engine's: a kv page, a copy's end or a
+    /// held table naming one is refused where its slot is placed, by name,
+    /// and the first slot past the run is placed as any other.
+    #[test]
+    fn a_slot_in_the_tables_run_is_refused_where_it_is_placed() {
+        let device = Context::bind().expect("a Metal 4 device");
+        let pools = Pools::listed_over(&device, CHUNK, 8, 8, CHUNK, 2).expect("a pool");
+        for chunk in 1..3u32 {
+            let refused = pools.kv_pages(&[chunk], None).err();
+            assert!(
+                matches!(&refused, Some(Fault::Residency(why)) if why.contains("tables run")),
+                "chunk {chunk}: {refused:?}"
+            );
+        }
+        let past = pools.kv_pages(&[3], None).expect("the first slot past the tables run");
+        assert_eq!(past.len(), 1);
     }
 }
