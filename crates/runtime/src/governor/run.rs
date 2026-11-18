@@ -156,6 +156,9 @@ pub struct Steer {
     ceiling: Option<u64>,
     /// The regime and segment count the log last named.
     noted: Option<(Regime, u64)>,
+    /// Whether the pool held its hard limit at the last turn that moved it,
+    /// so reaching it and leaving it are each named once.
+    at_limit: Option<bool>,
 }
 
 /// Where the host's room leaves a pool: what the log names at info when it
@@ -217,6 +220,7 @@ impl Steer {
             room: None,
             ceiling: None,
             noted: None,
+            at_limit: None,
         }
     }
 
@@ -318,6 +322,37 @@ impl Steer {
         }
     }
 
+    /// Names, at info, the pool reaching its hard limit and leaving it: an
+    /// edge each, never a tick. A pool that starts under it names nothing
+    /// until it reaches it; one that starts at it says so once.
+    fn note_limit(&mut self, held: u64, limits: &Limits) {
+        let full = held >= limits.hard_limit;
+        if self.at_limit == Some(full) || (self.at_limit.is_none() && !full) {
+            self.at_limit = Some(full);
+            return;
+        }
+        self.at_limit = Some(full);
+        if full {
+            tracing::info!(
+                held_mib = held >> 20,
+                hard_limit_mib = limits.hard_limit >> 20,
+                "the pool holds its hard limit"
+            );
+        } else {
+            tracing::info!(
+                held_mib = held >> 20,
+                hard_limit_mib = limits.hard_limit >> 20,
+                "the pool is under its hard limit again"
+            );
+        }
+    }
+
+    /// Whether the pool held its hard limit at its last turn.
+    #[must_use]
+    pub const fn at_limit(&self) -> Option<bool> {
+        self.at_limit
+    }
+
     /// The regime the log last named.
     #[must_use]
     pub fn regime(&self) -> Option<Regime> {
@@ -387,9 +422,11 @@ impl Steer {
                 }
             }
         }
+        let held = pool.held();
         if let Some(room) = &self.room {
-            room.settle(pool.held());
+            room.settle(held);
         }
+        self.note_limit(held, &limits);
         if read.is_some() {
             pool.ticked();
         }
@@ -640,6 +677,27 @@ mod tests {
             .with_room(&big, Some(PoolRoom::alone(roomy.reader())));
         tick(&mut held, &mut big);
         assert_eq!(held.regime(), Some(Regime::AtLimit));
+    }
+
+    #[test]
+    fn the_pool_reaching_and_leaving_its_hard_limit_is_an_edge_each() {
+        let host = Host::new(2000);
+        let mut pool = Pool::on(&host, 300, ELASTIC);
+        let mut steer = Steer::new(&pool, BALANCED, 512 * MIB)
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.at_limit(), Some(false));
+        // Its demand grows it to the limit within a few ticks.
+        for _ in 0..4 {
+            tick(&mut steer, &mut pool);
+        }
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.at_limit(), Some(true));
+        // Another app takes most of the host: the pool gives some back.
+        host.others.store(1500, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert!(pool.segments() < 1000);
+        assert_eq!(steer.at_limit(), Some(false));
     }
 
     #[test]
