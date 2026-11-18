@@ -472,9 +472,6 @@ struct WorkItemCompletionState {
     resolution: AtomicU32,
     cancel_requested: AtomicBool,
     native_retired: AtomicBool,
-    /// An engine took the fire ([`WorkItemCompletion::commit_target_epoch`])
-    /// and has not retired it yet.
-    in_engine: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
     /// Run once the completion resolves (or, never resolved, as the last
@@ -553,7 +550,6 @@ impl WorkItemCompletionState {
             cancel_requested: AtomicBool::new(false),
 
             native_retired: AtomicBool::new(false),
-            in_engine: AtomicBool::new(false),
             message: Mutex::new(None),
             guard,
             on_settled: Mutex::new(Vec::new()),
@@ -576,7 +572,6 @@ impl WorkItemCompletionState {
     fn commit_target_epoch(&self, target_epoch: u64) {
         assert!(target_epoch >= FIRST_COMPLETION_EPOCH);
         self.native_retired.store(false, Ordering::Release);
-        self.in_engine.store(true, Ordering::Release);
         let previous = self.target_epoch.swap(target_epoch, Ordering::AcqRel);
         assert!(
             previous == 0 || target_epoch > previous,
@@ -612,7 +607,6 @@ impl WorkItemCompletionState {
 
     fn mark_native_retired(&self) {
         self.native_retired.store(true, Ordering::Release);
-        self.in_engine.store(false, Ordering::Release);
     }
 
     fn result(&self) -> Option<Result<()>> {
@@ -672,24 +666,15 @@ impl Drop for WorkItemCompletionState {
         if self.native_retired.load(Ordering::Acquire) {
             self.terminal.mark_recyclable();
         }
+        // No one holds the work item any more: nothing runs it now. A fire
+        // an engine took is held by its lane's landing book
+        // ([`FrameSettlements`]) until its step lands, so its last handle
+        // goes only once it has landed (its hooks ran then), or once its
+        // lane, and the engine with it, is gone. Its hooks (its epoch, its
+        // leases, its in-flight count) are never kept past that: kept,
+        // they held what they name off the pool and the planner's count of
+        // the process's fires for good.
         let hooks = std::mem::take(self.on_settled.get_mut().unwrap());
-        let unresolved =
-            self.resolution.load(Ordering::Acquire) == WORK_ITEM_RESOLUTION_PENDING;
-        if unresolved && self.in_engine.load(Ordering::Acquire) {
-            // An engine still runs the fire: its hooks (its epoch, its
-            // leases) must not go before it lands, and dropping them would
-            // run their guards. Kept for good: what they hold is never
-            // handed out again, where running them now could hand it out
-            // under the fire.
-            tracing::error!(
-                hooks = hooks.len(),
-                "a fire's last handle went while its engine still ran it; \
-                 keeping what it holds"
-            );
-            std::mem::forget(hooks);
-            return;
-        }
-        // No one holds the work item any more: nothing runs it now.
         run_settled(hooks);
     }
 }
@@ -1196,13 +1181,31 @@ mod tests {
         assert!(matches!(frame.check(), Some(Err(_))));
     }
 
-    /// The last handle on a fire the engine still runs going does not run
-    /// its hooks: they hold what the fire names.
+    /// A fire the engine took keeps its hooks (its epoch, its leases, its
+    /// in-flight count) until its step lands, every other handle on it gone
+    /// meanwhile: the landing book holds it. Then they run; they are never
+    /// kept past the landing.
     #[test]
-    fn a_dropped_completion_the_engine_still_runs_keeps_its_hooks() {
+    fn a_fire_whose_other_handles_went_keeps_its_hooks_until_it_lands() {
+        let broker = CompletionBroker::new();
+        let settlements = FrameSettlements::new();
         let (fire, ran) = submitted_fire();
+        let frame = broker.submission_completion(FIRST_COMPLETION_EPOCH);
+        settlements.expect(
+            engine::FrameId(1),
+            vec![LandingStep {
+                cells: vec![fire.terminal_cell_ptr()],
+                completions: vec![fire.clone()],
+                member_lanes: vec![0, 1],
+                wakes: Vec::new(),
+            }],
+            &frame,
+            &broker,
+        );
         drop(fire);
-        assert!(!ran.load(Ordering::Acquire));
+        assert!(!ran.load(Ordering::Acquire), "a hook ran under the frame");
+        settlements.settled(engine::FrameId(1), 0, &engine::StepOutcome::default(), &broker);
+        assert!(ran.load(Ordering::Acquire), "its hooks run once it lands");
     }
 
     /// One never submitted runs them as it goes: nothing reads what it
