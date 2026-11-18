@@ -334,13 +334,20 @@ async fn acquire_grant<C: FireContext>(
     demand: crate::planner::Demand,
     windowed: bool,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
-    if demand.is_zero() {
-        return Ok(Some(crate::planner::AllocationGrant::empty()));
-    }
     let pid = ctx.process_id();
     let Some(planner) = crate::planner::planner_of(pid) else {
+        if demand.is_zero() {
+            return Ok(Some(crate::planner::AllocationGrant::empty()));
+        }
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
+    // Even an empty grant is the planner's: a process that is not resident
+    // gets none, and its fire waits for its restore.
+    if demand.is_zero()
+        && let Some(grant) = planner.grant_now(pid, demand)
+    {
+        return Ok(Some(grant));
+    }
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
             planner.note_peak(pid, demand);
