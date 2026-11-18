@@ -2427,6 +2427,9 @@ impl PoolPort for BindRoomPool {
     fn reclaimable_idle(&self) -> u32 {
         self.cache.lock().len() as u32
     }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
     fn suspend_capable(&self) -> bool {
         self.host > 0
     }
