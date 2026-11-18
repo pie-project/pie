@@ -6,6 +6,7 @@ assumes = { coopmat = true }
 
 [provenance]
 measured = ["kernel.gemm.path"]
+rates = "pie tune vulkan --rates on 2026-11-18 (pie 0.6.0, commits 271067756 and 2a33bd37a, identical on Vulkan), NVIDIA RTX PRO 4500 Blackwell, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, the host's clock around each frame, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there (the plain tiled kernel below 96 rows, the cooperative-matrix tile from 96, as gemm.path states), the median rate past its weight reads; the tiled attention by keys; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over 82 cores; operands: engine::rates' pattern. Spread over the five runs: matmul points at most 4.9% (4096 at 362 rows), attention 1.1%, launch 0.3%, copy 3.6%, per-row ops 2.9%, scan 10.8% (one run 151.8 G/s, four 137.0-137.6), few-row 0.5%, workgroups a core 0.7%"
 
 [kernel]
 # `pie tune --quick` over Qwen3-0.6B's and Qwen3-8B's bf16 projections: below
@@ -13,3 +14,17 @@ measured = ["kernel.gemm.path"]
 # and runs 1.2-1.8x the 32x32 tiled kernel's time; from 96 it runs 0.5-0.95x.
 # The fitted path runs at 1.011x the per-point best, coopmat everywhere 1.164x.
 gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]
+
+[rates]
+launch_ns = 2188
+gemm_tflops_by_rows = [
+  [1024, [[256, 7.1], [362, 10.1], [512, 14.2], [724, 16.4], [1024, 18.4], [1448, 15.3], [2048, 18.4], [2896, 19.1], [4096, 20.7], [5793, 22.6], [8192, 23.6]]],
+  [2048, [[256, 12.6], [362, 17.2], [512, 18.5], [724, 14.4], [1024, 18.3], [1448, 20.0], [2048, 21.1], [2896, 23.2], [4096, 24.1], [5793, 24.8], [8192, 24.8]]],
+  [4096, [[256, 18.6], [362, 16.3], [512, 18.0], [724, 20.0], [1024, 21.1], [1448, 23.3], [2048, 24.1], [2896, 24.6], [4096, 25.0], [5793, 25.2], [8192, 25.4]]],
+]
+attn_tflops_by_keys = [[512, 4.65], [1024, 5.88], [2048, 6.47], [4096, 6.76], [8192, 6.91]]
+hbm_gbps = 789.9
+elementwise_gbps = 826.1
+scan_gelems = 137.3
+few_row_tflops = 4.52
+workgroups_per_core = 4.03

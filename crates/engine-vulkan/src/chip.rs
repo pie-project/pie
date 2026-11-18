@@ -316,6 +316,18 @@ mod tests {
         assert!(!without.gemm_coopmat(2048));
     }
 
+    /// The RTX PRO 4500's file states every rate a load weighs, so it
+    /// measures none at load.
+    #[test]
+    fn the_rtx_pro_4500_states_every_rate() {
+        let pro = Device {
+            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
+            ..device("nvidia", 32, Some(82), true)
+        };
+        let (profile, _) = resolve(&pro, None);
+        assert!(profile.rates().complete(&engine_gpu::rates::KEYS));
+    }
+
     /// An NVIDIA GPU no file measured runs the vendor file's path and its
     /// load says so, by name, with the command that measures it; the RTX PRO
     /// 4500, whose crossover was measured, says nothing.
