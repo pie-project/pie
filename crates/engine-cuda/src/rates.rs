@@ -57,7 +57,7 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
 use profile::fire::Rates;
 
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
@@ -301,51 +301,34 @@ mod on_device {
         /// the measurement (one counter across every burst of it,
         /// `engine::rates::Rotation`, so a burst reads the next operand
         /// sets, never the first again): a burst of `k` launches, `k`
-        /// doubled until a launch's time settles
-        /// (`engine::rates::timed_frames`; CUDA states no bound on one
-        /// submission), the median of `rounds` after a warm burst, over its
-        /// launches.
+        /// doubled until a launch's time settles, then such bursts until
+        /// their rate stops moving (`engine::rates::warmed_frames`; CUDA
+        /// states no bound on one submission), the median of `rounds` after
+        /// a warm burst, over its launches.
         fn burst(
             &self,
             rounds: usize,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
-            self.burst_of(rounds, false, once)
-        }
-
-        /// [`Clock::burst`] for a memory-bound op: before it is timed, its
-        /// own bursts warm the device until their rate stops moving
-        /// (`engine::rates::warm_up`'s rule): the DVFS level sustained
-        /// serving sees, not the one an idle device starts at.
-        fn burst_warmed(
-            &self,
-            rounds: usize,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
-            self.burst_of(rounds, true, once)
-        }
-
-        fn burst_of(
-            &self,
-            rounds: usize,
-            warm: bool,
+            touched: &Touched,
+            sets: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
             let turn = engine::rates::Rotation::default();
             let mut fire = |k: usize| (0..k).try_for_each(|_| once(turn.next(usize::MAX)));
+            // Its sets touched once, by the first burst over them.
+            engine::rates::touch_once(
+                touched,
+                None,
+                u32::try_from(sets).unwrap_or(u32::MAX),
+                &mut |k| self.time(&mut || fire(k as usize)),
+            )?;
             self.time(&mut || fire(1))?;
-            let k = engine::rates::timed_frames(
+            let k = engine::rates::warmed_frames(
                 None,
                 None,
                 |k| self.time(&mut || fire(k as usize)),
                 |why| why,
             )?
             .fires as usize;
-            if warm {
-                engine::rates::warm_up(|| {
-                    self.time(&mut || fire(k)).map(|ns| k as f64 / ns.max(1.0))
-                })?;
-            }
             self.time(&mut || fire(k))?;
             let mut times = (0..rounds)
                 .map(|_| self.time(&mut || fire(k)))
@@ -562,7 +545,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the per-row ops"))
+        })?;
         engine::rates::rate_from(
             "per-row ops",
             ns,
@@ -610,6 +595,8 @@ mod on_device {
         n: u32,
         k: u32,
         weights: Vec<Buffer>,
+        /// The planes touched once, by the first matmul over them.
+        touched: Touched,
         act: Option<Buffer>,
         y: Option<Buffer>,
         rows: u32,
@@ -624,6 +611,7 @@ mod on_device {
                 n,
                 k,
                 weights,
+                touched: Touched::default(),
                 act: None,
                 y: None,
                 rows: 0,
@@ -664,7 +652,9 @@ mod on_device {
                 )
             };
             lay(held, || fire(0))?;
-            let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
+            let ns = clock.burst(ROUNDS, &self.touched, planes, &mut |i| {
+                fire(i).map_err(say("the matmul"))
+            })?;
             engine::rates::rate_from(
                 &format!("matmul {m}x{n}x{k}"),
                 ns,
@@ -817,7 +807,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the attention"))
+        })?;
         engine::rates::rate_from(
             &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
             ns,
@@ -911,7 +903,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the scan"))
+        })?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,
@@ -946,7 +940,10 @@ mod on_device {
             )
         };
         lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the few-rows matmul")))?;
+        // Its one plane is its own set, touched by its first burst.
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
+            fire().map_err(say("the few-rows matmul"))
+        })?;
         let rate = engine::rates::rate_from(
             &format!("few-rows matmul {m}x{w}x{w}"),
             ns,
@@ -962,7 +959,7 @@ mod on_device {
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |_| {
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
             crate::device::copy_d2d(stream, into.ptr(), from.ptr(), COPY_BYTES)
                 .map_err(say("the copy"))
         })?;
@@ -1003,7 +1000,7 @@ mod on_device {
             let exec = graph
                 .instantiate(stream)
                 .map_err(say("the launch's graph"))?;
-            clock.burst(LAUNCH_ROUNDS, &mut |_| {
+            clock.burst(LAUNCH_ROUNDS, &Touched::default(), 1, &mut |_| {
                 exec.launch(stream).map_err(say("the launch's graph"))
             })
         };

@@ -336,6 +336,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         },
         &registered,
     );
@@ -456,6 +458,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
             adapter: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         })
         .expect("the slots rebind");
     // The stale pass kept its ids where the cell no longer is: `seen` reads
@@ -540,6 +544,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 })
                 .collect(),
             adapter: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         })
         .expect("the unparked slots rebind");
     last = before;

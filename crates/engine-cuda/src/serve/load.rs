@@ -161,6 +161,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget.max_tokens =
             crate::api::on_lattice(&engine, lattice_top, boot.budget.max_tokens);
     }
+    // A fire carries a row a lane at least: lanes past its rows are fired as
+    // waves of as many as it has rows for.
+    boot.budget.max_lanes = boot.budget.max_lanes.min(boot.budget.max_tokens);
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
         boot.budget.max_tokens,
@@ -303,8 +306,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         patches: boot.patches.clone(),
         voxels: voxels.clone(),
     };
+    // A rung's fire carries a row a lane at least: its lanes are the asked
+    // lanes it has rows for, as the refit's rungs are.
     let budget_at = |tokens: u32| {
         let mut budget = boot.budget.clone();
+        budget.max_lanes = budget.max_lanes.min(tokens);
         budget.max_tokens = tokens;
         let mut buckets: Vec<u32> = stated_buckets
             .iter()

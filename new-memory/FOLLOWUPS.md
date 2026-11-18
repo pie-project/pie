@@ -90,3 +90,10 @@ on the pool kind (`None` on a shared pool), and handle/snapshot stage by that sp
 shared pool's tier slots (sc/plex11-offload-staging). Once Cerebras states a single-shape shared pool, `with_pages`,
 `with_pool`'s pinned use, `host_pool`, `alloc_host_slots` and the split in handle/snapshot all delete, and every engine
 takes `shared_stores`.
+
+## F14. Guest state leaves `Engine::fire_facts`' guest term
+
+The guest-state line (0da550eb6) states guest scratch as Instance-slot state
+through `Engine::guest_state`, but keeps `Engine::fire_facts` and the fire's
+guest term as they were: each engine moves its scratch from the term into
+`guest_state` when its half ports. The term goes once no engine states it.

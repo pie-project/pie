@@ -482,6 +482,54 @@ fn assemble(
     )
 }
 
+/// `pie tune metal --rates`: this device's `[rates]` measured through
+/// Metal's own kernels ([`crate::rates::measure`]) at the shapes every
+/// backend times, laid over the profile a load on it runs and written whole,
+/// with the `[provenance]` entry naming how.
+pub fn rates(
+    profiles: Option<&Path>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let began = Instant::now();
+    let device = Context::bind().map_err(|e| e.to_string())?;
+    let name = device.name().to_string();
+    let facts = crate::chip::measured(&device, crate::chip::perf_cores());
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!(
+        "{name}: measuring the rates, starting from {}",
+        report.used
+    ));
+    let rates = crate::rates::measure(&device, base.clone(), say)?;
+    let tuned = engine::rates::tuned(&rates);
+    let seconds = began.elapsed().as_secs_f64();
+    let provenance = [
+        (
+            "source",
+            "\"pie tune metal --rates on this machine\"".to_string(),
+        ),
+        crate::rates::provenance(&name),
+        ("from", format!("\"{}\"", report.used)),
+        ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
+        ("seconds", format!("{seconds:.0}")),
+    ];
+    let file = assemble(&base, &name, &facts, &tuned, &provenance)?;
+    let block = format!(
+        "{}\n[provenance]\n{}\n",
+        tuned.trim_end(),
+        provenance
+            .iter()
+            .map(|(key, value)| format!("rates.{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(engine::rates::Rated {
+        device: name,
+        file,
+        block,
+        seconds,
+    })
+}
+
 pub struct Outcome {
     pub device: String,
     pub file: String,
@@ -526,6 +574,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         runahead: engine::runahead::Runahead::F1,
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),
+        top: crate::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
     // No runtime raises the rung here: the widest carve is backed.
@@ -921,8 +970,12 @@ pub fn run(
         lines.extend(searched);
     }
     let tuned = search::render_overrides(&chosen);
+    // Only what the run measured (`search::Line::measured`): a decision no
+    // check model reads, or one whose bar the noise pushed past the
+    // agreement tolerance, keeps its line in the report but is not called
+    // measured.
     let mut tuned_ids: Vec<String> = Vec::new();
-    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+    for l in lines.iter().filter(|l| l.measured) {
         let id = format!("\"{}\"", l.id);
         if !tuned_ids.contains(&id) {
             tuned_ids.push(id);
@@ -1263,6 +1316,219 @@ fn time(
             s[s.len() / 2]
         })
         .collect())
+}
+
+/// Metal's loads of one model for the check of the estimate
+/// (`engine::load::check`): `pie tune metal --check-estimate`.
+pub struct CheckBench<'a> {
+    artifact: &'a Path,
+    profiles: Option<&'a Path>,
+    trace: poem::Trace,
+    contract: checkpoint::contract::ModelContract,
+    model: String,
+    /// The served load's pool layout, once the check weighed it: what a
+    /// shell's seats take is laid out as that pool lays it.
+    layout: Option<crate::store::layout::Layout>,
+}
+
+/// The check bench of the model `deployment` names, its weights in
+/// `artifact`, under the user's profiles in `profiles`.
+///
+/// # Errors
+///
+/// No catalog row of that name, or an artifact that does not read.
+pub fn check_bench<'a>(
+    profiles: Option<&'a Path>,
+    artifact: &'a Path,
+    deployment: &str,
+) -> Result<CheckBench<'a>, String> {
+    use poem::Platform;
+    let row = poem_compiler::catalog::deployment(deployment)
+        .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
+    let trace = row.trace(Platform::Metal);
+    let model = engine::load::model_class(&trace).to_owned();
+    let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .map_err(|e| e.to_string())?;
+    Ok(CheckBench {
+        artifact,
+        profiles,
+        trace,
+        contract,
+        model,
+        layout: None,
+    })
+}
+
+impl engine::load::check::Bench for CheckBench<'_> {
+    /// `None`: the shape a served load is asked (the fire size `FIRE`, the
+    /// pool its capacity), whose weighing alone gives the rungs, the
+    /// estimate, the live range and the fire top; it fires nothing.
+    /// `Some(shell)`: `slots` seats of `context` each, every rung to `rows`
+    /// laid (`Top::EveryRung`), the pool holding those seats' runs and the
+    /// widest fire's rows, raised to the widest rung for the check's fires.
+    fn load(
+        &mut self,
+        run: engine::load::check::Run,
+        shell: Option<engine::load::check::Shell>,
+    ) -> Result<Box<dyn engine::load::check::Loaded + '_>, String> {
+        let page = 16u32;
+        let (lanes, tokens) = crate::FIRE;
+        // A served shape takes the fire size's lanes and the room the device
+        // leaves. A shell the check fires takes its own slots, the most lanes
+        // one of its fires has, and a pool of what its seats hold: each
+        // seat's run of its context's pages and its record's pieces, and the
+        // widest fire's rows landing past them, laid out as the served
+        // load's pool lays them (`Layout::shell_room`, the layout learned
+        // from the weighing load, which the check takes first).
+        let (slots, context, rows, kv_budget) = match shell {
+            None => (lanes, tokens, tokens, None),
+            Some(shell) => {
+                let layout = self.layout.ok_or_else(|| {
+                    "the check fired a shell before it weighed the served load".to_string()
+                })?;
+                let room = layout.shell_room(
+                    shell.slots,
+                    u64::from(shell.context.div_ceil(page)),
+                    u64::from(shell.rows.div_ceil(page)),
+                );
+                (shell.slots, shell.context, shell.rows, Some(room))
+            }
+        };
+        let mut loaded = crate::Shell::load(crate::Boot {
+            voxels: None,
+            trace: self.trace.clone(),
+            contract: &self.contract,
+            checkpoint: self.artifact,
+            budget: poem_compiler::Budget::new(slots, rows),
+            patches: patch_ladder(&self.trace),
+            profile: None,
+            page_size: page,
+            context,
+            slots,
+            kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: engine::runahead::Runahead::F1,
+            profiles: self.profiles.map(Path::to_path_buf),
+            residency: crate::ResidencyPlan::default(),
+            top: crate::Top::EveryRung,
+        })
+        .map_err(|e| e.to_string())?;
+        if shell.is_some() {
+            // No runtime raises the rung here: the check fires the shell
+            // itself, at its widest.
+            loaded.raise_whole().map_err(|e| e.to_string())?;
+            loaded.back_seats().map_err(|e| e.to_string())?;
+        } else {
+            self.layout = Some(loaded.pool_layout());
+        }
+        Ok(Box::new(CheckLoad {
+            shell: loaded,
+            trace: &self.trace,
+            model: &self.model,
+            run,
+        }))
+    }
+}
+
+/// One load of a [`CheckBench`].
+struct CheckLoad<'a> {
+    shell: crate::Shell,
+    trace: &'a poem::Trace,
+    model: &'a str,
+    run: engine::load::check::Run,
+}
+
+impl CheckLoad<'_> {
+    /// `fire`'s lanes, each on a fresh slot, and the fire timed to its
+    /// landing (ns).
+    fn fire_once(&mut self, fire: engine::load::rung::CheckFire) -> Result<f64, String> {
+        use poem::Request;
+        let tokens: Vec<Vec<u32>> = (0..fire.lanes)
+            .map(|lane| {
+                (0..fire.tokens_per_lane)
+                    .map(|i| 100 + (lane * 131 + i) * 7919 % 5000)
+                    .collect()
+            })
+            .collect();
+        for slot in 0..fire.lanes {
+            self.shell.open(slot).map_err(|e| e.to_string())?;
+        }
+        let word = self
+            .trace
+            .facts
+            .word(&Request::new(fire.tokens_per_lane, false));
+        let held = fire.keys_per_lane.saturating_sub(fire.tokens_per_lane);
+        let lanes: Vec<crate::Seated<'_>> = (0..fire.lanes)
+            .map(|slot| crate::Seated {
+                held: Some(held),
+                ..crate::Seated::of(crate::Lane {
+                    slot,
+                    word,
+                    tokens: &tokens[slot as usize],
+                })
+            })
+            .collect();
+        let began = Instant::now();
+        self.shell.fire_seated(&lanes).map_err(|e| e.to_string())?;
+        Ok(began.elapsed().as_nanos() as f64)
+    }
+}
+
+impl engine::load::check::Loaded for CheckLoad<'_> {
+    fn weighed(&self) -> Result<engine::load::check::Weighed, String> {
+        let weighed = self.shell.weighed().ok_or_else(|| {
+            format!(
+                "{} has no [rates] in its profile to estimate by: run `pie tune --rates`",
+                self.model
+            )
+        })?;
+        Ok(engine::load::check::Weighed {
+            model: self.model.to_owned(),
+            rungs: weighed.rungs.clone(),
+            estimate: weighed.estimate.clone(),
+            live: weighed.live,
+            fire_top: weighed.fire_top,
+            laid: weighed.rungs.iter().map(|r| r.tokens).max().unwrap_or(0),
+        })
+    }
+
+    /// Metal records no body: every serving fire encodes its own dispatch,
+    /// so a fire of a load run as serving runs it is what serving runs.
+    fn fire(
+        &mut self,
+        fire: engine::load::rung::CheckFire,
+    ) -> Result<engine::load::check::Fired, String> {
+        let ns = self.fire_once(fire)?;
+        Ok(engine::load::check::Fired {
+            ns,
+            replayed: self.run == engine::load::check::Run::Replayed,
+        })
+    }
+
+    /// Each dispatch committed and timed alone by the GPU's own clock
+    /// (`crate::encode::profile_kernels`), told by its kernel: a dispatch's
+    /// time holds no drain, so none is taken off.
+    fn dissect(
+        &mut self,
+        fire: engine::load::rung::CheckFire,
+    ) -> Result<engine::load::check::Dissection, String> {
+        crate::encode::reset_kernel_profile();
+        crate::encode::profile_kernels(true);
+        let fired = self.fire_once(fire);
+        crate::encode::profile_kernels(false);
+        let wall_ns = fired?;
+        let ops = crate::encode::kernel_profile()
+            .into_iter()
+            .map(|(name, ns, n)| (name, ns as f64, u32::try_from(n).unwrap_or(u32::MAX)))
+            .collect();
+        crate::encode::reset_kernel_profile();
+        Ok(engine::load::check::Dissection {
+            wall_ns,
+            ops,
+            drain_ns: 0.0,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 #![cfg(feature = "device")]
-#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -193,6 +192,10 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            // The fire this proves is one of the ceiling's rows: the load
+            // lays its rungs to them, not to the top the estimate would
+            // choose for serving (which chunks a prompt below it).
+            every_rung: Some(engine_cuda::EveryRung::To(fixture.text.ceiling)),
             pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
@@ -354,19 +357,17 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     }
 }
 
-/// Whether the device has tcgen05 (sm_100 and up).
+/// Whether the device has tcgen05, as the routed select asks it: the
+/// datacenter Blackwells and Thor. A compute capability of 10 and up is not
+/// it: the consumer Blackwells (12.x, the RTX Spark's sm_121) have no TMEM.
+#[cfg(not(feature = "rocm"))]
 fn tcgen05() -> bool {
-    use engine_cuda::device::rt;
-    let mut major = 0;
-    // SAFETY: an attribute query of device 0 into a local.
-    unsafe {
-        rt::cudaDeviceGetAttribute(
-            &mut major,
-            rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMajor,
-            0,
-        );
-    }
-    major >= 10
+    kernels_cuda::linear::gemm_sm100::supported()
+}
+
+#[cfg(feature = "rocm")]
+fn tcgen05() -> bool {
+    false
 }
 
 /// A grouped leg reading the bank once a batch against the GEMV reading it
@@ -392,8 +393,9 @@ fn pays(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv
         mean <= 0.01 * spread,
         "the two legs answer differently in the MEAN: {mean} over a spread of {spread}"
     );
-    // Below tcgen05 the "GEMV" leg is the routed MMA select, which reads a
-    // bank once an expert too: there grouping need only keep pace.
+    // Below tcgen05 a fire this wide takes the tiled mma.sync select ahead
+    // of either leg (it reads a bank once a slice of an expert's routes), so
+    // the two legs time the same kernel: grouping need only keep pace.
     let bound = if tcgen05() { gemv_ms } else { gemv_ms * 1.1 };
     assert!(
         grouped_ms < bound,

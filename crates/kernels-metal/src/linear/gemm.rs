@@ -133,6 +133,22 @@ const MPP_NARROW_ROWS: u32 = 64;
 
 /// The tensor-op tile `rows` rows into `columns` columns over `contraction`
 /// take, where the GPU has tensor ops and the shape fits it.
+/// The rows a dense matmul of `rows` rows computes, by the tile `act_x_wt`
+/// takes at that shape: the vector forms each row as it is, a row tile
+/// pads `rows` to its height. What a load weighs a rung's matmul rows by.
+#[must_use]
+pub fn rows_computed(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> u32 {
+    if rows < VECTOR_MAX_ROWS {
+        rows
+    } else if let Some((bm, _)) = mpp_fit(tuning, rows, columns, contraction) {
+        rows.next_multiple_of(bm.max(1))
+    } else if rows < TILE_M {
+        rows.next_multiple_of(NARROW_M)
+    } else {
+        rows.next_multiple_of(TILE_M)
+    }
+}
+
 fn mpp_fit(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> Option<(u32, u32)> {
     let bn = if rows <= MPP_NARROW_ROWS || !columns.is_multiple_of(128) {
         64

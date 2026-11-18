@@ -3057,6 +3057,8 @@ mod tests {
                     instance: fresh_instance.clone(),
                     rings: fresh_rings.clone(),
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 },
             )
             .expect("the slots rebind");
@@ -3134,6 +3136,8 @@ mod tests {
                     instance,
                     rings,
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 },
             )
             .expect("the slots rebind");
