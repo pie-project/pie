@@ -159,6 +159,25 @@ layer loop measured 11-15 (one layer body under `stablehlo.while`, code
 slower at the time, bitwise only with template weights) is a further cut,
 held until (a) removes the per-layer kernel offsets that blocked it.
 
+The layer loop is part of (e), not an option after it, for two reasons
+measured since:
+
+- Startup. (d) builds the whole ladder at load, before ready, with no
+  `prewarm` switch (11-18 ruling). Today the 0.6B's 162-program ladder
+  compiles in 2056 s summed (9525195d6 census), StableHLO 1.52 GB. The
+  loop's 4-7x faster compiles and 7-13x smaller code are what keep the
+  always-built ladder's startup and host memory bounded: about 300-500 s
+  summed and 0.1-0.2 GB of text at today's program count, before (b) and
+  (e) cut the count.
+- Memory-space assignment. With the attention `case` gone (a1.2), XLA's
+  MSA keeps no VMEM region across the unrolled layers and re-fetches what
+  every layer's kernels read (the rope tables, then their positions), a
+  stall it cannot hide: +193 us a 0.6B prefill-2048 fire (11-18 profile,
+  no boolean MSA flag or barrier restored it). Under one loop those values
+  are loop-invariant, which MSA can pin across the body. The 0.6B prefill
+  2048 row stands at -2.3% wall against 05ae16a48 until then (named in the
+  a1 merge).
+
 ## 3. Order
 
 1. (a) the RPA-style kernel, gated bitwise (contract A: lanes and adapters
