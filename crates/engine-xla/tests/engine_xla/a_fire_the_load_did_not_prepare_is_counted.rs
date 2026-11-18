@@ -46,6 +46,16 @@ fn a_fire_the_load_did_not_prepare_is_counted() {
     masked(&mut model, &mut refs, 1);
     let first = live.tallied(Tally::Compiled);
     assert!(first > 0, "a masked prompt is off the ladder, and counted");
+    assert_eq!(
+        live.tallied(Tally::BuiltInFire),
+        first,
+        "each program built after ready on a fire's path is built in a fire"
+    );
+    assert_eq!(
+        live.tallied(Tally::BuiltAtRegister),
+        0,
+        "nothing registered"
+    );
     masked(&mut model, &mut refs, 2);
     assert_eq!(
         live.tallied(Tally::Compiled),

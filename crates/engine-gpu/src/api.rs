@@ -246,6 +246,9 @@ pub struct Gpu<B: Host> {
     /// The guest pipelines built after the load as of the last count
     /// (`Programs::built_serving`).
     guest_built: u64,
+    /// Whether a build on a serving fire's path was warned of: the first
+    /// is, at warn; the rest are counted, and named at debug.
+    warned_in_fire: bool,
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
@@ -268,14 +271,18 @@ impl<B: Host> Gpu<B> {
             handed: None,
             live: engine::live::Live::armed(),
             guest_built: 0,
+            warned_in_fire: false,
             vocab: None,
         }
     }
 
-    /// Counts the pipelines built after ready, by a frame's fires or a bind:
-    /// the load built every kernel pipeline its walks named and every guest
-    /// step's, so each one built since is one it did not prepare
-    /// ([`engine::live::Tally::BuiltAfterReady`]).
+    /// Counts the pipelines built on a serving fire's path since the last
+    /// count, by its prepare, enqueue or settle: the load built every kernel
+    /// pipeline its walks named and every guest step's, so each one built
+    /// since is one a fire waited on ([`engine::live::Tally::BuiltInFire`]),
+    /// the first warned of. A guest pipeline built at a registration or a
+    /// bind, before any fire of it, is counted there instead
+    /// ([`Self::count_registered`]).
     /// And the steps a backend that keeps recordings walked to keep: a shape
     /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
     /// And the steps walked and kept by no recording: each ran eagerly. On a
@@ -290,26 +297,19 @@ impl<B: Host> Gpu<B> {
             .map_or_else(Vec::new, Shell::built_serving);
         // A kernel is built once, so each is named once.
         for kernel in built {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, 1);
-            tracing::error!(
-                engine = B::KIND,
-                kernel,
-                "a serving fire asked for a pipeline no walk of the load named, and built it"
-            );
+            self.live.tally(engine::live::Tally::BuiltInFire, 1);
+            self.warn_in_fire(kernel);
         }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
             self.live.tally(engine::live::Tally::Compiled, recorded);
         }
-        // A guest pipeline a bind built after the load, which built every
-        // one a stage can dispatch.
-        let guest = self.programs.built_serving();
-        if guest > self.guest_built {
-            self.live.tally(
-                engine::live::Tally::BuiltAfterReady,
-                guest - self.guest_built,
-            );
-            self.guest_built = guest;
+        // A guest pipeline built on the fire's own path: a registration or
+        // a bind took its own builds' count where it landed.
+        let guest = self.guest_built_since();
+        if guest > 0 {
+            self.live.tally(engine::live::Tally::BuiltInFire, guest);
+            self.warn_in_fire("a guest step's pipeline");
         }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
@@ -319,6 +319,45 @@ impl<B: Host> Gpu<B> {
                 engine::live::Tally::Eager
             };
             self.live.tally(tally, unkept);
+        }
+    }
+
+    /// The guest pipelines built since the last count, which this one takes.
+    fn guest_built_since(&mut self) -> u64 {
+        let guest = self.programs.built_serving();
+        let since = guest.saturating_sub(self.guest_built);
+        self.guest_built = guest;
+        since
+    }
+
+    /// Counts the guest pipelines a registration or a bind built after the
+    /// load: a program's code built at its own registration, before its
+    /// first fire, which no fire waits on
+    /// ([`engine::live::Tally::BuiltAtRegister`]).
+    fn count_registered(&mut self) {
+        let guest = self.guest_built_since();
+        if guest > 0 {
+            self.live.tally(engine::live::Tally::BuiltAtRegister, guest);
+            tracing::debug!(
+                engine = B::KIND,
+                guest,
+                "a registration built guest pipelines the load did not"
+            );
+        }
+    }
+
+    /// Warns once of a build on a serving fire's path, the graph-capture
+    /// rule's violation; later ones are named at debug, and all counted.
+    fn warn_in_fire(&mut self, what: &str) {
+        if std::mem::replace(&mut self.warned_in_fire, true) {
+            tracing::debug!(engine = B::KIND, what, "a serving fire built a pipeline");
+        } else {
+            tracing::warn!(
+                engine = B::KIND,
+                what,
+                "a serving fire built a pipeline the load did not (counted built_in_fire; \
+                 later ones are counted, named at debug)"
+            );
         }
     }
 
@@ -1002,7 +1041,9 @@ where
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+        let registered = self.programs.register(registration).map_err(refusal);
+        self.count_registered();
+        registered
     }
 
     /// The program adopted and its stages lowered in the returned compile,
@@ -1027,7 +1068,9 @@ where
                 B::KIND
             )));
         };
-        self.programs.finish(*prepared).map_err(refusal)
+        let finished = self.programs.finish(*prepared).map_err(refusal);
+        self.count_registered();
+        finished
     }
 
     fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
@@ -1064,8 +1107,9 @@ where
             .programs
             .bind(binding, place.as_ref(), &layout)
             .map_err(refusal);
-        // What the bind built, counted where it lands, before its first fire.
-        self.count_built();
+        // What the bind built, counted where it lands, before its first
+        // fire: the program's own registration's builds.
+        self.count_registered();
         let bound = bound?;
 
         // A lane that only classes the kernels refuse serve is refused
@@ -1200,6 +1244,8 @@ where
         }
 
         self.pending = Some((ticket.id, pending));
+        // What the settle built, on the fire's path.
+        self.count_built();
         if let Some(error) = refused {
             return Err(error);
         }

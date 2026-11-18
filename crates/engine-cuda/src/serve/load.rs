@@ -1893,6 +1893,7 @@ impl Shell {
         // The kernels a guest's wave fires are the engine's, not the
         // program's: loaded here, before ready, so no first fire builds them.
         kernels_cuda::runtime::channel::load_wave_kernels()?;
+        kernels_cuda::runtime::channel::load_gather_kernels()?;
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",

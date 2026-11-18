@@ -21,6 +21,7 @@ mod a_mask_reads_from_the_committed_boundary;
 mod a_pool_view_reads_the_packed_rows_order;
 mod a_readout_lands_in_one_plane_shape;
 mod a_registered_channel_carries_one_cell_across_its_instances;
+mod a_registration_build_is_counted_and_cached;
 mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_adapter_lies_in_its_slots;

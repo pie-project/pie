@@ -808,7 +808,7 @@ impl Shell {
         let registered = self.programs.register(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         registered
     }
@@ -834,7 +834,7 @@ impl Shell {
         let prepared = self.programs.prepare(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         prepared
     }

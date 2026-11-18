@@ -43,7 +43,9 @@ impl FrameShell for Shell {
         // A step refused here fires nothing: what its lanes' device-counted
         // folds left ahead goes back to where the step found it.
         let ahead = self.rs_ahead.clone();
+        let built = kernels_cuda::tally::counts().built;
         let prepared = self.prepare_step(step);
+        self.count_built_in_fire(built);
         if prepared.is_err() {
             self.rs_ahead = ahead;
         }
@@ -59,7 +61,10 @@ impl FrameShell for Shell {
             .slot
             .take()
             .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
-        match self.enqueue_on(&mut p, &slot) {
+        let built = kernels_cuda::tally::counts().built;
+        let enqueued = self.enqueue_on(&mut p, &slot);
+        self.count_built_in_fire(built);
+        match enqueued {
             Ok((launches, readback)) => {
                 p.slot = Some(slot);
                 Ok(Enqueued {
@@ -81,6 +86,31 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         self.settle_step(enqueued, None)
+    }
+}
+
+impl Shell {
+    /// Counts what this thread built since `before` (the kernels' tally) as
+    /// built on a serving fire's path: an instantiation no walk of the load
+    /// resolved (`engine::live::Tally::BuiltInFire`). An arming fire, and
+    /// any before the load sealed its bodies, builds as the load does.
+    pub(super) fn count_built_in_fire(&mut self, before: u64) {
+        if self.arming || !self.cache.bodies_sealed() {
+            return;
+        }
+        let built = kernels_cuda::tally::counts().built - before;
+        if built == 0 {
+            return;
+        }
+        self.live.tally(engine::live::Tally::BuiltInFire, built);
+        let total = self.live.tallied(engine::live::Tally::BuiltInFire);
+        if total.is_power_of_two() || built >= total {
+            eprintln!(
+                "engine-cuda: WARNING: a serving fire built {built} kernel instantiation(s) no \
+                 walk of the load resolved; {total} so far (Tally::BuiltInFire). Every one a \
+                 fire can reach is built before ready"
+            );
+        }
     }
 }
 
