@@ -27,7 +27,7 @@
 //! after the last (the output norm and projection) are stages of their own ([`Stage`]), with
 //! sides as a layer's.
 
-use poem_ir::{Attn, Def, Dim, Gather, Linear, Operands, Operation, Trace, Ty};
+use poem_ir::{Attn, Conv, Def, Dim, Gather, Linear, Operands, Operation, Trace, Ty};
 use serde::Serialize;
 
 use super::{At, Axis, Body, LayerBody, Mixer, Op, Phase, R, Reader};
@@ -133,15 +133,19 @@ impl StreamProgram {
     }
 }
 
-/// The ops that only reorder a step's rows: on the host, the order rows enter and leave a unit.
-const PERMUTES: &[&str] = &[
-    "conv.patchify",
-    "conv.unpatchify",
-    "conv.pixel_shuffle",
-    "conv.pixel_unshuffle",
-    "gather.pack_rows",
-    "gather.unpack_rows",
-];
+/// Whether `op` only reorders a step's rows (patches to and from images, pixels to and from
+/// channels, rows packed and unpacked): on the host, the order rows enter and leave a unit.
+fn permutes(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Conv(
+            Conv::Patchify { .. }
+                | Conv::Unpatchify { .. }
+                | Conv::PixelShuffle { .. }
+                | Conv::PixelUnshuffle { .. }
+        ) | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
+    )
+}
 
 /// Whether `op` selects the rows a reading reads out (`gather.rows` by the readout rows).
 fn readout(trace: &Trace, op: &Operation) -> bool {
@@ -404,8 +408,7 @@ pub fn lower(
             continue;
         }
         let node = &trace.nodes[at];
-        let op = node.op.name();
-        let permutes = PERMUTES.contains(&op);
+        let permutes = permutes(&node.op);
         ins.clear();
         node.op.inputs(&mut ins);
         let own = |v: &poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
