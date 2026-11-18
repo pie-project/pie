@@ -462,10 +462,15 @@ fn stream(args: &[String]) -> Result<(), String> {
                 for (w, cy) in by_what {
                     println!("  {w}: {:.2}M", cy / 1e6);
                 }
+                // (each op's words of the weight stream: where its records sit on the tape)
                 for o in &c.ops {
                     println!(
-                        "  op {} {} {:?}: {:.0} cycles",
-                        o.op, o.what, o.at, o.cycles
+                        "  op {} {} {:?}: {:.0} cycles, {} stream words",
+                        o.op,
+                        o.what,
+                        o.at,
+                        o.cycles,
+                        kernels_cerebras::stream::host::span_words(&p.records(o.op))
                     );
                 }
                 let (at, live) = p.peak();

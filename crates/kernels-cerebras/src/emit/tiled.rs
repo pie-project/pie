@@ -4,7 +4,9 @@
 //! - **The image PEs** (`tpe.csl`, one file; a PE's colours its parities', its place two config
 //!   words) run the program's ops in order, an interpreter over a table of 16-bit words: each op
 //!   its code, its length, its slots and sizes, the layouts of what it reads and makes.
-//! - **The tape** (`ttape.csl`): each PE sends its words, then forwards those of the PEs past it.
+//! - **The tape** (`ttape.csl`): each PE sends its words, then forwards those of the PEs past it
+//!   (its stamps: the start, its own words gone (the array has read the stream to its end, a
+//!   profile of the launch by the stream's ops), the end).
 //! - **The hub** (`thub.csl`, east of the array's last row): the all-reduces' sums and the
 //!   attention's keys up the last column, back out along the broadcast tree.
 //! - The spine and the rest: routes only (`filler.csl`).
@@ -471,7 +473,7 @@ fn tape_file(tw: u32) -> String {
         "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {tw};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
     t.push_str(
-        "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  stamp(2);\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
     );
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(tape_p, \"tape\");\n  @initialize_queue(q_i, .{ .color = @get_color(C_I) });\n  @initialize_queue(q_o, .{ .color = @get_color(C_O) });\n}\n");
     t
