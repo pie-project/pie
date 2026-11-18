@@ -26,6 +26,9 @@ pub(crate) trait Room: Send + Sync {
     /// Whether `pid`'s working set fits beside those of the processes
     /// holding the gate's permits (`holders`).
     fn fits(&self, pid: ProcessId, holders: &[ProcessId]) -> bool;
+    /// Whether no next process fits beside `holders` anywhere: their
+    /// working sets fill every device.
+    fn full(&self, holders: &[ProcessId]) -> bool;
 }
 
 pub(crate) struct OrderedSemaphore {
@@ -217,6 +220,20 @@ impl OrderedSemaphore {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("state lock poisoned")
+    }
+
+    /// A process asking now would wait: every seat is taken, a waiter
+    /// not held below the floor already waits (for room, or behind a
+    /// higher key), or the holders' working sets fill the room.
+    pub(crate) fn saturated(&self) -> bool {
+        let state = self.lock();
+        let schedule = schedule::current();
+        state.permits == 0
+            || state
+                .waiters
+                .iter()
+                .any(|w| !state.holds || !schedule.as_ref().is_some_and(|s| s.held(w.pid)))
+            || self.room.as_ref().is_some_and(|room| room.full(&state.holders))
     }
 
     pub(crate) fn available_permits(&self) -> usize {

@@ -159,7 +159,8 @@ impl Cluster {
     pub fn report(&mut self, id: WorkerId, status: WorkerStatus, now: Instant) -> Option<bool> {
         let w = self.workers.get_mut(&id)?;
         let bucket_crossed = w.load.kv_pressure_bucket != status.kv_pressure_bucket
-            || w.load.inflight != status.inflight;
+            || w.load.inflight != status.inflight
+            || w.load.saturated != status.saturated;
         let drain_changed = w.load.draining != status.draining;
         w.load = status;
         w.last_hb = now;

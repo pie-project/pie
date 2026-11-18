@@ -1182,6 +1182,25 @@ impl ResidencyPlanner {
     /// client, or a handle's stand-in, asks for no room until it runs
     /// again. With none running, it is admitted: one runs, whatever it
     /// asks (a set that can never fit is refused by name where it asks).
+    /// Whether the running among `admitted` fill the device room: no next
+    /// process fits beside them, its first step a page at the least.
+    pub fn full(&self, admitted: &[ProcessId]) -> bool {
+        let running: Vec<ProcessId> = self.with_counts(|inner| {
+            admitted
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    inner
+                        .procs
+                        .get(pid)
+                        .is_some_and(|proc| !proc.holder && !proc.idle)
+                })
+                .collect()
+        });
+        !running.is_empty()
+            && self.port.working_set_pages(&running) >= u64::from(self.port.device_stats().1)
+    }
+
     pub fn admits(&self, pid: ProcessId, admitted: &[ProcessId]) -> bool {
         let (mut running, next_step) = self.with_counts(|inner| {
             let running: Vec<ProcessId> = admitted

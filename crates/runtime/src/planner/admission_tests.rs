@@ -90,6 +90,9 @@ impl Room for On {
     fn fits(&self, pid: ProcessId, holders: &[ProcessId]) -> bool {
         self.0.admits(pid, holders)
     }
+    fn full(&self, holders: &[ProcessId]) -> bool {
+        self.0.full(holders)
+    }
 }
 
 /// A planner over a device of `total` pages, each of `sized` registered
@@ -318,4 +321,32 @@ async fn at_four_seats_all_six_lower_finish_after_the_higher_one() {
     assert_eq!(order.len(), 7);
     assert_eq!(order[0], high, "all six lower finish after the higher one");
     schedule::install(None);
+}
+
+/// Saturated, what a worker reports and the gateway admits by, is this
+/// admission's own rule: a device whose admitted processes all wait on
+/// their clients (their sets idle cache, room to reclaim) is not; one whose
+/// running sets fill it is, until one of them leaves.
+#[tokio::test(flavor = "current_thread")]
+async fn saturated_is_the_admission_rule_idle_cache_is_room() {
+    let _schedule = schedule::TEST_LOCK.write().await;
+    schedule::install(None);
+    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let (planner, gate) = device(6, &[(a, 3), (b, 3)], 8);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    ask(&gate, &[a, b], &tx);
+    settle().await;
+    let mut running = drain(&mut rx);
+    assert_eq!(running.len(), 2);
+    assert!(gate.saturated(), "two running sets of 3 fill a device of 6");
+    for pid in [a, b] {
+        planner.set_idle(pid, true);
+    }
+    assert!(!gate.saturated(), "sets of processes waiting on clients are room");
+    planner.set_idle(a, false);
+    planner.set_idle(b, false);
+    assert!(gate.saturated());
+    running.pop();
+    settle().await;
+    assert!(!gate.saturated(), "one left: a next one fits");
 }

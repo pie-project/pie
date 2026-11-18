@@ -595,7 +595,7 @@ mod tests {
 
     use super::*;
 
-    fn table(kv: u8) -> RoutingTable {
+    fn table(saturated: bool) -> RoutingTable {
         RoutingTable {
             epoch: 1,
             scales: false,
@@ -608,13 +608,14 @@ mod tests {
                 engine: String::new(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
-                    kv_pressure_bucket: kv,
+                    kv_pressure_bucket: 0,
                     inflight: 0,
                     running: 2,
                     waiting: 5,
                     capacity_tokens: 1000,
                     used_tokens: 250,
                     draining: false,
+                    saturated,
                 },
             }],
         }
@@ -660,7 +661,7 @@ mod tests {
         }
 
         fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
-            watch::channel(table(0)).1
+            watch::channel(table(false)).1
         }
 
         fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
@@ -716,14 +717,14 @@ mod tests {
             .collect()
     }
 
-    async fn rig(kv: u8) -> Rig {
-        rig_of(kv, &["test-route"]).await
+    async fn rig(saturated: bool) -> Rig {
+        rig_of(saturated, &["test-route"]).await
     }
 
     /// A gateway, its policies `names` running in a controller beside it,
     /// once the gateway has heard they run.
-    async fn rig_of(kv: u8, names: &[&str]) -> Rig {
-        let (table, table_rx) = watch::channel(table(kv));
+    async fn rig_of(saturated: bool, names: &[&str]) -> Rig {
+        let (table, table_rx) = watch::channel(table(saturated));
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
         let host = Host::start(
@@ -761,7 +762,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reload_swaps_the_programs_and_withdraws_the_old_ones_tables() {
-        let rig = rig(0).await;
+        let rig = rig(false).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
@@ -787,7 +788,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reload_that_does_not_load_leaves_the_running_set() {
-        let rig = rig(0).await;
+        let rig = rig(false).await;
         let mut broken = programs(&["replicate"]);
         broken.push(("garbled".to_string(), vec![0, 1, 2, 3]));
         assert!(matches!(
@@ -810,7 +811,7 @@ mod tests {
     async fn a_reload_tells_the_new_programs_what_the_old_ones_withdrew() {
         // test-share publishes the placement test-route made; test-route
         // names it as the process's executors.
-        let rig = rig_of(0, &["test-share", "test-route"]).await;
+        let rig = rig_of(false, &["test-share", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         let until = |want: &[WorkerId]| {
@@ -840,7 +841,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_is_held_below_the_floor_and_placed_where_its_policy_says() {
-        let rig = rig(0).await;
+        let rig = rig(false).await;
         let held = launch(
             1,
             serde_json::json!({"key": 0, "worker": "1", "executors": "3,2"}),
@@ -873,7 +874,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_policy_beside_another_places_what_it_places() {
-        let rig = rig_of(0, &["replicate", "test-route"]).await;
+        let rig = rig_of(false, &["replicate", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
@@ -887,7 +888,7 @@ mod tests {
             "scale-engine": "cuda",
             "scale-model": "m",
         });
-        let granted = rig_of(0, &["scale-by-prop", "test-route"]).await;
+        let granted = rig_of(false, &["scale-by-prop", "test-route"]).await;
         let mut scale = granted.host.scale_watch();
         granted
             .router
@@ -910,7 +911,7 @@ mod tests {
         );
 
         // test-route installs one too, and holds no `scale` grant.
-        let ungranted = rig_of(0, &["test-route"]).await;
+        let ungranted = rig_of(false, &["test-route"]).await;
         let scale = ungranted.host.scale_watch();
         ungranted
             .router
@@ -926,7 +927,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_launches_leave_in_key_order_when_room_opens() {
-        let rig = rig(255).await;
+        let rig = rig(true).await;
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waits = Vec::new();
         for (req, key) in [(1, 1), (2, 5), (3, 3)] {
@@ -942,7 +943,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
         assert!(order.lock().unwrap().is_empty(), "the cluster is saturated");
-        rig.table.send_replace(table(0));
+        rig.table.send_replace(table(false));
         for wait in waits {
             wait.await.unwrap();
         }
@@ -951,7 +952,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_terminated_launch_is_refused_while_it_waits_and_cancelled_once_it_runs() {
-        let mut rig = rig(0).await;
+        let mut rig = rig(false).await;
         let refused = launch(1, serde_json::json!({"refuse": "not today"}));
         match rig.router.admit(&refused, &rig.routing).await {
             Err(AdmitReject::Refused(why)) => assert_eq!(why, "not today"),
@@ -972,7 +973,7 @@ mod tests {
         // test-route places the process on worker 1; test-share, told the
         // placement changed, publishes it; test-route, told of that, names
         // what it read as the process's executors.
-        let rig = rig_of(0, &["test-share", "test-route"]).await;
+        let rig = rig_of(false, &["test-share", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -992,7 +993,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_running_process_placed_elsewhere_moves_there_once() {
-        let mut rig = rig_of(0, &["relocate"]).await;
+        let mut rig = rig_of(false, &["relocate"]).await;
         let placed = launch(
             1,
             serde_json::json!({"worker": 1, "move-to": 2, "move-after-ms": 0}),
@@ -1029,7 +1030,7 @@ mod tests {
             Ok(Ack::Ok)
         }
         fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
-            watch::channel(table(0)).1
+            watch::channel(table(false)).1
         }
         fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
             watch::channel(DirectoryView::default()).1
@@ -1061,7 +1062,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_new_controller_hears_the_live_processes_and_sessions_first() {
         let recorder = Recorder::default();
-        let (_table, table_rx) = watch::channel(table(0));
+        let (_table, table_rx) = watch::channel(table(false));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx, connected_rx.clone());
         let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
@@ -1138,7 +1139,7 @@ mod tests {
             Ok(Ack::Ok)
         }
         fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
-            watch::channel(table(0)).1
+            watch::channel(table(false)).1
         }
         fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
             watch::channel(DirectoryView::default()).1
@@ -1188,7 +1189,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_controller_that_replaces_a_dead_one_takes_up_its_running_processes() {
-        let (_table, table_rx) = watch::channel(table(0));
+        let (_table, table_rx) = watch::channel(table(false));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
         let start = || {
@@ -1261,7 +1262,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn with_no_policy_running_the_gateway_goes_by_its_defaults() {
-        let (_table, table_rx) = watch::channel(table(0));
+        let (_table, table_rx) = watch::channel(table(false));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
         let controller = controller::embed(controller::Config::default());
         let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
@@ -1275,7 +1276,7 @@ mod tests {
                 Ok(Ack::Ok)
             }
             fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
-                watch::channel(table(0)).1
+                watch::channel(table(false)).1
             }
             fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
                 self.0.directory_watch()
