@@ -1809,7 +1809,6 @@ fn a_sampler_registers_on_a_served_model() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256u32);
-    set_knob("PREWARM", 1);
     set_knob("SLOTS", lanes);
     set_knob("LANES", lanes);
     set_knob("TOKENS", 2 * lanes);
