@@ -955,6 +955,7 @@ mod tests {
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
+            refused: None,
         };
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),

@@ -67,6 +67,9 @@ pub struct Diagnostic {
 pub struct Refusal {
     pub origin: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// The `[rates]` keys the file states that this pie does not read (a
+    /// schema the file outlived): a load refuses a checked-in file by them.
+    pub stale_rates: Vec<String>,
 }
 
 impl std::fmt::Display for Refusal {
@@ -330,16 +333,17 @@ impl Registry {
         let mut walk = Walk::new(self, text, strict);
         walk.under = under;
         walk.inherited = inherited;
-        let refuse = |diagnostics| Refusal {
+        let refuse = |walk: Walk<'_>| Refusal {
             origin: origin.to_string(),
-            diagnostics,
+            diagnostics: walk.diags,
+            stale_rates: walk.stale_rates,
         };
         let table = match DeTable::parse(text) {
             Ok(table) => table,
             Err(e) => {
                 let at = e.span().map_or(0, |s| s.start);
                 walk.err(at, e.message().trim().to_string());
-                return Err(refuse(walk.diags));
+                return Err(refuse(walk));
             }
         };
         let mut file = File {
@@ -385,7 +389,7 @@ impl Registry {
         if walk.diags.is_empty() {
             Ok(file)
         } else {
-            Err(refuse(walk.diags))
+            Err(refuse(walk))
         }
     }
 }
@@ -538,6 +542,8 @@ struct Walk<'a> {
     under: &'a BTreeMap<&'static str, Vec<Rung>>,
     /// Facts the layers below assume, which the file may rely on.
     inherited: &'a [(usize, i64)],
+    /// `[rates]` keys stated that no rate reads.
+    stale_rates: Vec<String>,
 }
 
 impl<'a> Walk<'a> {
@@ -551,6 +557,7 @@ impl<'a> Walk<'a> {
             spans: BTreeMap::new(),
             under: &NONE,
             inherited: &[],
+            stale_rates: Vec::new(),
         }
     }
 
@@ -1012,6 +1019,7 @@ impl<'a> Walk<'a> {
                     continue;
                 }
                 other => {
+                    self.stale_rates.push(other.to_string());
                     self.err(
                         k.span().start,
                         format!(
