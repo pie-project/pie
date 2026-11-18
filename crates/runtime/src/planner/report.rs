@@ -141,10 +141,6 @@ impl ResidencyPlanner {
 
     pub(super) fn report_restored(self: &Arc<Self>, pid: ProcessId) {
         self.clear_host_swap_blocks();
-        let (model, engine) = self.port.locus();
-        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine) {
-            handle.unfence();
-        }
         let signal = self.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
@@ -155,6 +151,14 @@ impl ResidencyPlanner {
             proc.bind_room = None;
             Some(proc.signal.clone())
         });
+        // Resident first, then every set it holds now unfenced: one
+        // registered while it was away was born fenced
+        // ([`Self::register_kv_working_set`]) and is read here, and one
+        // registered from now on is born unfenced.
+        let (model, engine) = self.port.locus();
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine) {
+            handle.unfence();
+        }
         crate::scheduler::worker::notify_process_resume(pid);
         crate::policy::report(crate::policy::Event::Resumed(pid));
         self.stats.restores.fetch_add(1, Ordering::Relaxed);

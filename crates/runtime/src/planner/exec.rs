@@ -229,16 +229,22 @@ pub(super) fn spawn_restore(
 
 struct FenceGuard {
     handles: Vec<KvSuspendHandle>,
+    /// Whose sets: an eviction rolled back unfences every set its process
+    /// holds then, one born fenced meanwhile included.
+    pid: ProcessId,
+    locus: (usize, usize),
     armed: bool,
 }
 
 impl FenceGuard {
-    fn raise(handles: Vec<KvSuspendHandle>) -> Self {
+    fn raise(handles: Vec<KvSuspendHandle>, pid: ProcessId, locus: (usize, usize)) -> Self {
         for handle in &handles {
             handle.fence();
         }
         Self {
             handles,
+            pid,
+            locus,
             armed: true,
         }
     }
@@ -253,7 +259,9 @@ impl Drop for FenceGuard {
         if !self.armed {
             return;
         }
-        for handle in &self.handles {
+        let (model, engine) = self.locus;
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(self.pid, model, engine)
+        {
             handle.unfence();
         }
     }
@@ -483,7 +491,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         return;
     }
     let began = Instant::now();
-    let mut fence = FenceGuard::raise(handles);
+    let mut fence = FenceGuard::raise(handles, pid, (model, engine));
     crate::scheduler::worker::notify_process_suspend(pid);
     drain_detachable(pid).await;
     let drained = began.elapsed();
