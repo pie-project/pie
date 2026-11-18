@@ -1430,7 +1430,13 @@ impl Roles {
     }
 
     /// The engine closed channel `id`: its ring goes back once no bound
-    /// instance holds it.
+    /// instance holds it. Until then the channel is the engine's still
+    /// (closing, `Engine::close_channel`): its ring parks and unparks with
+    /// its instances' holder and is rebound like an open channel's
+    /// ([`Roles::rebinds`]), and goes back only after the engine closed
+    /// the last instance on it ([`Roles::close_instance`], which the lane
+    /// runs once `Engine::close_instance` returned), so no slot the engine
+    /// may still address is handed elsewhere.
     pub fn close_channel(&mut self, id: ChannelId) {
         let owner = Owner::Channel(id);
         if let Some(item) = self.items.get_mut(&owner) {

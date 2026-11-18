@@ -100,6 +100,15 @@ impl Guest {
         Guest::of(facts, segments * facts.segment_chunks)
     }
 
+    /// Fresh `Channel` slots for a ring of `registration`, where the runtime
+    /// would copy it back to on a restore.
+    pub fn ring(&mut self, engine: &dyn Engine, registration: &ChannelRegistration) -> Vec<u32> {
+        engine
+            .ring_facts(registration)
+            .expect("the channel's ring facts")
+            .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint))
+    }
+
     /// Registers `registration` over the channel slots its ring facts state.
     pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
         let slots = engine
