@@ -2910,9 +2910,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       uint32_t num_iterations_mask;
       uint32_t num_iterations = 0;
 
+      // PIE: a request's custom-mask rows are causal unless they read both
+      // ways (its word's wide bit): their keys past the diagonal are never
+      // read, and its diagonal tiles mask as the causal arm's do.
+      bool causal_bound = MASK_MODE == MaskMode::kCausal;
+      if constexpr (MASK_MODE == MaskMode::kCustom) {
+        causal_bound = !variant.mask_wide;
+      }
       if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
         num_iterations = ceil_div(
-            (MASK_MODE == MaskMode::kCausal
+            (causal_bound
                  ? min(chunk_size,
                        sub_if_greater_or_zero(
                            kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
@@ -2952,7 +2959,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           CTA_TILE_KV);
 
       const uint32_t mask_iteration =
-          (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+          (causal_bound || MASK_MODE == MaskMode::kMultiItemScoring
                ? min(chunk_size,
                      sub_if_greater_or_zero(
                          kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,

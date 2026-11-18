@@ -35,6 +35,44 @@ using VariantCustom = ::pie::attn::fa2::DefaultAttention<true, true, false, fals
 
 using VariantCustomSoftcap = ::pie::attn::fa2::DefaultAttention<true, true, true, false>;
 
+// PIE: a decode variant reading each request's mask as data, over the plain
+// arm `Base` it would run unmasked: a request's word (`maybe_mask_origin`)
+// puts its boundary past every key where it states none, so it reads no bit
+// and loads no offset; past its boundary key j is read where bit
+// `j - origin` of its row is set (`variants.cuh`'s layout, one query row).
+template <class Base>
+struct MaskData : Base {
+    const std::uint8_t* masks = nullptr;
+    const std::int64_t* offset = nullptr;
+    std::uint32_t origin = 0x7fffffffu;
+
+    // The word's one load issues here and is first read at a key's mask,
+    // after the key tiles' loads; the offset is read only by a key past the
+    // boundary.
+    template <typename Params>
+    __device__ __host__ MaskData(const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : Base(params, batch_idx, smem_ptr) {
+        origin = params.maybe_mask_origin[batch_idx] & 0x7fffffffu;
+        masks = params.maybe_custom_mask;
+        offset = params.maybe_mask_indptr + batch_idx;
+    }
+
+    REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        bool keep =
+            Base::template LogitsMask<Params>(params, batch_idx, qo_idx, kv_idx, qo_head_idx,
+                                              kv_head_idx);
+        if (kv_idx >= origin) {
+            const std::uint32_t at = kv_idx - origin;
+            keep = keep && ((masks[*offset + (at >> 3)] >> (at & 7)) & 1) != 0;
+        }
+        return keep;
+    })
+};
+
+using MaskedFull = MaskData<VariantFull>;
+using MaskedWindow = MaskData<VariantWindow>;
+using MaskedWindowSoftcap = MaskData<VariantWindowSoftcap>;
+
 using DecodeParams = ::pie::attn::fa2::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 using PrefillParams = ::pie::attn::fa2::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 

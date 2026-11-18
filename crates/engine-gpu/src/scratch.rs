@@ -497,7 +497,7 @@ fn copy_ceiling(
         let Some(rows) = rows.map(|rows| rows.min(tokens)) else {
             continue;
         };
-        if !fallback::copyable_mask(trace, compiled, &region.mask) {
+        if !fallback::copyable_mask(trace, compiled, &region.mask, crate::window::CARRIES) {
             continue;
         }
         let Some((ins, outs)) = fallback::operands(&trace.nodes, region) else {

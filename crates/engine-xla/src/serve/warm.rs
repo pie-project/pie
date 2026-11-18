@@ -36,6 +36,9 @@ struct Want {
     /// The lane reads out every row (a drafting lane's window), not its
     /// last.
     all_rows: bool,
+    /// The lane states a mask (every key allowed): its fire stages the
+    /// load's mask plane, a program of its own.
+    masked: bool,
 }
 
 impl Shell {
@@ -47,8 +50,7 @@ impl Shell {
         let classes = &self.compiled.classes;
         let plain = |shell: &Shell, word: u64| {
             classes.class_of(word & classes.mask).is_some_and(|class| {
-                !shell.masked.contains(class)
-                    && !shell.wide.contains(class)
+                !shell.wide.contains(class)
                     && !shell.corrected.contains(class)
                     // a class reading a guest input fires only with its
                     // channel's cell, which a synthetic lane has none of
@@ -84,9 +86,12 @@ impl Shell {
             rows,
             held_pages: 0,
             all_rows: false,
+            masked: false,
         };
         let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
+        // A class reads a lane's mask (the mask fold: data, not a class).
+        let masks = !self.masked.is_empty();
         // Where each part of the ladder starts in `shapes`: the load line
         // states the programs each part adds.
         let mut parts: Vec<(&str, usize)> = vec![("decode", 0)];
@@ -108,8 +113,16 @@ impl Shell {
                     rows: 1,
                     held_pages: pages,
                     all_rows: false,
+                    masked: false,
                 };
                 shapes.push(vec![lane; n as usize]);
+                // the same decodes beside a lane stating a mask (a beam): the
+                // mask is data, its plane the load's shape
+                if masks {
+                    let mut lanes = vec![lane; n as usize];
+                    lanes[0].masked = true;
+                    shapes.push(lanes);
+                }
             }
             pages = pad.next(pages);
         }
@@ -323,6 +336,7 @@ impl Shell {
                                 rows: 1 + depth,
                                 held_pages: pages,
                                 all_rows: true,
+                                masked: false,
                             };
                             shapes.push(vec![lane; n as usize]);
                             pages = pad.next(pages);
@@ -634,16 +648,29 @@ impl Shell {
         let page_size = self.paging().page_size.max(1);
         // Every lane reads the same scratch slots: what warm fires write is
         // never read back, and the pool need not hold a page per lane.
-        let owned: Vec<(Vec<u32>, crate::store::Scratch, Vec<u32>)> = shape
+        type Owned = (
+            Vec<u32>,
+            crate::store::Scratch,
+            Vec<u32>,
+            Option<engine::fire::Masking>,
+        );
+        let owned: Vec<Owned> = shape
             .iter()
             .map(|want| {
-                let n = (held_of(want, page_size) + want.rows)
-                    .div_ceil(page_size)
-                    .max(1);
+                let keys = held_of(want, page_size) + want.rows;
+                let n = keys.div_ceil(page_size).max(1);
+                // every key allowed
+                let mask = want.masked.then(|| {
+                    engine::fire::Masking::Extent(engine::fire::Mask::new(
+                        vec![0, keys],
+                        u64::from(keys),
+                    ))
+                });
                 (
                     vec![0; want.rows as usize],
                     self.pools.scratch(0, n as usize),
                     (0..want.rows).collect(),
+                    mask,
                 )
             })
             .collect();
@@ -654,7 +681,7 @@ impl Shell {
             .iter()
             .zip(&owned)
             .enumerate()
-            .map(|(at, (want, (tokens, scratch, every)))| {
+            .map(|(at, (want, (tokens, scratch, every, mask)))| {
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word: want.word,
@@ -667,6 +694,7 @@ impl Shell {
                 if want.all_rows {
                     seated.readout = Some(every);
                 }
+                seated.mask = mask.as_ref();
                 seated
             })
             .collect();

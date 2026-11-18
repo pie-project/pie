@@ -47,6 +47,14 @@ pub struct Gathered {
 
     pub request_of_token: Tensor,
 
+    /// The window's rows' mask entries (two words a row, as the fire's),
+    /// relayed as its positions are: a mask is per-row data, and the plane
+    /// they point into stays where the fire staged it.
+    /// Bit for bit the u32 words, packed with the window's other ints.
+    pub mask_words_host: Vec<i32>,
+
+    pub mask_words: Tensor,
+
     pub page_tables: Vec<GatheredTable>,
 }
 
@@ -82,6 +90,11 @@ pub struct Copies<'a> {
     pub rotations: &'a [i32],
 
     pub request_of_token: &'a [i32],
+
+    /// The fire's mask entries, two words a row (`mask::Staged::words`);
+    /// empty where no lane states a mask, every row's entry then stating
+    /// none.
+    pub mask_words: &'a [u32],
 }
 
 impl Copies<'_> {
@@ -94,6 +107,7 @@ impl Copies<'_> {
             positions: &[],
             rotations: &[],
             request_of_token: &[],
+            mask_words: &[],
         }
     }
 }
@@ -115,6 +129,15 @@ impl Windows {
         self.windows.iter().any(|w| w.gathered.is_some())
     }
 }
+
+/// What a copied window carries beside its token rows: each row's mask
+/// entry ([`Gathered::mask_words`]), the plane it points into staying whole
+/// where the fire staged it. A mask is per-row data, so a mask-reading
+/// region copies as one that reads none.
+pub const CARRIES: fallback::Carries = fallback::Carries {
+    masks: true,
+    read_ints: false,
+};
 
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
@@ -162,6 +185,16 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
     let positions_host = relay(copies.positions);
     let rotations_host = relay(copies.rotations);
     let request_of_token_host = relay(copies.request_of_token);
+    let mask_words_host: Vec<i32> = rows_host
+        .iter()
+        .flat_map(|&row| {
+            let at = 2 * row as usize;
+            match copies.mask_words.get(at..at + 2) {
+                Some(entry) => [entry[0] as i32, entry[1] as i32],
+                None => [crate::mask::NONE as i32, 0],
+            }
+        })
+        .collect();
 
     let page_tables = copies
         .page_tables
@@ -212,6 +245,8 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             rotations_host,
             request_of_token: Tensor::new(NIL, 0, 1, Dtype::I32),
             request_of_token_host,
+            mask_words: Tensor::new(NIL, 0, 2, Dtype::U32),
+            mask_words_host,
             page_tables,
         }),
 
@@ -288,7 +323,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && fallback::copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask, CARRIES)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;
@@ -361,6 +396,7 @@ impl Windows {
             out.extend_from_slice(&gathered.positions_host);
             out.extend_from_slice(&gathered.rotations_host);
             out.extend_from_slice(&gathered.request_of_token_host);
+            out.extend_from_slice(&gathered.mask_words_host);
             for table in &gathered.page_tables {
                 out.extend_from_slice(&table.page_indptr_host);
                 out.extend_from_slice(&table.page_indices_host);
@@ -389,6 +425,8 @@ impl Windows {
             gathered.positions = take(&gathered.positions_host)?;
             gathered.rotations = take(&gathered.rotations_host)?;
             gathered.request_of_token = take(&gathered.request_of_token_host)?;
+            let words = take(&gathered.mask_words_host)?;
+            gathered.mask_words = Tensor::new(words.buf, words.rows / 2, 2, Dtype::U32);
             for table in &mut gathered.page_tables {
                 table.page_indptr = take(&table.page_indptr_host)?;
                 table.page_indices = take(&table.page_indices_host)?;

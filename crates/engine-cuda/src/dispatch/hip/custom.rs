@@ -535,7 +535,7 @@ impl Run<'_> {
                 | Attn::Prefill {
                     o,
                     lse: Some(lse),
-                    mask: None,
+                    mask: _,
                     selection: None,
                     bias: None,
                     ..

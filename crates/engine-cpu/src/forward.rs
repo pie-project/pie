@@ -565,10 +565,12 @@ impl Run<'_> {
                 }
                 Ok(())
             }
+            // A step's lane states no attention mask (`step` takes none): the
+            // fire's masks, where an arm reads them, are every lane's "none".
             Attn::Prefill {
                 q,
                 cache,
-                mask: None,
+                mask: _,
                 selection: None,
                 bias: None,
                 floor: None,
@@ -585,6 +587,7 @@ impl Run<'_> {
             | Attn::Decode {
                 q,
                 cache,
+                mask: _,
                 selection: None,
                 bias: None,
                 window: None,
@@ -608,9 +611,6 @@ impl Run<'_> {
                 ..
             } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, observe, into, scores),
             Attn::ScorePages { keys, pages } => self.score_pages(keys, pages),
-            Attn::Prefill { mask: Some(_), .. } => {
-                Err("a custom mask, which this forward does not read".into())
-            }
             _ => Err(format!("`{}` has no host forward", Operands::name(op))),
         }
     }
