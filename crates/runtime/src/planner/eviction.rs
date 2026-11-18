@@ -280,6 +280,11 @@ impl ResidencyPlanner {
         if self.commit_evictions(victims.head, picks, false) {
             // Moves on their way fund it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
+        } else {
+            // Every pick declined at its start: the head is short as with
+            // none, and says so, rather than waiting on moves never begun.
+            tracing::debug!(head = ?victims.head_pid, "planner: no pick could start its move");
+            self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
         }
     }
 
@@ -352,7 +357,10 @@ impl ResidencyPlanner {
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
                     rank: proc.rank(),
-                    e6_fresh: proc.progressed || proc.idle || proc.held,
+                    // A bind waiter makes no progress until room comes: it
+                    // counts as fresh, as an idle one does, or it is never
+                    // a pick and the bind waits on it for good.
+                    e6_fresh: proc.progressed || proc.idle || proc.held || proc.bind_waiting,
                 })
                 .collect();
             Some((
@@ -405,9 +413,14 @@ impl ResidencyPlanner {
                 let Some(proc) = inner.procs.get(&pid) else {
                     continue;
                 };
+                // Waiting at a bind for room it makes no progress: it
+                // yields as an idle one does, as the victim set chose it
+                // (dropped here, it was chosen again on every quote and
+                // nothing moved: AMD's wedge).
+                let yields = proc.idle || proc.held || proc.bind_waiting;
                 if proc.state != Residency::Resident
-                    || (proc.rank() <= head_rank && !proc.idle && !proc.held)
-                    || (!proc.progressed && !proc.idle && !proc.held && !e6_relaxed)
+                    || (proc.rank() <= head_rank && !yields)
+                    || (!proc.progressed && !yields && !e6_relaxed)
                 {
                     continue;
                 }

@@ -648,7 +648,7 @@ fn bind_as(
 }
 
 /// As [`bind_as`], for a bind whose refusal is final: its process gives
-/// up, so it leaves the queue of guest binds waiting for room.
+/// up, so its need is no longer counted.
 fn bind_or_leave(
     roles: &RolesHandle,
     engine: &mut GuestEngine,
@@ -656,7 +656,7 @@ fn bind_or_leave(
     by: u128,
 ) -> anyhow::Result<InstanceId> {
     bind_as(roles, engine, program, by)
-        .inspect_err(|_| roles.lock().unwrap().leave_guest_queue(holder(by)))
+        .inspect_err(|_| roles.lock().unwrap().leave_guest_wait(holder(by)))
 }
 
 /// Each piece of `place`: its chunks' physical ids, and the segment each
@@ -1243,22 +1243,15 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
                             }
                         }
                         Err(error) => {
-                            // Short of room, or behind an earlier bind short
-                            // of it: a wait either way.
+                            // Short of room: a wait.
                             assert!(
-                                matches!(
-                                    short_of_wait(&error),
-                                    Some(RolesError::BindShort(_) | RolesError::GuestQueued { .. })
-                                ) || matches!(
-                                    error.downcast_ref::<RolesError>(),
-                                    Some(RolesError::GuestQueued { .. })
-                                ),
+                                matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
                                 "process {p} refused: {error}"
                             );
                             if roles.lock().unwrap().holds_guest_state(holder(by)) {
                                 // Suspended for room: it waits for its
-                                // restore, not in the queue.
-                                roles.lock().unwrap().leave_guest_queue(holder(by));
+                                // restore, its need not counted.
+                                roles.lock().unwrap().leave_guest_wait(holder(by));
                                 let park = roles
                                     .lock()
                                     .unwrap()
@@ -1425,7 +1418,7 @@ fn a_restore_rebinds_an_instance_with_its_pair_s_place() {
 }
 
 /// Fills the committed room with single-chunk guest states for holders
-/// from 500; the bind refused for want of room leaves the queue it joined.
+/// from 500; the bind refused for want of room no longer counts its need.
 fn fill_with_singles(roles: &RolesHandle) -> Vec<InstanceId> {
     let (singles, mut single) = runs_of(9, 1, 1, 1000);
     let mut ids = Vec::new();
@@ -1433,7 +1426,7 @@ fn fill_with_singles(roles: &RolesHandle) -> Vec<InstanceId> {
         match bind_as(roles, &mut single, singles, 500 + by) {
             Ok(id) => ids.push(id),
             Err(_) => {
-                roles.lock().unwrap().leave_guest_queue(holder(500 + by));
+                roles.lock().unwrap().leave_guest_wait(holder(500 + by));
                 break;
             }
         }
@@ -1456,7 +1449,7 @@ fn free_and_live(device: &Shared) -> (u32, u64) {
 /// behind it taking nothing (the free count does not drift), it binds in
 /// the committed segment, and they follow in arrival order.
 #[tokio::test(flavor = "current_thread")]
-async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smaller_binds_wait() {
+async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_room_leave_it() {
     use crate::governor::PoolTarget;
     const ENGINE: usize = 62;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
@@ -1473,7 +1466,7 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         ),
         "waits on a commit: {error}"
     );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1)], "it heads the queue");
+    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need is counted");
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
     assert_eq!(
@@ -1482,41 +1475,36 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         "the walk commits for it"
     );
 
-    // Smaller guest binds arriving meanwhile wait behind it, taking nothing.
+    // Smaller guest binds short of room meanwhile wait on the commit too,
+    // taking nothing and leaving the long bind's need as it is.
     let (small, mut small_engine) = runs_of(10, 1, 1, 2000);
     for by in 0..5 {
-        let error = bind_as(&roles, &mut small_engine, small, 100 + by).expect_err("behind it");
+        let error = bind_as(&roles, &mut small_engine, small, 100 + by).expect_err("no room");
         assert!(
-            matches!(
-                error.downcast_ref::<RolesError>(),
-                Some(RolesError::GuestQueued { head }) if *head == holder(1)
-            ),
+            matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
             "{error}"
         );
     }
     assert!(small_engine.bindings.is_empty(), "the engine was not asked");
-    assert_eq!(free_and_live(&device), before, "the free count does not drift");
+    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need stands");
 
-    // The commit: the head binds in the fresh segment, two runs of four.
+    // The commit: the long bind binds in the fresh segment, two runs of
+    // four, and its need is no longer counted.
     device.lock().unwrap().committed(2);
-    bind_as(&roles, &mut long_engine, long, 1).expect("the head binds");
+    bind_as(&roles, &mut long_engine, long, 1).expect("it binds");
     let pieces = pieces_of(&device, &long_engine.bindings[0].scratch);
     assert_eq!(pieces.len(), 2);
     assert!(pieces.iter().all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1)));
-    assert_eq!(
-        roles.lock().unwrap().guest_queue(),
-        (0..5).map(|by| holder(100 + by)).collect::<Vec<_>>(),
-        "the binds behind it, in arrival order"
-    );
+    assert_eq!(device.lock().unwrap().guest_head(), None);
 
-    // The next segment: they bind, in order, and the queue empties.
+    // The next segment: the small binds bind.
     device.lock().unwrap().committed(3);
     for by in 0..5 {
-        bind_as(&roles, &mut small_engine, small, 100 + by).expect("in its turn");
+        bind_as(&roles, &mut small_engine, small, 100 + by).expect("room came");
     }
-    assert!(roles.lock().unwrap().guest_queue().is_empty());
     let demand = device.lock().unwrap().pool().demand();
     assert_eq!(demand.wanted, demand.live, "no need is counted short any more");
+    let _ = before;
 }
 
 /// Free chunks enough for the head's slots, but scattered by the binds
@@ -1555,22 +1543,21 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         Some(crate::store::shared::GrowStep::Commit { prefix: 5 }),
         "the walk commits for the head's runs"
     );
-    roles.lock().unwrap().leave_guest_queue(holder(1));
+    roles.lock().unwrap().leave_guest_wait(holder(1));
     assert_eq!(grow.live_step_for_test(), None, "with no head, nothing more");
 }
 
-/// The head's process ends while it waits: dropping its wait leaves the
-/// queue (one place, however the wait ends), the bind behind it is told,
-/// and binds in room that was free all along; a bind of the same process
-/// queued again would find no stale head.
+/// A long bind waits on a commit while one chunk stands free: a small
+/// bind takes it at once, waiting behind nothing (the queue that held it
+/// back is gone). The long bind's process then ends: dropping its wait
+/// counts its need no more (one place, however the wait ends).
 #[tokio::test(flavor = "current_thread")]
-async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
+async fn a_small_bind_takes_free_room_while_a_long_one_waits_and_a_dropped_wait_s_need_is_cleared() {
     const ENGINE: usize = 64;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
     let ids = fill_with_singles(&roles);
     // One single chunk free again: room for a small bind, not the long.
     roles.lock().unwrap().close_instance(ids[0]);
-    let before = free_and_live(&device);
 
     let waits = |by: u128, program: ProgramId, engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>| {
         let device = device.clone();
@@ -1597,14 +1584,7 @@ async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
             |_, _| std::future::pending::<Result<(), String>>(),
             {
                 let roles = roles.clone();
-                move || {
-                    let roles = roles.clone();
-                    async move { super::guest_turn(&roles, holder(by)).await }
-                }
-            },
-            {
-                let roles = roles.clone();
-                move || roles.lock().unwrap().leave_guest_queue(holder(by))
+                move || roles.lock().unwrap().leave_guest_wait(holder(by))
             },
             |_| {},
         )
@@ -1612,63 +1592,19 @@ async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
     let (long, long_engine) = runs_of(8, 4, 2, 0);
     let (small, small_engine) = runs_of(10, 1, 1, 2000);
     let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
-    let mut head = Box::pin(waits(1, long, std::rc::Rc::new(std::cell::RefCell::new(long_engine))));
-    let next = waits(2, small, small_engine.clone());
-    tokio::pin!(next);
-    assert!(futures::poll!(head.as_mut()).is_pending(), "the head waits on a commit");
-    assert!(futures::poll!(next.as_mut()).is_pending(), "the next waits behind it");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(2)]);
-    assert_eq!(free_and_live(&device), before, "nothing taken");
-
-    // The head's process ends: its wait is dropped.
-    drop(head);
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(2)], "it left, once");
-    next.await.expect("the next binds in the free chunk");
-    assert_eq!(small_engine.borrow().bindings.len(), 1);
-    assert!(roles.lock().unwrap().guest_queue().is_empty());
-    let demand = device.lock().unwrap().pool().demand();
-    assert_eq!(demand.wanted, demand.live, "the head's need is no longer counted");
-}
-
-/// While the head waits for runs of four, a bind taking whole runs at least
-/// as long breaks none of them into shorter ones: it passes the head,
-/// taking room where there is some, and where there is none it queues
-/// behind it without touching the head's need.
-#[test]
-fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
-    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
-    fill_with_singles(&roles);
-    let (long, mut long_engine) = runs_of(8, 4, 2, 0);
-    bind_as(&roles, &mut long_engine, long, 1).expect_err("the head waits");
+    let mut long_wait = Box::pin(waits(1, long, std::rc::Rc::new(std::cell::RefCell::new(long_engine))));
+    assert!(futures::poll!(long_wait.as_mut()).is_pending(), "the long bind waits on a commit");
     assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)));
+    waits(2, small, small_engine.clone())
+        .await
+        .expect("the small bind takes the free chunk at once");
+    assert_eq!(small_engine.borrow().bindings.len(), 1);
 
-    // As long, no room: it waits behind the head; the head's need stays.
-    let (four, mut four_engine) = runs_of(11, 4, 1, 3000);
-    let error = bind_as(&roles, &mut four_engine, four, 200).expect_err("no room");
-    assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
-        "it passed the head and found no room: {error}"
-    );
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "the head's need stands");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(200)]);
-
-    // Shorter pieces queue behind it, taking nothing.
-    let (two, mut two_engine) = runs_of(12, 2, 1, 4000);
-    let error = bind_as(&roles, &mut two_engine, two, 300).expect_err("behind the head");
-    assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestQueued { .. })),
-        "{error}"
-    );
-
-    // A commit: the head binds in it, and the queue moves on.
-    device.lock().unwrap().committed(2);
-    bind_as(&roles, &mut long_engine, long, 1).expect("the head binds");
-    assert_eq!(
-        device.lock().unwrap().guest_head(),
-        Some((4, 1)),
-        "the next head's need counts at once"
-    );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(200), holder(300)]);
+    // The long bind's process ends: its wait is dropped.
+    drop(long_wait);
+    assert_eq!(device.lock().unwrap().guest_head(), None, "its need is no longer counted");
+    let demand = device.lock().unwrap().pool().demand();
+    assert_eq!(demand.wanted, demand.live);
 }
 
 /// A guest bind's wait under `bind_when_resident` for `by`, binding
@@ -1698,8 +1634,7 @@ fn waiting_bind<'a>(
             serve();
             std::future::ready(Ok::<(), String>(()))
         },
-        move || super::guest_turn(roles, holder(by)),
-        move || roles.lock().unwrap().leave_guest_queue(holder(by)),
+        move || roles.lock().unwrap().leave_guest_wait(holder(by)),
         |_| {},
     )
 }
@@ -1722,7 +1657,7 @@ fn at_the_target_a_guest_bind_short_of_runs_goes_to_the_planner() {
         matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
         "at the target it is the planner's: {error}"
     );
-    roles.lock().unwrap().leave_guest_queue(holder(1));
+    roles.lock().unwrap().leave_guest_wait(holder(1));
     let _ = grow.retarget(u64::from(u32::MAX));
     let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room yet");
     assert!(
@@ -1737,7 +1672,7 @@ fn at_the_target_a_guest_bind_short_of_runs_goes_to_the_planner() {
 /// binds; the bind behind it follows. Before, the head waited on a commit
 /// that could not come and no one asked the planner.
 #[tokio::test(flavor = "current_thread")]
-async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_queue_drains() {
+async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_next_bind_follows() {
     const ENGINE: usize = 67;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
     let _grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
@@ -1770,7 +1705,6 @@ async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_queue_drain
     behind.await.expect("the bind behind it follows");
     assert_eq!(long_engine.borrow().bindings.len(), 1);
     assert_eq!(small_engine.borrow().bindings.len(), 1);
-    assert!(roles.lock().unwrap().guest_queue().is_empty(), "the queue drained");
 }
 
 /// The head waits on a commit the target said could come, and the walk

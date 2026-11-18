@@ -2202,7 +2202,6 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| false,
         |_, _| false,
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
-        || std::future::ready(()),
         || {},
         |_| {},
     );
@@ -2911,4 +2910,41 @@ async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
     }
     assert!(waited.is_finished(), "quoted again on the rung's move, and served");
     waited.await.expect("the wait ends").expect("served");
+}
+
+/// AMD's wedge on c75d39a0b: the chunk branch chose the same process on
+/// every quote, an older one waiting at a bind of its own, and nothing
+/// moved: the victim set took a bind waiter as a victim, but the start of
+/// the moves declined it (ranked ahead of the head, neither idle nor
+/// held). A bind waiter the victim set chose now starts its move.
+#[tokio::test(flavor = "current_thread")]
+async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (holder, binder, decoding) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    // The holder first: older, ranked ahead of the binder.
+    for pid in [holder, binder, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&holder).unwrap();
+        proc.bind_waiting = true;
+        proc.progressed = false;
+    });
+    *pool.occupant.lock() = Some(holder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the bind waiter holding the chunks is moved"
+    );
+    waited.abort();
 }

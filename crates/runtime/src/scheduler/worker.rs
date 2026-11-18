@@ -1320,22 +1320,12 @@ impl SchedulerHandle {
             .await
             .map_err(|why| why.to_string())
         };
-        // However the bind ends, its process leaves the queue of guest
-        // binds waiting for room, waking the next.
+        // However the bind ends, the pool no longer counts its need.
         let leave = move || {
             if let Some(roles) =
                 crate::store::registry::try_get(0, engine).and_then(|stores| stores.roles)
             {
-                roles.lock().unwrap().leave_guest_queue(pid);
-            }
-        };
-        // Behind an earlier guest bind, its turn: woken only as a head
-        // leaves, it is not sent again before.
-        let turn = move || async move {
-            if let Some(roles) =
-                crate::store::registry::try_get(0, engine).and_then(|stores| stores.roles)
-            {
-                crate::store::roles::guest_turn(&roles, pid).await;
+                roles.lock().unwrap().leave_guest_wait(pid);
             }
         };
         // Waiting at the bind for room, the process is a victim the
@@ -1346,7 +1336,7 @@ impl SchedulerHandle {
             }
         };
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned, turn, leave, waiting,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting,
         )
         .await?;
         Ok((registered, bound))
