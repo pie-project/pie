@@ -7,21 +7,27 @@ api = 1
 match = { name_contains = ["MI300X"] }
 
 [rates]
-# `pie tune cuda --rates` on this MI300X VF (6 s): the launch a captured
-# dependent chain's per-node gap; the matmul's efficiency curve at n = k =
-# 1024, 2048 and 4096 over six row octaves through hipBLASLt's first
-# heuristic algorithm (ROCm pads no row tile: the curve carries it);
-# attention by keys; HBM and elementwise bandwidth; the gated delta scan.
-launch_ns = 1523
+# `pie tune cuda --rates` on this MI300X VF (the median of five runs, key by
+# key): the launch a captured dependent chain's per-node gap; the matmul's
+# efficiency curve at n = k = 1024, 2048 and 4096 over six row octaves
+# through hipBLASLt's first heuristic algorithm (ROCm pads no row tile: the
+# curve carries it); attention by keys; HBM and elementwise bandwidth; the
+# gated delta scan; the few-rows rate on the skinny kernel at 8 rows;
+# workgroups_per_core the skinny kernel's resident blocks a CU (8 x 4096 x
+# 4096: 64 KiB of staged rows, all of a CU's LDS, in 1024-thread blocks: 1,
+# over 304 CUs).
+launch_ns = 1680
 gemm_tflops_by_rows = [
-  [1024, [[256, 113.5], [512, 167.9], [1024, 276.2], [2048, 319.1], [4096, 391.3], [8192, 444.4]]],
-  [2048, [[256, 200.3], [512, 281.8], [1024, 359.3], [2048, 394.8], [4096, 425.1], [8192, 565.0]]],
-  [4096, [[256, 267.9], [512, 364.8], [1024, 407.3], [2048, 519.4], [4096, 549.3], [8192, 620.9]]],
+  [1024, [[256, 114.4], [512, 166.7], [1024, 273.5], [2048, 315.5], [4096, 391.3], [8192, 441.2]]],
+  [2048, [[256, 199.9], [512, 279.6], [1024, 351.8], [2048, 430.1], [4096, 479.0], [8192, 584.9]]],
+  [4096, [[256, 285.4], [512, 378.2], [1024, 410.6], [2048, 524.8], [4096, 553.5], [8192, 621.1]]],
 ]
-attn_tflops_by_keys = [[512, 65.3], [1024, 134.9], [2048, 222.5], [4096, 361.9], [8192, 521.9]]
-hbm_gbps = 4176.7
-elementwise_gbps = 2513.6
-scan_gelems = 3021.3
+attn_tflops_by_keys = [[512, 64.3], [1024, 136.9], [2048, 215.3], [4096, 363.7], [8192, 522.3]]
+hbm_gbps = 4124.9
+elementwise_gbps = 2526.6
+scan_gelems = 3026.3
+few_row_tflops = 46.3
+workgroups_per_core = 1.0
 
 [provenance]
-rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): AMD Instinct MI300X VF; the matmul through hipBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at commit f71a714a5; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
+rates = "pie tune cuda --rates on 2026-11-18 (pie 0.6.0): AMD Instinct MI300X VF, each key the median of five runs; the matmul through hipBLASLt's first heuristic algorithm, each rate a burst on the stream doubled until it settles, timed by events, the median of 5 (the launch of 15); the few-rows rate on 8 rows over one cached 4096-square plane; workgroups_per_core the few-rows kernel's resident blocks a multiprocessor by the occupancy calculator; operands: engine::rates' pattern; at commit 479c667b5; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
