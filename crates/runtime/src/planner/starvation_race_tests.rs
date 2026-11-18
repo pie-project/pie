@@ -2415,6 +2415,9 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
     fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
