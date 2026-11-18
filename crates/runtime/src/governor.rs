@@ -40,6 +40,9 @@ pub use ::engine::pressure::{Source, Yield, YieldOutOfRange};
 pub struct Reader {
     source: Source,
     last: f64,
+    /// The source's own value at the last read that reached it, until
+    /// [`Reader::take_fresh`] takes it.
+    fresh: Option<f64>,
     at: Option<crate::rt::Instant>,
     failed: bool,
 }
@@ -70,6 +73,7 @@ impl Reader {
         Self {
             source,
             last: 0.0,
+            fresh: None,
             at: None,
             failed: false,
         }
@@ -88,10 +92,11 @@ impl Reader {
             return self.last;
         }
         self.at = Some(crate::rt::Instant::now());
-        match self.source.read() {
-            Ok(pressure) => {
+        match self.source.sample() {
+            Ok(sample) => {
                 self.failed = false;
-                self.last = pressure;
+                self.last = sample.pressure;
+                self.fresh = Some(sample.raw);
             }
             Err(why) => {
                 if !self.failed {
@@ -106,6 +111,12 @@ impl Reader {
             }
         }
         self.last
+    }
+
+    /// The source's own value, where the last [`Self::read`] reached the
+    /// source rather than its period's cache; once.
+    pub fn take_fresh(&mut self) -> Option<f64> {
+        self.fresh.take()
     }
 }
 

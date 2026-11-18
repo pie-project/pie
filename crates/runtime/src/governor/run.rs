@@ -419,12 +419,15 @@ impl Steer {
         pool: &mut impl PoolTarget,
         pressure: f64,
         signal: &mut impl FnMut(Signal),
-    ) -> u64 {
+    ) -> Turn {
         self.read_room(pool);
         let yields = self.governor.yields().yields();
         if !yields && self.ceiling.is_none() {
             pool.ticked();
-            return self.governor.target();
+            return Turn {
+                target: self.governor.target(),
+                answer: Retarget::Reached,
+            };
         }
         // The system refusing memory is its own word that it has none to
         // give: full pressure, for a pool that yields to it.
@@ -441,13 +444,21 @@ impl Steer {
         let target = self.ceiling.map_or(target, |ceiling| target.min(ceiling));
         let limits = *self.governor.limits();
         let segments = within(&limits, target);
-        match pool.retarget(segments) {
+        let answer = pool.retarget(segments);
+        match answer {
             Retarget::Reached => {
                 if self.short.take().is_some() {
                     signal(Signal::Eased);
                 }
             }
             Retarget::NoRoom { held } => {
+                if self.short.is_none() {
+                    tracing::info!(
+                        held_mib = held.saturating_mul(limits.segment_bytes) >> 20,
+                        target_mib = segments.saturating_mul(limits.segment_bytes) >> 20,
+                        "the pool holds more than its target and has no room to evacuate into: the rest is live; tier pressure to the policy"
+                    );
+                }
                 if self.short != Some(held) {
                     self.short = Some(held);
                     signal(Signal::TierPressure {
@@ -463,8 +474,15 @@ impl Steer {
         }
         self.note_limit(held, &limits);
         pool.ticked();
-        target
+        Turn { target, answer }
     }
+}
+
+/// What one turn asked of the pool and how it answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turn {
+    pub target: u64,
+    pub answer: Retarget,
 }
 
 /// The segments `target` comes to, the floor's at least.
@@ -509,9 +527,23 @@ async fn watch(
     loop {
         interval.tick().await;
         let pressure = system.as_mut().map_or(0.0, |system| system.read());
-        steer.turn(&mut pool, pressure, &mut |signal| {
+        let held = pool.held();
+        let turn = steer.turn(&mut pool, pressure, &mut |signal| {
             steered::signal(engine, signal);
         });
+        // Once per read that reached the source: its own value, the reading,
+        // and what the pool made of the target.
+        if let Some(raw) = system.as_mut().and_then(Reader::take_fresh) {
+            tracing::debug!(
+                engine,
+                raw,
+                pressure,
+                target_mib = turn.target >> 20,
+                held_mib = held >> 20,
+                answer = ?turn.answer,
+                "pressure read"
+            );
+        }
         read_ledger(&pool, engine);
     }
 }

@@ -170,31 +170,64 @@ impl Source {
     /// The source did not answer, or answered something that is not a
     /// reading; the error says what.
     pub fn read(&self) -> Result<f64, String> {
+        self.sample().map(|sample| sample.pressure)
+    }
+
+    /// The pressure now, beside the source's own value it came from (PSI's
+    /// `some avg10` percentage, macOS's percent available, the test file's
+    /// number), for a log that shows both.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub fn sample(&self) -> Result<Sample, String> {
         match self {
             Source::Psi => {
                 let text = std::fs::read_to_string(Self::PSI)
                     .map_err(|e| format!("{}: {e}", Self::PSI))?;
-                psi_some_avg10(&text)
-                    .ok_or_else(|| format!("{} states no `some avg10`", Self::PSI))
+                let pressure = psi_some_avg10(&text)
+                    .ok_or_else(|| format!("{} states no `some avg10`", Self::PSI))?;
+                Ok(Sample {
+                    raw: pressure * 100.0,
+                    pressure,
+                })
             }
             Source::MacosAvailable => {
-                macos::sysctl_u32(macos::AVAILABLE).and_then(|level| {
-                    macos_available(level).ok_or_else(|| {
-                        format!("kern.memorystatus_level is {level}, not a percentage")
-                    })
+                let level = macos::sysctl_u32(macos::AVAILABLE)?;
+                let pressure = macos_available(level).ok_or_else(|| {
+                    format!("kern.memorystatus_level is {level}, not a percentage")
+                })?;
+                Ok(Sample {
+                    raw: f64::from(level),
+                    pressure,
                 })
             }
             Source::File(path) => {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
-                text.trim()
+                let pressure = text
+                    .trim()
                     .parse::<f64>()
                     .ok()
                     .filter(|share| (0.0..=1.0).contains(share))
-                    .ok_or_else(|| format!("{} holds no reading in [0, 1]", path.display()))
+                    .ok_or_else(|| format!("{} holds no reading in [0, 1]", path.display()))?;
+                Ok(Sample {
+                    raw: pressure,
+                    pressure,
+                })
             }
         }
     }
+}
+
+/// One reading of a [`Source`]: the source's own value and the pressure in
+/// `0..=1` it reads as.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+    /// What the source states: PSI's `some avg10` percent, macOS's percent
+    /// available, the test file's number.
+    pub raw: f64,
+    pub pressure: f64,
 }
 
 /// The `some avg10` of a PSI pressure file, in `0..=1`; `None` for text

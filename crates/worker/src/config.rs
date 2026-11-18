@@ -983,7 +983,10 @@ pub struct MemoryConfig {
     /// be read is refused by name. The floor is what the load promised: one
     /// lane at the full `max_context`, the reserved chunks, the activation
     /// span and the dense weights, so a long `max_context` raises the floor
-    /// and with it lowers how far yield can press.
+    /// and with it lowers how far yield can press. Once pressure goes, the
+    /// pool grows back only on demand, up to the target: nothing is
+    /// allocated for nobody. At `1` the pool trims under moderate pressure
+    /// too, by design; `0`, the default, never trims.
     ///
     /// Idle cache is not timed out by the runtime: with no worker policy
     /// installed it stays until a demand needs its room, and is then
