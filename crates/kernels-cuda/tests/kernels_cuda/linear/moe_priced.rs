@@ -1,12 +1,16 @@
 //! The bf16 routed select's pick against every leg that could take its fire,
 //! each timed on this device as serving runs it: captured in a graph, the
-//! bank rotated through copies past the last-level cache.
+//! bank rotated through copies past the last-level cache. Each leg's line
+//! states its median and spread in us and its price on the tests' roofline
+//! (the RTX Spark's rates: `common::roof`); `*` marks the leg priced
+//! cheapest, the one `matmul_select` takes on a device of those rates.
 
 use crate::common::linear_ref::t;
 use crate::common::{Gpu, Lcg, captured, forget, replay};
 use dtype::Dtype::{Bf16, I32};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::linear::moe::{self, ExpertTable};
+use kernels_cuda::tuning::Tuning;
 
 /// A routed projection: `[experts, top, n, k]`.
 struct Shape {
@@ -84,7 +88,12 @@ fn times(gpu: &Gpu, ctx: &Ctx, launch: &dyn Fn(&Ctx, usize)) -> Vec<f64> {
 fn each_legs_time_by_band() {
     let mut gpu = Gpu::open();
     let ctx = gpu.ctx();
-    let mut lcg = Lcg::seeded(0x5e1e_c7);
+    let roof = crate::common::roof();
+    let tuning = ctx.tuning();
+    let ctx = ctx.with_tuning(Tuning { roof, ..tuning });
+    let rates = roof.rates().expect("the tests' roofline states every rate");
+    let cores = moe::Cores::of(&ctx, ExpertTable::RESIDENT).expect("the device answers");
+    let mut lcg = Lcg::seeded(0x005e_1ec7);
     for s in &SHAPES {
         let plane = s.n * s.k;
         let bank_bytes = s.experts * plane * 2;
@@ -105,7 +114,9 @@ fn each_legs_time_by_band() {
             let y_at = gpu.zeros(count * s.n * 2);
             let bank = |i: usize| t(banks[i % copies], s.experts, plane, Bf16);
             let y = t(y_at, count, s.n, Bf16);
-            let legs = moe::legs(x, bank(0), &y, ExpertTable::RESIDENT, false);
+            let legs = moe::legs(x, bank(0), &y, ExpertTable::RESIDENT);
+            #[rustfmt::skip]
+            let shape = moe::Shape { routes: count as u32, experts: s.experts as u32, n: s.n as u32, k: s.k as u32 };
             let pick =
                 moe::cheapest(&ctx, x, bank(0), r, &y, ExpertTable::RESIDENT).expect("prices");
             let mut line = format!("{} r/e {per} ({count} routes):", s.name);
@@ -118,10 +129,11 @@ fn each_legs_time_by_band() {
                 let ts = times(&gpu, &ctx, &run);
                 let mark = if leg == pick { "*" } else { "" };
                 line += &format!(
-                    " {leg:?}{mark} {:.1} [{:.1}..{:.1}]",
+                    " {leg:?}{mark} {:.1} [{:.1}..{:.1}] priced {:.1}",
                     ts[ROUNDS / 2],
                     ts[0],
-                    ts[ROUNDS - 1]
+                    ts[ROUNDS - 1],
+                    moe::price(leg, shape, cores, rates) / 1e3
                 );
             }
             eprintln!("{line}");

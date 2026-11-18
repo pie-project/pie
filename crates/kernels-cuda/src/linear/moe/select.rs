@@ -10,6 +10,9 @@ use dtype::Dtype;
 
 pub(super) const GEMV_WARPS: u32 = 4;
 
+/// Weight rows a GEMV warp holds in flight.
+pub(super) const GEMV_ROWS: u32 = 4;
+
 pub(super) const MAX_GRID_Y: u32 = 65_535;
 
 pub(crate) struct Selected {
@@ -117,35 +120,30 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// A bf16 or f16 routed select's legs below the grouped tcgen05 GEMM: each
-/// reads an expert's weight rows once a slice of its routes, a slice as
-/// wide as the leg's tile.
+/// A bf16 or f16 routed select's legs below the grouped tcgen05 GEMM. Each
+/// streams an expert's weight rows once a slice of the routes it holds: the
+/// GEMV's slice is one route, the tiled GEMMs' their tile's rows.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {
     /// The tiled mma.sync GEMM (`moe_select_bf16_gemm`), an expert's routes
-    /// in slices of 64 (128 where its experts average 128), or on Hopper the
-    /// warp-specialized wgmma GEMM.
+    /// in slices of 64 (128 where its experts average the wide tile's), or
+    /// on Hopper the warp-specialized wgmma GEMM's 128.
     Tiled,
-    /// The register-held mma.sync kernel (`moe_select_bf16_held`), slices of
-    /// 8, 16 or 32 routes.
-    Held,
-    /// cuBLAS's batched GEMM over blocks of an expert's routes, staged in
-    /// and out.
-    Grouped,
-    /// The graph-safe grouped mma.sync kernel (`moe_select_bf16_mma`, on
-    /// Hopper `moe_select_bf16_wgmma`), slices of 8 to 64 routes.
+    /// The grouped mma.sync kernel (`moe_select_bf16_mma`; on Hopper
+    /// `moe_select_bf16_wgmma`), slices of 8 to 64 routes by how many the
+    /// average expert holds.
     Mma,
     /// One GEMV a route: each route reads its expert's rows.
     Gemv,
 }
 
-/// The legs that can take a select of `x` over `bank` into `y` (`staged`:
-/// under a live window's stage): each one's predicate is what its kernel can
-/// launch, never what it is worth. The per-route GEMV takes any.
+/// The legs that can take a select of `x` over `bank` into `y`, a tie's
+/// winner first: each one's predicate is what its kernel can launch, never
+/// what it is worth.
 #[cfg(feature = "cuda")]
 #[must_use]
-pub fn legs(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable, staged: bool) -> Vec<Leg> {
+pub fn legs(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable) -> Vec<Leg> {
     let bf16 = x.dtype == Dtype::Bf16 && bank.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16;
     let plane = u64::from(bank.width) == u64::from(x.width) * u64::from(y.width);
     // Where the grouped tcgen05 GEMM reads a resident bank the mma.sync
@@ -155,22 +153,15 @@ pub fn legs(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable, staged: b
     if bf16 && mma_sync && x.width.is_multiple_of(64) && bank.ptr.is_multiple_of(16) {
         legs.push(Leg::Tiled);
     }
-    if bf16 && mma_sync && x.width.is_multiple_of(32) && bank.ptr.is_multiple_of(16) {
-        legs.push(Leg::Held);
-    }
-    if !experts.streams()
-        && !staged
-        && matches!(x.dtype, Dtype::Bf16 | Dtype::F16)
-        && bank.dtype == x.dtype
-        && (1..=MAX_EXPERTS).contains(&bank.rows)
-        && plane
-    {
-        legs.push(Leg::Grouped);
-    }
     if bf16 && x.width.is_multiple_of(64) && y.width.is_multiple_of(8) && bank.rows >= 1 && plane {
         legs.push(Leg::Mma);
     }
-    legs.push(Leg::Gemv);
+    if matches!(x.dtype, Dtype::Bf16 | Dtype::F16)
+        && bank.dtype == x.dtype
+        && x.width.is_multiple_of(8)
+    {
+        legs.push(Leg::Gemv);
+    }
     legs
 }
 
@@ -188,21 +179,14 @@ pub fn matmul_select_on(
     const OP: &str = "linear.moe_select";
     let fan = selected(OP, x, routes, y)?;
     match leg {
-        Leg::Tiled | Leg::Held => {
-            let tiled = leg == Leg::Tiled;
-            if select_bf16_held(
-                ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts, tiled,
-            )? {
+        Leg::Tiled => {
+            if select_bf16_tiled(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)? {
                 Ok(())
             } else {
-                Err(refuse(
-                    OP,
-                    format!("the {leg:?} leg declined a fire `legs` gave it"),
-                ))
+                Err(refuse(OP, "the tiled leg declined a fire `legs` gave it"))
             }
         }
-        Leg::Grouped => select_grouped(ctx, OP, x, bank, routes, y, bank.rows, experts),
-        Leg::Mma if hopper_wgmma() && y.width.is_multiple_of(128) && !experts.streams() => {
+        Leg::Mma if wgmma_takes(y.width, experts) => {
             select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts)
         }
         Leg::Mma => select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts),
@@ -210,10 +194,8 @@ pub fn matmul_select_on(
     }
 }
 
-/// The leg [`matmul_select`] takes: the tiled GEMM past 12 routes an
-/// expert and 256 a fire, else cuBLAS's grouped GEMM where it is worth
-/// staging, else the grouped mma.sync select over its profile's span, else
-/// the per-route GEMV.
+/// The leg [`matmul_select`] takes: of [`legs`], the one [`price`] puts
+/// lowest on this device's roofline, a tie to the first.
 #[cfg(feature = "cuda")]
 pub fn cheapest(
     ctx: &Ctx,
@@ -225,29 +207,153 @@ pub fn cheapest(
 ) -> Result<Leg, Error> {
     const OP: &str = "linear.moe_select";
     let fan = selected(OP, x, routes, y)?;
-    let legs = legs(
-        x,
-        bank,
-        y,
+    let roof = ctx.tuning().roof.rates().ok_or_else(|| {
+        refuse(
+            OP,
+            "the routed select prices its legs on the device's roofline, and this load's \
+             profile states no `[rates]`",
+        )
+    })?;
+    let cores = Cores::of(ctx, experts).ok_or_else(|| {
+        refuse(
+            OP,
+            "the routed select prices its legs by the device's multiprocessors and their \
+             shared memory, and the device answers neither",
+        )
+    })?;
+    let shape = Shape {
+        routes: fan.route_count,
+        experts: bank.rows.max(1),
+        n: y.width,
+        k: x.width,
+    };
+    pick(&legs(x, bank, y, experts), shape, cores, roof).ok_or_else(|| {
+        refuse(
+            OP,
+            format!(
+                "no leg takes a {:?} select over a {:?} bank at K {}",
+                x.dtype, bank.dtype, x.width
+            ),
+        )
+    })
+}
+
+/// Of `legs`, the one [`price`] puts lowest, a tie to the first; `None` for
+/// none.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn pick(
+    legs: &[Leg],
+    shape: Shape,
+    cores: Cores,
+    roof: &crate::tuning::RoofRates,
+) -> Option<Leg> {
+    legs.iter()
+        .map(|&leg| (leg, price(leg, shape, cores, roof)))
+        .reduce(|best, next| if next.1 < best.1 { next } else { best })
+        .map(|(leg, _)| leg)
+}
+
+/// A routed select as its legs are priced: its routes, the bank's experts,
+/// and each expert's `n x k` plane.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub routes: u32,
+    pub experts: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// What a leg's tiles fill: the device's multiprocessors and each one's
+/// shared memory, the tuning its tiled legs lay their tiles by, and whether
+/// they run Hopper's wgmma kernels.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cores {
+    pub sms: u32,
+    pub smem_per_sm: u32,
+    pub hopper: bool,
+    /// `kernel.moe.bf16_wide_from`: routes an expert from which the tiled
+    /// GEMM lays the wide tile.
+    pub wide_from: u32,
+    /// `kernel.moe.bf16_gemm_stages`.
+    pub stages: u32,
+    /// The bank is streamed: Hopper's wgmma kernels stay off its mapped
+    /// entries.
+    pub streams: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Cores {
+    /// `ctx`'s device, `None` where it answers neither count.
+    #[must_use]
+    pub fn of(ctx: &Ctx, experts: ExpertTable) -> Option<Cores> {
+        Some(Cores {
+            sms: ctx.multiprocessors()?,
+            smem_per_sm: ctx.smem_per_sm()?,
+            hopper: hopper_wgmma(),
+            wide_from: ctx.tuning().bf16_wide_from(),
+            stages: ctx.tuning().bf16_gemm_stages(),
+            streams: experts.streams(),
+        })
+    }
+}
+
+/// `leg`'s time for a select of `shape` on `cores` under `roof`, in ns: its
+/// launches, and the longer of its padded flops at the matmul's rate (its
+/// rows as its tiles pad them) and the bytes it streams at the device's
+/// bandwidth, stretched by the share of its last wave its tiles leave idle.
+/// A leg streams an expert's plane once a slice of the routes the expert
+/// holds (the routes spread over the experts they reach), and every route's
+/// activation row in and product row out.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn price(leg: Leg, shape: Shape, cores: Cores, roof: &crate::tuning::RoofRates) -> f64 {
+    let Shape {
+        routes,
         experts,
-        !matches!(ctx.stage(), ArgValue::Ptr(0)),
-    );
-    let tiled = fan.route_count >= 256
-        && x.width.is_multiple_of(64)
-        && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
-    if tiled && legs.contains(&Leg::Tiled) {
-        return Ok(Leg::Tiled);
-    }
-    if legs.contains(&Leg::Grouped) && grouped_worth(ctx, x, bank, y, &fan, experts).is_some() {
-        return Ok(Leg::Grouped);
-    }
-    if legs.contains(&Leg::Mma)
-        && bf16_mma_spans(ctx, fan.route_count)
-        && fan.route_count > fan.top_k.unsigned_abs()
-    {
-        return Ok(Leg::Mma);
-    }
-    Ok(Leg::Gemv)
+        n,
+        k,
+    } = shape;
+    let (routes_f, n_f, k_f) = (f64::from(routes), f64::from(n), f64::from(k));
+    let plane = n_f * k_f * 2.0;
+    let rows_moved = routes_f * (n_f + k_f) * 2.0;
+    let hit = experts.min(routes).max(1);
+    let per = routes.div_ceil(experts.max(1));
+    let wave = |tiles: u64, per_sm: u32| -> f64 {
+        let slots = u64::from(cores.sms.max(1)) * u64::from(per_sm.max(1));
+        let tiles = tiles.max(1);
+        tiles as f64 / (tiles.div_ceil(slots) * slots) as f64
+    };
+    let tile = match leg {
+        Leg::Gemv => {
+            let tiles = u64::from(n.div_ceil(GEMV_WARPS * GEMV_ROWS)) * u64::from(routes);
+            let bytes = routes_f * plane + rows_moved;
+            return roof.launch_ns + bytes / roof.bytes_per_ns / wave(tiles, 1);
+        }
+        Leg::Tiled => tiled_tile(per, k, cores),
+        Leg::Mma => mma_tile(per, n, k, cores),
+    };
+    let slices = u64::from(hit) * u64::from(routes.div_ceil(hit).div_ceil(tile.slice));
+    let rows = slices * u64::from(tile.slice);
+    let tiles = slices * u64::from(n.div_ceil(tile.cols));
+    let fill = wave(tiles, cores.smem_per_sm / tile.smem.max(1));
+    let flops = 2.0 * rows as f64 * n_f * k_f;
+    let rate = roof.gemm_rate(u32::try_from(rows).unwrap_or(u32::MAX), n, k);
+    let bytes = slices as f64 * plane + rows_moved;
+    // The route order, then the select.
+    2.0 * roof.launch_ns + (flops / rate).max(bytes / roof.bytes_per_ns) / fill
+}
+
+/// A tiled leg's tile: the routes of one expert a CTA takes (its slice),
+/// the product columns, and the shared memory it holds.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tile {
+    pub slice: u32,
+    pub cols: u32,
+    pub smem: u32,
 }
 
 /// Whether this device is Hopper (sm_90), whose arch-specific target has
@@ -356,268 +462,6 @@ pub(crate) fn select_tc5_with(
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
 }
 
-#[cfg(feature = "cuda")]
-pub(super) const fn block_rows(per_expert: u32) -> u32 {
-    let want = per_expert.next_power_of_two();
-    if want < 16 {
-        16
-    } else if want > 128 {
-        128
-    } else {
-        want
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub(super) const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
-
-#[cfg(feature = "cuda")]
-pub(super) fn grouped_worth(
-    ctx: &Ctx,
-    x: Tensor,
-    bank: Tensor,
-    y: &Tensor,
-    fan: &Selected,
-    experts: ExpertTable,
-) -> Option<u32> {
-    if !ctx.tuning().moe_grouped() {
-        return None;
-    }
-    if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
-        return None;
-    }
-    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
-        return None;
-    }
-    let count = bank.rows;
-    if count == 0 || count > MAX_EXPERTS {
-        return None;
-    }
-    if u64::from(bank.width) != u64::from(x.width) * u64::from(y.width) {
-        return None;
-    }
-    let per_expert = fan.route_count.div_ceil(count);
-    if per_expert < ctx.tuning().moe_group_at() {
-        return None;
-    }
-    let block = block_rows(per_expert);
-    let blocks = u64::from(count) + u64::from(fan.route_count.div_ceil(block));
-    let rows = blocks * u64::from(block);
-    let staged = rows
-        .checked_mul(u64::from(x.width) + u64::from(y.width))?
-        .checked_mul(x.dtype.bytes_ceil())?;
-    (staged <= GROUP_WORKSPACE_CAP).then_some(count)
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn select_grouped(
-    ctx: &Ctx,
-    op: &'static str,
-    x: Tensor,
-    bank: Tensor,
-    routes: Tensor,
-    y: &mut Tensor,
-    experts: u32,
-    table: ExpertTable,
-) -> Result<(), Error> {
-    use cudarc::cublas::sys::{
-        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasHandle_t,
-        cublasOperation_t, cublasStatus_t, cudaDataType,
-    };
-
-    let (t, scalar) = match x.dtype {
-        Dtype::Bf16 => ("::pie::bf16", cudaDataType::CUDA_R_16BF),
-        Dtype::F16 => ("::pie::f16", cudaDataType::CUDA_R_16F),
-        other => {
-            return Err(refuse(
-                op,
-                format!("the grouped leg hands cuBLAS a 16-bit bank and this one is {other:?}"),
-            ));
-        }
-    };
-    let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
-
-    let fan = selected(op, x, routes, y)?;
-    let per_expert = fan.route_count.div_ceil(experts);
-    let block = block_rows(per_expert);
-    let blocks = experts + fan.route_count.div_ceil(block);
-    let rows = blocks.checked_mul(block).ok_or_else(|| {
-        refuse(
-            op,
-            format!("{blocks} blocks of {block} rows overflow the fire"),
-        )
-    })?;
-
-    let k = stated(op, x.width)?;
-    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let route_count = stated(op, fan.route_count)?;
-    let aligned_rows = stated(op, rows)?;
-    let block_size = stated(op, block)?;
-    let max_blocks = stated(op, blocks)?;
-    let expert_count = stated(op, experts)?;
-
-    let elem = x.dtype.bytes_ceil();
-    let slab = |name: &'static str, bytes: u64| -> Result<u64, Error> {
-        usize::try_from(bytes)
-            .map_err(|_| {
-                refuse(
-                    op,
-                    format!("{name} wants {bytes} bytes, past this host's usize"),
-                )
-            })
-            // One slab a stream: the layout lives within this op, so
-            // regions captured apart share it rather than holding one each.
-            .and_then(|bytes| ctx.scratch_stream(op, name, bytes))
-            .map(|ptr| ptr as usize as u64)
-    };
-    let sorted = slab("linear.moe_group_sorted", u64::from(rows) * 4)?;
-    let expert_ids = slab("linear.moe_group_experts", u64::from(blocks) * 4)?;
-    let staged_in = slab(
-        "linear.moe_group_in",
-        u64::from(rows) * u64::from(x.width) * elem,
-    )?;
-    let staged_out = slab(
-        "linear.moe_group_out",
-        u64::from(rows) * u64::from(y.width) * elem,
-    )?;
-    let ptrs = slab("linear.moe_group_ptrs", u64::from(blocks) * 3 * 8)?;
-    let w_ptrs = ptrs;
-    let act_ptrs = ptrs + u64::from(blocks) * 8;
-    let out_ptrs = ptrs + u64::from(blocks) * 16;
-
-    ctx.fire(
-        op,
-        Fire::at(kernel(ROUTE, "::pie::linear::moe_align_decode<::pie::i32>"))
-            .apply(Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4)),
-        &[
-            routes.arg(),
-            ArgValue::Ptr(sorted),
-            ArgValue::Ptr(expert_ids),
-            ArgValue::ABSENT,
-            route_count.arg(),
-            expert_count.arg(),
-            block_size.arg(),
-            max_blocks.arg(),
-            ArgValue::ABSENT,
-        ],
-    )?;
-
-    let gather_fan = if fan.by_token { fan.top_k } else { 1 };
-    ctx.fire(
-        op,
-        Fire::at(kernel(
-            ROUTE,
-            &format!("::pie::linear::gather_moe_aligned_inputs<{t}>"),
-        ))
-        .apply(Launch::grid(
-            [rows, x.width.div_ceil(BLOCK), 1],
-            [BLOCK, 1, 1],
-        )),
-        &[
-            x.arg(),
-            ArgValue::Ptr(sorted),
-            ArgValue::Ptr(staged_in),
-            route_count.arg(),
-            aligned_rows.arg(),
-            gather_fan.arg(),
-            k.arg(),
-            (-1i32).arg(),
-            stated(op, x.rows)?.arg(),
-        ],
-    )?;
-
-    ctx.fire(
-        op,
-        Fire::at(kernel(
-            ROUTE,
-            &format!("::pie::linear::build_moe_leg_ptrs<{t}>"),
-        ))
-        .apply(Launch::flat(blocks, BLOCK)),
-        &[
-            ArgValue::Ptr(expert_ids),
-            bank.arg(),
-            ArgValue::Ptr(staged_in),
-            ArgValue::Ptr(staged_out),
-            ArgValue::Ptr(w_ptrs),
-            ArgValue::Ptr(act_ptrs),
-            ArgValue::Ptr(out_ptrs),
-            max_blocks.arg(),
-            block_size.arg(),
-            k.arg(),
-            n.arg(),
-            ArgValue::Ptr(table.at()),
-        ],
-    )?;
-
-    let alpha = 1.0f32;
-    let beta = 0.0f32;
-    // SAFETY: `handle` is this context's live cuBLAS handle bound to its
-    // stream; the pointer arrays hold `blocks` entries in slabs this context
-    // owns for the fire's life.
-    let status = if crate::sizing::active() {
-        // A size-only walk (`crate::sizing`) runs no product.
-        cublasStatus_t::CUBLAS_STATUS_SUCCESS
-    } else {
-        unsafe {
-            cublasGemmBatchedEx(
-                handle,
-                cublasOperation_t::CUBLAS_OP_T,
-                cublasOperation_t::CUBLAS_OP_N,
-                n,
-                block_size,
-                k,
-                std::ptr::from_ref(&alpha).cast(),
-                w_ptrs as usize as *const *const std::ffi::c_void,
-                scalar,
-                k,
-                act_ptrs as usize as *const *const std::ffi::c_void,
-                scalar,
-                k,
-                std::ptr::from_ref(&beta).cast(),
-                out_ptrs as usize as *const *mut std::ffi::c_void,
-                scalar,
-                n,
-                max_blocks,
-                cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-        }
-    };
-    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Err(refuse(
-            op,
-            format!(
-                "`cublasGemmBatchedEx` answered {status:?} at {max_blocks} blocks of \
-                 M={block_size} N={n} K={k}"
-            ),
-        ));
-    }
-
-    ctx.fire(
-        op,
-        Fire::at(kernel(
-            COMBINE,
-            &format!("::pie::linear::reorder_moe_aligned_output<{t}>"),
-        ))
-        .apply(Launch::grid(
-            [rows, y.width.div_ceil(BLOCK), 1],
-            [BLOCK, 1, 1],
-        )),
-        &[
-            ArgValue::Ptr(staged_out),
-            ArgValue::Ptr(sorted),
-            y.arg(),
-            route_count.arg(),
-            aligned_rows.arg(),
-            n.arg(),
-            (-1i32).arg(),
-            0i32.arg(),
-            ArgValue::ABSENT,
-        ],
-    )
-}
-
 pub(crate) fn select_gemv(
     ctx: &Ctx,
     op: &'static str,
@@ -657,7 +501,7 @@ pub(crate) fn select_gemv(
     // Four weight rows a warp, their loads in flight together: Qwen3.6's
     // layer at 8 decode tokens (gate-up K 2048, down K 512) 55 + 37 us at one
     // row a warp, 40 + 21 at four (two 44 + 25, eight 45 + 24).
-    const ROWS: u32 = 4;
+    const ROWS: u32 = GEMV_ROWS;
     let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
@@ -731,7 +575,8 @@ pub(super) struct SelectPlan {
 }
 
 /// The [`SelectPlan`] of a select of `fan` over `experts` landing `y`
-/// (`glu` where it lands a GLU), on the tiled GEMM where `gemm`.
+/// (`glu` where it lands a GLU), on the tiled GEMM where `gemm` and its
+/// experts average more than 12 routes.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_plan(
@@ -747,10 +592,10 @@ pub(super) fn select_plan(
     wide: Option<u32>,
 ) -> Result<SelectPlan, Error> {
     let nb: u32 = match fan.route_count.div_ceil(experts) {
-        _ if gemm => 8,
         0..=4 => 1,
         5..=12 => 2,
-        _ => 4,
+        _ if !gemm => 4,
+        _ => 8,
     };
     let order = route_order_sliced(
         ctx,
@@ -838,5 +683,124 @@ pub fn matmul_select_quant(
         Some(biases) => {
             matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat, experts)
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::tuning::RoofRates;
+
+    /// The RTX Spark's measured rates (its user profile's `[rates]`).
+    fn spark() -> RoofRates {
+        let flops = |c: &[(u32, f64)]| c.iter().map(|&(m, t)| (m, t * 1e3)).collect();
+        #[rustfmt::skip]
+        let gemm_by_rows = vec![
+            (1024, flops(&[(256, 32.4), (512, 54.3), (1024, 72.3), (2048, 72.7), (4096, 78.7), (8192, 74.3)])),
+            (2048, flops(&[(256, 54.3), (512, 80.0), (1024, 85.3), (2048, 84.4), (4096, 81.1), (8192, 83.5)])),
+            (4096, flops(&[(256, 27.9), (512, 65.9), (1024, 88.9), (2048, 76.6), (4096, 81.0), (8192, 83.4)])),
+        ];
+        RoofRates {
+            launch_ns: 707.0,
+            bytes_per_ns: 264.4,
+            gemm_by_rows,
+        }
+    }
+
+    /// The Spark's 48 multiprocessors of 100 KiB, the registry's tiles.
+    const CORES: Cores = Cores {
+        sms: 48,
+        smem_per_sm: 100 << 10,
+        hopper: false,
+        wide_from: 128,
+        stages: 3,
+        streams: false,
+    };
+
+    const LEGS: [Leg; 3] = [Leg::Tiled, Leg::Mma, Leg::Gemv];
+
+    /// Qwen3-A3B's gate-up at `per` routes an expert.
+    fn gate_up(per: u32) -> Shape {
+        Shape {
+            routes: 128 * per,
+            experts: 128,
+            n: 1536,
+            k: 2048,
+        }
+    }
+
+    #[test]
+    fn at_one_route_an_expert_every_leg_streams_the_bank_once_and_the_gemv_launches_once() {
+        let roof = spark();
+        let p = |leg| price(leg, gate_up(1), CORES, &roof);
+        assert!(p(Leg::Gemv) < p(Leg::Tiled) && p(Leg::Gemv) < p(Leg::Mma));
+        assert_eq!(pick(&LEGS, gate_up(1), CORES, &roof), Some(Leg::Gemv));
+    }
+
+    #[test]
+    fn past_one_route_an_expert_the_gemv_streams_the_bank_again_a_route() {
+        let roof = spark();
+        for per in [4, 8, 12, 32] {
+            let p = |leg| price(leg, gate_up(per), CORES, &roof);
+            let again = p(Leg::Gemv) / p(Leg::Tiled);
+            assert!(
+                again > f64::from(per) / 2.0,
+                "{per} routes an expert: the GEMV priced {again:.1}x the tiled GEMM"
+            );
+            assert_ne!(pick(&LEGS, gate_up(per), CORES, &roof), Some(Leg::Gemv));
+        }
+    }
+
+    #[test]
+    fn slices_that_each_read_an_expert_once_tie_and_the_tie_is_the_tiled_gemms() {
+        let roof = spark();
+        for per in [4, 8, 12, 32] {
+            let (tiled, mma) = (
+                price(Leg::Tiled, gate_up(per), CORES, &roof),
+                price(Leg::Mma, gate_up(per), CORES, &roof),
+            );
+            assert!(
+                (tiled - mma).abs() <= 1e-9 * tiled,
+                "{per} routes an expert: tiled {tiled} against mma {mma}"
+            );
+            assert_eq!(pick(&LEGS, gate_up(per), CORES, &roof), Some(Leg::Tiled));
+        }
+    }
+
+    #[test]
+    fn a_wide_fire_takes_the_wide_tile_which_reads_an_expert_half_as_often() {
+        let roof = spark();
+        let p = |leg| price(leg, gate_up(256), CORES, &roof);
+        assert!(
+            p(Leg::Tiled) < p(Leg::Mma),
+            "{} {}",
+            p(Leg::Tiled),
+            p(Leg::Mma)
+        );
+        assert_eq!(pick(&LEGS, gate_up(256), CORES, &roof), Some(Leg::Tiled));
+    }
+
+    #[test]
+    fn a_fire_short_of_a_wave_is_stretched_by_the_cores_it_leaves_idle() {
+        let roof = spark();
+        let shape = Shape {
+            routes: 32,
+            experts: 8,
+            n: 128,
+            k: 256,
+        };
+        // Eight experts' one slice by one 128-column tile: 8 tiles on 48
+        // multiprocessors.
+        let plane = 128.0 * 256.0 * 2.0;
+        let bytes = 8.0 * plane + 32.0 * (128.0 + 256.0) * 2.0;
+        let full = 2.0 * roof.launch_ns + bytes / roof.bytes_per_ns;
+        let tiled = price(Leg::Tiled, shape, CORES, &roof);
+        let idle = (tiled - 2.0 * roof.launch_ns) / (full - 2.0 * roof.launch_ns);
+        assert!((idle - 6.0).abs() < 1e-9, "stretched {idle}x, not 48 / 8");
+    }
+
+    #[test]
+    fn no_leg_is_no_pick() {
+        assert_eq!(pick(&[], gate_up(1), CORES, &spark()), None);
     }
 }

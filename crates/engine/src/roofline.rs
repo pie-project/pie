@@ -106,25 +106,7 @@ impl Constants {
     /// `log width` at `sqrt(n k)` between the widths, clamped past them.
     #[must_use]
     pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
-        let at = |curve: &[(u32, f64)]| -> f64 {
-            curve
-                .iter()
-                .rev()
-                .find(|&&(rows, _)| rows <= m)
-                .or(curve.first())
-                .map_or(f64::INFINITY, |&(_, r)| r)
-        };
-        let width: Vec<(u32, f64)> = self.gemm_by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
-        let square = (f64::from(n) * f64::from(k)).sqrt();
-        // Past the widest width, its last span's slope in log width carries
-        // on (a wider plane fills more tiles); never below the widest's rate.
-        if let [.., (w0, r0), (w1, r1)] = width[..]
-            && square > f64::from(w1)
-        {
-            let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
-            return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
-        }
-        profile::fire::interpolate(&width, square).unwrap_or(f64::INFINITY)
+        profile::fire::gemm_rate(&self.gemm_by_rows, m, n, k)
     }
 
     /// The rows a matmul of `m x n x k` computes: `m` padded to its

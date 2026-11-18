@@ -1441,9 +1441,12 @@ impl Run<'_> {
             let (x, routes, mut out) = (self.tensor(x), self.tensor(routes), self.tensor(y));
             // relu^2 lands in the tiled GEMM's epilogue: fused where the
             // plain select's cheapest leg is that GEMM.
-            let tiled = linear::moe::cheapest(self.ctx(), x, bank, routes, &out, experts)?
-                == linear::moe::Leg::Tiled;
-            return linear::moe::select_bf16_held(
+            if linear::moe::cheapest(self.ctx(), x, bank, routes, &out, experts)?
+                != linear::moe::Leg::Tiled
+            {
+                return Ok(false);
+            }
+            return linear::moe::select_bf16_tiled(
                 self.ctx(),
                 "fused.moe_select_glu",
                 x,
@@ -1453,7 +1456,6 @@ impl Run<'_> {
                 &mut out,
                 Some(Glu::Relu2),
                 experts,
-                tiled,
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
