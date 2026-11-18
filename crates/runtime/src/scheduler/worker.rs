@@ -1386,12 +1386,15 @@ impl BatchScheduler {
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
-            // No launch past the cap is submitted from here (`post_frame`
-            // holds it): once none in flight is either, the pool may lower
-            // its rung.
+            // No frame past the cap is sealed from here, and no unframed
+            // launch past it posted (`post_frame` holds it): once none in
+            // flight is either, nor a frame sealed before still to go, the
+            // pool may lower its rung.
+            frame_policy.cap_fires(stepped.max_forward_tokens);
             if in_flight_launches
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
+                && frame_policy.sealed_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -1869,6 +1872,7 @@ impl BatchScheduler {
                             launch.request.tokens(),
                             launch.wire_row_count(),
                             launch.request.sequence_readouts(),
+                            launch.request.rung_rows(),
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -2494,6 +2498,17 @@ impl BatchScheduler {
                 }
                 continue;
             }
+            // What the frame posted owes its output from here, and only that.
+            if let Some(batch) = in_flight_launches.back() {
+                frame_policy.on_frame_posted(
+                    batch
+                        .requests
+                        .iter()
+                        .filter(|request| request.frame.is_some())
+                        .filter_map(|request| request.pipeline_id),
+                    now,
+                );
+            }
             if rider_batch {
                 frame_policy.record_rider_wave();
             }
@@ -2562,10 +2577,13 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back.
+                // An unframed launch past the pool's activation rung (SPEC
+                // decision 6) waits until the rung is back. A framed one was
+                // sealed under the cap, and its frame goes whole: the rung is
+                // not lowered under a sealed frame (`FramePolicy::cap_fires`).
                 QueuedItem::Launch(launch)
-                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
+                    if !launch.framed
+                        && launch.request.request.rung_rows() > limits.max_forward_tokens =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
