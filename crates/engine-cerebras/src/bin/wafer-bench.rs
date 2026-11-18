@@ -64,7 +64,7 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir | .zt> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
-                     [--stamps 1]";
+                     [--stamps 1] [--anneal <moves a block>]";
 
 /// A headless slice's rows against the golden's: relative L2 and cosine (bf16 weights and
 /// activations against HF's f32).
@@ -302,6 +302,14 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             let cfg = engine_cerebras::config::Config {
                 cache_dir: Some(cache.into()),
                 cmaddr: get.get("cmaddr").cloned(),
+                // (`--anneal <moves a block>`: the annealing placer on the unit program kept)
+                wafer: engine_cerebras::config::Wafer {
+                    anneal: get
+                        .get("anneal")
+                        .map(|a| a.parse::<u64>().map_err(|e| format!("--anneal: {e}")))
+                        .transpose()?,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let positions = get
