@@ -302,7 +302,8 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             let cfg = engine_cerebras::config::Config {
                 cache_dir: Some(cache.into()),
                 cmaddr: get.get("cmaddr").cloned(),
-                // (`--anneal <moves a block>`: the annealing placer on the unit program kept)
+                // (`--anneal <moves a block>`: the annealing placer's budget on the unit program
+                // kept, `--anneal 0` off; unless stated, the engine's default)
                 wafer: engine_cerebras::config::Wafer {
                     anneal: get
                         .get("anneal")

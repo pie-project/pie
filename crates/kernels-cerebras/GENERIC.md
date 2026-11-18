@@ -3609,9 +3609,11 @@ points, never process state: `stream::Options::anneal`, and `compile_decode`'s `
 - `[cerebras.wafer] anneal = <moves a block>` for compile on load (`prepare.rs` sets it on
   each wanted reading's `Options`, and on the unit program kept; its sizing compiles run off).
 
-Until 1539 calibrates the link term on the chip, it is off by default. Off, a program is the
-search's byte for byte: `stream::write_stream` and `compile_decode` call `anneal::maybe`, which
-returns nothing.
+**Defaults.** A decode-unit program is annealed unless asked otherwise (`Anneal::unit`:
+`UNIT_PER_BLOCK` = 2,000 moves a block, seed 1, K / V columns only; `--anneal 0` or
+`anneal = 0` turns it off). 1556 was the A/B on the chip that turned it on (below). Stream
+readings and the decode templates stay off. Off, a program is the search's byte for byte:
+`stream::write_stream` and `compile_decode` call `anneal::maybe`, which returns nothing.
 
 - **State:** every block's origin over `place::stream::problem`'s blocks. The K / V columns
   always move. With `--anneal-units 1` the units move too, except the lane prologue's unit

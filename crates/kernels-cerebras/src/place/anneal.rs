@@ -19,7 +19,9 @@
 //!   and the search's program kept (reported), never a part of a run's result.
 //!
 //! Off unless asked ([`Anneal`], passed through the compile entry points): a program is placed
-//! as the search placed it, byte for byte.
+//! as the search placed it, byte for byte. A decode-unit program's callers ask for
+//! [`Anneal::unit`] by default (1556: Qwen3-0.6B's 28-layer step 2.95M -> 1.45M cycles on the
+//! chip, token-exact); stream readings and the decode templates stay off.
 
 use super::{BlockKind, Problem, Solution};
 use crate::floor::{Coord, Rect};
@@ -45,11 +47,27 @@ impl Anneal {
         Anneal::default()
     }
 
+    /// The annealer as a decode-unit program is placed unless asked otherwise:
+    /// [`UNIT_PER_BLOCK`] moves a block, seed 1, the K / V columns alone.
+    #[must_use]
+    pub fn unit() -> Anneal {
+        Anneal {
+            per_block: UNIT_PER_BLOCK,
+            seed: 1,
+            units: false,
+        }
+    }
+
     #[must_use]
     pub fn is_on(&self) -> bool {
         self.per_block > 0
     }
 }
+
+/// A decode-unit program's moves a block by default ([`Anneal::unit`]): 1556's A/B on the
+/// CS-3 (Qwen3-0.6B, 28 layers: 954,000 moves in 11.9 s, the step 2.95M -> 1.45M cycles, every
+/// token the golden's).
+pub const UNIT_PER_BLOCK: u64 = 2000;
 
 /// The penalty a PE of overlap or past the fabric (cycles).
 const PENALTY: f64 = 1.0e6;

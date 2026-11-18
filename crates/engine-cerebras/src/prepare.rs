@@ -391,7 +391,7 @@ pub fn stream_programs(
     let mut wanted = stream::wanted(trace, rows, voxels, schedule_steps(trace));
     // the annealer, where the config asks (its placement in the files hashed below)
     for w in &mut wanted {
-        w.o.anneal = anneal(cfg);
+        w.o.anneal = anneal(cfg, kernels_cerebras::place::anneal::Anneal::off());
     }
     let t0 = std::time::Instant::now();
     let (chosen, refused) =
@@ -578,8 +578,8 @@ pub fn unit_program(
         .tempdir_in(&cache.root)
         .map_err(io(&cache.root))?;
     let dir = stage.path().join("decode");
-    // the search's placement while sizing; the annealer, where the config asks, for the
-    // program kept alone
+    // the search's placement while sizing; the annealer (on unless the config says otherwise)
+    // for the program kept alone
     let compile = |at: u32, b: u32, a: &kernels_cerebras::place::anneal::Anneal| {
         let _ = std::fs::remove_dir_all(&dir);
         stream::compile_decode(trace, at, b, true, None, a, &dir)
@@ -632,7 +632,11 @@ pub fn unit_program(
             best.1
         }
     };
-    compile(at, lanes, &anneal(cfg))?;
+    compile(
+        at,
+        lanes,
+        &anneal(cfg, kernels_cerebras::place::anneal::Anneal::unit()),
+    )?;
     let mut hasher = blake3::Hasher::new();
     let mut files = walk(&dir)?;
     files.sort();
@@ -756,12 +760,17 @@ pub fn plane(landed: &Landed, name: &str, count: usize) -> Vec<f32> {
     }
 }
 
-/// The annealing placer as `cfg` asks (`wafer.anneal`: moves a block, seed 1; off unless
-/// stated).
-fn anneal(cfg: &Config) -> kernels_cerebras::place::anneal::Anneal {
-    kernels_cerebras::place::anneal::Anneal {
-        per_block: cfg.wafer.anneal.unwrap_or(0),
-        seed: 1,
-        units: false,
-    }
+/// The annealing placer as `cfg` asks (`wafer.anneal`: moves a block, seed 1, 0 off), else the
+/// program's own default (a decode unit program's `Anneal::unit`, a stream reading's off).
+fn anneal(
+    cfg: &Config,
+    default: kernels_cerebras::place::anneal::Anneal,
+) -> kernels_cerebras::place::anneal::Anneal {
+    cfg.wafer
+        .anneal
+        .map_or(default, |m| kernels_cerebras::place::anneal::Anneal {
+            per_block: m,
+            seed: 1,
+            units: false,
+        })
 }

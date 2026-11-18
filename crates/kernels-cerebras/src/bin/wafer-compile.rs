@@ -316,12 +316,15 @@ fn stream(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("--rows: {e}"))?;
     let ieee = args.iter().any(|a| a == "--ieee");
     // the annealer after the search (GENERIC.md, "Free placement"): `--anneal <moves a
-    // block>`, `--anneal-seed <n>`, `--anneal-units 1` (units move too, not the K / V columns
+    // block>` (0 off; unless stated, a decode unit program's `UNIT_PER_BLOCK`, a reading's
+    // off), `--anneal-seed <n>`, `--anneal-units 1` (units move too, not the K / V columns
     // alone)
-    let anneal = kernels_cerebras::place::anneal::Anneal {
-        per_block: get("--anneal")
-            .map_or(Ok(0), |m| m.parse())
-            .map_err(|e| format!("--anneal: {e}"))?,
+    let moves = get("--anneal")
+        .map(|m| m.parse::<u64>())
+        .transpose()
+        .map_err(|e| format!("--anneal: {e}"))?;
+    let mut anneal = kernels_cerebras::place::anneal::Anneal {
+        per_block: moves.unwrap_or(0),
         seed: get("--anneal-seed")
             .map_or(Ok(1), |v| v.parse())
             .map_err(|e| format!("--anneal-seed: {e}"))?,
@@ -337,6 +340,7 @@ fn stream(args: &[String]) -> Result<(), String> {
         .is_some_and(|d| d.values.contains(&reading));
     if reading == "decode" && !declared {
         // the decode step through the units, its caches `--positions` long (GENERIC.md G1)
+        anneal.per_block = moves.unwrap_or(kernels_cerebras::place::anneal::UNIT_PER_BLOCK);
         let positions: u32 = get("--positions")
             .map_or(Ok(4096), |r| r.parse())
             .map_err(|e| format!("--positions: {e}"))?;
