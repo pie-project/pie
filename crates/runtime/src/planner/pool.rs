@@ -156,7 +156,14 @@ pub trait PoolPort: Send + Sync + 'static {
         order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
-    fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache keyed above the floor down a tier, lowest key first;
+    /// with `up_to`, only cache keyed at or below it (what a demand keyed
+    /// so may take: a higher-keyed set stays for it).
+    fn prepare_demote(
+        &self,
+        room: usize,
+        up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn>;
     /// [`Self::prepare_sweep`] of the tails past the heads `order` names
     /// alone: those heads stay however few pages move.
     fn prepare_tail_sweep(
@@ -514,12 +521,16 @@ impl PoolPort for RegistryPool {
         .flatten()
     }
 
-    fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        room: usize,
+        up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         if !self.suspend_capable {
             return None;
         }
         self.with_kv_tagged("planner-demote", |kv| {
-            kv.prepare_demote(room, crate::policy::retention::Installed)
+            kv.prepare_demote(room, crate::policy::retention::Installed, up_to)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()

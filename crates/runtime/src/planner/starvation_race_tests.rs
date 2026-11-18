@@ -169,7 +169,11 @@ impl PoolPort for RacePool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }
@@ -1506,7 +1510,11 @@ impl PoolPort for RingPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }
@@ -2467,7 +2475,11 @@ impl PoolPort for BindRoomPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }
@@ -2946,4 +2958,78 @@ async fn a_process_is_re_keyed_when_its_row_lands() {
         planner.unregister(pid);
     }
     install(None);
+}
+
+/// PLEX's keys bound who a demand takes from: a key-15 process growing
+/// beside a key-20 live set, with a key-20 idle process and a handle at
+/// rest kept at 20, may park none of them; a key-10 idle process and a
+/// handle kept at 10 are its to park. With no lower set, it waits (the
+/// policy is asked) and the key-20 set keeps running.
+#[tokio::test(flavor = "current_thread")]
+async fn a_demand_parks_no_set_keyed_above_its_own() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let pids: Vec<ProcessId> = (0..6).map(|_| ProcessId::new_v4()).collect();
+    let (grower, high_live, high_idle, low_idle, high_rest, low_rest) =
+        (pids[0], pids[1], pids[2], pids[3], pids[4], pids[5]);
+    for &pid in &pids {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        for (pid, key) in [(grower, 15), (high_live, 20), (high_idle, 20), (low_idle, 10)] {
+            inner.procs.get_mut(&pid).unwrap().key = key;
+        }
+        for pid in [high_idle, low_idle] {
+            inner.procs.get_mut(&pid).unwrap().idle = true;
+        }
+        for (pid, kept) in [(high_rest, 20), (low_rest, 10)] {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.rest(1);
+            proc.kept = kept;
+            proc.holder = true;
+            proc.idle = true;
+        }
+        inner.enqueue(
+            grower,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members: HashSet<ProcessId> = planner
+        .victim_set()
+        .expect("the grower lacks pages")
+        .members
+        .iter()
+        .map(|victim| victim.pid)
+        .collect();
+    assert_eq!(
+        members,
+        HashSet::from([low_idle, low_rest]),
+        "only what is keyed at or below 15"
+    );
+    // With no lower set, nothing is the grower's to park: the key-20 sets
+    // stay resident and the grower waits.
+    planner.with_inner(|inner| {
+        inner.procs.remove(&low_idle);
+        inner.procs.remove(&low_rest);
+    });
+    assert!(
+        planner
+            .victim_set()
+            .is_none_or(|victims| victims.members.is_empty()),
+        "no higher-keyed set is a victim"
+    );
+    planner.plan_eviction();
+    let states = planner.with_inner(|inner| {
+        [high_live, high_idle, high_rest].map(|pid| inner.procs[&pid].state)
+    });
+    assert!(
+        states.iter().all(|state| *state == Residency::Resident),
+        "the key-20 sets keep running: {states:?}"
+    );
 }

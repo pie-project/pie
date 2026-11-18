@@ -991,10 +991,13 @@ impl KvStore {
     /// what lands on disk as its copies, journaled. Only cache keyed above
     /// the retention floor ([`retention::above_floor`]) moves: the rest is
     /// dropped when its room is wanted, never copied down.
+    /// With `up_to`, only groups keyed at or below it go: what a demand
+    /// keyed so may take. A higher-keyed group stays for it.
     pub fn prepare_demote(
         &mut self,
         room: usize,
         keys: impl Keys,
+        up_to: Option<i64>,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // Free slots only: a demote gives up no copy for idle cache.
         let room = room.min(self.host_pool.available() + self.disk_pool.available());
@@ -1004,6 +1007,7 @@ impl KvStore {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut groups = self.reclaim_order(&keys);
+        groups.retain(|(key, _)| up_to.is_none_or(|up_to| *key <= up_to));
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {

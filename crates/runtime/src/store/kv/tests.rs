@@ -90,6 +90,7 @@ fn tests_every_case() {
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
     keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free();
+    a_demand_demotes_no_cache_keyed_above_its_own();
     floor_keyed_idle_cache_is_dropped_not_demoted();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1103,7 +1104,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     let owner = ProcessId::from_u128(21);
     let tokens = kept_and_gone(&mut store, 12, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| 1)
+        .prepare_demote(8, |_| 1, None)
         .unwrap()
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
@@ -1146,7 +1147,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
 fn a_suspend_short_of_host_room_drops_host_cache_first() {
     let mut store = KvStore::new_with_swap(8, 3, 4, h(32));
     kept_and_gone(&mut store, 13, 3, ProcessId::from_u128(22));
-    let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
+    let txn = store.prepare_demote(8, |_| 1, None).unwrap().unwrap();
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
     let running = store.create_working_set();
@@ -1207,7 +1208,7 @@ fn a_demote_leaves_what_a_higher_key_covers() {
         entries: vec![(a, None, 1), (a, Some(32), 10)],
     };
     let txn = store
-        .prepare_demote(8, keys.clone())
+        .prepare_demote(8, keys.clone(), None)
         .unwrap()
         .expect("the tail goes to the host");
     assert_eq!(
@@ -1237,12 +1238,45 @@ fn keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free() {
         entries: vec![(a, None, 10), (b, None, 1)],
     };
     let txn = store
-        .prepare_demote(8, keys)
+        .prepare_demote(8, keys, None)
         .unwrap()
         .expect("the higher set goes: the lower one cannot free a page");
     assert_eq!(txn.page_count(), 4);
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &b_tokens), 4, "what the reader reads stays");
+}
+
+/// The conform shape: A kept at 20, B at 10, and a demand keyed 15 (a
+/// running filler growing). B goes; A, keyed above the demand, stays on
+/// the device however much the demand lacks. A demand keyed 20 takes A.
+/// Keyed alike (no policy), demotion is as it was.
+fn a_demand_demotes_no_cache_keyed_above_its_own() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(41));
+    store.set_page_size(16);
+    let (a, b) = (ProcessId::from_u128(51), ProcessId::from_u128(52));
+    let (a_tokens, b_tokens) = (prompt(23, 4), prompt(24, 4));
+    sealed_and_gone(&mut store, &a_tokens, a);
+    sealed_and_gone(&mut store, &b_tokens, b);
+    let keys = Steps {
+        entries: vec![(a, None, 20), (b, None, 10)],
+    };
+    let txn = store
+        .prepare_demote(16, keys.clone(), Some(15))
+        .unwrap()
+        .expect("B, keyed below the demand, goes");
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(on_device(&mut store, &b_tokens), 0);
+    assert!(
+        store.prepare_demote(16, keys.clone(), Some(15)).unwrap().is_none(),
+        "A, keyed above the demand, stays"
+    );
+    assert_eq!(on_device(&mut store, &a_tokens), 4, "A survives the pressure");
+    let txn = store
+        .prepare_demote(16, keys, Some(20))
+        .unwrap()
+        .expect("a demand keyed alike takes it");
+    assert_eq!(txn.page_count(), 4);
+    store.commit_suspend(txn).unwrap();
 }
 
 /// Idle cache no policy keys above the floor is not copied down a tier
@@ -1254,11 +1288,11 @@ fn floor_keyed_idle_cache_is_dropped_not_demoted() {
     let owner = ProcessId::from_u128(45);
     let tokens = kept_and_gone(&mut store, 18, 3, owner);
     assert!(
-        store.prepare_demote(8, |_| FLOOR).unwrap().is_none(),
+        store.prepare_demote(8, |_| FLOOR, None).unwrap().is_none(),
         "nothing moves at the floor"
     );
     assert!(
-        store.prepare_demote(8, |_| FLOOR - 1).unwrap().is_none(),
+        store.prepare_demote(8, |_| FLOOR - 1, None).unwrap().is_none(),
         "nor below it"
     );
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
@@ -1272,7 +1306,7 @@ fn floor_keyed_idle_cache_is_dropped_not_demoted() {
 
     let tokens = kept_and_gone(&mut store, 19, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| FLOOR + 1)
+        .prepare_demote(8, |_| FLOOR + 1, None)
         .unwrap()
         .expect("keyed above the floor, it moves");
     use ::engine::transfer::MemoryDomain::HostPinned;

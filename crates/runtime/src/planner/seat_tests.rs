@@ -277,7 +277,11 @@ impl PoolPort for GrowingPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }
