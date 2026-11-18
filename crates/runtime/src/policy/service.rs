@@ -407,22 +407,36 @@ fn nothing_left_ends(tier: Tier, why: &'static str) {
 }
 
 /// The default tier-pressure responder (see [`pressure::choose`]): for each
-/// pressed tier, discards working sets lowest retention key first until what
-/// they free covers the shortfall. Policy-layer code with the policy's own
-/// verb; the stores only carry the discards out. Answers what it discarded.
+/// pressed tier, frees working sets lowest retention key first until what
+/// they free covers the shortfall, within what the demand it serves may
+/// take ([`pressure::Demand`]): only sets keyed at or below the demand's
+/// key, and a higher-keyed one only where nothing running will free room
+/// and then only moved down. A device set moves down a tier where the
+/// tiers below have room ([`Cache::demote`]), and is discarded only where it
+/// cannot. Policy-layer code with the policy's own verb; the stores only
+/// carry the moves and discards out. Answers what it discarded.
 fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) -> Vec<ProcessId> {
     let mut discarded = Vec::new();
     for &tier in pressed {
         let short = registry.pressure[tier.index()].short;
+        let demand = registry.pressure[tier.index()].demand;
         if short == 0 {
             nothing_left_ends(tier, "the tier is short no more");
             continue;
         }
+        let below = tier == Tier::Device && (registry.cache.swap)().1 > 0;
         let candidates = registry
             .snapshot()
             .candidates_for(tier, keys)
             .into_iter()
             .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
+            .filter(|c| {
+                if below && !registry.handles.contains_key(&ProcessId::from_str(&c.id).unwrap()) {
+                    demand.may_demote(c.key)
+                } else {
+                    demand.may_discard(c.key)
+                }
+            })
             .collect();
         let chosen = pressure::choose(candidates, short);
         if chosen.is_empty() {
@@ -448,11 +462,29 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
             let Ok(owner) = ProcessId::from_str(&id) else {
                 continue;
             };
+            let key = keys.key_at(Some(owner), 0);
+            // Cache moves down where a tier below has room: kept, not lost.
+            if below && !registry.handles.contains_key(&owner) && (registry.cache.demote)(owner) {
+                tracing::info!(
+                    tier = tier.name(),
+                    short,
+                    working_set = %owner,
+                    key,
+                    up_to = ?demand.up_to,
+                    "tier pressure: the default responder moves a working set down a tier"
+                );
+                continue;
+            }
+            // What cannot move down is discarded only within the demand's key.
+            if !demand.may_discard(key) {
+                continue;
+            }
             tracing::info!(
                 tier = tier.name(),
                 short,
                 working_set = %owner,
-                key = keys.key_at(Some(owner), 0),
+                key,
+                up_to = ?demand.up_to,
                 "tier pressure: the default responder discards a working set"
             );
             discard(registry, owner, || {
@@ -470,6 +502,10 @@ struct Cache {
     owns: fn(ProcessId) -> bool,
     list: fn() -> (Vec<CachedWorkingSet>, u32),
     discard: fn(ProcessId),
+    /// Moves `owner`'s idle cache down a tier (device to host, then disk),
+    /// never dropping it: whether a move is on its way (no lower tier with
+    /// room, or nothing of it on the device, answers false).
+    demote: fn(ProcessId) -> bool,
     memory: fn() -> (u64, u64),
     swap: fn() -> (u64, u64),
     /// Recurrent state slots on the device, then where they rest: capacity
@@ -563,6 +599,11 @@ const STORES: Cache = Cache {
     bytes: pressure::meter_bytes,
     scale: pressure::common_scale,
     fire: crate::engine::fire_limits,
+    demote: |owner| {
+        crate::planner::planners()
+            .iter()
+            .fold(false, |moved, planner| planner.demote_owner(owner) || moved)
+    },
     discard: |owner| {
         let mut freed = 0;
         for stores in store_registry::all_for_model(0) {
@@ -1393,6 +1434,7 @@ mod tests {
         owns: |_| false,
         list: || (Vec::new(), 16),
         discard: |_| {},
+        demote: |_| false,
         memory: || (100, 40),
         swap: || (400, 300),
         state: || (4, 1),
@@ -1510,6 +1552,7 @@ mod tests {
             (sets, 16)
         },
         discard: |_| {},
+        demote: |_| false,
         memory: || (100, 40),
         swap: || (400, 300),
         state: || (4, 1),
@@ -1519,6 +1562,117 @@ mod tests {
         scale: || None,
         fire: || Some((5120, 256)),
     };
+
+    static BOUND_SETS: std::sync::Mutex<Vec<(ProcessId, u64)>> = std::sync::Mutex::new(Vec::new());
+    static BOUND_GONE: std::sync::Mutex<Vec<(ProcessId, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    static BOUND_BELOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    /// Idle sets of one page each that say whether they were moved down or
+    /// discarded, and a tier below with room or none.
+    const BOUND_CACHE: Cache = Cache {
+        owns: |owner| BOUND_SETS.lock().unwrap().iter().any(|(o, _)| *o == owner),
+        list: || {
+            let now = crate::rt::Instant::now();
+            let sets = BOUND_SETS
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(owner, pages)| CachedWorkingSet {
+                    owner,
+                    entries: 1,
+                    pages,
+                    last_use: now,
+                })
+                .collect();
+            (sets, 16)
+        },
+        discard: |owner| {
+            BOUND_SETS.lock().unwrap().retain(|(o, _)| *o != owner);
+            BOUND_GONE.lock().unwrap().push((owner, "discarded"));
+        },
+        demote: |owner| {
+            let below = BOUND_BELOW.load(std::sync::atomic::Ordering::SeqCst);
+            if below {
+                BOUND_SETS.lock().unwrap().retain(|(o, _)| *o != owner);
+                BOUND_GONE.lock().unwrap().push((owner, "moved down"));
+            }
+            below
+        },
+        memory: || (100, 40),
+        swap: || (400, 300),
+        state: || (4, 1),
+        state_swap: || (8, 3),
+        resident: |_| None,
+        bytes: |_| None,
+        scale: || {
+            Some(pressure::Scale {
+                kv_page_bytes: 1,
+                state_slot_bytes: 0,
+            })
+        },
+        fire: || Some((5120, 256)),
+    };
+
+    /// The default responder takes for a demand only what its key lets it:
+    /// sets keyed at or below it, moved down a tier where one below has room
+    /// and discarded where none has; above it, a set only moves down, and
+    /// only where nothing running will free room. A6000's conform: three
+    /// key-15 sets did not cover the shortfall, and the key-20 set was
+    /// discarded next for a lower-keyed ask.
+    #[test]
+    fn the_default_responder_takes_only_what_the_demand_s_key_lets_it() {
+        let (low, mid, high) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+        let keys = move |owner: Option<ProcessId>| -> i64 {
+            match owner {
+                Some(o) if o == low => 5,
+                Some(o) if o == mid => 15,
+                Some(o) if o == high => 20,
+                _ => 0,
+            }
+        };
+        let round = |up_to: Option<i64>, stalled: bool, below: bool| {
+            *BOUND_SETS.lock().unwrap() = vec![(low, 1), (mid, 1), (high, 1)];
+            BOUND_GONE.lock().unwrap().clear();
+            BOUND_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
+            let mut registry = Registry::new(BOUND_CACHE);
+            registry.pressure[Tier::Device.index()] = Reading {
+                short: 3,
+                demand: pressure::Demand { up_to, stalled },
+                ..Reading::default()
+            };
+            respond(&registry, &[Tier::Device], &keys);
+            let mut gone = BOUND_GONE.lock().unwrap().clone();
+            gone.sort_by_key(|(o, _)| keys(Some(*o)));
+            gone
+        };
+        assert_eq!(
+            round(Some(15), false, true),
+            vec![(low, "moved down"), (mid, "moved down")],
+            "at or below the demand's key, moved down: the tier below has room"
+        );
+        assert_eq!(
+            round(Some(15), false, false),
+            vec![(low, "discarded"), (mid, "discarded")],
+            "no tier below with room: discarded, still within the key"
+        );
+        assert_eq!(
+            round(Some(15), true, true),
+            vec![(low, "moved down"), (mid, "moved down"), (high, "moved down")],
+            "nothing running frees room: the higher set moves down too"
+        );
+        assert_eq!(
+            round(Some(15), true, false),
+            vec![(low, "discarded"), (mid, "discarded")],
+            "and is never discarded"
+        );
+        assert_eq!(
+            round(None, false, false).len(),
+            3,
+            "a demand no key bounds takes as before"
+        );
+        BOUND_SETS.lock().unwrap().clear();
+    }
 
     #[test]
     fn a_resting_handle_is_a_working_set_the_policy_reads_and_may_discard() {

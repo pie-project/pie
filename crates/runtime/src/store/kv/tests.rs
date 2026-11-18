@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::KvStore;
+use super::{DemoteBound, KvStore};
 use super::hash::Hash256;
 use super::page_table::{
     KvPageBacking, KvPageTable, NoReclaim, PhysicalKvPageId, PublishedPage, ReclaimQuote,
@@ -92,6 +92,7 @@ fn tests_every_case() {
     keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free();
     a_demand_demotes_no_cache_keyed_above_its_own();
     on_the_host_the_lower_set_goes_first();
+    a_demand_may_always_demote_its_own_cache();
     floor_keyed_idle_cache_is_dropped_not_demoted();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1262,18 +1263,18 @@ fn a_demand_demotes_no_cache_keyed_above_its_own() {
         entries: vec![(a, None, 20), (b, None, 10)],
     };
     let txn = store
-        .prepare_demote(16, keys.clone(), Some(15))
+        .prepare_demote(16, keys.clone(), Some(DemoteBound { up_to: 15, own: None }))
         .unwrap()
         .expect("B, keyed below the demand, goes");
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert!(
-        store.prepare_demote(16, keys.clone(), Some(15)).unwrap().is_none(),
+        store.prepare_demote(16, keys.clone(), Some(DemoteBound { up_to: 15, own: None })).unwrap().is_none(),
         "A, keyed above the demand, stays"
     );
     assert_eq!(on_device(&mut store, &a_tokens), 4, "A survives the pressure");
     let txn = store
-        .prepare_demote(16, keys, Some(20))
+        .prepare_demote(16, keys, Some(DemoteBound { up_to: 20, own: None }))
         .unwrap()
         .expect("a demand keyed alike takes it");
     assert_eq!(txn.page_count(), 4);
@@ -1316,6 +1317,35 @@ fn on_the_host_the_lower_set_goes_first() {
     };
     assert_eq!(below(&mut store, &b_tokens), 0, "the lower one is gone");
     assert_eq!(below(&mut store, &a_tokens), 4, "the higher one stays on the host");
+}
+
+/// A6000's shape: one process sealed a set kept at 20 that fills the
+/// device, and its next ask is keyed lower: the ask may move its own cache
+/// down a tier whatever the keys, and the set survives on the host.
+fn a_demand_may_always_demote_its_own_cache() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(45));
+    store.set_page_size(16);
+    let (asker, other) = (ProcessId::from_u128(55), ProcessId::from_u128(56));
+    let tokens = prompt(27, 4);
+    sealed_and_gone(&mut store, &tokens, asker);
+    let keys = Steps {
+        entries: vec![(asker, None, 20)],
+    };
+    let bound = |own| DemoteBound { up_to: 0, own };
+    assert!(
+        store.prepare_demote(8, keys.clone(), Some(bound(Some(other)))).unwrap().is_none(),
+        "another's ask keyed 0 takes nothing keyed 20"
+    );
+    let txn = store
+        .prepare_demote(8, keys, Some(bound(Some(asker))))
+        .unwrap()
+        .expect("its own cache goes down for it");
+    assert_eq!(txn.page_count(), 4);
+    store.commit_suspend(txn).unwrap();
+    let probe = store.create_working_set();
+    let found = keys_ahead(&store, probe, 0, &tokens);
+    store.release_working_set(probe, store.current_epoch());
+    assert_eq!(store.cached_run_any_tier(&found).len(), 4, "kept on the host");
 }
 
 /// Idle cache no policy keys above the floor is not copied down a tier

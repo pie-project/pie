@@ -15,6 +15,8 @@ use crate::store::rs::RsUnits;
 /// `sizes` names.
 struct SizedPool {
     total: u32,
+    /// Free host slots: room below the device.
+    host: u32,
     sizes: parking_lot::Mutex<HashMap<ProcessId, u64>>,
 }
 
@@ -36,7 +38,7 @@ impl PoolPort for SizedPool {
         }
     }
     fn host_stats(&self) -> (u32, u32) {
-        (0, 0)
+        (self.host, self.host)
     }
     fn disk_stats(&self) -> (u32, u32) {
         (0, 0)
@@ -85,7 +87,7 @@ impl PoolPort for SizedPool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _up_to: Option<i64>,
+        _bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -114,8 +116,19 @@ fn device(
     sized: &[(ProcessId, u64)],
     seats: usize,
 ) -> (Arc<ResidencyPlanner>, Arc<OrderedSemaphore>) {
+    device_with_host(total, 0, sized, seats)
+}
+
+/// [`device`] with `host` free slots below the device.
+fn device_with_host(
+    total: u32,
+    host: u32,
+    sized: &[(ProcessId, u64)],
+    seats: usize,
+) -> (Arc<ResidencyPlanner>, Arc<OrderedSemaphore>) {
     let pool = SizedPool {
         total,
+        host,
         sizes: parking_lot::Mutex::new(sized.iter().copied().collect()),
     };
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool)));
@@ -389,5 +402,29 @@ async fn stated_seats_cap_admission_whatever_room_stands() {
     settle().await;
     assert_eq!(drain(&mut rx).len(), 1, "a freed seat lets one more in");
     drop(running);
+    schedule::install(None);
+}
+
+/// Admission counts the tiers: a waiter whose set does not fit the device
+/// beside the running is admitted where what it lacks there the planner may
+/// move below for it (sets keyed below it, as far as the host has room);
+/// not where only higher-keyed sets could move; never past the device and
+/// the host together.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_counts_the_room_below_the_device_under_the_key_bound() {
+    let _schedule = schedule::TEST_LOCK.write().await;
+    let (a, b, c) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    let sized = [(a, 3), (b, 3), (c, 3)];
+    let case = |keys: [i64; 3], host: u32| {
+        schedule::install(Some(Table::new(
+            HashMap::from([(a, keys[0]), (b, keys[1]), (c, keys[2])]),
+            None,
+        )));
+        let (planner, _gate) = device_with_host(6, host, &sized, 8);
+        planner.admits(c, &[a, b])
+    };
+    assert!(case([1, 1, 5], 8), "lower-keyed sets can move to the host for it");
+    assert!(!case([9, 9, 5], 8), "only higher-keyed sets could move: it waits");
+    assert!(!case([1, 1, 5], 2), "never past the device and the host together");
     schedule::install(None);
 }

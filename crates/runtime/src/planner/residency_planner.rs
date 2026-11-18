@@ -226,6 +226,13 @@ impl ResidencyPlanner {
             short.retain(|id| waiting.contains(&id));
             short.take_said()
         };
+        // Whose demand it is: the head's key bounds what the responder takes
+        // (the head ranks first, so its key is the highest the waiters
+        // carry), and a fleet standing still lets higher-keyed sets move down.
+        let demand = crate::policy::pressure::Demand {
+            up_to: self.head_key(),
+            stalled: self.is_wedged(),
+        };
         for (tier, bytes) in said {
             // What the weight cache gave back comes free as the fires
             // reading it retire; the next report says what is still short.
@@ -239,7 +246,7 @@ impl ResidencyPlanner {
                 );
                 continue;
             }
-            (self.sink)(tier, bytes);
+            (self.sink)(tier, bytes, demand);
         }
     }
 
@@ -388,11 +395,43 @@ impl ResidencyPlanner {
         let (disk_free, _) = self.port.disk_stats();
         let room = (host_free.saturating_sub(reserve) + disk_free).min(wanted.max(1));
         // The demand is the head's: it takes cache keyed at or below its own
-        // key, never above (PLEX's keys say which survives; equal keys take
-        // from each other, so a run with no policy demotes as it did).
-        let up_to = self.head_key();
+        // key, and its own, never above (PLEX's keys say which survives;
+        // equal keys take from each other, so a run with no policy demotes
+        // as it did). Where nothing it may take is left and nothing running
+        // will free room (the fleet stands still), higher-keyed cache moves
+        // down a tier for it, lowest key first: kept, never dropped, so
+        // over-demand runs slower and is never refused.
+        let bound = self.head_bound();
+        let mut txn = (room > 0)
+            .then(|| self.port.prepare_demote(room as usize, bound))
+            .flatten();
+        if txn.is_none() && bound.is_some() && room > 0 && self.is_wedged() {
+            txn = self.port.prepare_demote(room as usize, None);
+        }
+        let Some(txn) = txn else {
+            self.demoting.store(false, Ordering::Release);
+            return false;
+        };
+        exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
+        true
+    }
+
+    /// Moves `owner`'s idle cache on this device down a tier, whatever its
+    /// key (the policy layer chose it), as far as the tiers below have room
+    /// past the host's reserve: whether a move is on its way.
+    pub fn demote_owner(self: &Arc<Self>, owner: ProcessId) -> bool {
+        if !self.port.suspend_capable() || self.demoting.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let (host_free, host_total) = self.port.host_stats();
+        let (disk_free, _) = self.port.disk_stats();
+        let room = host_free.saturating_sub(host_total / HOST_RESERVE_DIVISOR) + disk_free;
+        let bound = crate::store::kv::DemoteBound {
+            up_to: i64::MIN,
+            own: Some(owner),
+        };
         let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize, up_to))
+            .then(|| self.port.prepare_demote(room as usize, Some(bound)))
             .flatten();
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
@@ -419,13 +458,30 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// The policy key of the process whose demand heads the queue: what it
-    /// may take from others is keyed at or below it.
-    pub(super) fn head_key(&self) -> Option<i64> {
-        self.with_counts(|inner| {
-            let (_, waiter) = inner.unmet_head()?;
-            inner.procs.get(&waiter.pid).map(|proc| proc.key)
+    /// What the demand heading the queue may demote: idle cache keyed at
+    /// or below its process's key, and its own. A process the policy has
+    /// not keyed yet (its row not landed) carries no key to bound it.
+    pub(super) fn head_bound(&self) -> Option<crate::store::kv::DemoteBound> {
+        let up_to = self.head_key()?;
+        let pid = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid))?;
+        Some(crate::store::kv::DemoteBound {
+            up_to,
+            own: Some(crate::policy::schedule::plex_id(pid)),
         })
+    }
+
+    /// The policy key of the process whose demand heads the queue, where the
+    /// installed table names it: what it may take from others is keyed at
+    /// or below it. `None` (no bound) for a process no row keys yet: a
+    /// default placeholder would bound a fresh arrival below every kept set.
+    pub(super) fn head_key(&self) -> Option<i64> {
+        let (pid, key) = self.with_counts(|inner| {
+            let (_, waiter) = inner.unmet_head()?;
+            inner.procs.get(&waiter.pid).map(|proc| (waiter.pid, proc.key))
+        })?;
+        crate::policy::schedule::current()
+            .is_some_and(|table| table.names(pid))
+            .then_some(key)
     }
 
     pub(super) fn re_arm_idle_reclaim(&self) {
@@ -448,8 +504,9 @@ impl ResidencyPlanner {
         let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
         let (model, engine) = self.port.locus();
         // A set at rest keyed above the head's demand stays for it, as idle
-        // cache keyed so does ([`Self::demote_idle`]).
-        let up_to = self.head_key();
+        // cache keyed so does ([`Self::demote_idle`]), while running work
+        // will free room; with the fleet standing still, it moves down.
+        let up_to = if self.is_wedged() { None } else { self.head_key() };
         let mut above: Vec<ProcessId> = Vec::new();
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set
@@ -1209,8 +1266,10 @@ impl ResidencyPlanner {
     /// client, or a handle's stand-in, asks for no room until it runs
     /// again. With none running, it is admitted: one runs, whatever it
     /// asks (a set that can never fit is refused by name where it asks).
-    /// Whether the running among `admitted` fill the device room: no next
-    /// process fits beside them, its first step a page at the least.
+    /// Whether the running among `admitted` fill every tier: no next
+    /// process, its first step a page at the least, fits beside them on
+    /// the device, even once all they hold there and all idle cache moved
+    /// below it as far as the swap has room.
     pub fn full(&self, admitted: &[ProcessId]) -> bool {
         let running: Vec<ProcessId> = self.with_counts(|inner| {
             admitted
@@ -1224,27 +1283,54 @@ impl ResidencyPlanner {
                 })
                 .collect()
         });
-        !running.is_empty()
-            && self.port.working_set_pages(&running).total()
-                >= u64::from(self.port.device_stats().1)
+        if running.is_empty() {
+            return false;
+        }
+        let parts = self.port.working_set_pages(&running);
+        let movable = parts
+            .resident
+            .saturating_add(parts.roles)
+            .saturating_add(self.port.idle_pages_up_to(i64::MAX));
+        let room = u64::from(self.port.device_stats().1)
+            .saturating_add(movable.min(u64::from(self.swap_stats().0)));
+        parts.total() >= room
     }
 
+    /// Whether `pid` is admitted beside `admitted` (the processes holding
+    /// execution seats; those of other devices are not weighed here): the
+    /// working sets of those running and `pid`'s own with its next step fit
+    /// the device, or what they lack there the planner may move below it
+    /// for `pid` under its key (idle cache, and the running sets it may
+    /// park: keyed below it, or alike and younger), as far as the swap has
+    /// room. Never past the device and the swap together. A process waiting
+    /// on its client, or a handle's stand-in, asks for no room until it
+    /// runs again. With none running, it is admitted: one runs, whatever it
+    /// asks (a set that can never fit is refused by name where it asks).
     pub fn admits(&self, pid: ProcessId, admitted: &[ProcessId]) -> bool {
-        let (mut running, next_step) = self.with_counts(|inner| {
+        let (mut running, parkable, next_step, key) = self.with_counts(|inner| {
+            let rank = inner.procs.get(&pid).map(Proc::rank);
+            let mut parkable = Vec::new();
             let running: Vec<ProcessId> = admitted
                 .iter()
                 .copied()
                 .filter(|other| *other != pid)
                 .filter(|other| {
-                    inner
-                        .procs
-                        .get(other)
-                        .is_some_and(|proc| !proc.holder && !proc.idle)
+                    let Some(proc) = inner.procs.get(other) else {
+                        return false;
+                    };
+                    let runs = !proc.holder && !proc.idle;
+                    if runs && rank.is_some_and(|rank| proc.rank() > rank) {
+                        parkable.push(*other);
+                    }
+                    runs
                 })
                 .collect();
+            let proc = inner.procs.get(&pid);
             (
                 running,
-                inner.procs.get(&pid).map_or(0, |proc| proc.next_step),
+                parkable,
+                proc.map_or(0, |proc| proc.next_step),
+                proc.map_or(0, |proc| proc.key),
             )
         });
         if running.is_empty() {
@@ -1255,12 +1341,25 @@ impl ResidencyPlanner {
         let parts = self.port.working_set_pages(&running);
         let need = parts.total().saturating_add(next_step);
         let (free, total) = self.port.device_stats();
-        let fits = need <= u64::from(total);
+        if need <= u64::from(total) {
+            return true;
+        }
+        let short = need - u64::from(total);
+        let parked = self.port.working_set_pages(&parkable);
+        let idle = self.port.idle_pages_up_to(key);
+        let swap_free = u64::from(self.swap_stats().0);
+        let movable = parked
+            .resident
+            .saturating_add(parked.roles)
+            .saturating_add(idle)
+            .min(swap_free);
+        let fits = short <= movable;
         if !fits && tracing::enabled!(target: "pie::admission", tracing::Level::DEBUG) {
             let own = self.port.working_set_pages(&[pid]);
             tracing::debug!(
                 target: "pie::admission",
                 %pid,
+                key,
                 running = running.len() - 1,
                 total,
                 need,
@@ -1273,7 +1372,10 @@ impl ResidencyPlanner {
                 own_reserved = own.reserved,
                 own_roles = own.roles,
                 free,
-                idle = self.port.reclaimable_idle(),
+                parkable = parkable.len(),
+                parkable_resident = parked.resident,
+                idle,
+                swap_free,
                 "refused for room"
             );
         }

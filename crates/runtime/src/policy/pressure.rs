@@ -110,6 +110,52 @@ pub struct Reading {
     pub band: Band,
     /// What every waiter on the tier is short of, in bytes.
     pub short: u64,
+    /// Whose demand the shortfall is: what may be taken for it.
+    pub demand: Demand,
+}
+
+/// The demand a tier's shortfall serves, as its raisers state it: what
+/// the default responder may take for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Demand {
+    /// The highest policy key among the short waiters: idle sets keyed at
+    /// or below it may be discarded or moved down for them. `None`: a
+    /// waiter no key bounds (no row keys it), so nothing bounds the take.
+    pub up_to: Option<i64>,
+    /// Nothing running will free room (every raiser's fleet stands still):
+    /// sets keyed above `up_to` may move down a tier for it, never be
+    /// discarded.
+    pub stalled: bool,
+}
+
+impl Demand {
+    /// Several raisers' demands as one: unbounded where any is, else the
+    /// highest key; stalled only where all are.
+    fn join(demands: impl IntoIterator<Item = Demand>) -> Demand {
+        let mut joined: Option<Demand> = None;
+        for demand in demands {
+            joined = Some(match joined {
+                None => demand,
+                Some(sum) => Demand {
+                    up_to: sum.up_to.zip(demand.up_to).map(|(a, b)| a.max(b)),
+                    stalled: sum.stalled && demand.stalled,
+                },
+            });
+        }
+        joined.unwrap_or_default()
+    }
+
+    /// Whether a set keyed `key` may be discarded for this demand.
+    #[must_use]
+    pub fn may_discard(&self, key: i64) -> bool {
+        self.up_to.is_none_or(|up_to| key <= up_to)
+    }
+
+    /// Whether a set keyed `key` may move down a tier for this demand.
+    #[must_use]
+    pub fn may_demote(&self, key: i64) -> bool {
+        self.stalled || self.may_discard(key)
+    }
 }
 
 /// A tier's bytes, as the worker policy reads them.
@@ -189,6 +235,8 @@ pub struct Scale {
 struct Gauge {
     /// Short bytes by who raised them (an engine's planner).
     short: BTreeMap<usize, u64>,
+    /// The demand each raiser's shortfall serves.
+    demand: BTreeMap<usize, Demand>,
     band: Band,
     reported: Option<Instant>,
 }
@@ -197,6 +245,7 @@ impl Gauge {
     const fn new() -> Self {
         Self {
             short: BTreeMap::new(),
+            demand: BTreeMap::new(),
             band: Band::Clear,
             reported: None,
         }
@@ -247,26 +296,40 @@ static SCALES: RwLock<Vec<Scale>> = RwLock::new(Vec::new());
 /// served. The worker policy hears of it when the tier's band changes; the
 /// default responder, whenever the shortfall changes or stands for a while.
 pub fn raise(tier: Tier, from: usize, short_bytes: u64) {
+    raise_for(tier, from, short_bytes, Demand::default());
+}
+
+/// [`raise`], saying whose demand the shortfall serves: what the default
+/// responder may take for it.
+pub fn raise_for(tier: Tier, from: usize, short_bytes: u64, demand: Demand) {
     let total = meter_bytes(tier).map_or(0, |bytes| bytes.total);
     let reading = {
         let mut gauges = GAUGES.lock().unwrap();
         let gauge = &mut gauges[tier.index()];
         let before = gauge.short();
+        let demand_before = Demand::join(gauge.demand.values().copied());
         if short_bytes == 0 {
             gauge.short.remove(&from);
+            gauge.demand.remove(&from);
         } else {
             gauge.short.insert(from, short_bytes);
+            gauge.demand.insert(from, demand);
         }
         let short = gauge.short();
+        let demand = Demand::join(gauge.demand.values().copied());
         let band = Band::of(gauge.band, short, total);
         let now = Instant::now();
         let stale = short > 0 && gauge.reported.is_none_or(|at| now - at >= AGAIN);
-        if band == gauge.band && short == before && !stale {
+        if band == gauge.band && short == before && demand == demand_before && !stale {
             return;
         }
         gauge.band = band;
         gauge.reported = Some(now);
-        Reading { band, short }
+        Reading {
+            band,
+            short,
+            demand,
+        }
     };
     tracing::debug!(
         tier = tier.name(),
@@ -289,6 +352,7 @@ pub fn reading(tier: Tier) -> Reading {
     Reading {
         band: gauge.band,
         short: gauge.short(),
+        demand: Demand::join(gauge.demand.values().copied()),
     }
 }
 
