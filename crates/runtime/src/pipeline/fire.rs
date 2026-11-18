@@ -1052,8 +1052,14 @@ struct RungAsk {
     /// Held (the walker cuts nothing under it) until dropped.
     want: crate::store::shared::RungWant,
     /// The room the rung lacks for it, asked of the planner beside the
-    /// pass; `None` where fires may take the rows now.
-    funding: Option<RaiseFunding>,
+    /// pass; `None` where fires may take the rows now. Started again by a
+    /// fire that waits on the rung with none under way ([`Self::wait`]).
+    funding: Mutex<Option<RaiseFunding>>,
+    /// Starts the funding of a raise for so many rows; `None` where no
+    /// shared pool steers the rung (the cap never moves).
+    fund: Option<Box<dyn Fn(u32) -> RaiseFunding + Send + Sync>>,
+    /// The rows the pass asked.
+    rows: u32,
 }
 
 /// Asks the rung on `engine` for the `rows` a fire of a pass of `own` rows
@@ -1069,31 +1075,34 @@ fn ask_rung(
     own: usize,
     rows: u32,
 ) -> Option<RungAsk> {
-    if own <= 1 && rows <= crate::store::shared::fire_cap(engine) {
+    if own <= 1 && rows <= 1 {
         return None;
     }
     // Held before the cap is read: the walker takes no cap down past an
     // ask, and `raise_now` lifts one it took before, both in the pool's
     // lock.
     let want = crate::store::shared::want_rows(engine, rows);
-    let funding = stores.shared.as_ref().and_then(|shared| {
+    let fund = stores.shared.clone().map(|shared| {
+        let kv = stores.kv.clone();
+        Box::new(move |rows: u32| {
+            let kv = kv.clone();
+            RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
+                crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| kv.current_epoch())
+            })
+        }) as Box<dyn Fn(u32) -> RaiseFunding + Send + Sync>
+    });
+    let funding = stores.shared.as_ref().zip(fund.as_ref()).and_then(|(shared, fund)| {
         crate::store::shared::raise_now(shared, engine, rows);
-        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
-            || {
-                let kv = stores.kv.clone();
-                RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
-                    crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
-                        kv.current_epoch()
-                    })
-                })
-            },
-        )
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
+            .then(|| fund(rows))
     });
     Some(RungAsk {
         engine,
         pid,
         want,
-        funding,
+        funding: Mutex::new(funding),
+        fund,
+        rows,
     })
 }
 
@@ -1107,6 +1116,15 @@ impl RungAsk {
         // with; the frame is not what funds it).
         if crate::store::shared::fire_cap(self.engine) < width {
             crate::scheduler::worker::notify_owner_waits(self.engine, self.pid);
+            // A fire past the cap always has its raise funded: one asked
+            // under a cap that covered it starts it now, never waiting on
+            // (or staged past) a raise nobody asks for.
+            let mut funding = self.funding.lock().unwrap();
+            if funding.is_none()
+                && let Some(fund) = &self.fund
+            {
+                *funding = Some(fund(self.rows.max(width)));
+            }
         }
         crate::inferlet::process::said(
             "enqueue: the activation rung",
@@ -1114,9 +1132,15 @@ impl RungAsk {
             wait_for_rung(
                 self.engine,
                 width,
-                self.funding
-                    .as_ref()
-                    .map(|funding| move || funding.failed()),
+                self.fund.as_ref().map(|_| {
+                    || {
+                        self.funding
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(RaiseFunding::failed)
+                    }
+                }),
             ),
         )
         .await
@@ -6467,6 +6491,30 @@ mod rung_wait_tests {
         );
         drop(ask);
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// A pass asked the rung under a cap that covered it, so funded no
+    /// raise; the cap came down before its fire was staged. Its fire never
+    /// goes past the cap (a frame left out for it waits on a raise nobody
+    /// asks for): it waits, its raise funded from the wait, and goes once
+    /// the rung is back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_past_a_cap_lowered_since_its_ask_funds_its_raise_and_waits() {
+        const ENGINE: usize = 9213;
+        let stores = super::unfolded_tests::pool_with_rungs(vec![(1, 1), (2, 2), (4, 3)]);
+        let pid = uuid::Uuid::new_v4();
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 4, 4).expect("four rows ask");
+        assert!(ask.funding.lock().unwrap().is_none(), "the cap covered it");
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 2);
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), ask.wait(4)).await;
+        assert!(waited.is_err(), "past the cap it waits");
+        assert!(ask.funding.lock().unwrap().is_some(), "its raise is funded");
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+        tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(4))
+            .await
+            .expect("no indefinite wait")
+            .expect("the rung takes it");
     }
 
     /// The MTP `--k 0 --pad 1` stall: a decode's pass of two rows was
