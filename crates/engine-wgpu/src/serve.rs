@@ -187,13 +187,19 @@ impl Serve for Api {
             ..
         } = launch;
         let arm = prepared.arm;
-        let hosted = layout
+        // The host reads back its own spans alone: the rest of the seat is
+        // for the step's programs, on the device.
+        let hosted: Vec<(u64, u64, u64)> = layout
             .iter()
-            .filter(|span| span.host)
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
-        frame.copy(&shell.readout[arm], 0, &shell.shelf.mirror[arm], 0, hosted)?;
+            .filter(|span| span.hosted && span.rows > 0)
+            .map(|span| (span.at, span.at, span.bytes()))
+            .collect();
+        engine_gpu::backend::Frame::copy_regions(
+            &mut frame,
+            &shell.readout[arm],
+            &shell.shelf.mirror[arm],
+            &hosted,
+        )?;
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,

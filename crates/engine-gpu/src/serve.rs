@@ -433,6 +433,12 @@ pub struct Seated<'a, B: Serve> {
 
     pub readout: Option<&'a [u32]>,
 
+    /// Whether the host reads back what the lane reads out (its readout
+    /// rows, and the outputs its program reads): a lane whose readout is
+    /// `None` hosts nothing. Its rows are laid for the fire all the same,
+    /// for a program that reads them on the device.
+    pub hosts: bool,
+
     /// The outputs the lane's program reads.
     pub reads: &'a [String],
 
@@ -485,6 +491,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             adapter: None,
             positions: &[],
             readout: None,
+            hosts: true,
             reads: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
@@ -578,7 +585,12 @@ impl ReadoutPlane {
 
 /// A lane's read of `plane`: `rows` table entries from `first`, or with
 /// `direct` the plane's rows from `first`, each of its `layers` after the
-/// last at byte `at` of the seat. The host reads back its lane's `host` span.
+/// last at byte `at` of the seat. A lane's `own` span (one a lane, at its
+/// index) is its readout rows; the others are outputs its program reads.
+/// A `seated` span's rows are copied into the arm's readout seat; the host
+/// reads back the `hosted` ones, and a span neither seated nor read by a
+/// program on the device is laid for the fire alone (its rows computed,
+/// nothing copied).
 #[derive(Clone, Copy, Debug)]
 pub struct ReadSpan {
     pub lane: u32,
@@ -590,7 +602,9 @@ pub struct ReadSpan {
     pub layers: u32,
     pub dtype: Dtype,
     pub direct: bool,
-    pub host: bool,
+    pub own: bool,
+    pub hosted: bool,
+    pub seated: bool,
 }
 
 impl ReadSpan {
@@ -605,7 +619,9 @@ impl ReadSpan {
             layers: 1,
             dtype: Dtype::Bf16,
             direct: false,
-            host: true,
+            own: true,
+            hosted: false,
+            seated: false,
         }
     }
 
@@ -2429,7 +2445,9 @@ impl<B: Serve> Shell<B> {
         self.harvest_through(landed.seq)?;
         let _ = self.landed.remove(&landed.seq);
         // Nothing fired since: the arm's seat holds this step's reads.
-        let read: Vec<&ReadSpan> = layout.iter().filter(|span| span.rows > 0).collect();
+        let read: Vec<&ReadSpan> = (layout.iter())
+            .filter(|span| span.rows > 0 && span.seated)
+            .collect();
         let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
@@ -4535,8 +4553,21 @@ fn readout_table<B: Serve>(
             layers: u32::try_from(read.values.len()).unwrap_or(u32::MAX),
             dtype: read.dtype,
             direct,
-            host: false,
+            own: false,
+            hosted: false,
+            seated: false,
         }
+    };
+    // A span is copied into the seat where the host reads it, or where a
+    // program reads it there.
+    let placed = |mut span: ReadSpan, at: &mut u64, hosted: bool, read: bool| {
+        span.hosted = hosted;
+        span.seated = hosted || read;
+        if span.seated {
+            span.at = *at;
+            *at += span.bytes();
+        }
+        span
     };
     let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
     let mut layout: Vec<ReadSpan> = (0..lanes.len()).map(ReadSpan::empty).collect();
@@ -4547,6 +4578,16 @@ fn readout_table<B: Serve>(
             continue;
         };
         let plane = &planes[host];
+        let seated = lanes.get(source);
+        let hosts = seated.is_some_and(|seated| seated.hosts);
+        // Its program reads the plane at the lane's own rows.
+        let read = seated.is_some_and(|seated| {
+            seated.reads.iter().any(|name| {
+                planes.iter().position(|plane| {
+                    plane.output == *name && plane.classes.contains(row.class as usize)
+                }) == Some(host)
+            })
+        });
         let (first, owned) = if plane.voxels {
             (row.voxel_offset, row.voxels)
         } else {
@@ -4556,11 +4597,15 @@ fn readout_table<B: Serve>(
             continue;
         }
         if plane.voxels {
-            layout[source] = ReadSpan {
-                host: true,
-                ..span_of(host, first, owned, at, true, row.source)
-            };
-            at += layout[source].bytes();
+            layout[source] = placed(
+                ReadSpan {
+                    own: true,
+                    ..span_of(host, first, owned, 0, true, row.source)
+                },
+                &mut at,
+                hosts,
+                read,
+            );
             continue;
         }
         let named = lanes.get(source).and_then(|seated| seated.readout);
@@ -4580,18 +4625,22 @@ fn readout_table<B: Serve>(
             _ if plane.seam != Kind::Readout => (first..first + owned).collect(),
             _ => vec![first + owned - 1],
         };
-        layout[source] = ReadSpan {
-            host: true,
-            ..span_of(
-                host,
-                u32::try_from(table.len()).unwrap_or(u32::MAX),
-                u32::try_from(picks.len()).unwrap_or(u32::MAX),
-                at,
-                false,
-                row.source,
-            )
-        };
-        at += layout[source].bytes();
+        layout[source] = placed(
+            ReadSpan {
+                own: true,
+                ..span_of(
+                    host,
+                    u32::try_from(table.len()).unwrap_or(u32::MAX),
+                    u32::try_from(picks.len()).unwrap_or(u32::MAX),
+                    0,
+                    false,
+                    row.source,
+                )
+            },
+            &mut at,
+            hosts,
+            read,
+        );
         table.extend(
             picks
                 .iter()
@@ -4602,6 +4651,7 @@ fn readout_table<B: Serve>(
         let source = row.source as usize;
         let class = row.class as usize;
         let host = layout[source];
+        let hosts = lanes.get(source).is_some_and(|seated| seated.hosts);
         for name in lanes.get(source).map_or(&[][..], |seated| seated.reads) {
             let Some(index) = planes
                 .iter()
@@ -4649,9 +4699,8 @@ fn readout_table<B: Serve>(
             if rows == 0 {
                 continue;
             }
-            let span = span_of(index, first, rows, at, direct, row.source);
-            at += span.bytes();
-            layout.push(span);
+            let span = span_of(index, first, rows, 0, direct, row.source);
+            layout.push(placed(span, &mut at, hosts, true));
         }
     }
     Ok((table, layout))
@@ -4719,6 +4768,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let need = prepared
             .readout_layout
             .iter()
+            .filter(|span| span.seated)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
@@ -4763,7 +4813,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         let mut bases: Vec<Option<Vec<u64>>> = vec![None; self.readouts.len()];
-        for span in prepared.readout_layout.iter().filter(|span| span.rows > 0) {
+        for span in (prepared.readout_layout.iter()).filter(|span| span.rows > 0 && span.seated) {
             let at = span.plane as usize;
             if bases[at].is_some() {
                 continue;
@@ -4799,7 +4849,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // one pair of barriers a fire, not one a lane.
         let layout = prepared.readout_layout.clone();
         let mut regions: Vec<(u64, u64, u64)> = Vec::new();
-        for span in layout.iter().filter(|span| span.rows > 0) {
+        for span in layout.iter().filter(|span| span.rows > 0 && span.seated) {
             let plane = &self.readouts[span.plane as usize];
             let layers = bases[span.plane as usize]
                 .as_deref()
@@ -4886,7 +4936,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             pixels,
             step: _,
         } = enqueued;
-        let lanes = rows.iter().filter(|span| span.host).count();
+        let lanes = rows.iter().filter(|span| span.own).count();
         self.arms.take(arm);
         self.inflight.push_back(Flight {
             seq,
@@ -4959,13 +5009,17 @@ fn elem(dtype: Dtype) -> u64 {
     poem_compiler::arena::elem_bytes(dtype).unwrap_or(2)
 }
 
-/// Each host span of `layout` in `raw`, widened to f32.
+/// Each lane's own span of `layout` in `raw`, widened to f32: nothing for
+/// a lane the host reads back nothing of.
 #[must_use]
 pub fn rows_from(raw: &[u8], layout: &[ReadSpan]) -> Vec<Vec<f32>> {
     layout
         .iter()
-        .filter(|span| span.host)
+        .filter(|span| span.own)
         .map(|span| {
+            if !span.hosted {
+                return Vec::new();
+            }
             let from = span.at as usize;
             let row = &raw[from..from + span.bytes() as usize];
             if span.dtype == Dtype::F32 {
@@ -5791,7 +5845,9 @@ mod tests {
             layers: 2,
             dtype: Dtype::F32,
             direct: false,
-            host: true,
+            own: true,
+            hosted: true,
+            seated: true,
         }
     }
 

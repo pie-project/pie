@@ -351,7 +351,7 @@ impl Serve for Api {
         let end = flight
             .rows
             .iter()
-            .filter(|span| span.host)
+            .filter(|span| span.hosted)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
@@ -393,6 +393,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 
     for lane in p.lanes {
         key.shown(&lane.readout);
+        key.shown(&lane.hosts);
         key.shown(&lane.reads);
     }
 

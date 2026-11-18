@@ -1511,6 +1511,7 @@ impl<B: Host> Gpu<B> {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                hosts: !matches!(lane.readout, Readout::None),
                 reads: &reads[at],
 
 
