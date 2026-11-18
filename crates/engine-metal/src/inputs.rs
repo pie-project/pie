@@ -320,6 +320,11 @@ impl Region {
         self.walk(at, from.len() as u64, |to, done, take| {
             // SAFETY: `walk` hands `take` mapped bytes at `to`, distinct
             // from `from`'s host allocation.
+            crate::store::diag_host_write(
+                to.as_ptr(),
+                usize::try_from(take).unwrap_or(0),
+                "inputs::Region::write",
+            );
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     from.as_ptr()
@@ -348,6 +353,11 @@ impl Region {
 
     pub fn zero_span(&mut self, at: u64, len: u64) -> Result<()> {
         self.walk(at, len, |to, _, take| {
+            crate::store::diag_host_write(
+                to.as_ptr(),
+                usize::try_from(take).unwrap_or(0),
+                "inputs::Region::zero_span",
+            );
             // SAFETY: as `write`.
             unsafe {
                 std::ptr::write_bytes(to.as_ptr(), 0, usize::try_from(take).unwrap_or(usize::MAX));

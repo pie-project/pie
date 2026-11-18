@@ -2335,6 +2335,11 @@ impl Pools {
                                 // each entry's bytes are its own (no other
                                 // entry of any group writes them).
                                 #[allow(unsafe_code)]
+                                crate::store::diag_host_write(
+                                    (base + within) as *const u8,
+                                    len,
+                                    "store::pools weight-cache table restage",
+                                );
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         piece.as_ptr(),
@@ -2646,5 +2651,49 @@ pub fn diag_fire_addresses(lane: u32, path: &'static str, addresses: &[u64]) {
     let chunks: Vec<u32> = addresses.iter().filter_map(|&a| diag_chunk_of_address(a)).collect();
     if !chunks.is_empty() {
         diag_fire_pages(lane, path, chunks);
+    }
+}
+
+
+/// PROBE: host address ranges no host write may touch once the load is laid
+/// (the tables run's chunks), and how many overlapping writes were named.
+static FORBIDDEN: std::sync::Mutex<Vec<(usize, usize, u32)>> = std::sync::Mutex::new(Vec::new());
+static FORBIDDEN_SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// PROBE: a host write of `len` bytes at `to` by `who`: named, with its
+/// caller, where it overlaps the tables run.
+pub fn diag_host_write(to: *const u8, len: usize, who: &'static str) {
+    let start = to as usize;
+    let end = start.saturating_add(len);
+    let Ok(forbidden) = FORBIDDEN.lock() else { return };
+    if let Some(&(lo, hi, chunk)) = forbidden.iter().find(|&&(lo, hi, _)| start < hi && end > lo) {
+        if FORBIDDEN_SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            eprintln!(
+                "PROBE-HOSTWRITE: {who} writes {len} bytes at {start:#x}, over tables chunk {chunk} \
+                 ({lo:#x}..{hi:#x}), fire {}:\n{}",
+                diag_fire_now(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
+}
+
+impl Pools {
+    /// PROBE: from now on, a host write over the tables run is named.
+    pub fn diag_forbid_tables_run(&self) {
+        let chunk = self.layout.chunk_bytes;
+        let mut ranges = Vec::new();
+        for c in 1..=self.layout.tables {
+            if let Ok(runs) = self.pool.host_runs(u64::from(c) * chunk, chunk) {
+                for (_, len, host) in runs {
+                    let lo = host.as_ptr() as usize;
+                    ranges.push((lo, lo + usize::try_from(len).unwrap_or(0), c));
+                }
+            }
+        }
+        eprintln!("PROBE-HOSTWRITE: forbidding {} host ranges of the tables run", ranges.len());
+        if let Ok(mut forbidden) = FORBIDDEN.lock() {
+            *forbidden = ranges;
+        }
     }
 }

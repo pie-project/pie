@@ -1451,6 +1451,7 @@ impl PreparedLoad<'_> {
                 "metal: the widest rung's recurrent scratch"
             );
         }
+        shell.pools.diag_forbid_tables_run();
         Ok(shell)
     }
 }

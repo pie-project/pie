@@ -221,6 +221,12 @@ impl Held {
             Place::Slot { host, .. } => {
                 // SAFETY: `check` keeps the span inside the region, which
                 // lies inside one slot of a mapped heap.
+                crate::store::diag_host_write(
+                    // SAFETY: inside the region, as below.
+                    unsafe { host.0.as_ptr().add(usize_of(at)) },
+                    from.len(),
+                    "program::held::Held::write",
+                );
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         from.as_ptr(),

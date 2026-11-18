@@ -960,6 +960,7 @@ impl Elastic {
     /// outright, during one it does not.
     pub unsafe fn zero(&self, offset: u64, bytes: u64) -> Result<()> {
         self.walk_spans(offset, bytes, |span, _, take| {
+            crate::store::diag_host_write(span.as_ptr(), usize_of(take), "elastic::Elastic::zero");
             // SAFETY: `host_span` returned `take` writable bytes there.
             unsafe { std::ptr::write_bytes(span.as_ptr(), 0, usize_of(take)) };
             Ok(())
@@ -997,6 +998,7 @@ impl Elastic {
             let from = &from[usize_of(done)..usize_of(done + take)];
             // SAFETY: `host_span` returned `take` writable bytes there, and
             // `from` is a distinct host allocation of that many bytes.
+            crate::store::diag_host_write(span.as_ptr(), from.len(), "elastic::Elastic::write_from");
             unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), span.as_ptr(), from.len()) };
             Ok(())
         })
