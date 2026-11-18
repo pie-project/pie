@@ -107,14 +107,7 @@ mod tests {
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, profile::Source::Defaults);
         let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES);
-        assert_eq!(
-            (
-                t.sdpa_tile_rows_per_request(),
-                t.sdpa_split_groups(),
-                t.sdpa_split_min_keys()
-            ),
-            (32, 16, 256)
-        );
+        assert_eq!((t.sdpa_split_groups(), t.sdpa_split_min_keys()), (16, 256));
         use crate::tuning::Qmm;
         for (rows, k, want) in [
             (1, 4096, Qmm::Qmv),

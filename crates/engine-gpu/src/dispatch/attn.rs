@@ -43,9 +43,9 @@ impl<B: Backend> Run<'_, B> {
         Ok(())
     }
 
-    /// Prefill attention: query rows tiled a workgroup of one head where a
-    /// request brings enough of them (`kernel.sdpa.tile_rows_per_request`),
-    /// else each row walked as a decode row.
+    /// Prefill attention: query rows tiled a workgroup of one head, or each
+    /// row walked as a decode row, whichever the device's roofline prices
+    /// cheaper at the fire's shape ([`crate::attn_choice`]).
     #[allow(clippy::too_many_arguments)]
     fn prefill_attention(
         &self,
@@ -88,7 +88,7 @@ impl<B: Backend> Run<'_, B> {
                 self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse, None,
             )
         };
-        // Which of the two a fire takes is its rows a request; a naming
+        // Which of the two a fire takes is its shape's cheaper; a naming
         // sink is told both.
         if let Some(names) = self.ctx.naming() {
             names.fork();
@@ -98,11 +98,24 @@ impl<B: Backend> Run<'_, B> {
             names.join();
             return Ok(());
         }
-        if q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
-            tiled()
-        } else {
-            walked()
-        }
+        let fire = crate::attn_choice::Fire {
+            rows: q.rows,
+            q_heads: q.width / head_dim.max(1),
+            kv_heads,
+            head_dim,
+            tile_rows: tactic.tile().1,
+        };
+        let tiles = self
+            .tuning()
+            .sdpa_tiles(fire)
+            .map_err(|key| kernels_slang::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "the device's profile states no `[rates] {key}` (or states it at nothing): \
+                     the choice between the tiled and the per-row attention weighs by it"
+                ),
+            })?;
+        if tiles { tiled() } else { walked() }
     }
 
     /// Decode attention, split into key ranges where the rows are too few.
@@ -183,10 +196,6 @@ impl<B: Backend> Run<'_, B> {
         let table = self.bindings().capture.ok_or_else(|| missing("capture table"))?;
         let stats = self.score_stats().ok_or_else(|| missing("normalisers' room"))?;
         Ok((table, stats))
-    }
-
-    fn requests(&self) -> u32 {
-        u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {

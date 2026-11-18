@@ -287,10 +287,20 @@ pub trait Tactics: std::fmt::Debug {
         bound.div_ceil(tile) * tile
     }
 
-    fn sdpa_tile_rows_per_request(&self) -> u32 {
-        self.profile()
-            .get::<crate::tuning::SdpaTileRowsPerRequest>()
-            .0
+    /// The compute units the device states (its cores, CUs or SMs): what
+    /// a wave-fill choice counts `[rates] workgroups_per_core` over.
+    fn cores(&self) -> u32;
+
+    /// Whether a prefill attention fire of `fire`'s shape takes the tiled
+    /// kernel ([`crate::attn_choice::tiles`]): the cheaper of it and the
+    /// per-row walk as the device's rates price them; the key of the rate
+    /// the profile leaves unstated.
+    fn sdpa_tiles(
+        &self,
+        fire: crate::attn_choice::Fire,
+    ) -> std::result::Result<bool, &'static str> {
+        let rates = engine::roofline::Constants::of(&self.profile().rates())?;
+        crate::attn_choice::tiles(fire, &rates, self.cores())
     }
 
     fn sdpa_split_groups(&self) -> u32;

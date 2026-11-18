@@ -1,7 +1,7 @@
 //! The hardware-dependent decisions engine-wgpu reads when it fires
 //! kernels-slang's entries, and [`Tuning`], the values one load runs under.
 
-use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest};
+use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows};
 use profile::{Decision, Domain, Profile, Registry, Var};
 
 pub const FACTS: &[Var] = &[
@@ -74,7 +74,6 @@ pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
         .add::<MoeTileRows>()
-        .add::<SdpaTileRowsPerRequest>()
         .add::<DecodeSplit>()
         .add::<DecodeSplitMinKeys>();
 }
@@ -247,6 +246,10 @@ fn qmm_rung(rung: Qmm) -> kernels_slang::linear::qmm::Qmm {
 impl engine_gpu::backend::Tactics for Tuning {
     fn profile(&self) -> &profile::Profile {
         Tuning::profile(self)
+    }
+
+    fn cores(&self) -> u32 {
+        self.cores
     }
 
     /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's

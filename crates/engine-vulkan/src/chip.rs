@@ -264,7 +264,6 @@ mod tests {
             );
             assert_eq!(t.sdpa_split_min_keys(), if qualcomm { 128 } else { 256 });
             assert_eq!(t.gemm_coopmat(2048) && t.moe_coopmat(), d.coopmat, "{d:?}");
-            assert_eq!(t.sdpa_tile_rows_per_request(), 32);
             for (pairs, experts, tile) in [
                 (0, 8, 1),
                 (15, 8, 1),

@@ -41,6 +41,20 @@ mod backend {
         device.chip().coopmat
     }
 
+    /// The tier a served load runs the device's kernels at.
+    pub fn tier(device: &Context) -> kernels_slang::Tier {
+        <Api as engine_gpu::serve::Serve>::tier(device)
+    }
+
+    /// The device's tuning as a served load holds it: its profile with
+    /// every `[rates]` key stated, measured now where the profile lacks one
+    /// (`engine_vulkan::rates::at_load`, saving nothing).
+    pub fn rated(device: &Context) -> engine_vulkan::tuning::Tuning {
+        let (profile, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+        let tuning = engine_vulkan::tuning::Tuning::new(profile, device.limits());
+        engine_vulkan::rates::at_load(device, tuning, None, None).expect("the rates measure")
+    }
+
     /// The device profile's moe tile rows and sorted rows for `pairs` routes
     /// over `experts`, and its sort's lanes.
     pub fn moe_rows(device: &Context, pairs: u32, experts: u32) -> (u32, u32, u32) {

@@ -6,4 +6,5 @@ mod mla;
 mod pool;
 mod score;
 mod sdpa;
+mod sdpa_choice;
 mod voxel;

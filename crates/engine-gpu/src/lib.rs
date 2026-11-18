@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod api;
 pub mod arena;
+pub mod attn_choice;
 pub mod backend;
 pub mod blob;
 pub mod books;

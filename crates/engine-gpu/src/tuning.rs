@@ -15,11 +15,6 @@ use profile::Decision;
 )]
 pub struct MoeTileRows(pub u32);
 
-/// The fewest rows per request that take the tiled attention kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
-pub struct SdpaTileRowsPerRequest(pub u32);
-
 /// The fewest keys a split slice holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
