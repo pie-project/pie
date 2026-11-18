@@ -32,6 +32,24 @@ pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32
     }
 }
 
+/// The waves hipBLASLt's first heuristic algorithm for a dense bf16 product
+/// of `m x n x k` fills on the current device, as hipBLASLt states them
+/// (`wavesCount`). `None` where it offers no algorithm or states none.
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn waves(m: u32, n: u32, k: u32) -> Option<f64> {
+    crate::hip::lt::waves(crate::hip::lt::Shape {
+        m,
+        n,
+        k,
+        bias: false,
+        groups: 1,
+        f32_out: false,
+    })
+    .ok()
+    .flatten()
+}
+
 /// The most rows ROCm's few-rows kernel (the skinny kernel) walks.
 pub const FEW_ROWS: u32 = 8;
 

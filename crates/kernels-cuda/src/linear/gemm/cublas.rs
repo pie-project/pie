@@ -966,11 +966,35 @@ impl Device {
 
 /// The rows of the tile a dense bf16 product of `m x n x k` (`act . w^T`)
 /// runs on this device under `tuning`'s workspace: cuBLASLt's first
-/// heuristic algorithm's (cuBLASLt's tile is `n`-major: its `N` is the
-/// product's rows). `None` where cuBLASLt offers none, or names a tile this
-/// does not know.
+/// heuristic algorithm's ([`tile`]). `None` where cuBLASLt offers none, or
+/// names a tile this does not know.
 #[must_use]
 pub fn tile_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<u32> {
+    tile(tuning, m, n, k).map(|t| t.rows)
+}
+
+/// The tile cuBLASLt's first heuristic algorithm runs a dense bf16 product
+/// on, and the waves it fills.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tile {
+    /// The tile's rows of the product (cuBLASLt's tile is `n`-major: its
+    /// `N` is the product's rows).
+    pub rows: u32,
+    /// The tile's columns of the product.
+    pub cols: u32,
+    /// The slices K is split into (1: none).
+    pub split_k: u32,
+    /// The waves its grid fills on this device, as cuBLASLt's heuristic
+    /// states them for the algorithm at the shape (`wavesCount`: its tiles
+    /// over the blocks the device holds at once of its kernel).
+    pub waves: f32,
+}
+
+/// [`Tile`] of a dense bf16 product of `m x n x k` on this device under
+/// `tuning`'s workspace. `None` where cuBLASLt offers no algorithm, or names
+/// a tile this does not know.
+#[must_use]
+pub fn tile(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<Tile> {
     let call = Call {
         act: 0,
         w: 0,
@@ -983,34 +1007,48 @@ pub fn tile_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Opti
         device.configure((tuning.gemm_workspace_mb() as usize) << 20);
         device.plan_for(call)
     })?;
-    let algo = &plan.heuristics.first()?.algo;
-    let mut id: u32 = 0;
-    let mut written: usize = 0;
-    // SAFETY: `algo` is an algorithm cuBLASLt returned; `id` is a u32 local
-    // of the size passed (the enum's) and `written` a local.
-    let asked = unsafe {
-        lt::cublasLtMatmulAlgoConfigGetAttribute(
-            std::ptr::from_ref(algo),
-            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID,
-            std::ptr::from_mut(&mut id).cast(),
-            std::mem::size_of::<u32>(),
-            &raw mut written,
-        )
+    let first = plan.heuristics.first()?;
+    let algo = &first.algo;
+    let config = |attribute| -> Option<u32> {
+        let mut value: u32 = 0;
+        let mut written: usize = 0;
+        // SAFETY: `algo` is an algorithm cuBLASLt returned; `value` is a
+        // u32 local of the size passed (each attribute asked is a u32 or
+        // an enum of one) and `written` a local.
+        let asked = unsafe {
+            lt::cublasLtMatmulAlgoConfigGetAttribute(
+                std::ptr::from_ref(algo),
+                attribute,
+                std::ptr::from_mut(&mut value).cast(),
+                std::mem::size_of::<u32>(),
+                &raw mut written,
+            )
+        };
+        if asked == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Some(value)
+        } else {
+            clear_error();
+            None
+        }
     };
-    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        clear_error();
-        return None;
-    }
+    let id = config(lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID)?;
     // `cublasLtMatmulTile_t` is `repr(u32)` over 0 to its END, every value
     // between a variant, so an id below END is one; its name spells the tile.
     if id >= lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_END as u32 {
         return None;
     }
     // SAFETY: `id` is below END, and every value from 0 to END is a variant.
-    let tile: lt::cublasLtMatmulTile_t = unsafe { std::mem::transmute(id) };
-    let name = format!("{tile:?}");
-    let (_, rows) = name
+    let named: lt::cublasLtMatmulTile_t = unsafe { std::mem::transmute(id) };
+    let name = format!("{named:?}");
+    let (cols, rows) = name
         .strip_prefix("CUBLASLT_MATMUL_TILE_")?
         .split_once('x')?;
-    rows.parse().ok().filter(|&r| r > 0)
+    let split_k =
+        config(lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
+    Some(Tile {
+        rows: rows.parse().ok().filter(|&r| r > 0)?,
+        cols: cols.parse().ok().filter(|&c| c > 0)?,
+        split_k: split_k.max(1),
+        waves: first.wavesCount,
+    })
 }

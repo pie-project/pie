@@ -14,7 +14,7 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::tile_rows;
+pub use cublas::{Tile, tile, tile_rows};
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
@@ -46,6 +46,43 @@ pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32
         let _ = (n, k);
         Err(crate::jit::runtimeless(OP))
     }
+}
+
+/// The blocks (each cluster's blocks counted) of the few-rows kernel a
+/// dense bf16 product of `m x n x k` runs on, where it does: the rows
+/// skeleton's grid from 2 to [`FEW_ROWS`] rows (one row runs the gemv,
+/// more cuBLASLt's algorithm). `None` elsewhere.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn few_rows_grid(m: u32, n: u32, k: u32) -> Option<u32> {
+    let (n, k) = (i32::try_from(n).ok()?, i32::try_from(k).ok()?);
+    ((2..=FEW_ROWS).contains(&m) && n > 0 && k > 0 && k % 8 == 0).then(|| {
+        crate::linear::gemv::rows_blocks(n, k) * crate::linear::gemv::rows_cluster(n, k)
+    })
+}
+
+/// The waves cuBLASLt's first heuristic algorithm fills on the current
+/// device for a dense bf16 product of `m x n x k` serving runs on it (past
+/// the few-rows kernel's rows, and short of `kernel.gemm.bf16_split_from`,
+/// where cuBLAS's own algorithm runs): its `wavesCount`, its tiles (and
+/// split-K slices) over the blocks of its kernel the device holds at once.
+/// `None` where serving runs another kernel or cuBLASLt states none.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn waves(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<f64> {
+    if m <= FEW_ROWS || (tuning.gemm_bf16_split_from > 0 && m >= tuning.gemm_bf16_split_from) {
+        return None;
+    }
+    tile(tuning, m, n, k)
+        .map(|t| f64::from(t.waves))
+        .filter(|&w| w.is_finite() && w > 0.0)
+}
+
+/// The current device's multiprocessors, where it answers.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn multiprocessors() -> Option<u32> {
+    crate::jit::device::multiprocessors()
 }
 
 /// The most rows CUDA's few-rows kernel (the rows skeleton) takes.
