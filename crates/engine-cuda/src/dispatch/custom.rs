@@ -1074,7 +1074,7 @@ impl Run<'_> {
         let sinks = self.tensor(*sink);
         match **attn {
             poem_ir::Attn::Decode {
-                mask: _,
+                mask,
                 q,
                 plan,
                 cache,
@@ -1098,6 +1098,7 @@ impl Run<'_> {
                 &mut self.tensor(*o_out),
                 &mut self.tensor(lse),
                 sinks,
+                self.applied_masks(mask),
             ),
             poem_ir::Attn::Prefill {
                 q,
@@ -1111,7 +1112,7 @@ impl Run<'_> {
                 lse: Some(lse),
                 // (A floored window is no `lse_sink`'s: the rule takes none.)
                 floor: _,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 causal: true,
@@ -1129,6 +1130,7 @@ impl Run<'_> {
                 &mut self.tensor(*o_out),
                 &mut self.tensor(lse),
                 sinks,
+                self.applied_masks(mask),
             ),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }

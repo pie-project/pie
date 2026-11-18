@@ -3,7 +3,8 @@
 //! each row attends: the engine stages the fire's group masks (bits and a
 //! byte offset a group) and the ragged kernel's custom arm reads them. The
 //! hidden rows land the host reference with the same rows hidden, so the
-//! staged offsets' type and the kernel's are checked together.
+//! staged offsets' type and the kernel's are checked together. The masks are
+//! data: the same lanes stating none replay the same body and read every row.
 
 use crate::common_encoder;
 
@@ -40,33 +41,35 @@ fn row_mask(at: usize, i: usize, rows: usize) -> Mask {
     Mask::new(runs, rows as u64)
 }
 
-fn fire_and_compare(graphs: Graphs) {
-    let trace = common_encoder::unbiased_trace();
-    let weights = Weights::random(&trace, 13);
-    let mut rig = Rig::load_trace(trace, &weights, 64, vec![16, 32, 64], graphs);
-
-    let mut rng = Lcg::seeded(17);
-    let inputs: Vec<Vec<f32>> = ROWS
-        .iter()
-        .map(|&n| (0..n * WIDTH as usize).map(|_| bf(rng.unit())).collect())
-        .collect();
+/// Fires the three lanes, each stating its mask or (`masked` false) none,
+/// and compares their rows with the host's under the same masks; returns the
+/// body the armed fire replayed.
+fn fire(
+    rig: &mut Rig,
+    weights: &Weights,
+    inputs: &[Vec<f32>],
+    graphs: Graphs,
+    masked: bool,
+) -> Option<String> {
     let want: Vec<Vec<f32>> = ROWS
         .iter()
-        .zip(&inputs)
+        .zip(inputs)
         .enumerate()
-        .map(|(at, (&n, x))| reference_with(&weights, x, n, None, &|i, j| admits(at, i, j)))
+        .map(|(at, (&n, x))| {
+            reference_with(weights, x, n, None, &|i, j| !masked || admits(at, i, j))
+        })
         .collect();
-
     let mut lanes = Vec::new();
     let mut attachments = Vec::new();
-    for (at, (&n, x)) in ROWS.iter().zip(&inputs).enumerate() {
+    for (at, (&n, x)) in ROWS.iter().zip(inputs).enumerate() {
         let handles = rig.lane(n as u32);
         rig.publish(handles.instance, 0, x);
-        let mut stated = lane(&rig, at as u32, &handles, at as u32);
+        let mut stated = lane(rig, at as u32, &handles, at as u32);
         // The runtime states a kv-less lane so: a group mask is a kv-less
         // lane's.
         stated.kv_less = true;
-        stated.mask = Some(Masking::Rows((0..n).map(|i| row_mask(at, i, n)).collect()));
+        stated.mask =
+            masked.then(|| Masking::Rows((0..n).map(|i| row_mask(at, i, n)).collect()));
         lanes.push(stated);
         attachments.push(attach(at as u32, &handles));
     }
@@ -77,18 +80,13 @@ fn fire_and_compare(graphs: Graphs) {
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the frame settles");
-    // Armed, the fire replays a body that reads its mask: one captured
-    // without a mask would land every row of its group.
-    if matches!(graphs, Graphs::On) {
+    let replayed = matches!(graphs, Graphs::On).then(|| {
         let shell = rig.engine.shell().expect("the load holds a shell");
-        let key = shell
+        shell
             .replayed_body()
-            .expect("an armed load replays a body for the masked fire");
-        assert!(
-            key.group_mask,
-            "the masked fire replayed {key}, a body captured with no group mask"
-        );
-    }
+            .expect("an armed load replays a body for the fire")
+            .to_string()
+    });
     let readouts = &ticket.steps[0].readouts;
     assert_eq!(readouts.len(), 3);
     for (at, readout) in readouts.iter().enumerate() {
@@ -96,9 +94,30 @@ fn fire_and_compare(graphs: Graphs) {
         assert_close(
             &readout.values,
             &want[at],
-            &format!("lane {at} hidden rows under its stated mask"),
+            &format!("lane {at} hidden rows, masked: {masked}"),
         );
     }
+    replayed
+}
+
+fn fire_and_compare(graphs: Graphs) {
+    let trace = common_encoder::unbiased_trace();
+    let weights = Weights::random(&trace, 13);
+    let mut rig = Rig::load_trace(trace, &weights, 64, vec![16, 32, 64], graphs);
+
+    let mut rng = Lcg::seeded(17);
+    let inputs: Vec<Vec<f32>> = ROWS
+        .iter()
+        .map(|&n| (0..n * WIDTH as usize).map(|_| bf(rng.unit())).collect())
+        .collect();
+    // The masks are data: the masked fire and the maskless one replay one
+    // body, each reading its own masks (a group stating none, every row).
+    let masked = fire(&mut rig, &weights, &inputs, graphs, true);
+    let maskless = fire(&mut rig, &weights, &inputs, graphs, false);
+    assert_eq!(
+        masked, maskless,
+        "a fire stating masks and one stating none replay one body"
+    );
 }
 
 #[test]

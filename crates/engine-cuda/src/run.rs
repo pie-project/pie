@@ -1577,8 +1577,12 @@ impl<'c> Run<'c> {
             })
     }
 
-    /// Each lane's mask word, cut to the window's lanes as `mask_indptr` is.
+    /// Each lane's mask word, cut to the window's lanes as `mask_indptr` is
+    /// (a copied window's own, gathered).
     pub(crate) fn mask_origin(&self) -> Option<Tensor> {
+        if let Some(gathered) = &self.window().gathered {
+            return gathered.mask.as_ref().map(|mask| mask.origin);
+        }
         if self.plane_base() {
             return self.fire.tables.mask_origin;
         }
@@ -1590,6 +1594,9 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn mask_indptr(&self) -> Option<Tensor> {
+        if let Some(gathered) = &self.window().gathered {
+            return gathered.mask.as_ref().map(|mask| mask.indptr);
+        }
         if self.plane_base() {
             return self.fire.tables.mask_indptr;
         }
@@ -1611,7 +1618,11 @@ impl<'c> Run<'c> {
         if self.expert.get(at).copied().unwrap_or(false) {
             return self.received(at, handle);
         }
-        if self.window().gathered.is_some() {
+        // The mask bits stay where the fire staged them: a copied window's
+        // lanes read them through their gathered offsets.
+        if self.window().gathered.is_some()
+            && !matches!(self.values[at].def, Def::Input(RuntimeInput::Mask))
+        {
             return self.compacted(id, handle);
         }
         if matches!(

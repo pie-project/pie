@@ -11,6 +11,10 @@ pub enum DecodeArm {
     Full,
     Softcap,
     Window,
+    /// Each request's mask read from its word's boundary on (a request
+    /// stating none reads every key), as the custom prefill arm reads it.
+    Custom,
+    CustomSoftcap,
     RelBiasFull,
     RelBiasWindow,
 }
@@ -52,6 +56,8 @@ pub(crate) fn decode_symbol(
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
         DecodeArm::Softcap => ("VariantWindowSoftcap", "DecodeParams"),
         DecodeArm::Window => ("VariantWindow", "DecodeParams"),
+        DecodeArm::Custom => ("VariantCustom", "DecodeParams"),
+        DecodeArm::CustomSoftcap => ("VariantCustomSoftcap", "DecodeParams"),
         DecodeArm::RelBiasFull => ("VariantRelBiasFull", "DecodeRelParams"),
         DecodeArm::RelBiasWindow => ("VariantRelBiasWindow", "DecodeRelParams"),
     };
@@ -267,6 +273,16 @@ pub fn decode_arm(
         return DecodeArm::Softcap;
     }
     DecodeArm::Window
+}
+
+/// The decode arm reading the fire's masks.
+#[must_use]
+pub fn decode_custom_arm(logits_soft_cap: f32) -> DecodeArm {
+    if logits_soft_cap > 0.0 {
+        DecodeArm::CustomSoftcap
+    } else {
+        DecodeArm::Custom
+    }
 }
 
 #[must_use]

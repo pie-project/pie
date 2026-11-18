@@ -631,7 +631,7 @@ impl Inputs {
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
         let pages = lanes * u64::from(paging.pages_per_slot);
         let window_slots =
-            crate::window::Slots::new(classes, lanes, runs, gathered, rows, page_tables, pages);
+            crate::window::Slots::new(classes, lanes, runs, gathered, rows, page_tables, pages, masked);
         let window_ints = window_slots.words();
 
         let mut at = 0u64;
@@ -699,11 +699,15 @@ impl Inputs {
             }
         });
         // A group's mask is a bit a (query, key) pair of its rows, from a
-        // byte of its own: the groups' pairs are at most the fire's rows
-        // squared, and a byte apiece more rounds each group's up.
+        // byte of its own, and only a group some lane states one for has
+        // bits (the rest read "none", `-1`, as data). A stated mask speaks of
+        // a row's keys as a paged lane's does, at most the context's a row:
+        // the stretch holds the fire's rows by the context (as the paged
+        // masks' does), a byte apiece more rounding each group's up; a fire
+        // stating more is refused by name (`stage_group_masks`).
         let group_masks = (group_mask_feeds > 0).then(|| {
             let indptr_bytes = ((lanes + 1) * 8).next_multiple_of(ALIGN);
-            let bits_bytes = ((rows * rows).div_ceil(8) + lanes).next_multiple_of(ALIGN);
+            let bits_bytes = ((rows * context).div_ceil(8) + lanes).next_multiple_of(ALIGN);
             let stride = indptr_bytes + bits_bytes;
             GroupMasksAt {
                 at: take(stride * group_mask_feeds as u64),

@@ -1149,6 +1149,7 @@ impl Shell {
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         one_direction_per_mask(&boot.trace, &compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
+        let mask_read = crate::exports::mask_reading_classes(&boot.trace, &compiled);
         let group_masked = group_masked_classes(&boot.trace, &compiled);
         let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
@@ -1434,7 +1435,7 @@ impl Shell {
             mrope_seat,
             &feeds.seats(),
             feeds.selections.len(),
-            !masked.is_empty() || !wide.is_empty(),
+            !mask_read.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
@@ -1539,6 +1540,7 @@ impl Shell {
             facts,
             page_tables,
             masked,
+            mask_read,
             group_masked,
             wide,
             feeds,
@@ -1592,7 +1594,6 @@ impl Shell {
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
-            arm_group_mask: false,
             arm_deferred: false,
             card: (0, 0),
             held_for_fires: 0,

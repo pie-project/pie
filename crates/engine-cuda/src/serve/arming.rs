@@ -69,12 +69,11 @@ struct SyntheticMedia {
 /// A synthetic lane's class and row count.
 type LaneRows = (usize, u32);
 /// What a body is armed for beyond its composition: how its lanes treat
-/// their recurrent rows, and whether its ragged attentions read a group
-/// mask.
+/// their recurrent rows. (A lane's attention mask, a group's too, is data
+/// one body reads: no treatment.)
 #[derive(Debug, Clone, Copy)]
 struct Treatment {
     rs: record::RsBody,
-    group_mask: bool,
 }
 
 /// A lattice being armed: the targets left, and what arming has counted.
@@ -1266,18 +1265,8 @@ impl Shell {
         // them, not only a drafter's: a guest that drafts for itself (MTP,
         // with no drafts output the load can see) verifies on the plain
         // classes, and it registers after the load arms.
-        //
-        // A composition over a class that reads a lane's group mask is
-        // recorded once more reading one (`record::BodyKey::group_mask`): a
-        // fire whose lanes state a mask replays that body, and the rest the
-        // maskless one.
         let buffering = self.buffers.is_some();
         let rungs = self.rs_rungs();
-        let group_masked = if self.feeds.ragged.is_empty() {
-            poem_ir::ClassSet::default()
-        } else {
-            self.group_masked.clone()
-        };
         let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
             .flat_map(|(bucket, target)| {
@@ -1297,24 +1286,9 @@ impl Shell {
                 } else {
                     &[record::RsBody::Folds]
                 };
-                let masks: &[bool] = if target
-                    .lanes()
-                    .0
-                    .iter()
-                    .any(|&(class, _)| group_masked.contains(class))
-                {
-                    &[false, true]
-                } else {
-                    &[false]
-                };
                 treatments
                     .iter()
-                    .flat_map(|&rs| {
-                        masks
-                            .iter()
-                            .map(move |&group_mask| Treatment { rs, group_mask })
-                    })
-                    .map(move |treatment| (bucket, target.clone(), treatment))
+                    .map(move |&rs| (bucket, target.clone(), Treatment { rs }))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1346,7 +1320,6 @@ impl Shell {
         let adapts = self.adapters().slots().seats() > 0;
         'targets: for (bucket, target, treatment) in &targets {
             self.arm_rs = treatment.rs;
-            self.arm_group_mask = treatment.group_mask;
             let (lanes, media) = target.lanes();
             let adapted: Vec<LaneRows> = lanes
                 .iter()
@@ -1375,9 +1348,8 @@ impl Shell {
                 }
             }
         }
-        // The voxel walk is a plain fire: no recurrent treatment, no mask.
+        // The voxel walk is a plain fire: no recurrent treatment.
         self.arm_rs = record::RsBody::Folds;
-        self.arm_group_mask = false;
         if walked.is_ok() {
             walked = self.size_voxels();
         }
@@ -1550,7 +1522,6 @@ impl Shell {
             return Ok(());
         }
         self.arm_rs = treatment.rs;
-        self.arm_group_mask = treatment.group_mask;
         // Past its kind's widest bucket a target captures cold: the top
         // bucket's fires made what its warm fire would.
         self.arm_cold = st.narrower(bucket, &target) && !st.verify;
@@ -1790,7 +1761,6 @@ impl Shell {
 
     fn arm_end(&mut self, mut st: Arming) -> Result<()> {
         self.arm_rs = record::RsBody::Folds;
-        self.arm_group_mask = false;
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a

@@ -149,6 +149,14 @@ impl Run<'_> {
                         built.info
                     );
                 }
+                // The fire's mask offsets and words, where it staged them: a
+                // decode reading the masks finds each request's here.
+                #[cfg(not(feature = "rocm"))]
+                let built = plan::DecodePlan {
+                    mask_indptr: self.mask_indptr(),
+                    mask_origin: self.mask_origin(),
+                    ..built
+                };
                 built.stage(self.ctx())?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
@@ -224,7 +232,7 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
-                mask: _,
+                mask,
                 q,
                 plan,
                 cache,
@@ -246,8 +254,10 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 &mut self.tensor(*o),
+                self.applied_masks(*mask),
             ),
             Attn::Decode {
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
                 mask: _,
                 q,
                 plan: _,
@@ -283,7 +293,8 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 bias: None,
                 floor: None,
                 causal: true,
@@ -330,6 +341,7 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
                 mask: _,
                 q,
                 plan,
@@ -374,7 +386,8 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 selection: None,
                 floor: None,
                 causal: true,
@@ -433,7 +446,7 @@ impl Run<'_> {
             ),
             // `causal: false` marks a wide class: its staged mask bits are unclipped.
             Attn::Prefill {
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 q,
                 plan,
@@ -449,19 +462,32 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => attn::masked(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*mask),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                &mut self.tensor(*o),
-            ),
+            } => match self.applied_masks(Some(*mask)) {
+                Some(bits) => attn::masked(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    bits,
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                ),
+                None => attn::prefill(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                ),
+            },
             Attn::Prefill {
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 q,
                 plan,
@@ -477,18 +503,32 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => attn::masked_lse(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*mask),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                &mut self.tensor(*o),
-                &mut self.tensor(*lse),
-            ),
+            } => match self.applied_masks(Some(*mask)) {
+                Some(bits) => attn::masked_lse(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    bits,
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                    &mut self.tensor(*lse),
+                ),
+                None => attn::prefill_lse(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                    &mut self.tensor(*lse),
+                ),
+            },
             Attn::Prefill {
                 kv_heads: _,
                 causal: false,
@@ -565,7 +605,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
             ),
             Attn::Decode {
-                mask: _,
+                mask,
                 q,
                 plan,
                 cache,
@@ -588,6 +628,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
+                self.applied_masks(*mask),
             ),
             Attn::Prefill {
                 q,
@@ -1434,6 +1475,17 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
+    /// The fire's mask bits an attention applies, where its op reads them
+    /// (the plan binds each request's offset and word). ROCm's kernels apply
+    /// none: its classes take no lane stating a mask
+    /// (`exports::masked_classes`), and its arms run maskless.
+    pub(crate) fn applied_masks(&self, mask: Option<poem_ir::ValueId>) -> Option<kernels_cuda::Tensor> {
+        if cfg!(feature = "rocm") {
+            return None;
+        }
+        mask.map(|mask| self.tensor(mask))
+    }
+
     pub(crate) fn dense_or_decoded(
         &self,
         op: &'static str,

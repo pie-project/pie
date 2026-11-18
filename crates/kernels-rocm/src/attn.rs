@@ -259,7 +259,14 @@ pub fn decode(
     head_dim: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
+    if mask.is_some() {
+        return Err(refuse(
+            "attn.decode",
+            "ROCm's decode applies no lane's attention mask; its classes take none",
+        ));
+    }
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
@@ -278,7 +285,14 @@ pub fn decode_lse(
     sm_scale: f32,
     o: &mut Tensor,
     lse: &mut Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
+    if mask.is_some() {
+        return Err(refuse(
+            "attn.decode",
+            "ROCm's decode applies no lane's attention mask; its classes take none",
+        ));
+    }
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
