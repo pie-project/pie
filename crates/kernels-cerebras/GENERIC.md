@@ -3786,3 +3786,52 @@ over a head of 256) at 49,056 B linked alone: 96 B of stack.
   cross-target design.
 - **No fallback list.** `target::plans` built the search's best three (`FALLBACKS`); the load took
   the first. One plan is built.
+
+### A1.2 One PE memory model (design)
+
+**Today.** Each regime splits a PE's 48 KB by hand, and several fit the same PE kind twice:
+
+| constant | where | what it bounds |
+|---|---|---|
+| `TILE_BUDGET` 12,288 halves, `TILE_FRACTIONS` | `stream/place.rs`, `stream/build.rs` | a weight PE's tiles |
+| `WEIGHT_WORDS` 20,480 halves | `stream/place.rs` | a weight PE's tiles and row store |
+| `WEIGHT_FIXED` / `WEIGHT_CODE` / `WEIGHT_MV` / `WEIGHT_MISS` | `stream/place.rs` | a weight PE's code, a least-squares fit beside `check::CODE_KINDS`' own `w_*.csl` refit |
+| `ROOT_BUDGET` 6,144 words | `stream/place.rs` | a root's held rows |
+| `CODE_RESERVE` 7,680 B | `check.rs` | every root's code, whatever its regions print (what stops gemma4-e2b -l2's `s0l0` head root, G4.3) |
+| `KV_WORDS` 18,432 halves | `stream/build.rs` | an attention PE's entries ("the rest is code and buffers") |
+| `WEIGHT_WORDS` 15,360 halves, `MAX_P` | `stream/grid.rs` | a grid weight PE |
+| `DATA_WORDS` 8,448 words | `stream/tiled.rs` | a tile PE's arena, staging and weight block (`tpe.csl` is already a `CODE_KINDS` refit) |
+| `CODE_WORDS` / `REGION_WORDS` / `RUNTIME_WORDS` | `cost/gemm.rs` | a GEMM PE's code, fitted to its ELFs |
+| `STORE_WORDS` 19,000 | `floorplan/stacked.rs` | a template storage PE (goes with the templates) |
+
+**The model.** A PE kind's bytes are its module's at the candidate's parameters, as the static check
+counts them: `check::pe_bytes(files, file, params)` = the arrays its params size (data) + the code
+it reaches (`code_bytes`, plus its kind's refit, `CODE_KINDS`). Its room is `PE_BYTES -
+STACK_ROOM - miss(kind)`, the kind's worst miss after its refit (`UNDER` where none). A search
+keeps a candidate exactly where every PE kind it places fits its room, and where it chooses a
+size (a tile's words, a K / V PE's entries, a root's held rows, an arena) it takes the largest
+the room leaves. Nothing is reserved by hand; a kind the fit misses gets a `CODE_KINDS` refit from
+linked images (as G4.2 did for weight PEs), not a budget.
+
+- Code depends on what a module reaches, not (past loop unrolling) on its array sizes: a
+  kind's code is evaluated once a candidate from its printed module (a root's regions printed as
+  `place::root_words` already prints them, pooled), its data by the regime's own array formula.
+- The search's price is unchanged; only which candidates fit moves. A program whose every PE
+  was within the old budgets and within its room is unchanged.
+
+**Steps** (each one its own commit, gated as below):
+1. Roots: `CODE_RESERVE` replaced by each root's code from its printed regions and its own
+   module (`root_over`); `ROOT_BUDGET` by the root's room past that code. Unblocks gemma4-e2b
+   -l2 (coordinated with G5's gemma4-sim).
+2. Weight PEs: `WEIGHT_*` and `TILE_BUDGET` / `WEIGHT_WORDS` replaced by the `w_*.csl` kind's
+   bytes and room (one fit, `CODE_KINDS`'); `TILE_FRACTIONS` become fractions of the derived
+   largest tile.
+3. K / V PEs: `KV_WORDS` and `kv_entries`' buffer arithmetic by `satt.csl`'s bytes at a
+   candidate's entries.
+4. Grid, tiled, GEMM: `grid::WEIGHT_WORDS`, `tiled::DATA_WORDS`, `cost::gemm`'s code words by
+   their kinds' bytes (M2f's files: with M2f).
+
+**Gates, each step.** Every program that still fits under the old budget and the new room is
+byte-identical (decode ident; flux identity); every program that moves is linked by cslc (its
+fullest PE's ELF against the model's estimate), and qwen3-sim, qwen3-sim4 and minimax-sim run
+token-exact on the simulator, flux2-mini's checks where a flux program moves.
