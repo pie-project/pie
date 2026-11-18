@@ -916,6 +916,7 @@ impl Lane {
                     &mut **engine,
                     &bind.binding,
                     |id| channels.engine_registered(id) || held.contains(&id),
+                    pipeline_id,
                 )
                 .and_then(|taken| {
                     match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {
