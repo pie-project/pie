@@ -1008,22 +1008,17 @@ impl Engine for Metal {
         self.loaded()?.program_facts(program).map_err(fault)
     }
 
-    fn fire_facts(
+    /// A guest program's state: its instances' value scratch and its
+    /// pair's batch sets, in `Instance` slots. Nothing of it lies in the
+    /// span, so Metal states no fire term (`Engine::fire_facts`' default)
+    /// and no standing bytes (`Engine::standing_after`'s).
+    fn guest_state(
         &self,
         program: ProgramId,
-        extents: &engine::BindExtents,
-    ) -> EngineResult<engine::FireFacts> {
+        at: &engine::BindExtents,
+    ) -> EngineResult<engine::GuestState> {
         self.loaded()?
-            .fire_facts(
-                program,
-                &eta_exec::Extents {
-                    row_count: extents.row_count,
-                    token_count: extents.token_count,
-                    sampled_rows: extents.sampled_rows,
-                    query_len: extents.query_len,
-                    key_len: extents.key_len,
-                },
-            )
+            .guest_state(program, &extents(at))
             .map_err(fault)
     }
 
@@ -1095,9 +1090,10 @@ impl Engine for Metal {
                 &binding.channels,
                 &binding.instance_slots,
                 &binding.ring_slots,
+                &binding.scratch,
+                &binding.pair,
             )
             .map_err(fault)?;
-        let standing_guest_bytes = shell.standing_guest_bytes();
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
@@ -1113,18 +1109,8 @@ impl Engine for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
-            standing_guest_bytes,
+            standing_guest_bytes: 0,
         })
-    }
-
-    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
-        self.loaded()?
-            .standing_after(
-                binding.program,
-                &extents(&binding.extents),
-                &binding.channels,
-            )
-            .map_err(fault)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
@@ -1132,7 +1118,7 @@ impl Engine for Metal {
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
         shell.close_program_instance(id).map_err(fault)?;
-        Ok(shell.standing_guest_bytes())
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

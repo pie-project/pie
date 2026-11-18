@@ -1074,6 +1074,15 @@ impl Prepared {
     /// The value scratch one lane of a stage of `plan` takes in a fire at
     /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
     pub fn scratch_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u64> {
+        Ok(u64::from(Self::stride_for(plan, regions, extents)?)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN))
+    }
+
+    /// One lane's value scratch for a stage of `plan` at `extents`, as its
+    /// kernels stride it (`uint scratch_stride`): what a batch's lanes hold
+    /// a stride each of.
+    pub fn stride_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u32> {
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -1094,10 +1103,7 @@ impl Prepared {
                 )
             })?
             .total;
-        Ok(u64::try_from(total)
-            .unwrap_or(u64::MAX)
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN))
+        lane_word(LANE_SCRATCH, total)
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
@@ -1371,6 +1377,12 @@ impl Prepared {
         }
         self.scratch = Some(at);
         Ok(())
+    }
+
+    /// Where this fire's value scratch lies: what a batch's lane scratch
+    /// table holds for this member.
+    pub fn scratch_at(&self) -> Result<ScratchAt> {
+        self.scratch().cloned()
     }
 
     fn scratch(&self) -> Result<&ScratchAt> {
@@ -2105,9 +2117,9 @@ pub struct Batch {
     lane_scratch: SpanRegion,
     row_meta: SpanRegion,
     row_indices: SpanRegion,
-    /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
-    /// a stride a member, in the span's guest region.
-    scratch: Option<ScratchAt>,
+    /// This fire's lanes' value scratch, each its member's own
+    /// ([`Batch::seat_scratch`]): what the lane scratch table addresses.
+    scratch: Vec<ScratchAt>,
     addresses: SpanRegion,
     table_bytes: u64,
     layouts: Vec<SpanRegion>,
@@ -2176,7 +2188,12 @@ impl Batch {
     /// `rows` readout rows a lane: what a fire term states before any is
     /// laid; 0 for a stage with no grouped seat.
     #[must_use]
-    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+    pub fn bytes_for(
+        plan: &LaunchStagePlan,
+        channels: u32,
+        lanes: u32,
+        rows: u32,
+    ) -> u64 {
         if !plan.needs.grouped_valid {
             return 0;
         }
@@ -2293,7 +2310,7 @@ impl Batch {
             lane_scratch: next(),
             row_meta: next(),
             row_indices: next(),
-            scratch: None,
+            scratch: Vec::new(),
             addresses: next(),
             table_bytes,
             layouts: (0..grouped.layout_words.len()).map(|_| next()).collect(),
@@ -2354,42 +2371,44 @@ impl Batch {
         Ok(next)
     }
 
-    /// The value scratch a fire of `members` members takes: a stride each.
-    #[must_use]
-    pub fn scratch_bytes(&self, members: u32) -> u64 {
-        (u64::from(members) * u64::from(self.key.scratch_stride))
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN)
-    }
-
-    /// Seats this fire's value scratch at `at` for `members` lanes, a
-    /// stride each: lane `l`'s base, in the lane scratch table, is `l`
-    /// strides past `at`.
-    pub fn seat_scratch(&mut self, at: ScratchAt, members: u32) -> Result<()> {
+    /// Writes each lane's scratch address into the lane scratch table:
+    /// lane `i` fires in `lanes[i]`, its member's own scratch, wherever the
+    /// pool laid it. No lane's bytes are reached from another's.
+    pub fn seat_scratch(&mut self, lanes: &[ScratchAt]) -> Result<()> {
+        if lanes.len() as u64 > u64::from(self.lanes) {
+            return Err(Fault::Ceiling {
+                what: "lanes of a batch's lane scratch table",
+                need: lanes.len() as u64,
+                have: u64::from(self.lanes),
+            });
+        }
         // Off Apple nothing encodes (a batch's encode is `Deviceless`), and
         // no reservation has an address to write.
         #[cfg(target_vendor = "apple")]
         {
-            let stride = u64::from(self.key.scratch_stride);
-            let mut bases = Vec::with_capacity(LaneScratch::bytes(members) as usize);
-            for lane in 0..u64::from(members) {
-                bases.extend(address_of(&at.buffer, at.offset + lane * stride)?.to_le_bytes());
+            let mut bases = Vec::with_capacity(LaneScratch::bytes(self.lanes) as usize);
+            for at in lanes {
+                bases.extend(address_of(&at.buffer, at.offset)?.to_le_bytes());
             }
             self.lane_scratch.write(0, &bases)?;
         }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = members;
-        self.scratch = Some(at);
+        self.scratch = lanes.to_vec();
         Ok(())
     }
 
-    fn scratch(&self) -> Result<&ScratchAt> {
-        self.scratch.as_ref().ok_or_else(|| {
-            Fault::program(
+    /// This fire's lanes' scratch, one a member: refused where the fire
+    /// seated other than `count` lanes.
+    fn lanes_scratch(&self, count: u32) -> Result<&[ScratchAt]> {
+        if self.scratch.len() as u64 != u64::from(count) {
+            return Err(Fault::program(
                 "program::launch",
-                "a batch fired before its fire seated its value scratch in the span",
-            )
-        })
+                format!(
+                    "a batch fires {count} lanes and seated {} lanes' scratch",
+                    self.scratch.len()
+                ),
+            ));
+        }
+        Ok(&self.scratch)
     }
 
     #[must_use]
@@ -2419,14 +2438,16 @@ impl Batch {
         if count == 0 {
             return Ok(());
         }
+        #[cfg(target_vendor = "apple")]
         let stride = u64::from(self.key.scratch_stride);
         self.pending_flags.zero_span(
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
-        let scratch = self.scratch()?.clone();
         #[cfg(target_vendor = "apple")]
-        poison_scratch(frame, scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
+        for lane in self.lanes_scratch(count)? {
+            poison_scratch(frame, lane.buffer.slab(), lane.offset, stride)?;
+        }
         let frame: &Frame = frame;
         let vocab = members[0]
             .grouped
@@ -2514,13 +2535,10 @@ impl Batch {
         for region in regions {
             match region.form {
                 Form::Fused => {
-                    for (index, member) in members.iter().enumerate() {
-                        member.encode_fused(
-                            frame,
-                            region,
-                            &scratch.buffer,
-                            scratch.offset + index as u64 * stride,
-                        )?;
+                    // A fused region fires each member in its own scratch.
+                    for member in members.iter() {
+                        let own = member.scratch_at()?;
+                        member.encode_fused(frame, region, &own.buffer, own.offset)?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -2631,11 +2649,10 @@ impl Batch {
                 encoder.useResource_usage(resource, usage);
             };
             // The lanes reach their scratch by the addresses in the lane
-            // scratch table.
-            resident(
-                &self.scratch()?.buffer,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
+            // scratch table: each member's own, wherever it lies.
+            for lane in &self.scratch {
+                resident(&lane.buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
             for member in members {
                 resident(
                     member.status.buffer(),
@@ -2815,11 +2832,10 @@ impl Batch {
                 encoder.useResource_usage(resource, usage);
             };
             // The lanes reach their scratch by the addresses in the lane
-            // scratch table.
-            resident(
-                &self.scratch()?.buffer,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
+            // scratch table: each member's own, wherever it lies.
+            for lane in &self.scratch {
+                resident(&lane.buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
             for member in members {
                 resident(
                     member.status.buffer(),
@@ -3062,3 +3078,4 @@ mod tests {
         }
     }
 }
+
