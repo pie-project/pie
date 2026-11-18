@@ -4795,7 +4795,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             bases[at] = Some(layers);
         }
 
+        // Every read lands in the arm's seat by one copy of all its regions:
+        // one pair of barriers a fire, not one a lane.
         let layout = prepared.readout_layout.clone();
+        let mut regions: Vec<(u64, u64, u64)> = Vec::new();
         for span in layout.iter().filter(|span| span.rows > 0) {
             let plane = &self.readouts[span.plane as usize];
             let layers = bases[span.plane as usize]
@@ -4811,15 +4814,18 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                     u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
                 }
             };
-            for copy in span_copies(span, layers, row_bytes, source_row) {
-                frame.copy(
-                    self.span.buffer()?,
-                    copy.from,
-                    &self.readout[prepared.arm],
-                    copy.to,
-                    copy.bytes,
-                )?;
-            }
+            regions.extend(
+                span_copies(span, layers, row_bytes, source_row)
+                    .into_iter()
+                    .map(|copy| (copy.from, copy.to, copy.bytes)),
+            );
+        }
+        if !regions.is_empty() {
+            frame.copy_regions(
+                self.span.buffer()?,
+                &self.readout[prepared.arm],
+                &regions,
+            )?;
         }
 
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
