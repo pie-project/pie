@@ -1004,28 +1004,6 @@ impl KvStore {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut groups = self.reclaim_order(&keys);
-        // The device holds the highest keys: cache that stays on it for
-        // now (a live set reads it, or dropping it frees no page) holds back
-        // every group keyed above it, which would go down in its place.
-        // Equal keys may pass each other.
-        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
-        let read = self
-            .cache
-            .values()
-            .filter(|entry| {
-                !unused.contains(&entry.path.terminal)
-                    && self.table.holds_resident(entry.path.terminal)
-            })
-            .map(|entry| keys.key_at(entry.owner, self.key_token(entry.path.pages)));
-        let unfreeing = groups
-            .iter()
-            .filter(|(_, ids)| !self.table.frees_device_pages(&self.roots(ids)))
-            .map(|(key, _)| *key);
-        let held = read
-            .chain(unfreeing)
-            .filter(|key| retention::above_floor(*key))
-            .min();
-        groups.retain(|(key, _)| held.is_none_or(|held| *key <= held));
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {

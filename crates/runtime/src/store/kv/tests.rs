@@ -89,7 +89,7 @@ fn tests_every_case() {
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
-    a_higher_set_is_not_demoted_for_a_lower_one_a_live_set_reads();
+    keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free();
     floor_keyed_idle_cache_is_dropped_not_demoted();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1219,12 +1219,13 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
 }
 
-/// The device holds the highest keys: a lower-keyed idle set that frees no
-/// device page (a live working set reads it) does not let a higher-keyed
-/// one go down in its place. The pressure is met by the planner's moves of
-/// the live sets instead (a suspend takes the pages they share). Keyed
-/// alike, the one that frees pages goes.
-fn a_higher_set_is_not_demoted_for_a_lower_one_a_live_set_reads() {
+/// Liveness under keyed pressure: a process reads the lower-keyed set live
+/// and needs more room, and the only cache that can free a page is keyed
+/// higher. Demotion goes in key order among the groups that can free pages:
+/// the lower set cannot (its reader holds it), so the higher one goes down
+/// and the reader makes progress. Holding the higher set back for the lower
+/// one would leave nothing that frees the room the reader waits on.
+fn keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free() {
     let mut store = KvStore::new_with_swap(16, 16, 0, h(39));
     store.set_page_size(16);
     let (a, b) = (ProcessId::from_u128(47), ProcessId::from_u128(48));
@@ -1235,20 +1236,13 @@ fn a_higher_set_is_not_demoted_for_a_lower_one_a_live_set_reads() {
     let keys = Steps {
         entries: vec![(a, None, 10), (b, None, 1)],
     };
-    assert!(
-        store.prepare_demote(8, keys).unwrap().is_none(),
-        "A, keyed above B, stays while B stays"
-    );
-    assert_eq!(on_device(&mut store, &a_tokens), 4);
-    let alike = Steps {
-        entries: vec![(a, None, 1), (b, None, 1)],
-    };
     let txn = store
-        .prepare_demote(8, alike)
+        .prepare_demote(8, keys)
         .unwrap()
-        .expect("keyed alike, A frees pages and goes");
+        .expect("the higher set goes: the lower one cannot free a page");
     assert_eq!(txn.page_count(), 4);
     store.commit_suspend(txn).unwrap();
+    assert_eq!(on_device(&mut store, &b_tokens), 4, "what the reader reads stays");
 }
 
 /// Idle cache no policy keys above the floor is not copied down a tier
