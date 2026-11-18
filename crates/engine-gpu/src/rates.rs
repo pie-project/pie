@@ -191,33 +191,13 @@ impl<'a, B: Serve> Rig<'a, B> {
     }
 
     /// One `fire`'s time inside a frame: a frame of `n` of it against one,
-    /// `n` doubled until a fire's time settles (`engine::rates::timed_frames`,
-    /// every engine's rule; the device's `max_submit` the only cap), the
-    /// host's clock around each frame's one submit.
+    /// `n` doubled until a fire's time settles, then such frames until their
+    /// rate stops moving (`engine::rates::warmed_frames`, every engine's
+    /// rule; the device's `max_submit` the only cap), the host's clock around
+    /// each frame's one submit.
     fn each(
         &self,
         timer: Timer<'_, B>,
-        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
-    ) -> Result<u64> {
-        self.each_of(timer, false, fire)
-    }
-
-    /// [`Rig::each`] for a memory-bound op: before it is timed, its own
-    /// frames warm the device until their rate stops moving
-    /// (`engine::rates::warm_up`'s rule): the DVFS level sustained serving
-    /// sees, not the one an idle device starts at.
-    fn each_warmed(
-        &self,
-        timer: Timer<'_, B>,
-        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
-    ) -> Result<u64> {
-        self.each_of(timer, true, fire)
-    }
-
-    fn each_of(
-        &self,
-        timer: Timer<'_, B>,
-        warm: bool,
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
     ) -> Result<u64> {
         let nothing = |_: &mut B::Frame| Ok(());
@@ -228,7 +208,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             Ok(median(walls))
         };
         self.frame(timer, 1, fire, &nothing)?;
-        let frames = engine::rates::timed_frames(
+        let frames = engine::rates::warmed_frames(
             self.max_submit,
             None,
             |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
@@ -238,12 +218,6 @@ impl<'a, B: Serve> Rig<'a, B> {
             self.unsettled.set(true);
         }
         let count = frames.fires;
-        if warm {
-            engine::rates::warm_up(|| {
-                self.frame(timer, count, fire, &nothing)
-                    .map(|(_, w)| f64::from(count) / (w as f64).max(1.0))
-            })?;
-        }
         let one = wall(1)?;
         if count < 2 {
             return Ok(one);
@@ -431,7 +405,7 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         })
         .collect::<Result<Vec<(Tensor, Tensor, Tensor, Tensor)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each_warmed(timer, &|sink| {
+    let ns = rig.each(timer, &|sink| {
         let (x, normed, packed, y) = sets[next.get() % sets.len()];
         next.set(next.get() + 1);
         kernels_slang::elemwise::norm::rmsnorm(sink, x, weight, 1e-6, normed)
@@ -631,7 +605,7 @@ fn scan<B: Serve>(
         })
         .collect::<Result<Vec<_>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each_warmed(timer, &|sink| {
+    let ns = rig.each(timer, &|sink| {
         let (raw, conv_state, scan_state) = &sets[next.get() % sets.len()];
         let raw = *raw;
         next.set(next.get() + 1);

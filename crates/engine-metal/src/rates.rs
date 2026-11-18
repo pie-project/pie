@@ -195,9 +195,9 @@ impl Bench<'_> {
 
     /// The GPU seconds one of what `encode` fills takes as serving runs it,
     /// back to back with others: each frame holds `k` of them, `k` doubled
-    /// until a fire's time settles (`engine::rates::timed_frames`, every
-    /// engine's rule), and the median of five such frames after a warm one,
-    /// over `k`. A frame of one short dispatch times the clock state the
+    /// until a fire's time settles, then such frames until their rate stops
+    /// moving (`engine::rates::warmed_frames`, every engine's rule), and the
+    /// median of five such frames after a warm one, over `k`. A frame of one short dispatch times the clock state the
     /// device idled into between frames, not the kernel (bimodal on an M5
     /// Pro at m = 64..2048 of the matmul ladder; 5 ms frames read the m = 16
     /// matmul 26% apart run to run on an M1 Max, 20 ms within 0.25%).
@@ -205,41 +205,15 @@ impl Bench<'_> {
         &self,
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
-        self.timed_of(false, encode)
-    }
-
-    /// [`Bench::timed`] for a memory-bound op: before it is timed, its own
-    /// frames warm the GPU until their rate stops moving
-    /// (`engine::rates::warm_up`'s rule): the DVFS level sustained serving
-    /// sees (an M1's per-row ops read 146, 175, 217 or 262 GB/s by the level
-    /// it had reached), not the one an idle device starts at.
-    fn timed_warmed(
-        &self,
-        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
-    ) -> Result<f64, String> {
-        self.timed_of(true, encode)
-    }
-
-    fn timed_of(
-        &self,
-        warm: bool,
-        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
-    ) -> Result<f64, String> {
         let turn = engine::rates::Rotation::default();
         self.frame_of(&turn, encode, 1)?;
-        let k = engine::rates::timed_frames(
+        let k = engine::rates::warmed_frames(
             None,
             None,
             |k| self.frame_of(&turn, encode, k).map(|s| s * 1e9),
             |why| why,
         )?
         .fires;
-        if warm {
-            engine::rates::warm_up(|| {
-                self.frame_of(&turn, encode, k)
-                    .map(|s| f64::from(k) / s.max(1e-12))
-            })?;
-        }
         self.frame_of(&turn, encode, k)?;
         let mut times = Vec::with_capacity(5);
         for _ in 0..5 {
@@ -312,7 +286,7 @@ impl Bench<'_> {
             ));
             held.extend([x, normed, packed, y]);
         }
-        let seconds = self.timed_warmed(&|sink, at| {
+        let seconds = self.timed(&|sink, at| {
             let (x, normed, packed, y) = sets[at as usize % sets.len()];
             kernels_metal::elemwise::norm::rmsnorm(sink, x, wt, 1e-6, normed)?;
             kernels_metal::linear::mlp::swiglu(sink, packed, width, y)
@@ -471,7 +445,7 @@ impl Bench<'_> {
         let weight = self.tensor(&weight, channels, CONV, Dtype::Bf16)?;
         let gates = self.tensor(&gates, TOKENS, 2 * HEADS, Dtype::F32)?;
         let y = self.tensor(&y, TOKENS, HEADS * DV, Dtype::F32)?;
-        let seconds = self.timed_warmed(&|sink, _| {
+        let seconds = self.timed(&|sink, _| {
             ssm::causal_conv1d_chunked(sink, x, weight, &pool, CONV, 1, convolved)?;
             ssm::gated_delta_chunked(
                 sink,
