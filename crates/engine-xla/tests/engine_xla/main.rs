@@ -15,6 +15,7 @@ mod a_double_block_fires_two_streams_through_the_engine;
 mod a_dry_load_traces_the_real_load_programs;
 mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
+mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_mask_reads_from_the_committed_boundary;
 mod a_pool_view_reads_the_packed_rows_order;
