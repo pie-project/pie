@@ -2413,12 +2413,10 @@ impl Shell {
                 token_lanes[at] = l as i32;
             }
         }
-        let token_words = (!token_feeds.is_empty()).then(|| {
-            (
-                inputs.i32s(handles, &token_rows, 1),
-                inputs.i32s(handles, &token_lanes, 1),
-            )
-        });
+        let token_words = (
+            inputs.i32s(handles, &token_rows, 1),
+            inputs.i32s(handles, &token_lanes, 1),
+        );
         // The streamed weights this fire reads: each streamed table's row
         // for every token row, each streamed bank's expert places
         // (`crate::store::streamed`).
@@ -3322,7 +3320,8 @@ impl Shell {
         // The tokens a guest pass put in the pool, gathered over the host's
         // stand-ins before anything reads them (a read of the pool: no
         // write, so the fire's placement is untouched).
-        if let Some((token_rows, token_lanes)) = bindings.token_words {
+        {
+            let (token_rows, token_lanes) = bindings.token_words;
             use crate::emit::Emit as _;
             let (root, tokens) = (self.pools.root(), bindings.tokens);
             tracer.emit(&mut |cx| {

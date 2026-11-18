@@ -33,6 +33,11 @@ struct Instance {
 
     #[cfg(feature = "wgpu")]
     gate: Arc<Gate>,
+
+    /// Its pair's score room as its session lays it now, read at a step
+    /// without waiting on a pass that holds the session.
+    #[cfg(feature = "wgpu")]
+    scores: Option<engine_gpu::serve::DeviceCell<crate::device::Api>>,
 }
 
 impl Instance {
@@ -434,6 +439,7 @@ impl Plane {
         &mut self,
         binding: &InstanceBinding,
         place: Option<&Place<'_, crate::device::Api>>,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal> {
         if !binding.ring_slots.is_empty() {
             return Err(Refusal::Program(format!(
@@ -490,14 +496,16 @@ impl Plane {
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
         #[cfg(not(feature = "wgpu"))]
-        let _ = place;
+        let _ = (place, layout);
         #[cfg(feature = "wgpu")]
-        let session = self.build_session(place, binding, &plan).map_err(|why| {
+        let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "wgpu")]
+        let scores = session.scores();
         self.instances.insert(
             id,
             Instance {
@@ -512,6 +520,8 @@ impl Plane {
                 })),
                 #[cfg(feature = "wgpu")]
                 gate: Arc::default(),
+                #[cfg(feature = "wgpu")]
+                scores,
                 plan,
                 inst,
                 geometry: binding.geometry,
@@ -903,6 +913,7 @@ impl Plane {
         place: Option<&Place<'_, crate::device::Api>>,
         binding: &InstanceBinding,
         plan: &ExecPlan,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<crate::guest::session::Session, String> {
         let place = place.ok_or_else(|| {
             "this engine bound no device, so a guest pass has nowhere to run".to_owned()
@@ -931,13 +942,14 @@ impl Plane {
             .library
             .clone()
             .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
-        let extents = eta_exec::Extents {
-            row_count: binding.extents.row_count,
-            token_count: binding.extents.token_count,
-            sampled_rows: binding.extents.sampled_rows,
-            query_len: binding.extents.query_len,
-            key_len: binding.extents.key_len,
-        };
+        let extents = engine_gpu::guest::state::extents_of(&binding.extents);
+        // The instance's state and its pair's, at the places the runtime
+        // took for them.
+        let instance =
+            engine_gpu::guest::state::Placed::at(place.pools, &binding.scratch, layout.instance)
+                .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
+        let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
+            .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
         let args = match self.step_args.get(&binding.program) {
             Some(args) => args.clone(),
             None => {
@@ -963,6 +975,8 @@ impl Plane {
                 slots: &binding.instance_slots,
                 align: place.align,
             },
+            [instance, pair],
+            layout,
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -1013,13 +1027,12 @@ impl Plane {
     /// Points every instance's tables at the chunks their slots sit in now.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
-        for seat in self.instances.values() {
-            seat.half
-                .lock()
-                .expect("half lock poisoned")
-                .session
+        for seat in self.instances.values_mut() {
+            let mut half = seat.half.lock().expect("half lock poisoned");
+            half.session
                 .rebind(pools)
                 .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            seat.scores = half.session.scores();
         }
         #[cfg(not(feature = "wgpu"))]
         let _ = pools;
@@ -1037,6 +1050,8 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                scratch,
+                pair,
                 ..
             } => {
                 if !rings.is_empty() {
@@ -1045,22 +1060,21 @@ impl Plane {
                          of a ring on the host"
                     )));
                 }
-                let seat = self.instances.get(id).ok_or(Refusal::Closed {
+                let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                     what: "instance",
                     id: id.0,
                 })?;
                 #[cfg(feature = "wgpu")]
                 {
                     seat.gate.settle(*id)?;
-                    seat.half
-                        .lock()
-                        .expect("half lock poisoned")
-                        .session
-                        .retarget(pools, instance)
+                    let mut half = seat.half.lock().expect("half lock poisoned");
+                    half.session
+                        .retarget(pools, instance, scratch, pair)
                         .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    seat.scores = half.session.scores();
                 }
                 #[cfg(not(feature = "wgpu"))]
-                let _ = (seat, pools, instance);
+                let _ = (seat, pools, instance, scratch, pair);
                 Ok(())
             }
             Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
@@ -1175,8 +1189,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         &mut self,
         binding: &InstanceBinding,
         place: Option<&Place<'_, crate::device::Api>>,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal> {
-        Plane::bind(self, binding, place)
+        Plane::bind(self, binding, place, layout)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn scores(
+        &self,
+        instance: InstanceId,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        self.instances.get(&instance)?.scores.clone()
     }
 
     fn moved_ends(&self, instance: InstanceId) -> Vec<(ChannelId, bool)> {

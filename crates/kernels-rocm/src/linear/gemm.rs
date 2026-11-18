@@ -33,8 +33,10 @@ pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32
 }
 
 /// The waves hipBLASLt's first heuristic algorithm for a dense bf16 product
-/// of `m x n x k` fills on the current device, as hipBLASLt states them
-/// (`wavesCount`). `None` where it offers no algorithm or states none.
+/// of `m x n x k` fills on the current device, as its library states the
+/// algorithm's kernel (`hip::lt::waves`). `None` where it offers no
+/// algorithm or states no waves; where its solution could not be read, the
+/// reason is kept for `hip::lt_kernel::pricing`.
 #[cfg(feature = "rocm")]
 #[must_use]
 pub fn waves(m: u32, n: u32, k: u32) -> Option<f64> {
@@ -46,8 +48,10 @@ pub fn waves(m: u32, n: u32, k: u32) -> Option<f64> {
         groups: 1,
         f32_out: false,
     })
-    .ok()
-    .flatten()
+    .unwrap_or_else(|why| {
+        crate::hip::lt_kernel::unread(why);
+        None
+    })
 }
 
 /// The most rows ROCm's few-rows kernel (the skinny kernel) walks.

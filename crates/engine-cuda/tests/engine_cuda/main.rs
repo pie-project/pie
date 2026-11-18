@@ -37,6 +37,7 @@ mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_stated_group_mask_reads_only_the_rows_it_admits;
+mod a_bound_guest_holds_its_scratch_as_state;
 mod a_buffer_frees_after_another_context_closes;
 mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]

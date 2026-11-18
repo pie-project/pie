@@ -30,8 +30,6 @@ sdpa.selected_mma = true
 # DeepSeek-V4.1 bounded replay, as vLLM prefills it (its decoder layers
 # route a quarter of a 2048-token batch): pf16-512 prefill 19.8k to ~29.8k tok/s.
 sdpa.compressed_replay = true
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 # MXFP4 experts averaging up to 16 routes on the 512-code-run select, past
 # them the staged one (gpt-oss-120b's miniature at c128 on an L40S: 2490 to
@@ -59,8 +57,6 @@ measured = [
   "kernel.moe.affine_grouped",
   "kernel.moe.affine_grouped_from",
   "kernel.moe.affine_wmma",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
   "kernel.moe.mxfp4_wmma",

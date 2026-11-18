@@ -409,6 +409,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             device.name(),
             &counts,
         )?;
+        // Which pricing the estimate gave the dense matmuls, said once: the
+        // waves of the kernels hipBLASLt states, or the measured curve as
+        // timed and why its solutions went unread.
+        #[cfg(feature = "rocm")]
+        eprintln!(
+            "engine-cuda: the matmuls weighed by {}",
+            kernels_cuda::hip::lt_kernel::pricing()
+        );
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(
@@ -1651,9 +1659,9 @@ impl Shell {
                 .arena
                 .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
         }
-        // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::fire_facts`):
-        // nothing is held for them here.
+        // A program's fires lay their tables and scratch in its pairs'
+        // state, which the runtime takes in `Instance` slots at bind
+        // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
@@ -1836,8 +1844,8 @@ impl Shell {
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
 
-    /// Where a guest's sampler meets across its blocks: the most blocks one
-    /// of its launches runs, at the plane's flight on this device.
+    /// Where a guest's sampler meets across its blocks: the most lanes'
+    /// spans one of its launches lays, at the plane's flight on this device.
     fn lane_arenas_bytes(&self) -> u64 {
         crate::program::launch::Arenas::bytes_for(
             self.programs.flight(),

@@ -222,6 +222,34 @@ pub fn interpolate(curve: &[(u32, f64)], x: f64) -> Option<f64> {
     Some(a + (b - a) * t)
 }
 
+/// A matmul's rate at `m` rows of an `n x k` plane, read off `by_rows` (rows
+/// curves at each square width, ascending in width, in any unit of rate):
+/// each width's curve at the timed rows at or below `m` (its first below
+/// that), in `log width` at `sqrt(n k)` between the widths. Past the widest
+/// width its last span's slope in log width carries on (a wider plane fills
+/// more tiles), never below the widest's rate; below the narrowest, its rate.
+/// Infinite for no curves.
+#[must_use]
+pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
+    let at = |curve: &[(u32, f64)]| -> f64 {
+        curve
+            .iter()
+            .rev()
+            .find(|&&(rows, _)| rows <= m)
+            .or(curve.first())
+            .map_or(f64::INFINITY, |&(_, r)| r)
+    };
+    let width: Vec<(u32, f64)> = by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
+    let square = (f64::from(n) * f64::from(k)).sqrt();
+    if let [.., (w0, r0), (w1, r1)] = width[..]
+        && square > f64::from(w1)
+    {
+        let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
+        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
+    }
+    interpolate(&width, square).unwrap_or(f64::INFINITY)
+}
+
 /// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a
 /// check of the estimate measures. Never a profile's.
 pub type FireTable = Vec<(u32, u64)>;

@@ -1439,7 +1439,14 @@ impl Run<'_> {
                 return Ok(false);
             }
             let (x, routes, mut out) = (self.tensor(x), self.tensor(routes), self.tensor(y));
-            return linear::moe::select_bf16_held(
+            // relu^2 lands in the tiled GEMM's epilogue: fused where the
+            // plain select's cheapest leg is that GEMM.
+            if linear::moe::cheapest(self.ctx(), x, bank, routes, &out, experts)?
+                != linear::moe::Leg::Tiled
+            {
+                return Ok(false);
+            }
+            return linear::moe::select_bf16_tiled(
                 self.ctx(),
                 "fused.moe_select_glu",
                 x,

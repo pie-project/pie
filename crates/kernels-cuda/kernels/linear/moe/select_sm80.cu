@@ -361,7 +361,7 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
 /// (`moe_route_order`), as `moe_select_mxfp4_mma` lands them; with `kGlu`
 /// the bank's `n` rows are `inter` gate rows and as many up rows and `out`
 /// the GLU.
-// `kTiles` and `kKSplit` as `moe_select_bf16_held` takes them.
+// `kTiles` m16 tiles a warp and K split across `kKSplit` groups of four warps.
 template <int kNb, int kDepth, int kGlu, int kGran, int kTiles = 2, int kKSplit = 1>
 __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
     const bf16* __restrict__ act,

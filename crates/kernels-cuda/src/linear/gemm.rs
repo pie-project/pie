@@ -66,16 +66,30 @@ pub fn few_rows_grid(m: u32, n: u32, k: u32) -> Option<u32> {
 /// the few-rows kernel's rows, and short of `kernel.gemm.bf16_split_from`,
 /// where cuBLAS's own algorithm runs): its `wavesCount`, its tiles (and
 /// split-K slices) over the blocks of its kernel the device holds at once.
-/// `None` where serving runs another kernel or cuBLASLt states none.
+/// Short of one such wave, the waves its tiles fill of the multiprocessors
+/// (at most one): a block alone on a multiprocessor runs it near its rate
+/// (L40S, width 2048 at 724 rows: 96 tiles of a kernel two a
+/// multiprocessor, 0.34 of `wavesCount`'s wave, ran 152 TFLOP/s against
+/// 227 at 2048 rows), so the device is short only the multiprocessors it
+/// leaves idle. `None` where serving runs another kernel or cuBLASLt states
+/// none.
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn waves(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<f64> {
     if m <= FEW_ROWS || (tuning.gemm_bf16_split_from > 0 && m >= tuning.gemm_bf16_split_from) {
         return None;
     }
-    tile(tuning, m, n, k)
-        .map(|t| f64::from(t.waves))
-        .filter(|&w| w.is_finite() && w > 0.0)
+    let t = tile(tuning, m, n, k)?;
+    let stated = f64::from(t.waves);
+    if !(stated.is_finite() && stated > 0.0) {
+        return None;
+    }
+    if stated >= 1.0 {
+        return Some(stated);
+    }
+    let tiles = f64::from(m.div_ceil(t.rows)) * f64::from(n.div_ceil(t.cols)) * f64::from(t.split_k);
+    let sms = f64::from(multiprocessors()?);
+    Some((tiles / sms).min(1.0))
 }
 
 /// The current device's multiprocessors, where it answers.
