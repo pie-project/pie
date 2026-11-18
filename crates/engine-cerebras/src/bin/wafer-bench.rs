@@ -28,7 +28,7 @@
 //! ```text
 //! wafer-bench --reading <stream program dir> --program <compiled out dir> --inputs <dir>
 //!             [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1]
-//!             [--statics <dir>] [--cmaddr <addr>]
+//!             [--statics <dir> | --checkpoint <dir | .zt>] [--cmaddr <addr>]
 //! wafer-bench --reading <stream program dir> --inputs <dir> --entries <out dir> [--grid T,H,W]
 //! ```
 //!
@@ -38,7 +38,9 @@
 //! rows back and runs the exit's ops; `--steps` steps of the poem's flow schedule, an Euler step
 //! each. The program is loaded and its static arrays (tiles, tables) written once; a step is its
 //! entries and a launch (`--reload 1`: the program loaded afresh a step; `--statics <dir>`: the
-//! static arrays' words from `<dir>/<k>.u32`, made from a checkpoint, not the program's files).
+//! static arrays' words from `<dir>/<k>.u32`, made from a checkpoint, not the program's files;
+//! `--checkpoint <dir>`: made here from the checkpoint as the engine makes them, and the entries'
+//! weights with them).
 //! With `--golden`, each step's velocity is held to `cpu_velocity<i>.f32` and the latent after it
 //! to `cpu_latent<i + 1>.f32` (relative L2 1e-2, cosine 0.999); `--save` writes them
 //! (`velocity<i>.f32`, `latent<i + 1>.f32`). `--entries` writes the first step's entries as the
@@ -58,7 +60,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
-                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
+                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir> | --checkpoint <dir | .zt>] [--stamps <dir>] \
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir | .zt> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
@@ -643,6 +645,31 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         }
     }
     let mut host = engine_cpu::Forward::host(trace.clone());
+    // `--checkpoint <dir>`: the static arrays and the entries' weights from the checkpoint, landed
+    // through the import contract as the engine lands it (a reading whose entries read weights,
+    // a VAE's latent normalisation, runs only so)
+    let made: Option<Vec<Option<Vec<u32>>>> = match get.get("checkpoint") {
+        Some(c) => {
+            let ckpt = std::fs::canonicalize(c).map_err(|e| format!("--checkpoint: {e}"))?;
+            let t0 = std::time::Instant::now();
+            // (a stamped artifact's own planes, or a raw checkpoint's through the import
+            // contract: the runtime's reading)
+            let contract = poem_compiler::catalog::repository().contract_for(&trace, &ckpt)?;
+            let landed = engine_cerebras::prepare::land(&trace, &contract, &ckpt)?;
+            let of =
+                |name: &str, count: usize| engine_cerebras::prepare::plane(&landed, name, count);
+            let mut weights = engine_cpu::Forward::new(trace.clone(), None, &of)?;
+            let statics = reading.statics(&mut weights, &reading.step(&trace, None, &[]))?;
+            host = engine_cpu::Forward::host_for(trace.clone(), &of, &reading.entry_values())?;
+            println!(
+                "READING {} landed and its statics made in {:.0} s",
+                reading.model,
+                t0.elapsed().as_secs_f64()
+            );
+            Some(statics)
+        }
+        None => None,
+    };
     if let Some(out) = get.get("entries") {
         let mut batch: Vec<Vec<(String, Vec<f32>)>> = Vec::new();
         for d in &dirs {
@@ -715,12 +742,16 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             .map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
-        let (got, cycles) = match get.get("statics") {
-            Some(dir) => {
+        let (got, cycles) = match (&made, get.get("statics")) {
+            (Some(words), _) => {
+                reading.write_statics(&mut rt, words)?;
+                reading.launch(&mut rt, &entries)?
+            }
+            (None, Some(dir)) => {
                 reading.write_statics(&mut rt, &statics_of(&reading, dir)?)?;
                 reading.launch(&mut rt, &entries)?
             }
-            None => reading.fire(&mut rt, &entries)?,
+            (None, None) => reading.fire(&mut rt, &entries)?,
         };
         if let Some(dir) = get.get("stamps") {
             save_tsc(&mut rt, &reading, dir, 0)?;
@@ -795,10 +826,11 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         println!("PROGRESS loaded {loaded:.1} s");
         rt.run();
         println!("PROGRESS running {:.1} s", t0.elapsed().as_secs_f64());
-        match get.get("statics") {
-            // the static arrays made elsewhere (from a checkpoint): the k-th array's words
-            Some(dir) => reading.write_statics(&mut rt, &statics_of(&reading, dir)?)?,
-            None => reading.write_static(&mut rt)?,
+        match (&made, get.get("statics")) {
+            // the static arrays made from the checkpoint here, or elsewhere: the k-th array's words
+            (Some(words), _) => reading.write_statics(&mut rt, words)?,
+            (None, Some(dir)) => reading.write_statics(&mut rt, &statics_of(&reading, dir)?)?,
+            (None, None) => reading.write_static(&mut rt)?,
         }
         println!(
             "READING_LOAD {}",
