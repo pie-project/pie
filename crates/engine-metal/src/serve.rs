@@ -1680,6 +1680,13 @@ impl Shell {
         self.pools.chunk_facts()
     }
 
+    /// Backs every seat's run, its pages and its record: what a caller
+    /// firing seat-addressed lanes directly asks before it opens a seat,
+    /// with no runtime committing ahead of it.
+    pub fn back_seats(&mut self) -> Result<()> {
+        self.pools.commit_seats(0, 0)
+    }
+
     /// The chunk pool's layout.
     #[must_use]
     pub fn pool_layout(&self) -> Layout {
@@ -4582,9 +4589,10 @@ impl Shell {
             workspace: 0,
         };
         // A caller firing directly (every lane seat-addressed) has no
-        // runtime to commit ahead of it: the segments its seats touch back now.
+        // runtime to commit ahead of it: the segments its seats and its
+        // demand touch back now.
         if lanes.iter().all(|seated| !seated.refs) && !self.warming {
-            self.pools.commit_seats()?;
+            self.pools.commit_seats(demand.kv_pages, demand.state_slots)?;
         }
         // Every page and record piece the fire reads or writes is checked
         // backed, ref by ref: a page in an uncommitted chunk under the

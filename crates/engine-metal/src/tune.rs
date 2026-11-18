@@ -1326,6 +1326,9 @@ pub struct CheckBench<'a> {
     trace: poem::Trace,
     contract: checkpoint::contract::ModelContract,
     model: String,
+    /// The served load's pool layout, once the check weighed it: what a
+    /// shell's seats take is laid out as that pool lays it.
+    layout: Option<crate::store::layout::Layout>,
 }
 
 /// The check bench of the model `deployment` names, its weights in
@@ -1353,6 +1356,7 @@ pub fn check_bench<'a>(
         trace,
         contract,
         model,
+        layout: None,
     })
 }
 
@@ -1370,22 +1374,25 @@ impl engine::load::check::Bench for CheckBench<'_> {
     ) -> Result<Box<dyn engine::load::check::Loaded + '_>, String> {
         let page = 16u32;
         let (lanes, tokens) = crate::FIRE;
+        // A served shape takes the fire size's lanes and the room the device
+        // leaves. A shell the check fires takes its own slots, the most lanes
+        // one of its fires has, and a pool of what its seats hold: each
+        // seat's run of its context's pages and its record's pieces, and the
+        // widest fire's rows landing past them, laid out as the served
+        // load's pool lays them (`Layout::shell_room`, the layout learned
+        // from the weighing load, which the check takes first).
         let (slots, context, rows, kv_budget) = match shell {
             None => (lanes, tokens, tokens, None),
             Some(shell) => {
-                // A shell fired directly is seat-addressed: each seat owns a
-                // run of its context's pages, and a fire's rows land past
-                // them.
-                let (_, kv_per_key) = poem_exec::store::kv::attention_counts(&self.trace)
-                    .map_err(|e| e.to_string())?;
-                let pages = u64::from(shell.slots) * u64::from(shell.context.div_ceil(page))
-                    + u64::from(shell.rows.div_ceil(page));
-                (
+                let layout = self.layout.ok_or_else(|| {
+                    "the check fired a shell before it weighed the served load".to_string()
+                })?;
+                let room = layout.shell_room(
                     shell.slots,
-                    shell.context,
-                    shell.rows,
-                    Some(pages * u64::from(page) * kv_per_key),
-                )
+                    u64::from(shell.context.div_ceil(page)),
+                    u64::from(shell.rows.div_ceil(page)),
+                );
+                (shell.slots, shell.context, shell.rows, Some(room))
             }
         };
         let mut loaded = crate::Shell::load(crate::Boot {
@@ -1393,7 +1400,7 @@ impl engine::load::check::Bench for CheckBench<'_> {
             trace: self.trace.clone(),
             contract: &self.contract,
             checkpoint: self.artifact,
-            budget: poem_compiler::Budget::new(lanes.max(slots), rows),
+            budget: poem_compiler::Budget::new(slots, rows),
             patches: patch_ladder(&self.trace),
             profile: None,
             page_size: page,
@@ -1411,6 +1418,9 @@ impl engine::load::check::Bench for CheckBench<'_> {
             // No runtime raises the rung here: the check fires the shell
             // itself, at its widest.
             loaded.raise_whole().map_err(|e| e.to_string())?;
+            loaded.back_seats().map_err(|e| e.to_string())?;
+        } else {
+            self.layout = Some(loaded.pool_layout());
         }
         Ok(Box::new(CheckLoad {
             shell: loaded,
