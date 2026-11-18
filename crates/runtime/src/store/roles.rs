@@ -105,6 +105,16 @@ pub enum RolesError {
     },
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
+    /// The engine bound an instance over an item a bind attaches to, and
+    /// the item is gone or off the device: a bind's items stay put while it
+    /// runs ([`Item::pending`]), so this is a broken contract, not a race
+    /// to wait out.
+    #[error("instance {instance:?} was bound over {owner:?}, which is {why}")]
+    Unattached {
+        instance: InstanceId,
+        owner: Owner,
+        why: &'static str,
+    },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -157,6 +167,14 @@ struct Item {
     adapter: Option<u128>,
     /// A channel or an adapter: the instances bound to it.
     attached: BTreeSet<InstanceId>,
+    /// The newest kv epoch of a fire that named it ([`Roles::touch`]): its
+    /// slots, let go, go back once that fire retires.
+    touched: u64,
+    /// A channel or an adapter: the binds attaching to it now, taken
+    /// ([`Roles::take_instance`]) and not yet bound or given back. The
+    /// engine may adopt its slots while the roles' lock is let go for its
+    /// bind, so it neither parks nor frees until they end, as if attached.
+    pending: u32,
     /// A channel: still registered. An instance: still bound.
     open: bool,
     /// Its slots moved and the engine has not been told yet.
@@ -173,6 +191,8 @@ impl Item {
             channels: Vec::new(),
             adapter: None,
             attached: BTreeSet::new(),
+            pending: 0,
+            touched: 0,
             open: true,
             stale: false,
         }
@@ -339,10 +359,16 @@ impl Roles {
     }
 
     fn give(&self, on: &Shared, parts: &[Part]) {
+        self.give_after(on, parts, 0);
+    }
+
+    /// Gives `parts` back once the fire at `epoch`, the last to name them,
+    /// retires.
+    fn give_after(&self, on: &Shared, parts: &[Part], epoch: u64) {
         let mut pool = on.lock().unwrap();
         for part in parts.iter().filter(|part| !part.refs.is_empty()) {
             if let Some(shape) = self.shapes.of(part.role) {
-                pool.give_refs(shape.pool, &part.refs);
+                pool.give_refs_after(shape.pool, &part.refs, epoch);
             }
         }
     }
@@ -466,19 +492,85 @@ impl Roles {
                 },
             };
         }
+        for owner in Self::attaching(&taken) {
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.pending += 1;
+            }
+        }
         Ok(taken)
     }
 
-    /// The bind of `taken` failed: its slots go back.
+    /// The items `taken`'s bind attaches to that were there before it: its
+    /// channels, and an adapter another instance holds.
+    fn attaching(taken: &Taken) -> Vec<Owner> {
+        taken
+            .channels
+            .iter()
+            .map(|&channel| Owner::Channel(channel))
+            .chain(
+                taken
+                    .adapter
+                    .as_ref()
+                    .filter(|(_, _, fresh)| !fresh)
+                    .map(|(key, _, _)| Owner::Adapter(*key)),
+            )
+            .collect()
+    }
+
+    /// `taken`'s bind no longer attaches: each item it held put is let go.
+    fn end_attaching(&mut self, taken: &Taken) -> Vec<Owner> {
+        let owners = Self::attaching(taken);
+        for owner in &owners {
+            if let Some(item) = self.items.get_mut(owner) {
+                item.pending = item.pending.saturating_sub(1);
+            }
+        }
+        owners
+    }
+
+    /// The bind of `taken` failed: its slots go back, and an item it held
+    /// put that a close let go meanwhile is freed now.
     pub fn untake(&mut self, taken: Taken) {
+        let owners = self.end_attaching(&taken);
+        self.give_taken(taken, owners);
+    }
+
+    fn give_taken(&mut self, taken: Taken, attaching: Vec<Owner>) {
         self.give(&self.device, &taken.parts);
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
         }
+        for owner in attaching {
+            self.free_if_done(owner);
+        }
     }
 
-    /// The engine bound `taken` as instance `id`, for `holder`.
-    pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+    /// The engine bound `taken` as instance `id`, for `holder`. Every item
+    /// the bind attached to is where the take found it: one gone, or off
+    /// the device, is refused by name ([`RolesError::Unattached`]), and
+    /// nothing of `taken` is kept.
+    pub fn bound(
+        &mut self,
+        id: InstanceId,
+        holder: Option<Holder>,
+        taken: Taken,
+    ) -> Result<(), RolesError> {
+        let owners = self.end_attaching(&taken);
+        for &owner in &owners {
+            let why = match self.items.get(&owner) {
+                None => Some("gone"),
+                Some(item) if item.tier != Tier::Device => Some("off the device"),
+                Some(_) => None,
+            };
+            if let Some(why) = why {
+                self.give_taken(taken, owners.clone());
+                return Err(RolesError::Unattached {
+                    instance: id,
+                    owner,
+                    why,
+                });
+            }
+        }
         for &channel in &taken.channels {
             if let Some(item) = self.items.get_mut(&Owner::Channel(channel)) {
                 item.attached.insert(id);
@@ -504,9 +596,10 @@ impl Roles {
             && item.channels.is_empty()
             && item.adapter.is_none()
         {
-            return;
+            return Ok(());
         }
         self.items.insert(Owner::Instance(id), item);
+        Ok(())
     }
 
     /// The engine closed instance `id`: its slots go back, and a closed
@@ -534,28 +627,29 @@ impl Roles {
     }
 
     /// Notes that a fire at `epoch` names instance `id`: its tables and
-    /// own rings, the channels it is bound to and the adapter it lands,
-    /// where they lie on the device. Once let go, each slot is handed out
-    /// again only after that epoch retires.
-    pub fn touch(&self, id: InstanceId, epoch: u64) {
-        let Some(item) = self.items.get(&Owner::Instance(id)) else {
+    /// own rings, the channels it is bound to and the adapter it lands.
+    /// Each item keeps the newest such epoch, and its slots, let go, go
+    /// back once that fire retires: a stamp an item, not a touch a slot,
+    /// on every frame's path.
+    pub fn touch(&mut self, id: InstanceId, epoch: u64) {
+        let Some(item) = self.items.get_mut(&Owner::Instance(id)) else {
             return;
         };
-        let shared = item
+        if item.touched >= epoch {
+            // Stamped at this epoch already, and so then were the items it
+            // names: an instance's channels and adapter are fixed at bind.
+            return;
+        }
+        item.touched = epoch;
+        let shared: Vec<Owner> = item
             .channels
             .iter()
             .map(|&channel| Owner::Channel(channel))
             .chain(item.adapter.map(Owner::Adapter))
-            .filter_map(|owner| self.items.get(&owner));
-        let mut pool = self.device.lock().unwrap();
-        for item in std::iter::once(item).chain(shared) {
-            if item.tier != Tier::Device {
-                continue;
-            }
-            for part in &item.parts {
-                if let Some(shape) = self.shapes.of(part.role) {
-                    pool.touch_pool(shape.pool, part.refs.iter().copied(), epoch);
-                }
+            .collect();
+        for owner in shared {
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.touched = item.touched.max(epoch);
             }
         }
     }
@@ -603,13 +697,14 @@ impl Roles {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
-        if item.open || !item.attached.is_empty() || item.tier == Tier::Moving {
+        if item.open || !item.attached.is_empty() || item.pending > 0 || item.tier == Tier::Moving
+        {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
         let on = self.tier(item.tier == Tier::Host);
         if let Some(on) = on {
-            self.give(&on, &item.parts);
+            self.give_after(&on, &item.parts, item.touched);
         }
     }
 
@@ -622,6 +717,8 @@ impl Roles {
         let instance = |id: &InstanceId| self.items.get(&Owner::Instance(*id));
         match owner {
             Owner::Instance(_) => item.holder == Some(holder) && item.open,
+            // A bind attaching to it holds it put.
+            _ if item.pending > 0 => false,
             Owner::Channel(_) => {
                 item.holder == Some(holder)
                     && item.open
@@ -758,8 +855,9 @@ impl Roles {
             let old = std::mem::replace(&mut item.parts, parts);
             item.tier = if txn.out { Tier::Host } else { Tier::Device };
             item.stale = !txn.out;
+            let touched = item.touched;
             if let Some(left) = &left {
-                self.give(left, &old);
+                self.give_after(left, &old, touched);
             }
             self.free_if_done(owner);
         }
@@ -1004,7 +1102,14 @@ pub fn bind_instance(
     };
     match engine.bind_instance(&binding) {
         Ok(bound) => {
-            roles.lock().unwrap().bound(bound.id, holder, taken);
+            let attached = roles.lock().unwrap().bound(bound.id, holder, taken);
+            if let Err(error) = attached {
+                // Its slots are given back: the engine must not keep it.
+                if let Err(closed) = engine.close_instance(bound.id) {
+                    tracing::error!(%closed, "closing an instance bound over a moved item");
+                }
+                return Err(error.into());
+            }
             Ok(bound)
         }
         Err(error) => {

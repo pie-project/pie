@@ -87,6 +87,13 @@ impl ResidencyPlanner {
         }
         self.stats.grow_waits.fetch_add(1, Ordering::Relaxed);
         ptrace!("plan waits on a grow kv={} rs={:?}", need.kv_pages, need.rs);
+        // What may hold freed slots out of the pool: a copy epoch still
+        // open fences every slot let go behind it.
+        if crate::planner::trace_enabled() || tracing::enabled!(tracing::Level::DEBUG) {
+            let copies = crate::scheduler::lane::open_copy_epochs();
+            ptrace!("open copy epochs: {copies}");
+            tracing::debug!(%copies, "planner: waits for room; open copy epochs");
+        }
         true
     }
 

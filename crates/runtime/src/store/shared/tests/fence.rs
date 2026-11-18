@@ -1,8 +1,9 @@
 //! A slot no one holds goes back only once the last device work naming it
-//! has landed: every fire and every copy takes an epoch of the kv store and
-//! touches the slots it names at it, a copy's epoch closing when the
-//! engine's `CopyCompletion` resolves (landed), not when it is enqueued.
-//! A copy still in flight cannot write into a slot handed to a new owner.
+//! has landed: every copy takes an epoch of the kv store and touches the
+//! slots it names at it, the epoch closing when the engine's
+//! `CopyCompletion` resolves (landed), not when it is enqueued, and closing
+//! as failed on every path where nothing of the copy runs. A copy still in
+//! flight cannot write into a slot handed to a new owner.
 
 use ::engine::chunk::SlotCopy;
 use ::engine::completion::copy_in_flight;
@@ -218,4 +219,164 @@ fn a_restore_aborted_under_its_copy_recycles_at_the_copy_s_epoch() {
         assert!(!out(&shared, page), "page {page} back once the copy landed");
     }
     with(&mut |kv| kv.release_device_reservation(std::mem::take(&mut rebound)));
+}
+
+/// A recurrent-state record parking (its fixed shapes' slots copied to the
+/// host by `copy_slots`, as a suspend moves state in a shared pool) is let
+/// go while the copy is in flight (a suspend committed, an abort, a process
+/// end). Its id may be named again at once (an id is a name), but no new
+/// record takes its slots until the copy lands: the state a new owner
+/// writes cannot be what parks.
+#[test]
+fn a_record_let_go_under_its_park_keeps_its_slots_until_the_copy_lands() {
+    let (shared, host, stores) = fenced();
+    let (id, held) = {
+        let mut pool = shared.lock().unwrap();
+        let id = pool.take_records(1).unwrap()[0];
+        (id, pool.record_refs(id))
+    };
+    assert!(!held.is_empty(), "a record holds a slot of each fixed shape");
+    let mut landings = Vec::new();
+    let mut parked = Vec::new();
+    for (shape, refs) in &held {
+        let pool_shape = shared
+            .lock()
+            .unwrap()
+            .fixed()
+            .iter()
+            .find(|fixed| fixed.id == *shape)
+            .unwrap()
+            .pool;
+        let host_refs = host
+            .lock()
+            .unwrap()
+            .take_refs(pool_shape, refs.len() as u64)
+            .unwrap();
+        let epoch = CopyEpoch::open_on(
+            &stores.kv,
+            stores.shared.as_ref(),
+            stores.host.as_ref(),
+            None,
+            &PreLaunchCopy::Slots(SlotCopy {
+                shape: *shape,
+                src: DEVICE,
+                dst: MemoryDomain::HostPinned,
+                slots: refs.iter().copied().zip(host_refs.iter().copied()).collect(),
+                runs: Vec::new(),
+            }),
+        );
+        let (landing, landed) = copy_in_flight();
+        epoch.retire_on(&landed);
+        landings.push(landing);
+        parked.push((pool_shape, host_refs));
+    }
+
+    shared.lock().unwrap().give_records(&[id]);
+    retire(&stores);
+    let slots_of = |record: u32| -> Vec<(EngineShape, Vec<u32>)> {
+        shared.lock().unwrap().record_refs(record)
+    };
+    let fresh = shared.lock().unwrap().take_records(1).unwrap()[0];
+    for ((shape, old), (_, new)) in held.iter().zip(slots_of(fresh)) {
+        assert!(
+            new.iter().all(|slot| !old.contains(slot)),
+            "a new record took shape {shape:?} slots the park still reads"
+        );
+    }
+    shared.lock().unwrap().give_records(&[fresh]);
+
+    for landing in landings {
+        landing.landed();
+    }
+    let pool = shared.lock().unwrap();
+    for (shape, refs) in &held {
+        let pool_shape = pool.fixed().iter().find(|fixed| fixed.id == *shape).unwrap().pool;
+        for &slot_ref in refs {
+            assert!(
+                !pool.pool().is_held(pool_shape, pool.slot(pool_shape, slot_ref)),
+                "shape {shape:?} ref {slot_ref} back once the copy landed"
+            );
+        }
+    }
+    drop(pool);
+    for (shape, refs) in parked {
+        host.lock().unwrap().give_refs(shape, &refs);
+    }
+}
+
+/// Opens the epoch of a copy of `refs` of the kv list device to host, as
+/// the lane does.
+fn copy_list(stores: &Stores, host_refs: &[u32], refs: &[u32]) -> CopyEpoch {
+    CopyEpoch::open_on(
+        &stores.kv,
+        stores.shared.as_ref(),
+        stores.host.as_ref(),
+        None,
+        &PreLaunchCopy::Slots(SlotCopy {
+            shape: LIST,
+            src: DEVICE,
+            dst: MemoryDomain::HostPinned,
+            slots: refs.iter().copied().zip(host_refs.iter().copied()).collect(),
+            runs: Vec::new(),
+        }),
+    )
+}
+
+/// A copy the engine refuses enqueued nothing: its epoch closes as the
+/// lane drops it, and a slot let go meanwhile goes back.
+#[test]
+fn a_copy_the_engine_refuses_holds_nothing() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let epoch = copy_list(&stores, &host_refs, &refs);
+    shared.lock().unwrap().give_refs(list, &refs);
+    retire(&stores);
+    assert!(out(&shared, refs[0]), "fenced while the copy is being handed over");
+    assert!(crate::scheduler::lane::open_copy_epochs().contains("being handed"));
+    // The engine's `copy_slots` answered Err: the lane drops the epoch.
+    drop(epoch);
+    assert!(!out(&shared, refs[0]), "a refused copy holds nothing");
+    let (current, retired) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        (kv.current_epoch(), kv.retired_through())
+    });
+    assert_eq!(current, retired, "no epoch is left open");
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+/// An engine that drops a copy's landing without resolving it has the copy
+/// fail: its epoch closes, and nothing behind it is fenced for good.
+#[test]
+fn a_copy_whose_landing_is_dropped_closes_its_epoch() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let epoch = copy_list(&stores, &host_refs, &refs);
+    let (landing, landed) = copy_in_flight();
+    epoch.retire_on(&landed);
+    shared.lock().unwrap().give_refs(list, &refs);
+    retire(&stores);
+    assert!(out(&shared, refs[0]));
+    drop(landing);
+    assert!(matches!(landed.check(), Some(Err(_))), "it failed");
+    assert!(!out(&shared, refs[0]), "and holds nothing");
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+/// A frame touched but never submitted (refused before the engine took
+/// it) touches at an epoch fires already hold: once they retire, nothing
+/// of the frame holds the slot.
+#[test]
+fn a_touched_frame_never_submitted_holds_no_fence() {
+    let (shared, _host, stores) = fenced();
+    let list = list_pool(&shared);
+    let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let current =
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.current_epoch());
+    shared.lock().unwrap().touch(LIST, refs.iter().copied(), current);
+    shared.lock().unwrap().give_refs(list, &refs);
+    retire(&stores);
+    assert!(!out(&shared, refs[0]), "no epoch the frame opened holds it");
 }

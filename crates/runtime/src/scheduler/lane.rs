@@ -124,6 +124,18 @@ fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
 }
 
+/// Engine `engine_idx`'s kv store's epoch as it moves (the serving model's,
+/// model 0's), where its stores are registered.
+fn epoch_of(engine_idx: usize) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+    let stores = crate::store::registry::try_get(0, engine_idx)?;
+    stores.roles.as_ref()?;
+    Some(crate::store::registry::with_kv_lock(
+        &stores.kv,
+        "lane-epoch",
+        |kv| kv.epoch_now(),
+    ))
+}
+
 /// With `PIE_CHECK_SLOT_REFS` set, a fire whose lanes name a slot of the
 /// engine's shared pool that is not handed out (its chunk not open for the
 /// shape, or the slot free in it) is refused, saying which: a page table
@@ -159,58 +171,78 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     })
 }
 
-/// Notes that the steps of `frame`, about to be submitted, name the slots
-/// they do: each lane's tables, record, slot copies, buffer pages and
-/// snapshots, and the instances attached (their tables, rings and
-/// adapters). Touched at the store's newest epoch, which every fire of the
-/// frame has opened by now; a slot let go before that epoch retires waits.
+/// Notes that the steps of `frame`, about to be submitted, name the
+/// instances attached: each one's items (its tables and rings, the channels
+/// it is bound to, its adapter) are stamped with the store's newest epoch,
+/// which every fire of the frame has opened by now, and go back, let go,
+/// only once it retires ([`crate::store::roles::Roles::touch`]). What else
+/// a lane names (kv pages, rs pages, records) its store fences at the
+/// fire's own epoch already.
 fn touch_frame(
-    engine_idx: usize,
     roles: Option<&crate::store::roles::RolesHandle>,
+    epoch_now: Option<&std::sync::atomic::AtomicU64>,
     frame: &::engine::FrameSubmission,
 ) {
-    let Some(stores) = crate::store::registry::try_get(0, engine_idx) else {
+    let (Some(roles), Some(epoch_now)) = (roles, epoch_now) else {
         return;
     };
-    let Some(shared) = &stores.shared else {
+    if frame.steps.iter().all(|step| step.attachments.is_empty()) {
         return;
-    };
-    let epoch =
-        crate::store::registry::with_kv_lock(&stores.kv, "fire-touch", |kv| kv.current_epoch());
-    {
-        let mut pool = shared.lock().unwrap();
-        let rs_list = pool.rs_list().map(|shape| shape.id);
-        for lane in frame.steps.iter().flat_map(|step| &step.lanes) {
-            for (shape, refs) in &lane.tables {
-                pool.touch(*shape, refs.iter().copied(), epoch);
-            }
-            for (shape, pairs) in lane.record.pieces().iter().chain(&lane.slot_copies) {
-                pool.touch(*shape, pairs.iter().flatten().copied(), epoch);
-            }
-            if let (Some(rs_list), ::engine::RsVerb::Buffer { pages, .. }) = (rs_list, &lane.rs) {
-                pool.touch(rs_list, pages.iter().copied(), epoch);
-            }
-            for snapshot in &lane.rs_snapshots {
-                for (shape, refs) in &snapshot.fixed {
-                    pool.touch(*shape, refs.iter().copied(), epoch);
-                }
-            }
-        }
     }
-    if let Some(roles) = roles {
-        let roles = roles.lock().unwrap();
-        for step in &frame.steps {
-            for attachment in &step.attachments {
-                roles.touch(attachment.instance, epoch);
-            }
+    let epoch = epoch_now.load(std::sync::atomic::Ordering::Acquire);
+    let mut roles = roles.lock().unwrap();
+    for step in &frame.steps {
+        for attachment in &step.attachments {
+            roles.touch(attachment.instance, epoch);
         }
     }
 }
 
+/// The copies the lanes handed their engines whose epochs are open: what
+/// [`open_copy_epochs`] tells a planner waiting for room.
+static OPEN: std::sync::Mutex<Vec<OpenCopy>> = std::sync::Mutex::new(Vec::new());
+
+struct OpenCopy {
+    seq: u64,
+    engine: Option<usize>,
+    what: &'static str,
+    since: Instant,
+    /// Whether the engine has the copy: false while it is being handed
+    /// over, true from then until it lands.
+    handed: bool,
+}
+
+/// Each copy epoch still open: its epoch, engine, what it moves, how long
+/// it has been open and whether the engine holds the copy (not landed).
+/// Empty when none is: every copy has closed its epoch.
+#[must_use]
+pub fn open_copy_epochs() -> String {
+    use std::fmt::Write;
+    let open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::new();
+    for copy in open.iter() {
+        let _ = write!(
+            out,
+            "copy epoch {} on engine {:?}: {}, open {:?}, {}; ",
+            copy.seq,
+            copy.engine,
+            copy.what,
+            copy.since.elapsed(),
+            if copy.handed {
+                "the engine's, not landed"
+            } else {
+                "being handed to the engine"
+            }
+        );
+    }
+    out
+}
+
 /// A copy's own epoch in its engine's kv store: opened as the copy is
 /// handed to the engine, the slots it names touched at it, and closed once
-/// the copy has landed ([`::engine::CopyCompletion`]), or, refused, as it
-/// drops.
+/// the copy has landed ([`::engine::CopyCompletion`]); closed as it drops
+/// where nothing of the copy runs (the engine refused it, or dropped its
+/// landing, which fails the copy). Every path closes it.
 pub(crate) struct CopyEpoch {
     kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
     seq: u64,
@@ -243,6 +275,15 @@ impl CopyEpoch {
     ) -> Self {
         use ::engine::transfer::MemoryDomain;
         let seq = crate::store::registry::with_kv_lock(kv, "copy-epoch", |kv| kv.begin_copy());
+        OPEN.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(OpenCopy {
+                seq,
+                engine: engine_idx,
+                what: plan.label(),
+                since: Instant::now(),
+                handed: false,
+            });
         let pool_of = |domain: MemoryDomain| match domain {
             MemoryDomain::LocalDisk => None,
             MemoryDomain::HostPinned => host,
@@ -278,8 +319,8 @@ impl CopyEpoch {
                     }
                 }
             }
-            // A state copy names the rs store's ids, which fence on its
-            // own epochs.
+            // A state copy names the rs store's ids of a pinned pool, which
+            // fence on its own epochs; no engine on a shared pool takes one.
             PreLaunchCopy::State(_) => {}
         }
         Self {
@@ -289,14 +330,26 @@ impl CopyEpoch {
         }
     }
 
-    /// Closes the epoch once the copy `landed` waits on has landed.
+    /// Closes the epoch once the copy `landed` waits on has landed (or
+    /// failed, its engine dropping it included).
     pub(crate) fn retire_on(self, landed: &::engine::CopyCompletion) {
+        if let Some(open) = OPEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .find(|open| open.seq == self.seq)
+        {
+            open.handed = true;
+        }
         landed.on_landed(move |_| drop(self));
     }
 }
 
 impl Drop for CopyEpoch {
     fn drop(&mut self) {
+        OPEN.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|open| open.seq != self.seq || open.engine != self.engine_idx);
         crate::store::registry::with_kv_lock(&self.kv, "copy-epoch", |kv| kv.settle(self.seq));
         if let Some(planner) = self
             .engine_idx
@@ -524,6 +577,10 @@ impl Lane {
         // The pool's instance and channel slots, looked up at the first
         // fire (the stores are registered before any process runs).
         let roles = std::cell::OnceCell::new();
+        // The kv store's epoch, read lock-free at each frame (looked up at
+        // the first, as the roles are).
+        let epoch_now: std::cell::OnceCell<Option<Arc<std::sync::atomic::AtomicU64>>> =
+            std::cell::OnceCell::new();
         let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>> =
             HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
@@ -617,6 +674,9 @@ impl Lane {
                                         engine,
                                         &channels,
                                         roles.get_or_init(|| roles_of(engine_idx)).as_ref(),
+                                        epoch_now
+                                            .get_or_init(|| epoch_of(engine_idx))
+                                            .as_deref(),
                                         &mut frame,
                                         &launch_rx,
                                         &mut stash,
@@ -756,6 +816,7 @@ impl Lane {
         engine: &mut EngineBox,
         channels: &ChannelJoin,
         roles: Option<&crate::store::roles::RolesHandle>,
+        epoch_now: Option<&std::sync::atomic::AtomicU64>,
         frame: &mut crate::engine::FrameFire,
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         stash: &mut Option<LaneRequest>,
@@ -801,7 +862,7 @@ impl Lane {
             steps = submitted.steps.len(),
             "submitting a frame to the engine"
         );
-        touch_frame(engine_idx, roles, &submitted);
+        touch_frame(roles, epoch_now, &submitted);
         let ticket = match engine.submit(&submitted) {
             Ok(ticket) => ticket,
             Err(error) if error.is_retryable() => {
@@ -904,7 +965,7 @@ impl Lane {
     }
 
     /// Hands `plan` to the engine under an epoch of its own, which the
-    /// slots it names are touched at and which retires once the copy has
+    /// slots it names are touched at and which closes once the copy has
     /// landed: a slot it names let go meanwhile is not handed out under it.
     /// What answers is the copy's landing, not its enqueue.
     fn copy(

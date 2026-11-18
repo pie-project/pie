@@ -181,6 +181,9 @@ pub struct KvStore {
     page_size: u32,
     log_seq: u64,
     seq: u64,
+    /// `seq`, read without the store's lock: the epoch a lane stamps the
+    /// items a frame names with ([`Self::epoch_now`]).
+    seq_now: Arc<std::sync::atomic::AtomicU64>,
     outstanding: BTreeSet<u64>,
     /// The engine's shared pool and its host tier, whose slots wait on
     /// these epochs: a slot let go is handed out again only once the last
@@ -428,6 +431,7 @@ impl KvStore {
             page_size: 0,
             log_seq: 0,
             seq: 0,
+            seq_now: Arc::default(),
             outstanding: BTreeSet::new(),
             fenced: Vec::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
@@ -622,16 +626,26 @@ impl KvStore {
     /// [`Self::settle`].
     pub fn begin_fire(&mut self) -> u64 {
         self.seq += 1;
+        self.seq_now
+            .store(self.seq, std::sync::atomic::Ordering::Release);
         self.outstanding.insert(self.seq);
         self.seq
     }
 
     /// Opens the epoch of a copy about to be handed to the engine: as a
     /// fire's, closed by [`Self::settle`], once the copy has landed (not
-    /// once it is enqueued). The slots it names are touched at it, so a
-    /// slot let go while the copy runs waits for it.
+    /// once it is enqueued), or as failed where nothing of it runs (the
+    /// engine refused it, or dropped its landing). The slots it names are
+    /// touched at it, so a slot let go while the copy runs waits for it.
     pub fn begin_copy(&mut self) -> u64 {
         self.begin_fire()
+    }
+
+    /// [`Self::current_epoch`] as it moves, read without the store's lock:
+    /// every fire opens its epoch before it reaches a lane, so a frame
+    /// read at it is covered.
+    pub fn epoch_now(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.seq_now)
     }
 
     /// The pools whose slots wait on this store's epochs: an engine's
@@ -2294,6 +2308,8 @@ impl KvStore {
         }
 
         self.seq += 1;
+        self.seq_now
+            .store(self.seq, std::sync::atomic::Ordering::Release);
         self.outstanding.insert(self.seq);
         Ok(KvPreparedWrite {
             ws,

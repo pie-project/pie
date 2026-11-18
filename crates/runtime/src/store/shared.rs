@@ -584,6 +584,11 @@ impl RoleShapes {
             .chain(&self.channel)
             .chain(&self.adapter)
     }
+
+    #[cfg(test)]
+    pub(crate) fn iter_for_test(&self) -> impl Iterator<Item = &FixedShape> {
+        self.iter()
+    }
 }
 
 /// The tiers below an engine's shared pool (CONTRACT-BC 22): its host
@@ -1737,21 +1742,33 @@ impl SharedPool {
         None
     }
 
+    /// The store lets `refs` of `shape` go, the last fire that named them at
+    /// `epoch`: each goes back once that fire retires.
+    pub fn give_refs_after(&mut self, shape: ShapeId, refs: &[u32], epoch: u64) {
+        let slots: Vec<Slot> = refs.iter().map(|&r| self.slot(shape, r)).collect();
+        self.pool.release(STORE, &slots, epoch);
+    }
+
     /// Notes that device work at `epoch` (a fire, or a copy) names `refs`
     /// of engine shape `engine`, a state or role shape's: once let go, each
     /// is handed out again only after that epoch retires
     /// ([`SlotPool::touch`]). Refs naming no slot handed out are passed
     /// over, as is a shape the pool does not lay.
     pub fn touch(&mut self, engine: EngineShape, refs: impl IntoIterator<Item = u32>, epoch: u64) {
-        let Some(shape) = self.pool_shape(engine).or_else(|| {
+        let Some(shape) = self.any_pool_shape(engine) else {
+            return;
+        };
+        self.touch_pool(shape, refs, epoch);
+    }
+
+    /// The pool shape of engine shape `engine`, a state or role shape's.
+    fn any_pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
+        self.pool_shape(engine).or_else(|| {
             self.roles
                 .iter()
                 .find(|shape| shape.id == engine)
                 .map(|shape| shape.pool)
-        }) else {
-            return;
-        };
-        self.touch_pool(shape, refs, epoch);
+        })
     }
 
     /// [`Self::touch`] by the pool's own shape id.
