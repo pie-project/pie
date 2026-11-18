@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::Notify;
 
 use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
-use crate::governor::{Growth, PoolTarget, Retarget};
+use crate::governor::{Growth, Mapped, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
 
@@ -637,21 +637,37 @@ impl PoolTarget for SharedGrow {
         self.shared.lock().unwrap().held()
     }
 
+    fn mapped(&self) -> Mapped {
+        let pool = self.shared.lock().unwrap();
+        Mapped {
+            segments: u64::from(pool.mapped_segments()),
+            draining: u64::from(pool.draining_segments()),
+        }
+    }
+
     fn growth(&self) -> Growth {
         self.shared.lock().unwrap().growth()
     }
 
+    /// Judged on what the pool maps, the measure the governor's target is
+    /// in: whatever keeps a segment past the target (state with no room to
+    /// evacuate into, idle cache among it, or a drained segment whose fire
+    /// has not retired, as on an idle pool) answers
+    /// [`Retarget::NoRoom`], so the policy's tier pressure sheds idle cache
+    /// for the difference.
     fn retarget(&mut self, segments: u64) -> Retarget {
-        let segments = u32::try_from(segments).unwrap_or(u32::MAX);
-        self.target.store(segments, Ordering::Release);
+        self.target.store(
+            u32::try_from(segments).unwrap_or(u32::MAX),
+            Ordering::Release,
+        );
         self.wake.notify_one();
         let mapped = self.shared.lock().unwrap().mapped_segments();
-        if self.no_room.load(Ordering::Acquire) && segments < mapped {
+        if u64::from(mapped) <= segments {
+            Retarget::Reached
+        } else {
             Retarget::NoRoom {
                 held: u64::from(mapped),
             }
-        } else {
-            Retarget::Reached
         }
     }
 
@@ -890,6 +906,99 @@ mod tests {
             "the class's rung needs no room"
         );
         assert_eq!(super::super::engine_rows(ENGINE), 512);
+    }
+
+    /// Mac, yield 1, after a burst, every prompt finished: a pool full of
+    /// idle cache, the system's pressure bringing the target under what
+    /// it maps. The walk evacuates the top segment and then waits on the
+    /// fire that carries the copy, which an idle pool never runs. Each
+    /// turn's answer is judged on what the pool maps: never reached past
+    /// the target, short of it tier pressure, so the policy sheds the idle
+    /// cache; once it has and a fire retired, the pool is at its target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_target_under_what_idle_cache_holds_is_never_reached_above_it() {
+        use crate::governor::run::Steer;
+        use crate::governor::{Signal, Source, Yield};
+
+        // The engine's stores, idle: no fire handed out, none outstanding.
+        const ENGINE: usize = 65;
+        let engines = vec![registry::EngineStores::default(); ENGINE + 1];
+        let model = registry::register_model_with_chunks(16, &engines);
+        let mut pool = super::super::tests::pool();
+        pool.committed(6);
+        // The prefix cache, idle: every record the pool holds, no fire
+        // reading any. Those in the lowest chunks went, leaving room for
+        // one segment's evacuation and no more.
+        let records = pool
+            .take_records(pool.records_available() as usize)
+            .unwrap();
+        let (gone, idle) = records.split_at(16);
+        pool.give_records(gone);
+        assert_eq!(pool.mapped_segments(), 8);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(model, ENGINE, shared.clone());
+
+        let dir = std::env::temp_dir().join(format!("pie-govr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        std::fs::write(&path, "0").unwrap();
+        let source = Source::File(path.clone());
+        let mut reader = crate::governor::Reader::new(source.clone());
+        let mut steer = Steer::new(&grow, Yield::new(1.0).unwrap()).with_source(source.name());
+        let segment = grow.segment_bytes();
+        let mut turn = |steer: &mut Steer, grow: &mut SharedGrow| {
+            let mut signals = Vec::new();
+            let turn = steer.turn(grow, reader.read(), &mut |signal| signals.push(signal));
+            let held = grow.held();
+            assert_eq!(turn.mapped.segments * segment, held, "the measure is held's");
+            assert!(
+                turn.answer != Retarget::Reached || held <= turn.segments * segment,
+                "reached with {held} held over a target of {} segments",
+                turn.segments
+            );
+            (turn, signals)
+        };
+        let (first, _) = turn(&mut steer, &mut grow);
+        assert_eq!(first.answer, Retarget::Reached);
+
+        // An app takes memory: 272 + 752 * 0.65 MiB comes to 6 segments of
+        // the 8 mapped.
+        std::fs::write(&path, "0.35").unwrap();
+        let (pressed, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(pressed.segments, 6);
+        assert_eq!(pressed.answer, Retarget::NoRoom { held: 8 });
+        assert!(matches!(signals[..], [Signal::TierPressure { .. }]), "{signals:?}");
+        // The walk evacuates segment 5 into the room below, and waits on
+        // its fire, which the idle engine never runs.
+        for _ in 0..4 {
+            grow.walk().await;
+        }
+        assert_eq!(shared.lock().unwrap().draining_segments(), 1);
+        for _ in 0..4 {
+            let (waiting, _) = turn(&mut steer, &mut grow);
+            assert_eq!(waiting.answer, Retarget::NoRoom { held: 8 });
+            assert_eq!(waiting.mapped.draining, 1);
+            grow.walk().await;
+        }
+
+        // The policy sheds the idle cache for the tier pressure, and a fire
+        // retires: the drained segment goes, the next empties, and the pool
+        // stands at its target.
+        shared.lock().unwrap().give_records(idle);
+        {
+            let stores = registry::get(model, ENGINE);
+            let mut kv = stores.kv.lock();
+            let fire = kv.begin_fire();
+            kv.settle(fire);
+        }
+        for _ in 0..4 {
+            grow.walk().await;
+        }
+        let (eased, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(eased.answer, Retarget::Reached);
+        assert_eq!(eased.mapped.segments, 6);
+        assert_eq!(signals, vec![Signal::Eased]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The walk runs on its wakes only: an ask made while it sleeps waits

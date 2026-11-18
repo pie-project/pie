@@ -775,8 +775,8 @@ pub trait SlotAccess {
 ///   are wanted (theirs is not), and atoms read but not resident are
 ///   wanted too.
 /// - A shrink the inner pool has no room for sheds the cache to its floor
-///   and tries again; only with the cache at its floor does a shortfall
-///   come back as [`Retarget::NoRoom`], the governor's `tier-pressure`.
+///   and tries again; whatever the inner pool still maps past the target
+///   comes back as [`Retarget::NoRoom`], the governor's `tier-pressure`.
 /// - At each tick: a kv or state waiter short sheds the cache; with none
 ///   short the atoms past break-even come back into what room is left. The
 ///   engine hears the resident set whenever it changed.
@@ -954,6 +954,10 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         self.inner.held()
     }
 
+    fn mapped(&self) -> crate::governor::Mapped {
+        self.inner.mapped()
+    }
+
     fn growth(&self) -> Growth {
         self.inner.growth()
     }
@@ -970,13 +974,9 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         if self.shed() == 0 {
             return first;
         }
-        match self.inner.retarget(segments) {
-            // What was shed comes back as the fires reading it retire: the
-            // pool is on its way, and the next tick tries again with the
-            // cache at its floor.
-            Retarget::NoRoom { .. } => Retarget::Reached,
-            reached => reached,
-        }
+        // What was shed comes back as the fires reading it retire: until
+        // the pool maps no more than asked, it answers short of it.
+        self.inner.retarget(segments)
     }
 
     fn take_refused(&mut self) -> bool {
