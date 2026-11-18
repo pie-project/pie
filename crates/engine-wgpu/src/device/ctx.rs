@@ -166,8 +166,9 @@ pub(crate) struct Core {
     pub(crate) name: String,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
-    /// `[engine.memory] budget_device`: what the load takes, all of it
-    /// together. The environment reports no memory size, so it is stated.
+    /// What the load takes, all of it together: the device memory read at
+    /// load ([`super::memory::at_load`]), or `[engine.memory]
+    /// budget_device` where stated.
     pub(crate) budget: u64,
 }
 
@@ -443,42 +444,45 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
-/// `allowance.budget`, refused where the operator states none.
-fn stated(allowance: engine::Allowance) -> Result<u64> {
-    allowance.budget.ok_or_else(|| {
-        Fault::Residency(
-            "wgpu: the environment reports no memory size; state \
-             `[engine.memory] budget_device` for what the load may take"
+/// Refuses a load on a target with no native wgpu backend: macOS, as on
+/// wgpu's Metal backend a large first submission never completes.
+fn native() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Err(Fault::NoDevice {
+            detail: "engine type wgpu has no backend on macOS in this build; use type = \"metal\""
                 .to_string(),
-        )
-    })
+        });
+    }
+    Ok(())
 }
 
 impl Context {
-    /// The device `boot` names, of which a load takes `allowance.budget`,
-    /// which must be stated.
+    /// The device `boot` names, of which a load takes what it states it
+    /// has, or `allowance.budget` where stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
-        stated(allowance)?;
+        native()?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes
-    /// `allowance.budget`, which must be stated: WebGPU reports no memory
-    /// size.
+    /// A device the host already holds, of which a load takes what its
+    /// adapter states it has, or `allowance.budget` where stated; refused
+    /// where neither states it.
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
-        let budget = stated(allowance)?;
         let Handed {
             adapter,
             device,
             queue,
         } = handed;
         let info = adapter.get_info();
+        let reading = super::memory::at_load(&adapter, allowance)?;
+        tracing::info!(device = %info.name, "{reading}");
+        let budget = reading.bytes;
         let features = device.features();
         let limits = device.limits();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -548,7 +552,7 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
-    /// What the device has for this load: the operator's budget.
+    /// What the device has for this load, as read at load.
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.core.budget
@@ -1058,15 +1062,6 @@ impl Pending {
 mod tests {
     use super::*;
     use crate::device::Buffer;
-
-    #[test]
-    fn a_load_without_budget_device_is_refused() {
-        let why = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE)
-            .unwrap_err()
-            .to_string();
-        assert!(why.contains("reports no memory size"), "{why}");
-        assert!(why.contains("[engine.memory] budget_device"), "{why}");
-    }
 
     #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
