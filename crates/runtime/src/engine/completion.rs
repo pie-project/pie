@@ -804,9 +804,11 @@ struct PendingFrame {
     /// and the waiters on what it puts; `None` once the step has settled
     /// and published them.
     steps: Vec<Option<LandingStep>>,
-    frame_cell: CellPtr,
-    wait_id: u64,
-    epoch: u64,
+    /// The submission's cell, its waiter and epoch, settled once every
+    /// step is in: `None` on an engine frame of a submission that took
+    /// more than one, all but its last (a refusal of lanes stopped the
+    /// one before short, `engine::FrameTicket::refused`).
+    frame: Option<(CellPtr, u64, u64)>,
 }
 
 /// How a step landed, as far as its fires are concerned: the lanes that
@@ -834,15 +836,13 @@ impl PendingFrame {
             .iter_mut()
             .filter_map(Option::take)
             .collect();
-        let frame = (lost || self.steps.iter().all(Option::is_none)).then_some((
-            self.frame_cell,
-            self.wait_id,
-            self.epoch,
-        ));
+        let done = lost || self.steps.iter().all(Option::is_none);
+        let frame = self.frame.filter(|_| done);
         Landed {
             steps,
             faults,
             lost,
+            done,
             frame,
         }
     }
@@ -855,6 +855,8 @@ struct Landed {
     /// The lanes of its one step that faulted.
     faults: Vec<engine::LaneFault>,
     lost: bool,
+    /// Every step of the frame is in.
+    done: bool,
     frame: Option<(CellPtr, u64, u64)>,
 }
 
@@ -985,16 +987,23 @@ impl FrameSettlements {
     }
 
     /// Books frame `frame`: each step's fires and the waiters on its puts,
-    /// step by step.
+    /// step by step, and `completion`'s cell once they are in, where the
+    /// frame is its submission's last (`None` on one before it).
     pub fn expect(
         &self,
         frame: engine::FrameId,
         steps: Vec<LandingStep>,
-        completion: &SubmissionCompletion,
+        completion: Option<&SubmissionCompletion>,
         broker: &CompletionBroker,
     ) {
-        let Some(frame_cell) = completion.terminal_cell_ptr() else {
-            return;
+        let frame_completion = match completion {
+            Some(completion) => {
+                let Some(cell) = completion.terminal_cell_ptr() else {
+                    return;
+                };
+                Some((cell, completion.wait_id(), completion.target_epoch()))
+            }
+            None => None,
         };
         let mut steps: Vec<_> = steps.into_iter().map(Some).collect();
         if steps.is_empty() {
@@ -1002,9 +1011,7 @@ impl FrameSettlements {
         }
         let mut pending = PendingFrame {
             steps,
-            frame_cell,
-            wait_id: completion.wait_id(),
-            epoch: completion.target_epoch(),
+            frame: frame_completion,
         };
         let mut landed = Vec::new();
         {
@@ -1013,7 +1020,7 @@ impl FrameSettlements {
             let mut done = false;
             for (step, faults) in early {
                 let landing = pending.land(step, Landing::Lanes(faults));
-                done |= landing.frame.is_some();
+                done |= landing.done;
                 landed.push(landing);
             }
             if !done {
@@ -1049,7 +1056,7 @@ impl FrameSettlements {
                 return;
             };
             let landed = pending.land(step, Landing::Lanes(faults));
-            if landed.frame.is_some() {
+            if landed.done {
                 tracing::debug!(frame = frame.0, "frame settled");
                 book.frames.remove(&frame);
             }

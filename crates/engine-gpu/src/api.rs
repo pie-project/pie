@@ -464,6 +464,11 @@ pub fn refusal(refusal: Refusal) -> Error {
 
 #[must_use]
 pub fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
 
@@ -967,6 +972,7 @@ where
             "submit"
         );
         let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
                 self.expect_fire(next);
@@ -982,6 +988,12 @@ where
                     steps.push(ticket);
                     pending.push(step_pending);
                 }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
                 Err(error) => {
                     self.pending = None;
                     self.count_built();
@@ -991,7 +1003,7 @@ where
         }
         B::submitted(self);
         self.count_built();
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
 
         if !self.settles_asynchronously() {

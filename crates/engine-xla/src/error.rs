@@ -183,6 +183,41 @@ pub enum Fault {
     Recipe(String),
 }
 
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Positions { lane, .. }
+            | Self::MaskWord { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. }
+            | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
+    }
+}
+
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -2387,7 +2387,7 @@ impl Shell {
         let mut inputs = Inputs::new();
         windows.bind(handles, &mut inputs)?;
 
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {

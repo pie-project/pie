@@ -143,6 +143,11 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
 }
 
 fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
         Fault::Refused { bytes } => Error::Exhausted {
@@ -841,6 +846,7 @@ impl Engine for Metal {
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
                 self.expect_fire(next);
@@ -853,6 +859,12 @@ impl Engine for Metal {
                 Ok((ticket, step_pending)) => {
                     steps.push(ticket);
                     pending.push(step_pending);
+                }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
                 }
                 Err(error) => {
                     self.pending = None;
@@ -869,7 +881,7 @@ impl Engine for Metal {
             }
         }
         self.tally_unbuilt();
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
         if !self.settles_asynchronously() {
             self.settle_frame(&mut ticket)?;

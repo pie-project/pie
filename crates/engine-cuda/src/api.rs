@@ -292,6 +292,11 @@ impl Cuda {
 }
 
 fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
             Error::Device(fault.to_string())
@@ -1437,6 +1442,7 @@ impl Cuda {
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settled = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             let at = engine::StepDone {
                 frame: id,
@@ -1453,16 +1459,43 @@ impl Cuda {
                         shell.trace().facts.plain(word) && !shell.wide(word)
                     })
                 });
-            if let Some((head, _)) = &split
-                && let Err(error) = self.fire_step(head, at, false)
-            {
-                self.pending = None;
-                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                return Err(attributed(error, airborne));
-            }
+            let fired = match &split {
+                // The head's lanes are the step's cut ones, in order.
+                Some((head, _)) => self.fire_step(head, at, false).map(drop).map_err(|error| {
+                    let cut = self
+                        .replay
+                        .map(|replay| {
+                            replay.cut_lanes(step, |word| {
+                                self.shell.as_ref().is_some_and(|shell| {
+                                    shell.trace().facts.plain(word) && !shell.wide(word)
+                                })
+                            })
+                        })
+                        .unwrap_or_default();
+                    of_lanes(error, &cut)
+                }),
+                None => Ok(()),
+            };
             let step = split.as_ref().map_or(step, |(_, tail)| tail);
-            let (ticket, step_settled) = match self.fire_step(step, at, true) {
+            let headed = split.is_some();
+            let fired = fired.and_then(|()| {
+                self.fire_step(step, at, true).map_err(|error| match error {
+                    // Its head's encoder rows ran: the step is not untouched,
+                    // so its lanes' refusal refuses the frame.
+                    Error::Lanes(_) if headed => Error::Invalid(format!(
+                        "{error}, after the step's encoder-only head fired"
+                    )),
+                    other => other,
+                })
+            });
+            let (ticket, step_settled) = match fired {
                 Ok(both) => both,
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
                 Err(error) => {
                     self.pending = None;
                     let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
@@ -1473,7 +1506,7 @@ impl Cuda {
             settled.push(step_settled);
         }
         self.pending = Some((id, settled));
-        Ok(FrameTicket { id, steps })
+        Ok(FrameTicket::of(id, steps, refused))
     }
 
     /// `submission` fired; its completion told the sink where `announce`.
@@ -1515,7 +1548,7 @@ impl Cuda {
                 continue;
             }
             words[at] = shell.adapted_word(words[at]).ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::lane(u32::try_from(at).unwrap_or(u32::MAX), format!(
                     "lane {at} is attached to an instance that bound an adapter, and \
                      this load's model text has no corrected class for its fact word \
                      {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
@@ -1815,6 +1848,23 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
              opened"
         }
         _ => "`copy_kv` between the domains named, neither of which is this load's own device",
+    }
+}
+
+/// A refusal of a split step's head, its lanes named by the step's lanes
+/// `cut` (the head's lane `i` is the step's lane `cut[i]`).
+fn of_lanes(error: Error, cut: &[u32]) -> Error {
+    match error {
+        Error::Lanes(lanes) => Error::Lanes(
+            lanes
+                .into_iter()
+                .map(|mut fault| {
+                    fault.lane = cut.get(fault.lane as usize).copied().unwrap_or(fault.lane);
+                    fault
+                })
+                .collect(),
+        ),
+        other => other,
     }
 }
 

@@ -43,7 +43,7 @@ pub struct StepOutcome {
 /// A lane of a step that faulted: lane `lane` of the step's
 /// [`crate::fire::Step::lanes`], the instance whose pass faulted where one
 /// did, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneFault {
     pub lane: u32,
     pub instance: Option<InstanceId>,
@@ -385,6 +385,15 @@ pub trait Engine: Send {
     /// what such a step left. A position an engine keeps by slot
     /// still goes back where a refused step found it: the slot outlives
     /// the set, and its next tenant must not meet it.
+    ///
+    /// A refusal a step's lanes earn for their own sake (a lane's word,
+    /// mask, positions, adapter or payload this load does not serve as
+    /// stated) names those lanes, never the frame: refused at the frame's
+    /// first step it is [`Error::Lanes`], nothing of the frame having run;
+    /// refused at a later step, the frame stops there and answers a ticket
+    /// of the steps before it with the lanes in
+    /// [`FrameTicket::refused`]. The runtime fails those lanes' fires alone
+    /// and submits what is left again.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
     /// Backs the pool's first `segments` segments
