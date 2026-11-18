@@ -47,32 +47,55 @@ pub const fn step_value(step: u32) -> u32 {
 pub const STEP_NODES: u32 = 0xF1;
 /// The low byte of a step table word naming one node of the step before it.
 pub const STEP_NODE: u32 = 0xF0;
+/// The low byte of a step table word `(node << 8) | STEP_VIEW`, after every
+/// step's nodes: a node no step computes, a view of its source's bytes that
+/// every reader resolves through, so its result takes no bytes of its own.
+pub const STEP_VIEW: u32 = 0xF2;
+
+/// What a streamed kernel publishes beside its dispatch words: the nodes
+/// each step computes, in step order, and the nodes it computes in none
+/// because they are views of their sources ([`STEP_VIEW`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepNodes {
+    pub steps: Vec<Vec<u32>>,
+    pub views: Vec<u32>,
+}
 
 /// A streamed region's step table split into its dispatch words and, where
-/// the emitter published them, the nodes each step computes (`None` for a
-/// table with no node lists, or one that names a step out of order).
+/// the emitter published them, the nodes each step computes and the views
+/// none does (`None` for a table with no node lists, or one that names a
+/// step out of order).
 #[must_use]
-pub fn step_node_table(table: &[u32]) -> (&[u32], Option<Vec<Vec<u32>>>) {
+pub fn step_node_table(table: &[u32]) -> (&[u32], Option<StepNodes>) {
     let split = table
         .iter()
-        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE))
+        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE | STEP_VIEW))
         .unwrap_or(table.len());
     let (steps, trailer) = table.split_at(split);
     if trailer.is_empty() {
         return (steps, None);
     }
-    let mut nodes: Vec<Vec<u32>> = Vec::with_capacity(steps.len());
+    let mut published = StepNodes {
+        steps: Vec::with_capacity(steps.len()),
+        views: Vec::new(),
+    };
     for &word in trailer {
+        let nodes = &mut published.steps;
         match word & 0xFF {
-            STEP_NODES if (word >> 8) as usize == nodes.len() => nodes.push(Vec::new()),
-            STEP_NODE if !nodes.is_empty() => nodes.last_mut().expect("opened").push(word >> 8),
+            STEP_NODES if published.views.is_empty() && (word >> 8) as usize == nodes.len() => {
+                nodes.push(Vec::new());
+            }
+            STEP_NODE if published.views.is_empty() && !nodes.is_empty() => {
+                nodes.last_mut().expect("opened").push(word >> 8);
+            }
+            STEP_VIEW => published.views.push(word >> 8),
             _ => return (steps, None),
         }
     }
-    if nodes.len() != steps.len() {
+    if published.steps.len() != steps.len() {
         return (steps, None);
     }
-    (steps, Some(nodes))
+    (steps, Some(published))
 }
 
 #[must_use]
@@ -1478,6 +1501,14 @@ pub fn emit_streamed_region(
         table.push((u32::try_from(step).unwrap_or(u32::MAX) << 8) | STEP_NODES);
         table.extend(nodes.iter().map(|&node| (node << 8) | STEP_NODE));
     }
+    table.extend(
+        region
+            .nodes
+            .iter()
+            .map(|node| node.index())
+            .filter(|&node| is_view_reshape(node))
+            .map(|node| ((node as u32) << 8) | STEP_VIEW),
+    );
     Ok((source, table))
 }
 

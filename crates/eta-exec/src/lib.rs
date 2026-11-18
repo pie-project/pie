@@ -54,8 +54,8 @@ pub use scratch::{
     ALIGN as SCRATCH_ALIGN, ChunkLayout, DUMMY_BYTES as SCRATCH_DUMMY_BYTES, Item as ScratchItem,
     Launch, Launches, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, POISON as SCRATCH_POISON,
     Pieces, Placed, SELECT_RESERVE, TooLarge, describe_launched, lay_out, lay_out_chunked, layout,
-    layout_chunked, layout_reusing, read_only_unlaunched, region_rows, value_lifetimes,
-    whole_value_temporaries,
+    layout_chunked, layout_reusing, most_alive, read_only_unlaunched, region_rows,
+    value_lifetimes, whole_value_temporaries,
 };
 pub use stage_cache::{Lookup, Stages};
 pub use status::{
