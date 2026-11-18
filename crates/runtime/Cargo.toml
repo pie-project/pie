@@ -131,7 +131,9 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# macOS reads its pressure and process memory through it; every unix's
+# tests read residency (`mincore`) and map memory with it.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
