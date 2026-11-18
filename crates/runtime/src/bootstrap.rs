@@ -955,11 +955,16 @@ fn init_tracing(
     Ok(())
 }
 
-/// Crates whose own debug output buries the runtime's, quieted under a level
-/// given as one word: naga's WGSL frontend writes ~880k lines at `debug`
-/// while a load builds its pipelines, and tarpc writes seven per gateway
-/// heartbeat. A level that names either target keeps its own say.
-const QUIET: [(&str, &str); 2] = [("naga", "warn"), ("tarpc", "info")];
+/// Crates whose own debug output buries the runtime's, held down under a
+/// level that would let it through: naga's WGSL frontend writes ~880k lines
+/// at `debug` while a load builds its pipelines, and tarpc writes seven per
+/// gateway heartbeat. A filter that names either target keeps its own say,
+/// and one whose base level is already as quiet gets nothing added: a quiet
+/// target is never made louder than the operator's level.
+const QUIET: [(&str, tracing_subscriber::filter::LevelFilter); 2] = [
+    ("naga", tracing_subscriber::filter::LevelFilter::WARN),
+    ("tarpc", tracing_subscriber::filter::LevelFilter::INFO),
+];
 
 /// The tracing filter for `level`: `RUST_LOG` when it is set, as it says;
 /// otherwise `level` with [`QUIET`]'s targets held down.
@@ -970,13 +975,42 @@ pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(quieted(level)))
 }
 
-/// `level` with a directive for each [`QUIET`] target it does not name.
-fn quieted(level: &str) -> String {
+/// `filter` with a directive for each [`QUIET`] target it names nowhere and
+/// whose quiet level is below the filter's base level. The base level is
+/// the last directive with no target (`off` where there is none, as an
+/// `EnvFilter` reads it); a directive's target is what precedes its `[`
+/// span or its `=`.
+fn quieted(filter: &str) -> String {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let directives: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .collect();
+    let target_of = |directive: &str| -> Option<String> {
+        let head = directive.split(['[', '=']).next().unwrap_or("");
+        let names_a_target = directive.contains('=') || directive.contains('[');
+        (names_a_target || head.parse::<LevelFilter>().is_err()).then(|| head.trim().to_owned())
+    };
+    let base = directives
+        .iter()
+        .rev()
+        .filter(|d| target_of(d).is_none())
+        .find_map(|d| d.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::OFF);
+    let named = |target: &str| {
+        directives.iter().filter_map(|d| target_of(d)).any(|t| {
+            t == target
+                || t.starts_with(&format!("{target}::"))
+                || target.starts_with(&format!("{t}::"))
+        })
+    };
     QUIET
         .iter()
-        .filter(|(target, _)| !level.contains(target))
-        .fold(level.to_owned(), |filter, (target, at)| {
-            format!("{filter},{target}={at}")
+        .filter(|(target, at)| *at < base && !named(target))
+        .fold(filter.to_owned(), |filter, (target, at)| {
+            format!("{filter},{target}={}", at.to_string().to_lowercase())
         })
 }
 
@@ -1030,11 +1064,42 @@ mod tests {
     use crate::model::RsCaps;
 
     #[test]
-    fn a_one_word_level_quiets_naga_and_tarpc_and_a_named_target_keeps_its_say() {
+    fn a_loud_base_quiets_naga_and_tarpc_and_never_makes_them_louder() {
         assert_eq!(quieted("debug"), "debug,naga=warn,tarpc=info");
-        assert_eq!(quieted("info"), "info,naga=warn,tarpc=info");
+        assert_eq!(quieted("trace"), "trace,naga=warn,tarpc=info");
+        // At info, naga is held to warn; tarpc already is as quiet.
+        assert_eq!(quieted("info"), "info,naga=warn");
+        // A base at or under each quiet level gets nothing added.
+        assert_eq!(quieted("warn"), "warn");
+        assert_eq!(quieted("error"), "error");
+        assert_eq!(quieted("off"), "off");
+        // A filter that names a target keeps its say, whether the target
+        // itself, one of its modules, or a span directive on it.
         assert_eq!(quieted("debug,naga=trace"), "debug,naga=trace,tarpc=info");
-        for filter in ["debug", "info", "debug,naga=trace"] {
+        assert_eq!(
+            quieted("debug,naga::front=trace"),
+            "debug,naga::front=trace,tarpc=info"
+        );
+        assert_eq!(
+            quieted("debug,tarpc[RPC]=debug"),
+            "debug,tarpc[RPC]=debug,naga=warn"
+        );
+        // A target that merely contains a quiet one's name is not it.
+        assert_eq!(
+            quieted("debug,naga_extra=info"),
+            "debug,naga_extra=info,naga=warn,tarpc=info"
+        );
+        // Only targets and no base: nothing passes but them, so nothing to quiet.
+        assert_eq!(quieted("runtime=debug"), "runtime=debug");
+        // A bare target name with no level is a target, not the base.
+        assert_eq!(quieted("debug,naga"), "debug,naga,tarpc=info");
+        for filter in [
+            "debug",
+            "info",
+            "warn",
+            "debug,naga::front=trace",
+            "debug,tarpc[RPC]=debug",
+        ] {
             assert!(tracing_subscriber::EnvFilter::try_new(quieted(filter)).is_ok());
         }
     }
