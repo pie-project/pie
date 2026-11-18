@@ -273,51 +273,25 @@ mod on_device {
         /// the measurement (one counter across every burst of it,
         /// `engine::rates::Rotation`, so a burst reads the next operand
         /// sets, never the first again): a burst of `k` launches, `k`
-        /// doubled until a launch's time settles
-        /// (`engine::rates::timed_frames`; CUDA states no bound on one
-        /// submission), the median of `rounds` after a warm burst, over its
-        /// launches.
+        /// doubled until a launch's time settles, then such bursts until
+        /// their rate stops moving (`engine::rates::warmed_frames`; CUDA
+        /// states no bound on one submission), the median of `rounds` after
+        /// a warm burst, over its launches.
         fn burst(
             &self,
             rounds: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
-            self.burst_of(rounds, false, once)
-        }
-
-        /// [`Clock::burst`] for a memory-bound op: before it is timed, its
-        /// own bursts warm the device until their rate stops moving
-        /// (`engine::rates::warm_up`'s rule): the DVFS level sustained
-        /// serving sees, not the one an idle device starts at.
-        fn burst_warmed(
-            &self,
-            rounds: usize,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
-            self.burst_of(rounds, true, once)
-        }
-
-        fn burst_of(
-            &self,
-            rounds: usize,
-            warm: bool,
-            once: &mut dyn FnMut(usize) -> Result<(), String>,
-        ) -> Result<f64, String> {
             let turn = engine::rates::Rotation::default();
             let mut fire = |k: usize| (0..k).try_for_each(|_| once(turn.next(usize::MAX)));
             self.time(&mut || fire(1))?;
-            let k = engine::rates::timed_frames(
+            let k = engine::rates::warmed_frames(
                 None,
                 None,
                 |k| self.time(&mut || fire(k as usize)),
                 |why| why,
             )?
             .fires as usize;
-            if warm {
-                engine::rates::warm_up(|| {
-                    self.time(&mut || fire(k)).map(|ns| k as f64 / ns.max(1.0))
-                })?;
-            }
             self.time(&mut || fire(k))?;
             let mut times = (0..rounds)
                 .map(|_| self.time(&mut || fire(k)))
@@ -525,7 +499,7 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
         engine::rates::rate_from(
             "per-row ops",
             ns,
@@ -874,7 +848,7 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,
@@ -887,7 +861,7 @@ mod on_device {
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
-        let ns = clock.burst_warmed(ROUNDS, &mut |_| {
+        let ns = clock.burst(ROUNDS, &mut |_| {
             crate::device::copy_d2d(stream, into.ptr(), from.ptr(), COPY_BYTES)
                 .map_err(say("the copy"))
         })?;

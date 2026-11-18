@@ -410,6 +410,25 @@ pub fn timed_frames<E>(
     })
 }
 
+/// A timed point's frames, the one rule for every point every engine
+/// times: their length settled by [`timed_frames`], then frames of that
+/// length run until their rate stops moving ([`warm_up`]'s rule), so the
+/// point is timed at the clock it holds under its own load, never in a
+/// state an earlier point or an idle gap left behind. Before this every
+/// point but the memory-bound ones went untimed by it, and on an M5 Pro a
+/// few-microsecond matmul read about 5 or about 34 TFLOP/s run to run.
+pub fn warmed_frames<E>(
+    max_submit: Option<std::time::Duration>,
+    estimate_ns: Option<f64>,
+    mut frame: impl FnMut(u32) -> Result<f64, E>,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Frames, E> {
+    let frames = timed_frames(max_submit, estimate_ns, &mut frame, refuse)?;
+    let k = frames.fires;
+    warm_up(|| frame(k).map(|ns| f64::from(k) / ns.max(f64::MIN_POSITIVE)))?;
+    Ok(frames)
+}
+
 /// What a backend's rates step measured, and whether a frame it needed
 /// stopped at the device's bound on one submission before it settled.
 #[derive(Debug, Clone, PartialEq)]
@@ -839,6 +858,34 @@ fn civil(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A point that starts in a slow clock state and leaves it only under
+    /// its own load: its frames' length settles while it is slow, and the
+    /// point is timed only once frames of that length run at the fast rate,
+    /// whatever the doublings saw. (On an M5 Pro a short matmul read about
+    /// 5 or about 34 TFLOP/s run to run: timed without this, by which state
+    /// the gap before it left.)
+    #[test]
+    fn a_point_is_timed_only_once_its_own_load_has_settled_its_clock() {
+        let calls = std::cell::Cell::new(0u32);
+        // Slow (10 ns a fire) for the frames the doublings settle in, then
+        // fast (1 ns a fire) once its own load has lifted the clock.
+        const SLOW: u32 = 3;
+        let frame = |k: u32| -> Result<f64, String> {
+            calls.set(calls.get() + 1);
+            let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
+            Ok(per * f64::from(k))
+        };
+        let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
+        calls.set(0);
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        let settled_at = calls.get();
+        assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
+        // The next frame of that length reads the fast state.
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
+    }
+
     use super::*;
 
     /// A profile of the toy registry stating `rates`.
