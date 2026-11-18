@@ -462,7 +462,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         warmed.rate / 1e3
     ));
     // The matmul curve at each width of `engine::rates::GEMM_WIDTHS` (n = k)
-    // and each octave of `engine::rates::GEMM_ROWS`, through the kernel this
+    // and each row count of `engine::rates::GEMM_ROWS`, through the kernel this
     // backend picks at that shape (`kernels_slang::linear::gemm::tile_for`);
     // the rows are multiples of every kernel's row tile, so the estimate's
     // padding to it (`row_tile`) lies between them.

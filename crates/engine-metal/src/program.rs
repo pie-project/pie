@@ -953,7 +953,7 @@ impl Plane {
                         #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
                         let mark = room.mark();
                         for prepared in group.iter_mut() {
-                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
+                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?)?;
                         }
                         #[cfg(target_vendor = "apple")]
                         room.poison_since(mark, frame)?;
@@ -1008,7 +1008,7 @@ impl Plane {
                             need: u64::from(needed),
                             have: u64::from(self.lanes),
                         })?;
-                    batch.seat_scratch(room.take(batch.scratch_bytes(needed))?);
+                    batch.seat_scratch(room.take(batch.scratch_bytes(needed))?, needed)?;
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
             }

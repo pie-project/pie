@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use eta_compiler::codegen::lane_scratch::LaneScratch;
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
 use eta_exec::{Launch, Launches, Layout, TooLarge};
 use eta_exec::{
@@ -466,6 +467,9 @@ struct Grouped {
     bindings: Held,
     pending_flags: Held,
     lane_indices: Held,
+    /// The lane's scratch base, a device address
+    /// ([`LANE_SCRATCH`](eta_compiler::codegen::lane_scratch::LANE_SCRATCH)), written where a fire seats its scratch.
+    lane_scratch: Held,
     row_meta: Held,
     row_indices: Held,
     readout_rows: u32,
@@ -490,6 +494,7 @@ impl Grouped {
             &mut self.table,
             &mut self.pending_flags,
             &mut self.lane_indices,
+            &mut self.lane_scratch,
             &mut self.row_meta,
             &mut self.row_indices,
         ]
@@ -588,6 +593,7 @@ impl Grouped {
         let index_bytes: Vec<u8> = (0..GROUPED_LANES).flat_map(u32::to_le_bytes).collect();
         let mut lane_indices = tables.take(index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
+        let lane_scratch = tables.take(LaneScratch::bytes(GROUPED_LANES))?;
 
         let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
         let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
@@ -636,6 +642,7 @@ impl Grouped {
             bindings,
             pending_flags,
             lane_indices,
+            lane_scratch,
             row_meta,
             row_indices,
             readout_rows,
@@ -710,9 +717,9 @@ const LANE_TEMPORARY: &str =
     "bytes before one lane's temporaries (the kernels' `uint temporary_offset`)";
 
 /// A lane's scratch extent as the generated kernels' layout word holds it:
-/// a `uint`, refused past one. A lane's base is `ulong(lane) * ulong(stride)`
-/// in every generated kernel, so a batch of lanes addresses as far as the
-/// region its scratch is taken from (`GuestCarve::take` refuses past that).
+/// a `uint`, refused past one. A lane's base is its own entry of the lane
+/// scratch table, a device address, so no lane's bytes are reached as an
+/// offset from another's.
 fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
     u32::try_from(bytes).map_err(|_| Fault::Ceiling {
         what,
@@ -1119,6 +1126,7 @@ impl Prepared {
                 shape.bytes().unwrap_or(u64::MAX),
                 (u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane)).max(1),
                 u64::from(GROUPED_LANES) * size_of::<u32>() as u64,
+                LaneScratch::bytes(GROUPED_LANES),
                 u64::from(GROUPED_LANES) * size_of::<RowMeta>() as u64,
                 u64::from(rows.max(1)) * size_of::<u32>() as u64,
             ]);
@@ -1351,9 +1359,18 @@ impl Prepared {
     }
 
     /// Seats this fire's value scratch at `at` (the guest region under the
-    /// fire's model carve); a later fire seats its own.
-    pub fn seat_scratch(&mut self, at: ScratchAt) {
+    /// fire's model carve); a later fire seats its own. A grouped kernel
+    /// finds it by its address in the lane scratch table.
+    pub fn seat_scratch(&mut self, at: ScratchAt) -> Result<()> {
+        // Off Apple nothing encodes (a grouped encode is `Deviceless`), and
+        // no reservation has an address to write.
+        #[cfg(target_vendor = "apple")]
+        if let Some(grouped) = self.grouped.as_mut() {
+            let base = address_of(&at.buffer, at.offset)?;
+            grouped.lane_scratch.write(0, &base.to_le_bytes())?;
+        }
         self.scratch = Some(at);
+        Ok(())
     }
 
     fn scratch(&self) -> Result<&ScratchAt> {
@@ -1681,14 +1698,11 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                {
-                    let scratch = self.scratch()?;
-                    encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
-                        4,
-                    );
-                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_scratch.raw()),
+                    grouped.lane_scratch.offset() as usize,
+                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+                );
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
@@ -1726,6 +1740,12 @@ impl Prepared {
                     ProtocolObject::from_ref(&**buffer.slab());
                 encoder.useResource_usage(resource, usage);
             };
+            // The lanes reach their scratch by the addresses in the lane
+            // scratch table.
+            resident(
+                &self.scratch()?.buffer,
+                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            );
             resident(
                 self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -1913,14 +1933,11 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                {
-                    let scratch = self.scratch()?;
-                    encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
-                        4,
-                    );
-                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_scratch.raw()),
+                    grouped.lane_scratch.offset() as usize,
+                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+                );
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
@@ -1959,6 +1976,12 @@ impl Prepared {
                     ProtocolObject::from_ref(&**buffer.slab());
                 encoder.useResource_usage(resource, usage);
             };
+            // The lanes reach their scratch by the addresses in the lane
+            // scratch table.
+            resident(
+                &self.scratch()?.buffer,
+                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            );
             resident(
                 self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -2077,6 +2100,9 @@ pub struct Batch {
     bindings: SpanRegion,
     pending_flags: SpanRegion,
     lane_indices: SpanRegion,
+    /// Each lane's scratch base, a device address ([`LANE_SCRATCH`](eta_compiler::codegen::lane_scratch::LANE_SCRATCH)),
+    /// written where a fire seats its scratch.
+    lane_scratch: SpanRegion,
     row_meta: SpanRegion,
     row_indices: SpanRegion,
     /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
@@ -2100,8 +2126,8 @@ type SpanRegion = crate::inputs::Region;
 
 /// A batch's tables' bytes, in the order [`Batch::lay`] lays them: the lane
 /// table, descriptors, params, offsets, bindings, pending flags, lane
-/// indices, row meta, row indices, output addresses and each fused
-/// region's layout.
+/// indices, lane scratch bases, row meta, row indices, output addresses and
+/// each fused region's layout.
 #[allow(clippy::too_many_arguments)]
 fn batch_pieces(
     lanes: u32,
@@ -2122,6 +2148,7 @@ fn batch_pieces(
         (binding * lanes64).max(4),
         (lanes64 * u64::from(channel_slots)).max(1),
         lanes64 * size_of::<u32>() as u64,
+        LaneScratch::bytes(lanes),
         lanes64 * size_of::<RowMeta>() as u64,
         (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
         lanes64 * table_bytes,
@@ -2178,6 +2205,7 @@ impl Batch {
             &self.bindings,
             &self.pending_flags,
             &self.lane_indices,
+            &self.lane_scratch,
             &self.row_meta,
             &self.row_indices,
             &self.addresses,
@@ -2195,6 +2223,7 @@ impl Batch {
             &mut self.bindings,
             &mut self.pending_flags,
             &mut self.lane_indices,
+            &mut self.lane_scratch,
             &mut self.row_meta,
             &mut self.row_indices,
             &mut self.addresses,
@@ -2261,6 +2290,7 @@ impl Batch {
             bindings: next(),
             pending_flags: next(),
             lane_indices: next(),
+            lane_scratch: next(),
             row_meta: next(),
             row_indices: next(),
             scratch: None,
@@ -2332,9 +2362,25 @@ impl Batch {
             .next_multiple_of(SCRATCH_ALIGN)
     }
 
-    /// Seats this fire's value scratch at `at`.
-    pub fn seat_scratch(&mut self, at: ScratchAt) {
+    /// Seats this fire's value scratch at `at` for `members` lanes, a
+    /// stride each: lane `l`'s base, in the lane scratch table, is `l`
+    /// strides past `at`.
+    pub fn seat_scratch(&mut self, at: ScratchAt, members: u32) -> Result<()> {
+        // Off Apple nothing encodes (a batch's encode is `Deviceless`), and
+        // no reservation has an address to write.
+        #[cfg(target_vendor = "apple")]
+        {
+            let stride = u64::from(self.key.scratch_stride);
+            let mut bases = Vec::with_capacity(LaneScratch::bytes(members) as usize);
+            for lane in 0..u64::from(members) {
+                bases.extend(address_of(&at.buffer, at.offset + lane * stride)?.to_le_bytes());
+            }
+            self.lane_scratch.write(0, &bases)?;
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = members;
         self.scratch = Some(at);
+        Ok(())
     }
 
     fn scratch(&self) -> Result<&ScratchAt> {
@@ -2538,14 +2584,11 @@ impl Batch {
                     self.offsets.at(0) as usize,
                     3,
                 );
-                {
-                    let scratch = self.scratch()?;
-                    encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
-                        4,
-                    );
-                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_scratch.view().raw()),
+                    self.lane_scratch.at(0) as usize,
+                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(layout.view().raw()),
                     layout.at(0) as usize,
@@ -2587,6 +2630,12 @@ impl Batch {
                     ProtocolObject::from_ref(&**buffer.slab());
                 encoder.useResource_usage(resource, usage);
             };
+            // The lanes reach their scratch by the addresses in the lane
+            // scratch table.
+            resident(
+                &self.scratch()?.buffer,
+                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            );
             for member in members {
                 resident(
                     member.status.buffer(),
@@ -2719,14 +2768,11 @@ impl Batch {
                     self.offsets.at(0) as usize,
                     3,
                 );
-                {
-                    let scratch = self.scratch()?;
-                    encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
-                        4,
-                    );
-                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_scratch.view().raw()),
+                    self.lane_scratch.at(0) as usize,
+                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(layout.view().raw()),
                     layout.at(0) as usize,
@@ -2768,6 +2814,12 @@ impl Batch {
                     ProtocolObject::from_ref(&**buffer.slab());
                 encoder.useResource_usage(resource, usage);
             };
+            // The lanes reach their scratch by the addresses in the lane
+            // scratch table.
+            resident(
+                &self.scratch()?.buffer,
+                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            );
             for member in members {
                 resident(
                     member.status.buffer(),
@@ -2982,7 +3034,7 @@ mod tests {
             "all_descriptors",
             "params",
             "offsets",
-            "all_scratch",
+            eta_compiler::codegen::lane_scratch::LANE_SCRATCH.name,
             "layout",
             "channel_bindings",
             "pending_flags",

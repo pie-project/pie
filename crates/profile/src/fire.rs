@@ -224,7 +224,7 @@ pub fn interpolate(curve: &[(u32, f64)], x: f64) -> Option<f64> {
 
 /// A matmul's rate at `m` rows of an `n x k` plane, read off `by_rows` (rows
 /// curves at each square width, ascending in width, in any unit of rate):
-/// each width's curve at the octave of rows at or below `m` (its first below
+/// each width's curve at the timed rows at or below `m` (its first below
 /// that), in `log width` at `sqrt(n k)` between the widths. Past the widest
 /// width its last span's slope in log width carries on (a wider plane fills
 /// more tiles), never below the widest's rate; below the narrowest, its rate.

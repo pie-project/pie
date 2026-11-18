@@ -3,6 +3,7 @@ pub mod cuda;
 pub mod error;
 pub mod fault;
 pub mod hip;
+pub mod lane_scratch;
 pub mod launch;
 pub mod layout;
 pub mod metal;

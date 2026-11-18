@@ -86,9 +86,30 @@ pub const GEMM_WIDTHS: [u32; 3] = [1024, 2048, 4096];
 /// The widest of [`GEMM_WIDTHS`].
 pub const GEMM_WIDTH: u32 = GEMM_WIDTHS[GEMM_WIDTHS.len() - 1];
 
-/// The rows the matmul curve is timed at: the lattice's octaves a fire's
-/// prompt reaches, 256 to 8192.
-pub const GEMM_ROWS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+/// The rows the matmul curve is timed at: half octaves (steps of √2,
+/// rounded) from 256 to 8192 rows, the reach of a fire's prompt. An
+/// octave-spaced curve can sit in a library's dips between octaves (an
+/// MI300X's hipBLASLt at width 4096: 523 TFLOP/s at 2048 rows, 599 at
+/// 2896, 556 at 4096), so the shapes between them would be priced from
+/// its dips.
+pub const GEMM_ROWS: [u32; 11] = half_octaves(256);
+
+/// `N` rows at steps of √2 from `from`, rounded to the nearest row: the
+/// even steps `from` doubled, the odd ones those times √2.
+const fn half_octaves<const N: usize>(from: u32) -> [u32; N] {
+    let mut rows = [0; N];
+    let mut i = 0;
+    while i < N {
+        let octave = from << (i / 2);
+        rows[i] = if i % 2 == 0 {
+            octave
+        } else {
+            (octave as f64 * std::f64::consts::SQRT_2 + 0.5) as u32
+        };
+        i += 1;
+    }
+    rows
+}
 
 /// The keys (and rows) the attention curve is timed at.
 pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
@@ -1797,6 +1818,10 @@ mod tests {
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
         assert!(GEMM_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            GEMM_ROWS,
+            [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]
+        );
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
         assert!(elementwise_sets() >= 2);
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
