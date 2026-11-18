@@ -269,6 +269,10 @@ pub struct Tuned {
     /// one submission (`max_submit_ms`) before it settled
     /// (`engine::rates::timed_frames`).
     pub frame_cut: bool,
+    /// A checked-in layer this device takes that states a `[rates]` key
+    /// this pie does not read (`<file>: <key>`): the layer was refused, and
+    /// a load refuses by it rather than run without the file.
+    pub refused: Option<String>,
 }
 
 impl Tuned {
@@ -278,6 +282,7 @@ impl Tuned {
         self.measured_this_load |= upper.measured_this_load;
         self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
         self.frame_cut |= upper.frame_cut;
+        self.refused = upper.refused.clone().or(self.refused.take());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -306,6 +311,7 @@ mod tests {
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
+            refused: None,
         };
         let up = Tuned {
             rates: Rates {
@@ -316,6 +322,7 @@ mod tests {
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
+            refused: None,
         };
         low.lay(&up);
         assert_eq!(

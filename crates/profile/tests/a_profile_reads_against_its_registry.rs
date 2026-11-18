@@ -1092,3 +1092,72 @@ fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
         report.what_was_measured()
     );
 }
+
+/// A user's file a load rewrites keeps every key this pie reads (a person's
+/// own decisions) and drops, by name, each it no longer reads: a removed
+/// decision in a table, one written dotted, a `[rates]` key of an old
+/// schema, a `provenance.measured` item naming a removed decision.
+#[test]
+fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        prefill.chunk = 2048\n\
+        graphs = \"on\"\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        \n\
+        [rates]\n\
+        bytes_per_ns = 650.0\n\
+        hbm_gbps = 700.0\n\
+        \n\
+        [provenance]\n\
+        measured = [\"engine.prefill.chunk\", \"engine.recording\"]\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(
+        dropped,
+        [
+            "engine.graphs",
+            "kernel.moe",
+            "rates.bytes_per_ns",
+            "provenance.measured: engine.recording"
+        ],
+        "{kept}"
+    );
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 1, "the person's chunk kept");
+    assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
+    assert_eq!(file.measured, ["engine.prefill.chunk"]);
+    // What reads is untouched: pruning it again drops nothing.
+    assert_eq!(r.prune(&kept), (kept.clone(), Vec::new()));
+}
+
+/// A stale inline table is an entry of its table: the keys after it in the
+/// same table are kept, and a stale `[table]` is still removed whole.
+#[test]
+fn a_stale_inline_table_takes_only_itself() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        recording = { use = \"bodies\", mem_mb = 4096 }\n\
+        prefill.chunk = 2048\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        grouped = true\n\
+        \n\
+        [compiler]\n\
+        launch_us = 3.0\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(dropped, ["engine.recording", "kernel.moe"], "{kept}");
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 2, "the chunk and the launch kept: {kept}");
+    assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
+    assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
+    assert!(!kept.contains("group_at") && !kept.contains("grouped"), "{kept}");
+}

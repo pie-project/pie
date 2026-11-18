@@ -133,10 +133,40 @@ settled point), never adjust it by a factor.
 A pool segment holds a stage heap beside the tables and config a guest pass
 reads, and a WebGPU usage scope can't see one buffer two ways, so engine-wgpu
 rewrites each step module's table and config declarations to read_write storage
-and binds them so (sc/gpu-guest-state e40261348). Measured against the last wgpu
-build that served guests (2d52e0715) on the L40S, ABBA ×3 medians: greedy
-−0.9% / +0.3% and top-p −1.8% / +0.1% at 1 / 8 lanes, inside the ±5 tok/s
-round-to-round spread: a dead heat. If a device shows a cost, the first lever is
-the config in a uniform buffer of its own (outside the segment), keeping its
-uniform binding without the usage conflict.
+(sc/gpu-guest-state e40261348). Measured against the last wgpu build that served
+guests (2d52e0715), ABBA ×3 medians, on the L40S: greedy −0.9% / +0.3% and top-p
+−1.8% / +0.1% at 1 / 8 lanes; on this box: +1.3% / +1.7% and +11.6% / +1.9%,
+all inside the round-to-round spread: a dead heat. If a device shows a cost, the
+first lever is the config in a uniform buffer of its own, outside the segment.
 
+## F18. The chunk fence does not land; reuse-after-release needs a test, not a watermark
+
+The fence (sc/np-fence-layer → sc/mac-wedge-fence b0bd6869c) returned a released
+slot only once the oldest open epoch passed the fire / copy that last named it.
+Mac Pro's M5 over-demand (64 requests, ×6 per build, rotated, on the wedge + seam
+base): every run of all three builds served 64 / 64 with 0 faults; wall medians
+no-fence 2c4cfb7c6 47.1 s (643.9 tok/s), fence b0bd6869c 69.7 s (474.3,
++48% wall), F16 a726af4f6 (copies on their own watermark) 67.8 s (489.4, +44%).
+The pool held 300–970 of 1932 pages "arriving" with the oldest epoch 400–500
+behind: epoch-wide retirement is the cost, and F16 recovered ~3%. Neither lands.
+
+The hazard the fence was for is real: on 7f544bab1 (before the wedge line),
+Metal over-demand page-faulted in 2 of 3 runs (kIOGPUCommandBufferCallbackErrorPageFault,
+45 / 64 and 47 / 64 served) when a released slot was handed out while a fire
+still named it; the M5 runs above show 0 faults on the current no-fence line.
+So: (1) a test that a slot released while a fire naming it is in flight is never
+handed out before that fire completes, on every engine, in the fake engine and
+on Metal; (2) if it fails, a per-page release on that page's own fire / copy
+completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
+
+
+## F19. B200's tcgen05 prefill skips any fire with a mask bound
+
+kernels-cuda attn.rs:387 runs the tcgen05 prefill only when no mask is bound.
+Since the mask layer, every prefill of a model that opens a mask takes the
+masked arm, so on B200 those prefills all run FA2: likely slower, and not
+checked bit-equal against tcgen05. The structural fix is for tcgen05 to read the
+per-lane mask offsets and words the way FA2 does (an unmasked lane reads
+nothing), not a per-fire switch between kernels. A B200 gate item before the PR
+to main: the tcgen05 masked path, the goldens bit-equal on B200, and c64 / prefill
+throughput ≤ 2% vs main.

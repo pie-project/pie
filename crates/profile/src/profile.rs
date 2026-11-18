@@ -689,6 +689,13 @@ impl Registry {
             let file = match self.parse_over(&layer.text, &origin, strict, &entries, below) {
                 Ok(file) => file,
                 Err(refusal) => {
+                    // A checked-in file stating a rate this pie does not
+                    // read is no file to run without: the load refuses by it.
+                    if seeded && let Some(key) = refusal.stale_rates.first() {
+                        tuned
+                            .refused
+                            .get_or_insert_with(|| format!("{origin}: `[rates] {key}`"));
+                    }
                     rejected.push((layer.source.clone(), refusal.to_string()));
                     continue;
                 }

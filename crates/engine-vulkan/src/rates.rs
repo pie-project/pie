@@ -74,16 +74,10 @@ pub fn at_load(
 ) -> Result<crate::tuning::Tuning> {
     let chip = tuning.profile().clone();
     let measured = device.chip();
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
         provenance: provenance(&measured.name),
-        check: &check,
+        registry: crate::chip::registry(),
     });
     let chip = engine::rates::rates_at_load(
         chip,
