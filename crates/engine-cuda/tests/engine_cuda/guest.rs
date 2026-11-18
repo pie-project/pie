@@ -248,6 +248,9 @@ pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
     use engine_cuda::program::launch::{Arenas, device_units};
     let units = device_units().max(1);
     plane.set_flight(1 << units.ilog2());
+    // The most lanes a test's fire carries: one a unit, the widest a lane
+    // sampler's test flies.
+    plane.set_fire_lanes(units);
     let bytes = Arenas::bytes_for(plane.flight(), units);
     let arenas = engine_cuda::device::Buffer::zeroed(2 * bytes as usize).expect("the lane arenas");
     let arenas: &'static engine_cuda::device::Buffer = Box::leak(Box::new(arenas));
