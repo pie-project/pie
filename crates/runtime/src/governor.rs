@@ -32,10 +32,11 @@ use std::time::Duration;
 
 pub use ::engine::pressure::{Source, Yield, YieldOutOfRange};
 
-/// Reads this system's memory pressure ([`::engine::pressure::Source`]) no
-/// more often than the system recomputes it, so the target moves at the
-/// system's cadence, not the loop's; a reading that fails reads `0` and is
-/// named once.
+/// Reads this system's memory pressure ([`::engine::pressure::Source`]) on
+/// the governor's tick, no more often than the system recomputes it (PSI's
+/// 2 s); a source that states no period (macOS's available memory, which
+/// has no notification of its own) is read every tick, the loop's [`TICK`]
+/// being its only clock. A reading that fails reads `0` and is named once.
 pub struct Reader {
     source: Source,
     last: f64,

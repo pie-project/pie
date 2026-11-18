@@ -150,7 +150,11 @@ impl Source {
     /// caller reads no more often. PSI's averages are recomputed every
     /// `PSI_FREQ`, `(2*HZ+1)` jiffies, "2 sec intervals"
     /// (kernel/sched/psi.c). `None`: the reading is current at each read
-    /// (macOS's available memory, the test file).
+    /// and the caller's own tick is the only clock. macOS states no
+    /// notification for its continuous `kern.memorystatus_level` (the
+    /// dispatch memory-pressure source fires only on the three-step level's
+    /// changes, which a tick sees anyway), and a sysctl read is cheap, so it
+    /// is read on each tick of the governor's loop; the test file likewise.
     #[must_use]
     pub const fn period(&self) -> Option<Duration> {
         match self {
