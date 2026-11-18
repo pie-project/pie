@@ -11,7 +11,11 @@
 //! - each stage's heap, the values its launches lay over their lifetimes
 //!   ([`eta_exec::tables::StageTables::scratch`]): the instance's own
 //!   (`per_instance`), in its own `Instance` slots or run of chunks, so the
-//!   pool holds a heap for every bound instance and none more. A pass is
+//!   pool holds a heap for every bound instance and none more. Its stages
+//!   share one region as wide as the widest: a stage runs whole (staged
+//!   in, dispatched, read back, its kept puts copied to their channels'
+//!   cells) before the next one stages anything, so no value of one
+//!   outlives it into another's. A pass is
 //!   one instance's dispatches over its own heap (these backends launch no
 //!   grouped kernel across instances), bound at the bind and rebound at an
 //!   unpark or an evacuation, never per fire; no value lives there between
@@ -70,8 +74,9 @@ pub struct GuestLayout {
 }
 
 impl GuestLayout {
-    /// Stage heaps of `heaps` bytes on the instance's side and score rows
-    /// of `scores` bytes (0: none) on the pair's, each aligned.
+    /// Stage heaps of `heaps` bytes sharing one region on the instance's
+    /// side, as wide as the widest, and score rows of `scores` bytes (0:
+    /// none) on the pair's.
     #[must_use]
     pub fn of(heaps: &[u64], scores: u64) -> GuestLayout {
         let mut ends = [0u64; 2];
@@ -81,10 +86,11 @@ impl GuestLayout {
             *end = at + bytes;
             at
         };
-        let side = Side::Instance;
+        let widest = heaps.iter().copied().max().unwrap_or(0);
+        let region = (widest > 0).then(|| take(Side::Instance, widest));
         let stages = heaps
             .iter()
-            .map(|&bytes| (side, take(side, bytes), bytes))
+            .map(|&bytes| (Side::Instance, region.unwrap_or(0), bytes))
             .collect();
         let scores = (scores > 0).then(|| (take(Side::Pair, scores), scores));
         GuestLayout {
@@ -304,17 +310,21 @@ mod tests {
         chunk_slots: 1024,
     };
 
-    /// The heaps are the instance's, the score room the pair's, each part
-    /// aligned on its side.
+    /// The heaps are the instance's, its stages sharing one region as wide
+    /// as the widest; the score room is the pair's.
     #[test]
-    fn the_heaps_are_the_instances_and_the_score_room_the_pairs() {
-        let layout = GuestLayout::of(&[1000, 300], 5000);
+    fn the_stages_share_one_region_and_the_score_room_is_the_pairs() {
+        let layout = GuestLayout::of(&[1000, 3000, 300], 5000);
         assert_eq!(
             layout.stages,
-            vec![(Side::Instance, 0, 1000), (Side::Instance, 1024, 300)]
+            vec![
+                (Side::Instance, 0, 1000),
+                (Side::Instance, 0, 3000),
+                (Side::Instance, 0, 300)
+            ]
         );
         assert_eq!(layout.scores, Some((0, 5000)));
-        assert_eq!((layout.instance, layout.pair), (1324, 5000));
+        assert_eq!((layout.instance, layout.pair), (3000, 5000));
         assert_eq!(GuestLayout::of(&[], 0), GuestLayout::default());
     }
 
