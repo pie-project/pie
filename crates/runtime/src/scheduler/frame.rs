@@ -65,6 +65,9 @@ struct ArrivedFire {
     tokens: usize,
     rows: usize,
     readouts: usize,
+    /// What the fire takes of its activation rung
+    /// ([`crate::engine::FireRequest::rung_rows`]).
+    rung_rows: usize,
 }
 
 struct PlacedFire {
@@ -130,6 +133,9 @@ impl LaneState {
 struct SealedFrame {
     waves: Vec<Vec<u64>>,
     members: BTreeSet<ProcessId>,
+    /// The widest of its fires' rung rows: a frame sealed under the cap
+    /// goes as sealed, and the rung is not lowered under it until it has.
+    widest: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -205,8 +211,13 @@ pub(crate) struct FramePolicy {
     join_hold: Option<Instant>,
     gather_seq: u64,
     quiesce_mark: Option<u64>,
+    /// The lanes with a fire in a posted frame, exactly
+    /// ([`Self::on_frame_posted`], [`Self::on_frame_retired`]).
     in_flight_lanes: BTreeSet<ProcessId>,
     in_flight_since: BTreeMap<ProcessId, Instant>,
+    /// The rung rows a fire sealed now may take: the activation rung's cap
+    /// ([`Self::cap_fires`]).
+    fire_cap: usize,
     submit_deadline: Duration,
     silence_timeout: Duration,
     stats: Option<Arc<SchedulerStats>>,
@@ -228,8 +239,30 @@ impl FramePolicy {
         self
     }
 
-    /// The worker policy's bound on a batch of passes, as it stands now;
-    /// none leaves a wave the engine's one fire's tokens.
+    /// Fires are cut to `rows` of the activation rung now: a lane whose
+    /// next frame holds a wider fire (cut under a cap since lowered) is
+    /// left out of the frames sealed from here, its frame kept whole until
+    /// the cap is back; every fire of a frame sealed goes.
+    pub fn cap_fires(&mut self, rows: usize) {
+        self.fire_cap = rows;
+    }
+
+    /// The widest rung rows a sealed frame still to go takes; 0 where none
+    /// waits. The rung is not lowered under it until it has gone.
+    #[must_use]
+    pub fn sealed_widest(&self) -> usize {
+        self.sealed.iter().map(|frame| frame.widest).max().unwrap_or(0)
+    }
+
+    /// A frame was posted to the engine with fires of `lanes`: they owe its
+    /// output until it retires ([`Self::on_frame_retired`]).
+    pub fn on_frame_posted(&mut self, lanes: impl IntoIterator<Item = ProcessId>, now: Instant) {
+        for lane in lanes {
+            self.in_flight_lanes.insert(lane);
+            self.in_flight_since.entry(lane).or_insert(now);
+        }
+    }
+
     pub fn new(
         k: usize,
         max_wave_rows: usize,
@@ -262,6 +295,7 @@ impl FramePolicy {
             gather_seq: 0,
             quiesce_mark: None,
             in_flight_lanes: BTreeSet::new(),
+            fire_cap: usize::MAX,
             in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
@@ -283,7 +317,7 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
-        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows);
+        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows, tokens);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -295,6 +329,7 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
         readouts: usize,
+        rung_rows: usize,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
         self.record_arrival(
@@ -306,6 +341,7 @@ impl FramePolicy {
                 tokens,
                 rows,
                 readouts,
+                rung_rows,
             },
         );
         if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
@@ -329,6 +365,7 @@ impl FramePolicy {
                 tokens: 0,
                 rows: 0,
                 readouts: 0,
+                rung_rows: 0,
             },
         );
     }
@@ -812,6 +849,7 @@ impl FramePolicy {
             let mut wave_rows = vec![0usize; k];
             let mut wave_readouts = vec![0usize; k];
             let mut members: HashSet<ProcessId> = HashSet::new();
+            let mut sealed_widest = 0usize;
             let mut dropped_empty = false;
             for lane_id in &order {
                 let Some(lane) = self.lanes.get_mut(lane_id) else {
@@ -820,6 +858,11 @@ impl FramePolicy {
                 let Some(front) = lane.frames.front() else {
                     continue;
                 };
+                // Cut under a cap since lowered: kept whole, out of this
+                // frame, until the cap is back (the queued rows ask it).
+                if front.fires.iter().any(|fire| fire.rung_rows > self.fire_cap) {
+                    continue;
+                }
                 let mut live: Vec<PlacedFire> = front
                     .fires
                     .iter()
@@ -874,6 +917,12 @@ impl FramePolicy {
                 }
                 members.insert(*lane_id);
                 let lane = self.lanes.get_mut(lane_id).expect("measured lane exists");
+                sealed_widest = lane
+                    .frames
+                    .front()
+                    .into_iter()
+                    .flat_map(|front| front.fires.iter().map(|fire| fire.rung_rows))
+                    .fold(sealed_widest, usize::max);
                 let frame_complete_at = lane.frames.front().and_then(|front| front.complete_at);
                 if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
                     let us = done.saturating_duration_since(from).as_micros() as u64;
@@ -930,6 +979,7 @@ impl FramePolicy {
             self.sealed.push_back(SealedFrame {
                 waves,
                 members: members.iter().copied().collect(),
+                widest: sealed_widest,
             });
             self.lanes
                 .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
@@ -1087,10 +1137,6 @@ ready_age_newest={}us",
                     return FramePlan::Hold(Duration::from_micros(500));
                 }
                 let frame = self.sealed.pop_front().expect("front frame exists");
-                self.in_flight_lanes.extend(frame.members.iter().copied());
-                for member in frame.members.iter().copied() {
-                    self.in_flight_since.entry(member).or_insert(now);
-                }
                 let mut starved_us = 0u64;
                 if !self.executing_now
                     && let Some(since) = self.last_retire_at
@@ -1370,6 +1416,50 @@ mod tests {
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
+        a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
+    }
+
+    /// A prompt split across a lower: its last piece, cut under the cap
+    /// before it came down, is kept whole out of the frames sealed under
+    /// the lowered cap (the frame goes with the other lanes), and its lane
+    /// owes nothing meanwhile; the cap back, the piece goes and completes.
+    /// A frame sealed under the old cap goes whole, and the rung is not
+    /// lowered under it until it has.
+    fn a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing() {
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let (prompt, decode) = (pid(), pid());
+        policy.cap_fires(128);
+        // The prompt's first piece (64 rows) and a decode, one frame.
+        policy.on_fire_enqueued(stamp(prompt, 0, 0, 1), Some(prompt), 1, 64, 1);
+        policy.on_fire_enqueued(stamp(decode, 0, 0, 1), Some(decode), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        let mut first = fires(&plan(&mut policy, &queued, Instant::now()));
+        first.sort_unstable();
+        assert_eq!(first, vec![1, 2]);
+        policy.on_frame_posted([prompt, decode], Instant::now());
+        policy.on_frame_retired([prompt, decode]);
+
+        // Its last piece (33 rows), cut under 128, arrives; the cap comes
+        // down to 32 before it is sealed.
+        policy.cap_fires(32);
+        policy.on_fire_enqueued(stamp(prompt, 1, 0, 1), Some(prompt), 3, 33, 1);
+        policy.on_fire_enqueued(stamp(decode, 1, 0, 1), Some(decode), 4, 1, 1);
+        let queued: QueuedFireIds = [3, 4].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![4],
+            "the frame goes without the piece past the cap"
+        );
+        assert!(!policy.in_flight_lanes.contains(&prompt), "it owes nothing");
+        assert_eq!(policy.sealed_widest(), 0);
+        policy.on_frame_posted([decode], Instant::now());
+        policy.on_frame_retired([decode]);
+
+        // The cap back (the queued rows ask it): the piece goes.
+        policy.cap_fires(128);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
     }
 
     /// A process whose bind found no room for its guest state (or whose
@@ -1492,7 +1582,7 @@ mod tests {
         let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
         let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
         for (at, &lane) in lanes.iter().enumerate() {
-            policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5);
+            policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5, 5);
         }
         let mut sealed_ids = Vec::new();
         for _ in 0..3 {
@@ -1510,7 +1600,7 @@ mod tests {
         assert_eq!(sealed_ids, vec![10, 11, 12], "every lane seals in its turn");
 
         let lone = pid();
-        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12);
+        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, 12);
         let queued: QueuedFireIds = [20].into_iter().collect();
         assert_eq!(
             fires(&plan(&mut policy, &queued, Instant::now())),

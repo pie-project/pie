@@ -259,7 +259,7 @@ fn render(start: Instant, component: &str, version: &str) -> String {
          pie_kv_cached_from_below_tokens_total {below}\n{rows}",
         below = runtime::store::CACHED_FROM_BELOW_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
         rows = policy_rows(),
-    )
+    ) + &runtime::store::waiting::metrics()
 }
 
 /// The worker policy's rows the port enacted, and those it passed over, by column.

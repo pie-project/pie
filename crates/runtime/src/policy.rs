@@ -82,6 +82,9 @@ pub(crate) enum Event {
     /// the rows before its first readout are its prompt, each readout a
     /// token it generates.
     Fired(ProcessId, u64, u64),
+    /// While it waits for admission: the tokens of its prompt's prefix the
+    /// stores hold now ([`crate::store::waiting`]), in place of the last.
+    Waiting(ProcessId, u64),
     CacheEmptied(ProcessId, By),
     Started(ProcessId),
     Paused(ProcessId),

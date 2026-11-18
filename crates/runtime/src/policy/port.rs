@@ -283,7 +283,13 @@ struct Proc {
     /// its KV meanwhile.
     idle: bool,
     session: Option<String>,
-    /// What its fires mapped in from the cache, once one has looked.
+    /// Its `cached-tokens`, two meanings by state. Waiting: the leading
+    /// tokens of its prompt some kv store holds now, kept up as the cache
+    /// changes (store::waiting); only a prompt the runtime has at arrival
+    /// (`prompt-tokens`, or a completion's `raw-prompt`) is looked up, so a
+    /// chat request reads none while it waits and a policy ranking waiting
+    /// work by it (lpm) passes chat over. Running and after: what its fires
+    /// mapped in from the cache, once one has looked.
     cached_tokens: Option<u64>,
     /// The rows its fires wrote before the first readout; known once it
     /// read one out.
@@ -525,9 +531,22 @@ impl Port {
                     proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0) + tokens);
                 }
             }
+            Event::Waiting(pid, tokens) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id)
+                    && proc.state == State::Waiting
+                {
+                    proc.cached_tokens = Some(tokens);
+                }
+            }
             Event::Started(pid) | Event::Resumed(pid) => {
                 let id = schedule::plex_id(pid);
                 if let Some(proc) = self.procs.get_mut(&id) {
+                    if proc.state == State::Waiting {
+                        // What it found while waiting is its fires' to count
+                        // from its start.
+                        proc.cached_tokens = None;
+                    }
                     proc.state = State::Running;
                     host.started(&id.to_string());
                 }

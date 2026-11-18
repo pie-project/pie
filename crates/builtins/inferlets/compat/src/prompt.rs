@@ -30,14 +30,10 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         tokens.extend_from_slice(ids);
         ends.push(tokens.len() as u32);
     } else if let Some(raw) = &req.raw_prompt {
-        // a raw prompt that already spells the model's prefix (a chat render's
-        // BOS) is not given it twice, as vLLM and SGLang read it
-        let body = model::encode(raw);
-        let prefix = chat::prefix();
-        if !body.starts_with(&prefix) {
-            tokens.extend(prefix);
-        }
-        tokens.extend(body);
+        tokens.extend(client_api::props::raw_prompt_tokens(
+            chat::prefix(),
+            model::encode(raw),
+        ));
         ends.push(tokens.len() as u32);
     } else {
         let messages = &req.messages;

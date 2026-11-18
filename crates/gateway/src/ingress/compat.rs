@@ -133,6 +133,54 @@ fn props(headers: &HeaderMap, body: &Value) -> Props {
     props
 }
 
+/// A completion's one prompt, as the compat inferlet reads it: a string, or
+/// an array of one string.
+fn completion_prompt(body: &Value) -> Option<&str> {
+    match body.get("prompt")? {
+        Value::String(text) => Some(text),
+        Value::Array(items) => match items.as_slice() {
+            [Value::String(text)] => Some(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A completion's one prompt given as token ids: an array of integers, or
+/// an array of one such array.
+fn completion_token_ids(body: &Value) -> Option<Value> {
+    let ids = |v: &Value| {
+        v.as_array()
+            .filter(|ids| !ids.is_empty() && ids.iter().all(Value::is_u64))
+            .map(|_| v.clone())
+    };
+    let prompt = body.get("prompt")?;
+    ids(prompt).or_else(|| match prompt.as_array()?.as_slice() {
+        [one] => ids(one),
+        _ => None,
+    })
+}
+
+/// The prompt the runtime looks up at arrival, from the request body alone:
+/// a completion's text as `raw-prompt`, or its token ids as `prompt-tokens`.
+/// Whatever a client set for either is dropped, so no client can state a
+/// cached prefix its request does not have; a chat request states neither.
+fn state_prompt(path: &str, body: &Value, props: &mut Props) {
+    props.remove(client_api::props::RAW_PROMPT);
+    props.remove(client_api::props::PROMPT_TOKENS);
+    if path != "/v1/completions" {
+        return;
+    }
+    if let Some(text) = completion_prompt(body) {
+        props.insert(
+            client_api::props::RAW_PROMPT.to_string(),
+            Value::String(text.to_string()),
+        );
+    } else if let Some(ids) = completion_token_ids(body) {
+        props.insert(client_api::props::PROMPT_TOKENS.to_string(), ids);
+    }
+}
+
 /// In order, so a later turn's text starts with an earlier one's.
 fn prompt_text(body: &Value) -> Option<String> {
     fn gather(value: &Value, text: &mut String) {
@@ -332,7 +380,8 @@ async fn relay(
             Err(e) => return error_body(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")),
         }
     };
-    let props = props(&headers, &body);
+    let mut props = props(&headers, &body);
+    state_prompt(uri.path(), &body, &mut props);
     let launch = Launch {
         state,
         identity: identity(&headers),
@@ -758,5 +807,50 @@ mod tests {
             assert!(path.starts_with("/v1"), "{path}");
             assert!(!inferlet.is_empty());
         }
+    }
+
+    #[test]
+    fn the_stated_prompt_comes_from_the_body_not_the_client() {
+        let faked = || -> Props {
+            serde_json::from_value(json!({
+                "raw-prompt": "a hot prefix",
+                "prompt-tokens": [1, 2, 3],
+            }))
+            .unwrap()
+        };
+        let mut props = faked();
+        state_prompt("/v1/completions", &json!({"prompt": "abc"}), &mut props);
+        assert_eq!(props.get("raw-prompt"), Some(&json!("abc")));
+        assert!(!props.contains_key("prompt-tokens"));
+        let mut props = faked();
+        state_prompt("/v1/completions", &json!({"prompt": [5, 6]}), &mut props);
+        assert_eq!(props.get("prompt-tokens"), Some(&json!([5, 6])));
+        assert!(!props.contains_key("raw-prompt"));
+        let mut props = faked();
+        state_prompt("/v1/chat/completions", &json!({"messages": []}), &mut props);
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn a_completion_prompt_of_token_ids_is_stated_as_them() {
+        assert_eq!(
+            completion_token_ids(&json!({"prompt": [5, 6]})),
+            Some(json!([5, 6]))
+        );
+        assert_eq!(
+            completion_token_ids(&json!({"prompt": [[5, 6]]})),
+            Some(json!([5, 6]))
+        );
+        assert_eq!(completion_token_ids(&json!({"prompt": [[5], [6]]})), None);
+        assert_eq!(completion_token_ids(&json!({"prompt": "abc"})), None);
+    }
+
+    #[test]
+    fn a_completion_prompt_is_its_one_string() {
+        assert_eq!(completion_prompt(&json!({"prompt": "abc"})), Some("abc"));
+        assert_eq!(completion_prompt(&json!({"prompt": ["abc"]})), Some("abc"));
+        assert_eq!(completion_prompt(&json!({"prompt": ["a", "b"]})), None);
+        assert_eq!(completion_prompt(&json!({"prompt": [1, 2]})), None);
+        assert_eq!(completion_prompt(&json!({"messages": []})), None);
     }
 }
