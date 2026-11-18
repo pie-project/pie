@@ -50,6 +50,18 @@ pub struct Room {
     pub room: u64,
 }
 
+impl Room {
+    /// What the host can still give, signed: negative by what it is short
+    /// once what it has available falls under the defended line and the
+    /// floor, which a process holding memory gives back to keep it there.
+    #[must_use]
+    pub fn net(&self) -> i64 {
+        let net =
+            i128::from(self.available) - i128::from(self.defended) - i128::from(SAFETY_FLOOR_BYTES);
+        i64::try_from(net).unwrap_or(if net < 0 { i64::MIN } else { i64::MAX })
+    }
+}
+
 /// Whether, and how, a low-memory killer defends memory past
 /// `MemAvailable`, with the texts its line is read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,10 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_never_goes_negative() {
+    fn the_room_saturates_and_its_net_says_the_shortfall() {
         let room = room_of("MemAvailable: 1024 kB\n", Killer::None, PAGE).unwrap();
         assert!(room.available < 64 * MIB);
         assert_eq!(room.room, 0);
+        assert_eq!(room.net(), -(63 * MIB as i64));
+        let room = room_of(MEMINFO, Killer::Pressure, PAGE).unwrap();
+        assert_eq!(room.net(), (AVAILABLE - SAFETY_FLOOR_BYTES) as i64);
     }
 
     #[test]

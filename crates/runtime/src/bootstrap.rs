@@ -540,6 +540,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
     let engine_count = engine_configs.len();
+    // Each engine's reader of the host's room, where its device shares the
+    // host's memory: its governor holds its pool within it.
+    let rooms: Vec<Option<::engine::HostRoom>> = engine_configs
+        .iter()
+        .map(|d| d.engine_backend.host_room())
+        .collect();
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
@@ -739,8 +745,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
-    for steered in governed {
-        crate::governor::run::start(steered, memory_tolerance);
+    for (engine, steered) in governed.into_iter().enumerate() {
+        let room = rooms.get(engine).cloned().flatten();
+        crate::governor::run::start(steered, memory_tolerance, room);
     }
     active_guard.disarm();
     Ok(BootstrapHandle {
