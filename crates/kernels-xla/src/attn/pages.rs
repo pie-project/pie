@@ -61,14 +61,35 @@ struct Shape {
     /// Where the keys and values planes' pages lie (`PageMap`): table page
     /// `p` is plane page `p · stride + offset` of each.
     maps: [PageMap; 2],
+    /// The custom mask, where the fire carries one: its plane's columns
+    /// (`i32 [rp, w]`, key position `k` at column `k`, zero past the mask's
+    /// bound), prefetched 4 each row's flag.
+    mask: Option<i64>,
+}
+
+/// Pages a row's buffer is shifted by so its key `j` is position
+/// `align(k0, 128) + j`: a masked row's columns then come in one aligned
+/// copy.
+fn shift_pages(ps: i64) -> Option<i64> {
+    if ps % 128 == 0 {
+        Some(1)
+    } else if 128 % ps == 0 {
+        Some(128 / ps)
+    } else {
+        None
+    }
 }
 
 impl Shape {
     fn vmem(span: i64, h: &Heads) -> i64 {
+        // a row's buffer is a 128-key block longer (`shift_pages`), and a
+        // masked row's columns ride beside it
+        let span = span + 128;
         let (qh, w, wv) = (h.qh(), h.kvh * h.d, h.kvh * h.dv);
         // both slots of keys and values, the state, the blocks, room for
         // a chunk's temporaries
         2 * span * (w + wv) * 2
+            + span * 4
             + h.dv * QP * 4
             + 2 * G * (qh * h.d * 4 + h.dv * QP * 4 + 2 * QP * 4)
             + 8 * CHUNK * (w + wv) * 4
@@ -97,8 +118,15 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         scale,
         pooled,
         maps,
+        mask,
     } = *s;
     let ordered = pooled.is_some();
+    let Some(a) = shift_pages(ps) else {
+        return bad(format!("pages of {ps} keys"));
+    };
+    // a row's buffer: its span and the shift's room, whole 128-key blocks
+    let held = span + 128;
+    let slots_b = held / ps;
     let (qh, gq, d, dv, kvh) = (h.qh(), h.g, h.d, h.dv, h.kvh);
     let (w, wv) = (kvh * d, kvh * dv);
     // a buffer's row: a key row, or (pooled) a bf16 row of 128 of it (two
@@ -136,7 +164,13 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         name: "decode_pages".into(),
         grid: vec![steps],
         semantics: vec![Sem::Arbitrary],
-        prefetch: vec![vec![table], vec![rp], vec![rp], vec![rp]],
+        prefetch: {
+            let mut p = vec![vec![table], vec![rp], vec![rp], vec![rp]];
+            if mask.is_some() {
+                p.push(vec![rp]);
+            }
+            p
+        },
         ins: match pooled {
             None => vec![
                 block(vec![rp * qh, d], Elem::F32, vec![G * qh, d]),
@@ -153,7 +187,16 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                     index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
                 },
             ],
-        },
+        }
+        .into_iter()
+        .chain(mask.map(|w| Operand {
+            array: vec![rp, w],
+            elem: Elem::I32,
+            block: vec![],
+            window: Window::Any,
+            index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
+        }))
+        .collect(),
         outs: vec![
             block(vec![rp * dv, QP], Elem::F32, vec![G * dv, QP]),
             block(vec![rp, QP], Elem::F32, vec![G, QP]),
@@ -163,24 +206,29 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         scratch: vec![
             // ordered: a page apiece, its rows as they lie
             if ordered {
-                MTy::Ref(vec![2, span / ps, ps * kk / 2, lw], Elem::U32, Space::Vmem)
+                MTy::Ref(vec![2, slots_b, ps * kk / 2, lw], Elem::U32, Space::Vmem)
             } else {
-                MTy::Ref(vec![2, span * kk, lw], Elem::Bf16, Space::Vmem)
+                MTy::Ref(vec![2, held * kk, lw], Elem::Bf16, Space::Vmem)
             },
             if ordered {
-                MTy::Ref(
-                    vec![2, span / ps, ps * kv_ / 2, lwv],
-                    Elem::U32,
-                    Space::Vmem,
-                )
+                MTy::Ref(vec![2, slots_b, ps * kv_ / 2, lwv], Elem::U32, Space::Vmem)
             } else {
-                MTy::Ref(vec![2, span * kv_, lwv], Elem::Bf16, Space::Vmem)
+                MTy::Ref(vec![2, held * kv_, lwv], Elem::Bf16, Space::Vmem)
             },
             MTy::Sem(vec![2, 2]),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![dv, QP], Elem::F32, Space::Vmem),
-        ],
+        ]
+        .into_iter()
+        // a masked row's columns over its buffer, and their copy's semaphore
+        .chain(mask.iter().flat_map(|_| {
+            [
+                MTy::Ref(vec![1, held], Elem::I32, Space::Vmem),
+                MTy::Sem(vec![1]),
+            ]
+        }))
+        .collect(),
     };
     k.build(|b, blk| {
         let i = blk.grid.ids[0];
@@ -199,6 +247,14 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let (o_ref, m_ref, l_ref) = (blk.outs[0], blk.outs[1], blk.outs[2]);
         let (kbuf, vbuf, sems) = (blk.scratch[0], blk.scratch[1], blk.scratch[2]);
         let (m_sc, l_sc, a_sc) = (blk.scratch[3], blk.scratch[4], blk.scratch[5]);
+        let masked = mask.map(|_| {
+            (
+                blk.grid.prefetch[4],
+                blk.ins[blk.ins.len() - 1],
+                blk.scratch[6],
+                blk.scratch[7],
+            )
+        });
         // Every page of row `row`'s range, from its first page on, into
         // `slot` (`wait`: waited for).
         let copies = |b: &mut Body, row: V, slot: V, wait: bool| -> Built<()> {
@@ -233,7 +289,11 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                         src_rows[at] = b.addi(row, from)?;
                     }
                 }
+                // shifted so buffer key `j` is position `align(k0, 128) + j`
                 let dp = b.subi(p, p0)?;
+                let av = b.i32(a);
+                let lead = b.remsi(p0, av)?;
+                let dp = b.addi(dp, lead)?;
                 let z = b.i32(0);
                 for (plane, buf, width, which, per) in
                     [(kp, kbuf, lw, 0, ps * kk), (vp, vbuf, lwv, 1, ps * kv_)]
@@ -332,8 +392,11 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let l1 = b.load(hi, &[row])?;
             let psv = b.i32(ps);
             let p0 = b.divsi(l0, psv)?;
+            let av = b.i32(a);
+            let lead = b.remsi(p0, av)?;
+            let p0 = b.subi(p0, lead)?;
             let k0 = b.muli(p0, psv)?;
-            // buffer key `j` is position `k0 + j`
+            // buffer key `j` is position `k0 + j` (`k0` a whole 128 keys)
             let lo_k = b.subi(l0, k0)?;
             let hi_k = b.subi(l1, k0)?;
             let hi_k = b.maxsi(hi_k, lo_k)?;
@@ -363,98 +426,139 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let c1 = b.addi(hi_k, top)?;
             let c1 = b.divsi(c1, cv)?;
             let one = b.i32(1);
-            b.for_range(c0, c1, one, |b, c| {
-                let cv = b.i32(CHUNK);
-                let kb = b.muli(c, cv)?;
-                let kb = b.assume_multiple(kb, CHUNK)?;
-                let i0 = b.index(0);
-                // a chunk's rows `[CHUNK, width]` of a buffer: ordered, a
-                // pair at a time (its pages' 16 rows of two lane blocks
-                // each), the pairs side by side
-                let chunk = |b: &mut Body, buf: V, per: i64, width: i64, lanes: i64| -> Built<V> {
-                    if ordered {
-                        let psv = b.i32(ps);
-                        let cp = b.divsi(kb, psv)?;
-                        let cidx = b.as_index(cp)?;
-                        let mut pieces = Vec::new();
-                        for j in 0..per / 2 {
-                            let jr = b.index(j * ps);
-                            let x =
-                                b.vload(buf, &[sidx, cidx, jr, i0], &[1, CHUNK / ps, ps, 128])?;
-                            let x = b.shape_cast(x, &[CHUNK, 128])?;
-                            let x = b.bitcast_v(x, Elem::I32)?;
-                            // a word's low half is the even 128-lane block,
-                            // as a float's high bits; its high half the odd
-                            let lo = b.shli(x, sixteen_v)?;
-                            let hi = b.andi(x, high_v)?;
-                            for half in [lo, hi] {
-                                let f = b.bitcast_v(half, Elem::F32)?;
-                                pieces.push(b.convert_f(f, Elem::Bf16)?);
+            // The chunk walk; with `mrow` (the row's custom-mask columns over
+            // its buffer) they gate its keys too.
+            let walk = |b: &mut Body, mrow: Option<V>| -> Built<()> {
+                b.for_range(c0, c1, one, |b, c| {
+                    let cv = b.i32(CHUNK);
+                    let kb = b.muli(c, cv)?;
+                    let kb = b.assume_multiple(kb, CHUNK)?;
+                    let i0 = b.index(0);
+                    // a chunk's rows `[CHUNK, width]` of a buffer: ordered, a
+                    // pair at a time (its pages' 16 rows of two lane blocks
+                    // each), the pairs side by side
+                    let chunk =
+                        |b: &mut Body, buf: V, per: i64, width: i64, lanes: i64| -> Built<V> {
+                            if ordered {
+                                let psv = b.i32(ps);
+                                let cp = b.divsi(kb, psv)?;
+                                let cidx = b.as_index(cp)?;
+                                let mut pieces = Vec::new();
+                                for j in 0..per / 2 {
+                                    let jr = b.index(j * ps);
+                                    let x = b.vload(
+                                        buf,
+                                        &[sidx, cidx, jr, i0],
+                                        &[1, CHUNK / ps, ps, 128],
+                                    )?;
+                                    let x = b.shape_cast(x, &[CHUNK, 128])?;
+                                    let x = b.bitcast_v(x, Elem::I32)?;
+                                    // a word's low half is the even 128-lane block,
+                                    // as a float's high bits; its high half the odd
+                                    let lo = b.shli(x, sixteen_v)?;
+                                    let hi = b.andi(x, high_v)?;
+                                    for half in [lo, hi] {
+                                        let f = b.bitcast_v(half, Elem::F32)?;
+                                        pieces.push(b.convert_f(f, Elem::Bf16)?);
+                                    }
+                                }
+                                return b.concat(&pieces, 1);
                             }
-                        }
-                        return b.concat(&pieces, 1);
+                            let kkv = b.i32(per);
+                            let kbr = b.muli(kb, kkv)?;
+                            let bidx = b.as_index(kbr)?;
+                            let x = b.vload(buf, &[sidx, bidx, i0], &[1, CHUNK * per, lanes])?;
+                            b.shape_cast(x, &[CHUNK, width])
+                        };
+                    let kc = chunk(b, kbuf, kk, w, lw)?;
+                    let s = b.matmul(kc, qbd, zs, true)?;
+                    let s = b.mulf(s, sc)?;
+                    // keys in `[lo_k, hi_k)` only
+                    let off = b.broadcast_i(kb, &[CHUNK, QP])?;
+                    let kj = b.addi(key_s, off)?;
+                    let lb = b.broadcast_i(lo_k, &[CHUNK, QP])?;
+                    let hb = b.broadcast_i(hi_k, &[CHUNK, QP])?;
+                    let ge = b.cmpi(ICmp::Sge, kj, lb)?;
+                    let lt = b.cmpi(ICmp::Slt, kj, hb)?;
+                    let valid = b.andi(ge, lt)?;
+                    let valid = if let Some(mrow) = mrow {
+                        // the chunk's columns, keys turned onto the sublanes
+                        let kbi = b.as_index(kb)?;
+                        let cols = b.vload(mrow, &[i0, kbi], &[1, CHUNK])?;
+                        let cols = b.broadcast(cols, &[CHUNK, CHUNK])?;
+                        let cols = b.transpose(cols)?;
+                        let zc = b.splat_i(&[CHUNK, QP], 0)?;
+                        let keep = b.cmpi(ICmp::Ne, cols, zc)?;
+                        b.andi(valid, keep)?
+                    } else {
+                        valid
+                    };
+                    let s = b.select(valid, s, ninf_s)?;
+                    let m0 = b.vload(m_sc, &[i0, i0], &[1, QP])?;
+                    let mx = b.max_rows(s)?;
+                    let mn = b.maxf(m0, mx)?;
+                    let alive = b.cmpf(true, mn, ninf1)?;
+                    let ms = b.select(alive, mn, z1)?;
+                    let msb = b.broadcast(ms, &[CHUNK, QP])?;
+                    let zz = b.subf(s, msb)?;
+                    let p = b.exp(zz)?;
+                    let dm = b.subf(m0, ms)?;
+                    let corr = b.exp(dm)?;
+                    let l0 = b.vload(l_sc, &[i0, i0], &[1, QP])?;
+                    let l = b.mulf(l0, corr)?;
+                    let ps_ = b.sum_rows(p)?;
+                    let l = b.addf(l, ps_)?;
+                    b.vstore(l, l_sc, &[i0, i0])?;
+                    b.vstore(mn, m_sc, &[i0, i0])?;
+                    let vc = chunk(b, vbuf, kv_, wv, lwv)?;
+                    // a buffer row past the range may hold anything
+                    let offv = b.broadcast_i(kb, &[CHUNK, wv])?;
+                    let vj = b.addi(key_v, offv)?;
+                    let lbv = b.broadcast_i(lo_k, &[CHUNK, wv])?;
+                    let hbv = b.broadcast_i(hi_k, &[CHUNK, wv])?;
+                    let ge = b.cmpi(ICmp::Sge, vj, lbv)?;
+                    let lt = b.cmpi(ICmp::Slt, vj, hbv)?;
+                    let held = b.andi(ge, lt)?;
+                    let vc = b.select(held, vc, zv)?;
+                    let pb = b.convert_f(p, Elem::Bf16)?;
+                    // each kv head's values against every query head's
+                    // probabilities, its own query heads' columns kept
+                    let mut ov = zo;
+                    for kh in 0..kvh {
+                        let vh = b.slice(vc, &[0, kh * dv], &[CHUNK, dv])?;
+                        let oh = b.matmul_tl(vh, pb, zo)?;
+                        let khv = b.splat_i(&[dv, QP], kh)?;
+                        let mine = b.cmpi(ICmp::Eq, head_o, khv)?;
+                        ov = b.select(mine, oh, ov)?;
                     }
-                    let kkv = b.i32(per);
-                    let kbr = b.muli(kb, kkv)?;
-                    let bidx = b.as_index(kbr)?;
-                    let x = b.vload(buf, &[sidx, bidx, i0], &[1, CHUNK * per, lanes])?;
-                    b.shape_cast(x, &[CHUNK, width])
-                };
-                let kc = chunk(b, kbuf, kk, w, lw)?;
-                let s = b.matmul(kc, qbd, zs, true)?;
-                let s = b.mulf(s, sc)?;
-                // keys in `[lo_k, hi_k)` only
-                let off = b.broadcast_i(kb, &[CHUNK, QP])?;
-                let kj = b.addi(key_s, off)?;
-                let lb = b.broadcast_i(lo_k, &[CHUNK, QP])?;
-                let hb = b.broadcast_i(hi_k, &[CHUNK, QP])?;
-                let ge = b.cmpi(ICmp::Sge, kj, lb)?;
-                let lt = b.cmpi(ICmp::Slt, kj, hb)?;
-                let valid = b.andi(ge, lt)?;
-                let s = b.select(valid, s, ninf_s)?;
-                let m0 = b.vload(m_sc, &[i0, i0], &[1, QP])?;
-                let mx = b.max_rows(s)?;
-                let mn = b.maxf(m0, mx)?;
-                let alive = b.cmpf(true, mn, ninf1)?;
-                let ms = b.select(alive, mn, z1)?;
-                let msb = b.broadcast(ms, &[CHUNK, QP])?;
-                let zz = b.subf(s, msb)?;
-                let p = b.exp(zz)?;
-                let dm = b.subf(m0, ms)?;
-                let corr = b.exp(dm)?;
-                let l0 = b.vload(l_sc, &[i0, i0], &[1, QP])?;
-                let l = b.mulf(l0, corr)?;
-                let ps_ = b.sum_rows(p)?;
-                let l = b.addf(l, ps_)?;
-                b.vstore(l, l_sc, &[i0, i0])?;
-                b.vstore(mn, m_sc, &[i0, i0])?;
-                let vc = chunk(b, vbuf, kv_, wv, lwv)?;
-                // a buffer row past the range may hold anything
-                let offv = b.broadcast_i(kb, &[CHUNK, wv])?;
-                let vj = b.addi(key_v, offv)?;
-                let lbv = b.broadcast_i(lo_k, &[CHUNK, wv])?;
-                let hbv = b.broadcast_i(hi_k, &[CHUNK, wv])?;
-                let ge = b.cmpi(ICmp::Sge, vj, lbv)?;
-                let lt = b.cmpi(ICmp::Slt, vj, hbv)?;
-                let held = b.andi(ge, lt)?;
-                let vc = b.select(held, vc, zv)?;
-                let pb = b.convert_f(p, Elem::Bf16)?;
-                // each kv head's values against every query head's
-                // probabilities, its own query heads' columns kept
-                let mut ov = zo;
-                for kh in 0..kvh {
-                    let vh = b.slice(vc, &[0, kh * dv], &[CHUNK, dv])?;
-                    let oh = b.matmul_tl(vh, pb, zo)?;
-                    let khv = b.splat_i(&[dv, QP], kh)?;
-                    let mine = b.cmpi(ICmp::Eq, head_o, khv)?;
-                    ov = b.select(mine, oh, ov)?;
+                    let a0 = b.vload(a_sc, &[i0, i0], &[dv, QP])?;
+                    let cb = b.broadcast(corr, &[dv, QP])?;
+                    let a = b.mulf(a0, cb)?;
+                    let a = b.addf(a, ov)?;
+                    b.vstore(a, a_sc, &[i0, i0])
+                })
+            };
+            match masked {
+                Some((fl, plane, mrow, msem)) => {
+                    let en = b.load(fl, &[row])?;
+                    let z = b.i32(0);
+                    let off = b.cmpi(ICmp::Eq, en, z)?;
+                    let on = b.cmpi(ICmp::Ne, en, z)?;
+                    b.when(off, |b| walk(b, None))?;
+                    b.when(on, |b| {
+                        // the row's columns from `k0`, one aligned copy
+                        let z = b.i32(0);
+                        let from = b.assume_multiple(k0, 128)?;
+                        let src = b.ref_slice(plane, &[row, from], &[1, held])?;
+                        let sem = b.ref_slice(msem, &[z], &[1])?;
+                        let sem = b.ref_squeeze(sem)?;
+                        b.dma_start(src, mrow, sem)?;
+                        b.dma_wait(sem, src, mrow)?;
+                        walk(b, Some(mrow))
+                    })?;
                 }
-                let a0 = b.vload(a_sc, &[i0, i0], &[dv, QP])?;
-                let cb = b.broadcast(corr, &[dv, QP])?;
-                let a = b.mulf(a0, cb)?;
-                let a = b.addf(a, ov)?;
-                b.vstore(a, a_sc, &[i0, i0])
-            })?;
+                None => walk(b, None)?,
+            }
             // each query head's column off its own kv head's rows
             let o = b.vload(a_sc, &[i0, i0], &[dv, QP])?;
             let m = b.vload(m_sc, &[i0, i0], &[1, QP])?;
@@ -478,6 +582,10 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
 /// The rows' reading: `q` `[r, kvh, g, d]` bf16, row `i` reading positions
 /// `[lo[i], hi[i])` of lane `lane[i]` (whose pages `pt[lane · pages + p]`
 /// name) from the `keys`/`values` planes (`[slots, kvh·d]`, pages of `ps`).
+/// `mask`: each row's custom-mask flag (`[r]` i32, 0 off), the mask plane
+/// (`[r, pitch]` u8, a row's byte at key position `k`) and its bound (keys
+/// at or past it are masked out): a flagged row admits only the keys its
+/// plane row keeps, as the walk does.
 pub(crate) fn attend(
     f: &mut Func,
     q: Val,
@@ -493,6 +601,7 @@ pub(crate) fn attend(
     scale: f64,
     vmem_cap: i64,
     maps: [PageMap; 2],
+    mask: Option<(Val, Val, i64)>,
 ) -> Built<Flashed> {
     let r = f.dims(q)[0];
     let span = pages * ps;
@@ -521,6 +630,8 @@ pub(crate) fn attend(
             _ => return bad("pool planes not both in the pool's row-pair order"),
         },
         maps,
+        // a row's columns copy from `k0 < span`, a buffer's worth
+        mask: mask.map(|_| 2 * span + 128),
     };
     let qh = h.qh();
     let pad_i = |f: &mut Func, x: Val| -> Built<Val> {
@@ -544,15 +655,23 @@ pub(crate) fn attend(
         f.pad(q, z, &[0, 0], &[(rp - r) * qh, 0], &[0, 0])?
     };
     let kern = kernel(&s, vmem_cap)?;
-    let out = match (s.pooled, f.view_parts(keys)) {
+    let mut operands = vec![pt, lane, lo, hi];
+    let mut cols = None;
+    if let (Some((en, plane, bound)), Some(w)) = (mask, s.mask) {
+        operands.push(pad_i(f, en)?);
+        cols = Some(mask_columns(f, plane, bound, rp, w)?);
+    }
+    operands.push(q);
+    match (s.pooled, f.view_parts(keys)) {
         // both planes out of the pool itself
-        (Some(_), Some((pool, _))) => kern.call(f, &[pt, lane, lo, hi, q, pool])?,
+        (Some(_), Some((pool, _))) => operands.push(pool),
         _ => {
-            let keys = f.convert(keys, Elem::Bf16);
-            let values = f.convert(values, Elem::Bf16);
-            kern.call(f, &[pt, lane, lo, hi, q, keys, values])?
+            operands.push(f.convert(keys, Elem::Bf16));
+            operands.push(f.convert(values, Elem::Bf16));
         }
-    };
+    }
+    operands.extend(cols);
+    let out = kern.call(f, &operands)?;
     // `[rp·dv, QP]` as `[r, kvh, g, dv]`
     let o = f.reshape(out[0], &[rp, h.dv, QP])?;
     let o = f.slice_axis(o, 2, 0, qh)?;
@@ -569,6 +688,28 @@ pub(crate) fn attend(
         m: stat(f, out[1])?,
         l: stat(f, out[2])?,
     })
+}
+
+/// A mask plane (`[r, pitch]` u8) as the kernel copies it: `i32 [rp, w]`,
+/// key position `k` at column `k`, zero at and past `min(bound, pitch)`
+/// (masked out, as the walk masks them) and on padded rows.
+pub(crate) fn mask_columns(f: &mut Func, plane: Val, bound: i64, rp: i64, w: i64) -> Built<Val> {
+    let r = f.dims(plane)[0];
+    let pitch = f.dims(plane)[1];
+    let x = f.convert(plane, Elem::I32);
+    let x = if pitch > w {
+        f.slice_axis(x, 1, 0, w)?
+    } else {
+        x
+    };
+    let cols = f.dims(x)[1];
+    let io = f.iota(Elem::I32, &[r, cols], 1);
+    let edge = f.like_i(io, bound.min(pitch));
+    let inb = f.compare(crate::hlo::Cmp::Lt, io, edge)?;
+    let z = f.like_i(x, 0);
+    let x = f.select(inb, x, z)?;
+    let zero = f.const_i(Elem::I32, 0, &[]);
+    f.pad(x, zero, &[0, 0], &[rp - r, w - cols], &[0, 0])
 }
 
 #[cfg(test)]
@@ -594,6 +735,7 @@ mod tests {
             scale: 0.1,
             maps: [PageMap::IDENTITY; 2],
             pooled: None,
+            mask: None,
         };
         let c = kernel(&s, 100 << 20).unwrap();
         assert!(c.module.contains("tpu.enqueue_dma"));
@@ -602,6 +744,38 @@ mod tests {
         if let Some(p) = std::env::var_os("PAGES_DUMP") {
             std::fs::write(p, &c.module).unwrap();
         }
+    }
+
+    /// A fire carrying a custom mask: each row's flag prefetched, the
+    /// column plane an operand, a flagged row's columns copied beside its
+    /// pages and turned onto the sublanes; one chunk walk without them, one
+    /// with.
+    #[test]
+    fn a_masked_row_copies_its_columns() {
+        let h = Heads {
+            kvh: 8,
+            g: 2,
+            d: 128,
+            dv: 128,
+        };
+        let s = Shape {
+            rp: 256,
+            span: 512,
+            ps: 16,
+            table: 256 * 32,
+            pages: 32,
+            slots: 20000 * 16,
+            h,
+            scale: 0.1,
+            maps: [PageMap::IDENTITY; 2],
+            pooled: None,
+            mask: Some(2 * 512 + 128),
+        };
+        let c = kernel(&s, 100 << 20).unwrap();
+        assert!(c.module.contains("scratch_operands = 8 : i64"));
+        assert_eq!(c.operands.len(), 9);
+        assert!(c.module.contains("memref<1x640xi32"));
+        assert_eq!(c.module.matches("tpu.transpose").count(), 1);
     }
 
     /// The keys and values planes' pages by maps of their own: the copies
@@ -628,6 +802,7 @@ mod tests {
             scale: 0.1,
             maps,
             pooled: None,
+            mask: None,
         };
         let plain = kernel(&shape([PageMap::IDENTITY; 2]), 100 << 20).unwrap();
         let mapped = [

@@ -70,6 +70,8 @@ class MemoryConfig:
     engine measures the device and uses all of it."""
     # The most device memory the load takes ("20GiB"), per device.
     budget_device: Optional[str] = None
+    # The kv tokens the device holds exactly (cuda); omit to fill the device.
+    kv_device_tokens: Optional[int] = None
     # Pinned host bytes for suspended kv; omit for every seat at full context.
     budget_host: Optional[str] = None
     # Disk bytes suspended kv spills to below the host (the only tier on metal

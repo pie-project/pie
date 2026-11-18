@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::caps::Capabilities;
 
 pub mod armed;
+pub mod check;
+pub mod rung;
+pub mod top;
+
+pub use rung::{
+    CheckFire, FireEstimate, GemmShape, NoRung, RungFacts, Terms, TopRung, TopWhy, fire_top,
+    model_class, pick, scored, shape_table, top_rung,
+};
+pub use top::{
+    Counts, Kept, Refused, choose, choose_tiled, estimate, line_of, measured_line, rectangle,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
@@ -96,6 +107,14 @@ pub struct Residency {
     /// config key reaches it) fills what `device` leaves.
     #[serde(default)]
     pub device_kv_budget: Option<u64>,
+    /// The tokens the device's kv pages hold, where the operator fixes them
+    /// (`[engine.memory] kv_device_tokens`): the pool holds exactly the
+    /// pages they fill, beside what its other shapes take, and the load is
+    /// refused where the allowance cannot hold that. `None` fills what
+    /// `device` leaves. An engine that cannot size its pool by it refuses
+    /// it.
+    #[serde(default)]
+    pub device_kv_tokens: Option<u64>,
     /// `None`: every seat at full context, and at least one device pool.
     #[serde(default)]
     pub host_kv_budget: Option<u64>,
@@ -153,6 +172,7 @@ impl Residency {
         Residency {
             device: Allowance::WHOLE,
             device_kv_budget: None,
+            device_kv_tokens: None,
             host_kv_budget: None,
             kv_seats: None,
             disk_kv_budget: Some(0),

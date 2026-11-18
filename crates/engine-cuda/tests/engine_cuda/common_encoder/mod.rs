@@ -37,6 +37,9 @@ pub const NAME: &str = "encoder-mini";
 /// attends (a group mask, the ragged kernel's custom arm).
 pub struct EncoderLayer {
     pub biased: bool,
+    /// Unbiased, whether the model states its attention takes a lane's mask
+    /// (`RaggedMask::Stated`) or not (`GroupBlockDiagonal`).
+    pub stated: bool,
 }
 
 impl ForwardHybrid for EncoderLayer {
@@ -81,9 +84,16 @@ impl ForwardHybrid for EncoderLayer {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            table.map_or(RaggedMask::GroupBlockDiagonal, |table| {
-                ops::attn::relative_bias(&table, MAX_LEN)
-            }),
+            table.map_or(
+                if self.stated {
+                    RaggedMask::Stated
+                } else {
+                    RaggedMask::GroupBlockDiagonal
+                },
+                |table| {
+                    ops::attn::relative_bias(&table, MAX_LEN)
+                },
+            ),
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEADS * HEAD_DIM));
@@ -93,12 +103,18 @@ impl ForwardHybrid for EncoderLayer {
 }
 
 pub fn trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer { biased: true }, Platform::Cuda)
+    trace_hybrid(NAME, &EncoderLayer { biased: true, stated: false }, Platform::Cuda)
 }
 
 /// The layer with no bias: its lanes may state group masks.
 pub fn unbiased_trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer { biased: false }, Platform::Cuda)
+    trace_hybrid(NAME, &EncoderLayer { biased: false, stated: true }, Platform::Cuda)
+}
+
+/// The layer with no bias whose attention states no lane's mask: a lane
+/// stating one is refused.
+pub fn unstated_trace() -> Trace {
+    trace_hybrid(NAME, &EncoderLayer { biased: false, stated: false }, Platform::Cuda)
 }
 
 pub fn to_bf16(x: f32) -> u16 {

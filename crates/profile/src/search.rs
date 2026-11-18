@@ -17,10 +17,47 @@ pub const LANES: [usize; 3] = [1, 4, 8];
 /// Tuned decisions as `(decision id, TOML value)`.
 pub type Entries = Vec<(String, String)>;
 
+/// The fires `pie tune` times at each rung width beside the one before
+/// them, which compiles or records: the median is kept.
+pub const FIRE_REPS: usize = 3;
+
+/// The fires a check of the estimate times on every backend: a fire of
+/// each width in `widths` (the rungs its load lays, in tokens), `fire`
+/// timing one in nanoseconds (told whether it is timed: the first a width,
+/// which records, is not); the median of [`FIRE_REPS`] is kept.
+pub fn time_fires(
+    widths: &[u32],
+    mut fire: impl FnMut(u32, bool) -> Result<u64, String>,
+    say: &mut dyn FnMut(&str),
+) -> Result<crate::fire::FireTable, String> {
+    let mut widths = widths.to_vec();
+    widths.sort_unstable();
+    widths.dedup();
+    let mut table = Vec::with_capacity(widths.len());
+    for width in widths {
+        fire(width, false)?;
+        let mut times = (0..FIRE_REPS)
+            .map(|_| fire(width, true))
+            .collect::<Result<Vec<u64>, String>>()?;
+        times.sort_unstable();
+        let ns = times[times.len() / 2].max(1);
+        say(&format!(
+            "  a fire of {width} tokens: {:.2} ms",
+            ns as f64 / 1e6
+        ));
+        table.push((width, ns));
+    }
+    Ok(table)
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
     pub id: &'static str,
     pub text: String,
+    /// The run measured it: compared it on a model that reads it, and
+    /// changed it or kept it under a bar of [`crate::AGREEMENT`] or less. A
+    /// tuned file's `[provenance] measured` lists these alone.
+    pub measured: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +85,14 @@ pub trait Bench {
     /// A fingerprint of the plan model `model` compiles under `file`:
     /// equal fingerprints serve the same. `None` where it cannot say.
     fn plan(&self, model: usize, file: &str) -> Option<u64>;
+    /// Whether [`Bench::plan`] covers every decision, not only the
+    /// plan-only ones (a price, a fusion): its fingerprint is all the
+    /// load would run (XLA's program texts), so a candidate whose
+    /// fingerprint equals today's serves the same whatever its decision,
+    /// and a decision no check model's plan moves is not served at all.
+    fn plan_covers_all(&self) -> bool {
+        false
+    }
 }
 
 /// One decision the search tries.
@@ -530,6 +575,28 @@ fn shown(label: &str) -> String {
 /// file, what each model it moved served, and the mean it must beat.
 type Best = (f64, String, String, Vec<(usize, Serving)>, f64);
 
+/// Of `served`, the lowest candidate within [`crate::AGREEMENT`] of the
+/// fastest: by its value where every tied label reads as a number, else the
+/// first served. `None` where none served.
+fn pick_tied(served: Vec<Best>) -> Option<Best> {
+    let fastest = served.iter().map(|b| b.0).fold(f64::INFINITY, f64::min);
+    let tied: Vec<Best> = served
+        .into_iter()
+        .filter(|b| b.0 <= fastest * (1.0 + crate::AGREEMENT))
+        .collect();
+    let numbers: Option<Vec<f64>> = tied
+        .iter()
+        .map(|b| b.1.trim().parse::<f64>().ok())
+        .collect();
+    match numbers {
+        Some(values) => {
+            let at = (0..tied.len()).min_by(|&a, &b| values[a].total_cmp(&values[b]))?;
+            tied.into_iter().nth(at)
+        }
+        None => tied.into_iter().next(),
+    }
+}
+
 /// Coordinate descent over `knobs` on `bench`'s models: each decision's
 /// candidates are served on the models that read it (or, for a price or
 /// fusion, whose plan it changes), against the incumbent served again just
@@ -565,10 +632,11 @@ pub fn search(
     let mut lines = Vec::new();
     for knob in knobs {
         let mut fresh = vec![false; names.len()];
+        let by_plan = knob.plan_only || bench.plan_covers_all();
         let movable: Vec<usize> = (0..names.len())
             .filter(|&m| {
                 incumbent[m].as_ref().is_some_and(|s| {
-                    (knob.plan_only || s.read.contains(&knob.id))
+                    (by_plan || s.read.contains(&knob.id))
                         && !(refuses(knob.id) && s.refused.is_some())
                 })
             })
@@ -585,12 +653,16 @@ pub fn search(
                 "kept; no check model reads it".to_string()
             };
             say(&format!("{}: {text}", knob.id));
-            lines.push(Line { id: knob.id, text });
+            lines.push(Line {
+                id: knob.id,
+                text,
+                measured: false,
+            });
             continue;
         }
         let plans: Vec<Option<u64>> = (0..names.len())
             .map(|m| {
-                if knob.plan_only {
+                if by_plan {
                     bench.plan(m, &incumbent_text)
                 } else {
                     None
@@ -598,6 +670,8 @@ pub fn search(
             })
             .collect();
         let mut best: Option<Best> = None;
+        // Every candidate that served, as `best` would hold it.
+        let mut served_all: Vec<Best> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         // Each model's drift between two servings of the incumbent.
         let mut noise: Vec<f64> = vec![0.0; names.len()];
@@ -637,9 +711,7 @@ pub fn search(
             let on: Vec<usize> = movable
                 .iter()
                 .copied()
-                .filter(|&m| {
-                    !knob.plan_only || plans[m].is_none() || bench.plan(m, &text) != plans[m]
-                })
+                .filter(|&m| !by_plan || plans[m].is_none() || bench.plan(m, &text) != plans[m])
                 .collect();
             if on.is_empty() {
                 notes.push(format!("plans the same\u{1f}{seen}"));
@@ -666,6 +738,7 @@ pub fn search(
                                 names[m]
                             ));
                             best = None;
+                            served_all.clear();
                             break 'candidate;
                         }
                     };
@@ -720,10 +793,23 @@ pub fn search(
             let n = on.len() as f64;
             let rms = (on.iter().map(|&m| noise[m] * noise[m]).sum::<f64>() / n).sqrt();
             let bar = 1.0 - (2.0 * rms / n.sqrt()).max(0.01);
+            served_all.push((r, label.clone(), text.clone(), got.clone(), bar));
             if best.as_ref().is_none_or(|(b, ..)| r < *b) {
                 best = Some((r, label.clone(), text, got, bar));
             }
         }
+        // Of the candidates within the agreement tolerance of the fastest,
+        // the lowest is taken: a near-tie between two runs of a tune lands
+        // on the same value, and two tunes write the same profile.
+        if best.is_some() {
+            best = pick_tied(served_all);
+        }
+        // A keep says the incumbent holds only where a change had to beat
+        // no more than the agreement tolerance: past it, the run's noise
+        // hid any difference, and nothing was measured.
+        let measured = best
+            .as_ref()
+            .is_some_and(|(r, .., bar)| r < bar || 1.0 - bar <= crate::AGREEMENT);
         let text = match best {
             Some((r, label, text, got, bar)) if r < bar => {
                 chosen = with_entry(&chosen, knob.id, &label);
@@ -774,13 +860,32 @@ pub fn search(
             format!("{text} ({})", notes.join("; "))
         };
         say(&format!("{}: {text}", knob.id));
-        lines.push(Line { id: knob.id, text });
+        lines.push(Line {
+            id: knob.id,
+            text,
+            measured,
+        });
     }
     Ok((chosen, lines))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_near_tie_takes_the_lowest_candidate() {
+        let b = |r: f64, label: &str| (r, label.to_string(), String::new(), Vec::new(), 1.0);
+        // 0.96, 0.97 and 1.00 sit within 5% of the fastest: the lowest value.
+        let got = super::pick_tied(vec![b(1.00, "128"), b(0.97, "64"), b(0.96, "256")]);
+        assert_eq!(got.map(|g| g.1).as_deref(), Some("64"));
+        // A clear winner is taken whatever its value.
+        let got = super::pick_tied(vec![b(1.00, "64"), b(0.90, "256")]);
+        assert_eq!(got.map(|g| g.1).as_deref(), Some("256"));
+        // Labels that are not numbers: the first served of the tied.
+        let got = super::pick_tied(vec![b(0.99, "\"walk\""), b(0.98, "\"flash\"")]);
+        assert_eq!(got.map(|g| g.1).as_deref(), Some("\"walk\""));
+        assert!(super::pick_tied(Vec::new()).is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -867,5 +972,102 @@ mod tests {
             lines[2].text.contains("no check model reads it"),
             "{lines:?}"
         );
+        // Measured: what was compared and changed; not what no model reads.
+        assert!(lines[0].measured && lines[1].measured, "{lines:?}");
+        assert!(!lines[2].measured, "{lines:?}");
+    }
+
+    /// A bench whose every serving is 10% off the last: noise no change
+    /// can beat within the agreement tolerance.
+    struct Noisy(bool);
+
+    impl Bench for Noisy {
+        fn models(&self) -> Vec<String> {
+            vec!["noisy".into()]
+        }
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            Ok(render_overrides(entries))
+        }
+        fn serve(&mut self, _: usize, _: &str) -> Result<Serving, String> {
+            self.0 = !self.0;
+            let t = if self.0 { 100.0 } else { 110.0 };
+            Ok(Serving {
+                prompt: vec![t],
+                steps: vec![vec![t]; 3],
+                readout: vec![1.0, 0.0],
+                read: vec!["kernel.n"],
+                refused: None,
+            })
+        }
+        fn plan(&self, _: usize, _: &str) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_keep_under_noise_past_the_agreement_is_not_measured() {
+        let knobs = vec![Knob {
+            id: "kernel.n",
+            current: "10".into(),
+            candidates: vec![("20".into(), String::new())],
+            halfway: false,
+            plan_only: false,
+        }];
+        let (chosen, lines) =
+            search(&mut Noisy(false), Vec::new(), &knobs, "", &mut |_| {}).unwrap();
+        assert!(chosen.is_empty(), "{lines:?}");
+        assert!(lines[0].text.starts_with("kept"), "{lines:?}");
+        assert!(!lines[0].measured, "{lines:?}");
+    }
+
+    /// A bench whose plan fingerprint covers every decision: `kernel.noop`
+    /// is read by the model but moves nothing it runs, and noise would make
+    /// one of its candidates look faster.
+    struct Planned(usize);
+
+    impl Bench for Planned {
+        fn models(&self) -> Vec<String> {
+            vec!["toy".into()]
+        }
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            Ok(render_overrides(entries))
+        }
+        fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
+            self.0 += 1;
+            // Every other serve is 10% faster, whatever it serves.
+            let t = if self.0 % 2 == 0 { 90.0 } else { 100.0 };
+            let _ = value(file, "noop");
+            Ok(Serving {
+                prompt: vec![t],
+                steps: vec![vec![t]; 3],
+                readout: vec![1.0, 0.0],
+                read: vec!["kernel.noop"],
+                refused: None,
+            })
+        }
+        fn plan(&self, _: usize, _: &str) -> Option<u64> {
+            Some(7)
+        }
+        fn plan_covers_all(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_decision_that_moves_no_plan_is_not_served() {
+        let knobs = vec![Knob {
+            id: "kernel.noop",
+            current: "1".into(),
+            candidates: vec![("2".into(), String::new()), ("3".into(), String::new())],
+            halfway: false,
+            plan_only: false,
+        }];
+        let start = vec![("kernel.noop".to_string(), "1".to_string())];
+        let mut bench = Planned(0);
+        let (chosen, lines) = search(&mut bench, start, &knobs, "", &mut |_| {}).unwrap();
+        assert_eq!(chosen[0].1, "1", "{lines:?}");
+        assert!(lines[0].text.contains("plans the same"), "{lines:?}");
+        // Only the incumbent's first serving: no candidate was served.
+        assert_eq!(bench.0, 1);
     }
 }

@@ -747,8 +747,8 @@ fn the_page_copy_kernel_reads_mapped_planes_tpu_only() {
     let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
     tuning.chunks.decode_pages = 8;
     for (qh, kvh, d, window) in [(16usize, 8usize, 128usize, None), (8, 2, 256, Some(512))] {
-        let want = long_decode_case(qh, kvh, d, window, tuning, IDENTITY);
-        let got = long_decode_case(qh, kvh, d, window, tuning, MAPPED);
+        let want = long_decode_case(qh, kvh, d, window, tuning, IDENTITY, false);
+        let got = long_decode_case(qh, kvh, d, window, tuning, MAPPED, false);
         assert!(
             want.iter()
                 .zip(&got)
@@ -790,7 +790,22 @@ fn long_decode_with(
     window: Option<u32>,
     tuning: kernels_xla::tuning::Tuning,
 ) {
-    long_decode_case(qh, kvh, d, window, tuning, IDENTITY);
+    long_decode_case(qh, kvh, d, window, tuning, IDENTITY, false);
+}
+
+/// Rows under a custom mask through the page-copy kernel: each flagged
+/// row's mask columns ride beside its pages, a causal row (flag 1) and a
+/// wide one (flag 2, to its lane's capacity) admitting only the keys its
+/// mask keeps; the unflagged rows read as before. One program, no run-time
+/// choice of the walk.
+#[test]
+fn a_masked_decode_through_the_page_copy_kernel_answers_the_reference() {
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d) in [(16usize, 8usize, 128usize), (8, 1, 256)] {
+        long_decode_case(qh, kvh, d, None, tuning, IDENTITY, true);
+    }
+    long_decode_case(8, 2, 256, Some(512), tuning, MAPPED, true);
 }
 
 fn long_decode_case(
@@ -800,6 +815,7 @@ fn long_decode_case(
     window: Option<u32>,
     tuning: kernels_xla::tuning::Tuning,
     maps: (PageMap, PageMap),
+    masked: bool,
 ) -> Vec<f32> {
     let mut rng = Rng(5);
     let ps = 16;
@@ -812,8 +828,18 @@ fn long_decode_case(
     let rows: Vec<(i32, i32)> = (0..64)
         .map(|l| (l as i32, (pool.capacity(l) as i32) - 1 - (l as i32 % 5)))
         .collect();
-    let fire = Fire::plain(&rows);
+    let mut fire = Fire::plain(&rows);
     let n = rows.len();
+    if masked {
+        // a mask over every position a lane may hold; rows flagged off,
+        // causal and wide in turn
+        let stride = 80 * ps as u32;
+        fire.stride = stride;
+        fire.mask = (0..n * stride as usize)
+            .map(|i| u8::from((i * 7 + i / 5) % 3 != 0))
+            .collect();
+        fire.enabled = (0..n).map(|r| [0u8, 1, 2][r % 3]).collect();
+    }
     let q = rng.bf16s(n * qh * d, 1.0);
     let scale = 0.125;
     let mut b = Bench::new().with_tuning(tuning);
@@ -1559,7 +1585,17 @@ fn a_tall_wide_prefill_lays_its_kv_in_parts() {
 
 #[test]
 fn a_prefill_reads_the_rows_it_appended_fresh() {
-    prefill_fresh_case(IDENTITY);
+    prefill_fresh_case(IDENTITY, 20);
+}
+
+/// A lane holding 300 positions before the fire (19 pages, past the 16 a
+/// gathered rectangle once held): the flash kernel copies every one of
+/// them page by page and answers the reference, over identity and mapped
+/// planes (the values' pages a list of their own).
+#[test]
+fn a_prefill_reads_an_older_prefix_of_any_length() {
+    prefill_fresh_case(IDENTITY, 300);
+    prefill_fresh_case(MAPPED, 300);
 }
 
 /// The fresh-row read over planes laid by their own page maps: the flash
@@ -1568,19 +1604,121 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
 /// reference as the identity pool does.
 #[test]
 fn a_prefill_reads_its_fresh_rows_over_mapped_planes() {
-    prefill_fresh_case(MAPPED);
+    prefill_fresh_case(MAPPED, 20);
 }
 
-fn prefill_fresh_case(maps: (PageMap, PageMap)) {
-    let mut rng = Rng(31);
+/// Rows under a custom mask through the flash kernel: lane 1 (300 older
+/// positions, its rows causal under the mask) and lane 3 (its rows wide,
+/// flag 2, to its capacity) read every key through their pages, each kept
+/// only where its mask row keeps it; lanes 0 and 2 read as before. One
+/// program, no run-time choice of the walk.
+#[test]
+fn a_masked_prefill_reads_through_the_flash_kernel() {
+    prefill_masked_case(IDENTITY);
+    prefill_masked_case(MAPPED);
+}
+
+fn prefill_masked_case(maps: (PageMap, PageMap)) {
+    let mut rng = Rng(37);
     let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
     let lanes: Vec<Vec<i32>> = vec![
         (0..40).collect(),
-        (40..48).collect(),
+        (40..48).chain(60..90).collect(),
         (48..52).collect(),
         (52..56).collect(),
     ];
-    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40).with_maps(maps);
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 40).with_maps(maps);
+    let runs = [(0, 0, 600), (1, 300, 100), (2, 0, 1), (3, 0, 51)];
+    let mut fire = Fire::plain(&prefill_rows(&runs, 16));
+    let rows = fire.positions.len();
+    let stride = 640u32;
+    fire.stride = stride;
+    fire.mask = (0..rows * stride as usize)
+        .map(|i| u8::from((i * 7 + i / 5) % 3 != 0))
+        .collect();
+    fire.enabled = fire
+        .req
+        .iter()
+        .zip(&fire.positions)
+        .map(|(&l, &p)| if p < 0 { 0 } else { [0u8, 1, 0, 2][l as usize] })
+        .collect();
+    let w = kvh * d;
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let k = rng.bf16s(rows * w, 1.0);
+    let v = rng.bf16s(rows * w, 1.0);
+    let sink = (pool.slots / ps - 1) as i32;
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for (&lane, &kp) in fire.req.iter().zip(&fire.positions) {
+        if kp < 0 {
+            page.push(sink);
+            off.push(0);
+        } else {
+            let slot = pool.slot(lane as usize, kp as usize);
+            page.push((slot / ps) as i32);
+            off.push((slot % ps) as i32);
+        }
+    }
+    let scale = 0.1;
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let plan = fire.prefill(&mut b);
+    let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let kt = b.bf16(rows as u32, w as u32, &k);
+    let vt = b.bf16(rows as u32, w as u32, &v);
+    let pt = b.i32(rows as u32, 1, &page);
+    let ot = b.i32(rows as u32, 1, &off);
+    let o = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
+    if !b
+        .run(|ctx| {
+            let read = low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            assert!(read.is_some(), "a tall append is read fresh");
+            let call = arbiter::prefill(
+                qr, &plan, &kv, None, d as u32, kvh as u32, scale, o, 1000,
+            )?;
+            low::attend_fresh(ctx, call, kv, read)
+        })
+        .unwrap()
+    {
+        return;
+    }
+    for (i, &p) in page.iter().enumerate() {
+        if p != sink {
+            let slot = p as usize * ps + off[i] as usize;
+            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+    }
+    let (want, _) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|r| fire.admitted(&pool, r, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o), &want, qh * d, rows - 16, 2e-3);
+}
+
+/// `shift`: the positions lane 1 holds before the shifted fire.
+fn prefill_fresh_case(maps: (PageMap, PageMap), shift: i32) {
+    let mut rng = Rng(31);
+    let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
+    // lane 1's pages run on past the others' (room for a 300-position
+    // prefix and its 100 rows)
+    let lanes: Vec<Vec<i32>> = vec![
+        (0..40).collect(),
+        (40..48).chain(60..90).collect(),
+        (48..52).collect(),
+        (52..56).collect(),
+    ];
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 40).with_maps(maps);
     let runs = [(0, 0, 600), (1, 0, 100), (2, 0, 1), (3, 0, 51)];
     let fire = Fire::plain(&prefill_rows(&runs, 16));
     let rows = fire.positions.len();
@@ -1607,6 +1745,7 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
     let mut b = Bench::new();
     let kv = pool.bind(&mut b);
     let twin = pool.bind(&mut b);
+    let stray_kv = pool.bind(&mut b);
     let plan = fire.prefill(&mut b);
     let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
     let qr = ragged(&mut b, &runs, qt);
@@ -1616,11 +1755,11 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
     let vt2 = b.bf16(rows as u32, w as u32, &v2);
     let pt = b.i32(rows as u32, 1, &page);
     let ot = b.i32(rows as u32, 1, &off);
-    // The same fire with lane 1 holding 20 positions before it: a walk.
+    // The same fire with lane 1 holding `shift` positions before it.
     let mut shifted = fire.positions.clone();
     for (p, &l) in shifted.iter_mut().zip(&fire.req) {
         if l == 1 && *p >= 0 {
-            *p += 20;
+            *p += shift;
         }
     }
     let old = Fire {
@@ -1644,8 +1783,17 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
     let lse = b.zeros(Dtype::F32, rows as u32, qh as u32);
     let o_old = b.zeros(Dtype::Bf16, rows as u32, wq);
     let o_old_win = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let o_stray = b.zeros(Dtype::Bf16, rows as u32, wq);
     if !b
         .run(|ctx| {
+            // The unshifted fire with lane 1's rows landing `shift` slots
+            // on (a guest's stated write slots): lane 1 reads its keys
+            // through its table, as the walk does, not the rows it handed.
+            let read = low::kv_append(ctx, kt, vt, &stray_kv, pt_old, ot_old)?;
+            let call = arbiter::prefill(
+                qr, &plan, &stray_kv, None, d as u32, kvh as u32, scale, o_stray, 1000,
+            )?;
+            low::attend_fresh(ctx, call, stray_kv, read)?;
             low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
             let read = low::kv_append(ctx, kt2, vt2, &twin, pt, ot)?;
             let call = arbiter::prefill_lse(
@@ -1665,8 +1813,11 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
             )?;
             low::attend_fresh(ctx, call, kv, read)?;
             // The shifted fire appends its rows to the pool itself: its
-            // lane 1 reads 20 older keys there, beside its own rows.
-            let read = low::kv_append(ctx, kt2, vt2, &kv, pt_old, ot_old)?;
+            // lane 1 reads `shift` older keys there, beside its own rows,
+            // read fresh as the twin's append hands them (other keys than
+            // the pool's: a walk would read the pool's).
+            low::kv_append(ctx, kt2, vt2, &kv, pt_old, ot_old)?;
+            let read = low::kv_append(ctx, kt, vt, &twin, pt_old, ot_old)?;
             let call = arbiter::prefill(
                 qr, &plan_old, &kv, None, d as u32, kvh as u32, scale, o_old, 1000,
             )?;
@@ -1695,8 +1846,39 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
         lanes: pool.lanes.clone(),
         ..pool
     };
-    // The device pool holds the first append, then the shifted fire's.
-    for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k2, &v2, &page_old, &off_old)] {
+    // The stray fire's pool: its rows where they landed, read through the
+    // tables at the fire's own positions.
+    let mut strayed = Pool {
+        keys: pool.keys.clone(),
+        values: pool.values.clone(),
+        lanes: pool.lanes.clone(),
+        ..pool
+    };
+    for (i, &p) in page_old.iter().enumerate() {
+        if p != sink {
+            let slot = p as usize * ps + off_old[i] as usize;
+            strayed.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            strayed.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+    }
+    let (want_stray, _) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &strayed.keys,
+        &strayed.values,
+        f64::from(scale),
+        &|r| fire.admitted(&strayed, r, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o_stray), &want_stray, qh * d, live, 2e-3);
+    // The rows read: the first append's, then the shifted fire's as read
+    // fresh.
+    for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k, &v, &page_old, &off_old)] {
         for (i, &p) in pg.iter().enumerate() {
             if p != sink {
                 let slot = p as usize * ps + of[i] as usize;
@@ -1808,6 +1990,7 @@ fn a_mapped_pool_reads_what_the_identity_pool_reads() {
                 window,
                 kernels_xla::tuning::Tuning::DEFAULT,
                 IDENTITY,
+                false,
             )],
             vec![long_decode_case(
                 8,
@@ -1816,6 +1999,7 @@ fn a_mapped_pool_reads_what_the_identity_pool_reads() {
                 window,
                 kernels_xla::tuning::Tuning::DEFAULT,
                 MAPPED,
+                false,
             )],
         );
     }
@@ -1881,6 +2065,128 @@ fn kv_append_lands_rows_at_each_planes_mapped_cells() {
         assert_close(&got_v, &want_v, 0.0, 0.0);
         assert!(clean_k && clean_v, "{n} rows: a row landed outside a page");
     }
+}
+
+/// A prefill's readout rows under a custom mask answer masked: a causal
+/// row (flag 1) and a wide one (flag 2, to its lane's capacity) admit only
+/// the keys their mask rows keep, as the walk admits them. Before the
+/// readout read took the mask, a masked readout row read every key of its
+/// range unmasked (fresh rows and older pages alike): silently wrong.
+#[test]
+fn a_masked_readout_answers_masked() {
+    let mut rng = Rng(41);
+    let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
+    let lanes: Vec<Vec<i32>> = vec![
+        (0..40).collect(),
+        (40..48).collect(),
+        (48..52).collect(),
+        (52..56).collect(),
+    ];
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40);
+    let runs = [(0, 0, 600), (1, 0, 100), (2, 0, 1), (3, 0, 51)];
+    let mut fire = Fire::plain(&prefill_rows(&runs, 16));
+    let rows = fire.positions.len();
+    let readouts: Vec<i32> = vec![599, 699, 700, 751, 699, 699, 699, 699];
+    let r = readouts.len();
+    // The fire's tables carry the masks, a row's mask row and flag: lane 0's
+    // read-out row causal under its mask, lane 1's wide (flag 2), lane 2's
+    // causal (its mask keeps none of its one key), lane 3's unmasked.
+    let stride = 640u32;
+    fire.stride = stride;
+    fire.mask = (0..rows * stride as usize)
+        .map(|i| u8::from((i * 7 + i / 5 + i / 640) % 3 != 0))
+        .collect();
+    for (t, en) in [(599usize, 1u8), (699, 2), (700, 1), (751, 0)] {
+        fire.enabled[t] = en;
+    }
+    // the readout rows' own tables, for the reference
+    let mut out = Fire::plain(
+        &readouts
+            .iter()
+            .map(|&t| (fire.req[t as usize], fire.positions[t as usize]))
+            .collect::<Vec<_>>(),
+    );
+    out.stride = stride;
+    out.mask = readouts
+        .iter()
+        .flat_map(|&t| {
+            let at = t as usize * stride as usize;
+            fire.mask[at..at + stride as usize].to_vec()
+        })
+        .collect();
+    out.enabled = readouts.iter().map(|&t| fire.enabled[t as usize]).collect();
+    let w = kvh * d;
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let k = rng.bf16s(rows * w, 1.0);
+    let v = rng.bf16s(rows * w, 1.0);
+    let sink = (pool.slots / ps - 1) as i32;
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for (&lane, &kp) in fire.req.iter().zip(&fire.positions) {
+        if kp < 0 {
+            page.push(sink);
+            off.push(0);
+        } else {
+            let slot = pool.slot(lane as usize, kp as usize);
+            page.push((slot / ps) as i32);
+            off.push((slot % ps) as i32);
+        }
+    }
+    let qr: Vec<f32> = readouts
+        .iter()
+        .flat_map(|&t| q[t as usize * qh * d..(t as usize + 1) * qh * d].to_vec())
+        .collect();
+    let scale = 0.1;
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let plan = fire.decode(&mut b);
+    let qt = b.bf16(r as u32, (qh * d) as u32, &qr);
+    let kt = b.bf16(rows as u32, w as u32, &k);
+    let vt = b.bf16(rows as u32, w as u32, &v);
+    let pt = b.i32(rows as u32, 1, &page);
+    let ot = b.i32(rows as u32, 1, &off);
+    let at = b.i32(r as u32, 1, &readouts);
+    let o = b.zeros(Dtype::Bf16, r as u32, (qh * d) as u32);
+    if !b
+        .run(|ctx| {
+            let read = low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            assert!(read.is_some(), "a tall append is read fresh");
+            let call = attn::decode(qt, &plan, None, d as u32, scale, o)?;
+            low::attend_readouts(
+                ctx,
+                call,
+                kv,
+                read,
+                at,
+                plan.positions,
+                plan.request_of_token,
+            )
+        })
+        .unwrap()
+    {
+        return;
+    }
+    for (i, &p) in page.iter().enumerate() {
+        if p != sink {
+            let slot = p as usize * ps + off[i] as usize;
+            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+    }
+    let (want, _) = sdpa(
+        &qr,
+        r,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|i| out.admitted(&pool, i, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o), &want, qh * d, r, 2e-3);
 }
 
 #[test]
@@ -2333,7 +2639,8 @@ fn score_capture_lands_the_mean_softmax_rows() {
 /// lane staged before read. Every row's keys are fresh, so the flash kernel
 /// takes it: it reads its fresh rows from a twin pool's append (the walk
 /// would read the pool's), told by what it answers. The plane-of-ones form
-/// still walks the pool, and the two agree with the host to the same
+/// (every row flagged) reads its lanes through their pages in the kernel,
+/// the pool's own append, and the forms agree with the host to the same
 /// tolerance.
 #[test]
 fn a_wide_prefill_reads_its_lanes_keys_without_a_plane() {
@@ -2448,14 +2755,12 @@ fn a_wide_prefill_reads_its_lanes_keys_without_a_plane() {
     // The plane of ones walked the pool, its own append.
     let want = reference(&pool.keys, &pool.values, &k, &v);
     check_rows(&b.read_f32(o_ones), &want, qh * d, live, 2e-3);
-    // The walk with no plane reads what the plane of ones read, bit for bit
-    // (padded rows answer whatever each form leaves in them)
-    let (walk, ones) = (b.read_f32(o_walk), b.read_f32(o_ones));
-    let n = live * qh * d;
-    assert!(
-        (0..n).all(|i| walk[i].to_bits() == ones[i].to_bits()),
-        "the walk without a plane answers the plane of ones' bits"
-    );
+    // The walk with no plane reads what the plane of ones read (through the
+    // kernel, its mask columns gating each key): equal to contract A's
+    // stated bound, the bf16 rounding every attention check here states
+    // (`check_rows`: atol 2e-3, rtol 8e-3; padded rows answer whatever each
+    // form leaves in them).
+    check_rows(&b.read_f32(o_walk), &b.read_f32(o_ones), qh * d, live, 2e-3);
 }
 
 /// `PIE_XLA_MASK_BENCH=1`: a wide prefill's device time, two lanes of 1024

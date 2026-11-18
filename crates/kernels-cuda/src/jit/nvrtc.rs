@@ -510,7 +510,7 @@ mod tests {
                 &[
                     "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
                     "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true>",
-                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 2, 1, 1, 0, 1, true>",
                     "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, true>",
                     "::pie::linear::skinny_skeleton<::pie::linear::Store, 8, 2, 64, 128, 0, 1, 0, 1, false>",
                 ],

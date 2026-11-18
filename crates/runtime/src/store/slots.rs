@@ -55,11 +55,6 @@ pub type ShapeId = u16;
 /// configured.
 pub const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
-/// Copy-on-write fixed sets each running lane holds while it fires: the one
-/// the fire writes before the working set's set is let go. Charged per lane
-/// a fire carries, not per working set.
-pub const COW_SETS_PER_LANE: u32 = 1;
-
 const NONE: u32 = u32::MAX;
 const NO_SHAPE: ShapeId = ShapeId::MAX;
 const WORD: u32 = u64::BITS;
@@ -81,8 +76,8 @@ pub struct SlotShape {
 }
 
 impl SlotShape {
-    /// Slot sets each working set holds of this shape; a running lane holds
-    /// [`COW_SETS_PER_LANE`] more of a fixed one.
+    /// Slot sets each working set holds of this shape; a fork's write takes
+    /// one more of a fixed one from the pool while a sibling still reads it.
     pub fn sets_per_working_set(&self) -> u32 {
         match self.kind {
             ShapeKind::Fixed => FIXED_SETS_PER_WORKING_SET,

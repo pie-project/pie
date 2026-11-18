@@ -528,16 +528,32 @@ impl<B: Backend> Run<'_, B> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                match mask {
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {}
-                    _ => return Err(kernels_slang::Error::Unsupported { op: op.name() }),
-                }
-                let stated = self.group_mask(*q_indptr, *kv_indptr).map(|stated| {
-                    kernels_slang::attn::dense::CustomMask {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
+                let stated = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        Some(kernels_slang::attn::dense::CustomMask {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        })
                     }
-                });
+                    (
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => None,
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_slang::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model \
+                                     states none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
+                    }
+                    (poem_ir::RaggedMask::RelativeBias { .. }, _) => {
+                        return Err(kernels_slang::Error::Unsupported { op: op.name() });
+                    }
+                };
                 kernels_slang::attn::dense::ragged(
                     self.ctx,
                     self.uncut(*q),

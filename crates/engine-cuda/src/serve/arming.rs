@@ -109,14 +109,17 @@ pub(super) struct Arming {
     /// stops arming there.
     capped: bool,
     /// What the device's free memory fell by across each composition's
-    /// fires, less what the pool backed in that window, summed: what the
-    /// captures took, and nothing the pool, serving or the runtime took
-    /// between them. None where free memory cannot be read.
+    /// capturing fire, less what the pool backed in that window, summed:
+    /// what the captures took, and nothing the pool, serving, the runtime
+    /// or a first launch's process-wide loads took around them. None where
+    /// free memory cannot be read.
     took: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
     profiled: usize,
     ballot: Ballot,
+    /// When arming began.
+    began: std::time::Instant,
 }
 
 impl Arming {
@@ -1050,10 +1053,10 @@ impl Shell {
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
-                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB (or the card) arms no \
+                    "engine-cuda: WARNING: the bodies' hold of {} MiB arms no \
                      lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
-                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
-                     bodies_mem or free the card.",
+                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Free \
+                     the card.",
                     self.bodies_mem >> 20,
                     rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
                     need(&buckets) >> 20,
@@ -1067,7 +1070,7 @@ impl Shell {
         }
         if buckets.len() < was.len() {
             eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB (or the card) arms every key at {fine} \
+                "engine-cuda: the bodies' hold of {} MiB arms every key at {fine} \
                  bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
                  {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
                  lattice, {} MiB left).",
@@ -1271,7 +1274,7 @@ impl Shell {
         // maskless one.
         let buffering = self.buffers.is_some();
         let rungs = self.rs_rungs();
-        let group_masked = if self.feeds.ragged.is_empty() {
+        let group_masked = if self.stated_feeds.is_empty() {
             poem_ir::ClassSet::default()
         } else {
             self.group_masked.clone()
@@ -1502,6 +1505,7 @@ impl Shell {
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
+            began: std::time::Instant::now(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1599,13 +1603,21 @@ impl Shell {
         }
         let owned = self.synthetic_lanes_with(&lanes, &media);
         self.armed_body = None;
-        let free_before = crate::device::free_bytes();
-        let backed_before = self.pools.backed_bytes();
+        // What the composition's capture took: the free bytes the device lost
+        // across the fire that captured it (the last one run), less what the
+        // pool backed then. The warm fires before it are walks: a kernel's
+        // first launch there loads what the process keeps for every load
+        // after (code objects, a library's kernels, the runtime's queues),
+        // which no load's bodies hold, so a load's figure counts none of it
+        // and does not depend on which load of the process ran first.
+        let (mut free_before, mut backed_before) = (None, 0);
         let idle = matches!(target, BodySynth::Idle);
         for _ in 0..record::WARM_FIRES {
             if idle {
                 self.at_bucket(bucket);
             }
+            free_before = crate::device::free_bytes();
+            backed_before = self.pools.backed_bytes();
             let fired = self.fire_synthetic(&owned);
             let landed = self.device.synchronize();
             if let Err(why) = fired.and(landed) {
@@ -1626,9 +1638,10 @@ impl Shell {
             }
         }
         self.arm_cold = false;
-        // What the pool backed across the window (a mapped range backs the
-        // activation's holds and segments as the fires first touch them) is
-        // the pool's, not the capture's; a flat range, allocated, backs none.
+        // What the pool backed across the capture's fire (a mapped range
+        // backs the activation's holds and segments as the fires first touch
+        // them) is the pool's, not the capture's; a flat range, allocated,
+        // backs none.
         let pool_grew = self.pools.backed_bytes().saturating_sub(backed_before);
         st.took = st
             .took
@@ -1830,7 +1843,10 @@ impl Shell {
             refusals: stats.tally.refusals,
             seal,
         };
-        eprintln!("engine-cuda: {report}");
+        eprintln!(
+            "engine-cuda: {report}; armed in {:.1} s",
+            st.began.elapsed().as_secs_f64()
+        );
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
@@ -1841,14 +1857,18 @@ impl Shell {
         // The record: written where every rung armed, at what the bodies
         // took and what their captures took; dropped, and said, where a record's
         // allowance armed short of whole.
+        let took = stats.census.bytes as u64;
+        let captured = st.took.unwrap_or(took);
+        if !st.verify {
+            // What this arming took, the allowance a re-arm within the same
+            // load starts from ([`Shell::rearm_bodies`]) and a measuring
+            // load's refit holds: a load with no record to keep (no cache
+            // directory) measures all the same.
+            self.bodies_took = captured.max(took);
+        }
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
         {
-            let took = stats.census.bytes as u64;
-            let captured = st.took.unwrap_or(took);
-            // What this arming took, the allowance a re-arm within the same
-            // load starts from ([`Shell::rearm_bodies`]).
-            self.bodies_took = captured.max(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
@@ -2139,7 +2159,7 @@ impl core::fmt::Display for Armed {
                         spare >> 20
                     ),
                     None if self.belted => "record::MAX_BODIES".to_string(),
-                    None => "[engine] bodies_mem".to_string(),
+                    None => "the bodies' hold".to_string(),
                 },
                 self.never_from,
             )?,

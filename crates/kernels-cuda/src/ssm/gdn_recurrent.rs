@@ -168,7 +168,7 @@ impl Delta {
                     format!("{} rows of value tiles overflow a grid", self.n),
                 )
             })?;
-        let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks);
+        let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
         let blocks = tiles.div_ceil(warps).min(sms * per_sm);
         let entrypoint = if warps == FUSED_WARPS_WIDE {
             "::pie::ssm::gdn_step_fused<8>"
