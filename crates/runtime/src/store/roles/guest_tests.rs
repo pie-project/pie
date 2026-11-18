@@ -1817,3 +1817,38 @@ fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
     park(&roles, 1);
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
+
+/// A frame naming the last instance of a pair is on its way through the
+/// engine when that instance closes: the pair's state (its batch tables,
+/// which every grouped fire of its instances reads) and the instance's own
+/// slots stay out of the free count until the frame lands, then come free.
+/// Given back at the close, the pair's chunks went to another owner under
+/// the fire (Metal's 0xa0, FUSED_GEOMETRY_MISMATCH).
+#[test]
+fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let pair = super::FireKey {
+        program: PROGRAM,
+        extents: BindExtents::default(),
+    };
+    assert!(!roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+    let free = || device.lock().unwrap().pool().free_chunks();
+    let before = free();
+    let named = roles.lock().unwrap().reading([id]);
+    assert!(named.contains(&Owner::Pair(pair)), "the frame names the pair");
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(
+        free(),
+        before,
+        "the pair's chunks, and its instance's, wait on the frame naming them"
+    );
+    roles.lock().unwrap().landed(&named);
+    assert_eq!(
+        free(),
+        before + 3,
+        "as the frame lands: the pair's two chunks, and the one its instance's scratch run lay in"
+    );
+    assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+}

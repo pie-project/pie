@@ -142,6 +142,7 @@ pub(super) fn bind_reader(
             &rings,
             &scratch,
             &pair,
+            0,
         )
         .expect("the reader binds");
     (id, slots, rings)

@@ -243,6 +243,7 @@ pub fn alone_slots(
             .collect(),
         scratch: ScratchPlace::None,
         pair: ScratchPlace::None,
+        pair_generation: 0,
     }
 }
 

@@ -159,3 +159,16 @@ handed out before that fire completes, on every engine, in the fake engine and
 on Metal; (2) if it fails, a per-page release on that page's own fire / copy
 completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
 
+
+## F19. An evacuation's rebase stops at the first instance it cannot place
+
+engine-cuda's `Plane::rebase` (program.rs) re-addresses every bound
+instance after an evacuation, parked ones included, whose `bound.slots`
+still name refs freed at the park. One of those refused by `guest_span`
+ends the loop with `?`: the instances after it, every pair's `base` and
+`stale`, and the channels' rebase are left at their pre-evacuation
+addresses, though the pool's copy has moved the chunks. A parked instance
+should be skipped by name (its restore's rebind places it), and the rest
+re-addressed whatever one instance answers. Not hit in the beam runs (it
+needs an evacuation while a guest is parked); `Plane::rebind` is now
+all-or-nothing and poisons an instance whose rings move only partway.

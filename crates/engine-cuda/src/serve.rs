@@ -880,6 +880,14 @@ impl Shell {
     /// What `program` bound at `extents` holds as state, as the pool lays
     /// it: each instance's lane scratch and its pair's tables
     /// ([`crate::program::Plane::pair_room`]).
+    /// Whether the pair's state is laid again at its next fire
+    /// ([`crate::program::Plane::pair_stale`]). For a test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pair_stale(&self, program: engine::ProgramId, extents: eta_exec::Extents) -> Option<bool> {
+        self.programs.pair_stale(program, extents)
+    }
+
     pub fn guest_state(
         &self,
         program: engine::ProgramId,
