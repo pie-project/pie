@@ -95,6 +95,25 @@ pub struct Shape {
     pub lag: Vec<(u32, u32)>,
     /// Chunks the other PEs may start ahead of the slowest lagging PE (`None`: any).
     pub drift: Option<u64>,
+    /// The row line's rule v13: iq2 rebound right after the last piece on the old colour is
+    /// read (before its weights), a PE of no words too; else at its turn and after the op.
+    pub v13: bool,
+    /// The row line's `XF` and `XB` on queues of their own, bound for good (no rebinding).
+    pub x_queues: bool,
+    /// A GEMM of fewer input words than PEs gives them to the westmost PEs (none of no words
+    /// west of one with), not spread over the row.
+    pub packed: bool,
+}
+
+impl Shape {
+    /// The first of PE `i`'s input words of `k` over the row.
+    fn word0(&self, i: u32, k: u32) -> u32 {
+        if self.packed && k < self.gx {
+            i.min(k)
+        } else {
+            (u64::from(i) * u64::from(k) / u64::from(self.gx)) as u32
+        }
+    }
 }
 
 /// A message: its sender, and what it is (an op's index and a round of it).
@@ -102,6 +121,9 @@ pub struct Shape {
 struct Msg {
     from: (u32, u32),
     tag: (u32, u32, u32),
+    /// (`cap` 0) its multicast and its destination's place on the path, nearest first.
+    cast: u32,
+    pos: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +152,8 @@ pub struct Found {
     pub stranded: Vec<String>,
     /// Ramps held at the end by a colour no queue of the PE is bound to.
     pub held: Vec<String>,
+    /// The most chunks a PE started ahead of the slowest lagging PE.
+    pub lead: u64,
     pub done: bool,
 }
 
@@ -201,15 +225,53 @@ impl Shape {
             }
             Op::RowReduce(_) => self.allred(&mut v, x, y, false, mode, (oi, 2, k)),
             Op::HeadReduce(_) => self.allred(&mut v, x, y, true, mode, (oi, 3, k)),
+            Op::Gemm { k: kw, mask } if self.v13 && mask & self.class_bit(y) != 0 => {
+                let words = |cp: u32| self.word0(cp + 1, kw) > self.word0(cp, kw);
+                let last_f = (0..x).rev().find(|&c| words(c));
+                let last_b = (x + 1..self.gx).rev().find(|&c| words(c));
+                if last_f.is_none() {
+                    v.push(Act::Bind(2, Colour::Xb));
+                }
+                for cp in 0..self.gx {
+                    if cp == x {
+                        if words(cp) {
+                            if x > 0 {
+                                v.push(Act::Send(Colour::Xb, (oi, cp, 0)));
+                            }
+                            if x + 1 < self.gx {
+                                v.push(Act::Send(Colour::Xf, (oi, cp, 0)));
+                            }
+                        }
+                        if last_b.is_none() {
+                            v.push(Act::Bind(2, Colour::Xf));
+                        }
+                        if words(cp) && self.hol {
+                            v.push(Act::Tape);
+                        }
+                        continue;
+                    }
+                    if !words(cp) {
+                        continue;
+                    }
+                    v.push(Act::Recv(2, (cp, y), (oi, cp, 0)));
+                    if Some(cp) == last_f {
+                        v.push(Act::Bind(2, Colour::Xb));
+                    }
+                    if Some(cp) == last_b {
+                        v.push(Act::Bind(2, Colour::Xf));
+                    }
+                    if self.hol {
+                        v.push(Act::Tape);
+                    }
+                }
+            }
             Op::Gemm { k: kw, mask } => {
                 if mask & self.class_bit(y) != 0 {
                     for cp in 0..self.gx {
                         if cp == x {
                             v.push(Act::Bind(2, Colour::Xb));
                         }
-                        let lo =
-                            |i: u32| (u64::from(i) * u64::from(kw) / u64::from(self.gx)) as u32;
-                        if lo(cp + 1) == lo(cp) {
+                        if self.word0(cp + 1, kw) == self.word0(cp, kw) {
                             continue;
                         }
                         if cp == x {
@@ -301,7 +363,7 @@ impl Shape {
     fn dests(&self, x: u32, y: u32, c: Colour) -> Vec<(u32, u32)> {
         match c {
             Colour::Kf => (y + 1..self.rq).map(|r| (x, r)).collect(),
-            Colour::Kb => (0..y).map(|r| (x, r)).collect(),
+            Colour::Kb => (0..y).rev().map(|r| (x, r)).collect(),
             // (a chain hop: the next PE east)
             Colour::A0 | Colour::A1 => {
                 if x + 1 < self.gx {
@@ -310,17 +372,19 @@ impl Shape {
                     Vec::new()
                 }
             }
-            Colour::Rb => (0..x).map(|c| (c, y)).collect(),
+            Colour::Rb => (0..x).rev().map(|c| (c, y)).collect(),
             Colour::Bb => {
                 let lo = (x / self.band) * self.band;
-                (lo..x).map(|c| (c, y)).collect()
+                (lo..x).rev().map(|c| (c, y)).collect()
             }
             Colour::Xf => (x + 1..self.gx).map(|c| (c, y)).collect(),
-            Colour::Xb => (0..x).map(|c| (c, y)).collect(),
+            Colour::Xb => (0..x).rev().map(|c| (c, y)).collect(),
         }
     }
 
-    /// Runs the network; `cap`: messages a PE's colour holds (`None`: unbounded).
+    /// Runs the network; `cap`: messages a PE's colour holds (`None`: unbounded; `Some(0)`: a
+    /// message longer than the fabric's buffers, read by a PE only after the PEs before it on
+    /// its path, its sender done once the nearest has read it).
     #[must_use]
     pub fn run(&self, cap: Option<usize>) -> Found {
         let (gx, rq) = (self.gx as usize, self.rq as usize);
@@ -372,10 +436,15 @@ impl Shape {
             Colour::A0 | Colour::A1 => iq4(pe.x) == c,
             Colour::Rb | Colour::Bb => pe.iq5 == c,
             Colour::Kf | Colour::Kb => pe.iq6 == c,
-            Colour::Xf | Colour::Xb => pe.iq2 == c,
+            Colour::Xf | Colour::Xb => self.x_queues || pe.iq2 == c,
         };
         // PEs waiting for room at a destination: woken when it reads
         let mut waiting_room: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // (`cap` 0: a sender's messages not yet read)
+        let mut unread = vec![0usize; n];
+        // (`cap` 0: each multicast's destinations, which have read it, and the first that has
+        // not: a wavelet reaches a PE only through the ones before it on the path)
+        let mut casts: Vec<(Vec<usize>, Vec<bool>, usize)> = Vec::new();
         let mut rng = self.seed;
         macro_rules! wake {
             ($w:expr) => {{
@@ -413,18 +482,20 @@ impl Shape {
                         pes[p].acts = Vec::new();
                         break;
                     }
-                    if let Some(d) = self.drift
-                        && !lagging[p]
-                        && !lag_ids.is_empty()
-                    {
+                    if !lagging[p] && !lag_ids.is_empty() {
                         let slow = lag_ids
                             .iter()
                             .filter(|&&q| !pes[q].done)
                             .map(|&q| pes[q].started)
                             .min();
-                        if slow.is_some_and(|s| pes[p].started >= s + d) {
+                        if let (Some(d), Some(s)) = (self.drift, slow)
+                            && pes[p].started >= s + d
+                        {
                             parked.push(p);
                             break;
+                        }
+                        if let Some(s) = slow {
+                            found.lead = found.lead.max((pes[p].started + 1).saturating_sub(s));
                         }
                     }
                     let pe = &mut pes[p];
@@ -445,6 +516,9 @@ impl Shape {
                         }
                     }
                     continue;
+                }
+                if unread[p] > 0 {
+                    break;
                 }
                 let a = pes[p].acts[pes[p].at];
                 let (x, y) = (pes[p].x, pes[p].y);
@@ -473,7 +547,7 @@ impl Shape {
                         // in ramp mode) a queue is bound to the colour there (a wavelet to a
                         // ramp with no queue on its colour waits in the router, holding the
                         // multicast)
-                        if let Some(cap) = cap
+                        if let Some(cap) = cap.filter(|&c| c > 0)
                             && let Some(&(dx, dy)) = ds.iter().find(|&&(dx, dy)| {
                                 let d = id(dx, dy);
                                 fifo[d][ci(c)].len() >= cap
@@ -483,15 +557,30 @@ impl Shape {
                             waiting_room[id(dx, dy)].push(p);
                             break;
                         }
-                        for (dx, dy) in ds {
+                        let cast = casts.len() as u32;
+                        if cap == Some(0) {
+                            let ids: Vec<usize> = ds.iter().map(|&(dx, dy)| id(dx, dy)).collect();
+                            let k = ids.len();
+                            casts.push((ids, vec![false; k], 0));
+                        }
+                        for (pos, (dx, dy)) in ds.into_iter().enumerate() {
                             let d = id(dx, dy);
-                            let m = Msg { from: (x, y), tag };
+                            let m = Msg {
+                                from: (x, y),
+                                tag,
+                                cast,
+                                pos: pos as u32,
+                            };
                             if self.hol && (!ramp[d].is_empty() || !bound(&pes[d], c)) {
                                 ramp[d].push_back((c, m));
                             } else {
                                 fifo[d][ci(c)].push_back(m);
                             }
                             wake!(d);
+                        }
+                        if cap == Some(0) && !self.dests(x, y, c).is_empty() {
+                            // (its output queue drained: the nearest PE on the path has it)
+                            unread[p] += 1;
                         }
                     }
                     Act::Tape => {
@@ -501,15 +590,44 @@ impl Shape {
                     }
                     Act::Recv(q, from, tag) => {
                         let c = match q {
+                            2 if self.x_queues => {
+                                if from.0 < x {
+                                    Colour::Xf
+                                } else {
+                                    Colour::Xb
+                                }
+                            }
                             2 => pes[p].iq2,
                             4 => iq4(x),
                             5 => pes[p].iq5,
                             _ => pes[p].iq6,
                         };
-                        let Some(m) = fifo[p][ci(c)].pop_front() else {
+                        let Some(&m) = fifo[p][ci(c)].front() else {
                             break;
                         };
+                        if cap == Some(0) && m.pos as usize > casts[m.cast as usize].2 {
+                            // (not yet through the PEs before it on the path)
+                            break;
+                        }
+                        fifo[p][ci(c)].pop_front();
+                        if cap == Some(0) {
+                            let cs = &mut casts[m.cast as usize];
+                            cs.1[m.pos as usize] = true;
+                            while cs.2 < cs.1.len() && cs.1[cs.2] {
+                                cs.2 += 1;
+                            }
+                            if let Some(&next) = cs.0.get(cs.2) {
+                                wake!(next);
+                            }
+                        }
                         found.messages += 1;
+                        if cap == Some(0) && m.pos == 0 {
+                            let s = id(m.from.0, m.from.1);
+                            unread[s] -= 1;
+                            if unread[s] == 0 {
+                                wake!(s);
+                            }
+                        }
                         if (m.from != from || m.tag != tag) && found.wrong.len() < 20 {
                             found.wrong.push(format!(
                                 "({x}, {y}) on {c:?}: wants {from:?} {tag:?}, takes {:?} {:?}",
@@ -528,7 +646,7 @@ impl Shape {
         for (p, pe) in pes.iter().enumerate() {
             if !pe.done {
                 blocked += 1;
-                if found.blocked.len() < 30 {
+                if found.blocked.len() < 3000 {
                     let what = pe.acts.get(pe.at).map(|a| match *a {
                         Act::Recv(q, from, tag) => {
                             let c = match q {
@@ -544,10 +662,15 @@ impl Shape {
                         Act::Tape => "reads the tape (iq3) behind its held ramp".into(),
                     });
                     found.blocked.push(format!(
-                        "({}, {}) {}",
+                        "({}, {}) {}{}",
                         pe.x,
                         pe.y,
-                        what.unwrap_or_else(|| "?".into())
+                        what.unwrap_or_else(|| "?".into()),
+                        if unread[p] > 0 {
+                            format!(" (its {} sends not yet taken)", unread[p])
+                        } else {
+                            String::new()
+                        }
                     ));
                 }
             }
@@ -597,6 +720,9 @@ mod tests {
             hol: false,
             lag: Vec::new(),
             drift: None,
+            v13: false,
+            x_queues: false,
+            packed: false,
             ops: vec![
                 Op::RowReduce(8),
                 Op::HeadReduce(8),
@@ -657,6 +783,9 @@ mod tests {
             hol: true,
             lag: Vec::new(),
             drift: None,
+            v13: false,
+            x_queues: false,
+            packed: false,
             ops: vec![
                 g(256, 3),
                 g(3072, 3),
@@ -834,6 +963,109 @@ mod tests {
             "attention sweep: {bad} runs not clean of {}",
             2 * lags.len() * 5 * 4
         );
+    }
+
+    /// klein's whole program in ramp mode under a row-line rule, every slow PE set, drift and
+    /// seed: the first run that holds a ramp, if any.
+    fn ramp_free(rule: (bool, bool, bool), sync: bool, caps: &[Option<usize>]) -> Option<String> {
+        let (gx, rq) = (48, 32);
+        let lags: Vec<Vec<(u32, u32)>> = vec![
+            vec![],
+            vec![(2, 0)],
+            vec![(1, 5)],
+            vec![(20, 17)],
+            vec![(47, 31)],
+            (0..gx).map(|x| (x, 9)).collect(),
+            (0..rq).map(|y| (21, y)).collect(),
+            (16..32).map(|x| (x, 3)).collect(),
+        ];
+        for kbm in [8, 16] {
+            for lag in &lags {
+                for drift in [Some(0), Some(1), Some(4), None] {
+                    for seed in [0, 7, 99] {
+                        for &cap in caps {
+                            let mut s = klein(gx, rq, kbm);
+                            (s.v13, s.packed, s.x_queues) = rule;
+                            if sync {
+                                s.ops = s
+                                    .ops
+                                    .iter()
+                                    .flat_map(|&o| match o {
+                                        Op::Gemm { .. } => vec![o, Op::RowReduce(1)],
+                                        _ => vec![o],
+                                    })
+                                    .collect();
+                            }
+                            s.lag = lag.clone();
+                            s.drift = drift;
+                            s.seed = seed;
+                            let f = s.run(cap);
+                            if !(f.done && f.wrong.is_empty() && f.held.is_empty()) {
+                                return Some(format!(
+                                    "kbm {kbm} lag {lag:?} drift {drift:?} seed {seed} cap {cap:?}: held {:?} wrong {:?} blocked {:?}",
+                                    f.held.first(),
+                                    f.wrong.first(),
+                                    f.blocked.iter().take(6).collect::<Vec<_>>()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The row line's rules in ramp mode, on klein's whole program at both `kbm`s, every slow
+    /// PE set, drift and seed, with pieces longer than the fabric's buffers (`cap` 0) and with
+    /// whole pieces buffered (`None`):
+    /// - as built, v13 (iq2 rebound right after the last piece on the old colour is read, a PE
+    ///   of no words too), and v13 with a short GEMM's words on the westmost PEs (`packed`) all
+    ///   hold a ramp: a GEMM's first `XB` (or its next one's first `XF`) can reach a PE before
+    ///   it has left the op before, wherever iq2 is rebound inside the op;
+    /// - a row-wide reduction after each GEMM with `packed` words holds none, v13 or not: no
+    ///   piece of a GEMM leaves before every PE of the row has left the one before, and none
+    ///   waits on an `XB` first;
+    /// - so does the row line on queues of its own, bound for good.
+    #[test]
+    fn row_line_rules_in_ramp_mode() {
+        let both = [Some(0), None];
+        let free = |rule, sync| ramp_free(rule, sync, &both).is_none();
+        assert!(!free((false, false, false), false), "as built");
+        assert!(!free((true, false, false), false), "v13");
+        assert!(!free((true, true, false), false), "v13, packed");
+        assert!(!free((true, false, false), true), "v13, a reduction after");
+        assert!(
+            free((false, true, false), true),
+            "packed, a reduction after"
+        );
+        assert!(
+            free((true, true, false), true),
+            "v13, packed, a reduction after"
+        );
+        assert!(free((false, false, true), false), "own queues");
+    }
+
+    /// The drift the attention allows: a band slow, the others run ahead by every key block
+    /// (its reductions are the band's alone), so the lead grows with the key blocks: twice at
+    /// `kbm` 8 what it is at 16. A row-wide reduction after it bounds it.
+    #[test]
+    fn the_attentions_drift_grows_with_its_key_blocks() {
+        let r = |mask: u8, row: u32, head: u32| Op::Region { mask, row, head };
+        let lead = |kbm: u32| {
+            let mut s = klein(48, 64, kbm);
+            s.ops = vec![r(3, 1, 0), Op::Attend, r(3, 1, 0)];
+            s.lag = (16..32)
+                .flat_map(|x| (0..64).map(move |y| (x, y)))
+                .collect();
+            let f = s.run(None);
+            assert!(f.done, "{f:?}");
+            f.lead
+        };
+        let (a, b) = (lead(8), lead(16));
+        eprintln!("lead in chunks: kbm 8 {a}, kbm 16 {b}");
+        // (the key blocks: 64 / 8 and 64 / 16, plus the reduction before)
+        assert_eq!((a, b), (64 / 8 + 1, 64 / 16 + 1));
     }
 
     /// klein's cuts at full size (c2, c4, c5): `GEMM_FLOW=1 cargo test -- --ignored`.
