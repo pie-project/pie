@@ -34,6 +34,21 @@ pub struct Steer {
     /// tolerance: the host's room is a fact of the platform, not pressure
     /// to yield to.
     ceiling: Option<u64>,
+    /// The ceiling last named in the log, so a reading that barely moves it
+    /// names nothing.
+    noted: Option<u64>,
+    /// The last reading of the host's room failed, so the next failure names
+    /// nothing and the next success names the recovery.
+    unreadable: bool,
+}
+
+/// Whether a ceiling moved enough from the one last named to name again: by
+/// a sixteenth of it or more, or onto the floor or the hard limit.
+const fn moved(noted: u64, ceiling: u64, limits: &Limits) -> bool {
+    if noted == ceiling {
+        return false;
+    }
+    noted.abs_diff(ceiling) >= noted / 16 || ceiling == limits.floor || ceiling == limits.hard_limit
 }
 
 /// What one turn leaves the caller to do.
@@ -63,6 +78,8 @@ impl Steer {
             idled: false,
             room: None,
             ceiling: None,
+            noted: None,
+            unreadable: false,
         }
     }
 
@@ -90,25 +107,65 @@ impl Steer {
     /// or less by what the host is short.
     /// A reading that cannot be taken is named, and holds the pool to its
     /// floor until one can.
+    ///
+    /// Only a change is named: the first ceiling, one that moves by a
+    /// sixteenth or more of the last named, one that reaches the floor or the
+    /// hard limit, and a reading that fails or recovers. A tick that moves
+    /// nothing names nothing.
     fn read_room(&mut self, pool: &impl PoolTarget) {
         let Some(room) = &self.room else {
             return;
         };
         let limits = *self.governor.limits();
-        let ceiling = match room() {
+        let held = pool.held();
+        let (ceiling, read) = match room() {
             Ok(room) => {
-                let ceiling = i128::from(pool.held()) + i128::from(room);
-                u64::try_from(ceiling.max(0)).unwrap_or(u64::MAX)
+                let ceiling = i128::from(held) + i128::from(room);
+                if self.unreadable {
+                    self.unreadable = false;
+                    self.noted = None;
+                    tracing::info!("the host's room reads again");
+                }
+                (
+                    u64::try_from(ceiling.max(0)).unwrap_or(u64::MAX),
+                    Some(room),
+                )
             }
             Err(why) => {
-                tracing::error!(
-                    %why,
-                    "the host's room could not be read: the pool holds to its floor until it can"
-                );
-                0
+                if !self.unreadable {
+                    self.unreadable = true;
+                    tracing::error!(
+                        %why,
+                        "the host's room could not be read: the pool holds to its floor until it can"
+                    );
+                }
+                (0, None)
             }
         };
-        self.ceiling = Some(ceiling.clamp(limits.floor, limits.hard_limit));
+        let ceiling = ceiling.clamp(limits.floor, limits.hard_limit);
+        self.ceiling = Some(ceiling);
+        if self
+            .noted
+            .is_none_or(|noted| moved(noted, ceiling, &limits))
+        {
+            self.noted = Some(ceiling);
+            if let Some(room) = read {
+                tracing::info!(
+                    ceiling_mib = ceiling >> 20,
+                    held_mib = held >> 20,
+                    room_mib = room >> 20,
+                    floor_mib = limits.floor >> 20,
+                    hard_limit_mib = limits.hard_limit >> 20,
+                    "the pool's ceiling follows the host's room"
+                );
+            }
+        }
+    }
+
+    /// The ceiling the log last named.
+    #[must_use]
+    pub const fn ceiling_noted(&self) -> Option<u64> {
+        self.noted
     }
 
     #[must_use]
@@ -395,6 +452,46 @@ mod tests {
         }
         assert_eq!(steer.ceiling(), Some(1000 * MIB));
         assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn the_log_names_a_ceiling_only_when_it_moves() {
+        let host = Host::new(900);
+        let mut pool = Pool::on(&host, 600, ELASTIC);
+        let mut steer =
+            Steer::new(&pool, BALANCED, 512 * MIB).with_room(&pool, Some(host.reader()));
+        tick(&mut steer, &mut pool);
+        let first = steer.ceiling_noted().expect("the first ceiling is named");
+        // A few MiB of drift moves the ceiling but names nothing.
+        host.others.store(10, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_ne!(steer.ceiling(), Some(first));
+        assert_eq!(steer.ceiling_noted(), Some(first));
+        // An app taking 500 MiB is named, and so is its going.
+        host.others.store(500, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling_noted(), steer.ceiling());
+        let low = steer.ceiling_noted();
+        host.others.store(0, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_ne!(steer.ceiling_noted(), low);
+        assert_eq!(steer.ceiling_noted(), steer.ceiling());
+    }
+
+    #[test]
+    fn a_ceiling_onto_the_floor_or_limit_is_named() {
+        let limits = Limits {
+            floor: 100,
+            hard_limit: 1000,
+            step: 10,
+            shrink_step: 10,
+            segment_bytes: 1,
+        };
+        assert!(!moved(500, 500, &limits));
+        assert!(!moved(500, 510, &limits));
+        assert!(moved(500, 540, &limits));
+        assert!(moved(101, 100, &limits));
+        assert!(moved(999, 1000, &limits));
     }
 
     #[test]
