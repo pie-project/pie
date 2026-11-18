@@ -429,13 +429,19 @@ fn stream(args: &[String]) -> Result<(), String> {
                         Some((bounds.w, bounds.h)),
                     )?
                 }
-                _ => kernels_cerebras::stream::tiled::program(
+                // (`--stages N`: its first N ops alone, the last's value read out: a part of the
+                // reading on the simulator)
+                _ => kernels_cerebras::stream::tiled::program_upto(
                     &trace,
                     &reading,
                     clip,
                     !ieee,
                     tile,
                     Some((bounds.w, bounds.h)),
+                    get("--stages")
+                        .map(|s| s.parse::<usize>())
+                        .transpose()
+                        .map_err(|e| format!("--stages: {e}"))?,
                 )?,
             };
             let c = kernels_cerebras::cost::tiled::time(&p);
