@@ -486,6 +486,35 @@ fn the_text_rows_feed_the_denoise_loop() {
     assert!(rel <= 2e-2 && cos >= 0.999, "rel L2 {rel}, cosine {cos}");
 }
 
+/// The text's own rows (16) as the denoise loop's context lane, the programs compiled at 64 rows a
+/// class: the engine pads the lane to its class (zero rows past the text's, as the guest would),
+/// and the loop lands on the host's own loop over the text rows padded so, bit for bit.
+#[test]
+fn a_short_context_lane_pads_to_its_class() {
+    if rows() != 64 {
+        eprintln!(
+            "the programs' classes are 64 rows here: READING_ROWS=64 (the default) runs this"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("a scratch directory");
+    let (cache, ckpt) = (tmp.path().join("cache"), tmp.path().join("ckpt"));
+    common::checkpoint(&common::trace(), &ckpt);
+    let mut engine = engine_at(&cache, Some("host"));
+    let caps = load(&mut engine, &ckpt);
+    let ctx = text_pass(&mut engine, &PROMPT);
+    assert_eq!(ctx.len(), PROMPT.len() * HIDDEN, "the text pass's own rows");
+    let ran = common::guest::loop_on_rows(&mut engine, &caps, 2, &ctx, PROMPT.len() as u32);
+    let want = host_loop(2, &host_text(&PROMPT));
+    for (i, (got, want)) in ran.latents.iter().zip(&want).enumerate() {
+        assert_eq!(
+            got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "the latent after step {i}"
+        );
+    }
+}
+
 /// diffusers' decode of the pipeline's latent above (`mk_tiny_flux2_pipe.py --vae`): 64 x 64
 /// pixels, in [-1, 1].
 const VAE_GOLDEN: &[u8] = include_bytes!("flux_2_mini_vae16_pixels.f32");

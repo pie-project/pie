@@ -318,8 +318,10 @@ impl CerebrasEngine {
                 (0..a.lanes.max(1)).map(move |k| (a.lane as usize + k as usize, a.instance))
             })
             .collect();
-        // each request's step: its lanes, tokens and inputs (a lane's own rows: a causal
-        // reading's lane may bring fewer, the rest padding)
+        // each request's step: its lanes, tokens and inputs (a lane's own rows: a lane may bring
+        // fewer than its class's, the rest padding: a causal reading's its last token again, the
+        // rows past them unread; another's zero rows of its row inputs, as a guest pads a lane to
+        // its input's rows; the outputs its own rows alone)
         let mut owned: Vec<Owned> = Vec::with_capacity(requests.len());
         let mut lanes: Vec<StreamLane> = Vec::with_capacity(step.lanes.len());
         let mut own: Vec<usize> = Vec::with_capacity(step.lanes.len());
@@ -328,11 +330,19 @@ impl CerebrasEngine {
             let mut tokens: Vec<u32> = Vec::new();
             for (at, lane) in step.lanes[range.clone()].iter().enumerate() {
                 let (at, class) = (range.start + at, &classes[at]);
-                let short = reading.causal && lane.tokens.len() < class.rows as usize;
+                // (a grid reading's rows, and a lane's clip's, are its voxels: never short)
+                let short = lane.tokens.len() < class.rows as usize
+                    && !reading.host_only
+                    && reading.clip.is_none()
+                    && (reading.causal || clips.get(&at).is_none_or(Vec::is_empty));
                 own.push(lane.tokens.len());
                 tokens.extend_from_slice(&lane.tokens);
                 if short {
-                    let pad = lane.tokens.last().copied().unwrap_or(0);
+                    let pad = if reading.causal {
+                        lane.tokens.last().copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     tokens.resize(tokens.len() + class.rows as usize - lane.tokens.len(), pad);
                 }
                 // (a grid reading's rows are its clip's voxels: its lane's tokens are none of them)
@@ -413,9 +423,14 @@ impl CerebrasEngine {
                             return Err(invalid(format!("input {}: a boolean cell", feed.id)));
                         }
                     };
+                    // (a short lane's row inputs its own rows, zero rows after them)
                     let (len, off, rows) = match axis {
                         InputAxis::Lane => (classes.len() * width, k * width, 1),
-                        InputAxis::Row => (n_rows * width, row0 * width, rlanes[k].rows),
+                        InputAxis::Row => (
+                            n_rows * width,
+                            row0 * width,
+                            rlanes[k].rows.min(own[own.len() - rlanes.len() + k]),
+                        ),
                         InputAxis::Voxel => {
                             let [t, h, w] = rlanes[k].clip.unwrap_or([0; 3]);
                             (n_voxels * width, vox0 * width, (t * h * w) as usize)

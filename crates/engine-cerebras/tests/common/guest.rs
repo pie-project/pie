@@ -119,6 +119,18 @@ pub fn loop_on(
     steps: u32,
     context: &[f32],
 ) -> Ran {
+    loop_on_rows(engine, caps, steps, context, rows() as u32)
+}
+
+/// [`loop_on`] with the context lane of `context_rows` rows (the text's own, which an inferlet
+/// that does not pad its lane sends: fewer than the program's class).
+pub fn loop_on_rows(
+    engine: &mut engine_cerebras::CerebrasEngine,
+    caps: &Capabilities,
+    steps: u32,
+    context: &[f32],
+    context_rows: u32,
+) -> Ran {
     let trace = trace();
     let image_rows = grid()[1] * grid()[2] / 4;
     // the guest: the poem's schedule as the runtime states it to an inferlet
@@ -230,7 +242,7 @@ pub fn loop_on(
     let mut latents = Vec::new();
     for _ in 0..d.steps() {
         let frame = FrameSubmission::of(Step {
-            lanes: vec![lane("context", rows() as u32), lane("latents", image_rows)],
+            lanes: vec![lane("context", context_rows), lane("latents", image_rows)],
             attachments: vec![Attachment {
                 lane: 0,
                 lanes: 2,
