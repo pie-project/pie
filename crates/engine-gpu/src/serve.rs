@@ -80,6 +80,11 @@ pub trait Serve: Backend {
     /// of a ring lies on the host.
     const CHANNEL_CELLS: bool;
 
+    /// Whether the backend's fires are walks that fire nothing, a naming
+    /// load's (`named::Named`): a fire of a capturing class then lays its
+    /// score rows nowhere a kernel runs, and asks no pair's room for them.
+    const NAMES: bool = false;
+
     /// The target the backend's kernels are instantiated for.
     const TARGET: kernels_slang::Target;
 
@@ -4121,6 +4126,13 @@ impl<B: Serve> Shell<B> {
             .filter(|&(lane, _)| scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some())
             .find_map(|(_, row)| lanes[row.source as usize].scores)
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
+        // A naming walk fires nothing: its capturing classes' rows bind the
+        // span's buffer, which no kernel writes.
+        let named = match (room, B::NAMES) {
+            (None, true) => Some(self.span.buffer()?),
+            _ => None,
+        };
+        let room = room.or(named.map(|buffer| (buffer, 0, u64::MAX)));
         let slots = self.span.slots(&self.handles, rung, fire_rows, scored, room)?;
         self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(
