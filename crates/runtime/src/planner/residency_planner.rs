@@ -1266,6 +1266,23 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// Whether a process's demand waits for room: a kv allocation, a
+    /// restore or a guest bind, unmet. A rise is ordered among them by its
+    /// own key and is not counted: it is what the room it waits on goes to
+    /// in turn, not what a rung walk gives room back for.
+    #[must_use]
+    pub fn demand_waits(&self) -> bool {
+        self.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.is_unmet()
+                    && !matches!(
+                        waiter.kind,
+                        super::wait::WaitKind::Allocation { rise: true, .. }
+                    )
+            })
+        })
+    }
+
     pub fn pages_freed(self: &Arc<Self>) {
         self.port.freed();
         // A set let go or a segment backed: admission reads its seats again.

@@ -24,6 +24,7 @@ fn allocation(demand: Demand) -> WaitKind {
         notify: Arc::new(Notify::new()),
         outcome: None,
         yielded: false,
+        rise: false,
     }
 }
 
@@ -362,6 +363,51 @@ fn dry_pool_two_asks(planner: &ResidencyPlanner) -> Vec<EntryKey> {
             })
             .collect()
     })
+}
+
+/// A rise asks for every free page beside the chunks it lacks, and gives
+/// them back at once: past the pool's kv total (the lent span in none of
+/// it), it is no hog, where the same ask of kv is.
+#[test]
+fn a_rise_past_the_kv_total_is_no_hog() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(4))));
+    let (kv, rise) = planner.with_inner(|inner| {
+        let mut park = |rise: bool| {
+            let pid = ProcessId::new_v4();
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+            let WaitKind::Allocation {
+                demand,
+                notify,
+                outcome,
+                yielded,
+                ..
+            } = allocation(Demand {
+                kv_pages: 8,
+                rs: RsUnits::default(),
+            })
+            else {
+                unreachable!()
+            };
+            let key = inner.enqueue(
+                pid,
+                WaitKind::Allocation {
+                    demand,
+                    notify,
+                    outcome,
+                    yielded,
+                    rise,
+                },
+            );
+            (key, pid)
+        };
+        (park(false), park(true))
+    });
+    assert!(!planner.check_hog(rise.0, rise.1), "a rise is no hog");
+    assert!(planner.check_hog(kv.0, kv.1), "the same ask of kv is");
 }
 
 fn unfailed(planner: &ResidencyPlanner, keys: &[EntryKey]) -> usize {
