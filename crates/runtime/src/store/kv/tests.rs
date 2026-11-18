@@ -91,6 +91,7 @@ fn tests_every_case() {
     a_demote_leaves_what_a_higher_key_covers();
     keyed_pressure_demotes_a_higher_set_when_no_lower_one_can_free();
     a_demand_demotes_no_cache_keyed_above_its_own();
+    on_the_host_the_lower_set_goes_first();
     floor_keyed_idle_cache_is_dropped_not_demoted();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -500,7 +501,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let ws = store.create_working_set();
     let before = commit_fresh(&mut store, ws, 3, 1);
     let sets = HashSet::from([ws]);
-    let Some(txn) = store.prepare_suspend(&sets).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&sets, |_| 0).unwrap() else {
         panic!("three private resident pages suspend");
     };
     let tiers: Vec<_> = txn
@@ -546,7 +547,7 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     commit_fresh(&mut store, c, 1, 1);
     assert_eq!(store.available_pages(), 2);
     let suspend = |store: &mut KvStore, ws| {
-        let Some(txn) = store.prepare_suspend(&HashSet::from([ws])).unwrap() else {
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), |_| 0).unwrap() else {
             panic!("a suspend with pages to move");
         };
         store.commit_suspend(txn).unwrap()
@@ -590,12 +591,12 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     store.retire_idle();
     assert!(
         store
-            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX, |_| 0)
             .unwrap()
             .is_none()
     );
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, |_| 0)
         .unwrap()
         .unwrap();
     let mut granted = store.reserve_device_pages(4).unwrap();
@@ -620,7 +621,7 @@ fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     let w = store.create_working_set();
     sealed(&mut store, w, &tokens);
     store.keep_checkpoint(w, 3, Some(ProcessId::from_u128(1)));
-    let suspend = |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws])) {
+    let suspend = |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws]), |_| 0) {
         Ok(Some(txn)) => store.commit_suspend(txn).unwrap(),
         other => panic!("a suspend with room: {other:?}"),
     };
@@ -646,7 +647,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
     let quote = |store: &KvStore| store.reclaim_quotes(&[HashSet::from([b])], u32::MAX);
     // B runs beside A: only its own page goes.
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([a])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([a]), |_| 0).unwrap() else {
         panic!("A has its own page to move");
     };
     assert_eq!(store.commit_suspend(txn).unwrap(), 1);
@@ -658,7 +659,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
         .prepare_restore(&HashSet::from([a]), &mut granted)
         .unwrap();
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([b])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([b]), |_| 0).unwrap() else {
         panic!("B's own page still goes");
     };
     assert_eq!(txn.page_count(), 1);
@@ -681,7 +682,7 @@ fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     store.mark_suspended(&HashSet::from([a, b]));
     let page = u64::from(store.page_size.max(1));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1, |_| 0)
         .unwrap()
         .expect("something to move");
     assert_eq!(sweep.page_count(), 1, "no more than was wanted");
@@ -702,7 +703,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // Suspended with nothing moved, as a kv-less eviction leaves them.
     store.mark_suspended(&HashSet::from([a, b]));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX, |_| 0)
         .unwrap()
         .expect("room for two pages");
     assert_eq!(sweep.page_count(), 2);
@@ -720,7 +721,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // It runs: the next sweep leaves it alone.
     assert!(
         store
-            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, |_| 0)
             .unwrap()
             .is_none()
     );
@@ -1152,7 +1153,7 @@ fn a_suspend_short_of_host_room_drops_host_cache_first() {
     assert_eq!(store.host_swap_available(), 0);
     let running = store.create_working_set();
     commit_fresh(&mut store, running, 2, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([running])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([running]), |_| 0).unwrap() else {
         panic!("two pages to move");
     };
     use ::engine::transfer::MemoryDomain::HostPinned;
@@ -1277,6 +1278,44 @@ fn a_demand_demotes_no_cache_keyed_above_its_own() {
         .expect("a demand keyed alike takes it");
     assert_eq!(txn.page_count(), 4);
     store.commit_suspend(txn).unwrap();
+}
+
+/// Conform's "on the host, the lower one is gone": A kept at 20 and B at
+/// 10, both demoted to a full host; a suspend short of host room drops B,
+/// the lower, and keeps A there, only as much as it needs.
+fn on_the_host_the_lower_set_goes_first() {
+    let mut store = KvStore::new_with_swap(16, 8, 0, h(43));
+    store.set_page_size(16);
+    let (a, b) = (ProcessId::from_u128(53), ProcessId::from_u128(54));
+    let (a_tokens, b_tokens) = (prompt(25, 4), prompt(26, 4));
+    sealed_and_gone(&mut store, &a_tokens, a);
+    sealed_and_gone(&mut store, &b_tokens, b);
+    let keys = Steps {
+        entries: vec![(a, None, 20), (b, None, 10)],
+    };
+    for _ in 0..2 {
+        let txn = store
+            .prepare_demote(16, keys.clone(), None)
+            .unwrap()
+            .expect("a set to the host");
+        store.commit_suspend(txn).unwrap();
+    }
+    assert_eq!(store.host_swap_available(), 0, "both on the host");
+    let running = store.create_working_set();
+    commit_fresh(&mut store, running, 4, 1);
+    let txn = store
+        .prepare_suspend(&HashSet::from([running]), keys)
+        .unwrap()
+        .expect("four pages to park");
+    store.commit_suspend(txn).unwrap();
+    let below = |store: &mut KvStore, tokens: &[u32]| {
+        let probe = store.create_working_set();
+        let found = keys_ahead(store, probe, 0, tokens);
+        store.release_working_set(probe, store.current_epoch());
+        store.cached_run_any_tier(&found).len()
+    };
+    assert_eq!(below(&mut store, &b_tokens), 0, "the lower one is gone");
+    assert_eq!(below(&mut store, &a_tokens), 4, "the higher one stays on the host");
 }
 
 /// Idle cache no policy keys above the floor is not copied down a tier
@@ -1429,7 +1468,7 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
         4,
         "the orphan's and the short page's slots are free again"
     );
-    store.drop_entries_off_device();
+    store.drop_entries_off_device(usize::MAX, &|_: Option<ProcessId>| 0);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
         3,
@@ -1719,7 +1758,7 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     s.set_parked(b, true);
 
     let txn = s
-        .prepare_suspend(&HashSet::from([a]))
+        .prepare_suspend(&HashSet::from([a]), |_| 0)
         .unwrap()
         .expect("no running reader keeps them");
     assert_eq!(s.commit_suspend(txn).unwrap(), 3);
