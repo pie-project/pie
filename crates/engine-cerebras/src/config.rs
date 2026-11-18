@@ -67,8 +67,7 @@ pub struct Wafer {
     pub stream_rows: Option<u32>,
     /// The annealing placer's moves a block after the search for a stream or unit program
     /// (kernels-cerebras `place::anneal`: the K / V columns placed by the link term; the run's
-    /// budget that times the program's blocks, deterministic; 0 off). Unless stated: a decode
-    /// unit program's `place::anneal::UNIT_PER_BLOCK`, a stream reading's off.
+    /// budget that times the program's blocks, deterministic): off unless stated.
     pub anneal: Option<u64>,
 }
 

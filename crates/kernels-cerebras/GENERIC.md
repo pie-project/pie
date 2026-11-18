@@ -3609,10 +3609,10 @@ points, never process state: `stream::Options::anneal`, and `compile_decode`'s `
 - `[cerebras.wafer] anneal = <moves a block>` for compile on load (`prepare.rs` sets it on
   each wanted reading's `Options`, and on the unit program kept; its sizing compiles run off).
 
-**Defaults.** A decode-unit program is annealed unless asked otherwise (`Anneal::unit`:
-`UNIT_PER_BLOCK` = 2,000 moves a block, seed 1, K / V columns only; `--anneal 0` or
-`anneal = 0` turns it off). 1556 was the A/B on the chip that turned it on (below). Stream
-readings and the decode templates stay off. Off, a program is the search's byte for byte:
+**Defaults.** Off everywhere. 1556's A/B turned it on for decode-unit programs (a192b6aeb);
+1560 put that win on the fabric's height, which `Stream::of` now cuts itself, with the K / V
+placement within noise (below), so it is off again: the feature, `--anneal` and `anneal =`
+stay. Off, a program is the search's byte for byte:
 `stream::write_stream` and `compile_decode` call `anneal::maybe`, which returns nothing.
 
 - **State:** every block's origin over `place::stream::problem`'s blocks. The K / V columns
@@ -3751,7 +3751,7 @@ token-exact (16 / 16 against the golden):
 | 28 layers, off | 700 x 898 | 374,743 | 19,439 | 2.80-3.11M | 21 ms |
 | 28 layers, annealed | 700 x 707 | 374,743 | 8,361 | 1.42-1.50M | 17 ms |
 
-So the annealer is the default for decode-unit programs now (`Anneal::unit`, above). The
+So the annealer was made the default for decode-unit programs (since turned off again, 1560). The
 cost model misses two things:
 - **The level.** The full program costs 7.9x its price off and 3.9x annealed. A layer costs
   ~108k cycles off and ~51k annealed, against ~13.3k priced (6.1k early + 7.2k late).
