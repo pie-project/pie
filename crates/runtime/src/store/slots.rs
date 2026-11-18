@@ -1819,13 +1819,13 @@ impl SlotPool {
         }
     }
 
-    /// Slots let go and waiting on a fire.
     /// What the pool tells as room comes free ([`RoomGiven`]).
     #[must_use]
     pub fn room_given(&self) -> std::sync::Arc<RoomGiven> {
         std::sync::Arc::clone(&self.given)
     }
 
+    /// Slots let go and waiting on a fire.
     pub fn pending_slots(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
     }

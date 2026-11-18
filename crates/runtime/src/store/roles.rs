@@ -1519,18 +1519,23 @@ impl Roles {
     }
 
     /// Notes that a fire at `epoch` names instance `id`: its tables and
-    /// own rings, the channels it is bound to and the adapter it lands,
-    /// where they lie on the device. Once let go, each slot is handed out
+    /// own rings, its guest scratch, the channels it is bound to, the
+    /// adapter it lands and its pair's state, where they lie on the device. Once let go, each slot is handed out
     /// again only after that epoch retires.
     pub fn touch(&self, id: InstanceId, epoch: u64) {
         let Some(item) = self.items.get(&Owner::Instance(id)) else {
             return;
         };
+        // Its pair's state too: its batch tables and lane table, which a
+        // grouped fire of its reads. Let go at the pair's last close while
+        // that fire is in flight, they waited on nothing, and a chunk
+        // reused under the fire fed it foreign layout words.
         let shared = item
             .channels
             .iter()
             .map(|&channel| Owner::Channel(channel))
             .chain(item.adapter.map(Owner::Adapter))
+            .chain(item.pair.map(Owner::Pair))
             .filter_map(|owner| self.items.get(&owner));
         let mut pool = self.device.lock().unwrap();
         for item in std::iter::once(item).chain(shared) {

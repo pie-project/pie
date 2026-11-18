@@ -1794,3 +1794,33 @@ async fn a_guest_bind_waiting_for_fenced_room_binds_as_the_fire_retires() {
     );
     assert!(roles.lock().unwrap().guest_queue().is_empty());
 }
+
+/// A fire at epoch 5 names the last instance of a pair, which closes while
+/// the fire is in flight: the pair's state (its batch tables, read by the
+/// fire) waits on that fire as the instance's own slots do, coming free
+/// only as it retires. Untouched, its chunks came free at the close and
+/// could be handed out under the fire.
+#[test]
+fn a_pair_s_state_waits_on_the_fires_of_its_instances() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let pair = super::FireKey {
+        program: PROGRAM,
+        extents: BindExtents::default(),
+    };
+    assert!(!roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+    let free = || device.lock().unwrap().pool().free_chunks();
+    let before = free();
+    roles.lock().unwrap().touch(id, 5);
+    roles.lock().unwrap().close_instance(id);
+    assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty(), "the pair is closed");
+    // Untouched, the pair's two chunks came free here, under the fire.
+    assert_eq!(free(), before, "the pair's chunks wait on the fire naming it");
+    device.lock().unwrap().pool_mut().retire_through(5);
+    assert_eq!(
+        free(),
+        before + 3,
+        "as the fire retires: the pair's two chunks, and the one its instance's scratch run lay in"
+    );
+}
