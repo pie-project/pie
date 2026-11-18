@@ -81,6 +81,20 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = rs;
         0
     }
+    /// Whether `pieces` free runs of `run` adjacent chunks stand for a
+    /// guest's state now: what a bind short of room waits on
+    /// ([`super::wait::WaitKind::BindRoom`]). None where the pool keeps
+    /// no guest state.
+    fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
+        let _ = (run, pieces);
+        false
+    }
+    /// The device pages that, moved out whole, free `chunks` chunks for a
+    /// guest's state, as [`Self::rs_as_pages`] for state.
+    fn chunks_as_pages(&self, chunks: u32) -> u32 {
+        let _ = chunks;
+        0
+    }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
     /// state. `None` where the kv pages are a pool of their own.
@@ -240,6 +254,21 @@ impl PoolPort for RegistryPool {
 
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         self.with_rs(|rs| (rs.host_available(), rs.host_capacity()))
+    }
+
+    fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| shared.lock().unwrap().pool().free_chunk_runs(run) >= pieces)
+    }
+
+    fn chunks_as_pages(&self, chunks: u32) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(0, |shared| {
+                let slots = shared.lock().unwrap().list_slots_for_chunks(chunks);
+                u32::try_from(slots).unwrap_or(u32::MAX)
+            })
     }
 
     fn rs_as_pages(&self, rs: RsUnits) -> u32 {

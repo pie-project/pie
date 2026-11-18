@@ -755,6 +755,13 @@ impl Engine for Xla {
     /// A registered channel an instance may carry or feed on the device
     /// keeps its ring in the pool's `Channel` slots, the rows every instance
     /// bound to it reads; one only the host reads or writes takes none.
+    /// Every registration: its ring on the host, mirrored where the host
+    /// reads or writes it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

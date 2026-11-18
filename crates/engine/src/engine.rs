@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
@@ -244,6 +244,19 @@ pub trait Engine: Send {
         Ok(FireFacts::default())
     }
 
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]), held while bound, and told to
+    /// the engine in the binding ([`InstanceBinding::scratch`],
+    /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
+    /// at every bind, on the lane, before it is sent. The default states
+    /// none: an engine that lays its guests' scratch in the fire's span
+    /// ([`Self::fire_facts`]) states it there until it moves it here.
+    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
+        let _ = (program, extents);
+        Ok(GuestState::default())
+    }
+
     /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
     /// row beside the model's activation, or none where they land inside
     /// the span already, and the rows a fixed store holds, if any. Asked
@@ -270,6 +283,20 @@ pub trait Engine: Send {
     fn standing_after(&self, binding: &InstanceBinding) -> Result<u64> {
         let _ = binding;
         Ok(0)
+    }
+
+    /// Whether [`Engine::register_channel`] takes `registration`: the
+    /// engine then holds the channel's ring (in its `Channel` slots, or
+    /// itself, as a host mirror), and an instance bound on the channel
+    /// reads that ring. `false` where it answers `Unsupported`: the runtime
+    /// keeps the channel alone, and each instance holds its own ring in
+    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
+    /// registration, asked before anything of a bind is taken, so a bind
+    /// that registers a channel takes its instance's rings by it. The
+    /// default holds none, as the default `register_channel` takes none.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        false
     }
 
     /// The `Channel` slots a registered channel's ring takes, asked before
