@@ -63,6 +63,14 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
 }
 
+/// `pid` waits on something the frame's firing would free: no frame on
+/// `engine` waits on its lanes until its next submit.
+pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::OwnerWaits(pid));
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -283,6 +291,10 @@ enum SchedulerItem {
     AdmissionQueued(ProcessId),
     AdmissionDequeued(ProcessId),
     ProcessResume(ProcessId),
+    /// The process waits on something the frame's firing would free (a
+    /// raise of the activation rung): its lanes go out of the frame
+    /// ([`super::frame::FramePolicy::on_owner_waits`]).
+    OwnerWaits(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -2016,6 +2028,9 @@ impl BatchScheduler {
             SchedulerItem::ProcessResume(pid) => {
                 frame_policy.on_process_resume(pid);
             }
+            SchedulerItem::OwnerWaits(pid) => {
+                frame_policy.on_owner_waits(pid);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
@@ -2961,7 +2976,7 @@ impl BatchScheduler {
                 // bind lands: its lanes go out of the frame, as a
                 // suspension's do, and come back with its next submit.
                 if waits && let Some(pid) = pipeline_id {
-                    frame_policy.on_bind_waits(pid);
+                    frame_policy.on_owner_waits(pid);
                 }
             }
             LaneCommit::BindInstance {
