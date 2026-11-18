@@ -3604,7 +3604,8 @@ returns nothing.
 - **Moves:**
   - translate a block, by up to 256 PEs, shrinking with the temperature;
   - swap two units of one footprint;
-  - relocate a K / V column beside or below one of its block's units.
+  - move an attending block's K / V columns together (their links one staircase by head),
+    by a step or beside or below one of the block's units; half the time one column alone.
 - **Energy:** the link term's estimate, plus a million cycles for each PE of overlap or each
   PE past `Bounds::system`. A unit's footprint covers its roots and weight PEs, plus its
   helpers under its rest columns.
@@ -3613,6 +3614,9 @@ returns nothing.
   - Each attending unit's K / V round trip costs its rows times twice its head root's
     Manhattan distance to the column's root, at `HOP` (`CHAIN_HOP`, 2 cycles) a hop.
   - The program's own price reads no position: it is the same constant before and after.
+  - A move's overlap is read from its blocks' neighbours alone: an index of the blocks by
+    the 32-PE cells their rectangles touch, followed as moves are accepted (a test holds its
+    change of energy to the whole energy's).
 - **Schedule:**
   - the starting temperature is the mean change of 256 moves that clash with nothing;
   - it falls geometrically to 1e-4 of that over the moves;
@@ -3649,6 +3653,16 @@ returns nothing.
 
 Every placement kept passes the check with no new kind of warning, and every run finishes
 well inside the safety stop.
+
+**With the index and the group moves** (`--anneal 2000` moves a block, seed 1, K / V
+columns only):
+
+| program | moves | links: search's → kept | time | note |
+|---|---|---|---|---|
+| qwen3-sim units | 10,000 | 140 → 52 | 0.0 s | |
+| Qwen3-0.6B units | 954,000 | 5,056 → 3,944 | 6.7 s | |
+| flux2-mini denoise (64 rows) | 36,000 | 36,448 → 20,576 | 0.0 s | |
+| klein denoise (64 rows) | 1,266,000 | 421,354 kept | 12.9 s | the best now routes, colours and lays, but routed 428,010 > 421,354 |
 
 Where it stops:
 - **Klein's denoise:** moving K / V columns among the units sends their links through other

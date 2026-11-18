@@ -157,8 +157,8 @@ struct Model {
     of: Vec<Vec<usize>>,
     /// The units' blocks (swappable when of one size).
     units: Vec<usize>,
-    /// A K / V column's block and its block's units' blocks.
-    kv: Vec<(usize, Vec<usize>)>,
+    /// Each attending block's K / V columns' blocks and its units' blocks (they move together).
+    groups: Vec<(Vec<usize>, Vec<usize>)>,
     w: u32,
     h: u32,
 }
@@ -206,12 +206,6 @@ impl Model {
         ]
     }
 
-    /// Block `i`'s penalty: its PEs past the fabric and its overlap with every other block
-    /// (`skip` aside).
-    fn clash(&self, i: usize, at: &[Coord], skip: Option<usize>) -> f64 {
-        self.past(i, at) + self.overlap(i, at, skip)
-    }
-
     fn past(&self, i: usize, at: &[Coord]) -> f64 {
         let mut past = 0u32;
         for r in self.rects(i, at).into_iter().flatten() {
@@ -221,11 +215,11 @@ impl Model {
         PENALTY * f64::from(past)
     }
 
-    fn overlap(&self, i: usize, at: &[Coord], skip: Option<usize>) -> f64 {
+    fn overlap(&self, i: usize, at: &[Coord], skip: &[usize]) -> f64 {
         let mine = self.rects(i, at);
         let mut over = 0u64;
         for j in 0..at.len() {
-            if j == i || Some(j) == skip {
+            if j == i || skip.contains(&j) {
                 continue;
             }
             for q in self.rects(j, at).into_iter().flatten() {
@@ -250,16 +244,66 @@ impl Model {
             + (0..at.len()).map(|i| self.pull(i, at)).sum::<f64>();
         let past: f64 = (0..at.len()).map(|i| self.past(i, at)).sum();
         // (each overlap counted from both sides: halved)
-        let over: f64 = (0..at.len())
-            .map(|i| self.overlap(i, at, None))
-            .sum::<f64>()
-            / 2.0;
+        let over: f64 = (0..at.len()).map(|i| self.overlap(i, at, &[])).sum::<f64>() / 2.0;
         links + past + over
     }
 
-    /// The energy's change if blocks `moved` (one or two) take their new origins in `at`
-    /// from `was`.
-    fn delta(&self, moved: &[usize], was: &[Coord], at: &[Coord]) -> f64 {
+    /// Block `i`'s overlap at `at` with every other block (`skip` aside), its neighbours
+    /// found through `idx` (the blocks at `was`; `moved` the ones not there in `at`): the
+    /// same sum as [`Model::overlap`]'s, in time a block's neighbourhood.
+    fn overlap_near(
+        &self,
+        i: usize,
+        at: &[Coord],
+        skip: &[usize],
+        moved: &[usize],
+        idx: &mut Index,
+    ) -> f64 {
+        let mine = self.rects(i, at);
+        let mut over = 0u64;
+        let mut add = |j: usize| {
+            for q in self.rects(j, at).into_iter().flatten() {
+                for r in mine.iter().flatten() {
+                    let ox = (r.x + r.w).min(q.x + q.w).saturating_sub(r.x.max(q.x));
+                    let oy = (r.y + r.h).min(q.y + q.h).saturating_sub(r.y.max(q.y));
+                    over += u64::from(ox) * u64::from(oy);
+                }
+            }
+        };
+        for j in idx.near(&self.cells(i, at, idx.c)) {
+            if j != i && !skip.contains(&j) && !moved.contains(&j) {
+                add(j);
+            }
+        }
+        for &j in moved {
+            if j != i && !skip.contains(&j) {
+                add(j);
+            }
+        }
+        PENALTY * over as f64
+    }
+
+    /// The index cells (`c` PEs a side) block `i`'s rectangles at `at` touch.
+    fn cells(&self, i: usize, at: &[Coord], c: u32) -> Vec<(u32, u32)> {
+        let mut v = Vec::new();
+        for r in self.rects(i, at).into_iter().flatten() {
+            if r.w == 0 || r.h == 0 {
+                continue;
+            }
+            for cy in r.y / c..=(r.y + r.h - 1) / c {
+                for cx in r.x / c..=(r.x + r.w - 1) / c {
+                    v.push((cx, cy));
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The energy's change if blocks `moved` take their new origins in `at` from `was` (`idx`
+    /// the blocks at `was`).
+    fn delta(&self, moved: &[usize], was: &[Coord], at: &[Coord], idx: &mut Index) -> f64 {
         let mut ts: Vec<usize> = moved
             .iter()
             .flat_map(|&i| self.of[i].iter().copied())
@@ -272,13 +316,81 @@ impl Model {
         }
         // a moved block's clashes (a pair of moved blocks' overlap counted once)
         for (n, &i) in moved.iter().enumerate() {
-            let skip = if n == 1 { Some(moved[0]) } else { None };
-            d += self.clash(i, at, skip) - self.clash(i, was, skip);
+            // (a pair of moved blocks counted at the first of them)
+            let skip = &moved[..n];
+            d += self.past(i, at) - self.past(i, was);
+            d += self.overlap_near(i, at, skip, moved, idx)
+                - self.overlap_near(i, was, skip, moved, idx);
             d += self.pull(i, at) - self.pull(i, was);
         }
         d
     }
 }
+
+/// The blocks by the coarse cells (`c` PEs a side) their rectangles touch: a moved block's
+/// overlap read from its neighbours alone.
+struct Index {
+    c: u32,
+    cells: std::collections::HashMap<(u32, u32), Vec<usize>>,
+    seen: Vec<u64>,
+    epoch: u64,
+}
+
+impl Index {
+    /// Cells of `c` PEs a side over the blocks at `at`.
+    fn new(model: &Model, at: &[Coord], c: u32) -> Index {
+        let mut x = Index {
+            c,
+            cells: std::collections::HashMap::new(),
+            seen: vec![0; at.len()],
+            epoch: 0,
+        };
+        for i in 0..at.len() {
+            x.insert(model, i, at);
+        }
+        x
+    }
+
+    fn insert(&mut self, model: &Model, i: usize, at: &[Coord]) {
+        for k in model.cells(i, at, self.c) {
+            self.cells.entry(k).or_default().push(i);
+        }
+    }
+
+    fn remove(&mut self, model: &Model, i: usize, at: &[Coord]) {
+        for k in model.cells(i, at, self.c) {
+            if let Some(v) = self.cells.get_mut(&k)
+                && let Some(n) = v.iter().position(|&j| j == i)
+            {
+                v.swap_remove(n);
+            }
+        }
+    }
+
+    /// Block `i` from its origin in `was` to the one in `at`.
+    fn relocate(&mut self, model: &Model, i: usize, was: &[Coord], at: &[Coord]) {
+        self.remove(model, i, was);
+        self.insert(model, i, at);
+    }
+
+    /// The blocks in `cells`, each once.
+    fn near(&mut self, cells: &[(u32, u32)]) -> Vec<usize> {
+        self.epoch += 1;
+        let mut v = Vec::new();
+        for k in cells {
+            for &j in self.cells.get(k).map_or(&[][..], |v| &v[..]) {
+                if self.seen[j] != self.epoch {
+                    self.seen[j] = self.epoch;
+                    v.push(j);
+                }
+            }
+        }
+        v
+    }
+}
+
+/// The index's cell side (PEs).
+const CELL: u32 = 32;
 
 /// A seeded xorshift generator.
 struct Rng(u64);
@@ -315,20 +427,44 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
     let price = crate::cost::stream::time(p).cycles;
     let e0 = model.energy(&start);
     let (mut at, mut e) = (start.clone(), e0);
+    let mut idx = Index::new(&model, &at, CELL);
     let (mut best, mut be) = (start.clone(), e0);
     let mut rng = Rng(seed.max(1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     // the starting temperature: the mean change of a few random moves
-    let free: Vec<usize> = (0..at.len()).filter(|&i| !model.fixed[i]).collect();
-    if free.is_empty() {
+    // (units move one at a time; K / V columns by their attending block)
+    let free: Vec<usize> = model
+        .units
+        .iter()
+        .copied()
+        .filter(|&i| !model.fixed[i])
+        .collect();
+    if free.is_empty() && model.groups.is_empty() {
         return Err("anneal: no block to move".into());
     }
     // (moves that clash say nothing of the links' scale: left out)
     let (mut probe, mut n) = (0.0, 0u32);
     for _ in 0..256 {
-        let i = free[rng.below(free.len() as u64) as usize];
+        // (a unit where units move, else an attending block's K / V columns)
+        let moved: Vec<usize> = if free.is_empty() {
+            model.groups[rng.below(model.groups.len() as u64) as usize]
+                .0
+                .clone()
+        } else {
+            vec![free[rng.below(free.len() as u64) as usize]]
+        };
+        let to = jitter(&mut rng, at[moved[0]], 16, &model);
+        let dd = (
+            i64::from(to.x) - i64::from(at[moved[0]].x),
+            i64::from(to.y) - i64::from(at[moved[0]].y),
+        );
         let mut next = at.clone();
-        next[i] = jitter(&mut rng, at[i], 16, &model);
-        let d = model.delta(&[i], &at, &next).abs();
+        if moved.iter().any(|&k| super::shift(at[k], dd).is_err()) {
+            continue;
+        }
+        for &k in &moved {
+            next[k] = super::shift(at[k], dd).unwrap_or(at[k]);
+        }
+        let d = model.delta(&moved, &at, &next, &mut idx).abs();
         if d < PENALTY / 2.0 {
             probe += d;
             n += 1;
@@ -353,11 +489,11 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
         let reach = ((1.0 - frac) * 256.0).max(1.0) as u32;
         let mut next = at.clone();
         let kind = rng.below(10);
-        let moved: Vec<usize> = if kind < 6 {
+        let moved: Vec<usize> = if kind < 6 && !free.is_empty() {
             let i = free[rng.below(free.len() as u64) as usize];
             next[i] = jitter(&mut rng, at[i], reach, &model);
             vec![i]
-        } else if kind < 8 {
+        } else if kind < 7 && !free.is_empty() {
             // a swap of two units of one footprint
             let i = model.units[rng.below(model.units.len() as u64) as usize];
             let same: Vec<usize> = model
@@ -374,30 +510,60 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
             if model.fixed[i] || same.is_empty() {
                 continue;
             }
-            let _ = units;
             let j = same[rng.below(same.len() as u64) as usize];
             next.swap(i, j);
             vec![i, j]
         } else {
-            // a K / V column next to one of its block's units (below or beside it)
-            if model.kv.is_empty() {
+            // an attending block's K / V columns together (their links a staircase by head):
+            // moved a step, or next to one of the block's units
+            if model.groups.is_empty() {
                 continue;
             }
-            let (k, us) = &model.kv[rng.below(model.kv.len() as u64) as usize];
-            let u = us[rng.below(us.len() as u64) as usize];
-            let (uw, uh) = model.size[u];
-            next[*k] = match rng.below(3) {
-                0 => Coord::new(at[u].x + rng.below(u64::from(uw)) as u32, at[u].y + uh),
-                1 => Coord::new(at[u].x + uw, at[u].y + rng.below(u64::from(uh)) as u32),
-                _ => Coord::new(
-                    at[u].x.saturating_sub(model.size[*k].0),
-                    at[u].y + rng.below(u64::from(uh)) as u32,
-                ),
+            let (all, us) = &model.groups[rng.below(model.groups.len() as u64) as usize];
+            // (the block's columns together, else one of them alone)
+            let one;
+            let ks: &Vec<usize> = if rng.below(2) == 0 {
+                all
+            } else {
+                one = vec![all[rng.below(all.len() as u64) as usize]];
+                &one
             };
-            vec![*k]
+            let lead = ks[0];
+            let to = if rng.below(2) == 0 {
+                jitter(&mut rng, at[lead], reach, &model)
+            } else {
+                let u = us[rng.below(us.len() as u64) as usize];
+                let (uw, uh) = model.size[u];
+                match rng.below(3) {
+                    0 => Coord::new(at[u].x + rng.below(u64::from(uw)) as u32, at[u].y + uh),
+                    1 => Coord::new(at[u].x + uw, at[u].y + rng.below(u64::from(uh)) as u32),
+                    _ => Coord::new(
+                        at[u].x.saturating_sub(model.size[lead].0),
+                        at[u].y + rng.below(u64::from(uh)) as u32,
+                    ),
+                }
+            };
+            let (dx, dy) = (
+                i64::from(to.x) - i64::from(at[lead].x),
+                i64::from(to.y) - i64::from(at[lead].y),
+            );
+            let mut ok = true;
+            for &k in ks {
+                match super::shift(at[k], (dx, dy)) {
+                    Ok(c) => next[k] = c,
+                    Err(_) => ok = false,
+                }
+            }
+            if !ok {
+                continue;
+            }
+            ks.clone()
         };
-        let d = model.delta(&moved, &at, &next);
+        let d = model.delta(&moved, &at, &next, &mut idx);
         if d <= 0.0 || rng.unit() < (-d / temp).exp() {
+            for &k in &moved {
+                idx.relocate(&model, k, &at, &next);
+            }
             at = next;
             e += d;
             accepted += 1;
@@ -543,9 +709,7 @@ fn model(
             wires: s.py,
         });
     }
-    let mut kv = Vec::new();
     for (k, kc) in s.kv.iter().enumerate() {
-        let us: Vec<usize> = kc.units.iter().map(|&u| unit_block[u]).collect();
         for &u in &kc.units {
             terms.push(Term::Trip {
                 u: unit_block[u],
@@ -555,7 +719,6 @@ fn model(
                 rows: p.units[u].unit.rows,
             });
         }
-        kv.push((kv_block[k], us));
     }
     let mut of = vec![Vec::new(); n];
     for (t, term) in terms.iter().enumerate() {
@@ -575,14 +738,22 @@ fn model(
         .copied()
         .filter(|&i| i != usize::MAX)
         .collect();
+    let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+    for (k, kc) in s.kv.iter().enumerate() {
+        let us: Vec<usize> = kc.units.iter().map(|&u| unit_block[u]).collect();
+        match groups.iter_mut().find(|(_, g)| *g == us) {
+            Some((ks, _)) => ks.push(kv_block[k]),
+            None => groups.push((vec![kv_block[k]], us)),
+        }
+    }
     Ok(Model {
+        groups,
         size,
         skirt,
         fixed,
         terms,
         of,
         units,
-        kv,
         w: b.w,
         h: b.h,
     })
@@ -769,6 +940,68 @@ mod tests {
             crate::floorplan::stream::Bounds::system(),
         )
         .unwrap()
+    }
+
+    /// The index's change of energy is the whole energy's, every kind of move: a unit,
+    /// a swap, an attending block's K / V columns.
+    #[test]
+    fn the_indexed_delta_is_the_energys_change() {
+        let p = decode_units("qwen3-0.6b-bf16-kv-bf16-l2");
+        let s = &p.stream;
+        let pr = super::super::stream::problem(s, &s.wiring()).unwrap();
+        let model =
+            super::model(&p, &pr, crate::floorplan::stream::Bounds::system(), true).unwrap();
+        let mut at = super::Solution::pinned(&pr).at;
+        let mut idx = super::Index::new(&model, &at, super::CELL);
+        let mut rng = super::Rng(12345);
+        for step in 0..400 {
+            let mut next = at.clone();
+            let moved: Vec<usize> = match step % 3 {
+                0 => {
+                    let i = model.units[rng.below(model.units.len() as u64) as usize];
+                    if model.fixed[i] {
+                        continue;
+                    }
+                    next[i] = super::jitter(&mut rng, at[i], 64, &model);
+                    vec![i]
+                }
+                1 => {
+                    let (i, j) = (
+                        model.units[rng.below(model.units.len() as u64) as usize],
+                        model.units[rng.below(model.units.len() as u64) as usize],
+                    );
+                    if i == j || model.fixed[i] || model.fixed[j] {
+                        continue;
+                    }
+                    next.swap(i, j);
+                    vec![i, j]
+                }
+                _ => {
+                    let ks = &model.groups[rng.below(model.groups.len() as u64) as usize].0;
+                    let d = (rng.below(41) as i64 - 20, rng.below(41) as i64 - 20);
+                    if ks.iter().any(|&k| super::super::shift(at[k], d).is_err()) {
+                        continue;
+                    }
+                    for &k in ks {
+                        next[k] = super::super::shift(at[k], d).unwrap();
+                    }
+                    ks.clone()
+                }
+            };
+            let d = model.delta(&moved, &at, &next, &mut idx);
+            let full = model.energy(&next) - model.energy(&at);
+            assert!(
+                (d - full).abs() <= 1e-6 * full.abs().max(1.0),
+                "step {step}: {d} vs {full}"
+            );
+            // (accept every other one: the index followed)
+            if step % 2 == 0 {
+                for &k in &moved {
+                    idx.relocate(&model, k, &at, &next);
+                }
+                at = next;
+            }
+        }
     }
 
     /// qwen3-sim's decode units annealed: the same seed gives the same placement, the
