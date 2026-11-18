@@ -271,9 +271,6 @@ pub struct Ctx {
     lane: core::cell::Cell<u32>,
 
     tuning: crate::tuning::Tuning,
-    /// The device's roofline, where the load handed it one: what a choice
-    /// between kernels weighs them by.
-    roofline: Option<&'static dyn crate::roofline::Roofline>,
 }
 
 impl Ctx {
@@ -295,7 +292,6 @@ impl Ctx {
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
             tuning: crate::tuning::Tuning::DEFAULT,
-            roofline: None,
         }
     }
 
@@ -321,25 +317,6 @@ impl Ctx {
     #[must_use]
     pub const fn tuning(&self) -> crate::tuning::Tuning {
         self.tuning
-    }
-
-    #[must_use]
-    pub const fn with_roofline(
-        mut self,
-        roofline: Option<&'static dyn crate::roofline::Roofline>,
-    ) -> Self {
-        self.roofline = roofline;
-        self
-    }
-
-    pub fn set_roofline(&mut self, roofline: &'static dyn crate::roofline::Roofline) {
-        self.roofline = Some(roofline);
-    }
-
-    /// The device's roofline, where the load handed this context one.
-    #[must_use]
-    pub const fn roofline(&self) -> Option<&'static dyn crate::roofline::Roofline> {
-        self.roofline
     }
 
     #[must_use]

@@ -83,13 +83,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     )
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
-    #[cfg(not(feature = "rocm"))]
-    device.set_roofline(crate::top::roofline(&chip).map_err(|key| {
-        Fault::Card(format!(
-            "the device's profile states no `[rates] {key}`, which its choices between kernels \
-             read"
-        ))
-    })?);
     let engine = crate::chip::Engine::of(&chip);
     // The most rows one prompt lays: its context, where the model keeps a
     // lane's rows (kv or recurrent state); a model that keeps none (a

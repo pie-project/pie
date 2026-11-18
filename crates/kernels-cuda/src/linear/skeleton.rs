@@ -1268,11 +1268,6 @@ impl RowLeg {
         })
     }
 
-    /// The launches it takes: one a piece.
-    pub(crate) const fn launches(&self) -> usize {
-        self.pieces.len()
-    }
-
     /// The epilogue over `products` (`m x parts · n`, the plain product of
     /// the packed bank), `ins` its inputs and `outs` its results (a paged
     /// one's its cache's plane, `paging` where its rows live).

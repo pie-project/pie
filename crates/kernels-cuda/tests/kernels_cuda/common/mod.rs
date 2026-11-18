@@ -18,37 +18,6 @@ fn check(code: rt::cudaError, call: &str) {
 /// take (see [`Gpu`]'s drop).
 static BLAS: std::sync::Mutex<Vec<(i32, usize)>> = std::sync::Mutex::new(Vec::new());
 
-/// A device's roofline as a test's choices between kernels weigh them:
-/// the L40S profile's `[rates]` under the engine's rules
-/// (`engine::roofline::Constants`).
-pub struct TestRoofline;
-
-/// The one [`TestRoofline`].
-pub static TEST_ROOFLINE: TestRoofline = TestRoofline;
-
-impl kernels_cuda::roofline::Roofline for TestRoofline {
-    fn few_rows_ns(
-        &self,
-        flops: f64,
-        bytes: f64,
-        workgroups: u32,
-        cores: u32,
-    ) -> Result<f64, &'static str> {
-        let full = 2.0 * f64::from(cores.max(1));
-        let fill = (full / f64::from(workgroups.max(1))).max(1.0);
-        Ok(905.0 + (flops / 12_000.0 * fill).max(bytes / 649.4))
-    }
-
-    fn gemm_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> f64 {
-        let flops = 2.0 * f64::from(m) * f64::from(n) * f64::from(k);
-        905.0 + (flops / 141_500.0).max(bytes / 649.4)
-    }
-
-    fn per_row_ns(&self, bytes: f64) -> f64 {
-        905.0 + bytes / 645.5
-    }
-}
-
 pub struct Gpu {
     ordinal: i32,
     stream: rt::cudaStream_t,
@@ -165,7 +134,6 @@ impl Gpu {
             Ctx::on(self.stream.cast())
                 .with_cublas(self.cublas.cast())
                 .with_slabs(self.slabs)
-                .with_roofline(Some(&TEST_ROOFLINE))
         };
         // `PIE_TEST_PDL=1` runs every test on this context with sm100's
         // launch decisions on (programmatic dependents, split tickets).

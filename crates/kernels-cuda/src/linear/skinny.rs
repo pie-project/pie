@@ -71,16 +71,6 @@ pub(crate) fn kernel(epi: &Epilogue) -> &'static Kernel {
     )
 }
 
-/// The blocks the skinny skeleton's grid takes over `n` columns with `epi`
-/// filled in: a block a tile of its columns (whole heads, for a body of a
-/// head's span).
-#[cfg(feature = "cuda")]
-pub(crate) fn blocks(epi: &Epilogue, n: u32) -> u32 {
-    let parts = epi.parts().max(1);
-    let (warps, _) = shape(epi.span(), parts).unwrap_or((WARPS, STEP));
-    n / (warps * 16 / parts)
-}
-
 /// A generated body holds no fields; C++ gives the empty struct one byte.
 const NO_FIELDS: u8 = 0;
 

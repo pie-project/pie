@@ -234,34 +234,6 @@ impl Constants {
         Ok(if work > 0.0 { work / rate * fill } else { 0.0 })
     }
 
-    /// A few-rows dispatch of `flops` (over the rows its kernel's tile
-    /// computes) moving `bytes`, as `workgroups` workgroups over `cores`
-    /// units: its launch and the longer of its bytes at the bandwidth and
-    /// its compute at `few_row_tflops` under the wave rule
-    /// ([`Constants::wave_ns`]); the key where the profile states none.
-    pub fn few_row_dispatch_ns(
-        &self,
-        flops: f64,
-        bytes: f64,
-        workgroups: u32,
-        cores: u32,
-    ) -> Result<f64, &'static str> {
-        let compute = self.wave_ns(flops, self.few_row_rate()?, workgroups, cores)?;
-        let read = if bytes > 0.0 {
-            bytes / self.bytes_per_ns
-        } else {
-            0.0
-        };
-        Ok(self.launch_ns + compute.max(read))
-    }
-
-    /// A per-row launch moving `bytes`: its launch and the bytes at the
-    /// per-row ops' bandwidth (`elementwise_gbps`).
-    #[must_use]
-    pub fn per_row_ns(&self, bytes: f64) -> f64 {
-        self.launch_ns + bytes.max(0.0) / self.elementwise_bytes_per_ns
-    }
-
     /// A matmul of `m x n x k` reading `bytes` (its weight plane).
     #[must_use]
     pub fn gemm_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> f64 {
@@ -399,18 +371,6 @@ mod tests {
             unstated.wave_ns(1e6, 1e3, 66, 80),
             Err("workgroups_per_core")
         );
-    }
-
-    #[test]
-    fn a_few_row_dispatch_short_of_a_wave_pays_for_its_compute_not_its_reads() {
-        let c = constants();
-        // 4 GFLOP at 4 TFLOP/s: 1 ms of compute, past 1 MB of reads.
-        assert_eq!(c.few_row_dispatch_ns(4e9, 1e6, 264, 80), Ok(900.0 + 1e6));
-        // A quarter of the device's workgroups: four times the compute.
-        assert!((c.few_row_dispatch_ns(4e9, 1e6, 66, 80).unwrap() - (900.0 + 4e6)).abs() < 1e-3);
-        // Reads that outlast the compute at any fill bind.
-        assert_eq!(c.few_row_dispatch_ns(4e6, 7e9, 66, 80), Ok(900.0 + 1e7));
-        assert_eq!(c.per_row_ns(4e5), 900.0 + 1e3);
     }
 
     #[test]

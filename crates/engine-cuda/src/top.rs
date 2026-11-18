@@ -140,46 +140,6 @@ pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
     }
 }
 
-/// `chip`'s roofline as kernels-cuda's choices between kernels weigh them
-/// ([`kernels_cuda::roofline::Roofline`]): its `[rates]`
-/// (`engine::roofline::Constants`) over the tile each product pads to
-/// ([`row_tile`]), held for the life of the process (a load's contexts
-/// read it at every fire). The key it lacks where the profile states none.
-#[cfg(not(feature = "rocm"))]
-pub fn roofline(
-    chip: &profile::Profile,
-) -> std::result::Result<&'static dyn kernels_cuda::roofline::Roofline, &'static str> {
-    let constants = engine::roofline::Constants::of(&chip.rates())?.with_row_tile(row_tile(chip));
-    constants.few_row_rate()?;
-    constants.full_rate_workgroups(1)?;
-    Ok(Box::leak(Box::new(Choices(constants))))
-}
-
-/// [`roofline`]'s constants, as kernels-cuda reads them.
-#[cfg(not(feature = "rocm"))]
-struct Choices(engine::roofline::Constants);
-
-#[cfg(not(feature = "rocm"))]
-impl kernels_cuda::roofline::Roofline for Choices {
-    fn few_rows_ns(
-        &self,
-        flops: f64,
-        bytes: f64,
-        workgroups: u32,
-        cores: u32,
-    ) -> std::result::Result<f64, &'static str> {
-        self.0.few_row_dispatch_ns(flops, bytes, workgroups, cores)
-    }
-
-    fn gemm_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> f64 {
-        self.0.gemm_ns(m, n, k, bytes)
-    }
-
-    fn per_row_ns(&self, bytes: f64) -> f64 {
-        self.0.per_row_ns(bytes)
-    }
-}
-
 /// The fire top of `rungs` (every rung of the lattice a load offers) a
 /// prompt of `context` holds, on `device`, whose profile states `rates`,
 /// over a live range of `live` bytes, each matmul padded to `row_tile`

@@ -326,7 +326,6 @@ impl Context {
                         pdl: false,
                         ..self.ctx.tuning()
                     })
-                    .with_roofline(self.ctx.roofline())
                     .with_rank(self.ctx.rank()),
                 #[cfg(feature = "rocm")]
                 ctx: Ctx::on(stream)
@@ -410,13 +409,6 @@ impl Context {
     /// streams.
     pub fn set_tuning(&mut self, tuning: kernels_cuda::tuning::Tuning) {
         self.ctx.set_tuning(tuning);
-    }
-
-    /// Lay the device's roofline on this context, before it opens side
-    /// streams: what a choice between kernels weighs them by.
-    #[cfg(not(feature = "rocm"))]
-    pub fn set_roofline(&mut self, roofline: &'static dyn kernels_cuda::roofline::Roofline) {
-        self.ctx.set_roofline(roofline);
     }
 
     #[must_use]

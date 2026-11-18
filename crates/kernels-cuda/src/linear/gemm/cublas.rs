@@ -5,9 +5,7 @@
 //! streaming skeleton covers run on it, the epilogue fused (the gemv one
 //! row; the rows skeleton up to its tile of 16 rows of one part, a
 //! structural bound), the kernel streaming the weight once through every
-//! row; few rows of a region the rows skeleton does not take run fused on
-//! the skinny skeleton where it covers them and the device's roofline
-//! weighs it below the unfused leg; every other
+//! row; every other
 //! runs cuBLASLt's first heuristic algorithm for its shape
 //! (its own ranking, deterministic for the shape, the workspace and the
 //! library), an anchored region with an epilogue cuBLASLt lands on that
@@ -206,17 +204,6 @@ pub(crate) fn anchored(
         skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
         return Ok(true);
     }
-    // Few rows of a region the rows skeleton does not take (its parts, a
-    // packed gate | up, or a head's span) run fused on the skinny skeleton
-    // where it covers them and the device's roofline weighs its one
-    // dispatch below the unfused leg's.
-    if m <= crate::linear::skeleton::ROWS_M as i32
-        && Skeleton::Skinny.covers(epi, m, n, k, &tuning)
-        && fused_on_skinny(ctx, op, epi, m, n, k)?
-    {
-        Skeleton::Skinny.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
-        return Ok(true);
-    }
     if let [out] = outs
         && epi.parts() == 1
         && on_lt(ctx, op, epi, act, w, ins, *out, m, n, k)?
@@ -224,84 +211,6 @@ pub(crate) fn anchored(
         return Ok(true);
     }
     unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k)
-}
-
-/// Whether few rows of `epi` (a region the rows skeleton does not take)
-/// run fused on the skinny skeleton rather than on the unfused leg: where,
-/// under the device's roofline ([`crate::roofline::Roofline`]), the fused
-/// dispatch costs less. The skinny skeleton computes its whole tile of
-/// [`crate::linear::skinny::ROWS`] rows on mma.sync over a block a tile of
-/// columns (whole heads for a head's span), a few-rows dispatch of that
-/// many blocks under the wave rule; the leg streams the product on the
-/// rows skeleton's grid (cuBLAS's, where it lands f32 sums), the product
-/// written and read back, then runs the epilogue's launches over it. A
-/// region whose leg the row skeleton does not carry has the fused fire
-/// alone. Refused by name on a context that holds no roofline, or a profile
-/// that states no rate the choice reads.
-fn fused_on_skinny(
-    ctx: &Ctx,
-    op: &'static str,
-    epi: &Epilogue,
-    m: i32,
-    n: i32,
-    k: i32,
-) -> Result<bool, Error> {
-    let Some(leg) = RowLeg::of(epi, n.unsigned_abs()) else {
-        return Ok(true);
-    };
-    let roofline = ctx.roofline().ok_or_else(|| {
-        refuse(
-            op,
-            "few rows of a region the rows skeleton does not take choose between the skinny \
-             skeleton and the unfused leg by the device's roofline, and this context holds none",
-        )
-    })?;
-    let cores = crate::jit::device::multiprocessors().ok_or_else(|| {
-        refuse(
-            op,
-            "the device did not answer its multiprocessors, which the roofline's wave rule reads",
-        )
-    })?;
-    let unrated = |key: &'static str| {
-        refuse(
-            op,
-            format!(
-                "the device's profile states no `[rates] {key}`, which the few-rows choice reads"
-            ),
-        )
-    };
-    let (mu, nu, ku) = (m.unsigned_abs(), n.unsigned_abs(), k.unsigned_abs());
-    let wide = epi.parts() * nu;
-    let weight = f64::from(wide) * f64::from(ku) * 2.0;
-    let act = f64::from(mu) * f64::from(ku) * 2.0;
-    let results = (epi.results() as f64) * f64::from(mu) * f64::from(nu) * 2.0;
-    let fused = roofline
-        .few_rows_ns(
-            2.0 * f64::from(crate::linear::skinny::ROWS) * f64::from(wide) * f64::from(ku),
-            weight + act + results,
-            crate::linear::skinny::blocks(epi, nu),
-            cores,
-        )
-        .map_err(unrated)?;
-    let wide_i = i32::try_from(wide).unwrap_or(i32::MAX);
-    let products = f64::from(mu) * f64::from(wide) * epi.product_bytes() as f64;
-    let product = if epi.rounds() {
-        let blocks = crate::linear::gemv::rows_blocks(wide_i, k)
-            * crate::linear::gemv::rows_cluster(wide_i, k);
-        roofline
-            .few_rows_ns(
-                2.0 * f64::from(mu) * f64::from(wide) * f64::from(ku),
-                weight + act + products,
-                blocks,
-                cores,
-            )
-            .map_err(unrated)?
-    } else {
-        roofline.gemm_ns(mu, wide, ku, weight)
-    };
-    let launches = leg.launches().max(1);
-    let legs = launches as f64 * roofline.per_row_ns((products + results) / launches as f64);
-    Ok(fused < product + legs)
 }
 
 /// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at cuBLASLt's
