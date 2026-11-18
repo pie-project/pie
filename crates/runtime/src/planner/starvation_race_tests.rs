@@ -3033,3 +3033,83 @@ async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
     gate.await.expect("the gate ends").expect("resident");
     assert_eq!(planner.stats.gate_parks.load(Ordering::Relaxed), 1);
 }
+
+/// Reuse after release, the eviction window (the 1200-beam divergence:
+/// beam_search's verify rescore registers a fresh working set per
+/// hypothesis mid-process and prefills on it). P's set S0 stands when the
+/// planner moves P off Resident; the eviction fences and quiesces it (its
+/// snapshot). A set S1 that P registers after that, before the park, was
+/// born unfenced: its prefill took its lease, got its grant, and ran on
+/// P's instance while the park copied and freed its slots, which another
+/// owner then took and wrote. Now S1 is registered under the lock P left
+/// Resident under: born fenced, its prefill does not fire, and no grant is
+/// given to P, until the restore. The park's copy is P's last completed
+/// state, and no slot goes to another owner under a fire of P's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_set_registered_mid_eviction_prefills_only_after_the_restore() {
+    use crate::inferlet::process::residency::{
+        ProcessResidency, kv_lease_quiescent, kv_suspend_handles, register_residency,
+    };
+    use crate::store::kv::working_set::{FireLeaseError, KvWorkingSet};
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let stores = crate::store::registry::get(model, 0);
+    let fresh =
+        || crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.create_working_set());
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    register_residency(pid, Arc::downgrade(&residency));
+    let s0 = KvWorkingSet::new(model, 0, fresh(), 16);
+    planner.register_kv_working_set(pid, &residency, &s0);
+    drop(s0.fire_lease().expect("resident: S0 fires"));
+
+    // The eviction: off Resident under the planner's lock, then its
+    // snapshot fenced and quiesced.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicting);
+    let snapshot = kv_suspend_handles(pid, model, 0);
+    assert_eq!(snapshot.len(), 1);
+    for handle in &snapshot {
+        handle.fence();
+        handle.quiesce().await;
+    }
+
+    // Between the snapshot and the park, P registers a fresh set for a
+    // rescore, and its prefill asks to fire.
+    let s1 = KvWorkingSet::new(model, 0, fresh(), 16);
+    planner.register_kv_working_set(pid, &residency, &s1);
+    assert!(
+        matches!(s1.fire_lease(), Err(FireLeaseError::Fenced)),
+        "a set registered mid-eviction is born fenced: its prefill does not fire before the restore"
+    );
+    let prefill = Demand {
+        kv_pages: 2,
+        rs: RsUnits::default(),
+    };
+    assert!(
+        planner.grant_now(pid, prefill).is_none(),
+        "no grant for a fire of a process not resident"
+    );
+    assert!(
+        planner.grant_now(pid, Demand::default()).is_none(),
+        "not even an empty one"
+    );
+    // The park runs with no fire of P's in flight on any set it holds:
+    // what it copies is P's last completed state, and the slots it frees
+    // go to another owner under no fire of P's.
+    assert!(kv_lease_quiescent(pid, model, 0));
+
+    // The restore: every set P holds fires again, the rescore's included.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Restoring);
+    planner.report_restored(pid);
+    for set in [&s0, &s1] {
+        drop(set.fire_lease().expect("resident again: it fires"));
+    }
+    assert!(planner.grant_now(pid, Demand::default()).is_some());
+}
