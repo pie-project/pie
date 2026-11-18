@@ -2742,10 +2742,19 @@ impl<'c> Run<'c> {
             }
             let _ = write!(sink, "{at}:");
             let _ = match slot {
+                // Where the mask tables lie, a decode's as a prefill's: a
+                // copied window's are its own (`window::GatheredMask`).
                 StructSlot::Decode(p) => write!(
                     sink,
-                    "d{:?}{:?}{:?}{:?}",
-                    p.info, p.workspace, p.shape, p.window
+                    "d{:?}{:?}{:?}{:?}{:?}",
+                    p.info,
+                    p.workspace,
+                    p.shape,
+                    p.window,
+                    (
+                        p.mask_indptr.map(|table| table.ptr),
+                        p.mask_origin.map(|table| table.ptr)
+                    )
                 ),
                 StructSlot::Prefill(p) => write!(
                     sink,

@@ -151,7 +151,6 @@ impl Run<'_> {
                 }
                 // The fire's mask offsets and words, where it staged them: a
                 // decode reading the masks finds each request's here.
-                #[cfg(not(feature = "rocm"))]
                 let built = plan::DecodePlan {
                     mask_indptr: self.mask_indptr(),
                     mask_origin: self.mask_origin(),
