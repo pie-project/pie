@@ -150,33 +150,44 @@ pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
 /// the profile states none.
 pub fn shape(
     chip: &profile::Profile,
-) -> impl Fn(engine::roofline::Constants) -> std::result::Result<engine::roofline::Constants, &'static str>
-+ use<> {
+) -> Result<
+    impl Fn(engine::roofline::Constants) -> std::result::Result<engine::roofline::Constants, &'static str>
+    + use<>,
+> {
     let tile = row_tile(chip);
     #[cfg(feature = "cuda")]
     let tuning = kernels_cuda::tuning::Tuning::of(chip);
-    move |constants| {
+    #[cfg(feature = "cuda")]
+    let cores = kernels_cuda::linear::gemm::multiprocessors().ok_or_else(|| {
+        Fault::Card(
+            "the device did not answer its multiprocessor count, which the few-rows kernel's \
+             wave rule reads"
+                .to_owned(),
+        )
+    })?;
+    Ok(move |constants: engine::roofline::Constants| {
         let constants = constants.with_row_tile(tile.clone());
         #[cfg(feature = "cuda")]
-        let constants = constants.with_gemm_waves(std::sync::Arc::new(move |m, n, k| {
-            kernels_cuda::linear::gemm::waves(&tuning, m, n, k)
-        }));
-        #[cfg(feature = "rocm")]
-        let constants =
-            constants.with_gemm_waves(std::sync::Arc::new(kernels_cuda::linear::gemm::waves));
-        #[cfg(feature = "cuda")]
         {
-            let cores = kernels_cuda::linear::gemm::multiprocessors().ok_or("workgroups_per_core")?;
-            constants.with_few_rows(
-                std::sync::Arc::new(kernels_cuda::linear::gemm::few_rows_grid),
-                cores,
-            )
+            constants
+                .with_gemm_waves(std::sync::Arc::new(move |m, n, k| {
+                    kernels_cuda::linear::gemm::waves(&tuning, m, n, k)
+                }))
+                .with_few_rows(
+                    std::sync::Arc::new(kernels_cuda::linear::gemm::few_rows_grid),
+                    cores,
+                )
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "rocm")]
+        {
+            Ok(constants
+                .with_gemm_waves(std::sync::Arc::new(kernels_cuda::linear::gemm::waves)))
+        }
+        #[cfg(not(feature = "device"))]
         {
             Ok(constants)
         }
-    }
+    })
 }
 
 /// The fire top of `rungs` (every rung of the lattice a load offers) a

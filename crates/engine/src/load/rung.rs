@@ -668,6 +668,7 @@ mod tests {
             row_tile: std::sync::Arc::new(|_, _, _| 1),
             few_rows: None,
             gemm_waves: None,
+            gemm_full_by_rows: None,
         }
     }
 

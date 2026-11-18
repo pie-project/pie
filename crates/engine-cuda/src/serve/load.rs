@@ -399,7 +399,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             after_weights,
             prompt_rows,
             &chip.rates(),
-            crate::top::shape(&chip),
+            crate::top::shape(&chip)?,
             device.name(),
             &counts,
         )?;

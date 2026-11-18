@@ -17,15 +17,16 @@
 //!
 //! Two device facts weigh the choice between kernels of one op. A matmul
 //! of decode-shaped rows (4 to 256) runs at `few_row_tflops`, the rate of
-//! the kernel serving picks there ([`Constants::few_row_ns`],
-//! [`Constants::with_few_rows`]). A dispatch of `W` workgroups over the
-//! device's `S = workgroups_per_core · cores` slots runs in `W / S` waves,
-//! the last one only in part: its compute takes `work / rate` times
-//! `max(1, ceil(W / S)) / (W / S)` ([`wave_fill`], [`Constants::wave_ns`]),
-//! the one wave-fill rule every choice and every matmul's price reads. A
-//! matmul on the vendor library's algorithm is priced by the waves the
-//! library states its algorithm fills at the shape
-//! ([`Constants::with_gemm_waves`]), the curve stated at its full rate.
+//! the kernel serving picks there, under the wave rule over that kernel's
+//! grid ([`Constants::with_few_rows`], [`Constants::matmul_compute_ns`]).
+//! A dispatch of `W` workgroups fills the device's `S =
+//! workgroups_per_core · cores` slots only in part where `W < S`: its
+//! compute takes `work / rate · max(1, S / W)` ([`Constants::wave_ns`]),
+//! the one wave-fill rule every choice reads. A matmul on the vendor
+//! library's algorithm, where the library states the waves its algorithm
+//! fills at the shape, is priced by those waves rounded up to whole ones
+//! ([`wave_fill`], [`Constants::with_gemm_waves`]) at the curve's full
+//! rate; where it states none, at the curve as timed.
 //! Neither key is read as unbounded where unstated: a choice that needs one
 //! and finds it unstated is refused by its key.
 
@@ -83,6 +84,10 @@ pub struct Constants {
     /// The waves the curve's kernel fills at a shape, where the backend
     /// states them ([`Constants::with_gemm_waves`]).
     pub gemm_waves: Option<GemmWaves>,
+    /// `gemm_by_rows` at its full rate: each point times the fill of the
+    /// waves it filled where it was timed, where the backend states them
+    /// ([`Constants::with_gemm_waves`]). `gemm_by_rows` stays as measured.
+    pub gemm_full_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 impl std::fmt::Debug for Constants {
@@ -90,6 +95,7 @@ impl std::fmt::Debug for Constants {
         f.debug_struct("Constants")
             .field("launch_ns", &self.launch_ns)
             .field("gemm_by_rows", &self.gemm_by_rows)
+            .field("gemm_full_by_rows", &self.gemm_full_by_rows)
             .field("attn_by_keys", &self.attn_by_keys)
             .field("bytes_per_ns", &self.bytes_per_ns)
             .field("elementwise_bytes_per_ns", &self.elementwise_bytes_per_ns)
@@ -104,6 +110,7 @@ impl PartialEq for Constants {
     fn eq(&self, other: &Constants) -> bool {
         self.launch_ns == other.launch_ns
             && self.gemm_by_rows == other.gemm_by_rows
+            && self.gemm_full_by_rows == other.gemm_full_by_rows
             && self.attn_by_keys == other.attn_by_keys
             && self.bytes_per_ns == other.bytes_per_ns
             && self.elementwise_bytes_per_ns == other.elementwise_bytes_per_ns
@@ -164,6 +171,7 @@ impl Constants {
             row_tile: Arc::new(|_, _, _| 1),
             few_rows: None,
             gemm_waves: None,
+            gemm_full_by_rows: None,
         })
     }
 
@@ -187,15 +195,17 @@ impl Constants {
     }
 
     /// These constants with the waves the curve's kernel fills at a shape
-    /// (`waves`): each point of the curve, timed at `m x w x w`, stated at
-    /// its full rate (its rate times [`wave_fill`] of the waves it filled
-    /// there), so a matmul's compute is its flops at the full rate times
-    /// the fill of the waves at its own shape
-    /// ([`Constants::gemm_compute_ns`]): a shape whose tiles fill whole
-    /// waves runs at the full rate, one a tile past them pays a wave.
+    /// (`waves`, as the vendor library states them for the algorithm it
+    /// picks): the curve, timed at `m x w x w`, also stated at its full
+    /// rate (`gemm_full_by_rows`: each point times [`wave_fill`] of the
+    /// waves it filled there, where stated), so a matmul whose waves are
+    /// stated costs its flops at the full rate times the fill of its own
+    /// waves ([`Constants::gemm_compute_ns`]): whole waves run at the full
+    /// rate, a tile past them pays a wave. `gemm_by_rows` stays as
+    /// measured, so laying the waves twice is laying them once.
     #[must_use]
     pub fn with_gemm_waves(self, waves: GemmWaves) -> Constants {
-        let gemm_by_rows = self
+        let full = self
             .gemm_by_rows
             .iter()
             .map(|(w, curve)| {
@@ -207,26 +217,17 @@ impl Constants {
             })
             .collect();
         Constants {
-            gemm_by_rows,
+            gemm_full_by_rows: Some(full),
             gemm_waves: Some(waves),
             ..self
         }
     }
 
-    /// The fill of the waves the curve's kernel runs `m x n x k` in
-    /// ([`wave_fill`]); 1 where the backend states no waves.
-    #[must_use]
-    pub fn gemm_fill(&self, m: u32, n: u32, k: u32) -> f64 {
-        self.gemm_waves
-            .as_ref()
-            .and_then(|waves| waves(m, n, k))
-            .map_or(1.0, wave_fill)
-    }
-
     /// The compute of a matmul of `m x n x k` taking `flops` (its rows
     /// padded to its tile), in ns: on the backend's few-rows kernel where
     /// it serves the shape, `flops` at `few_row_tflops` under the wave rule
-    /// over its grid ([`wave`]); else at the matmul curve's rate.
+    /// over its grid ([`Constants::wave_ns`]); else on the curve's kernel
+    /// ([`Constants::gemm_compute_ns`]).
     #[must_use]
     pub fn matmul_compute_ns(&self, m: u32, n: u32, k: u32, flops: f64) -> f64 {
         if flops <= 0.0 {
@@ -241,36 +242,26 @@ impl Constants {
         }
     }
 
-    /// `flops` of `m x n x k` on the curve's kernel: at the curve's rate,
-    /// times the fill of its waves ([`Constants::gemm_fill`]).
+    /// `flops` of `m x n x k` on the curve's kernel: where the backend
+    /// states the waves it fills there, at the curve's full rate times
+    /// their [`wave_fill`]; else at the curve's rate as timed.
     fn curve_compute_ns(&self, m: u32, n: u32, k: u32, flops: f64) -> f64 {
-        flops / self.gemm_rate(m, n, k) * self.gemm_fill(m, n, k)
+        let stated = self
+            .gemm_waves
+            .as_ref()
+            .and_then(|waves| waves(m, n, k))
+            .zip(self.gemm_full_by_rows.as_deref());
+        match stated {
+            Some((waves, full)) => flops / rate_on(full, m, n, k) * wave_fill(waves),
+            None => flops / self.gemm_rate(m, n, k),
+        }
     }
 
-    /// The matmul rate at `m` rows of an `n x k` plane: each width's curve
-    /// at the octave of rows at or below `m` (its first below that), in
-    /// `log width` at `sqrt(n k)` between the widths, clamped past them.
+    /// The matmul rate at `m` rows of an `n x k` plane, as the curve was
+    /// timed ([`rate_on`]).
     #[must_use]
     pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
-        let at = |curve: &[(u32, f64)]| -> f64 {
-            curve
-                .iter()
-                .rev()
-                .find(|&&(rows, _)| rows <= m)
-                .or(curve.first())
-                .map_or(f64::INFINITY, |&(_, r)| r)
-        };
-        let width: Vec<(u32, f64)> = self.gemm_by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
-        let square = (f64::from(n) * f64::from(k)).sqrt();
-        // Past the widest width, its last span's slope in log width carries
-        // on (a wider plane fills more tiles); never below the widest's rate.
-        if let [.., (w0, r0), (w1, r1)] = width[..]
-            && square > f64::from(w1)
-        {
-            let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
-            return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
-        }
-        profile::fire::interpolate(&width, square).unwrap_or(f64::INFINITY)
+        rate_on(&self.gemm_by_rows, m, n, k)
     }
 
     /// The rows a matmul of `m x n x k` computes: `m` padded to its
@@ -319,16 +310,6 @@ impl Constants {
         self.few_row_flops_per_ns.ok_or("few_row_tflops")
     }
 
-    /// A matmul of decode-shaped `m x n x k` (4 to 256 rows) reading
-    /// `bytes`, on the kernel serving picks there: its launch and the
-    /// longer of its weight reads and its flops (its rows padded to its
-    /// kernel's tile, [`Constants::gemm_flops`]) at `few_row_tflops`; the
-    /// key where the profile states none.
-    pub fn few_row_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> Result<f64, &'static str> {
-        let rate = self.few_row_rate()?;
-        Ok(self.dispatch_ns(self.gemm_flops(m, n, k), rate, bytes))
-    }
-
     /// The workgroups the device holds at once for a kernel's full rate
     /// over `cores` compute units, `S = workgroups_per_core · cores`; the
     /// key where the profile states none.
@@ -339,10 +320,9 @@ impl Constants {
 
     /// The compute of `work` at `rate` (work a ns, the kernel's full rate)
     /// as a dispatch of `workgroups` over `cores` units runs it: `work /
-    /// rate` times the fill of its `workgroups / S` waves ([`wave_fill`]:
-    /// `S / workgroups` short of a wave, whole waves past it), `S` the
-    /// device's [`Constants::full_rate_workgroups`]. The one wave-fill rule
-    /// every choice between kernels and every matmul's price reads.
+    /// rate · max(1, S / workgroups)`, `S` the device's
+    /// [`Constants::full_rate_workgroups`]. The one wave-fill rule every
+    /// choice between kernels reads.
     pub fn wave_ns(
         &self,
         work: f64,
@@ -365,20 +345,47 @@ impl Constants {
     }
 }
 
+/// The matmul rate a curve of rates by rows at each width states at `m`
+/// rows of an `n x k` plane: each width's curve at the octave of rows at or
+/// below `m` (its first below that), in `log width` at `sqrt(n k)` between
+/// the widths, clamped past them.
+fn rate_on(curves: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
+    let at = |curve: &[(u32, f64)]| -> f64 {
+        curve
+            .iter()
+            .rev()
+            .find(|&&(rows, _)| rows <= m)
+            .or(curve.first())
+            .map_or(f64::INFINITY, |&(_, r)| r)
+    };
+    let width: Vec<(u32, f64)> = curves.iter().map(|(w, c)| (*w, at(c))).collect();
+    let square = (f64::from(n) * f64::from(k)).sqrt();
+    // Past the widest width, its last span's slope in log width carries
+    // on (a wider plane fills more tiles); never below the widest's rate.
+    if let [.., (w0, r0), (w1, r1)] = width[..]
+        && square > f64::from(w1)
+    {
+        let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
+        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
+    }
+    profile::fire::interpolate(&width, square).unwrap_or(f64::INFINITY)
+}
+
 /// `work` at `rate` as a dispatch of `workgroups` runs it on a device
-/// holding `full` at once for its full rate: `work / rate` times the fill
-/// of its `workgroups / full` waves ([`wave_fill`], [`Constants::wave_ns`]).
+/// needing `full` at once for its full rate: `work / rate · max(1, full /
+/// workgroups)` ([`Constants::wave_ns`]).
 fn wave(work: f64, rate: f64, workgroups: u32, full: f64) -> f64 {
-    let fill = wave_fill(f64::from(workgroups.max(1)) / full);
+    let fill = (full / f64::from(workgroups.max(1))).max(1.0);
     if work > 0.0 { work / rate * fill } else { 0.0 }
 }
 
-/// The time a dispatch of `waves` waves takes over the time its work
-/// takes at the full rate: its waves rounded up to whole ones (at least
-/// one) over `waves`. A dispatch short of a wave (`waves` < 1) leaves the
-/// rest of the device idle (`1 / waves`); one a tile past whole waves
-/// runs the last wave nearly empty. 1 at whole waves, and where `waves`
-/// is nothing.
+/// The time a dispatch of `waves` waves, as the vendor library states
+/// them for its algorithm, takes over the time its work takes at the full
+/// rate: its waves rounded up to whole ones (at least one) over `waves`.
+/// A dispatch short of a wave leaves the rest of the device idle (`1 /
+/// waves`); one a tile past whole waves runs the last wave nearly empty.
+/// 1 at whole waves, and where `waves` is nothing. Only stated waves are
+/// rounded: [`Constants::wave_ns`]'s `S` is a knee, not a residency.
 #[must_use]
 pub fn wave_fill(waves: f64) -> f64 {
     if waves.is_finite() && waves > 0.0 {
@@ -420,6 +427,7 @@ mod tests {
             row_tile: Arc::new(|_, _, _| 1),
             few_rows: None,
             gemm_waves: None,
+            gemm_full_by_rows: None,
         }
     }
 
@@ -472,41 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn a_few_row_matmul_runs_at_its_own_rate_past_its_weight_reads() {
-        let c = constants();
-        let plane = 2.0 * 1024.0 * 1024.0;
-        // 8 rows of a 1024 plane: 16.8 MFLOP at 4 TFLOP/s (4.19 us) against
-        // 2 MiB at 700 GB/s (3.0 us): the compute binds.
-        let flops = 2.0 * 8.0 * 1024.0 * 1024.0;
-        assert_eq!(
-            c.few_row_ns(8, 1024, 1024, plane),
-            Ok(900.0 + flops / 4_000.0)
-        );
-        // One row: the read binds.
-        assert_eq!(
-            c.few_row_ns(1, 1024, 1024, plane),
-            Ok(900.0 + plane / 700.0)
-        );
-        let unstated = Constants {
-            few_row_flops_per_ns: None,
-            ..constants()
-        };
-        assert_eq!(
-            unstated.few_row_ns(8, 1024, 1024, plane),
-            Err("few_row_tflops")
-        );
-    }
-
-    #[test]
     fn a_dispatch_short_of_the_device_s_workgroups_pays_for_the_slots_it_leaves() {
         let c = constants();
         // 80 units at 3.3 a unit: 264 workgroups fill the device.
         assert!((c.full_rate_workgroups(80).unwrap() - 264.0).abs() < 1e-9);
-        // Whole waves: the work at its rate.
+        // 264 or more: the work at its rate.
         assert_eq!(c.wave_ns(1e6, 1e3, 264, 80), Ok(1e3));
-        assert_eq!(c.wave_ns(1e6, 1e3, 792, 80), Ok(1e3));
-        // 1000, 3.79 waves: the last runs part empty, four waves' time.
-        assert!((c.wave_ns(1e6, 1e3, 1000, 80).unwrap() - 1e3 * 4.0 * 264.0 / 1000.0).abs() < 1e-6);
+        assert_eq!(c.wave_ns(1e6, 1e3, 1000, 80), Ok(1e3));
         // 66, a quarter: four times as long.
         assert!((c.wave_ns(1e6, 1e3, 66, 80).unwrap() - 4e3).abs() < 1e-6);
         let unstated = Constants {
@@ -526,8 +506,8 @@ mod tests {
         let grid: FewRowGrid = Arc::new(|m, n, _| (m <= 16).then_some(n / 4));
         let c = constants().with_few_rows(grid.clone(), 80).unwrap();
         let flops = 2.0 * 8.0 * 4096.0 * 1024.0;
-        // 1056 workgroups, four whole waves of 264: the flops at 4 TFLOP/s.
-        assert!((c.matmul_compute_ns(8, 4224, 1024, flops) - flops / 4_000.0).abs() < 1e-6);
+        // 1024 workgroups fill the 264: the flops at 4 TFLOP/s.
+        assert!((c.matmul_compute_ns(8, 4096, 1024, flops) - flops / 4_000.0).abs() < 1e-6);
         // 64 workgroups, a quarter short of 264: 264 / 64 the time.
         let narrow = c.matmul_compute_ns(8, 256, 1024, flops);
         assert!((narrow - flops / 4_000.0 * 264.0 / 64.0).abs() < 1e-6);
@@ -546,27 +526,38 @@ mod tests {
         );
     }
 
-    /// The curve stated at its full rate where its points filled part of a
-    /// wave; a shape a tile past whole waves pays the last wave.
+    /// The curve kept as measured and stated beside it at its full rate;
+    /// a shape a tile past whole waves pays the last wave, one whose waves
+    /// the library states none of runs at the curve as timed.
     #[test]
     fn a_matmul_on_the_library_s_kernel_pays_for_the_waves_it_fills() {
         assert_eq!(wave_fill(3.0), 1.0);
         assert!((wave_fill(0.5) - 2.0).abs() < 1e-12);
         assert!((wave_fill(2.25) - 3.0 / 2.25).abs() < 1e-12);
         // Every curve point (n = k, a width it times) fills 1.5 waves
-        // (fill 4/3); the 3000-column shape at hand 2 or 2.25.
+        // (fill 4/3); the 3000-column shape at hand 2 or 2.25; a
+        // 5000-column one none stated.
         let at = |w: f64| -> GemmWaves {
-            Arc::new(move |_, n, _| Some(if n == 3000 { w } else { 1.5 }))
+            Arc::new(move |_, n, _| match n {
+                3000 => Some(w),
+                5000 => None,
+                _ => Some(1.5),
+            })
         };
         let plain = constants();
         let c = plain.clone().with_gemm_waves(at(2.0));
-        let rate = plain.gemm_rate(4096, 4096, 4096);
-        assert!((c.gemm_rate(4096, 4096, 4096) - rate * 4.0 / 3.0).abs() < 1e-6);
+        assert_eq!(c.gemm_by_rows, plain.gemm_by_rows, "the curve stays as measured");
+        assert_eq!(c.clone().with_gemm_waves(at(2.0)).gemm_full_by_rows, c.gemm_full_by_rows);
+        let rate = plain.gemm_rate(2048, 3000, 4096);
         let flops = c.gemm_flops(2048, 3000, 4096);
         let whole = c.gemm_compute_ns(2048, 3000, 4096);
-        assert!((whole - flops / c.gemm_rate(2048, 3000, 4096)).abs() < 1e-6);
-        let past = plain.with_gemm_waves(at(2.25)).gemm_compute_ns(2048, 3000, 4096);
+        assert!((whole - flops / (rate * 4.0 / 3.0)).abs() < 1e-6);
+        let past = plain.clone().with_gemm_waves(at(2.25)).gemm_compute_ns(2048, 3000, 4096);
         assert!((past / whole - 3.0 / 2.25).abs() < 1e-9);
+        assert_eq!(
+            c.gemm_compute_ns(2048, 5000, 4096),
+            plain.gemm_compute_ns(2048, 5000, 4096)
+        );
     }
 
     #[test]
