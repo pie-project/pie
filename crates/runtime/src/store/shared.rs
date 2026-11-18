@@ -1733,8 +1733,7 @@ impl SharedPool {
     /// rung it holds, and hears a wider one before any fire takes it).
     #[must_use]
     pub fn raise_owed(&self, rung: u32) -> bool {
-        self.pool.act_chunks(rung) > self.pool.act_reserved()
-            || self.pool.rung_of(rung) > self.told
+        self.pool.act_chunks(rung) > self.pool.act_reserved() || self.pool.rung_of(rung) > self.told
     }
 
     /// This pool steers `engine`: the rung it holds is published to the

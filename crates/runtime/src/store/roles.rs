@@ -1067,7 +1067,8 @@ impl Roles {
                 });
             }
         }
-        let mut taken = GuestTaken::default();        let run = state.chunks_a_piece();
+        let mut taken = GuestTaken::default();
+        let run = state.chunks_a_piece();
         if (state.per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
@@ -1646,6 +1647,20 @@ impl Roles {
         go
     }
 
+    /// Whether `owner` is still the engine's to rebind: an instance not
+    /// closed, a channel some open instance or its own registration still
+    /// holds. A restore reads its rebinds off the roles ([`Self::stale`])
+    /// and the lane runs them in turn, closes between them: one the lane
+    /// closed meanwhile is gone from the engine, and nothing reads its
+    /// slots, so its rebind is cancelled, never sent.
+    #[must_use]
+    pub fn rebinds(&self, owner: Owner) -> bool {
+        self.items.get(&owner).is_some_and(|item| match owner {
+            Owner::Instance(_) => item.open,
+            _ => true,
+        })
+    }
+
     /// The engine took `owner`'s new slots.
     pub fn rebound(&mut self, owner: Owner) {
         let (adapter, pair) = match self.items.get_mut(&owner) {
@@ -2105,6 +2120,18 @@ pub fn rebind(
     mut replay: impl FnMut(&mut dyn Engine, InstanceId, Pump) -> ::engine::Result<()>,
 ) -> ::engine::Result<()> {
     let owner = Owner::of(&rebind);
+    // Run on the lane, after any close the lane ran since the restore read
+    // its rebinds: a closed instance is the engine's no longer, and the
+    // runtime never rebinds what it closed.
+    if let Some(roles) = roles
+        && !roles.lock().unwrap().rebinds(owner)
+    {
+        tracing::debug!(
+            ?owner,
+            "a restore's rebind cancelled: closed since it was read"
+        );
+        return Ok(());
+    }
     engine.rebind_slots(rebind)?;
     let Some(roles) = roles else {
         return Ok(());
