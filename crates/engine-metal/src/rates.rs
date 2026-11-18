@@ -42,6 +42,19 @@ use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
 
+
+/// The rates this backend's estimate weighs a fire by, of
+/// `profile::fire::KEYS`: what its load measures where its chip's profile
+/// states none.
+pub const KEYS: [&str; 6] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+];
+
 /// The widest fire this backend's lattice reaches: the tokens a served
 /// Metal load is asked ([`crate::FIRE`]).
 pub const ROWS_TOP: u32 = crate::FIRE.1;
@@ -575,7 +588,7 @@ pub fn at_load(
         check: &check,
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, save, None, max_submit, |_max_submit| {
+    engine::rates::rates_at_load(chip, &KEYS, save, None, max_submit, |_max_submit| {
         Ok(engine::rates::Measured {
             rates: measure(device, measure_chip, &mut |_| {})?,
             unsettled: false,
@@ -691,6 +704,8 @@ pub fn measure(
         hbm_gbps: Some(bytes),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
+        few_row_tflops: None,
+        workgroups_per_core: None,
     })
 }
 
