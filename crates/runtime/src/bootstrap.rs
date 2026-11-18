@@ -540,6 +540,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
     let engine_count = engine_configs.len();
+    // Each engine's share of the host's room, where its device shares the
+    // host's memory: its governor holds its pool within it. Every engine of
+    // this process is on one host, so they share one ledger of its room (the
+    // first reader stated reads it for all), and each pool's grant is
+    // debited before the next reads: N pools are granted the room once.
+    let readers: Vec<Option<::engine::HostRoom>> = engine_configs
+        .iter()
+        .map(|d| d.engine_backend.host_room())
+        .collect();
+    let host = readers
+        .iter()
+        .flatten()
+        .next()
+        .cloned()
+        .map(crate::governor::run::HostShare::new);
+    let mut rooms: Vec<Option<crate::governor::run::PoolRoom>> = readers
+        .iter()
+        .map(|reader| reader.as_ref().and(host.as_ref()).map(|host| host.pool()))
+        .collect();
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
@@ -633,6 +652,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 interval.tick().await;
                 let d = planner.diagnostics();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
+                // Who holds the device pool's slots, whatever the queue.
+                if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
+                    .and_then(|stores| stores.shared)
+                {
+                    println!(
+                        "[pool-held] {}",
+                        shared.lock().unwrap().pool().held_census()
+                    );
+                }
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }
@@ -640,7 +668,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
-                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} gate_parks={} \
+                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      grow_waits={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
@@ -671,6 +699,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_faults_total,
                     d.restores_total,
                     d.restore_failures_total,
+                    d.restore_roles_short_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
@@ -740,8 +769,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
-    for steered in governed {
-        crate::governor::run::start(steered, memory_tolerance);
+    for (engine, steered) in governed.into_iter().enumerate() {
+        let room = rooms.get_mut(engine).and_then(Option::take);
+        crate::governor::run::start(steered, memory_tolerance, room);
     }
     active_guard.disarm();
     Ok(BootstrapHandle {
@@ -938,18 +968,74 @@ fn init_tracing(
     Ok(())
 }
 
+/// Crates whose own debug output buries the runtime's, held down under a
+/// level that would let it through: naga's WGSL frontend writes ~880k lines
+/// at `debug` while a load builds its pipelines, and tarpc writes seven per
+/// gateway heartbeat. A filter that names either target keeps its own say,
+/// and one whose base level is already as quiet gets nothing added: a quiet
+/// target is never made louder than the operator's level.
+const QUIET: [(&str, tracing_subscriber::filter::LevelFilter); 2] = [
+    ("naga", tracing_subscriber::filter::LevelFilter::WARN),
+    ("tarpc", tracing_subscriber::filter::LevelFilter::INFO),
+];
+
+/// The tracing filter for `level`: `RUST_LOG` when it is set, as it says;
+/// otherwise `level` with [`QUIET`]'s targets held down.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(quieted(level)))
+}
+
+/// `filter` with a directive for each [`QUIET`] target it names nowhere and
+/// whose quiet level is below the filter's base level. The base level is
+/// the last directive with no target (`off` where there is none, as an
+/// `EnvFilter` reads it); a directive's target is what precedes its `[`
+/// span or its `=`.
+fn quieted(filter: &str) -> String {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let directives: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .collect();
+    let target_of = |directive: &str| -> Option<String> {
+        let head = directive.split(['[', '=']).next().unwrap_or("");
+        let names_a_target = directive.contains('=') || directive.contains('[');
+        (names_a_target || head.parse::<LevelFilter>().is_err()).then(|| head.trim().to_owned())
+    };
+    let base = directives
+        .iter()
+        .rev()
+        .filter(|d| target_of(d).is_none())
+        .find_map(|d| d.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::OFF);
+    let named = |target: &str| {
+        directives.iter().filter_map(|d| target_of(d)).any(|t| {
+            t == target
+                || t.starts_with(&format!("{target}::"))
+                || target.starts_with(&format!("{t}::"))
+        })
+    };
+    QUIET
+        .iter()
+        .filter(|(target, at)| *at < base && !named(target))
+        .fold(filter.to_owned(), |filter, (target, at)| {
+            format!("{filter},{target}={}", at.to_string().to_lowercase())
+        })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn init_tracing(
     log_dir: Option<&Path>,
     verbose: bool,
     telemetry_config: &TelemetryConfig,
 ) -> Result<()> {
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
 
-    let default_level = if verbose { "debug" } else { "info" };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter = log_filter(if verbose { "debug" } else { "info" });
 
     let file_layer = if let Some(dir) = log_dir {
         fs::create_dir_all(dir)
@@ -987,8 +1073,49 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::seat_cap;
+    use super::{quieted, seat_cap};
     use crate::model::RsCaps;
+
+    #[test]
+    fn a_loud_base_quiets_naga_and_tarpc_and_never_makes_them_louder() {
+        assert_eq!(quieted("debug"), "debug,naga=warn,tarpc=info");
+        assert_eq!(quieted("trace"), "trace,naga=warn,tarpc=info");
+        // At info, naga is held to warn; tarpc already is as quiet.
+        assert_eq!(quieted("info"), "info,naga=warn");
+        // A base at or under each quiet level gets nothing added.
+        assert_eq!(quieted("warn"), "warn");
+        assert_eq!(quieted("error"), "error");
+        assert_eq!(quieted("off"), "off");
+        // A filter that names a target keeps its say, whether the target
+        // itself, one of its modules, or a span directive on it.
+        assert_eq!(quieted("debug,naga=trace"), "debug,naga=trace,tarpc=info");
+        assert_eq!(
+            quieted("debug,naga::front=trace"),
+            "debug,naga::front=trace,tarpc=info"
+        );
+        assert_eq!(
+            quieted("debug,tarpc[RPC]=debug"),
+            "debug,tarpc[RPC]=debug,naga=warn"
+        );
+        // A target that merely contains a quiet one's name is not it.
+        assert_eq!(
+            quieted("debug,naga_extra=info"),
+            "debug,naga_extra=info,naga=warn,tarpc=info"
+        );
+        // Only targets and no base: nothing passes but them, so nothing to quiet.
+        assert_eq!(quieted("runtime=debug"), "runtime=debug");
+        // A bare target name with no level is a target, not the base.
+        assert_eq!(quieted("debug,naga"), "debug,naga,tarpc=info");
+        for filter in [
+            "debug",
+            "info",
+            "warn",
+            "debug,naga::front=trace",
+            "debug,tarpc[RPC]=debug",
+        ] {
+            assert!(tracing_subscriber::EnvFilter::try_new(quieted(filter)).is_ok());
+        }
+    }
 
     /// What bootstrap reads of a load's chunk facts for the model's
     /// recurrent state: whether it holds any, and its RsCaps.
@@ -1010,14 +1137,15 @@ mod tests {
     /// size, a record's and not a slot's, and it skips the cap.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts = ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-            kv_pages: 8,
-            kv_page_size: 16,
-            kv_page_bytes: 4096,
-            state_slots: 4,
-            state_slot_bytes: 1 << 20,
-            ..::engine::chunk::DegeneratePools::default()
-        });
+        let mut facts =
+            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
+                kv_pages: 8,
+                kv_page_size: 16,
+                kv_page_bytes: 4096,
+                state_slots: 4,
+                state_slot_bytes: 1 << 20,
+                ..::engine::chunk::DegeneratePools::default()
+            });
         facts.record_bytes = 0;
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
@@ -1027,10 +1155,22 @@ mod tests {
         let (hybrid, caps) = read(&facts);
         assert!(hybrid && caps.has_state());
         assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
-        assert_eq!(seat_cap(512, hybrid, Some(45)), 512, "hybrid: admitted by its planner");
+        assert_eq!(
+            seat_cap(512, hybrid, Some(45)),
+            512,
+            "hybrid: admitted by its planner"
+        );
 
-        assert_eq!(seat_cap(512, false, None), 512, "no seated-first pool, no cap");
-        assert_eq!(seat_cap(16, false, Some(45)), 16, "a cap under the seats stands");
+        assert_eq!(
+            seat_cap(512, false, None),
+            512,
+            "no seated-first pool, no cap"
+        );
+        assert_eq!(
+            seat_cap(16, false, Some(45)),
+            16,
+            "a cap under the seats stands"
+        );
         assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
     }
 }

@@ -359,6 +359,12 @@ impl Region {
 #[derive(Debug)]
 pub struct Inputs {
     store: Region,
+    /// The token rows and lanes the regions below are laid for: the
+    /// rung's. A fire past either is refused before anything is staged, as
+    /// its rows would run on into the next region (a kv write table run on
+    /// into its offsets, read as page ids).
+    rows: u32,
+    lanes: u32,
     tokens: u64,
     positions: u64,
     rotations: u64,
@@ -546,6 +552,8 @@ impl Inputs {
         // ([`Region::place`]); nothing of its own.
         Ok(Inputs {
             store: Region::unplaced(total, Buffer::zeroed(device, 0)?),
+            rows: budget.max_tokens,
+            lanes: budget.max_lanes,
             tokens,
             positions,
             rotations,
@@ -675,6 +683,18 @@ impl Inputs {
         let rows = fire.tokens.len() as u32;
         let width = self.bands.iter().sum::<u32>().max(1);
         let lanes = fire.slot_ids.len() as u32 / width;
+        for (what, need, have) in [
+            ("token rows a fire stages in its rung's regions", rows, self.rows),
+            ("lanes a fire stages in its rung's regions", lanes, self.lanes),
+        ] {
+            if need > have {
+                return Err(Fault::Ceiling {
+                    what,
+                    need: u64::from(need),
+                    have: u64::from(have),
+                });
+            }
+        }
 
         let valid = vec![1u8; rows as usize];
 
@@ -1432,5 +1452,68 @@ fn bytes_of(values: &[i32]) -> &[u8] {
     // readable as `u8`.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod rung_tests {
+    use super::{Fire, Inputs};
+    use crate::device::{Context, Handles};
+    use crate::error::Fault;
+    use crate::store::kv::Paging;
+    use poem_compiler::Budget;
+
+    /// A fire wider than the rung its regions were laid for is refused
+    /// before a byte is staged. Staged, its rows ran on into the next
+    /// region: the kv write table into its offsets, read as page ids 0..15,
+    /// and the append wrote kv rows over the engine's tables run and the
+    /// instances' status words.
+    #[test]
+    fn a_fire_wider_than_its_rung_is_refused_before_it_is_staged() {
+        let device = Context::bind().expect("a Metal 4 device");
+        let budget = Budget {
+            max_lanes: 4,
+            max_tokens: 4,
+            buckets: vec![4],
+            max_adapters: 0,
+            readouts_per_lane: 1,
+        };
+        let paging = Paging::of(16, 64, 4, 1).expect("paging");
+        let mut inputs = Inputs::reserve(
+            &device, &budget, paging, 1, 1, 0, None, None, false, &[], 0, &[1], 4, 0,
+        )
+        .expect("a rung's regions");
+        let wide = [0i32; 5];
+        let lane = [0i32; 1];
+        let fire = Fire {
+            tokens: &wide,
+            positions: &wide,
+            rotations: &wide,
+            windows: &[],
+            slot_ids: &lane,
+            slot_of_row: &wide,
+            adapter_routes: None,
+            request_of_token: &wide,
+            readout_rows: &lane,
+            page_tables: &[],
+            mask: None,
+            patches: None,
+            voxels: None,
+            mrope_positions: None,
+            rs_replay: None,
+            rs_commit: None,
+            rs_snaps: None,
+            rs_pages: None,
+            group_of_lane: &lane,
+            packings: &[],
+        };
+        let refused = inputs.write(&Handles::new(), &fire).err();
+        assert!(
+            matches!(
+                refused,
+                Some(Fault::Ceiling { what: "token rows a fire stages in its rung's regions", need: 5, have: 4 })
+            ),
+            "{refused:?}"
+        );
     }
 }

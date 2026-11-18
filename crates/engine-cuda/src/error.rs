@@ -57,6 +57,15 @@ pub enum Fault {
         have: u64,
     },
 
+    /// A fire's carve that asks a value more bytes than the arena map laid
+    /// its slot: the value's rows would land in a neighbour's.
+    Overcarved {
+        value: u32,
+        rows: u32,
+        need: u64,
+        laid: u64,
+    },
+
     Mask {
         lane: u32,
         stated: u64,
@@ -204,6 +213,17 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"
+            ),
+            Self::Overcarved {
+                value,
+                rows,
+                need,
+                laid,
+            } => write!(
+                f,
+                "this fire carves value {value} at {rows} rows, {need} bytes, and the arena \
+                 laid its slot for {laid}: its rows past the slot would land in another \
+                 value's"
             ),
             Self::Mask {
                 lane,

@@ -310,7 +310,7 @@ pub mod rt {
             return asked;
         }
         // The load opens every stream it fires on before its pools.
-        match kernels_cuda::hip::kfd::save_areas(u32::MAX) {
+        match kernels_cuda::hip::kfd::held() {
             Ok(areas) => {
                 // SAFETY: the caller's live out-parameter, just written.
                 unsafe { *free = (*free).saturating_sub(areas.bytes() as usize) };

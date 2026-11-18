@@ -11,12 +11,11 @@
 //! current rung's carve is state's to take.
 //!
 //! A capturing lane's score rows (`poem_ir::Dim::Capturing`,
-//! `Placement::Capture`) are no arena value and no part of a rung's carve:
-//! a fire lays them in its guest region, right under its rung's carve, one
-//! key row for each capturing lane in lane order and one page row for each
-//! of those whose program reads pages ([`CaptureRows`]). The reading
-//! program's per-member term states them (`Engine::fire_facts`), and the
-//! runtime cuts such a fire to a rung they fit beside.
+//! `Placement::Capture`) are no arena value and no part of the span: a fire
+//! lays them in the score room of a pair it carries that reads them, state
+//! of that pair in the pool (`crate::guest::state`), one key row for each
+//! capturing lane in lane order and one page row for each of those whose
+//! program reads pages ([`CaptureRows`]).
 
 use kernels_slang::Tensor;
 use poem_compiler::{ArenaMap, Budgets, CompiledModel, FireRows, Placement};
@@ -33,7 +32,7 @@ use crate::store::kv::Paging;
 /// What a rung's carve and its rooms are each aligned to: no storage
 /// binding a device asks more of (Vulkan's `minStorageBufferOffsetAlignment`
 /// is at most 256).
-const ALIGN: u64 = 256;
+pub const ALIGN: u64 = 256;
 
 /// One rung: fires of at most `tokens` tokens and as many lanes.
 #[derive(Debug)]
@@ -52,7 +51,7 @@ pub struct Rung {
 /// The score rows of a load whose trace captures (`Dim::Capturing`): a
 /// capturing lane's key row is a mass a key of the load's context, and its
 /// page row a mass a kv page of it. No arena slot holds either: a fire lays
-/// its capturing lanes' rows in its guest region, under its rung's carve.
+/// its capturing lanes' rows in a reading pair's score room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureRows {
     /// The keys of the load's context: a key row's f32s.
@@ -113,20 +112,14 @@ impl CaptureRows {
         u64::from(self.pages) * 4
     }
 
-    /// Where the page rows start in a guest region of `keys` key rows and
-    /// `pages` page rows, and the region's bytes: the key rows first, each
-    /// run aligned.
-    fn region(&self, keys: u32, pages: u32) -> (u64, u64) {
+    /// Where the page rows start in a room of `keys` key rows and `pages`
+    /// page rows, and the room's bytes: the key rows first, each run
+    /// aligned.
+    #[must_use]
+    pub fn region(&self, keys: u32, pages: u32) -> (u64, u64) {
         let pages_at = (u64::from(keys) * self.key_bytes()).next_multiple_of(ALIGN);
         let pages = (u64::from(pages) * self.page_bytes()).next_multiple_of(ALIGN);
         (pages_at, if keys == 0 { 0 } else { pages_at + pages })
-    }
-
-    /// The most the region's alignment adds to a fire's rows: what a
-    /// program's term states once beside its lanes' rows.
-    #[must_use]
-    pub const fn slack() -> u64 {
-        2 * (ALIGN - 1)
     }
 }
 
@@ -200,12 +193,12 @@ pub struct Span<B: Backend> {
     /// For each rung, the carve its fires take ([`Span::widen`]).
     widest: Vec<usize>,
     routers: Vec<u32>,
-    /// The score rows a capturing lane takes in a fire's guest region,
-    /// where the trace captures.
+    /// The score rows a capturing lane takes in a pair's score room, where
+    /// the trace captures.
     capture: Option<CaptureRows>,
     /// The pool's last segment and the byte in it the span ends at: the
-    /// segment is the span a fire's carve and its guest region may take
-    /// together, and the pool states it so (`ChunkFacts::act_span_chunks`).
+    /// segment is the span a fire's carve may take, and the pool states it
+    /// so (`ChunkFacts::act_span_chunks`).
     place: Option<(B::Buffer, u64)>,
 }
 
@@ -247,7 +240,7 @@ impl<B: Backend> Span<B> {
         self.rungs.iter().map(Rung::bytes).max().unwrap_or(0)
     }
 
-    /// The score rows a capturing lane takes in a fire's guest region;
+    /// The score rows a capturing lane takes in a pair's score room;
     /// `None` where the trace captures nothing.
     #[must_use]
     pub fn capture(&self) -> Option<CaptureRows> {
@@ -342,17 +335,20 @@ impl<B: Backend> Span<B> {
         Ok(end - self.rungs[rung].bytes)
     }
 
-    /// A fire's slots at rung `rung`: its carve at its place and, right
-    /// under it, its guest region: a key row for each of the fire's
-    /// capturing lanes and a page row for each of those whose program reads
-    /// pages (`scored`). Every layer's capture is the one key row it adds
-    /// into; a fire none of whose lanes captures binds no row.
+    /// A fire's slots at rung `rung`: its carve at its place and, where a
+    /// lane of it captures (`scored`), its capturing lanes' rows in `room`
+    /// (a reading pair's score room: its segment buffer, first byte and
+    /// bytes): a key row for each of the fire's capturing lanes and a page
+    /// row for each of those whose program reads pages. Every layer's
+    /// capture is the one key row it adds into; a fire none of whose lanes
+    /// captures binds no row.
     pub fn slots(
         &self,
         handles: &Handles<B>,
         rung: usize,
         rows: FireRows,
         scored: Scored,
+        room: Option<(&B::Buffer, u64, u64)>,
     ) -> Result<SlotTable> {
         let (buffer, end) = self.placed()?;
         let at = &self.rungs[rung];
@@ -360,20 +356,27 @@ impl<B: Backend> Span<B> {
         let captured = match self.capture {
             Some(capture) if scored.rows() > 0 => {
                 let (pages_at, region) = capture.region(scored.rows(), scored.page_rows());
-                let need = at.bytes.saturating_add(region);
-                if need > end {
+                let Some((room, room_at, room_bytes)) = room else {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a score room for the {} capturing lane(s) of a fire, which no \
+                             lane's pair keeps: a lane captures only where a program it \
+                             runs reads its scores",
+                            scored.rows()
+                        ),
+                    });
+                };
+                if region > room_bytes {
                     return Err(Fault::Ceiling {
-                        what: "bytes of the activation span for a fire's carve and its guest \
-                               region's score rows",
-                        need,
-                        have: end,
+                        what: "bytes of a pair's score room for a fire's capturing lanes",
+                        need: region,
+                        have: room_bytes,
                     });
                 }
-                let region_at = base - region;
                 let keys = Tensor::new(
                     handles.bind(
-                        buffer,
-                        region_at,
+                        room,
+                        room_at,
                         u64::from(scored.rows()) * capture.key_bytes(),
                     )?,
                     scored.rows(),
@@ -384,8 +387,8 @@ impl<B: Backend> Span<B> {
                     .then(|| {
                         Ok::<_, Fault>(Tensor::new(
                             handles.bind(
-                                buffer,
-                                region_at + pages_at,
+                                room,
+                                room_at + pages_at,
                                 u64::from(scored.page_rows()) * capture.page_bytes(),
                             )?,
                             scored.page_rows(),
@@ -500,9 +503,9 @@ mod tests {
 
     use super::{ALIGN, CaptureRows, Grain, grain};
 
-    /// A guest region lays its key rows, then its page rows, each run
-    /// aligned, and none where no lane captures; what the term states
-    /// covers it at every count.
+    /// A score room lays its key rows, then its page rows, each run
+    /// aligned, and none where no lane captures; a pair's room, laid for
+    /// the most lanes a fire carries, holds every fire's rows.
     #[test]
     fn a_guest_region_lays_a_key_row_a_capturing_lane_and_a_page_row_a_reader() {
         let rows = CaptureRows { keys: 2048, pages: 128 };
@@ -515,11 +518,8 @@ mod tests {
             let (pages_at, bytes) = odd.region(keys, pages);
             assert_eq!(pages_at % ALIGN, 0);
             assert!(
-                bytes
-                    <= u64::from(keys) * odd.key_bytes()
-                        + u64::from(pages) * odd.page_bytes()
-                        + CaptureRows::slack(),
-                "{keys} key rows and {pages} page rows past the term"
+                bytes <= odd.region(64, 64).1,
+                "{keys} key rows and {pages} page rows past a 64-lane room"
             );
         }
     }

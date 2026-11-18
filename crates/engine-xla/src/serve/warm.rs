@@ -1,5 +1,5 @@
-//! Warm fires at load (`[engine] prewarm = true`): the fire shapes a server meets
-//! first are traced, compiled (or loaded from the disk cache, where a warm
+//! Warm fires at load, every load, before it answers ready: the fire shapes a
+//! server meets are traced, compiled (or loaded from the disk cache, where a warm
 //! machine finds them) and run once before the first request, as engine-cuda
 //! arms its bodies (`serve/arming.rs`), so no request waits on a compile.
 //!
@@ -33,6 +33,9 @@ struct Want {
     word: u64,
     rows: u32,
     held_pages: u32,
+    /// The lane reads out every row (a drafting lane's window), not its
+    /// last.
+    all_rows: bool,
 }
 
 impl Shell {
@@ -47,6 +50,14 @@ impl Shell {
                 !shell.masked.contains(class)
                     && !shell.wide.contains(class)
                     && !shell.corrected.contains(class)
+                    // a class reading a guest input fires only with its
+                    // channel's cell, which a synthetic lane has none of
+                    && !shell
+                        .dit
+                        .feeds()
+                        .inputs
+                        .iter()
+                        .any(|(_, readers)| readers.contains(class))
             })
         };
         if !plain(self, decode) || !plain(self, prefill) || self.patch_seat.is_some() {
@@ -72,13 +83,18 @@ impl Shell {
             word,
             rows,
             held_pages: 0,
+            all_rows: false,
         };
         let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
         let mut pages = pad.rung(pad.page_floor).min(cap);
         while pages <= cap {
-            // A lane at this bound holds more than half of it.
-            let seats = u32::try_from(pool / u64::from(pages / 2).max(1)).unwrap_or(u32::MAX);
+            // A fire's page bound is its longest lane's: that lane holds more
+            // than half of it, every other lane a page at least (over-demand:
+            // 64 decodes beside one long lane at 64 pages compiled mid-run,
+            // where the ladder had seated every lane past half the bound).
+            let seats = u32::try_from(1 + pool.saturating_sub(u64::from(pages / 2 + 1)))
+                .unwrap_or(u32::MAX);
             // and the rung the most lanes it seats pad to (Qwen3.6-35B-A3B's
             // v5e pool seats 126: its c256 decodes ran 128 lanes, compiled
             // mid-run)
@@ -88,6 +104,7 @@ impl Shell {
                     word: decode,
                     rows: 1,
                     held_pages: pages,
+                    all_rows: false,
                 };
                 shapes.push(vec![lane; n as usize]);
             }
@@ -122,18 +139,11 @@ impl Shell {
         {
             shapes.push(vec![fresh(prefill, b)]);
             shapes.push(vec![fresh(prefill, b - 1)]);
-            for n in [4u32, 8, 16, 32, 64] {
-                // A hybrid's prompts, cut at their last whole page, fire many
-                // and short; so do a load's whose lanes stop short of a wide
-                // fire's 64, from 2048 rows (v6e gpt-oss c32: 16 prompts of
-                // 2893 rows).
-                let narrow = max_lanes < 64 && n == 32 && b >= 2048 && n <= max_lanes;
-                let shown = if hybrid {
-                    b / n >= 2
-                } else {
-                    n <= 8 && b >= 64
-                };
-                if (shown && n <= lanes_cap) || (!hybrid && narrow) {
+            // Every lane rung whose prompts (two rows at least, a decode's
+            // one) fit the rows: a burst of short prompts fires many at once
+            // (c64: 64 prompt tails of 3 rows in 256 rows compiled mid-run).
+            for &n in buckets.iter().filter(|&&n| n >= 2 && n <= lanes_cap) {
+                if b / n >= 2 {
                     // `n - 1` lanes and the padding lane the rest takes (two
                     // or three lanes pad to four).
                     shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
@@ -171,13 +181,17 @@ impl Shell {
                 }
             }
         }
-        // Prefills beside decodes (`MIXED_HOST_RUNG` prefill lanes): every
-        // decode lane rung at every row rung from 256 it fits in, and at the
-        // padding rung, which a full fire's decode pads overflow into.
+        // Prefills beside decodes: every decode lane rung at every row rung
+        // it fits in, and at the padding rung, which a full fire's decode
+        // pads overflow into. A fire's prompt lanes pad to a lane rung from
+        // `MIXED_HOST_RUNG` up (`canonical_pads`), so every such rung `p` is
+        // taken too, where `p / 2` prompts of two rows each (the fewest that
+        // pad to it) fit beside the decodes in the rows and `p + d` in the
+        // lanes: what the cutter can form, no more (c64 and over-demand:
+        // 10 to 40 prompt tails of 3 rows beside decodes at 32 to 128 rows
+        // compiled mid-run).
         let host = pad.mixed_host_rung;
-        // A hybrid fires a prompt's tail behind its last whole page beside
-        // the decodes: its mixed fires take every row rung.
-        let least = if hybrid { pad.prefill_floor } else { 256 };
+        let least = pad.prefill_floor;
         // (A fire that prefills pads its decodes to `pad.rung`: a half rung of
         // the ladder is a decode-only fire's.)
         for &d in buckets
@@ -197,6 +211,20 @@ impl Shell {
                 let mut lanes = vec![fresh(decode, 1); d as usize];
                 lanes.push(fresh(prefill, rows));
                 shapes.push(lanes);
+                let mut p = pad.next(host);
+                while p + d <= max_lanes {
+                    let n = p / 2;
+                    // the prompts' rows: the bucket, less the decodes, the
+                    // one-row lanes their count pads with and the rest lane
+                    let r = b.saturating_sub(d + p - n);
+                    if b != top && r >= 2 * n {
+                        let mut lanes = vec![fresh(decode, 1); d as usize];
+                        lanes.extend(std::iter::repeat_n(fresh(prefill, r / n), n as usize));
+                        lanes[d as usize].rows += r % n;
+                        shapes.push(lanes);
+                    }
+                    p = pad.next(p);
+                }
                 // A fire this wide holds many prompts beside its decodes: their
                 // lanes pad to 32 or 64 (v6e gpt-oss c256 at 4096-row fires:
                 // 27 prompts and a decode compiled mid-run, twice, 48 s), and
@@ -245,6 +273,42 @@ impl Shell {
                     lanes.extend(std::iter::repeat_n(fresh(prefill, rows / n), n as usize));
                     lanes[d as usize].rows += rows % n;
                     shapes.push(lanes);
+                }
+            }
+        }
+        // A drafting lane (a load whose model drafts, `draft_depth`) reads
+        // out every row of its window: its prompt at every row rung, and
+        // its verify window (a token and its drafts, as deep as the model
+        // drafts) at every page bound, one lane each (the MTP inferlet:
+        // a 2-row window and a 29-row prompt compiled mid-run). Many
+        // drafting lanes at once fire unpadded, at their own lane counts
+        // (`canonical_pads` takes a lane reading one row): those stay off
+        // the ladder until lanes are data.
+        if let Some(depth) = self.trace().facts.draft_depth {
+            let drafts = facts.word(&Request::new(2, false).drafting(true));
+            let window = facts.word(&Request::new(1 + depth, false).drafting(true));
+            // (a fire reads out no more rows than the load's store holds, its
+            // padding lane's among them)
+            let store = self.readout_store_rows().unwrap_or(u32::MAX);
+            if plain(self, drafts) && plain(self, window) {
+                for &b in buckets
+                    .iter()
+                    .filter(|&&b| (pad.prefill_floor.max(2)..=widest.min(store)).contains(&b))
+                {
+                    shapes.push(vec![Want {
+                        all_rows: true,
+                        ..fresh(drafts, b - 1)
+                    }]);
+                }
+                let mut pages = pad.rung(pad.page_floor).min(cap);
+                while pages <= cap {
+                    shapes.push(vec![Want {
+                        word: window,
+                        rows: 1 + depth,
+                        held_pages: pages,
+                        all_rows: true,
+                    }]);
+                    pages = pad.next(pages);
                 }
             }
         }
@@ -518,7 +582,7 @@ impl Shell {
         let page_size = self.paging().page_size.max(1);
         // Every lane reads the same scratch slots: what warm fires write is
         // never read back, and the pool need not hold a page per lane.
-        let owned: Vec<(Vec<u32>, crate::store::Scratch)> = shape
+        let owned: Vec<(Vec<u32>, crate::store::Scratch, Vec<u32>)> = shape
             .iter()
             .map(|want| {
                 let n = (held_of(want, page_size) + want.rows)
@@ -527,6 +591,7 @@ impl Shell {
                 (
                     vec![0; want.rows as usize],
                     self.pools.scratch(0, n as usize),
+                    (0..want.rows).collect(),
                 )
             })
             .collect();
@@ -537,7 +602,7 @@ impl Shell {
             .iter()
             .zip(&owned)
             .enumerate()
-            .map(|(at, (want, (tokens, scratch)))| {
+            .map(|(at, (want, (tokens, scratch, every)))| {
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word: want.word,
@@ -547,6 +612,9 @@ impl Shell {
                 seated.window = &scratch.window;
                 seated.fixed = &scratch.fixed;
                 seated.held = Some(held_of(want, page_size));
+                if want.all_rows {
+                    seated.readout = Some(every);
+                }
                 seated
             })
             .collect();
@@ -557,8 +625,12 @@ impl Shell {
     }
 }
 
-/// A decode lane at page bound `p` holds `p · page_size - 1` rows, so its
-/// token lands in the last slot of its `p`-th page; a fresh lane holds none.
+/// A lane at page bound `p` holds `p · page_size` rows less its own, so
+/// its last row lands in the last slot of its `p`-th page; a fresh lane
+/// holds none.
 fn held_of(want: &Want, page_size: u32) -> u32 {
-    (want.held_pages * page_size).saturating_sub(want.rows.min(1))
+    if want.held_pages == 0 {
+        return 0;
+    }
+    (want.held_pages * page_size).saturating_sub(want.rows)
 }

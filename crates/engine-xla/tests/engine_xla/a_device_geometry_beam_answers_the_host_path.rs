@@ -226,6 +226,8 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
             extents: engine::program::BindExtents {
                 row_count: BEAMS,
                 token_count: BEAMS,
@@ -408,6 +410,8 @@ fn device_fed_tokens_reach_the_next_fire() {
             instance_slots: Vec::new(),
             ring_slots,
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
             extents: engine::program::BindExtents {
                 row_count: 1,
                 token_count: 1,

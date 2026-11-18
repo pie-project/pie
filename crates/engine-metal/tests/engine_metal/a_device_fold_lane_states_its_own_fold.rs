@@ -153,8 +153,12 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
     let channel = layout.channel.expect("a channel shape");
-    let slots: Vec<u32> = (instance.per_chunk..instance.per_chunk + facts.instance.slots).collect();
-    let mut next = 2 * channel.per_chunk;
+    // From the first chunk no slot holds: past the engine's tables run,
+    // which no slot names, and the seats' runs.
+    let free = layout.free_chunk();
+    let first = free * instance.per_chunk;
+    let slots: Vec<u32> = (first..first + facts.instance.slots).collect();
+    let mut next = (free + 1) * channel.per_chunk;
     let rings: Vec<engine::RingSlots> = facts
         .rings
         .iter()
@@ -167,22 +171,26 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
             }
         })
         .collect();
+    let extents = eta_exec::Extents {
+        row_count: lanes * ROWS,
+        token_count: lanes * ROWS,
+        sampled_rows: lanes,
+        query_len: ROWS,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) = crate::guest_places(&mut shell, program, &extents, 0);
     let id = shell
         .bind_program(
             program,
             &[],
-            eta_exec::Extents {
-                row_count: lanes * ROWS,
-                token_count: lanes * ROWS,
-                sampled_rows: lanes,
-                query_len: ROWS,
-                ..eta_exec::Extents::default()
-            },
+            extents,
             GeometryClass::DeviceGeometry,
             PortMask::NONE,
             &[engine::ChannelId(7)],
             &slots,
             &rings,
+            &scratch,
+            &pair,
         )
         .expect("the device-geometry instance binds");
     let verbs: Vec<RsVerb> = (0..lanes).map(|_| buffering(&shell)).collect();

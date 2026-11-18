@@ -459,6 +459,7 @@ pub unsafe fn hipStreamCreateWithFlags(stream: *mut Stream, flags: c_uint) -> Hi
 }
 
 pub unsafe fn hipStreamDestroy(stream: Stream) -> HipError {
+    super::kfd::forget(stream);
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipStreamDestroy)(stream) },
@@ -745,6 +746,26 @@ pub unsafe fn hipFuncGetAttribute(value: *mut c_int, attr: c_int, function: Func
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipFuncGetAttribute)(value, attr, function) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
+pub unsafe fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+    blocks: *mut c_int,
+    function: Function,
+    block: c_int,
+    shared_bytes: usize,
+) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe {
+            (api.hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor)(
+                blocks,
+                function,
+                block,
+                shared_bytes,
+            )
+        },
         Err(_) => hipErrorNotInitialized,
     }
 }

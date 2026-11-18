@@ -48,8 +48,6 @@ moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 sdpa.compressed_replay = true
 ssm.gdn_fused_scan = true
 ssm.conv_vec4 = true
@@ -99,8 +97,6 @@ measured = [
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_mma_per_from",
   "kernel.moe.mxfp4_select_lean",
-  "kernel.moe.bf16_mma_from",
-  "kernel.moe.bf16_mma_until",
   "kernel.ssm.gdn_fused_scan",
   "kernel.ssm.gdn_step_blocks",
   "kernel.ssm.conv_vec4",

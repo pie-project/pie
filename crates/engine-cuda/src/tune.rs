@@ -91,16 +91,16 @@ pub fn rates(
 
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
 /// its pages and context.
-pub(crate) struct Shape {
-    pub(crate) slots: u32,
-    pub(crate) budget: poem_compiler::Budget,
-    pub(crate) patches: Option<poem_compiler::PatchLadder>,
-    pub(crate) page_size: u32,
-    pub(crate) context: u32,
+pub struct Shape {
+    pub slots: u32,
+    pub budget: poem_compiler::Budget,
+    pub patches: Option<poem_compiler::PatchLadder>,
+    pub page_size: u32,
+    pub context: u32,
 }
 
 /// Load `artifact` under `knobs` shaped by `shape` (from the trace).
-pub(crate) fn load(
+pub fn load(
     artifact: &Path,
     deployment: &str,
     knobs: crate::Knobs,
@@ -283,7 +283,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     Some(h.finish())
 }
 
-pub(crate) fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
+pub fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
     crate::api::patch_ladder(
         trace,
         &engine::load::Budgets {
@@ -461,146 +461,6 @@ pub fn run(
     })
 }
 
-/// Contract A at eight decode lanes: each lane's greedy decode served in
-/// one fire of eight (the few-rows products at eight rows) against the same
-/// lane served alone (one row, the gemv), token for token; a step where the
-/// two pick apart is admitted only as a near-tie (the drift over the full
-/// row diffuse, and the decision's gap within twice its largest per-logit
-/// move). Run by hand on a served model:
-/// `PIE_CONTRACT_ARTIFACT=<.zt> PIE_CONTRACT_DEPLOYMENT=<row>`.
-#[cfg(all(test, feature = "cuda"))]
-mod eight_lanes {
-    use super::*;
-
-    const LANES: u32 = 8;
-    const PROMPT: u32 = 128;
-    const STEPS: usize = 32;
-
-    fn argmax(row: &[f32]) -> usize {
-        row.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map_or(0, |(at, _)| at)
-    }
-
-    /// The decision's top-1 less its top-2.
-    fn gap(row: &[f32]) -> f32 {
-        let mut top = [f32::NEG_INFINITY; 2];
-        for &v in row {
-            if v > top[0] {
-                top = [v, top[0]];
-            } else if v > top[1] {
-                top[1] = v;
-            }
-        }
-        top[0] - top[1]
-    }
-
-    #[test]
-    #[ignore = "a contract check run by hand on a served model"]
-    fn eight_lanes_decode_as_each_lane_alone_up_to_near_ties() {
-        let (Some(artifact), Some(deployment)) = (
-            std::env::var_os("PIE_CONTRACT_ARTIFACT"),
-            std::env::var("PIE_CONTRACT_DEPLOYMENT").ok(),
-        ) else {
-            eprintln!("skipping: PIE_CONTRACT_ARTIFACT / PIE_CONTRACT_DEPLOYMENT unset");
-            return;
-        };
-        let slots = 2 * LANES;
-        let (mut shell, trace) = load(
-            Path::new(&artifact),
-            &deployment,
-            crate::Knobs::default(),
-            |trace| Shape {
-                slots,
-                budget: poem_compiler::Budget::new(LANES, 0),
-                patches: patches(trace, LANES),
-                page_size: 16,
-                context: 1024,
-            },
-        )
-        .expect("the model loads");
-        let word = |n: usize| trace.facts.word(&poem::Request::new(n as u32, false));
-        let prompt = |lane: u32| -> Vec<u32> {
-            (0..PROMPT)
-                .map(|i| 1000 + (i * 7919 + lane * 104_729) % 20_000)
-                .collect()
-        };
-        // Lane `l` runs in slot `l` with the others (batched) and in slot
-        // `LANES + l` alone; both prefill alone, the same rows.
-        let mut last = [[0u32; 2]; LANES as usize];
-        for lane in 0..LANES {
-            for (side, slot) in [(0, lane), (1, LANES + lane)] {
-                shell.open(slot).expect("a slot opens");
-                let tokens = prompt(lane);
-                let rows = shell
-                    .fire(&[crate::Lane {
-                        slot,
-                        word: word(tokens.len()),
-                        tokens: &tokens,
-                    }])
-                    .expect("the prompt fires");
-                last[lane as usize][side] = argmax(&rows[0]) as u32;
-            }
-        }
-        let mut parted = vec![false; LANES as usize];
-        let (mut same, mut ties) = (0usize, 0usize);
-        for step in 0..STEPS {
-            let next: Vec<[u32; 1]> = (0..LANES as usize).map(|l| [last[l][0]]).collect();
-            let lanes: Vec<crate::Lane> = (0..LANES)
-                .map(|l| crate::Lane {
-                    slot: l,
-                    word: word(1),
-                    tokens: &next[l as usize],
-                })
-                .collect();
-            let batched = shell.fire(&lanes).expect("the eight lanes fire");
-            for lane in 0..LANES as usize {
-                let token = [last[lane][1]];
-                let alone = shell
-                    .fire(&[crate::Lane {
-                        slot: LANES + lane as u32,
-                        word: word(1),
-                        tokens: &token,
-                    }])
-                    .expect("the lane fires alone")
-                    .swap_remove(0);
-                let (a, b) = (&alone, &batched[lane]);
-                let (ta, tb) = (argmax(a), argmax(b));
-                if !parted[lane] && ta != tb {
-                    let moved: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
-                    let drift = moved.iter().copied().fold(0.0f32, f32::max);
-                    let elsewhere = moved
-                        .iter()
-                        .enumerate()
-                        .filter(|(t, _)| *t != ta && *t != tb)
-                        .map(|(_, d)| *d)
-                        .fold(0.0f32, f32::max);
-                    let diffuse = moved[ta] <= elsewhere && moved[tb] <= elsewhere;
-                    let (ga, gb) = (gap(a), gap(b));
-                    let tie = diffuse && ga.max(gb) <= 2.0 * drift;
-                    println!(
-                        "lane {lane} parts at step {step}: alone {ta} batched {tb}; gap {ga:.4} / \
-                         {gb:.4}, max drift {drift:.4}, diffuse {diffuse}: {}",
-                        if tie { "near-tie" } else { "NOT a near-tie" }
-                    );
-                    assert!(tie, "lane {lane} parts at step {step} on no near-tie");
-                    parted[lane] = true;
-                    ties += 1;
-                } else if !parted[lane] {
-                    same += 1;
-                }
-                // Side 0 is the batched slot's, side 1 the lone one's.
-                last[lane] = [tb as u32, ta as u32];
-            }
-        }
-        println!(
-            "{deployment}: {LANES} lanes x {STEPS} steps: {same} steps the same token, {ties} \
-             lane(s) parted on a near-tie"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,7 +484,7 @@ mod tests {
         let registry = crate::chip::registry();
         let knobs = search::knobs(&base, SEARCH_SKIPS, "");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
-        for want in ["kernel.moe.grouped", fused] {
+        for want in ["kernel.moe.mxfp4_grouped", fused] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
         }
         for k in &knobs {

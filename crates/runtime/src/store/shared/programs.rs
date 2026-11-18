@@ -715,12 +715,7 @@ pub async fn take_raise(
                 super::ask_walk(mover.engine());
                 None
             }
-            Some(at)
-                if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.copying().is_some() =>
-            {
-                None
-            }
+            Some(at) if !pool.raise_owed(at) || pool.copying().is_some() => None,
             Some(at) => {
                 let stood = pool.stands_at(at);
                 pool.plan_raise(at).ok().and_then(|evacuation| {
@@ -898,19 +893,45 @@ impl Funder for Planner {
         let Some(planner) = crate::planner::planner_of(self.pid) else {
             return Err(format!("process {} has no planner to fund it", self.pid));
         };
-        let demand = crate::planner::Demand {
-            kv_pages: pages,
-            rs: crate::store::rs::RsUnits::default(),
-        };
-        match planner.acquire(self.pid, self.quorum, demand).await {
-            Ok(crate::planner::Acquired::Granted(grant)) => {
-                // Given back at once: the raise takes the room it freed.
-                drop(grant);
-                Ok(true)
-            }
-            Ok(crate::planner::Acquired::Requote | crate::planner::Acquired::Yield) => Ok(false),
-            Err(error) => Err(error.to_string()),
+        fund_with(&planner, self.pid, self.quorum, pages).await
+    }
+}
+
+/// `pid`'s ask of `pages` kv pages of `planner` for a span short of room,
+/// as a waiter of `quorum`.
+///
+/// Suspended meanwhile, the process has nothing to ask until it is
+/// resident again: the planner answers its ask at once (`Yield`), and asked
+/// again at once, the span walk spun on its worker with no await between
+/// asks, holding the planner's own task (woken there, in the worker's
+/// next-task slot, which no other worker takes) off every worker: no plan
+/// ran again, and every waiter stood with pages free. It asks again once
+/// its residency comes back, the planner's event.
+pub async fn fund_with(
+    planner: &std::sync::Arc<crate::planner::ResidencyPlanner>,
+    pid: uuid::Uuid,
+    quorum: uuid::Uuid,
+    pages: u32,
+) -> Result<bool, String> {
+    let demand = crate::planner::Demand {
+        kv_pages: pages,
+        rs: crate::store::rs::RsUnits::default(),
+    };
+    match planner.acquire(pid, quorum, demand).await {
+        Ok(crate::planner::Acquired::Granted(grant)) => {
+            // Given back at once: the raise takes the room it freed.
+            drop(grant);
+            Ok(true)
         }
+        Ok(crate::planner::Acquired::Yield) => {
+            planner
+                .wait_resident(pid)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(false)
+        }
+        Ok(crate::planner::Acquired::Requote) => Ok(false),
+        Err(error) => Err(error.to_string()),
     }
 }
 

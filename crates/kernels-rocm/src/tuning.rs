@@ -101,12 +101,6 @@ pub struct QmmSplitWideMax(pub u32);
 #[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
 pub struct PrefillCtasPerSm(pub u32);
 
-/// The most requests an eager decode serves with the static, unsplit
-/// schedule (which skips planning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.static_max_requests", constant(range(0..=65_536)), default = 512, tune = search)]
-pub struct DecodeStaticMaxRequests(pub u32);
-
 /// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
 /// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -313,7 +307,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
         .add::<PrefillCtasPerSm>()
-        .add::<DecodeStaticMaxRequests>()
         .add::<GemmSkinnyRows>()
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
@@ -368,7 +361,6 @@ pub struct Tuning {
     pub qmm_split_thin_max: u32,
     pub qmm_split_wide_max: u32,
     pub prefill_ctas_per_sm: u32,
-    pub decode_static_max_requests: u32,
     pub gemm_skinny_rows: u32,
     pub gemm_skinny_quad_from: u32,
     pub gemm_skinny_dense_rows: u32,
@@ -494,10 +486,6 @@ impl Tuning {
         self.prefill_ctas_per_sm
     }
 
-    #[must_use]
-    pub const fn decode_static_max_requests(&self) -> u32 {
-        self.decode_static_max_requests
-    }
 
     #[must_use]
     pub const fn gemm_skinny_rows(&self) -> u32 {
@@ -680,7 +668,6 @@ impl Tuning {
         qmm_split_thin_max: 32,
         qmm_split_wide_max: 16,
         prefill_ctas_per_sm: 2,
-        decode_static_max_requests: 512,
         gemm_skinny_rows: 64,
         gemm_skinny_quad_from: 3,
         gemm_skinny_dense_rows: 4,
@@ -735,7 +722,6 @@ impl Tuning {
             qmm_split_thin_max: profile.get::<QmmSplitThinMax>().0,
             qmm_split_wide_max: profile.get::<QmmSplitWideMax>().0,
             prefill_ctas_per_sm: profile.get::<PrefillCtasPerSm>().0,
-            decode_static_max_requests: profile.get::<DecodeStaticMaxRequests>().0,
             gemm_skinny_rows: profile.get::<GemmSkinnyRows>().0,
             gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
             gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,

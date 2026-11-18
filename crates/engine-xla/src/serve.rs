@@ -2414,12 +2414,10 @@ impl Shell {
                 token_lanes[at] = l as i32;
             }
         }
-        let token_words = (!token_feeds.is_empty()).then(|| {
-            (
-                inputs.i32s(handles, &token_rows, 1),
-                inputs.i32s(handles, &token_lanes, 1),
-            )
-        });
+        let token_words = (
+            inputs.i32s(handles, &token_rows, 1),
+            inputs.i32s(handles, &token_lanes, 1),
+        );
         // The streamed weights this fire reads: each streamed table's row
         // for every token row, each streamed bank's expert places
         // (`crate::store::streamed`).
@@ -3268,7 +3266,16 @@ impl Shell {
             slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage,
             lands, pixels,
         )?;
-        Ok((self.device.program(&text, sig)?, probed))
+        let fire = || {
+            let rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+            format!(
+                "rows {} bucket {} lanes {} lane rows {rows:?}",
+                descriptor.rows,
+                descriptor.bucket,
+                descriptor.lanes.len()
+            )
+        };
+        Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
     /// The values a trace's unweighted per-head rms norms read, with their head
@@ -3314,7 +3321,8 @@ impl Shell {
         // The tokens a guest pass put in the pool, gathered over the host's
         // stand-ins before anything reads them (a read of the pool: no
         // write, so the fire's placement is untouched).
-        if let Some((token_rows, token_lanes)) = bindings.token_words {
+        {
+            let (token_rows, token_lanes) = bindings.token_words;
             use crate::emit::Emit as _;
             let (root, tokens) = (self.pools.root(), bindings.tokens);
             tracer.emit(&mut |cx| {

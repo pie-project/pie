@@ -9,9 +9,6 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # which never reads it here (the QK-normed qkv append; it has no QK norm): the win was noise.
 moe.mxfp4_mma_from = 49  # 2.9% faster end to end
 moe.mxfp4_select_lean = true  # 1.7% faster end to end
-# bf16 MoE routes past one token on the grouped mma.sync kernel: Qwen3.6-35B-A3B c128 1,489 -> 3,590 tok/s
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 # NVFP4 experts against bf16 rows on the register-dequant mma.sync kernel past one token, as L40S:
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
