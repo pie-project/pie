@@ -3054,7 +3054,15 @@ impl Shell {
                 && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!("PROBE-DELTAS: at a frame's harvest: {why}");
+                eprintln!(
+                    "PROBE-DELTAS: the reserved chunks this engine states: {:?}",
+                    self.pools.chunk_facts().reserved
+                );
                 for chunk in 1..=self.pools.layout().tables {
+                    eprintln!(
+                        "PROBE-DELTAS: tables chunk {chunk}'s whole history (shape, logical, lookups): {:?}",
+                        crate::store::diag_history(chunk)
+                    );
                     let named = crate::store::diag_who_named(chunk);
                     eprintln!(
                         "PROBE-DELTAS: tables chunk {chunk} named as a kv page by (fire, lane, path), now fire {}: {:?}",
@@ -5677,7 +5685,15 @@ impl engine::frame::Shell for Shell {
                 && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!("PROBE-DELTAS: at a fire's prepare start: {why}");
+                eprintln!(
+                    "PROBE-DELTAS: the reserved chunks this engine states: {:?}",
+                    self.pools.chunk_facts().reserved
+                );
                 for chunk in 1..=self.pools.layout().tables {
+                    eprintln!(
+                        "PROBE-DELTAS: tables chunk {chunk}'s whole history (shape, logical, lookups): {:?}",
+                        crate::store::diag_history(chunk)
+                    );
                     let named = crate::store::diag_who_named(chunk);
                     eprintln!(
                         "PROBE-DELTAS: tables chunk {chunk} named as a kv page by (fire, lane, path), now fire {}: {:?}",

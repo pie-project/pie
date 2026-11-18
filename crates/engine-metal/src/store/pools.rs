@@ -1889,6 +1889,11 @@ impl Pools {
                 let from = src_at + offset + u64::from(span.src_token) * cell;
                 let to = dst_at + offset + u64::from(span.dst_token) * cell;
                 if from != to {
+                    crate::store::diag_fire_pages(
+                        u32::MAX - 2,
+                        "a kv run copy's destination",
+                        vec![u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX)],
+                    );
                     self.pool.copy(frame, from, to, bytes)?;
                 }
             }
@@ -1926,6 +1931,11 @@ impl Pools {
             self.pool
                 .admit(u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             if from != to {
+                crate::store::diag_fire_pages(
+                    u32::MAX - 1,
+                    "a whole-slot copy's destination",
+                    vec![u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX)],
+                );
                 self.pool.copy(frame, from, to, shape.slot_bytes)?;
             }
         }
