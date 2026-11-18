@@ -240,6 +240,8 @@ struct SessionRegistry {
 struct SessionHandle {
     turns: mpsc::Sender<Request>,
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
+    /// Which process each of its turns launched.
+    routes: Arc<Mutex<TurnRoutes>>,
 }
 
 impl WorkerControl for WorkerControlServer {
@@ -309,6 +311,36 @@ impl WorkerControl for WorkerControlServer {
         }
     }
 
+    async fn set_executors(
+        self,
+        _: tarpc::context::Context,
+        req_id: ReqId,
+        executors: Vec<WorkerId>,
+    ) {
+        let session = self.sessions.active.lock().await.get(&req_id).copied();
+        let Some(session) = session else {
+            return;
+        };
+        let routes = match self.sessions.sessions.lock().await.get(&session) {
+            Some(handle) => handle.routes.clone(),
+            None => return,
+        };
+        let pid = routes
+            .lock()
+            .await
+            .by_pid
+            .iter()
+            .find(|(_, req)| **req == req_id)
+            .and_then(|(pid, _)| pid.parse().ok());
+        match pid {
+            Some(pid) => runtime::offload::executors::name(
+                pid,
+                executors.iter().map(|w| w.0.to_string()).collect(),
+            ),
+            None => tracing::debug!(%req_id, "new helpers for a turn with no process yet"),
+        }
+    }
+
     async fn set_priority(self, _: tarpc::context::Context, req_id: ReqId, p: Priority) {
         tracing::debug!(%req_id, ?p, "set_priority: no runtime hook (no-op)");
     }
@@ -371,12 +403,14 @@ impl WorkerControlServer {
             .map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();
+        let routes: Arc<Mutex<TurnRoutes>> = Arc::default();
         tokio::spawn(session_driver(
             session,
             client_id,
             self.gateway.clone(),
             turns_rx,
             cancels.clone(),
+            routes.clone(),
             Arc::downgrade(&self.sessions),
         ));
         map.insert(
@@ -384,6 +418,7 @@ impl WorkerControlServer {
             SessionHandle {
                 turns: turns_tx.clone(),
                 cancels,
+                routes,
             },
         );
         Ok(turns_tx)
@@ -465,9 +500,9 @@ async fn session_driver(
     gateway: GatewayInboundClient,
     mut turns: mpsc::Receiver<Request>,
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
+    routes: Arc<Mutex<TurnRoutes>>,
     registry: Weak<SessionRegistry>,
 ) {
-    let routes: Arc<Mutex<TurnRoutes>> = Arc::default();
     let (link_gone_tx, mut link_gone) = mpsc::unbounded_channel::<()>();
     let router = tokio::spawn(message_router(client_id, routes.clone()));
     let mut running = tokio::task::JoinSet::new();
@@ -610,8 +645,30 @@ async fn run_turn(
         return push_eos(gateway, req_id).await;
     }
 
+    // Once the turn names its process, the gateway hears when it starts
+    // here (its execution admitted): the cluster's policies count its
+    // waiting from that, not from its first output.
+    let mut start: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    let mut armed = false;
+    let arm = |process_id: &Option<String>| {
+        process_id
+            .as_deref()
+            .and_then(|pid| pid.parse().ok())
+            .map(runtime::policy::started)
+    };
+    if let Some(rx) = arm(&process_id) {
+        start = Some(rx);
+        armed = true;
+    }
+
     loop {
         tokio::select! {
+            fired = async { start.as_mut().expect("armed").await }, if start.is_some() => {
+                start = None;
+                if fired.is_ok() {
+                    let _ = gateway.started(push_ctx(), req_id).await;
+                }
+            }
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 match (&process_id, corr) {
@@ -628,6 +685,10 @@ async fn run_turn(
                     return TurnEnd::Aborted;
                 };
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
+                if !armed && let Some(rx) = arm(&process_id) {
+                    start = Some(rx);
+                    armed = true;
+                }
                 match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {

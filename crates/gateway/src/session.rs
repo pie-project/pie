@@ -31,6 +31,24 @@ pub struct TurnInput {
     pub message: ClientMessage,
     pub blobs: Vec<BlobRef>,
     pub priority: Priority,
+    /// How a launch goes on after output it has sent, if it can: then it
+    /// can be moved once running.
+    pub resume: Option<Resume>,
+}
+
+/// Given each `message` a launch emits, in order, the input that launches
+/// it again going on after them (`None` until it can). A turn that has one
+/// moves once it has sent output: launched again elsewhere under the same
+/// process, it sends the client only what follows.
+#[derive(Clone)]
+pub struct Resume(pub Arc<ResumeFn>);
+
+pub type ResumeFn = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+impl std::fmt::Debug for Resume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resume")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +142,9 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     /// A running turn moved to `worker`, or (`None`) could not.
     fn moved(&self, _req: &Request, _worker: Option<WorkerId>, _why: &str) {}
+
+    /// The worker started the turn's process.
+    fn started(&self, _req: &Request) {}
 }
 
 struct TurnState {
@@ -151,6 +172,9 @@ struct TurnState {
     answered: bool,
     process: Option<String>,
     lost: Arc<AtomicBool>,
+    resume: Option<Resume>,
+    /// The launch input that goes on after the output sent so far.
+    resumed: Option<String>,
 }
 
 struct Inner {
@@ -253,6 +277,8 @@ impl Inner {
                     answered: false,
                     process: None,
                     lost: lost.clone(),
+                    resume: input.resume,
+                    resumed: None,
                 },
             );
         }
@@ -439,6 +465,12 @@ impl Sessions {
                 if relaunch && matches!(message, ServerMessage::Response { ok: true, .. }) {
                     return Control::Continue;
                 }
+                if let ServerMessage::ProcessEvent { event, value, .. } = message
+                    && event == "message"
+                    && let Some(resume) = &turn.resume
+                {
+                    turn.resumed = (resume.0)(value);
+                }
                 if let ServerMessage::ProcessEvent { process_id, .. }
                 | ServerMessage::File { process_id, .. } = message
                 {
@@ -515,13 +547,22 @@ impl Sessions {
             if old == target || turn.outcome.is_some() {
                 return false;
             }
-            // Run again, it would send what the client already has, or find
-            // the handles it names left behind.
-            if turn.emitted || turn.request.message.uses_handles() {
+            // Run again from its input, it would send what the client
+            // already has, or find the handles it names left behind: it
+            // moves after output only going on from it.
+            if turn.request.message.uses_handles() {
                 Err(turn.request.clone())
-            } else {
+            } else if !turn.emitted {
                 relaunch(turn, old);
                 Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+            } else if let Some(resumed) = turn.resumed.clone()
+                && let ClientMessage::LaunchProcess { input, .. } = &mut turn.request.message
+            {
+                *input = resumed;
+                relaunch(turn, old);
+                Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+            } else {
+                Err(turn.request.clone())
             }
         };
         let entry = match entry {
@@ -531,7 +572,7 @@ impl Sessions {
                 self.inner.router.moved(
                     &request,
                     None,
-                    "it has sent output or names handles, so it finishes where it runs",
+                    "it has sent output it cannot go on from, or names handles, so it finishes where it runs",
                 );
                 return false;
             }
@@ -556,6 +597,20 @@ impl Sessions {
     pub async fn terminate(&self, req_id: ReqId) {
         if let Some(worker) = self.inner.end(req_id, Outcome::Cancelled, By::Policy) {
             self.inner.router.cancel(worker, req_id).await;
+        }
+    }
+
+    /// The worker says the turn's process started.
+    pub fn started(&self, req_id: ReqId) {
+        let request = self
+            .inner
+            .turns
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .map(|turn| turn.request.clone());
+        if let Some(request) = request {
+            self.inner.router.started(&request);
         }
     }
 
@@ -872,6 +927,7 @@ mod tests {
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -883,6 +939,7 @@ mod tests {
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -996,6 +1053,7 @@ mod tests {
             message: ClientMessage::Ping { corr_id: 1 },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -1191,6 +1249,68 @@ mod tests {
             "run again, it would send what the client has"
         );
         assert_eq!(router.dispatched.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_can_go_on_moves_after_output_under_its_process() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let mut input = launch();
+        input.resume = Some(Resume(Arc::new(|value: &str| {
+            Some(format!("after {value}"))
+        })));
+        let (_h, mut rx) = sessions
+            .create(ident(), input, Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        let said = |value: &str| {
+            Tokens::Chunk(ServerMessage::ProcessEvent {
+                process_id: "p".into(),
+                event: "message".into(),
+                value: value.into(),
+            })
+        };
+        sessions
+            .feed_from(req, said("one"), Some(WorkerId(7)))
+            .await;
+        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
+        assert!(sessions.migrate(req, WorkerId(8)).await);
+        assert_eq!(*router.cancels.lock().unwrap(), [(WorkerId(7), req)]);
+        assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
+        let message = router.messages.lock().unwrap()[1].clone();
+        let ClientMessage::LaunchProcess { input, .. } = message else {
+            panic!("a launch");
+        };
+        assert_eq!(input, "after one", "it goes on after what was sent");
+        assert_eq!(
+            sessions
+                .feed_from(req, said("late"), Some(WorkerId(7)))
+                .await,
+            worker_api::Control::Abort,
+            "the worker it left is not heard"
+        );
+        let renamed = Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id: "q".into(),
+            event: "message".into(),
+            value: "two".into(),
+        });
+        sessions.feed_from(req, renamed, Some(WorkerId(8))).await;
+        let mut seen = Vec::new();
+        while let Ok(Some(Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id, value, ..
+        }))) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            seen.push((process_id, value));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("p".to_string(), "one".to_string()),
+                ("p".to_string(), "two".to_string())
+            ],
+            "one process to the client"
+        );
     }
 
     #[tokio::test]

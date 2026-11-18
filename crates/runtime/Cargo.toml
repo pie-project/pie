@@ -65,6 +65,8 @@ engine-cerebras = { path = "../engine-cerebras", optional = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The PLEX 1.1 policy host the worker port embeds.
+plex-host = { path = "../plex-host" }
 tokio = { version = "1.53", features = ["full"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 tracing-appender = "0.2"

@@ -11,8 +11,6 @@ pub struct Worker {
     /// Its engine kind, as its config spells it.
     pub engine: String,
     pub addr: String,
-    /// The token the actuator launched it with, if it did.
-    pub launch: Option<String>,
     /// Its process id, as it told it.
     pub pid: Option<u32>,
     pub last_hb: Instant,
@@ -34,8 +32,6 @@ pub struct Cluster {
     pub gateway_epoch: u64,
     pub workers: HashMap<WorkerId, Worker>,
     pub gateways: HashMap<GatewayId, Gateway>,
-    /// The actuator has slots to launch workers into.
-    pub scales: bool,
     next_worker_id: u64,
     next_gateway_id: u64,
 }
@@ -85,7 +81,6 @@ impl Cluster {
                 model,
                 engine: String::new(),
                 addr,
-                launch: None,
                 pid: None,
                 last_hb: now,
                 health: Health::Healthy,

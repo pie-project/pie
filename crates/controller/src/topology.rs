@@ -45,7 +45,6 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
     let routing = RoutingTable {
         epoch: cluster.gateway_epoch,
         workers,
-        scales: cluster.scales,
         author: cluster.author(),
     };
 
@@ -60,7 +59,6 @@ pub fn empty_routing() -> RoutingTable {
     RoutingTable {
         epoch: 0,
         workers: Vec::new(),
-        scales: false,
         author: None,
     }
 }

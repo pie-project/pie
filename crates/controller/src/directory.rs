@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use controller_api::{DirectoryView, GroupView, Key, StateReport};
+use controller_api::{DirectoryView, GroupView, Key, OffDevice, StateReport};
 use ids::WorkerId;
 
 #[derive(Clone, Default)]
@@ -37,6 +37,8 @@ struct Inner {
     hints: HashMap<WorkerId, HashMap<Key, u64>>,
     /// Each worker's kv page, in tokens, and whether its disk tier is kept.
     disk_tiers: HashMap<WorkerId, (u32, bool)>,
+    /// The held pages each worker keeps off the device, and where.
+    off: HashMap<WorkerId, HashMap<Key, OffDevice>>,
 }
 
 /// A run some worker keeps whole, and the workers (pools among them) that
@@ -45,6 +47,9 @@ struct Inner {
 pub struct Group {
     pub keys: Arc<Vec<Key>>,
     pub sites: Vec<WorkerId>,
+    /// The sites whose copy is not wholly on the device, and the lowest
+    /// tier any of its pages is on.
+    pub site_tiers: Vec<(WorkerId, OffDevice)>,
     /// The workers whose persistent disk tier keeps every page of it.
     pub disk_sites: Vec<WorkerId>,
     /// The most leading tokens of it some worker's owner asked kept on
@@ -159,6 +164,13 @@ impl Directory {
         if let Some(link) = report.link {
             self.report_link(worker, link);
         }
+        if let Some(off) = report.off_device {
+            self.inner
+                .lock()
+                .unwrap()
+                .off
+                .insert(worker, off.into_iter().collect());
+        }
         self.report(
             worker,
             report.peer,
@@ -197,6 +209,7 @@ impl Directory {
                     GroupView {
                         keys: group.keys.as_ref().clone(),
                         sites: group.sites,
+                        site_tiers: group.site_tiers,
                         disk_sites: group.disk_sites,
                         persist_tokens: group.persist_tokens,
                     },
@@ -287,6 +300,14 @@ impl Directory {
                 .map(|(worker, _)| *worker)
                 .collect();
             sites.sort_by_key(|w| w.0);
+            group.site_tiers = sites
+                .iter()
+                .filter_map(|w| {
+                    let off = inner.off.get(w)?;
+                    let lowest = group.keys.iter().filter_map(|key| off.get(key)).max()?;
+                    Some((*w, *lowest))
+                })
+                .collect();
             group.sites = sites;
             let mut disk_sites: Vec<WorkerId> = inner
                 .disk
@@ -495,6 +516,40 @@ mod tests {
         );
         directory.forget(WorkerId(1));
         assert_eq!(directory.disk_tier(WorkerId(1)), None);
+    }
+
+    #[test]
+    fn a_site_whose_copy_is_off_the_device_names_its_lowest_tier() {
+        let directory = Directory::default();
+        let run = vec![key(1), key(2)];
+        for (worker, off) in [
+            (1, Vec::new()),
+            (2, vec![(key(2), OffDevice::Host)]),
+            (
+                3,
+                vec![(key(1), OffDevice::Host), (key(2), OffDevice::Disk)],
+            ),
+        ] {
+            directory.report_state(
+                WorkerId(worker),
+                StateReport {
+                    added: run.clone(),
+                    full: true,
+                    runs_added: vec![run.clone()],
+                    off_device: Some(off),
+                    ..StateReport::default()
+                },
+            );
+        }
+        let view = directory.view(1);
+        assert_eq!(
+            view.groups[0].1.site_tiers,
+            [
+                (WorkerId(2), OffDevice::Host),
+                (WorkerId(3), OffDevice::Disk)
+            ],
+            "worker 1 holds it on the device"
+        );
     }
 
     #[test]

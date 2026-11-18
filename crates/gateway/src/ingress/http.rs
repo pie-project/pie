@@ -37,6 +37,7 @@ pub async fn generate(
         message: payload,
         blobs: Vec::new(),
         priority: Priority::Normal,
+        resume: None,
     };
 
     let (handle, rx) = match state

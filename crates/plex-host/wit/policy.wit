@@ -1,0 +1,38 @@
+package plex:policy@1.1.0;
+
+/// What a policy exports.
+@since(version = 1.1.0)
+interface policy {
+    use plex:core/types@1.1.0.{event, mark};
+
+    /// React to what happened. Every read in one call sees one snapshot;
+    /// every write (a row, a note, the alarm, a terminate) takes effect
+    /// together when the call returns. A call that traps or overruns its
+    /// deadline has all of its writes discarded.
+    @since(version = 1.1.0)
+    react: func(events: list<event>, now: mark);
+}
+
+/// A policy inside an engine: when its processes run and what KV it keeps.
+/// These are the most a worker policy may import; a policy imports the
+/// columns it writes, and an import is the authority to write.
+@since(version = 1.1.0)
+world worker {
+    include plex:core/imports@1.1.0;
+    include plex:schedule/imports@1.1.0;
+    include plex:retention/imports@1.1.0;
+
+    @since(version = 1.1.0)
+    export policy;
+}
+
+/// A policy at the controller: where processes run and where KV is copied.
+@since(version = 1.1.0)
+world cluster {
+    include plex:core/imports@1.1.0;
+    include plex:placement/imports@1.1.0;
+    include plex:replication/imports@1.1.0;
+
+    @since(version = 1.1.0)
+    export policy;
+}

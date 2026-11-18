@@ -39,6 +39,10 @@ struct Input {
     park_ms: u64,
     #[serde(default)]
     use_park: bool,
+    /// After the prefill, say "ready" and wait for the client's go: a
+    /// process waiting on its client with its KV in place.
+    #[serde(default)]
+    wait_after_prefill: bool,
 }
 
 fn default_prompt() -> String {
@@ -160,6 +164,10 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::session::send("t:1");
     }
     generated.push(g0 as u32);
+    if input.wait_after_prefill {
+        inferlet::session::send("ready");
+        let _ = inferlet::session::receive().await;
+    }
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {

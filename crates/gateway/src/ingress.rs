@@ -17,7 +17,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/v1/ws", get(ws::ws)) // WebSocket, multi-turn
         .route("/v1/models", get(compat::models))
         .route(
-            "/v1/plex/sessions/{session}/props",
+            "/v1/plex/sessions/{session}/hints",
             post(plex::session_props),
         )
         .route(

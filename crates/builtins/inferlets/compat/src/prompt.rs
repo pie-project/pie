@@ -26,7 +26,10 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
     let mut images = Vec::new();
     let mut ends = Vec::new();
     let mut system_tokens = None;
-    if let Some(raw) = &req.raw_prompt {
+    if let Some(ids) = &req.prompt_tokens {
+        tokens.extend_from_slice(ids);
+        ends.push(tokens.len() as u32);
+    } else if let Some(raw) = &req.raw_prompt {
         // a raw prompt that already spells the model's prefix (a chat render's
         // BOS) is not given it twice, as vLLM and SGLang read it
         let body = model::encode(raw);
