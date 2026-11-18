@@ -34,9 +34,8 @@
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::error::{Fault, Result};
 
-/// The driver's safety floor under the measured capacity: one size on
-/// every backend.
-pub const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
+/// The user's stated safety margin ([`engine::SAFETY_FLOOR_BYTES`]).
+pub use engine::SAFETY_FLOOR_BYTES;
 
 /// What the host had for a load when read, and how that was reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -17,6 +17,12 @@
 //! allows, as several buffers under one budget where a buffer is bounded,
 //! or by measurement where it cannot lay a class out itself.
 
+/// The safety margin the user stated under every device's measured
+/// capacity: what the driver is left beside everything a load places, and
+/// what a host sharing its memory with the device keeps free past what it
+/// reports available. One size, on every backend; each one imports it.
+pub const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
+
 use std::collections::BTreeMap;
 use std::fmt;
 

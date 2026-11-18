@@ -49,6 +49,7 @@ pub use fire::{
     RsVerb, Serves, Step,
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use memory::SAFETY_FLOOR_BYTES;
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,
     InstanceBinding, InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration,
