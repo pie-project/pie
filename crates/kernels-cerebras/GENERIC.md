@@ -3452,6 +3452,21 @@ The run order is kv0, kv300, kv600, kv0 again, 3 steps each against the golden, 
   PEs: the VAE's `tpe.csl` 48,224 B, 928 B of stack; the tapes 47,920 B; the denoise's
   `gpe.csl` 47,216 B). The choice before the refit took (64, 256) at tile 2,4, which cslc
   refused (out of PE memory).
+- **Open: requests smaller than the load's budget.** Compile on load sizes a voxel class by the
+  load's `max_voxels` (`stream::wanted`): a request of fewer latent rows than the class is refused
+  at submission (1547: klein's 128² request, 64 latent rows, into a load of `max_voxels` 4,096, a
+  latents class of 1,024 rows), not padded (a lane with a clip is never short: padding 64 rows
+  to 1,024 would compute 16 times the request). Serving needs one load for every image size, as
+  decode's ladder of classes: latents rows at powers of 2 or 4 up to `max_voxels`, each request
+  the least class that holds it, padded within it (its waste under the ladder's ratio).
+  - **Its cost as separate co-resident programs: none fit.** A GEMM denoise's footprint is its
+    weights' tapes, not its rows: klein's at context 512 and latents 64, 256 and 1,024 rows
+    places 384 x 1,040 (kbm 64), 384 x 848 (kbm 32) and 384 x 848 (kbm 16) (39.6M, 51.2M and
+    78.5M cycles a step), and the 1024² load's three readings already take 642 x 1,158 of the
+    system's fabric. A second denoise of 384 x 848 does not place beside them.
+  - So the ladder is one program's: the classes' rows a run-time choice over the same weights
+    and tapes (a launch's latents rows of the ladder's, the attention's key blocks and the row
+    blocks it streams cut to them), not a program a rung. Not built; the GEMM hang first.
 - **Open: the GEMM regime on the chip.** No GEMM-regime program has completed on a system.
   Klein's 1024² denoise (384 x 576 + 502 tape rows, request 1520) linked, loaded and landed its
   1.99G words of static arrays, then its first launch never returned (killed at 3,000 s).
