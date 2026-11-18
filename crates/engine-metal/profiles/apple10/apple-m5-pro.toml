@@ -5,37 +5,46 @@ device = "Apple M5 Pro"
 
 [rates]
 # Each point the median of five whole measurements by Metal's rates step
-# under engine::rates' shared rule, on 2026-11-18 (by Mac Pro, on
-# sc/mac-roofline-7-r2 ee62a4dcd). Every point agreed within 1% across the
-# five but these:
-#   launch: 6937 / 7903 / 7793 / 7942 / 7741 ns
-#   matmul 256 x 2048: 5.52 / 7.97 / 5.95 / 5.50 / 5.54 TFLOP/s
-#   matmul 512 x 2048: 29.30 / 29.67 / 29.56 / 29.68 / 29.51
-#   matmul 512 x 4096: 29.33 / 29.18 / 29.23 / 29.13 / 28.45
-#   matmul 2048 x 4096: 30.18 / 30.03 / 30.05 / 30.22 / 29.83
-#   matmul 4096 x 4096: 28.51 / 28.39 / 28.48 / 28.48 / 28.17
-#   matmul 8192 x 4096: 28.42 / 28.39 / 28.30 / 28.34 / 27.80
-#   attention, 2048 keys: 14.66 / 14.57 / 14.52 / 14.83 / 14.59
-#   attention, 4096 keys: 16.01 / 16.04 / 15.78 / 16.00 / 16.00
-# and these, two-moded on this device (a fast and a slow state, split 2-3
-# or 3-2 across the runs, not one outlier): their median stands until the
-# rates step settles them.
-#   matmul 256 x 1024: 4.97 / 34.35 / 5.09 / 34.06 / 5.11
-#   matmul 512 x 1024: 5.52 / 30.91 / 13.23 / 30.85 / 19.44
-#   matmul 1024 x 1024: 32.30 / 32.68 / 14.97 / 32.76 / 22.94
-#   attention, 512 keys: 10.77 / 10.87 / 6.79 / 10.81 / 7.82
-launch_ns = 7793
+# under engine::rates' shared rule, each operand set touched once by the
+# first point over it, on 2026-11-18 (by Mac Pro, on
+# sc/macpro-rates-first-touch 3d42a4209, 120 s idle before each run). Every
+# point agreed within 1% across the five but these, most of them by the
+# fifth run alone, which started in the device state that also reads a
+# launch of about 2 us (one run in four or five on this device, idle or
+# not):
+#   launch: 7785 / 7900 / 7831 / 7863 / 1652 ns
+#   matmul 256 x 1024: 32.77 / 32.22 / 33.27 / 32.97 / 24.36 TFLOP/s
+#   matmul 512 x 1024: 30.77 / 30.73 / 30.72 / 30.89 / 26.11
+#   matmul 1024 x 1024: 32.70 / 32.87 / 32.80 / 32.87 / 29.92
+#   matmul 2048 x 1024: 31.85 / 31.76 / 31.77 / 31.87 / 30.40
+#   matmul 4096 x 1024: 31.38 / 31.39 / 31.36 / 31.35 / 30.68
+#   matmul 8192 x 1024: 30.28 / 30.39 / 30.25 / 30.27 / 30.08
+#   matmul 256 x 2048: 27.91 / 27.88 / 27.92 / 27.97 / 25.91
+#   matmul 512 x 2048: 29.53 / 29.59 / 29.47 / 29.63 / 28.31
+#   matmul 1024 x 2048: 30.69 / 30.75 / 30.74 / 30.77 / 30.03
+#   matmul 2048 x 2048: 31.16 / 31.17 / 31.17 / 31.17 / 30.81
+#   matmul 256 x 4096: 25.03 / 25.01 / 25.10 / 25.15 / 24.65
+#   matmul 512 x 4096: 29.24 / 29.01 / 29.21 / 29.08 / 28.94
+#   matmul 1024 x 4096: 30.13 / 30.18 / 29.93 / 29.94 / 29.87
+#   attention, 512 keys: 10.84 / 10.40 / 11.69 / 10.28 / 11.25
+#   attention, 1024 keys: 12.58 / 12.59 / 12.59 / 12.56 / 12.69
+#   attention, 2048 keys: 14.77 / 14.52 / 14.72 / 14.79 / 14.49
+#   attention, 4096 keys: 16.02 / 15.79 / 15.85 / 16.03 / 15.95
+#   per-row ops: 283.71 / 284.39 / 284.03 / 283.83 / 272.20
+#   few-row matmul: 25.09 / 25.03 / 25.17 / 25.19 / 24.65
+#   workgroups a core: 2.381 / 2.376 / 2.391 / 2.423 / 2.576
+launch_ns = 7831
 gemm_tflops_by_rows = [
-  [1024, [[256, 5.1], [512, 19.4], [1024, 32.3], [2048, 31.9], [4096, 31.3], [8192, 30.3]]],
-  [2048, [[256, 5.5], [512, 29.6], [1024, 30.7], [2048, 31.2], [4096, 30.5], [8192, 28.8]]],
-  [4096, [[256, 25.0], [512, 29.2], [1024, 29.9], [2048, 30.0], [4096, 28.5], [8192, 28.3]]],
+  [1024, [[256, 32.8], [512, 30.7], [1024, 32.8], [2048, 31.8], [4096, 31.4], [8192, 30.3]]],
+  [2048, [[256, 27.9], [512, 29.5], [1024, 30.7], [2048, 31.2], [4096, 30.4], [8192, 28.9]]],
+  [4096, [[256, 25.0], [512, 29.1], [1024, 29.9], [2048, 30.0], [4096, 28.6], [8192, 28.5]]],
 ]
-attn_tflops_by_keys = [[512, 10.8], [1024, 12.6], [2048, 14.6], [4096, 16.0], [8192, 19.0]]
-hbm_gbps = 276.3
-elementwise_gbps = 283.4
-scan_gelems = 305.3
-few_row_tflops = 24.91
-workgroups_per_core = 2.42
+attn_tflops_by_keys = [[512, 10.8], [1024, 12.6], [2048, 14.7], [4096, 16.0], [8192, 18.8]]
+hbm_gbps = 276.2
+elementwise_gbps = 283.8
+scan_gelems = 305.5
+few_row_tflops = 25.09
+workgroups_per_core = 2.39
 
 [provenance]
-rates = "Metal's rates step (pie tune metal --rates) on 2026-11-18, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; the few-row matmul at m = 4 to 256 over n = k = 4096, its most flops over time; workgroups a core from the matmul's first curve rows over as few columns as launch one workgroup a core or fewer, against the curve's rate there; operands: engine::rates' pattern"
+rates = "Metal's rates step (pie tune metal --rates) on 2026-11-18, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, each set touched once by the first point over it, the per-row ops warmed; the few-row matmul at m = 4 to 256 over n = k = 4096, its most flops over time; workgroups a core from the matmul's first curve rows over as few columns as launch one workgroup a core or fewer, against the curve's rate there; operands: engine::rates' pattern"
