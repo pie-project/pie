@@ -1,7 +1,7 @@
 //! Text completion for benchmarking: exact token counts, no per-token streaming.
 
 use inferlet::eta::prelude::*;
-use inferlet::{chat, session};
+use inferlet::{chat, sampler, session};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -115,30 +115,47 @@ struct Output {
     prologue_us: Vec<u64>,
 }
 
-/// In-graph sample from `logits`: argmax at `temperature <= 0`, otherwise
-/// temperature-scaled TopP Gumbel-max (`keep = pivot_threshold(softmax(l/T),
-/// cummass_le(p)); argmax(select(keep, l/T, -inf) + gumbel(r))`).
-fn sample(
-    logits: Tensor,
-    vocab: u32,
-    temperature: f32,
-    top_p: f32,
-    rng: Option<Channel>,
-) -> Tensor {
-    match rng {
-        None => reduce_argmax(logits),
-        Some(rng) => {
-            let scaled = logits / temperature;
-            let probs = softmax(&scaled);
-            let keep = pivot_threshold(probs, cummass_le(top_p));
-            let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
-            let masked = select(&keep, &scaled, &neg_inf);
-            let r = rng.take();
-            let g = gumbel(&r, [vocab]);
-            let r_next = &r + iota(2);
-            rng.put(&r_next);
-            reduce_argmax(masked + g)
+/// The standard sampler's knobs for `temperature` and `top_p`, as the
+/// built-in inferlets' generation loop seeds them: argmax at `temperature <=
+/// 0`, otherwise temperature-scaled Gumbel-max, nucleus-truncated below
+/// `top_p < 1` (`top_p >= 1` keeps every token, so it is no knob). The same
+/// shapes the runtime's prewarm builds, so a request builds nothing.
+struct SampleKnobs {
+    temperature: Option<f32>,
+    top_p: Option<Channel>,
+}
+
+impl SampleKnobs {
+    fn new(temperature: f32, top_p: f32) -> Self {
+        let sampled = temperature > 0.0;
+        Self {
+            temperature: sampled.then_some(temperature),
+            top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
         }
+    }
+
+    /// Read without consuming: the seeded value stays for every fire.
+    fn read(&self) -> sampler::Knobs {
+        sampler::Knobs {
+            temperature: self.temperature,
+            top_p: self.top_p.as_ref().map(|c| reshape(c.read(), [])),
+            top_k: None,
+            min_p: None,
+            repetition: None,
+            frequency: None,
+            presence: None,
+            logprobs: None,
+        }
+    }
+}
+
+/// A pass's rng as the standard sampler's stage bodies take it.
+fn slots(rng: &Channel) -> sampler::Slots {
+    sampler::Slots {
+        rng: rng.traced(),
+        hist: None,
+        mask: None,
+        logprobs: None,
     }
 }
 
@@ -296,11 +313,10 @@ async fn run_one(
     let run_start = std::time::Instant::now();
 
     let vocab = model::output_vocab_size();
-    let sampled_rng = (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]));
-    let prefill_rng =
-        (input.temperature > 0.0).then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]));
-    let temperature = input.temperature;
-    let top_p = input.top_p;
+    // A greedy pass steps its rng too, unread: the standard shape's.
+    let sampled_rng = Channel::from([rng_seed, 0u32]);
+    let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
+    let (temperature, top_p) = (input.temperature, input.top_p);
 
     let ws = WorkingSet::new();
     let n = prompt_vec.len() as u32;
@@ -346,21 +362,16 @@ async fn run_one(
     fwd_p
         .state(&[&ws], StateGeometry::folding())
         .context("bind prefill state")?;
+    let prefill_knobs = SampleKnobs::new(temperature, top_p);
     fwd_p.epilogue(move || {
-        let t = reshape(
-            sample(
-                intrinsics::output(0, "logits"),
-                vocab,
-                temperature,
-                top_p,
-                prefill_rng,
-            ),
-            [1],
+        let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
+        sampler::prefill(
+            vocab,
+            &prefill_knobs.read(),
+            &slots(&prefill_rng),
+            &g0_ch.traced(),
+            carried_on.as_ref(),
         );
-        if let Some(tok_in) = tok_in {
-            tok_in.put(&t);
-        }
-        g0_ch.put(&t);
     });
 
     // Built before the prefill submits, so its `tok_in` claim precedes the prefill's build.
@@ -372,19 +383,15 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], StateGeometry::folding())
                 .context("bind decode state")?;
+            let knobs = SampleKnobs::new(temperature, top_p);
             fwd.epilogue(move || {
-                let t = reshape(
-                    sample(
-                        intrinsics::output(0, "logits"),
-                        vocab,
-                        temperature,
-                        top_p,
-                        sampled_rng,
-                    ),
-                    [1],
+                sampler::decode(
+                    vocab,
+                    &knobs.read(),
+                    &slots(&sampled_rng),
+                    &tok_in.traced(),
+                    &out.traced(),
                 );
-                tok_in.put(&t);
-                out.put(&t);
             });
             Some(fwd)
         } else {
