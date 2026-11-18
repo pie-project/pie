@@ -58,13 +58,17 @@ pub struct Metal {
 }
 
 impl Metal {
-    /// Fires refused for a pipeline the load did not build, counted as
-    /// `Tally::Compiled` (the load should have prepared them).
+    /// Fires that reached a pipeline the load did not build, counted as
+    /// `Tally::BuiltInFire`: once the load is sealed nothing builds on a
+    /// fire's path here (the pipeline cache refuses the key, and the fire
+    /// with it), so what a backend that builds there would count is these.
+    /// It reads 0 where every pipeline a fire can reach was built before
+    /// ready.
     fn tally_unbuilt(&self) {
         if let Some(shell) = self.shell.as_ref() {
             let missed = shell.take_unbuilt_pipelines();
             if missed > 0 {
-                self.live.tally(engine::live::Tally::Compiled, missed);
+                self.live.tally(engine::live::Tally::BuiltInFire, missed);
             }
         }
     }
@@ -169,7 +173,7 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
@@ -952,10 +956,11 @@ impl Engine for Metal {
         let before = shell.program_compilations();
         let id = shell.register_program(registration).map_err(fault)?;
         // A registration after ready that compiled guest code is one the
-        // load's prewarm did not prepare.
+        // load's prewarm did not prepare: built at its registration, before
+        // its first fire (no fire waits on it).
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
             tracing::warn!(
                 program = registration.program_hash,
                 regions = built,
@@ -997,10 +1002,11 @@ impl Engine for Metal {
         let before = shell.program_compilations();
         let id = shell.finish_program(*registered).map_err(fault)?;
         // The compile's regions count at the finish: a registration after
-        // ready that compiled guest code is one the prewarm did not prepare.
+        // ready that compiled guest code is one the prewarm did not prepare,
+        // built at its registration (no fire waits on it).
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
             tracing::warn!(
                 program = id.0,
                 regions = built,

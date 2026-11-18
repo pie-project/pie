@@ -78,6 +78,7 @@ pub(crate) static OPS: &[Op] = &[
             "bias",
             "extent",
             "log_scaling",
+            "mask",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -93,6 +94,7 @@ pub(crate) static OPS: &[Op] = &[
             let bias: Option<Value> = a.next()?;
             let extent: Option<u32> = a.next()?;
             let log_scaling: Option<(u32, f32)> = a.next()?;
+            let mask: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.decode", || {
@@ -110,6 +112,7 @@ pub(crate) static OPS: &[Op] = &[
                         bias.as_ref(),
                         extent,
                         log_scaling,
+                        mask.as_ref(),
                     )
                 })?,
             )

@@ -160,6 +160,17 @@ on Metal; (2) if it fails, a per-page release on that page's own fire / copy
 completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
 
 
+## F19. B200's tcgen05 prefill skips any fire with a mask bound
+
+kernels-cuda attn.rs:387 runs the tcgen05 prefill only when no mask is bound.
+Since the mask layer, every prefill of a model that opens a mask takes the
+masked arm, so on B200 those prefills all run FA2: likely slower, and not
+checked bit-equal against tcgen05. The structural fix is for tcgen05 to read the
+per-lane mask offsets and words the way FA2 does (an unmasked lane reads
+nothing), not a per-fire switch between kernels. A B200 gate item before the PR
+to main: the tcgen05 masked path, the goldens bit-equal on B200, and c64 / prefill
+throughput ≤ 2% vs main.
+
 ## F20. An evacuation's rebase stops at the first instance it cannot place
 
 engine-cuda's `Plane::rebase` (program.rs) re-addresses every bound

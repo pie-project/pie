@@ -823,10 +823,12 @@ fn every_rung_of_a_miniature_with_unservable_classes_names_what_the_largest_name
 
 /// A fire whose lanes mix classes so that a region's mask comes in runs: a
 /// plain prompt and a prompt under an adapter, which run the prompt's
-/// attention, with a plain decode between them in the class order. The
-/// region launches a run at a time, and the fire still asks for no pipeline
-/// the load did not build and encodes no more dispatches than the load
-/// named.
+/// attention, with a plain decode between them in the class order. Where
+/// the load copies windows the region's rows are copied into one (its
+/// attention reads the fire's masks, which the copy carries), launching as
+/// the plain prompts do; else it launches a run at a time. Either way the
+/// fire asks for no pipeline the load did not build and encodes no more
+/// dispatches than the load named.
 #[test]
 fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     let fixture = fixture("qwen3-micro-text", None);
@@ -886,10 +888,17 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     let got = shell.fire_seated(&seated).expect("the mixed fire fires");
     assert!(got[..2].iter().all(|row| row.iter().all(|v| v.is_finite())));
     let (dispatches, launches) = shell.walked_serving();
-    assert!(
-        launches > whole,
-        "the mixed fire cut no region: {launches} launches, {whole} of the plain prompts"
-    );
+    if shell.copies() {
+        assert_eq!(
+            launches, whole,
+            "the mixed fire's cut region was not copied into one window"
+        );
+    } else {
+        assert!(
+            launches > whole,
+            "the mixed fire cut no region: {launches} launches, {whole} of the plain prompts"
+        );
+    }
     assert_eq!(
         shell.compiled(),
         built,
@@ -906,6 +915,117 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
         named.dispatches,
         shell.compiled() - built,
         shell.recorded_serving()
+    );
+}
+
+/// A masked lane in a mixed fire (a masked prompt, a plain decode, a
+/// prompt under an adapter) fires with every lane in it, launches as the same fire stating
+/// no mask does (a mask is data: it cuts no region of its own, and where the
+/// load copies windows the copy carries its rows' entries), and the masked
+/// prompt answers what it answers alone through its mask (up to contract
+/// A's near-tie), which hides keys (it answers otherwise unmasked).
+#[test]
+fn a_masked_lane_in_a_mixed_fire_launches_and_answers_as_unmasked_lanes_do() {
+    use eta_compiler::contract::{Drift, near_tie};
+    use engine::fire::{Mask, Masking};
+
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    // Every fire walks, so each counts its launches.
+    shell.walk_every_fire();
+    let tokens: Vec<u32> = (0..CONTEXT).map(|at| (at * 37 + 11) % 256).collect();
+    const ROWS: usize = 8;
+    let plain = |rows: usize| word(&fixture.trace, rows as u32);
+    let adapted = fixture
+        .trace
+        .facts
+        .word(&Request::new(ROWS as u32, false).adapted(true));
+    let seat: Vec<Seated<'_>> = (0..3)
+        .map(|lane| Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: lane,
+                word: plain(ROWS),
+                tokens: &tokens[..ROWS],
+            })
+        })
+        .collect();
+    shell.fire_seated(&seat).expect("three plain prompts fire");
+    // A mask a row over the lane's rows: rows 2 and 5 hide key 1, the rest
+    // admit every key (a row reads none past its own whatever it says).
+    let mask = Masking::Rows(
+        (0..ROWS as u64)
+            .map(|row| match row {
+                2 | 5 => Mask::new(vec![0, 1, 1, ROWS as u32 - 2], ROWS as u64),
+                _ => Mask::new(vec![0, ROWS as u32], ROWS as u64),
+            })
+            .collect(),
+    );
+    let lane = |slot: u32, held: u32, word: u64, rows: usize| Seated {
+        held: Some(held),
+        ..Seated::of(Lane {
+            slot,
+            word,
+            tokens: &tokens[..rows],
+        })
+    };
+    let mixed = |masked: bool| {
+        [
+            Seated {
+                mask: masked.then_some(&mask),
+                ..lane(0, 0, plain(ROWS), ROWS)
+            },
+            lane(1, ROWS as u32, plain(1), 1),
+            Seated {
+                adapter: Some(0),
+                ..lane(2, 0, adapted, ROWS)
+            },
+        ]
+    };
+    shell.walked_serving();
+    let unmasked = shell.fire_seated(&mixed(false)).expect("the mixed fire fires");
+    let (_, plain_launches) = shell.walked_serving();
+    let got = shell
+        .fire_seated(&mixed(true))
+        .expect("the mixed fire with a masked lane fires");
+    let (_, launches) = shell.walked_serving();
+    assert_eq!(
+        launches, plain_launches,
+        "the masked lane's rows launched otherwise than unmasked ones"
+    );
+    assert!(
+        got[0]
+            .iter()
+            .zip(&unmasked[0])
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the masked lane's mask hid nothing"
+    );
+    let alone = shell
+        .fire_seated(&[Seated {
+            mask: Some(&mask),
+            ..lane(0, 0, plain(ROWS), ROWS)
+        }])
+        .expect("the masked prompt fires alone")
+        .swap_remove(0);
+    let (a, b) = (&alone, &got[0]);
+    let (ta, tb) = (argmax(a) as usize, argmax(b) as usize);
+    if ta != tb {
+        let mut top = [f32::NEG_INFINITY; 2];
+        for &v in a {
+            if v > top[0] {
+                top = [v, top[0]];
+            } else if v > top[1] {
+                top[1] = v;
+            }
+        }
+        let parting = near_tie(top[0] - top[1], &[ta, tb], Drift::Rows { a, b }, None);
+        assert!(parting.tie, "the masked lane parts from itself alone on no near-tie: {parting:?}");
+    }
+    eprintln!(
+        "mixed fire with a masked lane: {launches} launches ({plain_launches} unmasked), \
+         token {tb} beside {ta} alone"
     );
 }
 
@@ -1180,6 +1300,142 @@ fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
             .contains(&format!("will read {}", buffer + u64::from(ROWS))),
         "{refused}"
     );
+}
+
+/// A lane's attention mask is per-row data, never its class (the mask fold):
+/// a masked beam lane beside three plain decodes fires in one fire and one
+/// body, the launches four plain decodes make (where the backend records,
+/// the plain fire's recording replayed, none of its own kept), and each lane
+/// answers what it answers alone (contract A: a token parts only on a
+/// near-tie). The beam's mask is read: it answers otherwise unmasked.
+#[test]
+fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
+    use eta_compiler::contract::{Drift, near_tie};
+    use engine::fire::{Mask, Masking};
+
+    const PLAIN: u32 = 3;
+    const LANES: u32 = PLAIN + 1;
+    const PROMPT: u32 = 40;
+    const STEPS: u32 = 6;
+    let fixture = fixture("qwen3-micro-text", None);
+    // Each lane's slot pair: batched in slot `l`, alone in slot `LANES + l`.
+    let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, 2 * LANES, 256) else {
+        return;
+    };
+    let trace = fixture.trace.clone();
+    let beam = PLAIN as usize;
+    // Every key but a stretch of the prompt (`8..16`), so a lane reading no
+    // mask answers otherwise.
+    let beam_mask = |columns: u32| {
+        Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)))
+    };
+    // `(slot, tokens, held, mask)` a lane.
+    type Row<'a> = (u32, &'a [u32], u32, Option<&'a Masking>);
+    let fire = |shell: &mut Shell, lanes: &[Row<'_>]| -> Vec<Vec<f32>> {
+        let seated: Vec<Seated<'_>> = lanes
+            .iter()
+            .map(|&(slot, tokens, held, mask)| Seated {
+                held: Some(held),
+                mask,
+                ..Seated::of(Lane {
+                    slot,
+                    word: word(&trace, tokens.len() as u32),
+                    tokens,
+                })
+            })
+            .collect();
+        shell.fire_seated(&seated).expect("the fire serves")
+    };
+
+    let mut last = [[0u32; 2]; LANES as usize];
+    for lane in 0..LANES {
+        let tokens: Vec<u32> = (0..PROMPT)
+            .map(|t| (t * 7 + 11 + lane * 13) % 256)
+            .collect();
+        for (side, slot) in [(0usize, lane), (1, LANES + lane)] {
+            let rows = fire(&mut shell, &[(slot, &tokens, 0, None)]);
+            last[lane as usize][side] = argmax(&rows[0]);
+        }
+    }
+    shell.walked_serving();
+    shell.recorded_serving();
+    let (mut same, mut ties) = (0u32, 0u32);
+    let mut parted = [false; LANES as usize];
+    for step in 0..STEPS {
+        let held = PROMPT + step;
+        let mask = beam_mask(held + 1);
+        let next: Vec<[u32; 1]> = (0..LANES as usize).map(|l| [last[l][0]]).collect();
+        let rows = |masked: bool| -> Vec<Row<'_>> {
+            (0..LANES)
+                .map(|l| {
+                    let mask = (masked && l as usize == beam).then_some(&mask);
+                    (l, &next[l as usize][..], held, mask)
+                })
+                .collect()
+        };
+        // The same lanes stating no mask first: the same keys written.
+        let plain = fire(&mut shell, &rows(false));
+        let (_, plain_launches) = shell.walked_serving();
+        shell.recorded_serving();
+        let batched = fire(&mut shell, &rows(true));
+        let (_, launches) = shell.walked_serving();
+        assert_eq!(
+            shell.recorded_serving(),
+            0,
+            "step {step}: the fire with a masked lane kept a recording of its own"
+        );
+        assert!(
+            launches == 0 || launches == plain_launches,
+            "step {step}: the fire with a masked lane made {launches} launches, the plain \
+             one {plain_launches}"
+        );
+        assert!(
+            plain[beam]
+                .iter()
+                .zip(&batched[beam])
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "step {step}: the beam's mask hid nothing"
+        );
+        for lane in 0..LANES as usize {
+            let token = [last[lane][1]];
+            let alone = fire(
+                &mut shell,
+                &[(
+                    LANES + lane as u32,
+                    &token,
+                    held,
+                    (lane == beam).then_some(&mask),
+                )],
+            )
+            .swap_remove(0);
+            let (a, b) = (&alone, &batched[lane]);
+            let (ta, tb) = (argmax(a) as usize, argmax(b) as usize);
+            if !parted[lane] && ta != tb {
+                let mut top = [f32::NEG_INFINITY; 2];
+                for &v in a {
+                    if v > top[0] {
+                        top = [v, top[0]];
+                    } else if v > top[1] {
+                        top[1] = v;
+                    }
+                }
+                let parting = near_tie(top[0] - top[1], &[ta, tb], Drift::Rows { a, b }, None);
+                eprintln!("lane {lane} parts at step {step}: {parting:?}");
+                assert!(
+                    parting.tie,
+                    "lane {lane} (beam: {}) parts at step {step} on no near-tie",
+                    lane == beam
+                );
+                parted[lane] = true;
+                ties += 1;
+            } else if !parted[lane] {
+                same += 1;
+            }
+            last[lane] = [tb as u32, ta as u32];
+        }
+    }
+    eprintln!("{same} lane steps the same token, {ties} parted on a near-tie");
+    assert!(same > 0, "no lane step answered as it does alone");
 }
 
 /// A row's causal bound is its row order, the cache row; a stated position

@@ -89,7 +89,11 @@ pub struct Shell {
     inputs: Inputs,
     facts: kv::Facts,
     page_tables: usize,
+    /// The classes a lane may state a mask on (`exports::masked_classes`).
     masked: poem_ir::ClassSet,
+    /// The classes whose attention reads the fire's masks: a fire carrying
+    /// one stages every lane's entry, a mask or none.
+    mask_read: poem_ir::ClassSet,
     /// The classes a stated mask reaches as a group's (a ragged attention):
     /// a lane there states one or none.
     group_masked: poem_ir::ClassSet,
@@ -178,10 +182,6 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
-    /// The arming fire's ragged attentions read a group mask: its lanes
-    /// state every row of their group admitted, and its body is the masked
-    /// twin (`record::BodyKey::group_mask`).
-    arm_group_mask: bool,
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),
@@ -808,7 +808,7 @@ impl Shell {
         let registered = self.programs.register(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         registered
     }
@@ -834,7 +834,7 @@ impl Shell {
         let prepared = self.programs.prepare(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         prepared
     }

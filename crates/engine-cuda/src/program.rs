@@ -513,7 +513,7 @@ impl Plane {
     }
 
     /// The region modules registrations built that the load's prewarm had
-    /// not: the engine's `Tally::BuiltAfterReady` from registrations.
+    /// not: the engine's `Tally::BuiltAtRegister` from registrations.
     #[must_use]
     pub const fn built_late(&self) -> u64 {
         self.cache.built_late()
