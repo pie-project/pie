@@ -1606,7 +1606,8 @@ fn lit(x: f32) -> String {
 
 /// A printed module's scratch rows (its row buffers `b<k>`, the sum's, exp's and recip's rows,
 /// the 16-bit rounding's): nothing it holds from one `row()` to the next, so the regions a root
-/// runs one after another can share them ([`pooled`]).
+/// runs one after another can share them ([`pooled`]); so can its row parameters (`in<k>` of a
+/// row's: written by the root just before its `row()`, read by nothing after it).
 fn scratch_name(n: &str) -> bool {
     matches!(n, "sumt" | "ep" | "ek" | "ra" | "ry" | "rsg" | "h16")
         || n.strip_prefix('b')
@@ -1640,7 +1641,12 @@ pub fn pooled(csl: &str) -> (String, Vec<ScratchRow>, u32) {
             } else {
                 return None;
             };
-            scratch_name(name).then(|| (name.to_string(), ty))
+            // (a row's parameter: the root writes it just before `row()`, never reads it)
+            let row_in = name
+                .strip_prefix("in")
+                .is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()))
+                && r.contains("// a row's");
+            (scratch_name(name) || row_in).then(|| (name.to_string(), ty))
         });
         match decl {
             Some((name, ty)) => {
@@ -1679,19 +1685,21 @@ mod tests {
     #[test]
     fn a_pooled_module_takes_its_scratch_rows_in() {
         let csl = "const C: u16 = 64;\n\
-                   var in0: [C]f32 align(16) = @zeros([C]f32);   // a row's\n\
+                   var in0: [C]f32 align(16) = @zeros([C]f32);   // resident\n\
+                   var in1: [C]f32 align(16) = @zeros([C]f32);   // a row's\n\
                    var b0: [C]f32 align(16) = @zeros([C]f32);\n\
                    var b12: [C]f32 align(16) = @zeros([C]f32);\n\
                    var ek = @zeros([C]u16);\n\
                    var h16 = @zeros([C]@fp16());\n\
                    var b0x = @zeros([C]u16);\n\
-                   fn f() void { g(&b12, &in0, &b0x); h(@ptrcast([*]u16, &ek)); }\n";
+                   fn f() void { g(&b12, &in0, &b0x, &in1); h(@ptrcast([*]u16, &ek)); }\n";
         let (text, rows, c) = pooled(csl);
         assert_eq!(c, 64);
         let names: Vec<(&str, &str)> = rows.iter().map(|(n, t)| (n.as_str(), *t)).collect();
         assert_eq!(
             names,
             [
+                ("in1", "f32"),
                 ("b0", "f32"),
                 ("b12", "f32"),
                 ("ek", "u16"),
@@ -1700,7 +1708,7 @@ mod tests {
         );
         assert!(text.contains("param b12: [*]f32;\n") && text.contains("param h16: [*]@fp16();\n"));
         assert!(text.contains("var in0: [C]f32") && text.contains("var b0x = @zeros([C]u16);"));
-        assert!(text.contains("g(b12, &in0, &b0x); h(@ptrcast([*]u16, ek));"));
+        assert!(text.contains("g(b12, &in0, &b0x, in1); h(@ptrcast([*]u16, ek));"));
     }
 
     /// srope's STEP in f32 as the PE runs it (a DIRECT anchor at each multiple of the period, one

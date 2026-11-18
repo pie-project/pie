@@ -3737,3 +3737,37 @@ The regions at a root run one after another, and nothing a region keeps in its s
   alone at 49,056 B, 96 B of stack (the estimate 49,267 B: inside the check's `OVER`, and its
   code, ~13.6 KB, past the search's `CODE_RESERVE` of 7,680 B). Next: a root's code in the
   search by its regions' (the kind refit G4.2 did for weight PEs), so the plan keeps the stack.
+
+### G4.4 gemma4-e2b -l2: room for the stack, and gemma4-sim
+
+G4.3's plan for gemma4-e2b -l2 (663 x 408) had s0l0's head root (`cy_1_0.csl`: four head regions
+over a head of 256) at 49,056 B linked alone: 96 B of stack.
+
+- **A root's code by its regions, measured** (not built): each region module's code as the check
+  measures it (its `init` / `row` and what they reach), against 40 column roots linked alone
+  (qwen3-sim, qwen3-sim4, minimax-sim, Qwen3-0.6B -l2, Qwen3.5-0.8B -l1, nemotron -l1,
+  qwen3-30b-a3b-mini -l1, minimax-m25-mini -l1, gemma4-e2b -l2). The search's root model (its
+  words and those regions' code) misses the linked images by -14.4 KB to +9.7 KB: its data side is
+  far over on rest roots (held rows) and under on head roots, so a fit of the code alone has no
+  useful worst miss. The emitted program's check, by contrast, is within ~0.5 KB on stream roots
+  (49,267 B estimated for that root). The data: `scratch/cleanup/g4/fit/rfit1.tsv`.
+- **Built instead**: (1) a region's row parameters (`in<k>` of a row's: written by the root just
+  before its `row()`, read by nothing after it) join the pool (`emit::region::pooled`); the
+  root's fullest image 49,056 B to 45,952 B. (2) The build's memory gate (`stream::build::fits`)
+  keeps each kind of PE's check estimate within a PE less the stack's room, else the next
+  cheapest candidate (it was the estimate's worst over-estimate, 2,361 B, past a PE).
+- **gemma4-e2b -l2** plans at 663 x 408 and links in full (cslc through the SIF): the largest
+  image is 45,952 B, leaving 3,200 B of stack.
+- **Identity**: every decode program keeps its layout and price; root and region files change
+  (the pooled row inputs), as do klein's text and denoise (93 files); flux2-mini's text, denoise
+  and tiled VAEs are byte-identical. qwen3-sim on the simulator: 16 of 16, logits identical to
+  the unpooled program's, 10 cycles a step more.
+- **gemma4-sim** (`models/gemma_4.poem`): E2B's head widths, rotations, per-layer embeddings,
+  window and softcap at hidden 256, 2 q heads, 1 K / V head, 2 layers, a vocabulary of 512.
+  Its random-weight checkpoint and golden come from `hf_sim.py`, which now builds a multimodal
+  release's text model alone, saved under the release's names. `_vectors=4` moves the norm
+  weights off their init, because at the init the tied embeddings echo the input token. It
+  builds at 14 x 88, with the same head-root image as e2b -l2. **On the simulator it stalls at
+  its first step**: a d2h of every PE's stamps returns 82 of 3,696 words, and the simulator
+  stops idle at 3.73M cycles. This is not bisected yet. gemma4-sim cannot build without the
+  pool, so the earlier binaries cannot run it; qwen3-sim with the pooled row inputs runs right.

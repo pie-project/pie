@@ -72,22 +72,21 @@ impl Default for KvSplit {
 pub const MAX_KV_REP: u32 = 16;
 
 /// `p`'s PEs' memory, the static check's model of it as emitted ([`crate::check::PeBytes`]):
-/// refused only past the model's worst miss (a program that links is never refused; one within
-/// the miss, the price picks and its link checks).
+/// each kind of PE's estimate leaves the stack's room ([`crate::build::STACK_ROOM`]); past it,
+/// the next cheapest candidate. (The estimate's rms miss on stream units' linked images is 539 B,
+/// its worst over 1,068 B: a PE it puts within the stack's room of a PE is likelier not to run
+/// than to; gemma4-e2b -l2's s0l0 head root, estimated 49,267 B, links at 49,056 B, 96 B of stack.)
 fn fits(p: &Program) -> R<()> {
     let e = crate::emit::stream::emit(p)?;
     let rep = crate::check::placed(&e.placed, &e.files, None);
     if let Some((f, d, c)) = rep.codes.iter().find(|(_, data, code)| {
-        crate::check::PeBytes {
-            data: *data,
-            code: *code,
-        }
-        .overflows()
+        data + code + i64::from(crate::build::STACK_ROOM) > crate::check::PE_BYTES
     }) {
         return Err(format!(
-            "{}: `{f}`: {d} B data + ~{c} B code past a PE's {} B",
+            "{}: `{f}`: {d} B data + ~{c} B code past a PE's {} B less the stack's {} B",
             p.trace.name,
-            crate::check::PE_BYTES
+            crate::check::PE_BYTES,
+            crate::build::STACK_ROOM
         ));
     }
     Ok(())
