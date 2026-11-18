@@ -86,7 +86,7 @@ impl PoolPort for TierPool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _up_to: Option<i64>,
+        _bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }

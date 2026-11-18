@@ -194,8 +194,10 @@ impl ResidencyPlanner {
         }
     }
 
-    /// `pid` holds all that is held in the pool: no other process holds kv
-    /// pages or state, none is on its way back, and no idle cache could go.
+    /// `pid` holds all that is held in the pool: it holds something, no
+    /// other process holds kv pages or state, none is on its way back, and
+    /// no idle cache could go, dropped or moved down a tier. Short then, it
+    /// cannot fit across the tiers beside nothing but itself.
     /// Stalled (nothing of it in flight), it is stuck on what it holds
     /// itself, and a restart frees only that to ask for the same again.
     pub(super) fn sole_holder(&self, pid: ProcessId) -> bool {
@@ -210,7 +212,10 @@ impl ResidencyPlanner {
             (others, inner.evicting.is_empty())
         });
         quiet
+            && (held_page_count(pid, model, engine) > 0
+                || !held_rs_units(pid, model, engine).is_zero())
             && self.port.reclaimable_idle() == 0
+            && self.port.idle_pages_up_to(i64::MAX) == 0
             && others.into_iter().all(|other| {
                 held_page_count(other, model, engine) == 0
                     && held_rs_units(other, model, engine).is_zero()

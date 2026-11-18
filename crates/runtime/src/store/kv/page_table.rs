@@ -2149,12 +2149,7 @@ impl KvPageTable {
         }
         let resident = locations
             .into_iter()
-            .filter(|location| {
-                matches!(
-                    self.backing_at(location),
-                    Ok(KvPageBacking::Resident(_))
-                )
-            })
+            .filter(|location| matches!(self.backing_at(location), Ok(KvPageBacking::Resident(_))))
             .count();
         (resident, usize::try_from(unmapped).unwrap_or(usize::MAX))
     }

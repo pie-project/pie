@@ -18,8 +18,9 @@ use std::sync::Arc;
 use crate::policy::pressure::{self, Tier};
 use crate::rt::Instant;
 
-/// Says that `tier` is short of `bytes` in all now (0 once it is not).
-pub type Sink = Arc<dyn Fn(Tier, u64) + Send + Sync>;
+/// Says that `tier` is short of `bytes` in all now (0 once it is not), for
+/// which demand ([`pressure::Demand`]).
+pub type Sink = Arc<dyn Fn(Tier, u64, pressure::Demand) + Send + Sync>;
 
 /// Sheds the engine's weight cache to its floor; the slots it gave back
 /// (0 when nothing was above the floor, or the weights do not stream).
@@ -27,7 +28,7 @@ pub type WeightShed = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// The sink a planner on `engine` raises tier pressure through.
 pub fn sink(engine: usize) -> Sink {
-    Arc::new(move |tier, bytes| pressure::raise(tier, engine, bytes))
+    Arc::new(move |tier, bytes, demand| pressure::raise_for(tier, engine, bytes, demand))
 }
 
 /// What one waiter lacks on each tier, since when it has lacked any, and

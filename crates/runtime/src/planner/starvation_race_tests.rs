@@ -178,7 +178,7 @@ impl PoolPort for RacePool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _up_to: Option<i64>,
+        _bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -1525,7 +1525,7 @@ impl PoolPort for RingPool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _up_to: Option<i64>,
+        _bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -2496,7 +2496,7 @@ impl PoolPort for BindRoomPool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _up_to: Option<i64>,
+        _bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -2989,19 +2989,37 @@ async fn a_process_is_re_keyed_when_its_row_lands() {
 /// policy is asked) and the key-20 set keeps running.
 #[tokio::test(flavor = "current_thread")]
 async fn a_demand_parks_no_set_keyed_above_its_own() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
     let planner = Arc::new(ResidencyPlanner::new(
         Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
     ));
     let pids: Vec<ProcessId> = (0..6).map(|_| ProcessId::new_v4()).collect();
     let (grower, high_live, high_idle, low_idle, high_rest, low_rest) =
         (pids[0], pids[1], pids[2], pids[3], pids[4], pids[5]);
+    // The policy keys them: a bound reads only a key a row states.
+    install(Some(Table::new(
+        std::collections::HashMap::from([
+            (grower, 15),
+            (high_live, 20),
+            (high_idle, 20),
+            (low_idle, 10),
+        ]),
+        None,
+        std::collections::HashMap::new(),
+        None,
+    )));
     for &pid in &pids {
         planner.register(pid);
         planner.note_admitted(pid);
     }
     planner.with_inner(|inner| {
-        for (pid, key) in [(grower, 15), (high_live, 20), (high_idle, 20), (low_idle, 10)] {
+        for (pid, key) in [
+            (grower, 15),
+            (high_live, 20),
+            (high_idle, 20),
+            (low_idle, 10),
+        ] {
             inner.procs.get_mut(&pid).unwrap().key = key;
         }
         for pid in [high_idle, low_idle] {
@@ -3047,11 +3065,74 @@ async fn a_demand_parks_no_set_keyed_above_its_own() {
         "no higher-keyed set is a victim"
     );
     planner.plan_eviction();
-    let states = planner.with_inner(|inner| {
-        [high_live, high_idle, high_rest].map(|pid| inner.procs[&pid].state)
-    });
+    let states = planner
+        .with_inner(|inner| [high_live, high_idle, high_rest].map(|pid| inner.procs[&pid].state));
     assert!(
         states.iter().all(|state| *state == Residency::Resident),
         "the key-20 sets keep running: {states:?}"
     );
+    install(None);
+}
+
+/// Liveness under the key bound: with nothing running to free room (the
+/// fleet stands still), a lower-keyed demand may move higher-keyed resting
+/// sets down a tier (an idle process's, a handle's at rest), never a
+/// running one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stalled_fleet_lets_a_lower_demand_move_higher_resting_sets_down() {
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (asker, high_idle, high_rest) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    install(Some(Table::new(
+        std::collections::HashMap::from([(asker, 5), (high_idle, 20)]),
+        None,
+        std::collections::HashMap::new(),
+        None,
+    )));
+    for pid in [asker, high_idle, high_rest] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&high_idle).unwrap().idle = true;
+        let rest = inner.procs.get_mut(&high_rest).unwrap();
+        rest.rest(1);
+        rest.kept = 20;
+        rest.holder = true;
+        rest.idle = true;
+        inner.enqueue(
+            asker,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members: HashSet<ProcessId> = planner
+        .victim_set()
+        .expect("the asker lacks pages")
+        .members
+        .iter()
+        .map(|victim| victim.pid)
+        .collect();
+    assert!(
+        planner.with_inner(|inner| inner.fleet_stalled()),
+        "nothing runs"
+    );
+    assert_eq!(
+        members,
+        HashSet::from([high_idle, high_rest]),
+        "resting higher-keyed sets move down for it"
+    );
+    for pid in [asker, high_idle, high_rest] {
+        planner.unregister(pid);
+    }
+    install(None);
 }

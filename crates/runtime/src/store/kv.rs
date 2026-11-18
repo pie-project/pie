@@ -20,6 +20,14 @@ use page_table::{
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
 use crate::inferlet::process::ProcessId;
+
+/// What a demand may demote ([`KvStore::prepare_demote`]): idle cache keyed
+/// at most `up_to`, and the asker's own (`own`) whatever its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoteBound {
+    pub up_to: i64,
+    pub own: Option<ProcessId>,
+}
 use crate::policy::retention::{self, Keys};
 use crate::policy::{By, Event};
 use crate::rt::Instant;
@@ -997,15 +1005,16 @@ impl KvStore {
     /// what lands on disk as its copies, journaled. Only cache keyed above
     /// the retention floor ([`retention::above_floor`]) moves: the rest is
     /// dropped when its room is wanted, never copied down.
-    /// With `up_to`, only groups keyed at or below it go: what a demand
-    /// keyed so may take. A higher-keyed group stays for it.
+    /// With `bound`, only groups keyed at or below its key go, or the
+    /// asker's own: what a demand keyed so may take. A higher-keyed group
+    /// stays for it.
     pub fn prepare_demote(
         &mut self,
         room: usize,
         keys: impl Keys,
-        up_to: Option<i64>,
+        bound: Option<DemoteBound>,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_demote_where(room, keys, false, up_to)
+        self.prepare_demote_where(room, keys, false, bound)
     }
 
     /// The tiers entry `id`'s KV may sit on.
@@ -1056,8 +1065,9 @@ impl KvStore {
         room: usize,
         keys: impl Keys,
         now: bool,
-        up_to: Option<i64>,
+        bound: Option<DemoteBound>,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        let up_to = bound.map(|bound| bound.up_to);
         // Free slots only: a demote gives up no copy for idle cache.
         let room = room.min(self.host_pool.available() + self.disk_pool.available());
         if room == 0 {
@@ -1080,7 +1090,15 @@ impl KvStore {
             })
             .filter(|(_, ids)| !ids.is_empty())
             .collect();
-        groups.retain(|(key, _)| up_to.is_none_or(|up_to| *key <= up_to));
+        if let Some(bound) = bound {
+            groups.retain(|(key, ids)| {
+                *key <= bound.up_to
+                    || bound.own.is_some_and(|own| {
+                        ids.iter()
+                            .all(|id| self.cache.get(id).is_some_and(|e| e.owner == Some(own)))
+                    })
+            });
+        }
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
@@ -2521,6 +2539,21 @@ impl KvStore {
     /// every guest's fire waits on, and the planner, the governor's tick and
     /// the census each ask: a count stands a second, or fifty times what its
     /// walk took when that is longer.
+    /// The device pages only idle cache keyed at most `up_to` holds: what a
+    /// demand keyed so may free by dropping or demoting it.
+    pub fn idle_pages_up_to(&self, keys: impl Keys, up_to: i64) -> usize {
+        let roots: Vec<NodeId> = self
+            .reclaim_order(&keys)
+            .into_iter()
+            .filter(|(key, _)| *key <= up_to)
+            .flat_map(|(_, ids)| self.roots(&ids))
+            .collect();
+        if roots.is_empty() {
+            return 0;
+        }
+        self.table.cache_only_pages(&roots, &[]).len()
+    }
+
     pub fn reclaimable_cache_pages(&self) -> u32 {
         if let Some((at, took, pages)) = self.reclaimable.get()
             && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
@@ -2617,7 +2650,10 @@ impl KvStore {
         let order = &order[..];
         let mut pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         if self.swap_available() < pages.len().min(room) {
-            let wanted = pages.len().min(room).saturating_sub(self.disk_swap_available());
+            let wanted = pages
+                .len()
+                .min(room)
+                .saturating_sub(self.disk_swap_available());
             self.drop_entries_off_device(wanted, keys);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.stranded_pages(keep, order, wanted, spare_heads);

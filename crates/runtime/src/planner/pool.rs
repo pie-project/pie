@@ -128,6 +128,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pids;
         WorkingSetPages::default()
     }
+    /// The device pages dropping or demoting idle cache keyed at most
+    /// `up_to` would free: what a demand keyed so may take.
+    fn idle_pages_up_to(&self, up_to: i64) -> u64 {
+        let _ = up_to;
+        0
+    }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
     /// state. `None` where the kv pages are a pool of their own.
@@ -157,12 +163,12 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     /// Idle cache keyed above the floor down a tier, lowest key first;
-    /// with `up_to`, only cache keyed at or below it (what a demand keyed
-    /// so may take: a higher-keyed set stays for it).
+    /// with `bound`, only cache keyed at or below its key, or the asker's
+    /// own (what a demand keyed so may take: a higher-keyed set stays).
     fn prepare_demote(
         &self,
         room: usize,
-        up_to: Option<i64>,
+        bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     /// Idle cache a `retention/tiers` row keeps off the device, to move
     /// down now.
@@ -367,6 +373,12 @@ impl PoolPort for RegistryPool {
         }
     }
 
+    fn idle_pages_up_to(&self, up_to: i64) -> u64 {
+        self.with_kv_tagged("planner-idle-up-to", |kv| {
+            kv.idle_pages_up_to(crate::policy::retention::Installed, up_to)
+        }) as u64
+    }
+
     fn reclaim_idle(&self) -> u32 {
         let pages = self.with_kv_tagged("planner-reclaim-idle", |kv| {
             let epoch = kv.current_epoch();
@@ -529,13 +541,13 @@ impl PoolPort for RegistryPool {
     fn prepare_demote(
         &self,
         room: usize,
-        up_to: Option<i64>,
+        bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         if !self.suspend_capable {
             return None;
         }
         self.with_kv_tagged("planner-demote", |kv| {
-            kv.prepare_demote(room, crate::policy::retention::Installed, up_to)
+            kv.prepare_demote(room, crate::policy::retention::Installed, bound)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
