@@ -249,6 +249,8 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         },
         &channels,
     );
