@@ -978,59 +978,75 @@ fn scan<B: Serve>(
     launch: f64,
 ) -> Result<f64> {
     let channels = s.channels();
-    let qkv = rig.zeros(s.tokens, channels, Dtype::Bf16)?;
     let indptr = rig.words(&[0, s.tokens], 2, 1, Dtype::I32)?;
     let weight = rig.operand(channels, s.conv_width, Dtype::Bf16)?;
     let slots = rig.zeros(s.tokens, 1, Dtype::U32)?;
     let gates = rig.zeros(s.tokens, 2 * s.v_heads, Dtype::F32)?;
     let y = rig.zeros(s.tokens, s.v_heads * s.v_dim, Dtype::F32)?;
     // Each fire reads the next of these input rows and states, past the
-    // last-level cache, as a served layer's.
+    // last-level cache, as a served layer's: the conv's raw rows and its
+    // output (the scan's input), the conv's and the scan's state.
     let sets = (0..engine::rates::scan_sets_at(s))
         .map(|_| {
             let raw = rig.operand(s.tokens, channels, Dtype::Bf16)?;
+            let qkv = rig.operand(s.tokens, channels, Dtype::Bf16)?;
             let conv_bank = rig.operand(1, s.conv_width * channels, Dtype::F32)?;
             let scan_bank = rig.operand(1, s.v_heads * s.k_dim * s.v_dim, Dtype::F32)?;
             Ok((
                 raw,
+                qkv,
                 kernels_slang::ssm::StatePool::bank(conv_bank, slots),
                 kernels_slang::ssm::StatePool::bank(scan_bank, slots),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let next = std::cell::Cell::new(0usize);
-    rig.step(format!("scan {} tokens", s.tokens), None);
-    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
-        let (raw, conv_state, scan_state) = &sets[next.get() % sets.len()];
-        let raw = *raw;
-        next.set(next.get() + 1);
-        kernels_slang::ssm::conv1d::conv1d_chunked(
-            sink,
-            RaggedTensor { data: raw, indptr },
-            weight,
-            conv_state,
-            s.conv_width,
-            1,
-            qkv,
-        )
-        .map_err(fault("rates: conv"))?;
-        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-            sink,
-            tactic,
-            RaggedTensor { data: qkv, indptr },
-            gates,
-            scan_state,
-            s.k_heads,
-            s.v_heads,
-            s.k_dim,
-            s.v_dim,
-            y,
-        )
-        .map_err(fault("rates: scan"))
-    })?;
+    // The conv and the scan each timed on its own, as a fire runs (and its
+    // dissection times) each: back to back in one burst, the next pair's
+    // conv rewriting the rows the last scan reads waits on it, a wait no
+    // served layer has (the pair ran 3.5 ms a fire on an RTX PRO 4500
+    // against its 0.78 + 2.19 alone, the model's own 0.86 + 2.19).
+    let conv = {
+        let next = std::cell::Cell::new(0usize);
+        rig.step(format!("scan {} tokens: the conv", s.tokens), None);
+        rig.each(timer, &Touched::default(), sets.len(), &|sink| {
+            let (raw, qkv, conv_state, _) = &sets[next.get() % sets.len()];
+            next.set(next.get() + 1);
+            kernels_slang::ssm::conv1d::conv1d_chunked(
+                sink,
+                RaggedTensor { data: *raw, indptr },
+                weight,
+                conv_state,
+                s.conv_width,
+                1,
+                *qkv,
+            )
+            .map_err(fault("rates: conv"))
+        })?
+    };
+    let scan = {
+        let next = std::cell::Cell::new(0usize);
+        rig.step(format!("scan {} tokens: the scan", s.tokens), None);
+        rig.each(timer, &Touched::default(), sets.len(), &|sink| {
+            let (_, qkv, _, scan_state) = &sets[next.get() % sets.len()];
+            next.set(next.get() + 1);
+            kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
+                sink,
+                tactic,
+                RaggedTensor { data: *qkv, indptr },
+                gates,
+                scan_state,
+                s.k_heads,
+                s.v_heads,
+                s.k_dim,
+                s.v_dim,
+                y,
+            )
+            .map_err(fault("rates: scan"))
+        })?
+    };
     engine::rates::rate_from(
         &format!("scan of {} tokens", s.tokens),
-        ns as f64,
+        (conv + scan) as f64,
         engine::rates::SCAN_DISPATCHES,
         launch,
         scan_elements(s),
