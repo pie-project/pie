@@ -101,11 +101,6 @@ pub struct DecodePlan {
     pub workspace: Workspace,
     pub shape: Shape,
     pub window: Option<u32>,
-    /// Each request's byte offset into the fire's masks and its word
-    /// (`kernels_cuda`'s `DecodePlan::mask_indptr` / `mask_origin`): the
-    /// engine binds them at plan build; ROCm's decode reads no mask yet.
-    pub mask_indptr: Option<Tensor>,
-    pub mask_origin: Option<Tensor>,
     pub device: Device,
     /// The fire's mask offsets (i64, one a request and one past) and words
     /// (u32 a request), where it staged them: a decode reading a lane's mask
@@ -373,8 +368,6 @@ pub fn plan_decode(
         workspace,
         shape,
         window,
-        mask_indptr: None,
-        mask_origin: None,
         device: *device,
         mask_indptr: None,
         mask_origin: None,
