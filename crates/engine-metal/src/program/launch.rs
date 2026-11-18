@@ -22,7 +22,7 @@ fn launches<'a>(
     plan: &'a LaunchStagePlan,
     regions: &'a [Region],
     descriptors: &[ValueDesc],
-) -> Launches<'a> {
+) -> std::result::Result<Launches<'a>, eta_exec::TemporaryRefused> {
     let mut each = Vec::new();
     for (index, region) in plan.fused.iter().enumerate() {
         let groups = regions
@@ -49,14 +49,34 @@ fn launches<'a>(
             });
         }
     }
-    Launches {
+    Ok(Launches {
         each,
         // Held clear below the temporary area as the whole-value layout held
         // it: a one-row select keeps its state there.
         reserve: eta_exec::SELECT_RESERVE,
-        temporary: eta_exec::whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
+        temporary: eta_exec::stage_temporaries(descriptors, &temporary_needs(plan, regions))?,
         ..Launches::default()
-    }
+    })
+}
+
+/// What each streamed region's kernel takes of a lane's temporary area, as
+/// Metal's emitter publishes it: a top-k's histograms and candidates a row
+/// of its input, or each select's state below the reductions' planes. The
+/// other forms take the whole-value rule alone.
+pub(crate) fn temporary_needs(
+    plan: &LaunchStagePlan,
+    regions: &[Region],
+) -> Vec<eta_exec::TemporaryNeed> {
+    use eta_compiler::codegen::metal::{streamed_temporary_need, streamed_topk_temporary_need};
+    regions
+        .iter()
+        .filter(|region| region.form == Form::Streamed)
+        .map(|region| {
+            let index = region.region_index as usize;
+            streamed_topk_temporary_need(plan, index)
+                .unwrap_or_else(|| streamed_temporary_need(plan, index))
+        })
+        .collect()
 }
 
 /// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
@@ -66,8 +86,9 @@ fn layout_of(
     plan: &LaunchStagePlan,
     regions: &[Region],
     descriptors: &[ValueDesc],
-) -> std::result::Result<Layout, TooLarge> {
-    eta_exec::lay_out(plan, descriptors, &launches(plan, regions, descriptors))
+) -> std::result::Result<Layout, String> {
+    let launches = launches(plan, regions, descriptors).map_err(|why| why.to_string())?;
+    eta_exec::lay_out(plan, descriptors, &launches).map_err(|why: TooLarge| format!("{why:?}"))
 }
 use eta_ir::Dtype;
 use eta_ir::op::tags;
@@ -601,7 +622,7 @@ impl Grouped {
         let scratch_layout = layout_of(plan, regions, descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
+                format!("this fire's scratch does not fit: {why}"),
             )
         })?;
         let base = GroupLayout {
@@ -1099,7 +1120,7 @@ impl Prepared {
             .map_err(|why| {
                 Fault::program(
                     "program::launch",
-                    format!("a stage's scratch does not fit: {why:?}"),
+                    format!("a stage's scratch does not fit: {why}"),
                 )
             })?
             .total;
@@ -1169,7 +1190,7 @@ impl Prepared {
         let scratch_layout = layout_of(plan, regions, &descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
+                format!("this fire's scratch does not fit: {why}"),
             )
         })?;
         let scratch_stride = lane_word(LANE_SCRATCH, scratch_layout.total)?;
