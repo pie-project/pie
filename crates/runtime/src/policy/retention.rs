@@ -81,6 +81,19 @@ impl Keys for Installed {
 
 static CURRENT: RwLock<Option<Table>> = RwLock::new(None);
 
+/// Whether a retention table is installed.
+pub fn installed() -> bool {
+    CURRENT.read().is_some()
+}
+
+/// Whether the installed table states a row for `owner`.
+pub fn states(owner: ProcessId) -> bool {
+    CURRENT
+        .read()
+        .as_ref()
+        .is_some_and(|table| table.steps.contains_key(&owner))
+}
+
 pub(crate) fn install(retention: Option<Table>) {
     *CURRENT.write() = retention;
 }

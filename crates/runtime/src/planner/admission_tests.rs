@@ -17,6 +17,8 @@ struct SizedPool {
     total: u32,
     /// Free host slots: room below the device.
     host: u32,
+    /// The bounds each demote was asked under (`None`: unbounded).
+    demotes: parking_lot::Mutex<Vec<Option<i64>>>,
     sizes: parking_lot::Mutex<HashMap<ProcessId, u64>>,
 }
 
@@ -56,7 +58,7 @@ impl PoolPort for SizedPool {
         (0, 0)
     }
     fn suspend_capable(&self) -> bool {
-        false
+        self.host > 0
     }
     fn locus(&self) -> (usize, usize) {
         (0, 0)
@@ -87,8 +89,9 @@ impl PoolPort for SizedPool {
     fn prepare_demote(
         &self,
         _room: usize,
-        _bound: Option<crate::store::kv::DemoteBound>,
+        bound: Option<crate::store::kv::DemoteBound>,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
+        self.demotes.lock().push(bound.map(|bound| bound.up_to));
         None
     }
 }
@@ -129,6 +132,7 @@ fn device_with_host(
     let pool = SizedPool {
         total,
         host,
+        demotes: parking_lot::Mutex::new(Vec::new()),
         sizes: parking_lot::Mutex::new(sized.iter().copied().collect()),
     };
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool)));
@@ -427,4 +431,53 @@ async fn admission_counts_the_room_below_the_device_under_the_key_bound() {
     assert!(!case([9, 9, 5], 8), "only higher-keyed sets could move: it waits");
     assert!(!case([1, 1, 5], 2), "never past the device and the host together");
     schedule::install(None);
+}
+
+/// The liveness fallback of the planner's demote follows the bound: while a
+/// running request will free room, the head's demand demotes only within
+/// its retention key; set aside (lowest key first, moved down, never
+/// dropped) only where nothing running or admitted can free room and the
+/// head's own row has landed.
+#[tokio::test(flavor = "current_thread")]
+async fn the_demote_fallback_sets_the_bound_aside_only_when_nothing_frees_room() {
+    use crate::policy::retention::{Table, install};
+    let _schedule = schedule::TEST_LOCK.write().await;
+    let (head, filler) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let pool = Arc::new(SizedPool {
+        total: 4,
+        host: 8,
+        demotes: parking_lot::Mutex::new(Vec::new()),
+        sizes: parking_lot::Mutex::new(HashMap::new()),
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+    for pid in [head, filler] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    install(Some(Table::new(HashMap::from([(head, vec![(None, 15)])]))));
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            super::wait::WaitKind::Allocation {
+                demand: super::Demand {
+                    kv_pages: 100,
+                    rs: RsUnits::default(),
+                },
+                notify: Arc::new(tokio::sync::Notify::new()),
+                outcome: None,
+                yielded: false,
+            },
+        );
+    });
+    planner.demote_idle(8);
+    assert_eq!(*pool.demotes.lock(), vec![Some(15)], "the filler will run: bounded");
+    pool.demotes.lock().clear();
+    planner.with_inner(|inner| inner.procs.get_mut(&filler).unwrap().idle = true);
+    planner.demote_idle(8);
+    assert_eq!(
+        *pool.demotes.lock(),
+        vec![Some(15), None],
+        "nothing frees room: the bound is set aside, after the bounded ask"
+    );
+    install(None);
 }

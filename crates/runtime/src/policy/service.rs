@@ -499,6 +499,14 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
         if took {
             nothing_left_ends(tier, "a working set is moved down or discarded");
             let _ = KEPT.lock().unwrap()[tier.index()].end();
+        } else if demand.pending {
+            // Its own row on its way may raise what it may take: no answer
+            // of nothing yet.
+            tracing::debug!(
+                tier = tier.name(),
+                short,
+                "tier pressure: the waiters' retention rows have not landed; they wait for them"
+            );
         } else {
             // Said once an episode, as it starts; its repeats at DEBUG.
             if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
@@ -1670,7 +1678,7 @@ mod tests {
             let mut registry = Registry::new(BOUND_CACHE);
             registry.pressure[Tier::Device.index()] = Reading {
                 short: 3,
-                demand: pressure::Demand { up_to, stalled },
+                demand: pressure::Demand { up_to, stalled, pending: false },
                 ..Reading::default()
             };
             respond(&registry, &[Tier::Device], &keys);
@@ -1726,7 +1734,7 @@ mod tests {
             let mut registry = Registry::new(BOUND_CACHE);
             registry.pressure[Tier::Device.index()] = Reading {
                 short: 2,
-                demand: pressure::Demand { up_to, stalled: true },
+                demand: pressure::Demand { up_to, stalled: true, pending: false },
                 ..Reading::default()
             };
             respond(&registry, &[Tier::Device], &keys);

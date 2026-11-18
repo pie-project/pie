@@ -453,6 +453,40 @@ impl Inner {
         }
     }
 
+    /// Nothing running or admitted can free room: no move in flight, no
+    /// served ask about to fire, no fire on its way through the engine (it
+    /// ends and lets pages go), and every admitted process that is not
+    /// idle waits in the queue itself. A process between two short fires,
+    /// resident and not waiting, will run, so the fleet is not stalled. No
+    /// clock: what will end is what is in flight.
+    pub(super) fn nothing_frees_room(&self) -> bool {
+        if !self.evicting.is_empty() {
+            return false;
+        }
+        let mut waiting = HashSet::new();
+        for waiter in self.queue.values() {
+            match &waiter.kind {
+                WaitKind::Allocation {
+                    outcome: Some(_), ..
+                } => return false,
+                _ if waiter.is_unmet() => {
+                    waiting.insert(waiter.pid);
+                }
+                _ => {}
+            }
+        }
+        self.procs.iter().all(|(pid, proc)| match proc.state {
+            Residency::Resident => {
+                !proc.admitted
+                    || proc.idle
+                    || proc.holder
+                    || (waiting.contains(pid) && proc.fires == 0)
+            }
+            Residency::Evicting | Residency::Restoring => false,
+            Residency::Evicted => true,
+        })
+    }
+
     pub(super) fn fleet_stalled(&self) -> bool {
         if !self.evicting.is_empty() {
             return false;

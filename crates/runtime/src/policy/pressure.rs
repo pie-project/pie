@@ -126,6 +126,10 @@ pub struct Demand {
     /// sets keyed above `up_to` may move down a tier for it, never be
     /// discarded.
     pub stalled: bool,
+    /// A short waiter's own retention row has not landed yet: its bound
+    /// reads as the default for now, and a round that takes nothing for it
+    /// is no answer of nothing; it waits for the row.
+    pub pending: bool,
 }
 
 impl Demand {
@@ -139,6 +143,7 @@ impl Demand {
                 Some(sum) => Demand {
                     up_to: sum.up_to.zip(demand.up_to).map(|(a, b)| a.max(b)),
                     stalled: sum.stalled && demand.stalled,
+                    pending: sum.pending || demand.pending,
                 },
             });
         }

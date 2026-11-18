@@ -229,9 +229,11 @@ impl ResidencyPlanner {
         // Whose demand it is: the head's key bounds what the responder takes
         // (the head ranks first, so its key is the highest the waiters
         // carry), and a fleet standing still lets higher-keyed sets move down.
+        let (up_to, pending) = self.head_retention_stated();
         let demand = crate::policy::pressure::Demand {
-            up_to: self.head_retention(),
-            stalled: self.is_wedged(),
+            up_to,
+            stalled: !pending && self.nothing_frees_room(),
+            pending,
         };
         for (tier, bytes) in said {
             // What the weight cache gave back comes free as the fires
@@ -405,7 +407,16 @@ impl ResidencyPlanner {
         let mut txn = (room > 0)
             .then(|| self.port.prepare_demote(room as usize, bound))
             .flatten();
-        if txn.is_none() && bound.is_some() && room > 0 && self.is_wedged() {
+        // The liveness refinement, and only it: the bound is set aside
+        // (lowest key first still, moved down, never dropped) where nothing
+        // running or admitted can free room, and the head's own retention
+        // row has landed (a row on its way may raise its bound).
+        if txn.is_none()
+            && bound.is_some()
+            && room > 0
+            && !self.head_retention_stated().1
+            && self.nothing_frees_room()
+        {
             txn = self.port.prepare_demote(room as usize, None);
         }
         let Some(txn) = txn else {
@@ -497,8 +508,28 @@ impl ResidencyPlanner {
     /// what bounds the cache and resting sets its demand may take, like with
     /// like. Schedule priority orders who is served first, not what is kept.
     pub(super) fn head_retention(&self) -> Option<i64> {
-        let pid = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid))?;
-        Some(holder_key(crate::policy::schedule::plex_id(pid)))
+        self.head_retention_stated().0
+    }
+
+    /// [`Self::head_retention`], and whether it is pending: the head is live
+    /// but the policy's retention row for it has not landed yet (rows land
+    /// as the policy writes them). A pending bound reads as the default for
+    /// now, but nothing treats the demand as one the policy answered: it
+    /// waits for the row, which pokes the planner as it lands.
+    pub(super) fn head_retention_stated(&self) -> (Option<i64>, bool) {
+        let Some(pid) = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid)) else {
+            return (None, false);
+        };
+        let owner = crate::policy::schedule::plex_id(pid);
+        (
+            Some(holder_key(owner)),
+            crate::policy::retention::installed() && !crate::policy::retention::states(owner),
+        )
+    }
+
+    /// Nothing running or admitted can free room ([`Inner::nothing_frees_room`]).
+    pub(super) fn nothing_frees_room(&self) -> bool {
+        self.with_counts(|inner| inner.nothing_frees_room())
     }
 
     /// The schedule key of the process whose demand heads the queue, as the
@@ -536,7 +567,11 @@ impl ResidencyPlanner {
         // A set at rest keyed above the head's demand stays for it, as idle
         // cache keyed so does ([`Self::demote_idle`]), while running work
         // will free room; with the fleet standing still, it moves down.
-        let up_to = if self.is_wedged() { None } else { self.head_retention() };
+        let up_to = if !self.head_retention_stated().1 && self.nothing_frees_room() {
+            None
+        } else {
+            self.head_retention()
+        };
         let mut above: Vec<ProcessId> = Vec::new();
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set
@@ -712,12 +747,14 @@ impl ResidencyPlanner {
     }
 
     /// Reads each holder's retention key again: the table has changed.
-    pub fn rekey_holders(&self) {
+    pub fn rekey_holders(self: &Arc<Self>) {
         self.with_inner(|inner| {
             for (pid, proc) in inner.procs.iter_mut().filter(|(_, proc)| proc.holder) {
                 proc.kept = holder_key(*pid);
             }
         });
+        // A waiter's own row may have landed: what its demand may take moves.
+        self.poke();
     }
 
     /// Whether a holder's state is on the device, if it is one here.

@@ -3171,3 +3171,96 @@ async fn the_cache_bound_is_the_retention_key_not_the_schedule_priority() {
     planner.unregister(head);
     install(None);
 }
+
+/// A6000's "higher set survives": the fillers' retention rows land a moment
+/// after they ask. While a live head's own row has not landed, its bound
+/// is pending: it reads as the default, but the demand is no stall (no
+/// liveness move of higher sets) and no answer of nothing; once the row
+/// lands, the bound is its key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_whose_retention_row_has_not_landed_is_pending_not_the_floor() {
+    use crate::policy::retention::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (filler, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    planner.register(filler);
+    planner.note_admitted(filler);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            filler,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    install(Some(Table::new(std::collections::HashMap::from([(other, vec![(None, 20)])]))));
+    assert_eq!(
+        planner.head_retention_stated(),
+        (Some(crate::policy::retention::FLOOR), true),
+        "its row not landed: pending"
+    );
+    install(Some(Table::new(std::collections::HashMap::from([
+        (other, vec![(None, 20)]),
+        (filler, vec![(None, 15)]),
+    ]))));
+    assert_eq!(
+        planner.head_retention_stated(),
+        (Some(15), false),
+        "landed: its key"
+    );
+    install(None);
+    planner.unregister(filler);
+}
+
+/// "Stalled" (nothing running or admitted can free room) reads what is in
+/// flight, not the instant: a short request between two fires, resident
+/// and not waiting, will run; a waiter whose fire is still on its way will
+/// let pages go. Only waiters with nothing in flight, beside idle ones,
+/// stand still.
+#[tokio::test(flavor = "current_thread")]
+async fn short_requests_between_fires_are_no_stall() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (asker, filler) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [asker, filler] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            asker,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    assert!(
+        !planner.nothing_frees_room(),
+        "the filler, between fires and not waiting, will run"
+    );
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            filler,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        );
+        inner.procs.get_mut(&filler).unwrap().fires = 1;
+    });
+    assert!(
+        !planner.nothing_frees_room(),
+        "waiting, but its fire in flight will end"
+    );
+    planner.with_inner(|inner| inner.procs.get_mut(&filler).unwrap().fires = 0);
+    assert!(planner.nothing_frees_room(), "every one waits, nothing in flight");
+    for pid in [asker, filler] {
+        planner.unregister(pid);
+    }
+}

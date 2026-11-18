@@ -297,7 +297,7 @@ impl ResidencyPlanner {
             let head_key = crate::policy::schedule::current()
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
-            let stalled = inner.fleet_stalled();
+            let stalled = inner.nothing_frees_room();
             // A set at rest is weighed by the head's retention key, like
             // with like: what keeps sets, not the order of service.
             let head_kept =
@@ -524,7 +524,7 @@ impl ResidencyPlanner {
                     let head_key = crate::policy::schedule::current()
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
-                    let stalled = inner.fleet_stalled();
+                    let stalled = inner.nothing_frees_room();
                     let head_kept = super::residency_planner::holder_key(
                         crate::policy::schedule::plex_id(waiter.pid),
                     );
