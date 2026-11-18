@@ -773,25 +773,22 @@ impl<B: Serve> Shell<B> {
         let rs_bytes = rows.rs.as_ref().map_or(0, |rs| rs.bytes);
         let rs_tokens = rows.rs.as_ref().map_or(0, |rs| rs.tokens);
         // One working set: its pages, its record and one written
-        // copy-on-write, and its rs-list pages, beside the null chunk.
+        // copy-on-write, and a chunk of the rs list for the rows a fire
+        // leaves unfolded (as the runtime counts one), beside the null chunk.
         let least_chunks = crate::store::layout::Layout::least_chunks(
             chunk,
             [rows.list_bytes, rows.fixed_bytes],
             rows.pieces,
             asked.pages_per_slot,
-        ) + chunk.checked_div(rs_bytes).map_or(0, |per| {
-            asked
-                .context()
-                .div_ceil(rs_tokens.max(1))
-                .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-        }) + rows
+        ) + rows
             .windows
             .iter()
             .map(|w| {
                 let per = u32::try_from(chunk / w.bytes.max(1)).unwrap_or(1).max(1);
                 asked.context().div_ceil(w.tokens.max(1)).div_ceil(per)
             })
-            .sum::<u32>();
+            .sum::<u32>()
+            + u32::from(rs_bytes > 0);
         // The most pages a lane's table takes: the narrowest slot's.
         let table_pages = rows
             .windows
