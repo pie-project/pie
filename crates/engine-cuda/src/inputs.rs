@@ -581,6 +581,10 @@ pub struct Inputs {
     /// addresses.
     group_masks: Option<GroupMasksAt>,
     staged_windows: Vec<u8>,
+    /// The mask offsets and words the device holds, as the last fire staged
+    /// them: a fire whose lanes' entries are the same (every lane's "none"
+    /// step after step) copies none.
+    staged_mask_tables: Vec<u8>,
 }
 
 /// The slab's group-mask stretches: stretch `i` (the load's `i`th ragged
@@ -818,6 +822,7 @@ impl Inputs {
             mask_runs,
             group_masks,
             staged_windows: Vec::new(),
+            staged_mask_tables: Vec::new(),
             plan_values: grants.len(),
             plans: Vec::new(),
             grants,
@@ -1416,6 +1421,7 @@ impl Inputs {
             inject_runs,
             mask_runs,
             staged_windows,
+            staged_mask_tables,
             ..
         } = self;
         let host = staging[slot.at() as usize].host();
@@ -1455,8 +1461,24 @@ impl Inputs {
         }
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
-            copy(at_mask_indptr, (lanes as usize + 1) * 8)?;
-            copy(at_mask_origin, lanes as usize * 4)?;
+            let (indptr_len, origin_len) = ((lanes as usize + 1) * 8, lanes as usize * 4);
+            // SAFETY: the slot's pinned bytes, written for this fire by write_host.
+            let (indptr, origin) = unsafe {
+                (
+                    std::slice::from_raw_parts(host.add(at_mask_indptr as usize), indptr_len),
+                    std::slice::from_raw_parts(host.add(at_mask_origin as usize), origin_len),
+                )
+            };
+            let held = staged_mask_tables.len() == indptr_len + origin_len
+                && staged_mask_tables[..indptr_len] == *indptr
+                && staged_mask_tables[indptr_len..] == *origin;
+            if crate::device::alloc::is_capturing(stream) || !held {
+                copy(at_mask_indptr, indptr_len)?;
+                copy(at_mask_origin, origin_len)?;
+                staged_mask_tables.clear();
+                staged_mask_tables.extend_from_slice(indptr);
+                staged_mask_tables.extend_from_slice(origin);
+            }
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
