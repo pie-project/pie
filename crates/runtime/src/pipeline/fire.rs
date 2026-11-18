@@ -879,6 +879,18 @@ struct RaiseFunding {
     stop: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     failed: Arc<Mutex<Option<String>>>,
+    /// The funding's task is through (the cap reached its target, or it
+    /// could not go on): a fire past the cap later funds anew.
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Marks a funding's task through when it returns, by any path.
+struct FundingEnds(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for FundingEnds {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RaiseFunding {
@@ -893,17 +905,28 @@ impl RaiseFunding {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let funding = Self {
             stop: stop.clone(),
             stopped: stopped.clone(),
             failed: failed.clone(),
+            ended: ended.clone(),
         };
         crate::rt::spawn(async move {
+            let _ends = FundingEnds(ended);
             let Some(planner) = crate::planner::planner_of(pid) else {
                 tracing::debug!(%pid, "a raise's funding finds no planner");
                 return;
             };
             let target = crate::store::shared::cap_for(&shared, rows);
+            tracing::info!(
+                engine,
+                %pid,
+                rows,
+                target,
+                cap = crate::store::shared::fire_cap(engine),
+                "a raise of the activation rung is funded"
+            );
             // A step with nothing to do waits on the rung's next change (a
             // raise, a copy, the cap, room freed), armed at its top, or the
             // stop.
@@ -955,6 +978,7 @@ impl RaiseFunding {
                 };
                 match asked {
                     Ok(crate::planner::Acquired::Granted(grant)) => {
+                        tracing::info!(engine, %pid, pages, "a raise's room is granted");
                         // The room is given back and the rung takes it at
                         // once, the state in its span moved down first,
                         // before the pass's own pieces open it again.
@@ -1003,6 +1027,10 @@ impl RaiseFunding {
 
     fn failed(&self) -> Option<String> {
         self.failed.lock().unwrap().clone()
+    }
+
+    fn ended(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1117,10 +1145,13 @@ impl RungAsk {
         if crate::store::shared::fire_cap(self.engine) < width {
             crate::scheduler::worker::notify_owner_waits(self.engine, self.pid);
             // A fire past the cap always has its raise funded: one asked
-            // under a cap that covered it starts it now, never waiting on
-            // (or staged past) a raise nobody asks for.
+            // under a cap that covered it, or whose funding ended when the
+            // cap first reached it, starts it now, never waiting on (or
+            // staged past) a raise nobody asks for.
             let mut funding = self.funding.lock().unwrap();
-            if funding.is_none()
+            let refused = funding.as_ref().and_then(RaiseFunding::failed).is_some();
+            if !refused
+                && funding.as_ref().is_none_or(RaiseFunding::ended)
                 && let Some(fund) = &self.fund
             {
                 *funding = Some(fund(self.rows.max(width)));
@@ -4027,13 +4058,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut advanced = vec![false; groups.len()];
         let mut at = 0;
         while at < cuts.len() {
-            if recuttable && at > 0 && at + 1 < cuts.len() {
+            if recuttable && at > 0 {
                 // While the raise is pending the pass runs no further ahead
                 // of the device than a few pieces, so what is left is cut at
                 // the raised rung once it lands.
                 // A framed piece waits only on a frame already whole.
                 let ahead = PIECES_AHEAD.max(frame_size);
-                if at >= ahead && wanted > cut_at {
+                if at + 1 < cuts.len() && at >= ahead && wanted > cut_at {
                     let behind = submitted[at - ahead].clone();
                     // The piece behind settling or the cap rising, each its
                     // own event.
@@ -4051,7 +4082,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     }
                 }
                 let cap = crate::store::shared::fire_cap(engine);
-                if cap > cut_at && (!framed || at % frame_size == 0) {
+                // Wider: the rest is cut at the raised rung. Narrower (the
+                // walk lowered, or a bind's guest term narrowed the fit):
+                // the rest is cut again under it, its last piece too,
+                // rather than wait on a raise the fit may not allow.
+                let recut = (cap > cut_at && at + 1 < cuts.len()) || cap < cut_at;
+                if recut && (!framed || at % frame_size == 0) {
                     cut_at = cap;
                     let start = cuts[at - 1][0].map_or(0, |(_, to)| to);
                     let rest = host_cuts_from(

@@ -1023,14 +1023,17 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
 }
 
 /// A fire term appearing that the rung in hand cannot seat beside cuts
-/// fires at once, under a pass still asking the width and before any tick:
-/// the fit, not the patience, decides it.
+/// fires to the fit, but not under a pass still asking the width: the
+/// passes asking go first, at the rung the engine holds (the bind whose
+/// term narrowed the fit waits for the rung to come down). Once the ask
+/// is gone the cut is taken at once, before any tick: the fit, not the
+/// patience, decides it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
+async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_once_the_ask_is_gone() {
     const ENGINE: usize = 9303;
     let shared: Shared = Arc::new(Mutex::new(classed()));
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
-    let _want = want_rows(ENGINE, 2048);
+    let want = want_rows(ENGINE, 2048);
     grow.walk_rung().await;
     assert_eq!(fire_cap(ENGINE), u32::MAX, "asked and held");
     let fit = {
@@ -1051,6 +1054,9 @@ async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
         pool.fit_cap()
     };
     assert!(fit < u32::MAX, "the largest rung no longer fits");
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX, "not under the standing ask");
+    drop(want);
     grow.walk_rung().await;
     assert_eq!(fire_cap(ENGINE), fit, "cut to the fit before any tick");
 }

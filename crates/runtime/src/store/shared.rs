@@ -358,6 +358,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let cap = lifted(goal);
     if cap > fire_cap(engine) {
         set_fire_cap(engine, cap);
+        tracing::info!(engine, cap, "fires may take the raised rung");
     }
     drop(pool);
 }

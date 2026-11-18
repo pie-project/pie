@@ -258,13 +258,32 @@ impl SharedGrow {
                         // rung those rows take.
                         let pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        let asked = pool.rung_for(self.walk_rows());
+                        let rows = self.walk_rows();
+                        let asked = pool.rung_for(rows);
                         if tokens < now && pool.lifted(asked).min(pool.fit_cap()) > tokens {
                             continue;
                         }
+                        // Nor past an ask for the fit: a guest term that
+                        // narrowed it is a bind's still to be sent, which
+                        // waits for the rung to come down (`fund_span`);
+                        // the passes asking go first, at the rung the
+                        // engine holds, and the cut follows once their
+                        // asks are gone.
+                        // The passes' asks only: the live lanes' count
+                        // takes in the binds' own processes.
+                        let passes = super::wanted_rows(self.engine);
+                        if tokens < now && pool.lifted(pool.pool().rung_of(passes)) > tokens {
+                            tracing::info!(
+                                engine = self.engine,
+                                tokens,
+                                asked = passes,
+                                "a cut to the guest terms' fit waits for the passes asking wider"
+                            );
+                            return;
+                        }
                         super::set_fire_cap(self.engine, tokens);
                     }
-                    tracing::debug!(
+                    tracing::info!(
                         engine = self.engine,
                         tokens,
                         "fires cut to the activation rung"
@@ -795,6 +814,56 @@ mod tests {
             "cut before any tick: {}",
             super::super::fire_cap(ENGINE)
         );
+    }
+
+    /// A bind's guest term narrows the fit while a fire cut under the
+    /// wider cap is queued and asks its rows: the cut to the fit waits for
+    /// the ask (the engine keeps the rung it was told, and the frame policy
+    /// seals the fire at it), so the queued fire goes; once its ask is gone
+    /// fires are cut to the fit at once, the lower following the grant.
+    /// Nothing waits on itself: the bind waits for the lower, the lower for
+    /// the fire, the fire for nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_queued_under_a_fit_since_narrowed_goes_before_the_rung_comes_down() {
+        const ENGINE: usize = 9214;
+        let pool = super::super::tests::pool();
+        assert_eq!(pool.rung(), 2048);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+        assert_eq!(super::super::engine_rows(ENGINE), u32::MAX);
+        // A fire of 1024 rows is queued under the uncut cap, asking them.
+        let queued = super::super::want_rows(ENGINE, 1024);
+        super::super::grant_rung(ENGINE, u32::MAX);
+        // A bind counts its guest term: the widest rung that fits is 256.
+        {
+            let mut pool = shared.lock().unwrap();
+            let key = super::super::programs::FireKey {
+                program: ::engine::ProgramId(1),
+                extents: ::engine::BindExtents::default(),
+            };
+            let fixed = 55 * pool.pool().chunk_bytes();
+            pool.fire_facts_learned(
+                key,
+                &::engine::FireFacts {
+                    fixed,
+                    ..::engine::FireFacts::default()
+                },
+            );
+            pool.instance_bound(::engine::InstanceId(1), key);
+            assert_eq!(pool.fit_cap(), 256);
+        }
+        grow.walk_rung().await;
+        assert_eq!(super::super::fire_cap(ENGINE), u32::MAX, "not cut under the ask");
+        let held = super::super::engine_rows(ENGINE);
+        assert!(1024 <= held, "the engine keeps its rung: the queued fire goes at it");
+        let mut policy = crate::scheduler::frame::FramePolicy::new(1, 4096, 4096, None);
+        policy.cap_fires(held as usize);
+        assert!(policy.fire_cap() >= 1024, "sealed at the rung held");
+        // It ran: its ask is gone. Fires are cut to the fit at once,
+        // before any tick; the lower follows the scheduler's grant.
+        drop(queued);
+        grow.walk_rung().await;
+        assert!(super::super::fire_cap(ENGINE) <= 256, "cut to the fit");
     }
 
     /// A raise the walk found no room for is not tried again on its next
