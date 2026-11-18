@@ -1726,12 +1726,11 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     assert_eq!(store.available_pages(), 8, "and back once it retires");
 }
 
-/// A process waiting for admission whose prompt's prefix the store holds is
-/// told so before it runs; once that prefix is evicted, it is told it is
-/// gone, the store having said its cache changed.
+/// A process waiting for admission is told when its prompt's prefix joins
+/// the store's cache, and again when it is evicted; a change on a path its
+/// prompt does not need looks it up not at all.
 #[test]
 fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
-    use crate::policy::retention::FLOOR;
     use crate::store::registry;
     use crate::store::waiting::tests::{found, waits};
     use futures::FutureExt;
@@ -1739,29 +1738,44 @@ fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
     let model = registry::register_model(16, &[16], &[1]);
     let stores = registry::all_for_model(model);
     let tokens: Vec<u32> = (0..64).map(|t| 700 + t).collect();
+    let waiter = ProcessId::from_u128(71);
+    waits(&stores, waiter, &tokens);
+    assert_eq!(found(&stores, waiter), (0, Some(0)), "nothing cached yet");
+
+    let other: Vec<u32> = (0..64).map(|t| 900 + t).collect();
+    registry::with_kv_lock(&stores[0].kv, "test", |kv| {
+        sealed_and_gone(kv, &other, ProcessId::from_u128(72))
+    });
+    assert_eq!(
+        found(&stores, waiter),
+        (0, Some(0)),
+        "another prompt's prefix joins: no lookup"
+    );
+
     registry::with_kv_lock(&stores[0].kv, "test", |kv| {
         sealed_and_gone(kv, &tokens, ProcessId::from_u128(70))
     });
-
-    let waiter = ProcessId::from_u128(71);
-    waits(&stores, waiter, &tokens);
     assert_eq!(
         found(&stores, waiter),
-        Some(64),
-        "its four pages, before it runs"
+        (1, Some(64)),
+        "its four pages join, before it runs"
     );
 
     let changed = registry::with_kv_lock(&stores[0].kv, "test", |kv| kv.changed());
     let mut told = Box::pin(changed.notified());
     told.as_mut().enable();
     let dropped = registry::with_kv_lock(&stores[0].kv, "test", |kv| {
-        kv.reclaim_droppable(kv.current_epoch(), |_| FLOOR)
+        kv.discard_cache(ProcessId::from_u128(70), crate::policy::By::Host)
     });
-    assert!(dropped > 0, "the prefix is evicted");
+    assert!(dropped > 0, "its prefix is evicted");
     assert!(
         told.now_or_never().is_some(),
         "the store says its cache changed"
     );
-    assert_eq!(found(&stores, waiter), Some(0), "and the waiter finds none");
+    assert_eq!(
+        found(&stores, waiter),
+        (1, Some(0)),
+        "and the waiter, looked up again, finds none"
+    );
     crate::store::waiting::left(waiter);
 }

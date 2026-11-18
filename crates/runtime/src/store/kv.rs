@@ -189,6 +189,11 @@ pub struct KvStore {
     /// Told when an entry joins or leaves the cache: what a lookup of a
     /// waiting prompt's prefix finds may have changed.
     changed: Arc<tokio::sync::Notify>,
+    /// The page keys on the paths of the entries that joined the cache, and
+    /// of those that left it, since [`Self::take_changes`]; kept only while
+    /// a prompt waits ([`crate::store::waiting::watched`]).
+    joined: HashSet<Hash256>,
+    left: HashSet<Hash256>,
     /// A persistent disk tier's journal, and the slots it names.
     persisted: Option<Persisted>,
     /// How many leading tokens each owner's props ask to keep on disk
@@ -428,6 +433,8 @@ impl KvStore {
             moved: Arc::new(tokio::sync::Notify::new()),
             cached: Arc::new(tokio::sync::Notify::new()),
             changed: Arc::new(tokio::sync::Notify::new()),
+            joined: HashSet::new(),
+            left: HashSet::new(),
             persisted: None,
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
@@ -733,7 +740,7 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
-                self.changed.notify_waiters();
+                self.note_change(entry.path.terminal, false);
                 self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
@@ -928,7 +935,7 @@ impl KvStore {
             self.kept += 1;
             self.list(self.kept, path.terminal);
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
-            self.changed.notify_waiters();
+            self.note_change(path.terminal, true);
         }
     }
 
@@ -1540,7 +1547,7 @@ impl KvStore {
                 decoded: false,
             },
         );
-        self.changed.notify_waiters();
+        self.note_change(node, true);
         true
     }
 
@@ -1622,6 +1629,34 @@ impl KvStore {
     /// Told when an entry joins or leaves the cache: arm it before looking.
     pub fn changed(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.changed)
+    }
+
+    /// The entry ending at `terminal` joined the cache, or is leaving it
+    /// (before its pages are released): while a prompt waits, its path's
+    /// page keys are kept for [`Self::take_changes`].
+    fn note_change(&mut self, terminal: NodeId, joined: bool) {
+        if crate::store::waiting::watched() {
+            let keys = self
+                .table
+                .path_pages(terminal)
+                .into_iter()
+                .filter_map(|(_, key)| key);
+            if joined {
+                self.joined.extend(keys);
+            } else {
+                self.left.extend(keys);
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// The page keys of the entries that joined the cache and of those that
+    /// left it since the last call, `(joined, left)`.
+    pub fn take_changes(&mut self) -> (HashSet<Hash256>, HashSet<Hash256>) {
+        (
+            std::mem::take(&mut self.joined),
+            std::mem::take(&mut self.left),
+        )
     }
 
     /// Pages may have joined the cache.
@@ -1758,6 +1793,7 @@ impl KvStore {
         if let Some(owner) = owner {
             crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
         }
+        let terminal = path.terminal;
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -1767,7 +1803,7 @@ impl KvStore {
                 decoded,
             },
         );
-        self.changed.notify_waiters();
+        self.note_change(terminal, true);
     }
 
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {
