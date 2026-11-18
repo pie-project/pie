@@ -270,6 +270,7 @@ fn draw_all(rank: bool, cases: &[Case], flies: &[Fly]) -> (usize, usize) {
                         .expect("the lane stages");
                     assert!(matches!(launched, Launched::Airborne), "a lane was refused");
                 }
+                crate::guest::fit_span(&mut plane);
                 plane.fly(&context).expect("the wave flies");
                 plane.land(&context).expect("the wave lands");
                 context.synchronize().expect("the device synchronizes");

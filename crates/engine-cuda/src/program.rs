@@ -173,6 +173,49 @@ impl Plane {
     }
 }
 
+/// A staged fire's groups: each program at each extents it was staged at,
+/// with its instances, in staging order.
+fn staged_groups(
+    staged: &[(ProgramId, Extents, InstanceId)],
+) -> Vec<(ProgramId, Extents, Vec<InstanceId>)> {
+    let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
+    for (program_id, extents, instance) in staged {
+        match groups
+            .iter_mut()
+            .find(|(pid, ext, _)| pid == program_id && ext == extents)
+        {
+            Some((_, _, members)) => members.push(*instance),
+            None => groups.push((*program_id, *extents, vec![*instance])),
+        }
+    }
+    groups
+}
+
+/// Each group's lanes a flight and the bytes its flights lay (they fly one
+/// after another in it, as wide as its widest).
+fn group_lays(
+    programs: &mut BTreeMap<ProgramId, Program>,
+    groups: &[(ProgramId, Extents, Vec<InstanceId>)],
+    flight: u32,
+) -> Result<Vec<(u32, u64)>> {
+    groups
+        .iter()
+        .map(|(program_id, extents, members)| {
+            let program = programs.get_mut(program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            let bytes = fire_bytes(&program.batch(*extents)?.stages, flight);
+            let lanes = flight_lanes(u32::try_from(members.len()).unwrap_or(u32::MAX))
+                .min(bytes.max_lanes)
+                .max(1);
+            Ok((lanes, bytes.at(lanes)))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct Plane {
     cache: Cache,
@@ -380,6 +423,12 @@ impl Plane {
             self.laid.clear();
         }
         self.span = span;
+    }
+
+    /// The span the fire in hand lays its programs in ([`Plane::set_span`]).
+    #[must_use]
+    pub fn span(&self) -> (u64, u64) {
+        self.span
     }
 
     /// What a fire of `program_id` bound at `extents` takes of the fire's
@@ -916,6 +965,20 @@ impl Plane {
         Ok(launched)
     }
 
+    /// The bytes of the fire's span the fire in hand lays as [`Plane::fly`]
+    /// would: the wave's own tables, then each program's flights at their
+    /// lanes, each from a 256-byte boundary. A span backing fewer refuses
+    /// the fire by this figure (`Fault::Ceiling`).
+    pub fn staged_bytes(&mut self) -> Result<u64> {
+        let groups = staged_groups(&self.staged);
+        let lays = group_lays(&mut self.programs, &groups, self.flight)?;
+        Ok(lays
+            .iter()
+            .map(|&(_, bytes)| bytes.next_multiple_of(256))
+            .sum::<u64>()
+            + self.wave.bytes().next_multiple_of(256))
+    }
+
     pub fn fly(&mut self, context: &Context) -> Result<()> {
         if self.staged.is_empty() {
             return Ok(());
@@ -954,16 +1017,7 @@ impl Plane {
         let arenas = *arenas;
         let at = *at;
 
-        let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
-        for (program_id, extents, instance) in staged.iter() {
-            match groups
-                .iter_mut()
-                .find(|(pid, ext, _)| pid == program_id && ext == extents)
-            {
-                Some((_, _, members)) => members.push(*instance),
-                None => groups.push((*program_id, *extents, vec![*instance])),
-            }
-        }
+        let groups = staged_groups(staged);
 
         let mut meet = Vec::with_capacity(groups.len());
         for (program_id, extents, _) in &groups {
@@ -987,19 +1041,11 @@ impl Plane {
         // after another in it, as wide as its widest.
         let mut laying = Vec::with_capacity(groups.len());
         let mut places = Vec::with_capacity(groups.len());
-        for (program_id, extents, members) in &groups {
-            let program = programs.get_mut(program_id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("a staged fire names program {program_id}, which is gone"),
-                )
-            })?;
-            let bytes = fire_bytes(&program.batch(*extents)?.stages, *flight);
-            let lanes = flight_lanes(u32::try_from(members.len()).unwrap_or(u32::MAX))
-                .min(bytes.max_lanes)
-                .max(1);
+        for ((program_id, extents, _), (lanes, bytes)) in
+            groups.iter().zip(group_lays(programs, &groups, *flight)?)
+        {
             laying.push((*program_id, *extents, lanes));
-            places.push((lay(bytes.at(lanes))?, lanes));
+            places.push((lay(bytes)?, lanes));
         }
         let fresh = *laid != laying;
         *laid = laying;

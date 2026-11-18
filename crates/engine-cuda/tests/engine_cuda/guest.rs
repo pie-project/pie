@@ -192,6 +192,20 @@ pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
     )
 }
 
+/// Backs `plane`'s staged fire with a span of its own as long as the fire
+/// states it lays ([`engine_cuda::ProgramPlane::staged_bytes`], the figure
+/// a short span refuses it by), where the span it has is shorter: a fire of
+/// one lane a unit lays more on a device of more units.
+pub fn fit_span(plane: &mut engine_cuda::ProgramPlane) {
+    let need = plane.staged_bytes().expect("the staged fire's bytes");
+    if need <= plane.span().1 {
+        return;
+    }
+    let buffer = engine_cuda::device::Buffer::zeroed(need as usize).expect("the span's buffer");
+    let end = Box::leak(Box::new(buffer)).ptr() + need;
+    plane.set_span((end, need));
+}
+
 /// The run past a plane's lane arenas ([`alone_plane_fenced`]).
 pub struct Fence {
     buffer: &'static engine_cuda::device::Buffer,
