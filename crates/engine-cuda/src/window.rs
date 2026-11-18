@@ -86,6 +86,19 @@ pub struct Gathered {
     pub rows_host: Vec<i32>,
     pub rows: Tensor,
     pub page_tables: Vec<GatheredTable>,
+    /// The window's lanes' entries of the fire's masks, where the fire
+    /// stages them: a mask is per-lane data, gathered as the page tables are.
+    pub mask: Option<GatheredMask>,
+}
+
+/// A gathered window's mask entries, each lane's byte offset into the fire's
+/// bits (unchanged: the bits stay where the fire staged them) and its word.
+#[derive(Debug, Clone)]
+pub struct GatheredMask {
+    pub indptr_host: Vec<i64>,
+    pub origin_host: Vec<u32>,
+    pub indptr: Tensor,
+    pub origin: Tensor,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +118,9 @@ pub struct Copies<'a> {
     pub bucket: u32,
     pub enabled: bool,
     pub page_tables: &'a [Geometry],
+    /// The fire's mask entries (`mask::Staged`'s offsets and words), where
+    /// it stages them: a copied window carries its lanes'.
+    pub mask: Option<(&'a [i64], &'a [u32])>,
 }
 
 impl Copies<'_> {
@@ -114,6 +130,7 @@ impl Copies<'_> {
             bucket: 0,
             enabled: false,
             page_tables: &[],
+            mask: None,
         }
     }
 }
@@ -141,12 +158,16 @@ impl Slots {
         rows: u64,
         page_tables: usize,
         pages: u64,
+        masked: bool,
     ) -> Slots {
+        // A gathered window's mask entries: an 8-byte offset (two words,
+        // one more to align them) and a word a lane.
+        let mask = if masked { 3 * lanes + 3 } else { 0 };
         Slots {
             stride: lanes + 1 + 2 * u64::from(segs.max(1)),
             slots: (classes * (classes + 1) / 2 + 1 + gathered) as u64,
             gathered: gathered as u64,
-            gathered_stride: rows + page_tables as u64 * (3 * lanes + 1 + pages),
+            gathered_stride: rows + page_tables as u64 * (3 * lanes + 1 + pages) + mask,
         }
     }
 
@@ -254,7 +275,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                 kind,
                 GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
             ),
-            Def::Input(RuntimeInput::Mask) => false,
+            // Per-lane data: a copied window carries its lanes' entries.
+            Def::Input(RuntimeInput::Mask) => true,
             _ => match &decl.ty {
                 Ty::Struct(_) => true,
                 Ty::Tensor { shape, .. } => match shape.first() {
@@ -348,7 +370,8 @@ impl Windows {
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
                 && copyable(trace, region)
             {
-                let mut gathered = gather_of(&spans, indptr_host, copies.page_tables);
+                let mut gathered =
+                    gather_of(&spans, indptr_host, copies.page_tables, copies.mask);
                 gathered.spans[poem_ir::RowAxis::Patches] = patch;
                 gathered.spans[poem_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;
@@ -468,6 +491,16 @@ impl Windows {
                 out.extend_from_slice(&table.last_page_lens_host);
                 out.extend_from_slice(&table.kv_len_host);
             }
+            if let Some(mask) = &gathered.mask {
+                // The offsets 8-byte aligned, two words each.
+                let even = out.len().next_multiple_of(2);
+                open(&mut out, even as u64);
+                for &offset in &mask.indptr_host {
+                    out.push(offset as i32);
+                    out.push((offset >> 32) as i32);
+                }
+                out.extend(mask.origin_host.iter().map(|&word| word as i32));
+            }
         }
         out
     }
@@ -497,6 +530,13 @@ impl Windows {
                 table.page_indices = take(&mut at, table.page_indices_host.len(), 1);
                 table.last_page_lens = take(&mut at, table.last_page_lens_host.len(), 1);
                 table.kv_len = take(&mut at, table.kv_len_host.len(), 1);
+            }
+            if let Some(mask) = &mut gathered.mask {
+                at = (at - base).next_multiple_of(8) + base;
+                let lanes = mask.origin_host.len() as u32;
+                mask.indptr = Tensor::new(at, lanes + 1, 1, Dtype::I64);
+                at += u64::from(lanes + 1) * 8;
+                mask.origin = Tensor::new(at, lanes, 1, Dtype::U32);
             }
         }
     }
@@ -795,7 +835,12 @@ fn insert(windows: &mut Vec<Window>, window: Window) -> u32 {
     index as u32
 }
 
-fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], page_tables: &[Geometry]) -> Window {
+fn gather_of(
+    runs: &[MaskSpan],
+    indptr_host: &[i32],
+    page_tables: &[Geometry],
+    mask: Option<(&[i64], &[u32])>,
+) -> Window {
     let mut rows_host: Vec<i32> = Vec::new();
     let mut lanes: Vec<usize> = Vec::new();
     let mut bounds: Vec<i32> = vec![0];
@@ -864,6 +909,23 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], page_tables: &[Geometry]) -
             rows: Tensor::new(0, 0, 1, Dtype::I32),
             rows_host,
             page_tables: gathered_tables,
+            mask: mask.map(|(indptr, origins)| {
+                let at = |lane: usize| indptr.get(lane).copied().unwrap_or(0);
+                GatheredMask {
+                    // The offsets' last entry closes the last lane's run.
+                    indptr_host: lanes
+                        .iter()
+                        .map(|&lane| at(lane))
+                        .chain([lanes.last().map_or(0, |&lane| at(lane + 1))])
+                        .collect(),
+                    origin_host: lanes
+                        .iter()
+                        .map(|&lane| origins.get(lane).copied().unwrap_or(crate::mask::NONE))
+                        .collect(),
+                    indptr: Tensor::new(0, 0, 1, Dtype::I64),
+                    origin: Tensor::new(0, 0, 1, Dtype::U32),
+                }
+            }),
         }),
     }
 }
@@ -1309,7 +1371,7 @@ mod tests {
             runs: Vec::new(),
             of_region: Vec::new(),
             axes: Vec::new(),
-            slots: Slots::new(2, 8, 1, 1, 64, 1, 32),
+            slots: Slots::new(2, 8, 1, 1, 64, 1, 32, false),
             live_words: Vec::new(),
             seat: Seat::default(),
             live_base: 0,

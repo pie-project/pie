@@ -544,6 +544,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     None,
                     None,
                     None,
+                    None,
                 ))
             } else {
                 let plan = p.value(

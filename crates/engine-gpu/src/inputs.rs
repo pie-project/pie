@@ -135,13 +135,13 @@ pub struct Handles {
 
     pub request_of_token: Tensor,
 
+    /// The mask plane, bound whole whatever the fire stages: a recorded
+    /// fire binds it as one with no mask does.
     pub mask: Tensor,
 
-    /// One u32 a row: its enable flag (bits 0-1) and its lane's committed
-    /// boundary (bits 2-31), the key the row's plane column 0 is.
-    pub mask_enabled: Tensor,
-
-    pub mask_stride: u32,
+    /// Two u32 a row (`mask::Staged`'s words): the key the row's columns
+    /// start at, `mask::NONE` where it states no mask, and its byte offset.
+    pub mask_words: Tensor,
 
     pub patches: Option<PatchHandles>,
 
@@ -257,9 +257,10 @@ pub struct Laid {
     request_of_token: u64,
     mask_planes: u64,
     mask_plane_bytes: u64,
-    mask_enabled: u64,
-
-    mask_stride: u32,
+    mask_words: u64,
+    /// The leading rows whose words state no mask as the store holds them:
+    /// a fire stating none rewrites only past them.
+    words_none: u32,
     page_tables: Vec<TableAt>,
 
     patch: Option<PatchAt>,
@@ -301,7 +302,8 @@ pub struct GroupMaskHandles {
 
 impl Laid {
     /// Lays a fire's inputs for fires of `budget`: where each lies in the
-    /// store, and the store's bytes.
+    /// store, and the store's bytes; no one input past `binding`, the most
+    /// one reservation of the device binds.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn lay(
@@ -318,6 +320,7 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
+        binding: u64,
     ) -> Laid {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
@@ -325,7 +328,9 @@ impl Laid {
         // A lane's table holds as many pages as its narrowest list takes.
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot.max(table_pages));
 
-        let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+        // A gathered window's rows, positions, rotations and owners an int a
+        // row, its mask entries two.
+        let per_gathered = 6 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
             (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
@@ -349,11 +354,16 @@ impl Laid {
         let request_of_token = take(rows * 4);
 
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
-        let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
-        let mask_plane_bytes = rows * context;
-        let mask_planes = take(mask_plane_bytes);
+        // A row's columns run from its lane's boundary to its own key, at
+        // most the context; the plane is one binding, its offsets u32.
+        let mask_plane_bytes = (rows * context)
+            .min(binding)
+            .min(u64::from(u32::MAX))
+            / 4
+            * 4;
+        let mask_planes = take(mask_plane_bytes.max(4));
 
-        let mask_enabled = take(rows * 4);
+        let mask_words = take(rows * 8);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -431,8 +441,8 @@ impl Laid {
             request_of_token,
             mask_planes,
             mask_plane_bytes,
-            mask_enabled,
-            mask_stride,
+            mask_words,
+            words_none: 0,
             page_tables,
             patch,
             mrope,
@@ -658,18 +668,15 @@ impl<B: Backend> Inputs<B> {
             }
         };
 
-        let stride = fire.mask.map_or(0, |staged| staged.stride);
-        if u64::from(stride) > u64::from(self.laid.mask_stride) {
-            return Err(Fault::Ceiling {
-                what: "columns in one mask row",
-                need: u64::from(stride),
-                have: u64::from(self.laid.mask_stride),
-            });
-        }
         match fire.mask {
             None => {
-                self.store
-                    .zero_span(self.laid.mask_enabled, u64::from(rows) * 4)?;
+                if rows > self.laid.words_none {
+                    let from = self.laid.words_none;
+                    let none = crate::mask::none((rows - from) as usize);
+                    self.store
+                        .write(self.laid.mask_words + u64::from(from) * 8, words_of(&none))?;
+                    self.laid.words_none = rows;
+                }
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.laid.mask_plane_bytes {
@@ -680,8 +687,8 @@ impl<B: Backend> Inputs<B> {
                     });
                 }
                 self.store.write(self.laid.mask_planes, &staged.bytes)?;
-                let words: Vec<u8> = staged.words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                self.store.write(self.laid.mask_enabled, &words)?;
+                self.store.write(self.laid.mask_words, words_of(&staged.words))?;
+                self.laid.words_none = 0;
             }
         }
 
@@ -1006,22 +1013,17 @@ impl<B: Backend> Inputs<B> {
             request_of_token: i32s(handles, &self.store, self.laid.request_of_token, rows)?,
 
             mask: Tensor::new(
-                handles.bind(
-                    &self.store,
-                    self.laid.mask_planes,
-                    u64::from(rows) * u64::from(stride),
-                )?,
-                rows,
-                stride.max(1),
+                handles.bind(&self.store, self.laid.mask_planes, self.laid.mask_plane_bytes.max(4))?,
+                1,
+                u32::try_from(self.laid.mask_plane_bytes.max(4)).unwrap_or(u32::MAX),
                 Dtype::U8,
             ),
-            mask_enabled: Tensor::new(
-                handles.bind(&self.store, self.laid.mask_enabled, u64::from(rows) * 4)?,
+            mask_words: Tensor::new(
+                handles.bind(&self.store, self.laid.mask_words, u64::from(rows) * 8)?,
                 rows,
-                1,
+                2,
                 Dtype::U32,
             ),
-            mask_stride: stride,
             patches,
             mrope_positions,
             rs_replay: if rs_tables {
@@ -1101,6 +1103,14 @@ fn u32s<B: Backend>(
 ) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
+}
+
+fn words_of(values: &[u32]) -> &[u8] {
+    // SAFETY: a `u32` slice is `size_of_val` initialized bytes with no
+    // padding, `u8` has alignment 1, and the result borrows `values`.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {

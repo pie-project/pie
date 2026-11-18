@@ -341,7 +341,7 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
+        | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {

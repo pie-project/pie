@@ -1892,6 +1892,7 @@ dependencies = [
 name = "engine-wgpu"
 version = "0.6.0"
 dependencies = [
+ "ash",
  "checkpoint",
  "engine",
  "engine-cpu",
@@ -1911,6 +1912,7 @@ dependencies = [
  "tracing",
  "web-std",
  "wgpu",
+ "windows",
  "ztensor",
 ]
 
@@ -2427,6 +2429,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
@@ -4786,6 +4789,12 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "range-alloc"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "raw-window-handle"
@@ -7522,6 +7531,7 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
+ "bit-set 0.10.0",
  "bitflags 2.13.1",
  "bytemuck",
  "cfg-if",
@@ -7533,11 +7543,13 @@ dependencies = [
  "log",
  "naga",
  "naga-types",
+ "once_cell",
  "ordered-float",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
  "profiling",
+ "range-alloc",
  "raw-window-handle",
  "raw-window-metal",
  "renderdoc-sys",
@@ -7547,6 +7559,7 @@ dependencies = [
  "wgpu-naga-bridge",
  "wgpu-types",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

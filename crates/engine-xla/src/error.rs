@@ -106,12 +106,9 @@ pub enum Fault {
         rows: u64,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
-
         word: u64,
-
-        runs_masked_arm: bool,
     },
 
     Adapterless {
@@ -268,15 +265,11 @@ impl fmt::Display for Fault {
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
             ),
-            Self::MaskWord {
-                lane,
-                word,
-                runs_masked_arm,
-            } => write!(
+            Self::MaskUnread { lane, word } => write!(
                 f,
-                "lane {lane}'s word {word:#x} {} the masked arm and its mask says the \
-                 other thing",
-                if *runs_masked_arm { "runs" } else { "skips" }
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in: here `attn.decode`, a selection's and a \
+                 bias's arms read no per-lane mask"
             ),
             Self::Adapterless { lane } => write!(
                 f,

@@ -29,8 +29,8 @@ mod backend {
     pub const FIXTURES: &str = "PIE_WGPU_FIXTURES";
     pub const CHUNK: &str = "PIE_WGPU_CHUNK";
 
-    /// What a test's load takes: WebGPU reports no memory size, so
-    /// `[engine.memory] budget_device` is stated.
+    /// What a test's load takes: `[engine.memory] budget_device` is
+    /// stated, so a test takes no more than this of a device it shares.
     pub const ALLOWANCE: engine::Allowance = engine::Allowance {
         budget: Some(8 << 30),
     };
