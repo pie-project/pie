@@ -3989,6 +3989,10 @@ mod tests {
         asynchronous: bool,
         fired: Arc<std::sync::Mutex<Vec<Vec<(u64, u32)>>>>,
         next: u64,
+        /// Lands a frame stopped short after the frame submitted next,
+        /// out of the order they were submitted in.
+        reorder: bool,
+        held: Vec<::engine::StepDone>,
     }
 
     impl engine::Engine for LaneRefusalEngine {
@@ -4069,14 +4073,18 @@ mod tests {
                 self.fired.lock().unwrap().push(fed);
                 steps.push(::engine::FireTicket::default());
             }
-            for step in 0..steps.len() {
-                sink(
-                    ::engine::StepDone {
-                        frame: id,
-                        step: u32::try_from(step).expect("a few steps"),
-                    },
-                    ::engine::StepOutcome::committed(),
-                );
+            let landings: Vec<::engine::StepDone> = (0..steps.len())
+                .map(|step| ::engine::StepDone {
+                    frame: id,
+                    step: u32::try_from(step).expect("a few steps"),
+                })
+                .collect();
+            if self.reorder && refused.is_some() {
+                self.held.extend(landings);
+            } else {
+                for at in landings.into_iter().chain(std::mem::take(&mut self.held)) {
+                    sink(at, ::engine::StepOutcome::committed());
+                }
             }
             Ok(engine::FrameTicket::of(id, steps, refused))
         }
@@ -4146,6 +4154,21 @@ mod tests {
         Vec<Vec<std::result::Result<(), String>>>,
         Vec<Vec<(u64, u32)>>,
     ) {
+        fire_refusing_landing(asynchronous, false, steps)
+    }
+
+    /// [`fire_refusing`], with `reorder` landing a frame stopped short
+    /// after the one submitted next.
+    #[allow(clippy::type_complexity, reason = "a test's three answers")]
+    fn fire_refusing_landing(
+        asynchronous: bool,
+        reorder: bool,
+        steps: &[&[(u64, bool)]],
+    ) -> (
+        std::result::Result<(), String>,
+        Vec<Vec<std::result::Result<(), String>>>,
+        Vec<Vec<(u64, u32)>>,
+    ) {
         let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut lane = Lane::spawn(
             0,
@@ -4154,12 +4177,35 @@ mod tests {
                 asynchronous,
                 fired: Arc::clone(&fired),
                 next: 0,
+                reorder,
+                held: Vec::new(),
             })),
             Arc::new(SchedulerStats::default()),
         );
         let (fire, completions) = frame_of(steps);
         let flat: Vec<_> = completions.iter().flatten().cloned().collect();
-        let (frame, results) = fire_and_settle(&lane, fire, &flat);
+        let (frame, results) = if reorder {
+            // Every fire of a launch landing out of order is failed by the
+            // lane as it lands, whenever after the frame that does.
+            let answer = within("the launch is answered", lane.fire(fire, false))
+                .expect("the launch is answered");
+            let answer = match answer {
+                Ok(frame) => {
+                    within("the frame settles", frame).map_err(|error| format!("{error:#}"))
+                }
+                Err(error) => Err(error),
+            };
+            let results = flat
+                .iter()
+                .map(|completion| {
+                    within("the fire settles", completion.clone())
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .collect();
+            (answer, results)
+        } else {
+            fire_and_settle(&lane, fire, &flat)
+        };
         let mut results = results.into_iter();
         let by_step = completions
             .iter()
@@ -4242,6 +4288,30 @@ mod tests {
     #[test]
     fn a_lane_refused_past_the_first_step_stops_the_frame_there_inside_the_submit() {
         a_lane_refused_past_the_first_step_stops_the_frame_there(false);
+    }
+
+    /// A launch split into two engine frames whose second lands before its
+    /// first is refused by name: every fire of the launch fails, none on
+    /// another frame's tokens.
+    #[test]
+    fn a_split_launch_landing_out_of_order_is_refused_by_name() {
+        let (_frame, fires, fed) = fire_refusing_landing(
+            true,
+            true,
+            &[
+                &[(100, false), (101, false)],
+                &[(100, false), (101, true)],
+            ],
+        );
+        assert_eq!(fed.len(), 2, "the engine fired both frames: {fed:?}");
+        assert!(refused(&fires[1][1]), "{:?}", fires[1][1]);
+        for fired in [&fires[0][0], &fires[0][1], &fires[1][0]] {
+            let why = fired.as_ref().expect_err("no fire takes an out-of-order frame's tokens");
+            assert!(
+                why.contains("settled its engine frame 1 of 2 while frame 0 was expected"),
+                "named: {why}"
+            );
+        }
     }
 
     /// A lane refused at a frame's first step takes its instance's later

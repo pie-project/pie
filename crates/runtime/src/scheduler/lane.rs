@@ -974,6 +974,8 @@ impl Lane {
         }
         let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
         let last = booked.len() - 1;
+        // A launch of several frames is checked to land in order.
+        let split = (last > 0).then(|| completion::SplitLaunch::new(booked.len()));
         for (index, (id, steps, wakes)) in booked.into_iter().enumerate() {
             // Each step publishes its own cells and waiters as it lands.
             let steps = frame.steps[steps]
@@ -986,9 +988,16 @@ impl Lane {
                     wakes,
                 })
                 .collect();
-            // A lane's frames land in the order they were submitted: the
-            // submission is in once its last frame is.
-            settlements.expect(id, steps, (index == last).then_some(&completion), broker);
+            // A lane's frames land in the order they were submitted, which
+            // the split launch checks: the submission is in once its last
+            // frame is.
+            settlements.expect(
+                id,
+                steps,
+                (index == last).then_some(&completion),
+                split.as_ref().map(|split| (Arc::clone(split), index)),
+                broker,
+            );
         }
         Ok(completion)
     }
