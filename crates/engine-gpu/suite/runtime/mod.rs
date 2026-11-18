@@ -6,6 +6,7 @@ mod guest_state;
 mod outputs;
 mod port;
 mod readout_rows;
+mod readout_seat;
 mod register;
 mod roles;
 mod scores;

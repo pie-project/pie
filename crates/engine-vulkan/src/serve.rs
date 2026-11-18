@@ -58,6 +58,10 @@ impl Serve for Api {
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
+    const MAX_BUFFER_SOURCE: &'static str = "the least of VkPhysicalDeviceLimits::\
+        maxStorageBufferRange, maxMemoryAllocationSize (Vulkan 1.1) and maxBufferSize \
+        (Vulkan 1.3)";
+
     const RECORDS: bool = true;
 
     /// A pass keeps the cells only the device reads in `Channel` slots
