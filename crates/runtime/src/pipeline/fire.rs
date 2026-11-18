@@ -251,6 +251,15 @@ impl FireEpoch {
     fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
         completion.on_settled(move || drop(self));
     }
+
+    /// Stamps `completion` with this fire's epoch before it is submitted:
+    /// the lane stamps the slots the fire's frame names with it, so they
+    /// wait for this frame's fires, not for every fire opened since.
+    fn stamp(&self, completion: &crate::engine::WorkItemCompletion) {
+        if let Some(txn) = &self._txn.txn {
+            completion.stamp_kv_epoch(txn.seq());
+        }
+    }
 }
 
 struct RsTxnsGuard {
@@ -4327,6 +4336,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .get_mut(&fwd)?
                 .bound_instance
                 .reserve_completion();
+            epoch.stamp(&completion);
 
             // Only the last fire runs the program, so only it takes channel values.
             let ticket_reservation = last.then(|| TicketReservation::new(&cells, &accesses));
@@ -5412,6 +5422,7 @@ async fn fire_device_geometry<C: FireContext>(
     let (completion, instance_id, scheduler, cells, fwd_rep, accesses) = {
         let p = ctx.resources().get_mut(&fwd)?;
         let completion = p.bound_instance.reserve_completion();
+        epoch.stamp(&completion);
         let accesses = p.instance.program.channel_accesses.clone();
         (
             completion,

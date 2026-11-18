@@ -182,15 +182,19 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     })
 }
 
-/// Notes that the steps of `frame`, about to be submitted, name the slots
-/// they do: each lane's tables, record, slot copies, buffer pages and
-/// snapshots, and the instances attached (their tables, rings and
-/// adapters). Touched at the store's newest epoch, which every fire of the
-/// frame has opened by now; a slot let go before that epoch retires waits.
+/// Notes that the steps of `frame`, about to be submitted (`submitted`),
+/// name the slots they do: each lane's tables, record, slot copies, buffer
+/// pages and snapshots, and the instances attached (their tables, rings
+/// and adapters). Touched at the newest epoch the frame's own fires hold
+/// (each fire's `FireEpoch`, stamped on its completion before it was
+/// submitted): a slot let go waits until those fires, and every older
+/// epoch, retire, which is once the frame has landed, and not for the fires
+/// opened since for frames still to come. One locked pass over the pool.
 fn touch_frame(
     engine_idx: usize,
     roles: Option<&crate::store::roles::RolesHandle>,
-    frame: &::engine::FrameSubmission,
+    frame: &crate::engine::FrameFire,
+    submitted: &::engine::FrameSubmission,
 ) {
     let Some(stores) = crate::store::registry::try_get(0, engine_idx) else {
         return;
@@ -198,12 +202,16 @@ fn touch_frame(
     let Some(shared) = &stores.shared else {
         return;
     };
-    let epoch =
-        crate::store::registry::with_kv_lock(&stores.kv, "fire-touch", |kv| kv.current_epoch());
+    let fires = frame.steps.iter().flat_map(|step| &step.completions);
+    debug_assert!(
+        fires.clone().all(|fire| fire.kv_epoch() > 0),
+        "a fire reached the lane with no epoch of its own"
+    );
+    let epoch = fires.map(crate::engine::WorkItemCompletion::kv_epoch).max().unwrap_or(0);
     {
         let mut pool = shared.lock().unwrap();
         let rs_list = pool.rs_list().map(|shape| shape.id);
-        for lane in frame.steps.iter().flat_map(|step| &step.lanes) {
+        for lane in submitted.steps.iter().flat_map(|step| &step.lanes) {
             for (shape, refs) in &lane.tables {
                 pool.touch(*shape, refs.iter().copied(), epoch);
             }
@@ -222,7 +230,7 @@ fn touch_frame(
     }
     if let Some(roles) = roles {
         let roles = roles.lock().unwrap();
-        for step in &frame.steps {
+        for step in &submitted.steps {
             for attachment in &step.attachments {
                 roles.touch(attachment.instance, epoch);
             }
@@ -834,7 +842,7 @@ impl Lane {
             steps = submitted.steps.len(),
             "submitting a frame to the engine"
         );
-        touch_frame(engine_idx, roles, &submitted);
+        touch_frame(engine_idx, roles, frame, &submitted);
         let ticket = match engine.submit(&submitted) {
             Ok(ticket) => ticket,
             Err(error) if error.is_retryable() => {

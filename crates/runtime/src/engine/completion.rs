@@ -472,6 +472,10 @@ struct WorkItemCompletionState {
     resolution: AtomicU32,
     cancel_requested: AtomicBool,
     native_retired: AtomicBool,
+    /// The kv epoch the fire holds until it retires (`FireEpoch`), set
+    /// before the fire is submitted: what the lane stamps the slots its
+    /// frame names with. 0 where no epoch was opened for it.
+    kv_epoch: AtomicU64,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
     /// Run once the completion resolves (or, never resolved, as the last
@@ -550,6 +554,7 @@ impl WorkItemCompletionState {
             cancel_requested: AtomicBool::new(false),
 
             native_retired: AtomicBool::new(false),
+            kv_epoch: AtomicU64::new(0),
             message: Mutex::new(None),
             guard,
             on_settled: Mutex::new(Vec::new()),
@@ -729,6 +734,16 @@ impl WorkItemCompletion {
 
     pub fn terminal_cell_ptr(&self) -> CellPtr {
         self.state.terminal_cell_ptr()
+    }
+
+    /// The fire holds kv epoch `epoch` until it retires.
+    pub fn stamp_kv_epoch(&self, epoch: u64) {
+        self.state.kv_epoch.store(epoch, Ordering::Release);
+    }
+
+    /// The kv epoch the fire holds; 0 where none was stamped.
+    pub fn kv_epoch(&self) -> u64 {
+        self.state.kv_epoch.load(Ordering::Acquire)
     }
 
     pub fn commit_target_epoch(&self, target_epoch: u64) {

@@ -1670,20 +1670,34 @@ impl SlotPool {
             return;
         };
         let spc = state.spc();
+        // A table's refs run through a chunk in turn: its frame is looked up
+        // once a chunk, not once a slot.
+        let mut at: Option<(u32, Option<u32>)> = None;
         for slot_ref in refs {
             let (chunk, index) = (slot_ref / spc, slot_ref % spc);
-            let Some(meta) = self.chunks.get(chunk as usize) else {
+            let frame = match at {
+                Some((last, frame)) if last == chunk => frame,
+                _ => {
+                    let frame = self
+                        .chunks
+                        .get(chunk as usize)
+                        .filter(|meta| meta.shape == shape)
+                        .map(|meta| meta.frame);
+                    at = Some((chunk, frame));
+                    frame
+                }
+            };
+            let Some(frame) = frame else {
                 continue;
             };
-            if meta.shape != shape {
-                continue;
-            }
-            let word = meta.frame as usize * state.words + (index / WORD) as usize;
+            let word = frame as usize * state.words + (index / WORD) as usize;
             if state.free[word] & (1 << (index % WORD)) != 0 {
                 continue;
             }
-            let refs = &mut state.refs[(meta.frame * spc + index) as usize];
-            refs.touched = refs.touched.max(epoch);
+            let refs = &mut state.refs[(frame * spc + index) as usize];
+            if refs.touched < epoch {
+                refs.touched = epoch;
+            }
         }
     }
 
