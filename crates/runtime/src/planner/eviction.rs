@@ -298,6 +298,10 @@ impl ResidencyPlanner {
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
             let stalled = inner.fleet_stalled();
+            // A set at rest is weighed by the head's retention key, like
+            // with like: what keeps sets, not the order of service.
+            let head_kept =
+                super::residency_planner::holder_key(crate::policy::schedule::plex_id(waiter.pid));
             // A prompt not yet seated waits for a lane to finish rather than
             // suspending one mid-decode: only an idle or held process yields
             // to it.
@@ -317,7 +321,7 @@ impl ResidencyPlanner {
                         && ((stalled && (proc.idle || proc.holder))
                             || (proc.key <= head_key
                                 // A set at rest is keyed by what keeps it.
-                                && !(proc.holder && proc.kept > head_key)))
+                                && !(proc.holder && proc.kept > head_kept)))
                         && if seating {
                             proc.idle || proc.held
                         } else {
@@ -521,6 +525,9 @@ impl ResidencyPlanner {
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
                     let stalled = inner.fleet_stalled();
+                    let head_kept = super::residency_planner::holder_key(
+                        crate::policy::schedule::plex_id(waiter.pid),
+                    );
                     let quotes = crate::inferlet::process::residency::quote_locked(
                         kv,
                         working_sets,
@@ -535,7 +542,7 @@ impl ResidencyPlanner {
                             if (proc.rank() <= head_rank && !proc.idle && !proc.held)
                                 || (!(stalled && (proc.idle || proc.holder))
                                     && (proc.key > head_key
-                                        || (proc.holder && proc.kept > head_key)))
+                                        || (proc.holder && proc.kept > head_kept)))
                                 || (proc.holder && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)

@@ -234,7 +234,7 @@ impl ResidencyPlanner {
         // (the head ranks first, so its key is the highest the waiters
         // carry), and a fleet standing still lets higher-keyed sets move down.
         let demand = crate::policy::pressure::Demand {
-            up_to: self.head_key(),
+            up_to: self.head_retention(),
             stalled: self.is_wedged(),
         };
         for (tier, bytes) in said {
@@ -429,25 +429,48 @@ impl ResidencyPlanner {
     /// key (the policy layer chose it), as far as the tiers below have room
     /// past the host's reserve: whether a move is on its way.
     pub fn demote_owner(self: &Arc<Self>, owner: ProcessId) -> bool {
-        if !self.port.suspend_capable() || self.demoting.swap(true, Ordering::AcqRel) {
-            return false;
-        }
+        // Its own move, beside the planner's (it takes the `demoting` turn
+        // of neither): A6000's conform answered false for every set but the
+        // first while that turn was held, and freed nothing.
+        let why = if !self.port.suspend_capable() {
+            Some("the device moves nothing below it")
+        } else {
+            None
+        };
         let (host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
         let room = host_free.saturating_sub(host_total / HOST_RESERVE_DIVISOR) + disk_free;
+        let why = why.or((room == 0).then_some("no room below the device past the host's reserve"));
         let bound = crate::store::kv::DemoteBound {
             up_to: i64::MIN,
             own: Some(owner),
         };
-        let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize, Some(bound)))
-            .flatten();
+        let txn = if why.is_none() {
+            self.port.prepare_demote(room as usize, Some(bound))
+        } else {
+            None
+        };
         let Some(txn) = txn else {
-            self.demoting.store(false, Ordering::Release);
+            tracing::debug!(
+                %owner,
+                room,
+                why = why.unwrap_or(
+                    "none of its cache is idle on the device above the floor (in use, moving, \
+                     already below, or floor-keyed: dropped, not moved)"
+                ),
+                "planner: a set the policy chose does not move down"
+            );
             return false;
         };
-        exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
+        exec::spawn_move_out(self.clone(), txn, "demote", Self::owner_demote_done);
         true
+    }
+
+    fn owner_demote_done(self: &Arc<Self>, moved: bool) {
+        if moved {
+            self.re_arm_idle_reclaim();
+        }
+        self.poke();
     }
 
     /// A spill that failed is not tried again: the host's cache stays where
@@ -534,7 +557,7 @@ impl ResidencyPlanner {
     /// What the demand heading the queue may demote: idle cache keyed at
     /// or below its process's key, and its own.
     pub(super) fn head_bound(&self) -> Option<crate::store::kv::DemoteBound> {
-        let up_to = self.head_key()?;
+        let up_to = self.head_retention()?;
         let pid = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid))?;
         Some(crate::store::kv::DemoteBound {
             up_to,
@@ -542,13 +565,20 @@ impl ResidencyPlanner {
         })
     }
 
-    /// The policy key of the process whose demand heads the queue: what it
-    /// may take from others is keyed at or below it. One no row names yet
-    /// carries the key the installed table gives a fresh process (its
-    /// default); it may still move higher-keyed sets down a tier where
-    /// nothing running will free room (the liveness rule), never discard
-    /// them. `None` (no bound) where no table is installed: every key is
-    /// alike then.
+    /// The retention key of the head's own sets (what the policy keeps its
+    /// working set and cache at, the policy's default where it states none):
+    /// what bounds the cache and resting sets its demand may take, like with
+    /// like. Schedule priority orders who is served first, not what is kept.
+    pub(super) fn head_retention(&self) -> Option<i64> {
+        let pid = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid))?;
+        Some(holder_key(crate::policy::schedule::plex_id(pid)))
+    }
+
+    /// The schedule key of the process whose demand heads the queue, as the
+    /// victim choice reads it (the processes it may park are keyed at or
+    /// below it, like with like): one no row names yet carries the table's
+    /// default; `None` where no table is installed.
+    #[cfg(test)]
     pub(super) fn head_key(&self) -> Option<i64> {
         let key = self.with_counts(|inner| {
             let (_, waiter) = inner.unmet_head()?;
@@ -579,7 +609,7 @@ impl ResidencyPlanner {
         // A set at rest keyed above the head's demand stays for it, as idle
         // cache keyed so does ([`Self::demote_idle`]), while running work
         // will free room; with the fleet standing still, it moves down.
-        let up_to = if self.is_wedged() { None } else { self.head_key() };
+        let up_to = if self.is_wedged() { None } else { self.head_retention() };
         let mut above: Vec<ProcessId> = Vec::new();
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set
@@ -1424,7 +1454,10 @@ impl ResidencyPlanner {
         }
         let short = need - u64::from(total);
         let parked = self.port.working_set_pages(&parkable);
-        let idle = self.port.idle_pages_up_to(key);
+        // Cache is weighed by the waiter's retention key, like with like.
+        let idle = self
+            .port
+            .idle_pages_up_to(holder_key(crate::policy::schedule::plex_id(pid)));
         let swap_free = u64::from(self.swap_stats().0);
         let movable = parked
             .resident
@@ -1621,7 +1654,7 @@ impl ResidencyPlanner {
 /// key on its head where a policy keeps one (`Retain::upto`). A tail the
 /// head's key does not cover goes first by itself ([`holder_head`], the
 /// sweep), its pages at the whole set's key.
-fn holder_key(pid: ProcessId) -> i64 {
+pub(super) fn holder_key(pid: ProcessId) -> i64 {
     use crate::policy::retention::{Installed, Keys};
     Installed.key_at(Some(pid), 0)
 }

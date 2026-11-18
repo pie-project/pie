@@ -3009,6 +3009,12 @@ async fn a_demand_parks_no_set_keyed_above_its_own() {
         std::collections::HashMap::new(),
         None,
     )));
+    // And keeps the grower's own sets at 15: a set at rest is weighed by
+    // that, its retention key, like with like.
+    crate::policy::retention::install(Some(crate::policy::retention::Table::new(
+        std::collections::HashMap::from([(grower, vec![(None, 15)])]),
+        None,
+    )));
     for &pid in &pids {
         planner.register(pid);
         planner.note_admitted(pid);
@@ -3071,6 +3077,7 @@ async fn a_demand_parks_no_set_keyed_above_its_own() {
         states.iter().all(|state| *state == Residency::Resident),
         "the key-20 sets keep running: {states:?}"
     );
+    crate::policy::retention::install(None);
     install(None);
 }
 
@@ -3168,5 +3175,43 @@ async fn an_unkeyed_demand_is_bounded_by_the_table_s_default_key() {
     )));
     assert_eq!(planner.head_key(), Some(0), "the table's default key");
     planner.unregister(fresh);
+    install(None);
+}
+
+/// Like with like: the bound on the cache and resting sets a demand may
+/// take is its process's retention key, not its schedule priority. A head
+/// scheduled at 9 whose sets the policy keeps at nothing (the default)
+/// is bounded by the default retention key.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cache_bound_is_the_retention_key_not_the_schedule_priority() {
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let head = ProcessId::new_v4();
+    install(Some(Table::new(
+        std::collections::HashMap::from([(head, 9)]),
+        None,
+        std::collections::HashMap::new(),
+        None,
+    )));
+    planner.register(head);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    assert_eq!(planner.head_key(), Some(9), "its schedule priority orders service");
+    assert_eq!(
+        planner.head_retention(),
+        Some(crate::policy::retention::FLOOR),
+        "its retention key bounds what it takes"
+    );
+    planner.unregister(head);
     install(None);
 }

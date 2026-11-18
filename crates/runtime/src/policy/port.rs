@@ -142,6 +142,11 @@ pub(super) fn report(event: Event) {
 
 /// Per tier, the episode in which the default responder finds nothing left
 /// to discard: said once as it starts and once as it ends.
+/// Per tier: an episode of the default responder keeping sets keyed above
+/// the demand, said once at INFO as it starts.
+static KEPT: std::sync::Mutex<[process::WaitEpisode; 2]> =
+    std::sync::Mutex::new([process::WaitEpisode::new(), process::WaitEpisode::new()]);
+
 static NOTHING_LEFT: std::sync::Mutex<[process::WaitEpisode; 2]> =
     std::sync::Mutex::new([process::WaitEpisode::new(), process::WaitEpisode::new()]);
 
@@ -982,18 +987,90 @@ impl Port {
             }
             let rooms = (self.cache.rooms)();
             let below = tier == Tier::Device && rooms[1].1 + rooms[2].1 > 0;
-            let candidates = self
+            let mut candidates: Vec<pressure::Candidate> = self
                 .candidates_for(tier, &keys)
                 .into_iter()
                 .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
-                .filter(|c| {
-                    let handle =
-                        ProcessId::from_str(&c.id).is_ok_and(|id| self.handles.contains_key(&id));
-                    may_take(demand, c.key, below && !handle)
-                })
+                .filter(|c| c.bytes != Some(0) && c.key != pressure::PINNED)
                 .collect();
-            let chosen = pressure::choose(candidates, short);
-            if chosen.is_empty() {
+            candidates
+                .sort_by(|a, b| (a.key, a.last_use_ms, &a.id).cmp(&(b.key, b.last_use_ms, &b.id)));
+            // Lowest key first, until what was freed covers the shortfall.
+            // Each candidate is judged where it stands (`take_for`): moved
+            // down a tier where one below has room and the demand may move
+            // it; else discarded where the demand may discard it; else kept,
+            // and not counted.
+            let mut freed: u64 = 0;
+            let mut took = false;
+            for candidate in candidates {
+                if freed >= short {
+                    break;
+                }
+                let Ok(owner) = ProcessId::from_str(&candidate.id) else {
+                    continue;
+                };
+                let key = candidate.key;
+                let handle = self.handles.contains_key(&owner);
+                let movable = below && !handle;
+                match take_for(demand, key, movable, || (self.cache.demote)(owner)) {
+                    Take::MovedDown => {
+                        tracing::info!(
+                            tier = tier.name(),
+                            short,
+                            working_set = %owner,
+                            key,
+                            up_to = ?demand.up_to,
+                            "tier pressure: the default responder moves a working set down a tier"
+                        );
+                    }
+                    Take::Discard => {
+                        tracing::info!(
+                            tier = tier.name(),
+                            short,
+                            working_set = %owner,
+                            key,
+                            up_to = ?demand.up_to,
+                            "tier pressure: the default responder discards a working set"
+                        );
+                        match self.handles.get(&owner) {
+                            Some(handle) => crate::server::discard_handle(
+                                handle.resting.client,
+                                owner,
+                                "tier pressure: the default responder discarded it".to_string(),
+                            ),
+                            None => (self.cache.discard)(owner),
+                        }
+                        discarded.push(owner);
+                    }
+                    Take::Kept => {
+                        let why = if !movable {
+                            "keyed above the demand, and no tier below takes it"
+                        } else if !demand.may_demote(key) {
+                            "keyed above the demand, which running work will serve"
+                        } else {
+                            "keyed above the demand, and it could not move down"
+                        };
+                        // Said once an episode at INFO, its repeats at DEBUG.
+                        if KEPT.lock().unwrap()[tier.index()].seen() {
+                            tracing::info!(tier = tier.name(), working_set = %owner, key, up_to = ?demand.up_to, why, "tier pressure: the default responder keeps a working set");
+                        } else {
+                            tracing::debug!(tier = tier.name(), working_set = %owner, key, up_to = ?demand.up_to, why, "tier pressure: the default responder keeps a working set");
+                        }
+                        continue;
+                    }
+                }
+                took = true;
+                match candidate.bytes {
+                    Some(bytes) => freed = freed.saturating_add(bytes),
+                    // Its size unknown: the waiter's next report says
+                    // whether that was enough.
+                    None => break,
+                }
+            }
+            if took {
+                nothing_left_ends(tier, "a working set is moved down or discarded");
+                let _ = KEPT.lock().unwrap()[tier.index()].end();
+            } else {
                 // Said once an episode, as it starts; its repeats at DEBUG.
                 if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
                     tracing::info!(
@@ -1009,47 +1086,6 @@ impl Port {
                     );
                 }
                 pressure::answered_nothing(tier);
-            } else {
-                nothing_left_ends(tier, "a working set is discarded");
-            }
-            for id in chosen {
-                let Ok(owner) = ProcessId::from_str(&id) else {
-                    continue;
-                };
-                let key = (&keys as &dyn retention::Keys).key_at(Some(owner), 0);
-                let movable = below && !self.handles.contains_key(&owner);
-                match take_for(demand, key, movable, || (self.cache.demote)(owner)) {
-                    Take::MovedDown => {
-                        tracing::info!(
-                            tier = tier.name(),
-                            short,
-                            working_set = %owner,
-                            key,
-                            up_to = ?demand.up_to,
-                            "tier pressure: the default responder moves a working set down a tier"
-                        );
-                        continue;
-                    }
-                    Take::Kept => continue,
-                    Take::Discard => {}
-                }
-                tracing::info!(
-                    tier = tier.name(),
-                    short,
-                    working_set = %owner,
-                    key,
-                    up_to = ?demand.up_to,
-                    "tier pressure: the default responder discards a working set"
-                );
-                match self.handles.get(&owner) {
-                    Some(handle) => crate::server::discard_handle(
-                        handle.resting.client,
-                        owner,
-                        "tier pressure: the default responder discarded it".to_string(),
-                    ),
-                    None => (self.cache.discard)(owner),
-                }
-                discarded.push(owner);
             }
         }
     }
@@ -1128,18 +1164,6 @@ impl Port {
     }
 }
 
-/// Whether the default responder may take a set keyed `key` for `demand`:
-/// moved down a tier where one below has room (`movable`), else discarded.
-/// Within the demand's key either; above it, only moved down, and only
-/// where nothing running will free room.
-fn may_take(demand: pressure::Demand, key: i64, movable: bool) -> bool {
-    if movable {
-        demand.may_demote(key)
-    } else {
-        demand.may_discard(key)
-    }
-}
-
 /// What the default responder does with a chosen set.
 #[derive(Debug, PartialEq, Eq)]
 enum Take {
@@ -1151,16 +1175,17 @@ enum Take {
     Discard,
 }
 
-/// A chosen set keyed `key`: moved down where it can (`demote` starts the
-/// move and says whether it did), else discarded only within the demand's
-/// key.
+/// A set keyed `key`, judged where it stands: moved down a tier where one
+/// below takes it (`movable`) and the demand may move it (`demote` starts the
+/// move and says whether it did); else discarded where the demand's key
+/// allows; else kept, and not counted toward the shortfall.
 fn take_for(
     demand: pressure::Demand,
     key: i64,
     movable: bool,
     demote: impl FnOnce() -> bool,
 ) -> Take {
-    if movable && demote() {
+    if movable && demand.may_demote(key) && demote() {
         Take::MovedDown
     } else if demand.may_discard(key) {
         Take::Discard
@@ -1190,23 +1215,25 @@ mod responder_tests {
             stalled: true,
         };
         // Within the key: moved down where it can, else discarded.
-        assert!(may_take(bounded, 15, true));
         assert_eq!(take_for(bounded, 15, true, || true), Take::MovedDown);
-        assert_eq!(take_for(bounded, 15, true, || false), Take::Discard);
+        assert_eq!(
+            take_for(bounded, 15, true, || false),
+            Take::Discard,
+            "a move refused is a discard"
+        );
         assert_eq!(
             take_for(bounded, 5, false, || unreachable!()),
             Take::Discard
         );
-        // Above it: not a candidate unless stalled, and then only moved down.
-        assert!(!may_take(bounded, 20, true));
-        assert!(!may_take(bounded, 20, false));
-        assert!(may_take(stalled, 20, true));
-        assert!(!may_take(stalled, 20, false));
+        // Above it: kept unless stalled, and then only moved down; a move
+        // is not even asked for where the demand may not move it.
+        assert_eq!(take_for(bounded, 20, true, || unreachable!()), Take::Kept);
+        assert_eq!(take_for(bounded, 20, false, || unreachable!()), Take::Kept);
         assert_eq!(take_for(stalled, 20, true, || true), Take::MovedDown);
         assert_eq!(take_for(stalled, 20, true, || false), Take::Kept);
-        // Unbounded (no row keys the waiter): anything, as before.
+        assert_eq!(take_for(stalled, 20, false, || unreachable!()), Take::Kept);
+        // Unbounded (no table installed): anything, as before.
         let unbounded = pressure::Demand::default();
-        assert!(may_take(unbounded, 20, false));
         assert_eq!(
             take_for(unbounded, 20, false, || unreachable!()),
             Take::Discard
