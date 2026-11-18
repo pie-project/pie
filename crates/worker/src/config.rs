@@ -978,8 +978,9 @@ pub struct MemoryConfig {
     /// memory pressure, in `[0, 1]`: the device target is
     /// `floor + (budget - floor) * (1 - yield * pressure)`, with pressure
     /// the OS's own reading in `0..1` (Linux and Android PSI, macOS's
-    /// memory-pressure level; 0 where the system states none). `0` (a
-    /// dedicated machine) holds the whole budget whatever the pressure.
+    /// available memory). `0` (a dedicated machine) holds the whole budget
+    /// and reads nothing; above 0, a load on a system whose pressure cannot
+    /// be read is refused by name.
     ///
     /// Idle cache is not timed out by the runtime: with no worker policy
     /// installed it stays until a demand needs its room, and is then

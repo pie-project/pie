@@ -43,13 +43,27 @@ pub struct Reader {
     failed: bool,
 }
 
-impl Reader {
-    /// This system's reader, or `None` where it states no memory pressure.
-    #[must_use]
-    pub fn of_this_system() -> Option<Self> {
-        Source::of_this_system().map(Self::new)
+/// The pressure source a load's `yield` needs: none at a yield of 0, where
+/// nothing is read. A yield above 0 that has no source to follow is refused
+/// by name, never left to yield nothing.
+///
+/// # Errors
+///
+/// `yield` > 0 and `source` (this system's, [`Source::of_this_system`])
+/// did not answer.
+pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>) -> Result<Option<Source>, String> {
+    if !yields.yields() {
+        return Ok(None);
     }
+    source().map(Some).map_err(|why| {
+        format!(
+            "engine.memory.yield = {} needs the system's memory pressure, and {why}",
+            yields.share()
+        )
+    })
+}
 
+impl Reader {
     #[must_use]
     pub const fn new(source: Source) -> Self {
         Self {
@@ -289,6 +303,27 @@ mod tests {
         std::fs::write(&path, "lots").unwrap();
         assert_eq!(reader.read(), 0.0, "a failed reading is 0, named");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_yield_with_no_pressure_to_follow_is_refused_by_name() {
+        let gone = Source::File("/nonexistent/pie-pressure".into());
+        let refused = source_for(share(0.5), || gone.clone().checked()).expect_err("refused");
+        assert!(
+            refused.starts_with(
+                "engine.memory.yield = 0.5 needs the system's memory pressure, and PIE_PRESSURE_FILE reads "
+            ),
+            "{refused}"
+        );
+        let none = || Err("nothing reads it on this platform (windows)".to_string());
+        let refused = source_for(share(1.0), none).expect_err("refused");
+        assert!(refused.ends_with("nothing reads it on this platform (windows)"), "{refused}");
+    }
+
+    #[test]
+    fn a_yield_of_zero_reads_nothing_and_loads_without_a_source() {
+        let none = || -> Result<Source, String> { panic!("not read at yield 0") };
+        assert_eq!(source_for(Yield::NONE, none), Ok(None));
     }
 
     #[test]

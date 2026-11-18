@@ -1522,7 +1522,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   `governor_release_idle` and the loop constants PATIENCE, IDLE_AFTER, CUT_EVERY, CUT_SHARE, SETTLED, KEEP_CACHE
   (with FIRST_HOLD / LONGEST_HOLD, GROWTH_STEP and macOS's refault MIN_EVICTED / THRASHING) are gone for one key,
   `yield` in [0, 1], default 0: target = floor + (budget - floor) * (1 - yield * pressure), pressure the OS's own
-  reading (PSI some avg10 at the kernel's 2 s period; macOS pressure level), 0 and logged where none. A Fixed pool
+  reading (PSI some avg10 at the kernel's 2 s period; macOS 1 - kern.memorystatus_level / 100); yield > 0
+  with no readable source refuses the load by name. A Fixed pool
   (XLA; wgpu, laid whole at load via Backend::RESIZES_POOL) takes no yield, logged once. Rule and readers are
   engine::memory::target / engine::pressure, shared with the host tier. The rung's idle lower waits on need (a waiter short, or the target under what is
   mapped with no room), not on a tick count. Idle cache: no runtime expiry; a keep is the policy's retention keys.

@@ -12,11 +12,13 @@
 //! system states ([`host`]). `yield = 0` holds the ceiling whatever the
 //! system says. The rule itself is [`crate::memory::target`].
 //!
-//! Each source is the system's own, named with its documentation; none is
-//! thresholded or smoothed here. Where the system states none, there is no
-//! [`Source`], and the caller says so and reads `0`, never a guess. This
-//! module keeps no clock and logs nothing: a caller reads a source at most
-//! once a [`Source::period`] and names a failed reading itself.
+//! Each source is the system's own continuous reading, named with its
+//! documentation; none is thresholded, mapped or smoothed here. Where the
+//! system states none, or its source does not read, a yield above 0 has
+//! nothing to follow: [`Source::of_this_system`] says why, and the load is
+//! refused by name rather than yielding nothing. This module keeps no clock
+//! and logs nothing: a caller reads a source at most once a
+//! [`Source::period`] and names a failed reading itself.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -63,14 +65,15 @@ impl Yield {
 }
 
 /// The OS's host-memory pressure now, in `0..=1`, from this system's
-/// [`Source`]; `None` where it states none or the reading failed: the caller
-/// states `0` and logs it. The device tier reads the same: the rule's
+/// [`Source`]; `None` where it states none or the reading failed. A tier
+/// that yields to it refuses its load where [`Source::of_this_system`]
+/// does not answer, as the device governor does. The device tier reads the same: the rule's
 /// pressure is the OS's, whichever tier yields to it. A caller that reads
 /// on a clock keeps a [`Source`] and reads it no more often than
 /// [`Source::period`].
 #[must_use]
 pub fn host() -> Option<f64> {
-    Source::of_this_system()?.read().ok()
+    Source::of_this_system().ok()?.read().ok()
 }
 
 /// Where a reading of the system's memory pressure comes from.
@@ -85,16 +88,10 @@ pub enum Source {
     /// macOS: `kern.memorystatus_level`, the kernel's own continuous
     /// reading of the memory available, a percentage (xnu
     /// bsd/kern/kern_memorystatus.c, `memorystatus_level`; what Activity
-    /// Monitor's memory pressure graph shows as its complement). The
-    /// reading is `1 - level / 100` ([`macos_available`]).
+    /// Monitor's memory pressure graph shows as its complement), readable
+    /// unprivileged on every macOS pie supports. The reading is
+    /// `1 - level / 100` ([`macos_available`]).
     MacosAvailable,
-    /// macOS where `kern.memorystatus_level` cannot be read:
-    /// `kern.memorystatus_vm_pressure_level`, the level the
-    /// `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` dispatch source reports
-    /// (<https://developer.apple.com/documentation/dispatch/dispatch_source_type_memorypressure>).
-    /// It has three steps, so the reading is a chosen mapping
-    /// ([`macos_level`], stated in new-memory/DEVICE-MEMORY-INVENTORY.md).
-    MacosLevel,
     /// A test hook: the file `PIE_PRESSURE_FILE` names holds the reading,
     /// a number in `0..=1`, so a test can induce pressure mid-run.
     File(PathBuf),
@@ -103,23 +100,40 @@ pub enum Source {
 impl Source {
     const PSI: &str = "/proc/pressure/memory";
 
-    /// This system's source: the test hook where `PIE_PRESSURE_FILE` is
-    /// set, else the OS's own where it states one (a Linux or Android
-    /// kernel with PSI, macOS). `None` where it states none (no PSI,
-    /// Windows, iOS, a browser tab): the pressure is then `0`, and the
-    /// caller says so.
-    #[must_use]
-    pub fn of_this_system() -> Option<Source> {
-        if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
-            return Some(Source::File(path.into()));
+    /// This system's source, read once to show it reads: the test hook
+    /// where `PIE_PRESSURE_FILE` is set, else the OS's own (macOS's
+    /// available memory; a Linux or Android kernel's PSI).
+    ///
+    /// # Errors
+    ///
+    /// The source does not read (`"<source> reads <error>"`), or this
+    /// platform has none (Windows, iOS, a browser tab).
+    pub fn of_this_system() -> Result<Source, String> {
+        let source = if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
+            Source::File(path.into())
+        } else if cfg!(target_os = "macos") {
+            Source::MacosAvailable
+        } else if cfg!(any(target_os = "linux", target_os = "android")) {
+            Source::Psi
+        } else {
+            return Err(format!(
+                "nothing reads it on this platform ({})",
+                std::env::consts::OS
+            ));
+        };
+        source.checked()
+    }
+
+    /// This source if it reads now; else `"<source> reads <error>"`.
+    ///
+    /// # Errors
+    ///
+    /// It does not read.
+    pub fn checked(self) -> Result<Source, String> {
+        match self.read() {
+            Ok(_) => Ok(self),
+            Err(why) => Err(format!("{} reads {why}", self.name())),
         }
-        if cfg!(target_os = "macos") {
-            if Source::MacosAvailable.read().is_ok() {
-                return Some(Source::MacosAvailable);
-            }
-            return Source::MacosLevel.read().is_ok().then_some(Source::MacosLevel);
-        }
-        Source::Psi.read().is_ok().then_some(Source::Psi)
     }
 
     /// The source, named for the load log.
@@ -128,7 +142,6 @@ impl Source {
         match self {
             Source::Psi => "Linux PSI /proc/pressure/memory, some avg10",
             Source::MacosAvailable => "macOS kern.memorystatus_level, 1 - available / 100",
-            Source::MacosLevel => "macOS kern.memorystatus_vm_pressure_level",
             Source::File(_) => "PIE_PRESSURE_FILE",
         }
     }
@@ -137,12 +150,12 @@ impl Source {
     /// caller reads no more often. PSI's averages are recomputed every
     /// `PSI_FREQ`, `(2*HZ+1)` jiffies, "2 sec intervals"
     /// (kernel/sched/psi.c). `None`: the reading is current at each read
-    /// (macOS's level changes as the kernel's state does; the test file).
+    /// (macOS's available memory, the test file).
     #[must_use]
     pub const fn period(&self) -> Option<Duration> {
         match self {
             Source::Psi => Some(Duration::from_secs(2)),
-            Source::MacosAvailable | Source::MacosLevel | Source::File(_) => None,
+            Source::MacosAvailable | Source::File(_) => None,
         }
     }
 
@@ -167,11 +180,6 @@ impl Source {
                     })
                 })
             }
-            Source::MacosLevel => macos::sysctl_u32(macos::LEVEL).and_then(|level| {
-                macos_level(level).ok_or_else(|| {
-                    format!("kern.memorystatus_vm_pressure_level is {level}, not a level")
-                })
-            }),
             Source::File(path) => {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -199,11 +207,6 @@ pub fn psi_some_avg10(text: &str) -> Option<f64> {
     (percent.is_finite() && percent >= 0.0).then(|| (percent / 100.0).min(1.0))
 }
 
-/// `DISPATCH_MEMORYPRESSURE_NORMAL`, `_WARN`, `_CRITICAL` (dispatch/source.h).
-const NORMAL: u32 = 1;
-const WARN: u32 = 2;
-const CRITICAL: u32 = 4;
-
 /// `kern.memorystatus_level` (percent available) as a reading: `1 -
 /// level / 100`; `None` past 100.
 #[must_use]
@@ -211,25 +214,10 @@ pub fn macos_available(level: u32) -> Option<f64> {
     (level <= 100).then(|| 1.0 - f64::from(level) / 100.0)
 }
 
-/// The fallback's pressure level as a reading in `0..=1`. The levels are
-/// bits (normal 1, warn 2, critical 4), and the reading is a chosen mapping
-/// on them, `log2(level) / log2(CRITICAL)` (normal 0, warn 1/2, critical
-/// 1): three steps cannot say more. `None` for a value that is not one.
-#[must_use]
-pub const fn macos_level(level: u32) -> Option<f64> {
-    match level {
-        NORMAL | WARN | CRITICAL => {
-            Some(level.trailing_zeros() as f64 / CRITICAL.trailing_zeros() as f64)
-        }
-        _ => None,
-    }
-}
-
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod macos {
     pub(super) const AVAILABLE: &std::ffi::CStr = c"kern.memorystatus_level";
-    pub(super) const LEVEL: &std::ffi::CStr = c"kern.memorystatus_vm_pressure_level";
 
     /// A `u32` sysctl by name.
     pub(super) fn sysctl_u32(name: &std::ffi::CStr) -> Result<u32, String> {
@@ -266,7 +254,6 @@ mod macos {
 #[cfg(not(target_os = "macos"))]
 mod macos {
     pub(super) const AVAILABLE: &str = "kern.memorystatus_level";
-    pub(super) const LEVEL: &str = "kern.memorystatus_vm_pressure_level";
 
     pub(super) fn sysctl_u32(name: &str) -> Result<u32, String> {
         Err(format!("{name} is macOS's"))
@@ -325,14 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_levels_read_on_the_kernel_s_scale() {
-        assert_eq!(macos_level(NORMAL), Some(0.0));
-        assert_eq!(macos_level(WARN), Some(0.5));
-        assert_eq!(macos_level(CRITICAL), Some(1.0));
-        assert_eq!(macos_level(3), None);
-    }
-
-    #[test]
     fn the_test_file_is_a_source_of_its_own() {
         let dir = std::env::temp_dir().join(format!("pie-pressure-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -343,6 +322,8 @@ mod tests {
         std::fs::write(&path, "2").unwrap();
         assert!(source.read().is_err(), "out of range is no reading");
         std::fs::remove_dir_all(&dir).unwrap();
+        let gone = Source::File(path.clone()).checked().expect_err("no file");
+        assert!(gone.starts_with("PIE_PRESSURE_FILE reads "), "{gone}");
         assert_eq!(source.period(), None);
         assert_eq!(Source::Psi.period(), Some(Duration::from_secs(2)));
     }

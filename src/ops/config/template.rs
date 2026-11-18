@@ -83,7 +83,8 @@ const MEMORY: &str = r#"
 # disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
 # disk_persistent       = false     # keep the disk tier as cache for the next run
 # yield                 = 0.0       # in [0, 1]: device target = floor + (budget - floor)
-#                                   #   * (1 - yield * OS memory pressure); 0 holds the budget
+#                                   #   * (1 - yield * OS memory pressure); 0 holds the budget;
+#                                   #   above 0 the OS's pressure must be readable (PSI, macOS)
 # Idle cache has no time-based expiry: with no worker policy it stays until a
 # demand needs its room, then goes in retention-key / least-recently-used order.
 "#;

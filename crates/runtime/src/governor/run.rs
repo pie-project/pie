@@ -8,8 +8,17 @@ use super::{Governor, Growth, Limits, PoolTarget, Reader, Retarget, Signal, TICK
 /// front of it settles its windows on the governor's tick. Where the engine
 /// states a reader of the host's room (`room`, its share of the host's one
 /// ledger), every pool that can move is held within it.
-pub fn start(pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>) {
-    crate::rt::spawn(watch(pool, yields, room));
+/// `source` is the pressure source the load's yield needs
+/// ([`super::source_for`]), read where the pool moves.
+pub fn start(pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>, source: Option<super::Source>) {
+    crate::rt::spawn(watch(pool, yields, room, source));
+}
+
+/// Whether `yield` moves `pool` at all: one its engine states can shrink,
+/// and shared. XLA's and wgpu's are laid whole at load.
+#[must_use]
+pub fn yield_applies(pool: &Shared<Steered>) -> bool {
+    pool.growth() != Growth::Fixed && pool.with(|pool| pool.inner().is_shared())
 }
 
 /// One host's room, shared by every pool on it. A reading is what the host
@@ -401,10 +410,15 @@ fn within(limits: &Limits, target: u64) -> u64 {
     limits.segments(target.min(limits.hard_limit))
 }
 
-async fn watch(mut pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>) {
+async fn watch(
+    mut pool: Shared<Steered>,
+    yields: Yield,
+    room: Option<PoolRoom>,
+    source: Option<super::Source>,
+) {
     let mut steer = Steer::new(&pool, yields).with_room(&pool, room);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
-    let mut system = said(engine, yields, &steer, shared);
+    let mut system = said(engine, yields, &steer, shared, source);
     // A shared pool that does not yield may take every segment its range
     // holds: its walker commits them ahead of the waiters that need them,
     // off the fire path, and never gives them back. Held within the host's
@@ -438,8 +452,15 @@ async fn watch(mut pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>)
 }
 
 /// States in the load log what the device target follows, and opens the
-/// system's pressure reader where the pool yields to it.
-fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Reader> {
+/// system's pressure reader where the pool yields to it. The load refused
+/// a yield with no source before this runs ([`super::source_for`]).
+fn said(
+    engine: usize,
+    yields: Yield,
+    steer: &Steer,
+    shared: bool,
+    source: Option<super::Source>,
+) -> Option<Reader> {
     if !yields.yields() {
         tracing::info!(
             engine,
@@ -455,7 +476,7 @@ fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Rea
         );
         return None;
     }
-    let mut system = Reader::of_this_system();
+    let mut system = source.map(Reader::new);
     let limits = steer.governor().limits();
     match &mut system {
         Some(system) => {
@@ -471,10 +492,10 @@ fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Rea
                 "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure)"
             );
         }
-        None => tracing::info!(
+        None => tracing::error!(
             engine,
             yields = yields.share(),
-            "this system states no memory pressure: it reads 0, and the device target is the budget"
+            "the pool yields but was handed no pressure source: the load should have refused"
         ),
     }
     system
