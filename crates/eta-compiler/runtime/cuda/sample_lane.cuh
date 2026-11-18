@@ -13,25 +13,32 @@
 // width-32 tree (`canonical_reduce`), and the cut is `m1_cut_row` /
 // `m1_rank_row` over the group's hooks.
 //
-// The arena, per block (`M1_LANE_ARENA_STRIDE` apart, a lane's blocks' together
-// in the engine's lane arenas, laid once at load: a fire's lanes meet there
-// one launch after another): a 64-byte line (block 0's
-// holds the lane's barrier words, one a block; zeroed before the launch),
-// two exchange buffers, used by alternate merges (a block is at most one
-// merge ahead of the slowest), and two buffers of gathered elements.
+// A lane's span of the engine's lane arenas (`M1_LANE_SPAN`, laid once at
+// load: a fire's lanes meet there one launch after another): an arena per
+// block (`M1_LANE_ARENA_STRIDE` apart) — a 64-byte line (block 0's holds the
+// lane's barrier words, one a block; zeroed before the launch) and two
+// exchange buffers, used by alternate merges (a block is at most one merge
+// ahead of the slowest) — then the lane's gather buffers: two of gathered
+// elements for each of `M1_LANE_ARENAS` homes, however few blocks the lane
+// runs on, so a block's gathers past its own home stay in its lane's span.
 
 #define M1_LANE_HALF 24576u
 #define M1_LANE_HEAD 64u
 #define M1_LANE_MAX_SLICES 64u
-// The blocks' arenas a lane has (the launcher's LANE_SAMPLER_BLOCKS), and
-// the gathered elements each holds (two buffers of them, after the halves).
+// The gather homes a lane has (the launcher's LANE_SAMPLER_BLOCKS: the most
+// blocks a lane runs on), and the gathered elements each holds (two buffers
+// of them).
 #define M1_LANE_ARENAS 16u
 #define M1_FAST_GATHER 512u
-// A block's arena, from one to the next in the lane arenas: its line, its
-// halves and its gather buffers, to 256 bytes (the launcher's
-// `lane_arena_stride`).
-#define M1_LANE_ARENA_STRIDE                                                          \
-  ((M1_LANE_HEAD + 2u * M1_LANE_HALF + 2u * M1_FAST_GATHER * 8u + 255u) & ~255u)
+// A block's arena, from one to the next in a lane's span: its line and its
+// halves, to 256 bytes (the launcher's `lane_arena_stride`).
+#define M1_LANE_ARENA_STRIDE ((M1_LANE_HEAD + 2u * M1_LANE_HALF + 255u) & ~255u)
+// A lane's gather buffers, after its blocks' arenas (the launcher's
+// `LANE_SAMPLER_GATHERS`).
+#define M1_LANE_GATHERS (M1_LANE_ARENAS * 2u * M1_FAST_GATHER * 8u)
+// A lane's span of the lane arenas on `blocks` blocks (the launcher's
+// `lane_span`).
+#define M1_LANE_SPAN(blocks) ((m1_u64)(blocks) * M1_LANE_ARENA_STRIDE + M1_LANE_GATHERS)
 
 // ---------------------------------------------------------- the fast cut --
 //
@@ -812,15 +819,13 @@ struct M1Lane {
     combine_u32(values, n, 0u, nullptr, [](m1_u32 a, m1_u32 b, m1_u32) { return a + b; });
   }
 
-  // Where a block's `n`-th gathered element goes: its own arena's gather
-  // buffer, then those of the arenas past the lane's blocks (block + slices,
-  // + 2 slices, ...), as many as the lane has.
+  // Where a block's `n`-th gathered element goes: its own home's gather
+  // buffer, then the homes past the lane's blocks (block + slices,
+  // + 2 slices, ...), as many as the lane's span holds.
   __device__ __forceinline__ m1_u64* gather_slot(m1_u32 block, m1_u32 n, m1_u32 which) const {
     const m1_u32 home = block + slices * (n / M1_FAST_GATHER);
-    return reinterpret_cast<m1_u64*>(
-               arena + (m1_u64)home * stride + M1_LANE_HEAD + 2u * M1_LANE_HALF +
-               which * M1_FAST_GATHER * 8u) +
-           (n % M1_FAST_GATHER);
+    return reinterpret_cast<m1_u64*>(arena + (m1_u64)slices * stride) +
+           (home * 2u + which) * M1_FAST_GATHER + (n % M1_FAST_GATHER);
   }
   __device__ __forceinline__ m1_u32 gather_room(m1_u32 block) const {
     return block >= M1_LANE_ARENAS ? 0u

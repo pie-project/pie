@@ -160,3 +160,47 @@ impl PartialEq for Kernel {
 }
 
 impl Eq for Kernel {}
+
+#[cfg(feature = "rocm")]
+impl Kernel {
+    /// The blocks of `threads` threads and `smem` dynamic LDS bytes of this
+    /// kernel one compute unit of the current device holds at once: HIP's
+    /// occupancy calculator over the kernel's registers and LDS against the
+    /// compute unit's (`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`),
+    /// loading the kernel first.
+    #[allow(unsafe_code)]
+    pub fn resident_blocks(&'static self, threads: u32, smem: u32) -> Result<u32, crate::Error> {
+        const OP: &str = "jit.occupancy";
+        let function = self.resolve().map_err(|fault| fault.at(OP))?.function;
+        let mut blocks: i32 = 0;
+        // SAFETY: `function` is this kernel's live handle on the current
+        // device; `blocks` is a local out-pointer.
+        let code = unsafe {
+            crate::hip::rt::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                &raw mut blocks,
+                function,
+                i32::try_from(threads).unwrap_or(i32::MAX),
+                smem as usize,
+            )
+        };
+        if code != crate::hip::sys::HIP_SUCCESS {
+            return Err(Fault::Device {
+                call: "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+                code,
+            }
+            .at(OP));
+        }
+        u32::try_from(blocks)
+            .ok()
+            .filter(|&b| b > 0)
+            .ok_or_else(|| {
+                crate::jit::refuse(
+                    OP,
+                    format!(
+                        "`{}` seats {blocks} blocks of {threads} threads a compute unit",
+                        self.name
+                    ),
+                )
+            })
+    }
+}
