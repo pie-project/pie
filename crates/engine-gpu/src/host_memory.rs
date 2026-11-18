@@ -81,9 +81,18 @@ pub enum Killer<'a> {
 ///
 /// Names the reading the rule needed and could not take.
 pub fn room_of(meminfo: &str, killer: Killer<'_>, page: u64) -> std::result::Result<Room, String> {
-    let available =
-        mem_available(meminfo).ok_or_else(|| "/proc/meminfo states no MemAvailable".to_string())?;
-    let defended = match killer {
+    room_within(meminfo, defended_by(killer, page)?)
+}
+
+/// The bytes `killer` defends past `MemAvailable`, in pages of `page`
+/// bytes. Its levels and the zones' reserve do not change while a process
+/// serves, so a reader takes this once.
+///
+/// # Errors
+///
+/// Names the reading the rule needed and could not take.
+pub fn defended_by(killer: Killer<'_>, page: u64) -> std::result::Result<u64, String> {
+    Ok(match killer {
         Killer::None | Killer::Pressure => 0,
         Killer::Minfree { levels, zoneinfo } => {
             let minfree = foreground_minfree(levels).ok_or_else(|| {
@@ -99,7 +108,17 @@ pub fn room_of(meminfo: &str, killer: Killer<'_>, page: u64) -> std::result::Res
                 .checked_mul(page)
                 .ok_or_else(|| format!("{pages} pages of {page} bytes overflow"))?
         }
-    };
+    })
+}
+
+/// The room `/proc/meminfo`'s text leaves past `defended` bytes.
+///
+/// # Errors
+///
+/// Names `MemAvailable` where the text states none.
+pub fn room_within(meminfo: &str, defended: u64) -> std::result::Result<Room, String> {
+    let available =
+        mem_available(meminfo).ok_or_else(|| "/proc/meminfo states no MemAvailable".to_string())?;
     Ok(Room {
         available,
         defended,
@@ -202,13 +221,38 @@ fn foreground_minfree(levels: &str) -> Option<u64> {
 /// Refuses by name when a reading the rule needs cannot be taken.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn room() -> Result<Room> {
-    let refuse = |why: String| Fault::Device {
+    reader()?.read()
+}
+
+/// A reader of the host's room: what lmkd defends past `MemAvailable` is
+/// read once, when it is made; each reading after takes only
+/// `/proc/meminfo`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug)]
+pub struct Reader {
+    defended: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn refuse(why: String) -> Fault {
+    Fault::Device {
         call: "reading the host's memory for the load's capacity",
         why,
-    };
-    let read =
-        |path: &str| std::fs::read_to_string(path).map_err(|e| refuse(format!("{path}: {e}")));
-    let meminfo = read("/proc/meminfo")?;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| refuse(format!("{path}: {e}")))
+}
+
+/// Makes a [`Reader`], reading the low-memory killer's line once.
+///
+/// # Errors
+///
+/// Refuses by name when a reading the rule needs cannot be taken.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn reader() -> Result<Reader> {
     // SAFETY: `sysconf` reads a constant of the running system.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page = u64::try_from(page)
@@ -236,7 +280,22 @@ pub fn room() -> Result<Room> {
     };
     #[cfg(not(target_os = "android"))]
     let killer = Killer::None;
-    room_of(&meminfo, killer, page).map_err(refuse)
+    Ok(Reader {
+        defended: defended_by(killer, page).map_err(refuse)?,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Reader {
+    /// The host's room now: `/proc/meminfo`, past the line read once.
+    ///
+    /// # Errors
+    ///
+    /// Refuses by name when `/proc/meminfo` cannot be read or states no
+    /// `MemAvailable`.
+    pub fn read(&self) -> Result<Room> {
+        room_within(&read("/proc/meminfo")?, self.defended).map_err(refuse)
+    }
 }
 
 /// A system property's value, `None` where it is unset.
