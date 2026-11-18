@@ -282,40 +282,48 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
 pub const WARM_PROBE: u32 = 1024;
 
 /// The side of the warm-up's cube matmul (`side x side x side`), walked up
-/// by doubling with a real fire timed at each size (`time(side)`, ns):
+/// by doubling with a real fire timed at each size (`time(side, estimate)`,
+/// ns; `estimate` the walk's own for that fire, none for the two probes):
 /// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
 /// while its fire, estimated from the last one timed by the growth the last
 /// two measured (their time ratio, carried forward: not the flops' ratio),
-/// fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it is with no
-/// bound stated (nothing is walked then). The margin is the measurement's:
-/// no factor stands under the bound. A phone whose GPU faults a submission
-/// past its watchdog (KGSL's ~2 s) warms on a cube whose fire fits it.
+/// times `worst`, fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it
+/// is with no bound stated (nothing is walked then). `worst` starts at the
+/// caller's worst ratio of a measured time over its estimate (1 for none)
+/// and rises to each walked fire's measured time over the walk's estimate
+/// of it where that is more: the estimate's own error, measured, stands
+/// under the bound; no factor is tuned. Returns the side and the worst
+/// ratio seen. A phone whose GPU faults a submission past its watchdog
+/// warms on a cube whose fire fits it.
 pub fn warm_side<E>(
     max_submit: Option<std::time::Duration>,
-    mut time: impl FnMut(u32) -> Result<f64, E>,
-) -> Result<u32, E> {
+    mut worst: f64,
+    mut time: impl FnMut(u32, Option<f64>) -> Result<f64, E>,
+) -> Result<(u32, f64), E> {
     let Some(cap) = max_submit else {
-        return Ok(WARM_SHAPE.0);
+        return Ok((WARM_SHAPE.0, worst));
     };
     let bound = cap.as_nanos() as f64;
-    let mut before = time(WARM_PROBE / 2)?;
-    let mut last = time(WARM_PROBE)?;
+    let mut before = time(WARM_PROBE / 2, None)?;
+    let mut last = time(WARM_PROBE, None)?;
     let mut side = WARM_PROBE;
-    if last > bound {
-        return Ok(WARM_PROBE / 2);
+    if last * worst > bound {
+        return Ok((WARM_PROBE / 2, worst));
     }
     while side < WARM_SHAPE.0 {
         let growth = last / before.max(f64::MIN_POSITIVE);
-        if last * growth > bound {
+        let estimate = last * growth;
+        if estimate * worst > bound {
             break;
         }
-        let next = time(side * 2)?;
-        if next > bound {
+        let next = time(side * 2, Some(estimate))?;
+        worst = worst.max(next / estimate.max(f64::MIN_POSITIVE));
+        if next * worst > bound {
             break;
         }
         (before, last, side) = (last, next, side * 2);
     }
-    Ok(side)
+    Ok((side, worst))
 }
 
 /// The bytes an attention of `shape` moves at least: its queries read and
@@ -1175,19 +1183,19 @@ mod tests {
         // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
         let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
         let mut timed = Vec::new();
-        let side = warm_side(kgsl, |s| {
+        let (side, worst) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
             Ok::<f64, ()>(cubic(s))
         })
         .unwrap();
-        assert_eq!(side, 8192);
+        assert_eq!((side, worst), (8192, 1.0));
         assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
         // A device slowing past the flops' growth (each doubling 10x, as a
         // clock sinking under its power cap): 4096^3 at 300 ms, the next
         // estimated at 3 s, past the bound: it is never fired.
         let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
         let mut timed = Vec::new();
-        let side = warm_side(kgsl, |s| {
+        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
             Ok::<f64, ()>(sinking(s))
         })
@@ -1195,12 +1203,33 @@ mod tests {
         assert_eq!(side, 4096);
         assert_eq!(timed, vec![512, 1024, 2048, 4096]);
         // No bound stated: the widest, nothing timed.
-        let side = warm_side(None, |_| -> Result<f64, ()> {
+        let side = warm_side(None, 1.0, |_, _| -> Result<f64, ()> {
             panic!("timed with no bound")
         });
-        assert_eq!(side, Ok(WARM_SHAPE.0));
+        assert_eq!(side, Ok((WARM_SHAPE.0, 1.0)));
         // The probe itself past the bound: the cube under it.
-        assert_eq!(warm_side(kgsl, |_| Ok::<f64, ()>(3e9)), Ok(WARM_PROBE / 2));
+        assert_eq!(
+            warm_side(kgsl, 1.0, |_, _| Ok::<f64, ()>(3e9)),
+            Ok((WARM_PROBE / 2, 1.0))
+        );
+        // The walk's own estimate low by 1.3x at 4096 (its fire 1.3x the
+        // growth's): the worst ratio seen is 1.3, and 8192, estimated from
+        // 4096's growth, stands past a 1.5 s bound under it: never fired.
+        let mut timed = Vec::new();
+        let lagging = |side: u32| match side {
+            512 => 0.29e6,
+            1024 => 2.34e6,
+            2048 => 18.75e6,
+            _ => 150e6 * 1.3,
+        };
+        let (side, worst) = warm_side(Some(std::time::Duration::from_millis(1500)), 1.0, |s, _| {
+            timed.push(s);
+            Ok::<f64, ()>(lagging(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert!((worst - 1.3).abs() < 0.01, "{worst}");
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
     }
 
     /// The attention curve's keys are where its shape is compute-bound on
