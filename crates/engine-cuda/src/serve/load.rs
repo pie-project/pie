@@ -1659,9 +1659,9 @@ impl Shell {
                 .arena
                 .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
         }
-        // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::fire_facts`):
-        // nothing is held for them here.
+        // A program's fires lay their tables and scratch in its pairs'
+        // state, which the runtime takes in `Instance` slots at bind
+        // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like

@@ -6,11 +6,13 @@ use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, SlotRole};
 use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
+use engine::{GuestState, ScratchPlace};
 
 /// Slots of one role's shape, handed out from one chunk upward.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
     per_chunk: u32,
+    slot_bytes: u64,
     next: u32,
 }
 
@@ -23,6 +25,7 @@ impl Shape {
             .expect("the load states the guest shapes");
         Shape {
             per_chunk: shape.slots_per_chunk,
+            slot_bytes: shape.slot_bytes,
             next: chunk * shape.slots_per_chunk,
         }
     }
@@ -39,11 +42,19 @@ impl Shape {
     }
 }
 
-/// The two guest shapes, each in a chunk of its own.
-#[derive(Debug, Clone, Copy)]
+/// The two guest shapes, each in a chunk of its own, and the chunks past
+/// them, whole, for the guest state that lies in runs of chunks.
+#[derive(Debug, Clone)]
 pub struct Guest {
     instance: Shape,
     channel: Shape,
+    /// The next whole chunk, and the chunks backed, of `chunk_bytes`.
+    chunk: u32,
+    chunk_bytes: u64,
+    committed: u32,
+    /// Each pair's state, taken at its first bind ([`Guest::pair`]).
+    /// Keyed by the pair's program and extents, as written.
+    pairs: Vec<(String, ScratchPlace)>,
 }
 
 impl Guest {
@@ -59,9 +70,13 @@ impl Guest {
         );
         Guest {
             // The middle of what is backed: a test's own state sits in the
-            // first chunks, and a fire lays its programs in the last.
+            // first chunks, and the pairs' runs of chunks in the last.
             instance: Shape::of(facts, SlotRole::Instance, committed / 2 + 1),
             channel: Shape::of(facts, SlotRole::Channel, committed / 2),
+            chunk: committed / 2 + 2,
+            chunk_bytes: facts.chunk_bytes,
+            committed,
+            pairs: Vec::new(),
         }
     }
 
@@ -108,8 +123,61 @@ impl Guest {
         (instance, rings)
     }
 
-    /// Binds `binding` over the slots its program's facts state; every
-    /// channel it names is a registered one.
+    /// Where a bind of `pair` with guest state `state` finds its own
+    /// scratch and its pair's, as the runtime takes them (`store::roles`):
+    /// each a run of `Instance` slots where two of its size share a chunk,
+    /// else runs of `state.run` adjacent chunks; the instance's fresh, the
+    /// pair's taken at its first bind and named the same after.
+    pub fn places(
+        &mut self,
+        pair: (engine::ProgramId, impl std::fmt::Debug),
+        state: &GuestState,
+    ) -> (ScratchPlace, ScratchPlace) {
+        let scratch = self.take_state(state.per_instance, state);
+        let pair = format!("{pair:?}");
+        if let Some((_, place)) = self.pairs.iter().find(|(held, _)| *held == pair) {
+            return (scratch, place.clone());
+        }
+        let place = self.take_state(state.per_pair, state);
+        self.pairs.push((pair, place.clone()));
+        (scratch, place)
+    }
+
+    fn take_state(&mut self, bytes: u64, state: &GuestState) -> ScratchPlace {
+        if bytes == 0 {
+            return ScratchPlace::None;
+        }
+        let shape = &self.instance;
+        let slots = u32::try_from(bytes.div_ceil(shape.slot_bytes)).expect("slots count");
+        if slots * 2 <= shape.per_chunk {
+            let first = self.instance.next;
+            self.instance.take(&Footprint {
+                slots,
+                ..Footprint::default()
+            });
+            return ScratchPlace::Run { first, slots };
+        }
+        let run = state.chunks_a_piece();
+        let piece = u64::from(run) * self.chunk_bytes;
+        let pieces = (0..bytes.div_ceil(piece))
+            .map(|_| {
+                let first = self.chunk;
+                self.chunk += run;
+                assert!(
+                    self.chunk <= self.committed,
+                    "a test's guest state of {bytes} bytes lies in runs of {run} chunks \
+                     past the {} backed",
+                    self.committed
+                );
+                first
+            })
+            .collect();
+        ScratchPlace::Chunks { run, pieces }
+    }
+
+    /// Binds `binding` over the slots its program's facts state, its pair's
+    /// state where its guest state says; every channel it names is a
+    /// registered one.
     pub fn bind(&mut self, engine: &mut dyn Engine, binding: InstanceBinding) -> BoundInstance {
         let facts = engine
             .program_facts(binding.program)
@@ -117,10 +185,16 @@ impl Guest {
         let named: Vec<ChannelId> = binding.channels.clone();
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
+        let state = engine
+            .guest_state(binding.program, &binding.extents)
+            .expect("the program's guest state");
+        let (scratch, pair) = self.places((binding.program, binding.extents), &state);
         engine
             .bind_instance(&InstanceBinding {
                 instance_slots,
                 ring_slots,
+                scratch,
+                pair,
                 ..binding
             })
             .expect("the instance binds")
@@ -147,18 +221,22 @@ pub fn alone_slots(
                 slots: Vec::new(),
             })
             .collect(),
+        scratch: ScratchPlace::None,
+        pair: ScratchPlace::None,
     }
 }
 
 /// A guest item of a plane with no pool: a buffer of its own, the test
 /// process's until it ends.
-pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64> {
+pub fn alone_span(_: engine_cuda::program::Item<'_>, bytes: u64) -> engine_cuda::Result<u64> {
     let buffer = engine_cuda::device::Buffer::zeroed(bytes as usize)?;
     Ok(Box::leak(Box::new(buffer)).ptr())
 }
 
-/// A plane with no pool: its fires lay their programs' tables and scratch
-/// in a buffer of its own, the test process's until it ends.
+/// A plane with no pool: each pair's tables and each instance's scratch lie
+/// in a buffer of their own as long as the plane states them
+/// ([`alone_span`], `ProgramPlane::pair_room`), the test process's until it
+/// ends.
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
     alone_plane_fenced().0
 }
@@ -166,16 +244,15 @@ pub fn alone_plane() -> engine_cuda::ProgramPlane {
 /// [`alone_plane`], and the fence past its lane arenas: a zeroed run as long
 /// as they are, right after them, that no launch of the plane's writes.
 pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
-    const SPAN: usize = 256 << 20;
-    let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
-    let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
-    plane.set_span((end, SPAN as u64));
     // The flight and the lane arenas a load lays: the widest flight a
     // power of two of the device's units, its samplers' arenas beside.
     use engine_cuda::program::launch::{Arenas, device_units};
     let units = device_units().max(1);
     plane.set_flight(1 << units.ilog2());
+    // The most lanes a test's fire carries: one a unit, the widest a lane
+    // sampler's test flies.
+    plane.set_fire_lanes(units);
     let bytes = Arenas::bytes_for(plane.flight(), units);
     let arenas = engine_cuda::device::Buffer::zeroed(2 * bytes as usize).expect("the lane arenas");
     let arenas: &'static engine_cuda::device::Buffer = Box::leak(Box::new(arenas));
@@ -190,20 +267,6 @@ pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
             at: bytes,
         },
     )
-}
-
-/// Backs `plane`'s staged fire with a span of its own as long as the fire
-/// states it lays ([`engine_cuda::ProgramPlane::staged_bytes`], the figure
-/// a short span refuses it by), where the span it has is shorter: a fire of
-/// one lane a unit lays more on a device of more units.
-pub fn fit_span(plane: &mut engine_cuda::ProgramPlane) {
-    let need = plane.staged_bytes().expect("the staged fire's bytes");
-    if need <= plane.span().1 {
-        return;
-    }
-    let buffer = engine_cuda::device::Buffer::zeroed(need as usize).expect("the span's buffer");
-    let end = Box::leak(Box::new(buffer)).ptr() + need;
-    plane.set_span((end, need));
 }
 
 /// The run past a plane's lane arenas ([`alone_plane_fenced`]).

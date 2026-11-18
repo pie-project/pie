@@ -653,7 +653,7 @@ pub struct Cursor {
 }
 #[derive(Debug)]
 pub struct Prepared {
-    /// Where this stage's tables and scratch lie in the fire's span, laid
+    /// Where this stage's tables and scratch lie in its pair's state, laid
     /// by [`Prepared::lay`]: each an address in it.
     table: u64,
     table_host: Vec<u8>,
@@ -664,7 +664,6 @@ pub struct Prepared {
     params_host: Vec<u8>,
     offsets: u64,
     offsets_host: Vec<u8>,
-    scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
     /// offsets), pending flags, row tables and lane scratch table, one span
     /// staged in one copy a commit (`cell_at` their offsets, `cells_host`
@@ -707,12 +706,23 @@ pub struct Prepared {
     bindings: Vec<u32>,
 }
 
-/// What every span of a stage starts a whole number of in the fire's span.
-const SPAN_ALIGN: u64 = 256;
+/// What every span of a stage starts a whole number of in its pair's state.
+pub const SPAN_ALIGN: u64 = 256;
 
-/// The spans a stage lays: its params, offsets, table, descriptors, scratch
-/// and cells.
-const SPANS: u64 = 6;
+/// The spans a stage lays: its params, offsets, table, descriptors and
+/// cells.
+const SPANS: u64 = 5;
+
+/// The value scratch a lane of stages whose widest lane scratch is
+/// `stride` bytes holds: one region every stage's lane lies at. A program's
+/// stages run one after another on one stream, each over values it writes
+/// before it reads them, and none reads another's scratch: what passes
+/// between stages passes through channels. So the stages share one
+/// region, as wide as the widest, and none lays its own.
+#[must_use]
+pub fn lane_scratch(stride: u64) -> u64 {
+    stride.max(SCRATCH_ALIGN).next_multiple_of(SPAN_ALIGN)
+}
 
 #[must_use]
 pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
@@ -960,7 +970,6 @@ impl Prepared {
             params_host: records_bytes(&records),
             offsets: 0,
             offsets_host,
-            scratch: 0,
             cells: 0,
             cell_at: [0; CELLS],
             cells_host: Vec::new(),
@@ -1001,26 +1010,33 @@ impl Prepared {
             + 6 * 16
     }
 
-    /// The bytes each lane adds: its record and channel slots, its
-    /// descriptor row, its scratch and its intrinsic and pending cells.
+    /// The bytes each lane adds to the stage's tables: its record and
+    /// channel slots, its descriptor row and its intrinsic and pending
+    /// cells. Its value scratch is its instance's ([`Prepared::scratch_stride`],
+    /// [`lane_scratch`]).
     #[must_use]
     pub fn lane_bytes(&self) -> u64 {
         let words = self.pitch as u64;
         LANE_RECORD_BYTES
             + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
             + self.descriptor_row.len().max(1) as u64
-            + u64::from(self.scratch_stride)
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
             + u64::from(self.row_words) * size_of::<u64>() as u64
             + LaneScratch::bytes(1)
     }
 
-    /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
-    /// and returns where its bytes end. `fresh`: the span was laid
-    /// otherwise since this stage last lay here, so the tables no lane
-    /// changes are staged again. Nothing is kept there between fires: a
-    /// span is the fire's.
+    /// A lane's value scratch: what the kernels step `dispatch_lane` by.
+    #[must_use]
+    pub const fn scratch_stride(&self) -> u32 {
+        self.scratch_stride
+    }
+
+    /// Lays this stage's tables for `lanes` lanes in its pair's state from
+    /// `at` up (its lanes' scratch is each one's instance's,
+    /// [`Prepared::stage_lane`]), and returns where its tables end. `fresh`: the
+    /// state moved or came back since this stage last lay there, so the
+    /// tables no lane changes are staged again.
     pub fn lay(
         &mut self,
         extents: Extents,
@@ -1031,14 +1047,6 @@ impl Prepared {
     ) -> Result<u64> {
         self.filled = 0;
         let lanes = lanes.max(1);
-        let total = u64::from(self.scratch_stride) * u64::from(lanes);
-        if total > eta_exec::SCRATCH_MAX_BYTES {
-            return Err(Fault::Ceiling {
-                what: "a wave's fused-region scratch",
-                need: total,
-                have: eta_exec::SCRATCH_MAX_BYTES,
-            });
-        }
         let mut next = at.next_multiple_of(SPAN_ALIGN);
         let mut take = |bytes: usize| {
             let here = next;
@@ -1106,10 +1114,6 @@ impl Prepared {
                 .collect();
         }
 
-        self.scratch = take(
-            (self.scratch_stride as usize * lanes as usize)
-                .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256)),
-        );
         let words = self.pitch * lanes as usize;
         self.intrinsic_bases_host.resize(words, 0u64);
         self.intrinsic_modes_host.resize(words, 0u32);
@@ -1150,7 +1154,15 @@ impl Prepared {
         Ok(next)
     }
 
-    pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
+    /// Stages the next lane: its tables' rows, and `scratch`, its
+    /// instance's value scratch, in the lane scratch table.
+    pub fn stage_lane(
+        &mut self,
+        rings: &Rings,
+        cursors: &[Cursor],
+        commit: u64,
+        scratch: u64,
+    ) -> Result<u32> {
         let lane = self.filled;
         if lane >= self.lanes {
             return Err(Fault::program(
@@ -1207,17 +1219,8 @@ impl Prepared {
         self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
         let words = self.row_words as usize;
         self.row_pointers_host[lane as usize * words..(lane as usize + 1) * words].fill(0);
-        // The lane's scratch: the fire's span holds the lanes' scratch
-        // `scratch_stride` apart, lane `l`'s from the `l`-th. A build with
-        // `test-lane-scatter` seats them last lane first, so a kernel that
-        // finds a lane's scratch other than by its own base answers wrongly.
-        let place = if cfg!(feature = "test-lane-scatter") {
-            self.lanes - 1 - lane
-        } else {
-            lane
-        };
-        self.lane_scratch_host[lane as usize] =
-            self.scratch + u64::from(place) * u64::from(self.scratch_stride);
+        // The lane's scratch: its instance's own, where it lies now.
+        self.lane_scratch_host[lane as usize] = scratch;
         self.filled += 1;
         Ok(lane)
     }
@@ -1441,16 +1444,6 @@ impl Prepared {
     }
 
     #[must_use]
-    pub fn lane_ceiling(&self) -> u32 {
-        if self.scratch_stride == 0 {
-            return u32::MAX;
-        }
-        u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
-            .unwrap_or(u32::MAX)
-            .max(1)
-    }
-
-    #[must_use]
     pub const fn filled(&self) -> u32 {
         self.filled
     }
@@ -1595,30 +1588,25 @@ impl Prepared {
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
-            // Every place a lane's scratch is seated at
-            // ([`Prepared::stage_lane`]).
-            let places = if cfg!(feature = "test-lane-scatter") {
-                self.lanes
-            } else {
-                self.filled
-            };
-            // SAFETY: the scratch holds `lanes` places `scratch_stride`
-            // apart, each no shorter than its dummy bytes.
-            let code = unsafe {
-                dr::cuMemsetD2D32Async(
-                    self.scratch,
-                    self.scratch_stride as usize,
-                    SCRATCH_POISON,
-                    (SCRATCH_DUMMY_BYTES / 4) as usize,
-                    places as usize,
-                    stream.cast(),
-                )
-            };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                return Err(Fault::Device {
-                    call: "cuMemsetD2D32Async",
-                    code: code as i32,
-                });
+            for &scratch in &self.lane_scratch_host[..self.filled as usize] {
+                // SAFETY: each lane's scratch, its instance's, is no shorter
+                // than its dummy bytes.
+                let code = unsafe {
+                    dr::cuMemsetD2D32Async(
+                        scratch,
+                        SCRATCH_DUMMY_BYTES as usize,
+                        SCRATCH_POISON,
+                        (SCRATCH_DUMMY_BYTES / 4) as usize,
+                        1,
+                        stream.cast(),
+                    )
+                };
+                if code != dr::CUresult::CUDA_SUCCESS {
+                    return Err(Fault::Device {
+                        call: "cuMemsetD2D32Async",
+                        code: code as i32,
+                    });
+                }
             }
         }
         #[cfg(not(feature = "device"))]
@@ -1979,6 +1967,33 @@ mod tests {
     /// the temporary area's share of it; and what it was while the rows a
     /// scan of the model's row leaves unwritten, and the reshapes read as
     /// their sources, held bytes.
+    /// A program's stages share one lane scratch region, as wide as the
+    /// widest stage's: they run one after another on one stream and none
+    /// reads another's scratch, so a lane holds the widest, never the sum.
+    #[test]
+    fn a_lanes_stages_share_one_scratch_region() {
+        let vocab = shipped::QWEN_VOCAB;
+        let stages: Vec<Option<Prepared>> = shipped::all(vocab)
+            .iter()
+            .map(|(_, traced)| {
+                let package = shipped::package(traced, vocab);
+                let shapes: Vec<ChannelShape> =
+                    package.channels.iter().map(ChannelShape::of).collect();
+                Some(Prepared::build(&package.plans[0], &shapes, Extents::default()).expect("builds"))
+            })
+            .collect();
+        let strides: Vec<u64> = stages
+            .iter()
+            .flatten()
+            .map(|stage| u64::from(stage.scratch_stride()))
+            .collect();
+        let widest = *strides.iter().max().expect("a stage");
+        assert!(strides.iter().sum::<u64>() > widest, "{strides:?}");
+        let bytes = crate::program::fire_bytes(&stages, 128);
+        assert_eq!(bytes.scratch, widest, "{strides:?}");
+        assert!(lane_scratch(bytes.scratch) >= widest);
+    }
+
     #[test]
     fn a_shipped_programs_scratch_a_lane() {
         const WAS: [u64; 6] = [

@@ -748,15 +748,15 @@ impl Engine for Rank {
         Ok(crate::api::readout_facts())
     }
 
-    fn fire_facts(
+    fn guest_state(
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
-    ) -> EngineResult<engine::program::FireFacts> {
+    ) -> EngineResult<engine::GuestState> {
         match self.group.ranks[self.rank].try_lock().ok() {
-            Some(rank) => rank.fire_facts(program, extents),
+            Some(rank) => rank.guest_state(program, extents),
             None => Err(Error::Program(
-                "a rank is busy: a program's fire facts are asked between frames".to_string(),
+                "a rank is busy: a program's guest state is asked between frames".to_string(),
             )),
         }
     }
