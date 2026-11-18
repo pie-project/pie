@@ -1242,6 +1242,23 @@ impl Roles {
         (pair, state): (FireKey, GuestState),
         heads: bool,
     ) -> Result<GuestTaken, RolesError> {
+        // What segregating runs by length holds back: each class's partly
+        // filled Instance chunks and their free bytes, at debug.
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && let Ok(shape) = self.shape(SlotRole::Instance)
+        {
+            let device = self.device.lock().unwrap();
+            let classes: Vec<(u32, usize, u64)> = device
+                .pool()
+                .partial_classes(shape.pool)
+                .into_iter()
+                .map(|(class, chunks, free)| (class, chunks, free * shape.slot_bytes))
+                .collect();
+            tracing::debug!(
+                ?classes,
+                "Instance chunks partly filled, by class: (run length, chunks, free bytes)"
+            );
+        }
         for &id in channels {
             if let Some(item) = self.items.get(&Owner::Channel(id))
                 && item.tier != Tier::Device
