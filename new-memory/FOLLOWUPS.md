@@ -128,3 +128,14 @@ against ~0.64 GiB during a run on the M1 Max), so the capacity comes out ~22.4
 GiB where 24 GiB was measured safe. Read the cache component apart (or at a
 settled point), never adjust it by a factor.
 
+## F17. wgpu binds every step binding read_write
+
+A pool segment holds a stage heap beside the tables and config a guest pass
+reads, and a WebGPU usage scope can't see one buffer two ways, so engine-wgpu
+rewrites each step module's table and config declarations to read_write storage
+(sc/gpu-guest-state e40261348). Measured against the last wgpu build that served
+guests (2d52e0715), ABBA ×3 medians, on the L40S: greedy −0.9% / +0.3% and top-p
+−1.8% / +0.1% at 1 / 8 lanes; on this box: +1.3% / +1.7% and +11.6% / +1.9%,
+all inside the round-to-round spread: a dead heat. If a device shows a cost, the
+first lever is the config in a uniform buffer of its own, outside the segment.
+
