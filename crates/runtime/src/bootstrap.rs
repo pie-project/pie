@@ -944,18 +944,40 @@ fn init_tracing(
     Ok(())
 }
 
+/// Crates whose own debug output buries the runtime's, quieted under a level
+/// given as one word: naga's WGSL frontend writes ~880k lines at `debug`
+/// while a load builds its pipelines, and tarpc writes seven per gateway
+/// heartbeat. A level that names either target keeps its own say.
+const QUIET: [(&str, &str); 2] = [("naga", "warn"), ("tarpc", "info")];
+
+/// The tracing filter for `level`: `RUST_LOG` when it is set, as it says;
+/// otherwise `level` with [`QUIET`]'s targets held down.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(quieted(level)))
+}
+
+/// `level` with a directive for each [`QUIET`] target it does not name.
+fn quieted(level: &str) -> String {
+    QUIET
+        .iter()
+        .filter(|(target, _)| !level.contains(target))
+        .fold(level.to_owned(), |filter, (target, at)| {
+            format!("{filter},{target}={at}")
+        })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn init_tracing(
     log_dir: Option<&Path>,
     verbose: bool,
     telemetry_config: &TelemetryConfig,
 ) -> Result<()> {
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
 
-    let default_level = if verbose { "debug" } else { "info" };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter = log_filter(if verbose { "debug" } else { "info" });
 
     let file_layer = if let Some(dir) = log_dir {
         fs::create_dir_all(dir)
@@ -993,8 +1015,18 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::seat_cap;
+    use super::{quieted, seat_cap};
     use crate::model::RsCaps;
+
+    #[test]
+    fn a_one_word_level_quiets_naga_and_tarpc_and_a_named_target_keeps_its_say() {
+        assert_eq!(quieted("debug"), "debug,naga=warn,tarpc=info");
+        assert_eq!(quieted("info"), "info,naga=warn,tarpc=info");
+        assert_eq!(quieted("debug,naga=trace"), "debug,naga=trace,tarpc=info");
+        for filter in ["debug", "info", "debug,naga=trace"] {
+            assert!(tracing_subscriber::EnvFilter::try_new(quieted(filter)).is_ok());
+        }
+    }
 
     /// What bootstrap reads of a load's chunk facts for the model's
     /// recurrent state: whether it holds any, and its RsCaps.
