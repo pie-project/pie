@@ -12,7 +12,7 @@ use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
-use super::{Growth, PoolTarget, Retarget, Signal};
+use super::{Growth, Mapped, PoolTarget, Retarget, Signal};
 
 /// Today's pools of one engine, and the slots its weight shapes take; or
 /// the shared pool an engine that states one runs on, the weight shapes'
@@ -147,6 +147,10 @@ impl PoolTarget for EnginePool {
 
     fn held(&self) -> u64 {
         self.target().map_or(0, PoolTarget::held)
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.target().map_or_else(Mapped::default, PoolTarget::mapped)
     }
 
     fn growth(&self) -> Growth {
@@ -295,6 +299,10 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
 
     fn held(&self) -> u64 {
         self.0.lock().held()
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.0.lock().mapped()
     }
 
     fn growth(&self) -> Growth {

@@ -2055,6 +2055,16 @@ impl SharedPool {
         self.pool.segments().mapped_segments()
     }
 
+    /// Mapped segments an evacuation drained, waiting on the fire that
+    /// carries its copy to retire.
+    #[must_use]
+    pub fn draining_segments(&self) -> u32 {
+        let segments = self.pool.segments();
+        (0..segments.count())
+            .filter(|&s| matches!(segments.state(s), SegmentState::Draining { .. }))
+            .count() as u32
+    }
+
     /// The next step toward `target` mapped segments, the top span counted;
     /// `None` once there. A grow commits the lowest uncommitted segment, the
     /// commit ahead of need included; a shrink evacuates the highest

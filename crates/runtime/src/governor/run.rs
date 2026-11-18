@@ -1,7 +1,7 @@
 //! The loop, on a pool: read the system, move the target.
 
 use super::steered::{self, Shared, Steered};
-use super::{Governor, Growth, Limits, PoolTarget, Reader, Retarget, Signal, TICK, Yield};
+use super::{Governor, Growth, Limits, Mapped, PoolTarget, Reader, Retarget, Signal, TICK, Yield};
 
 /// Steers `pool`, an engine's: one that does not yield, or cannot move,
 /// keeps its size, but its loop still ticks, since the weight cache in
@@ -426,6 +426,8 @@ impl Steer {
             pool.ticked();
             return Turn {
                 target: self.governor.target(),
+                segments: within(self.governor.limits(), self.governor.target()),
+                mapped: pool.mapped(),
                 answer: Retarget::Reached,
             };
         }
@@ -445,6 +447,7 @@ impl Steer {
         let limits = *self.governor.limits();
         let segments = within(&limits, target);
         let answer = pool.retarget(segments);
+        let mapped = pool.mapped();
         match answer {
             Retarget::Reached => {
                 if self.short.take().is_some() {
@@ -456,7 +459,10 @@ impl Steer {
                     tracing::info!(
                         held_mib = held.saturating_mul(limits.segment_bytes) >> 20,
                         target_mib = segments.saturating_mul(limits.segment_bytes) >> 20,
-                        "the pool holds more than its target and has no room to evacuate into: the rest is live; tier pressure to the policy"
+                        held_segments = held,
+                        target_segments = segments,
+                        draining_segments = mapped.draining,
+                        "the pool maps more than its target and cannot give the rest back yet: state with no room to evacuate into, or drained segments waiting on their fire; tier pressure to the policy"
                     );
                 }
                 if self.short != Some(held) {
@@ -474,7 +480,12 @@ impl Steer {
         }
         self.note_limit(held, &limits);
         pool.ticked();
-        Turn { target, answer }
+        Turn {
+            target,
+            segments,
+            mapped,
+            answer,
+        }
     }
 }
 
@@ -482,6 +493,10 @@ impl Steer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
     pub target: u64,
+    /// The target in the pool's segments, what it was asked.
+    pub segments: u64,
+    /// What the pool mapped once asked: what its answer was judged on.
+    pub mapped: Mapped,
     pub answer: Retarget,
 }
 
@@ -532,7 +547,8 @@ async fn watch(
             steered::signal(engine, signal);
         });
         // Once per read that reached the source: its own value, the reading,
-        // and what the pool made of the target.
+        // and what the pool made of the target, with the segments its answer
+        // was judged on.
         if let Some(raw) = system.as_mut().and_then(Reader::take_fresh) {
             tracing::debug!(
                 engine,
@@ -540,6 +556,9 @@ async fn watch(
                 pressure,
                 target_mib = turn.target >> 20,
                 held_mib = held >> 20,
+                target_segments = turn.segments,
+                mapped_segments = turn.mapped.segments,
+                draining_segments = turn.mapped.draining,
                 answer = ?turn.answer,
                 "pressure read"
             );

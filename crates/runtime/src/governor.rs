@@ -172,14 +172,29 @@ pub enum Growth {
     Elastic,
 }
 
-/// What a pool made of a retarget.
+/// What a pool made of a retarget, judged on what it maps
+/// ([`PoolTarget::mapped`]) against the segments asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retarget {
-    /// It holds the segments asked for, or is on its way there.
+    /// It maps no more than the segments asked (a grow may still be on its
+    /// way).
     Reached,
-    /// A shrink found no room to evacuate its emptiest segment into: it
-    /// keeps `held` segments, and nothing it holds was dropped.
+    /// It maps `held` segments, more than asked, and could not give the
+    /// rest back yet: state no evacuation has room for, idle cache among
+    /// it, or a drained segment its fire has not retired. Nothing it holds
+    /// was dropped; the policy's tier pressure sheds idle cache for the
+    /// difference.
     NoRoom { held: u64 },
+}
+
+/// What a pool maps: the measure its [`Retarget`] answer is judged on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mapped {
+    /// Segments with memory under them.
+    pub segments: u64,
+    /// Of those, the ones an evacuation drained, waiting on the fire that
+    /// carries its copy to retire before they go.
+    pub draining: u64,
 }
 
 /// The pool a governor steers: it takes a number of segments; how they
@@ -195,9 +210,19 @@ pub trait PoolTarget {
     fn hard_limit(&self) -> u64;
     /// What the pool holds now, in bytes.
     fn held(&self) -> u64;
+    /// What the pool maps now, in segments: [`Self::held`]'s, where it
+    /// names no draining segments of its own.
+    fn mapped(&self) -> Mapped {
+        Mapped {
+            segments: self.held().div_ceil(self.segment_bytes().max(1)),
+            draining: 0,
+        }
+    }
     fn growth(&self) -> Growth;
     /// Moves the pool toward `segments`. A shrink evacuates the emptiest
     /// segment and then releases it, and stops where there is no room.
+    /// [`Retarget::Reached`] only where it maps no more than `segments`
+    /// ([`Self::mapped`]); short of that, [`Retarget::NoRoom`].
     fn retarget(&mut self, segments: u64) -> Retarget;
     /// Whether the system refused memory since this last asked: the system
     /// saying it can give no more, read as pressure 1.
