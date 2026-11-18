@@ -20,8 +20,8 @@
 //! under the micro's narrow banks).
 //!
 //! The fusions are turned off as a user turns them off, by a `[fuse]` file
-//! in the profile directory the load resolves; the walk is eager
-//! (`engine.graphs = "off"`) so each fire's count is that fire's alone.
+//! in the profile directory the load resolves; the walk is eager (a test's
+//! `Knobs::pin`) so each fire's count is that fire's alone.
 
 use std::path::{Path, PathBuf};
 
@@ -207,7 +207,7 @@ fn logits(
             std::fs::write(
                 &user,
                 format!(
-                    "api = 1\n\n[engine]\ngraphs = \"off\"\n\n[fuse]\nmatmul_moe_route = {}\n\
+                    "api = 1\n\n[fuse]\nmatmul_moe_route = {}\n\
                      moe_mega = {}\n",
                     flags.router, flags.mega
                 ),
@@ -215,13 +215,15 @@ fn logits(
             .expect("the user profile");
             Knobs {
                 profiles: Some(profiles.to_path_buf()),
+                pin: Some((engine_cuda::Graphs::Off, None)),
                 ..Knobs::default()
             }
         }
         Tuning::Defaults => Knobs {
             chip: Some(engine_cuda::chip::profile(
-                "[engine]\ngraphs = \"off\"\n[fuse]\nmatmul_moe_route = false\nmoe_mega = false\n",
+                "[fuse]\nmatmul_moe_route = false\nmoe_mega = false\n",
             )),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..Knobs::default()
         },
     };
@@ -240,7 +242,7 @@ fn logits(
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

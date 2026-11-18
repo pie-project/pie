@@ -86,7 +86,7 @@ pub fn pieces(
         // The lane's own record: each fixed shape's pieces it writes.
         let mut own = Vec::with_capacity(records.len());
         for &shape in records {
-            let Some((_, run_cow)) = lane.fixed.iter().find(|(id, _)| *id == shape) else {
+            let Some((_, run_cow)) = lane.record.pieces().iter().find(|(id, _)| *id == shape) else {
                 return Err(refuse(
                     at,
                     &format!("names no record of fixed shape {shape}"),
@@ -186,9 +186,11 @@ fn cut(lane: &Lane, from: u32, to: u32, bits: Bits) -> Lane {
             piece.rs_reset = RsReset::Held;
         }
         // The record is the copy the first piece wrote: in place from here.
-        for (_, pairs) in &mut piece.fixed {
-            for pair in pairs.iter_mut() {
-                *pair = [pair[1], pair[1]];
+        if let engine::fire::LaneRecord::Pieces(pieces) = &mut piece.record {
+            for (_, pairs) in pieces {
+                for pair in pairs.iter_mut() {
+                    *pair = [pair[1], pair[1]];
+                }
             }
         }
         // Slot copies run once, before the first piece reads or writes.

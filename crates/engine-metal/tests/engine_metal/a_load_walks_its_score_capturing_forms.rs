@@ -13,6 +13,7 @@ use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
 
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
+use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, reader};
 
 fn load(fixture: &Fixture) -> Shell {
     Shell::load(Boot {
@@ -61,24 +62,37 @@ fn a_load_walks_its_score_capturing_forms() {
     };
     let tokens: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     shell.open(0).expect("a slot opens");
+    // A capturing lane's rows are its reader's: readers bound after ready,
+    // at the prompt's rows and at one.
+    let program = shell
+        .register_program(&reader(1024))
+        .expect("the reader registers");
+    let (prompt_reader, ..) = bind_reader(&mut shell, program, tokens.len() as u32, 1);
+    let (decode_reader, ..) = bind_reader(&mut shell, program, 1, 2);
     shell
-        .fire_seated(&[Seated {
-            held: Some(0),
-            ..Seated::of(Lane {
-                slot: 0,
-                word: scores(tokens.len() as u32),
-                tokens: &tokens,
-            })
-        }])
+        .fire_attached(
+            &[Seated {
+                held: Some(0),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: scores(tokens.len() as u32),
+                    tokens: &tokens,
+                })
+            }],
+            &[at_lane(0, prompt_reader)],
+        )
         .expect("a prompt capturing its scores is served after the sealed walk");
     shell
-        .fire_seated(&[Seated {
-            held: Some(tokens.len() as u32),
-            ..Seated::of(Lane {
-                slot: 0,
-                word: scores(1),
-                tokens: &[5],
-            })
-        }])
+        .fire_attached(
+            &[Seated {
+                held: Some(tokens.len() as u32),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: scores(1),
+                    tokens: &[5],
+                })
+            }],
+            &[at_lane(0, decode_reader)],
+        )
         .expect("a decode capturing its scores is served after the sealed walk");
 }

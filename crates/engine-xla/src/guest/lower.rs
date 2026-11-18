@@ -3,7 +3,7 @@
 //!
 //! Every eta value of shape `S` becomes a tensor `[B, S...]`: lane `b` of the
 //! batch is one instance's pass. The semantics are the host interpreter's
-//! (`eta_exec::eval_op`), op by op; where the interpreter is exact (integer
+//! (`eta_compiler::eval::interp::eval_op`), op by op; where the interpreter is exact (integer
 //! arithmetic, comparisons, argmax, orderings and their ties, masks, the
 //! uniform draw's bits) so is this, and float math agrees within rounding.
 //!
@@ -121,6 +121,99 @@ impl Layout {
     pub fn pooled(&self) -> bool {
         !self.carried.is_empty()
     }
+}
+
+/// The pool's rows `ids` (an i32 vector) as a gather and a scatter keep
+/// them: two indices at least. A single row XLA turns into a `[1, 128]`
+/// `dynamic-slice` (or `dynamic-update-slice`) of the pool, which it may lay
+/// out column-major, and those take the pool in their result's layout: the
+/// whole pool copied, and copied again where XLA rematerializes it, to touch
+/// one lane's row, past the HBM a large pool leaves (gumbel_watermark's
+/// stage asked 48 GB of a 31 GB chip). A gather's or a scatter's operand
+/// keeps its own layout. One row is read, or written, twice.
+fn pool_ids(f: &mut Func, ids: Val) -> Lowering<(Val, bool)> {
+    if f.dims(ids)[0] != 1 {
+        return Ok((ids, false));
+    }
+    Ok((f.concat(&[ids, ids], 0)?, true))
+}
+
+/// The pool's rows `ids` (an i32 vector), `[n, 128]` (`pool_ids`).
+fn pool_rows_read(f: &mut Func, pool: Val, ids: Val) -> Lowering<Val> {
+    let (ids, twice) = pool_ids(f, ids)?;
+    let rows = f.take_rows(pool, ids)?;
+    if !twice {
+        return Ok(rows);
+    }
+    Ok(f.slice(rows, &[0, 0], &[1, 128], &[1, 1])?)
+}
+
+/// The pool with `rows` (`[n, 128]`) over its rows `ids` (`pool_ids`); an
+/// id off the pool writes nothing.
+fn pool_rows_write(f: &mut Func, pool: Val, ids: Val, rows: Val) -> Lowering<Val> {
+    let (ids, twice) = pool_ids(f, ids)?;
+    let rows = if twice {
+        f.concat(&[rows, rows], 0)?
+    } else {
+        rows
+    };
+    Ok(f.put_rows(pool, ids, rows, kernels_xla::hlo::Combine::Set)?)
+}
+
+/// `a / b` and `a % b`, elementwise, truncating (Rust's `/` and `%`), for a
+/// nonzero `b`: u32, or i32 by its magnitudes (`i32::MIN / -1` wraps to
+/// `i32::MIN`, `% -1` is 0). Restoring long division over the 32 bits in
+/// shifts, compares and subtracts, exact for every u32: the remainder's top
+/// bit stands in for the 33rd bit its shift would carry.
+fn int_divrem(f: &mut Func, a: Val, b: Val, signed: bool) -> Lowering<(Val, Val)> {
+    let dims = f.dims(a).to_vec();
+    let (ua, ub) = if signed {
+        let zero = f.const_i(Elem::I32, 0, &dims);
+        let magnitude = |f: &mut Func, x: Val| -> Lowering<Val> {
+            let negative = f.compare(Cmp::Lt, x, zero)?;
+            let flipped = f.sub(zero, x)?;
+            let m = f.select(negative, flipped, x)?;
+            Ok(f.bitcast(m, Elem::U32)?)
+        };
+        (magnitude(f, a)?, magnitude(f, b)?)
+    } else {
+        (a, b)
+    };
+    let zero = f.const_i(Elem::U32, 0, &dims);
+    let one = f.const_i(Elem::U32, 1, &dims);
+    let top = f.const_i(Elem::U32, 31, &dims);
+    let mut q = zero;
+    let mut r = zero;
+    for bit in (0..32).rev() {
+        let at = f.const_i(Elem::U32, bit, &dims);
+        let next = f.shr(ua, at)?;
+        let next = f.and(next, one)?;
+        let carried = f.shr(r, top)?;
+        let carried = f.compare(Cmp::Ne, carried, zero)?;
+        let shifted = f.shl(r, one)?;
+        let shifted = f.or(shifted, next)?;
+        let fits = f.compare(Cmp::Ge, shifted, ub)?;
+        let take = f.or(carried, fits)?;
+        let less = f.sub(shifted, ub)?;
+        r = f.select(take, less, shifted)?;
+        let place = f.shl(one, at)?;
+        let place = f.select(take, place, zero)?;
+        q = f.or(q, place)?;
+    }
+    if !signed {
+        return Ok((q, r));
+    }
+    let zero = f.const_i(Elem::I32, 0, &dims);
+    let q = f.bitcast(q, Elem::I32)?;
+    let r = f.bitcast(r, Elem::I32)?;
+    let a_neg = f.compare(Cmp::Lt, a, zero)?;
+    let b_neg = f.compare(Cmp::Lt, b, zero)?;
+    let flip = f.xor(a_neg, b_neg)?;
+    let nq = f.sub(zero, q)?;
+    let q = f.select(flip, nq, q)?;
+    let nr = f.sub(zero, r)?;
+    let r = f.select(a_neg, nr, r)?;
+    Ok((q, r))
 }
 
 /// Pool rows (u32 `[_, 128]`) a carried cell of `words` takes.
@@ -365,6 +458,7 @@ pub fn lower(
         package,
         b: i64::from(batch.lanes.max(1)),
         env: HashMap::new(),
+        splats: HashSet::new(),
     };
     let pack = (layout.in_words > 0).then(|| {
         l.f.param(Ty::new(Elem::U32, &[l.b, layout.in_words as i64]), None)
@@ -372,10 +466,15 @@ pub fn lower(
     let planes: Vec<Val> = (layout.reads.iter())
         .map(|read| {
             let rows = i64::from(read.rows) * i64::from(read.layers.max(1));
-            Ok(l.f.param(
+            // Row-major, as a fire lands its planes: the layout XLA picks
+            // for a narrow plane (`[128, 4]`, column-major) refuses the
+            // fire's buffer at the stage's run.
+            let p = l.f.param(
                 Ty::new(elem(read.dtype)?, &[rows, i64::from(read.width)]),
                 None,
-            ))
+            );
+            l.f.pin_row_major(p);
+            Ok(p)
         })
         .collect::<Lowering<_>>()?;
     // The pool, last: aliased to the last result.
@@ -408,7 +507,7 @@ pub fn lower(
         };
         let nr = cell_rows(slot.words) as i64;
         let pool = pool.expect("carried cells ride the pool");
-        let cells = l.f.take_rows(pool, cell_at[c])?;
+        let cells = pool_rows_read(&mut l.f, pool, cell_at[c])?;
         let cells = l.f.reshape(cells, &[l.b, nr * 128])?;
         let v = l.unpack(cells, 0, dtype, n)?;
         let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
@@ -422,6 +521,7 @@ pub fn lower(
         }
         let value = &package.values[id as usize];
         let v = if value.source == ValueOrigin::Const {
+            l.splats.insert(id);
             l.constant(value.dtype, value.literal_bits)?
         } else {
             let slot = *layout
@@ -483,7 +583,7 @@ pub fn lower(
                 cell
             };
             let cell = l.f.reshape(cell, &[l.b * nr, 128])?;
-            pool = l.f.put_rows(pool, cell_at[c], cell, kernels_xla::hlo::Combine::Set)?;
+            pool = pool_rows_write(&mut l.f, pool, cell_at[c], cell)?;
         }
         results.push(pool);
     }
@@ -500,6 +600,10 @@ struct Lower<'p> {
     package: &'p LaunchPackage,
     b: i64,
     env: HashMap<u32, Val>,
+    /// Values one constant fills: a constant, or a broadcast or reshape of
+    /// one. A division by one keeps XLA's divide, which it turns into a
+    /// multiply and shifts.
+    splats: HashSet<u32>,
 }
 
 impl Lower<'_> {
@@ -790,9 +894,11 @@ impl Lower<'_> {
         let r = dims.len();
         let n = dims[r - 1];
         let e = self.f.elem(x);
-        let identity = match fold {
-            Fold::Prod => self.f.const_f(e, 1.0, &[]),
-            _ => self.f.const_f(e, 0.0, &[]),
+        let one = i64::from(fold == Fold::Prod);
+        let identity = if e == Elem::F32 {
+            self.f.const_f(e, one as f64, &[])
+        } else {
+            self.f.const_i(e, one, &[])
         };
         let mut y = x;
         let mut d = 1i64;
@@ -1148,7 +1254,8 @@ impl Lower<'_> {
                 let d = dt(self, 0);
                 let a = self.arg(op, 0, &shape)?;
                 let b = self.arg(op, 1, &shape)?;
-                let y = self.arith(op.tag, d, a, b)?;
+                let constant = self.splats.contains(&op.args[1]);
+                let y = self.arith(op.tag, d, a, b, constant)?;
                 self.set(result, y)
             }
             tags::GT | tags::GE | tags::EQ | tags::NE | tags::LT | tags::LE => {
@@ -1239,10 +1346,12 @@ impl Lower<'_> {
                 self.set(result, y)
             }
             tags::CUMSUM | tags::CUMPROD => {
-                if dt(self, 0) != Dtype::F32 {
-                    // The interpreter scans in f32 and hands back f32 lanes
-                    // whatever the declared dtype: nothing to agree with.
-                    return refuse("a scan over integers");
+                // Integers scan in wrapping arithmetic, as the interpreter
+                // does (`i32::wrapping_add`, `u32::wrapping_mul`): XLA's
+                // integer add and multiply wrap, and both stay associative
+                // wrapped, so the doubling scan lands the walk's answer.
+                if dt(self, 0) == Dtype::Bool {
+                    return refuse("a scan over bools");
                 }
                 let (_, x) = self.raw_arg(op, 0)?;
                 let (x, _, _) = self.rows_of(x)?;
@@ -1257,6 +1366,9 @@ impl Lower<'_> {
             }
             tags::BROADCAST => {
                 let (id, x) = self.raw_arg(op, 0)?;
+                if self.splats.contains(&id) {
+                    self.splats.insert(result);
+                }
                 let src = self.shape(id);
                 if src.len() > shape.len() {
                     return refuse("a broadcast to a lower rank");
@@ -1281,6 +1393,9 @@ impl Lower<'_> {
                     return refuse("a kernel call that is not the identity boundary");
                 }
                 let (id, x) = self.raw_arg(op, 0)?;
+                if self.splats.contains(&id) {
+                    self.splats.insert(result);
+                }
                 if self.dtype(id) != self.dtype(result) || numel(&self.shape(id)) != numel(&shape) {
                     return refuse("a reshape that changes the count or the dtype");
                 }
@@ -1571,7 +1686,7 @@ impl Lower<'_> {
         })
     }
 
-    fn arith(&mut self, tag: u8, d: Dtype, a: Val, b: Val) -> Lowering<Val> {
+    fn arith(&mut self, tag: u8, d: Dtype, a: Val, b: Val, constant: bool) -> Lowering<Val> {
         let float = d == Dtype::F32;
         if d == Dtype::Bool {
             return refuse("arithmetic on bools");
@@ -1599,10 +1714,18 @@ impl Lower<'_> {
                 };
                 let one = self.f.like_i(b, 1);
                 let safe = self.f.select(odd, one, b)?;
-                let q = if tag == tags::DIV {
-                    self.f.div(a, safe)?
-                } else {
-                    self.f.rem(a, safe)?
+                // TPU has no integer divide: XLA's expansion of one by a
+                // varying divisor compiles ~36 s for a vocabulary-wide
+                // vector on v6e, so that divides by long division in
+                // shifts; by a constant, XLA's multiply and shifts.
+                let q = match (constant, tag == tags::DIV) {
+                    (true, true) => self.f.div(a, safe)?,
+                    (true, false) => self.f.rem(a, safe)?,
+                    (false, div) => {
+                        let (quotient, remainder) =
+                            int_divrem(&mut self.f, a, safe, d == Dtype::I32)?;
+                        if div { quotient } else { remainder }
+                    }
                 };
                 let q = match (minus, tag == tags::DIV) {
                     (Some(m), true) => {

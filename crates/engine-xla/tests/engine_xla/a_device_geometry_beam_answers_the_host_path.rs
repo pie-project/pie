@@ -151,7 +151,14 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-pub(crate) fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32) -> Lane {
+/// A lane of `tokens` on `pages` of the kv list `kv` past `held` keys.
+pub(crate) fn host_lane(
+    kv: engine::chunk::ShapeId,
+    slot: u32,
+    tokens: Vec<u32>,
+    pages: Vec<u32>,
+    held: u32,
+) -> Lane {
     let mut lane = Lane {
         slot,
         word: 0,
@@ -159,7 +166,7 @@ pub(crate) fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32)
         readout: Readout::Last,
         ..Lane::default()
     };
-    lane.kv.pages = pages;
+    lane.tables.push((kv, pages));
     lane.kv.held = held;
     lane
 }
@@ -189,7 +196,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
     let shared = refs.take(kv);
     rig.fire(
-        vec![host_lane(0, prompt, vec![shared], 0)],
+        vec![host_lane(kv, 0, prompt, vec![shared], 0)],
         Vec::new(),
         Vec::new(),
     );
@@ -237,6 +244,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         let host: Vec<Lane> = (0..BEAMS as usize)
             .map(|b| {
                 host_lane(
+                    kv,
                     1 + b as u32,
                     vec![beam_tokens[b]],
                     vec![shared, host_own[b]],
@@ -269,7 +277,8 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                     readout: Readout::Last,
                     ..Lane::default()
                 };
-                lane.kv.translation = vec![shared, device_own[b as usize]];
+                lane.tables.push((kv, vec![shared, device_own[b as usize]]));
+                lane.list = engine::fire::ListKind::Translation;
                 lane
             })
             .collect();
@@ -316,7 +325,7 @@ fn device_fed_tokens_reach_the_next_fire() {
     let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
     let shared = refs.take(kv);
     rig.fire(
-        vec![host_lane(0, prompt, vec![shared], 0)],
+        vec![host_lane(kv, 0, prompt, vec![shared], 0)],
         Vec::new(),
         Vec::new(),
     );
@@ -419,7 +428,7 @@ fn device_fed_tokens_reach_the_next_fire() {
     let mut wants = Vec::new();
     for step in 0..2u32 {
         let want = rig.fire(
-            vec![host_lane(1, vec![host_token], vec![shared, host_own], PAGE + step)],
+            vec![host_lane(kv, 1, vec![host_token], vec![shared, host_own], PAGE + step)],
             Vec::new(),
             Vec::new(),
         );
@@ -434,7 +443,7 @@ fn device_fed_tokens_reach_the_next_fire() {
         let _ = rig
             .engine
             .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
-                lanes: vec![host_lane(3, vec![0], vec![shared, device_own], PAGE + step)],
+                lanes: vec![host_lane(kv, 3, vec![0], vec![shared, device_own], PAGE + step)],
                 attachments: vec![attach(0, instance)],
                 media: Vec::new(),
                 voxels: Vec::new(),

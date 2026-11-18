@@ -199,13 +199,13 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<(Vec<f32>, Vec<u
         page_size: PAGE,
         context: ceiling,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         // Eager: the fold is read off the walk, not a recorded body.
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..knobs
         },
         cache_dir: None,

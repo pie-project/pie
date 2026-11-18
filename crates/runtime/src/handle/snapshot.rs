@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -76,13 +75,55 @@ fn sweep(root: &Path) -> std::io::Result<()> {
         for domain in shared {
             for page in std::fs::read_dir(domain?.path())? {
                 let page = page?;
-                if page.metadata()?.nlink() == 1 {
+                if link_count(&page.path())? == 1 {
                     std::fs::remove_file(page.path())?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// How many directory entries name the file at `path` (its hard links).
+#[cfg(unix)]
+fn link_count(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::symlink_metadata(path)?.nlink())
+}
+
+/// The file's identity on its volume: one value for all its hard links.
+#[cfg(unix)]
+fn file_id(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::symlink_metadata(path)?.ino())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn file_info(
+    path: &Path,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    let file = std::fs::File::open(path)?;
+    // SAFETY: a plain-old-data struct the call fills, on success, whole.
+    let mut info = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is open for the call's duration; `info` is ours.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+#[cfg(windows)]
+fn link_count(path: &Path) -> std::io::Result<u64> {
+    Ok(u64::from(file_info(path)?.nNumberOfLinks))
+}
+
+#[cfg(windows)]
+fn file_id(path: &Path) -> std::io::Result<u64> {
+    let info = file_info(path)?;
+    Ok(u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow))
 }
 
 fn store() -> Result<&'static (PathBuf, u64), HandleError> {
@@ -92,6 +133,7 @@ fn store() -> Result<&'static (PathBuf, u64), HandleError> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
     name: String,
@@ -119,20 +161,19 @@ struct Spent {
 }
 
 /// Where the rows end. What is folded is the manifest's `folded`, the one
-/// length there is; a manifest written before that carries it here as well,
-/// and it is not read.
+/// length there is.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedCursor {
     tail: Option<u32>,
     reserved: u32,
-    /// One past the highest slot written ([`Cursor::written`]); a manifest
-    /// that states none wrote inside what it reserved.
-    #[serde(default)]
-    written: Option<u32>,
+    /// One past the highest slot written ([`Cursor::written`]).
+    written: u32,
     spans: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedState {
     state_size: u64,
     buffer_page_tokens: u32,
@@ -143,9 +184,7 @@ struct SavedState {
     bytes: u64,
     /// The windows' position, for a model whose state is one window list:
     /// `buffer` is then its table, and `window_tokens` the window.
-    #[serde(default)]
     window: Option<WindowState>,
-    #[serde(default)]
     window_tokens: u32,
 }
 
@@ -214,7 +253,7 @@ fn used(root: &Path) -> std::io::Result<u64> {
             let meta = entry.metadata()?;
             if meta.is_dir() {
                 dirs.push(entry.path());
-            } else if seen.insert(meta.ino()) {
+            } else if seen.insert(file_id(&entry.path())?) {
                 bytes += meta.len();
             }
         }
@@ -655,8 +694,8 @@ fn store_domain(stores: &store_registry::Stores) -> Hash256 {
 fn unlink_unread(shared: &Path, names: &[String]) -> std::io::Result<()> {
     for name in names {
         for path in [shared.join(name), shared.join(format!("part-{name}"))] {
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.nlink() == 1 => std::fs::remove_file(&path)?,
+            match link_count(&path) {
+                Ok(1) => std::fs::remove_file(&path)?,
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -812,7 +851,7 @@ async fn finish(
         cursor: SavedCursor {
             tail: cursor.tail,
             reserved: cursor.reserved,
-            written: Some(cursor.written_end()),
+            written: cursor.written_end(),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -845,9 +884,29 @@ async fn finish(
 fn sync_disk(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        std::fs::File::open(entry.path())?.sync_all()?;
+        if entry.file_type()?.is_dir() {
+            sync_dir(&entry.path())?;
+            continue;
+        }
+        // Flushing a file asks for write access on Windows; unix takes either.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(entry.path())?
+            .sync_all()?;
     }
+    sync_dir(dir)
+}
+
+/// A directory's entries, synced: unix syncs the directory itself; Windows
+/// opens no directory as a file, and its file system journals the entries.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// A working set as `name` stands, off the device: the next process to bind
@@ -967,7 +1026,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
     let cursor = Cursor {
         tail: cursor.tail,
         reserved: cursor.reserved,
-        written: cursor.written.unwrap_or(cursor.reserved),
+        written: cursor.written,
         staged: Vec::new(),
         spans: cursor.spans,
     };
@@ -1066,7 +1125,7 @@ pub(super) async fn delete(tenant: &str, name: &str) -> Result<Value, HandleErro
         let domain = manifest.as_ref().map_or(domain, |m| m.domain.clone());
         for file in manifest.iter().flat_map(|m| m.files.iter()) {
             let page = root.join(SHARED).join(&domain).join(file);
-            if std::fs::metadata(&page).is_ok_and(|meta| meta.nlink() == 1) {
+            if link_count(&page).is_ok_and(|links| links == 1) {
                 std::fs::remove_file(page)?;
             }
         }
@@ -1210,7 +1269,9 @@ mod tests {
         let refused = refused.expect_err("a bound is not kept");
         assert!(
             refused.message.contains("reading the frozen length")
-                && refused.message.contains(crate::store::kv::page_table::UNPLACED),
+                && refused
+                    .message
+                    .contains(crate::store::kv::page_table::UNPLACED),
             "{}",
             refused.message
         );

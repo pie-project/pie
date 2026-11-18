@@ -403,6 +403,7 @@ fn fit(
                 emulated_cost / fp16_cost.min(emulated_cost),
             )
         },
+        measured: emulated_cost != 0.0,
     });
     let fp16 = (QmmFp16::spec().id.to_string(), fp16_on.to_string());
 
@@ -412,6 +413,7 @@ fn fit(
             id: spec.id,
             text: "not searched: the device does not say its GPU cores, so `fill` is unknown"
                 .to_string(),
+            measured: false,
         });
         return Ok((vec![fp16], lines));
     };
@@ -453,7 +455,11 @@ fn fit(
     if let Some(b) = fit.baseline {
         let _ = write!(text, "; today's ladder runs at {:.3}x", b / fit.floor);
     }
-    lines.push(Line { id: spec.id, text });
+    lines.push(Line {
+        id: spec.id,
+        text,
+        measured: true,
+    });
     let entries = vec![(spec.id.to_string(), ladder), fp16];
     Ok((entries, lines))
 }
@@ -900,6 +906,7 @@ pub fn run(
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                measured: false,
             });
         }
     } else {

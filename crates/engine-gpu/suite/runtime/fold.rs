@@ -249,7 +249,7 @@ impl Set {
             },
             readout: Readout::Last,
             tables: vec![(LIST, self.kv[..upto.div_ceil(PAGE) as usize].to_vec())],
-            fixed: vec![(FIXED, self.record.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, self.record.clone())]),
             tokens,
             ..Lane::default()
         }
@@ -376,7 +376,7 @@ impl Model {
         let bits = self.settled(&mut ticket);
         assert_eq!(
             self.outcome(&ticket),
-            self.asynchronous.then_some(StepOutcome::Committed),
+            self.asynchronous.then(StepOutcome::committed),
             "a fire whose fold lengths the host states reports no fold"
         );
         bits
@@ -419,7 +419,10 @@ impl Model {
     /// reported them under `tag`.
     fn reported(&mut self, ticket: &FrameTicket, tag: u64) -> Option<u32> {
         match self.outcome(ticket) {
-            Some(StepOutcome::Wrote(writes)) => {
+            Some(StepOutcome {
+                wrote: writes,
+                faulted,
+            }) if !writes.is_empty() && faulted.is_empty() => {
                 assert_eq!(writes.len(), 1, "one lane reports: {writes:?}");
                 let report = &writes[0];
                 assert_eq!(report.tag, tag, "the report carries the lane's tag");
@@ -489,6 +492,14 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
         Some(SlotKind::Fixed { pieces }) => pieces,
         other => panic!("{MODEL}'s record shape is {other:?}"),
     };
+    // The record's bytes the load states are the model's state rows, which
+    // its pool lays in `pieces` fixed slots: a record's, not its slots'.
+    let laid = facts.shape(FIXED).map_or(0, |shape| shape.slot_bytes) * u64::from(pieces);
+    assert!(
+        facts.record_bytes > 0 && facts.record_bytes <= laid,
+        "{MODEL} states a record of {} bytes in {laid} bytes of slots",
+        facts.record_bytes
+    );
     let rs_tokens = match facts.shape(RS).map(|shape| shape.kind) {
         Some(SlotKind::List { tokens, .. }) => tokens,
         other => panic!("{MODEL}'s rs list is {other:?}"),

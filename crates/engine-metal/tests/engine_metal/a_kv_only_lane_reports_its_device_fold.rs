@@ -217,7 +217,10 @@ fn a_kv_only_lane_reports_its_device_fold() {
         .expect("a plain fire lands")[0]
         .len() as u32;
     match report(&mut shell, vocab, &tokens, true, 0) {
-        engine::StepOutcome::Wrote(writes) => {
+        engine::StepOutcome {
+            wrote: writes,
+            faulted,
+        } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].tag, 7);
             assert_eq!(writes[0].fold, Some(FOLD), "the fold its program stated");
@@ -225,7 +228,10 @@ fn a_kv_only_lane_reports_its_device_fold() {
         other => panic!("the lane's report, not {other:?}"),
     }
     match report(&mut shell, vocab, &tokens, false, 1) {
-        engine::StepOutcome::Wrote(writes) => {
+        engine::StepOutcome {
+            wrote: writes,
+            faulted,
+        } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].fold, None, "no `fold` port, no fold told");
         }

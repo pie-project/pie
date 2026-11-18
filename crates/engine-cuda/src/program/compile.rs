@@ -27,6 +27,10 @@ const WARP: u32 = 32;
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 const MAX_BLOCK_THREADS: u32 = 1024;
 
+/// The narrowest block a region is emitted for on ROCm: one wavefront.
+#[cfg(feature = "rocm")]
+const ROCM_WAVE: u32 = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub major: i32,
@@ -151,22 +155,41 @@ fn compile_options() -> Vec<&'static [u8]> {
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
     #[cfg(feature = "rocm")]
     {
-        use kernels_cuda::hip::{self, CompileError};
-        match hip::compile(
-            "ptir_fused_region",
-            source,
-            architecture,
-            &HIPRTC_OPTIONS,
-            &[],
-        ) {
-            Ok(built) if built.code.is_empty() => Err(Failure::Retryable {
-                reason: "hiprtc produced an empty code object".into(),
-            }),
-            Ok(built) => Ok(built.code),
-            Err(CompileError::Rejected(log)) => Err(Failure::Deterministic {
-                reason: format!("hiprtc refused the emitted region: {log}"),
-            }),
-            Err(CompileError::Failed(reason)) => Err(Failure::Retryable { reason }),
+        use kernels_cuda::hip::{self, CompileError, code_object};
+        // A region states no launch bounds, so hiprtc emits it for the
+        // widest block and holds it to that block's registers; one that
+        // needs more spills, and its scratch is a buffer the runtime would
+        // allocate at its first launch (refused at load). As CUDA's driver
+        // narrows such a kernel's block, the region is emitted again for
+        // half the block till it needs none: the launch reads the width it
+        // was emitted for (`launch_width`). The narrowest is one wavefront.
+        let mut bound: Option<u32> = None;
+        loop {
+            let flag = bound.map(|threads| format!("--gpu-max-threads-per-block={threads}"));
+            let options: Vec<&str> = HIPRTC_OPTIONS
+                .iter()
+                .copied()
+                .chain(flag.as_deref())
+                .collect();
+            let code = match hip::compile("ptir_fused_region", source, architecture, &options, &[]) {
+                Ok(built) if built.code.is_empty() => {
+                    return Err(Failure::Retryable {
+                        reason: "hiprtc produced an empty code object".into(),
+                    });
+                }
+                Ok(built) => built.code,
+                Err(CompileError::Rejected(log)) => {
+                    return Err(Failure::Deterministic {
+                        reason: format!("hiprtc refused the emitted region: {log}"),
+                    });
+                }
+                Err(CompileError::Failed(reason)) => return Err(Failure::Retryable { reason }),
+            };
+            let narrower = bound.unwrap_or(MAX_BLOCK_THREADS) / 2;
+            if code_object::refuse_late_buffers(&code).is_ok() || narrower < ROCM_WAVE {
+                return Ok(code);
+            }
+            bound = Some(narrower);
         }
     }
     #[cfg(feature = "cuda")]
@@ -702,6 +725,8 @@ impl Cache {
         self.stats
     }
 
+    /// A program's registration, whole: [`Cache::plan`], the build, and
+    /// [`Cache::install`] on one thread.
     pub fn compile(
         &mut self,
         program_hash: u64,
@@ -710,9 +735,31 @@ impl Cache {
         versions: Versions,
         target: Target,
     ) -> std::result::Result<Compiled, Failure> {
+        match self.plan(program_hash, plan, kernels, versions, target)? {
+            Planned::Ready(compiled) => Ok(compiled),
+            Planned::Build(mut build) => {
+                let built = build.build();
+                self.install(build, built)
+            }
+        }
+    }
+
+    /// What a program's registration takes, on the engine's thread: the
+    /// program or its stages where this cache holds them, and the regions
+    /// it must build, each with its source and key. The build itself
+    /// ([`Build::build`]) holds nothing of the engine's and runs on any
+    /// thread.
+    pub fn plan(
+        &mut self,
+        program_hash: u64,
+        plan: &ExecPlan,
+        kernels: &[EmittedKernel],
+        versions: Versions,
+        target: Target,
+    ) -> std::result::Result<Planned, Failure> {
         if let Some(compiled) = self.programs.get(&program_hash) {
             self.stats.memory_hits += 1;
-            return Ok(compiled.clone());
+            return Ok(Planned::Ready(compiled.clone()));
         }
 
         let program_identity = cache_identity(
@@ -729,87 +776,69 @@ impl Cache {
             });
         }
 
-        match self.build(plan, kernels, versions, target) {
-            Ok(compiled) => {
-                self.stages.commit();
-                self.programs.insert(program_hash, compiled.clone());
-                Ok(compiled)
+        let refused = |failure: Failure, cache: &mut Cache| {
+            if let Failure::Deterministic { reason } = &failure {
+                cache.negative.insert(program_key, reason.clone());
             }
-            Err(failure) => {
-                self.stages.abandon();
-                if let Failure::Deterministic { reason } = &failure {
-                    self.negative.insert(program_key, reason.clone());
-                }
-                Err(failure)
+            failure
+        };
+        let index = match Emitted::index(kernels) {
+            Ok(index) => index,
+            Err(duplicate) => {
+                let failure = Failure::Deterministic {
+                    reason: format!(
+                        "the emitted kernel table names slot (kind {}, stage {}, region {}) \
+                         twice; an engine cannot know which of the two the host meant",
+                        duplicate.kind as u32, duplicate.stage, duplicate.region
+                    ),
+                };
+                return Err(refused(failure, self));
             }
-        }
-    }
-
-    pub fn forget(&mut self, program_hash: u64) {
-        self.programs.remove(&program_hash);
-    }
-
-    fn build(
-        &mut self,
-        plan: &ExecPlan,
-        kernels: &[EmittedKernel],
-        versions: Versions,
-        target: Target,
-    ) -> std::result::Result<Compiled, Failure> {
-        let index = Emitted::index(kernels).map_err(|duplicate| Failure::Deterministic {
-            reason: format!(
-                "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
-                 an engine cannot know which of the two the host meant",
-                duplicate.kind as u32, duplicate.stage, duplicate.region
-            ),
-        })?;
+        };
         let mut stages = Vec::with_capacity(plan.package.plans.len());
         for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
-            let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
-                reason: "a program with more than four billion stages is not a program".into(),
-            })?;
-            let identity =
-                cache_identity(BACKEND, target.device, stage_plan.signature_hash, versions);
-            let key = fnv1a64_with(
-                identity.as_bytes(),
-                &[
-                    target.rtc.0.to_le_bytes().as_slice(),
-                    target.rtc.1.to_le_bytes().as_slice(),
-                ],
-            );
-            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
-            match lookup {
-                Lookup::Hit => {
-                    self.stats.memory_hits += 1;
-                    if let Some(stage) = hit {
-                        stages.push(stage);
-                        continue;
-                    }
-                }
-                Lookup::Collided | Lookup::Miss => {}
-            }
-
-            let compiled = self.build_stage(stage_index, stage_plan, &index, &target)?;
-            if lookup == Lookup::Miss {
-                self.stages
-                    .stage(key, stage_plan.identity, compiled.clone());
-            }
-            stages.push(compiled);
+            let planned = self.plan_stage(stage_index, stage_plan, &index, versions, &target);
+            stages.push(planned.map_err(|failure| refused(failure, self))?);
         }
-        Ok(Compiled {
-            stages: Arc::new(stages),
+        Ok(Planned::Build(Build {
+            program_hash,
+            program_key,
+            architecture: target.architecture(),
+            stages,
             plans: Arc::new(plan.package.plans.clone()),
             kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
-        })
+            disk: self.disk.clone(),
+            persistent_hits: 0,
+            compilations: 0,
+        }))
     }
 
-    fn build_stage(
+    fn plan_stage(
         &mut self,
-        stage_index: u32,
+        stage_index: usize,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
+        versions: Versions,
         target: &Target,
-    ) -> std::result::Result<Stage, Failure> {
+    ) -> std::result::Result<StageBuild, Failure> {
+        let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
+            reason: "a program with more than four billion stages is not a program".into(),
+        })?;
+        let identity = cache_identity(BACKEND, target.device, plan.signature_hash, versions);
+        let key = fnv1a64_with(
+            identity.as_bytes(),
+            &[
+                target.rtc.0.to_le_bytes().as_slice(),
+                target.rtc.1.to_le_bytes().as_slice(),
+            ],
+        );
+        let (lookup, hit) = self.stages.lookup(key, plan.identity);
+        if lookup == Lookup::Hit {
+            self.stats.memory_hits += 1;
+            if let Some(stage) = hit {
+                return Ok(StageBuild::Held(stage));
+            }
+        }
         let mut regions = Vec::new();
         for region_index in 0..plan.fused.len() {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
@@ -851,16 +880,19 @@ impl Cache {
                     });
                 }
             };
-
-            let module = self.region_module(target, region_index, entry, source)?;
-            regions.push(Region {
-                region_index,
-                module,
-            });
+            let mut region = RegionBuild::new(target, region_index, entry, source);
+            region.module = self.built.get(&region.key).cloned();
+            if region.module.is_none() {
+                self.late += 1;
+            }
+            regions.push(region);
         }
-        Ok(Stage {
+        Ok(StageBuild::Regions {
+            key,
+            identity: plan.identity,
             signature_hash: plan.signature_hash,
-            regions: Arc::new(regions),
+            cached: lookup == Lookup::Miss,
+            regions,
         })
     }
 
@@ -949,6 +981,78 @@ impl Cache {
         Ok(wanted.len() as u64)
     }
 
+    /// A program's build made modules, on the engine's thread (a module
+    /// loads into the context current there), and kept: its regions' code,
+    /// its stages and the program. A deterministic refusal is remembered.
+    pub fn install(
+        &mut self,
+        build: Build,
+        built: std::result::Result<(), Failure>,
+    ) -> std::result::Result<Compiled, Failure> {
+        self.stats.persistent_hits += build.persistent_hits;
+        self.stats.compilations += build.compilations;
+        if let Err(failure) = built {
+            if let Failure::Deterministic { reason } = &failure {
+                self.negative.insert(build.program_key, reason.clone());
+            }
+            return Err(failure);
+        }
+        if let Some(compiled) = self.programs.get(&build.program_hash) {
+            return Ok(compiled.clone());
+        }
+        let mut stages = Vec::with_capacity(build.stages.len());
+        for stage in build.stages {
+            match stage {
+                StageBuild::Held(stage) => stages.push(stage),
+                StageBuild::Regions {
+                    key,
+                    identity,
+                    signature_hash,
+                    cached,
+                    regions,
+                } => {
+                    let mut modules = Vec::with_capacity(regions.len());
+                    for region in regions {
+                        match self.load(&region, &build.disk) {
+                            Ok(module) => {
+                                modules.push(Region {
+                                    region_index: region.region_index,
+                                    module,
+                                });
+                            }
+                            Err(failure) => {
+                                self.stages.abandon();
+                                return Err(failure);
+                            }
+                        }
+                    }
+                    let stage = Stage {
+                        signature_hash,
+                        regions: Arc::new(modules),
+                    };
+                    if cached {
+                        self.stages.stage(key, identity, stage.clone());
+                    }
+                    stages.push(stage);
+                }
+            }
+        }
+        self.stages.commit();
+        let compiled = Compiled {
+            stages: Arc::new(stages),
+            plans: build.plans,
+            kinds: build.kinds,
+        };
+        self.programs.insert(build.program_hash, compiled.clone());
+        Ok(compiled)
+    }
+
+    pub fn forget(&mut self, program_hash: u64) {
+        self.programs.remove(&program_hash);
+    }
+
+    /// One region's module, built whole on this thread.
+    #[cfg(all(test, feature = "rocm"))]
     fn region_module(
         &mut self,
         target: &Target,
@@ -956,46 +1060,205 @@ impl Cache {
         entry: &str,
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
+        let mut region = RegionBuild::new(target, region_index, entry, source);
+        region.module = self.built.get(&region.key).cloned();
+        if region.module.is_none() {
+            self.late += 1;
+        }
+        let mut build = Build {
+            program_hash: 0,
+            program_key: 0,
+            architecture: target.architecture(),
+            stages: Vec::new(),
+            plans: Arc::new(Vec::new()),
+            kinds: Arc::new(Vec::new()),
+            disk: self.disk.clone(),
+            persistent_hits: 0,
+            compilations: 0,
+        };
+        let built = build.build_region(&mut region, &mut std::collections::HashMap::new());
+        self.stats.persistent_hits += build.persistent_hits;
+        self.stats.compilations += build.compilations;
+        built?;
+        let disk = self.disk.clone();
+        self.load(&region, &disk)
+    }
+
+    /// `region`'s module: the one this cache holds for its text, else
+    /// loaded from the code its build made and kept under its key.
+    fn load(
+        &mut self,
+        region: &RegionBuild,
+        disk: &Disk,
+    ) -> std::result::Result<Arc<Module>, Failure> {
+        if let Some(module) = &region.module {
+            return Ok(Arc::clone(module));
+        }
+        if let Some(module) = self.built.get(&region.key).cloned() {
+            return Ok(module);
+        }
+        let module = region.load(disk)?;
+        self.built.insert(region.key.clone(), Arc::clone(&module));
+        Ok(module)
+    }
+}
+
+/// What [`Cache::plan`] found.
+#[derive(Debug)]
+pub enum Planned {
+    /// The program, as this cache holds it.
+    Ready(Compiled),
+    /// What its registration builds.
+    Build(Build),
+}
+
+/// A program's build: the regions [`Cache::plan`] found no code for in
+/// memory, compiled or read from disk by [`Build::build`] on any thread,
+/// then loaded and kept by [`Cache::install`] on the engine's.
+#[derive(Debug)]
+pub struct Build {
+    program_hash: u64,
+    program_key: u64,
+    architecture: String,
+    stages: Vec<StageBuild>,
+    plans: Arc<Vec<LaunchStagePlan>>,
+    kinds: Arc<Vec<Attach>>,
+    disk: Disk,
+    persistent_hits: u64,
+    compilations: u64,
+}
+
+#[derive(Debug)]
+enum StageBuild {
+    /// A stage this cache holds.
+    Held(Stage),
+    Regions {
+        key: u64,
+        identity: u64,
+        signature_hash: u64,
+        /// The stage cache had no entry at its key: the stage is kept.
+        cached: bool,
+        regions: Vec<RegionBuild>,
+    },
+}
+
+/// Where a region's code came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Memory,
+    Disk,
+    Compiled,
+}
+
+#[derive(Debug)]
+struct RegionBuild {
+    region_index: u32,
+    /// The region's own name.
+    entry: String,
+    /// Its source under [`REGION_SYMBOL`].
+    source: String,
+    key: String,
+    /// The dynamic shared memory each launch hands it.
+    dynamic: u32,
+    /// The module the cache holds for its text, where it holds one: the
+    /// region builds nothing.
+    module: Option<Arc<Module>>,
+    code: Option<(Arc<[u8]>, Origin)>,
+}
+
+impl RegionBuild {
+    fn new(target: &Target, region_index: u32, entry: &str, source: &str) -> RegionBuild {
         // The region is built under one symbol, so its code is keyed by
         // what it computes, never by the stage it sits in: stages whose
         // regions are the same text share one module.
         let source = source.replace(entry, REGION_SYMBOL);
         let key = region_key(target, &source);
-        if let Some(module) = self.built.get(&key).cloned() {
-            return Ok(module);
-        }
         let dynamic = cut_state_bytes(&source);
-        self.late += 1;
-        if let Some(cubin) = self.disk.load(&key, REGION_SYMBOL) {
+        RegionBuild {
+            region_index,
+            entry: entry.to_owned(),
+            source,
+            key,
+            dynamic,
+            module: None,
+            code: None,
+        }
+    }
+
+    /// Its module, loaded into the context current on this thread from
+    /// the code its build made. Code read from disk that does not load is
+    /// dropped from the disk, so the next registration compiles it.
+    fn load(&self, disk: &Disk) -> std::result::Result<Arc<Module>, Failure> {
+        let Some((code, origin)) = self.code.clone() else {
+            return Err(Failure::Retryable {
+                reason: format!("region `{}` was never built", self.entry),
+            });
+        };
+        let module = Module::load(&code, REGION_SYMBOL, self.dynamic).map_err(|error| {
+            if origin == Origin::Disk {
+                disk.invalidate(&self.key);
+            }
+            Failure::Retryable {
+                reason: format!("loading `{}`: {error}", self.entry),
+            }
+        })?;
+        Ok(Arc::new(module))
+    }
+}
+
+impl Build {
+    /// Compiles, or reads from disk, every region's code the plan found
+    /// none for. It holds nothing of the engine's and needs no context, so
+    /// it runs on any thread while the engine fires on. Regions the same
+    /// but for their names build once.
+    pub fn build(&mut self) -> std::result::Result<(), Failure> {
+        let mut stages = std::mem::take(&mut self.stages);
+        let mut made = std::collections::HashMap::new();
+        let built = stages.iter_mut().try_for_each(|stage| match stage {
+            StageBuild::Held(_) => Ok(()),
+            StageBuild::Regions { regions, .. } => regions
+                .iter_mut()
+                .try_for_each(|region| self.build_region(region, &mut made)),
+        });
+        self.stages = stages;
+        built
+    }
+
+    fn build_region(
+        &mut self,
+        region: &mut RegionBuild,
+        made: &mut std::collections::HashMap<String, Arc<[u8]>>,
+    ) -> std::result::Result<(), Failure> {
+        if region.module.is_some() || region.code.is_some() {
+            return Ok(());
+        }
+        if let Some(code) = made.get(&region.key) {
+            region.code = Some((Arc::clone(code), Origin::Memory));
+            return Ok(());
+        }
+        let code = match self.disk.load(&region.key, REGION_SYMBOL) {
             // One that asks for late memory was compiled before that was
             // refused: compiled again, and refused below if it still asks.
-            let loaded = late_memory(&cubin)
-                .ok()
-                .and_then(|()| Module::load(&cubin, REGION_SYMBOL, dynamic).ok());
-            match loaded {
-                Some(module) => {
-                    self.stats.persistent_hits += 1;
-                    let module = Arc::new(module);
-                    self.built.insert(key, Arc::clone(&module));
-                    return Ok(module);
-                }
-                None => self.disk.invalidate(&key),
+            Some(code) if late_memory(&code).is_ok() => {
+                self.persistent_hits += 1;
+                (Arc::<[u8]>::from(code), Origin::Disk)
             }
-        }
-
-        let cubin = compile(&source, &target.architecture())?;
-        self.stats.compilations += 1;
-        late_memory(&cubin).map_err(|why| Failure::Deterministic {
-            reason: format!("region {region_index} (`{entry}`): {why}"),
-        })?;
-        let module =
-            Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| Failure::Retryable {
-                reason: format!("loading `{entry}`: {error}"),
-            })?;
-        self.disk.store(&key, REGION_SYMBOL, &cubin);
-        let module = Arc::new(module);
-        self.built.insert(key, Arc::clone(&module));
-        Ok(module)
+            stale => {
+                if stale.is_some() {
+                    self.disk.invalidate(&region.key);
+                }
+                let code = compile(&region.source, &self.architecture)?;
+                self.compilations += 1;
+                late_memory(&code).map_err(|why| Failure::Deterministic {
+                    reason: format!("region {} (`{}`): {why}", region.region_index, region.entry),
+                })?;
+                self.disk.store(&region.key, REGION_SYMBOL, &code);
+                (Arc::<[u8]>::from(code), Origin::Compiled)
+            }
+        };
+        made.insert(region.key.clone(), Arc::clone(&code.0));
+        region.code = Some(code);
+        Ok(())
     }
 }
 

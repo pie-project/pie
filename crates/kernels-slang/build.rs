@@ -77,7 +77,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=PIE_SLANGC");
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir();
     let kernels = root.join("kernels");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let variants = collect(&kernels);
@@ -352,4 +352,13 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+/// This crate's directory, read when the build script runs: a path baked in
+/// when the script was compiled would name another checkout's crate where
+/// worktrees share a target directory.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for a build script")
+        .into()
 }

@@ -250,6 +250,143 @@ impl Region {
     }
 }
 
+/// The device a registration's compile builds its libraries and pipelines
+/// on, owned so the compile can run on any thread
+/// (`engine::Engine::prepare_program`): Metal states `MTLDevice` thread-safe
+/// for making libraries and pipeline states.
+pub struct CompileDevice {
+    #[cfg(target_vendor = "apple")]
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+}
+
+// SAFETY: the device is only asked to make libraries and pipeline states,
+// which Metal states safe from any thread.
+#[allow(unsafe_code)]
+unsafe impl Send for CompileDevice {}
+
+impl CompileDevice {
+    #[must_use]
+    pub fn of(context: &Context) -> CompileDevice {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2::Message as _;
+            CompileDevice {
+                device: context.device().retain(),
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = context;
+            CompileDevice {}
+        }
+    }
+}
+
+/// What a registration still has to compile, planned on the engine's
+/// thread ([`Cache::plan`]): the stages the cache did not hold, built on
+/// any thread ([`Job::run`]), then committed on the engine's thread
+/// ([`Cache::finish`]).
+pub struct Job {
+    device: CompileDevice,
+    program_hash: u64,
+    program_key: u64,
+    plans: Vec<LaunchStagePlan>,
+    kinds: Vec<Attach>,
+    kernels: Vec<EmittedKernel>,
+    /// Each stage: the cache's (a hit) or `None` (to build), with its key,
+    /// its identity and whether the cache takes it once built.
+    slots: Vec<(Option<Stage>, u64, u64, bool)>,
+    /// The region modules the cache held when the job was planned, by text
+    /// ([`Cache::modules`]).
+    modules: std::collections::HashMap<u64, Arc<Module>>,
+}
+
+// SAFETY: the stages a job holds and builds are immutable libraries and
+// pipeline states (and their plans), which Metal states safe to use from
+// any thread; nothing in a job is touched by two threads at once.
+#[allow(unsafe_code)]
+unsafe impl Send for Job {}
+
+/// A job run ([`Job::run`]): its stages, or why they did not build.
+pub struct Built {
+    job: Job,
+    stages: std::result::Result<Vec<Stage>, Failure>,
+    compilations: u64,
+    memory_hits: u64,
+    /// The region modules the job built, by text, for the cache.
+    made: std::collections::HashMap<u64, Arc<Module>>,
+}
+
+// SAFETY: as `Job`.
+#[allow(unsafe_code)]
+unsafe impl Send for Built {}
+
+/// A registration's compile, planned ([`Cache::plan`]): held already, or a
+/// job to run.
+pub enum Planned {
+    Held(Compiled),
+    Run(Job),
+}
+
+impl Job {
+    /// Builds every stage the cache did not hold: the libraries and
+    /// pipelines, on whatever thread runs it.
+    #[must_use]
+    pub fn run(self) -> Built {
+        let mut builder = Builder {
+            device: &self.device,
+            modules: &self.modules,
+            made: std::collections::HashMap::new(),
+            compilations: 0,
+            memory_hits: 0,
+        };
+        let stages = (|| {
+            let index = Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
+                reason: format!(
+                    "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
+                     an engine cannot know which of the two the host meant",
+                    duplicate.kind as u32, duplicate.stage, duplicate.region
+                ),
+            })?;
+            let mut stages = Vec::with_capacity(self.slots.len());
+            for (at, (held, ..)) in self.slots.iter().enumerate() {
+                if let Some(stage) = held {
+                    stages.push(stage.clone());
+                    continue;
+                }
+                let stage_index = u32::try_from(at).map_err(|_| Failure::Deterministic {
+                    reason: "a program with more than four billion stages is not a program".into(),
+                })?;
+                stages.push(builder.build_stage(stage_index, &self.plans[at], &index)?);
+            }
+            Ok(stages)
+        })();
+        let Builder {
+            compilations,
+            memory_hits,
+            made,
+            ..
+        } = builder;
+        Built {
+            job: self,
+            stages,
+            compilations,
+            memory_hits,
+            made,
+        }
+    }
+}
+
+/// The region compiles a job runs, on the device it owns.
+struct Builder<'a> {
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    device: &'a CompileDevice,
+    modules: &'a std::collections::HashMap<u64, Arc<Module>>,
+    made: std::collections::HashMap<u64, Arc<Module>>,
+    compilations: u64,
+    memory_hits: u64,
+}
+
 enum GroupedAnswer {
     Served(Region),
     Declined(String),
@@ -322,9 +459,27 @@ impl Cache {
         versions: Versions,
         target: Target,
     ) -> std::result::Result<Compiled, Failure> {
+        match self.plan(context, program_hash, plan, kernels, versions, target)? {
+            Planned::Held(compiled) => Ok(compiled),
+            Planned::Run(job) => self.finish(job.run()),
+        }
+    }
+
+    /// The first half of [`Cache::compile`], on the engine's thread: the
+    /// program the cache holds already, a deterministic refusal it
+    /// remembers, or a job of the stages it does not hold.
+    pub fn plan(
+        &mut self,
+        context: &Context,
+        program_hash: u64,
+        plan: &ExecPlan,
+        kernels: &[EmittedKernel],
+        versions: Versions,
+        target: Target,
+    ) -> std::result::Result<Planned, Failure> {
         if let Some(compiled) = self.programs.get(&program_hash) {
             self.stats.memory_hits += 1;
-            return Ok(compiled.clone());
+            return Ok(Planned::Held(compiled.clone()));
         }
 
         let program_identity = cache_identity(
@@ -341,16 +496,66 @@ impl Cache {
             });
         }
 
-        match self.build(context, plan, kernels, versions, target) {
-            Ok(compiled) => {
+        let mut slots = Vec::with_capacity(plan.package.plans.len());
+        for stage_plan in &plan.package.plans {
+            let identity = cache_identity(
+                Backend::Metal,
+                target.device,
+                stage_plan.signature_hash,
+                versions,
+            );
+            let key = eta_ir::fnv1a64(identity.as_bytes());
+            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
+            match (lookup, hit) {
+                (Lookup::Hit, Some(stage)) => {
+                    self.stats.memory_hits += 1;
+                    slots.push((Some(stage), key, stage_plan.identity, false));
+                }
+                (lookup, _) => {
+                    slots.push((None, key, stage_plan.identity, lookup == Lookup::Miss));
+                }
+            }
+        }
+        Ok(Planned::Run(Job {
+            device: CompileDevice::of(context),
+            program_hash,
+            program_key,
+            plans: plan.package.plans.clone(),
+            kinds: plan.package.stages.iter().map(|s| s.stage).collect(),
+            kernels: kernels.to_vec(),
+            slots,
+            modules: self.modules.clone(),
+        }))
+    }
+
+    /// The second half of [`Cache::compile`], on the engine's thread: a
+    /// built job's stages taken into the cache and its program held, or its
+    /// refusal remembered where it is deterministic.
+    pub fn finish(&mut self, built: Built) -> std::result::Result<Compiled, Failure> {
+        self.stats.compilations += built.compilations;
+        self.stats.memory_hits += built.memory_hits;
+        self.modules.extend(built.made);
+        let job = built.job;
+        match built.stages {
+            Ok(stages) => {
+                for ((held, key, identity, keep), stage) in job.slots.iter().zip(&stages) {
+                    if held.is_none() && *keep {
+                        self.stages.stage(*key, *identity, stage.clone());
+                    }
+                }
                 self.stages.commit();
-                self.programs.insert(program_hash, compiled.clone());
+                let compiled = Compiled {
+                    stages: Arc::new(stages),
+                    plans: Arc::new(job.plans),
+                    kinds: Arc::new(job.kinds),
+                };
+                self.programs.insert(job.program_hash, compiled.clone());
                 Ok(compiled)
             }
             Err(failure) => {
                 self.stages.abandon();
                 if let Failure::Deterministic { reason } = &failure {
-                    self.negative.insert(program_key, reason.clone());
+                    self.negative.insert(job.program_key, reason.clone());
                 }
                 Err(failure)
             }
@@ -361,63 +566,11 @@ impl Cache {
         self.programs.remove(&program_hash);
     }
 
-    fn build(
-        &mut self,
-        context: &Context,
-        plan: &ExecPlan,
-        kernels: &[EmittedKernel],
-        versions: Versions,
-        target: Target,
-    ) -> std::result::Result<Compiled, Failure> {
-        let index = Emitted::index(kernels).map_err(|duplicate| Failure::Deterministic {
-            reason: format!(
-                "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
-                 an engine cannot know which of the two the host meant",
-                duplicate.kind as u32, duplicate.stage, duplicate.region
-            ),
-        })?;
+}
 
-        let mut stages = Vec::with_capacity(plan.package.plans.len());
-        for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
-            let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
-                reason: "a program with more than four billion stages is not a program".into(),
-            })?;
-            let identity = cache_identity(
-                Backend::Metal,
-                target.device,
-                stage_plan.signature_hash,
-                versions,
-            );
-            let key = eta_ir::fnv1a64(identity.as_bytes());
-            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
-            match lookup {
-                Lookup::Hit => {
-                    self.stats.memory_hits += 1;
-                    if let Some(stage) = hit {
-                        stages.push(stage);
-                        continue;
-                    }
-                }
-                Lookup::Collided | Lookup::Miss => {}
-            }
-
-            let compiled = self.build_stage(context, stage_index, stage_plan, &index)?;
-            if lookup == Lookup::Miss {
-                self.stages
-                    .stage(key, stage_plan.identity, compiled.clone());
-            }
-            stages.push(compiled);
-        }
-        Ok(Compiled {
-            stages: Arc::new(stages),
-            plans: Arc::new(plan.package.plans.clone()),
-            kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
-        })
-    }
-
+impl Builder<'_> {
     fn build_stage(
         &mut self,
-        context: &Context,
         stage_index: u32,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
@@ -435,7 +588,7 @@ impl Cache {
                 continue;
             }
             if let Some(region) =
-                self.streamed_region(context, stage_index, region_index, plan, index)?
+                self.streamed_region(stage_index, region_index, plan, index)?
             {
                 if region_trace() {
                     eprintln!(
@@ -451,7 +604,7 @@ impl Cache {
                 continue;
             }
             let grouped_declined =
-                match self.grouped_region(context, stage_index, region_index, plan, index)? {
+                match self.grouped_region(stage_index, region_index, plan, index)? {
                     GroupedAnswer::Served(region) => {
                         if region_trace() {
                             eprintln!(
@@ -508,7 +661,7 @@ impl Cache {
                 }
             };
 
-            let module = self.region_module(context, entry, source)?;
+            let module = self.region_module(entry, source)?;
             regions.push(Region {
                 region_index,
                 steps: Arc::new(Vec::new()),
@@ -525,7 +678,6 @@ impl Cache {
 
     fn grouped_region(
         &mut self,
-        context: &Context,
         stage_index: u32,
         region_index: u32,
         plan: &LaunchStagePlan,
@@ -611,7 +763,7 @@ impl Cache {
                 )));
             }
         };
-        let module = self.region_module(context, entry, source)?;
+        let module = self.region_module(entry, source)?;
         #[cfg(target_vendor = "apple")]
         if library && module.max_threads() < super::launch::LIBRARY_SAMPLER_THREADS {
             return Ok(GroupedAnswer::Declined(format!(
@@ -636,7 +788,6 @@ impl Cache {
 
     fn streamed_region(
         &mut self,
-        context: &Context,
         stage_index: u32,
         region_index: u32,
         plan: &LaunchStagePlan,
@@ -675,7 +826,7 @@ impl Cache {
                 input: value,
             });
         }
-        let module = self.region_module(context, entry, source)?;
+        let module = self.region_module(entry, source)?;
         #[cfg(target_vendor = "apple")]
         if module.execution_width() != 32 {
             if region_trace() {
@@ -698,7 +849,6 @@ impl Cache {
 
     fn region_module(
         &mut self,
-        context: &Context,
         entry: &str,
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
@@ -708,20 +858,20 @@ impl Cache {
         // compares them; a module keeps its own pipeline, whatever it is
         // named.
         let key = eta_ir::fnv1a64(expanded.replace(entry, "ptir_region").as_bytes());
-        if let Some(module) = self.modules.get(&key) {
-            self.stats.memory_hits += 1;
+        if let Some(module) = self.modules.get(&key).or_else(|| self.made.get(&key)) {
+            self.memory_hits += 1;
             return Ok(module.clone());
         }
         #[cfg(target_vendor = "apple")]
         {
-            let module = Arc::new(Module::build(context.device(), &expanded, entry)?);
-            self.stats.compilations += 1;
-            self.modules.insert(key, module.clone());
+            let module = Arc::new(Module::build(&self.device.device, &expanded, entry)?);
+            self.compilations += 1;
+            self.made.insert(key, module.clone());
             Ok(module)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (context, entry, expanded);
+            let _ = (entry, expanded);
             Err(Failure::Retryable {
                 reason: "this build has no Metal in it: the target is not an Apple one".into(),
             })

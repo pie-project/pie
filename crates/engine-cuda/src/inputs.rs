@@ -198,6 +198,12 @@ pub struct RsHandles {
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
 
+/// The bytes the staged rs lane table of `lanes` lanes takes: what the slab
+/// lays, what a fire writes and what it copies to the device, one figure.
+const fn rs_lane_table_bytes(lanes: u64) -> u64 {
+    lanes * RS_LANE_BYTES
+}
+
 /// A buffering fire's rs tables, as `write_host` stages them.
 #[derive(Debug, Clone, Copy)]
 pub struct RsFire<'a> {
@@ -442,9 +448,7 @@ fn inject_tokens(
     let words = injects
         .iter()
         .all(|inject| inject.bytes % 4 == 0 && inject.dst_off % 4 == 0);
-    // kernels-rocm has no word gather: ROCm copies each run.
-    if cfg!(feature = "rocm")
-        || injects.len() < GATHERED_INJECTS
+    if injects.len() < GATHERED_INJECTS
         || !words
         || crate::device::alloc::is_capturing(stream)
     {
@@ -453,16 +457,9 @@ fn inject_tokens(
         }
         return Ok(());
     }
-    #[cfg(not(feature = "rocm"))]
-    return gather_injects(device, runs, tokens, injects);
-    #[cfg(feature = "rocm")]
-    {
-        let _ = runs;
-        Ok(())
-    }
+    gather_injects(device, runs, tokens, injects)
 }
 
-#[cfg(not(feature = "rocm"))]
 fn gather_injects(
     device: &crate::device::Context,
     (store, at): (&mut Buffer, u64),
@@ -579,11 +576,23 @@ pub struct Inputs {
     inject_runs: u64,
     /// The staged run table of [`inject_masks`] in the slab: a run a lane.
     mask_runs: u64,
-    /// Staged apart from the slab: their size is the groups', not the load's.
-    group_masks: Option<Buffer>,
-    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
-    outgrown: Vec<Buffer>,
+    /// Where the slab holds the fires' group masks, one stretch a ragged
+    /// attention: a body captured over them reads each fire's at the same
+    /// addresses.
+    group_masks: Option<GroupMasksAt>,
     staged_windows: Vec<u8>,
+}
+
+/// The slab's group-mask stretches: stretch `i` (the load's `i`th ragged
+/// attention) holds its byte offsets a group from `at + i * stride`, then
+/// its bits from `indptr_bytes` further on.
+#[derive(Debug, Clone, Copy)]
+struct GroupMasksAt {
+    at: u64,
+    feeds: u64,
+    stride: u64,
+    indptr_bytes: u64,
+    bits_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -616,6 +625,7 @@ impl Inputs {
         schedule_streams: &[Option<u32>],
         state_ids: u32,
         rs_page_tokens: Option<u32>,
+        group_mask_feeds: usize,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
@@ -681,11 +691,26 @@ impl Inputs {
             let replay_cap = rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
-                lanes: take(lanes * RS_LANE_BYTES),
+                lanes: take(rs_lane_table_bytes(lanes)),
                 pages: take(pages_cap * 8),
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
                 replay_cap,
+            }
+        });
+        // A group's mask is a bit a (query, key) pair of its rows, from a
+        // byte of its own: the groups' pairs are at most the fire's rows
+        // squared, and a byte apiece more rounds each group's up.
+        let group_masks = (group_mask_feeds > 0).then(|| {
+            let indptr_bytes = ((lanes + 1) * 8).next_multiple_of(ALIGN);
+            let bits_bytes = ((rows * rows).div_ceil(8) + lanes).next_multiple_of(ALIGN);
+            let stride = indptr_bytes + bits_bytes;
+            GroupMasksAt {
+                at: take(stride * group_mask_feeds as u64),
+                feeds: group_mask_feeds as u64,
+                stride,
+                indptr_bytes,
+                bits_bytes,
             }
         });
         let stage_bytes = take(0);
@@ -787,8 +812,7 @@ impl Inputs {
             max_rows: budget.max_tokens,
             inject_runs,
             mask_runs,
-            group_masks: None,
-            outgrown: Vec::new(),
+            group_masks,
             staged_windows: Vec::new(),
             plan_values: grants.len(),
             plans: Vec::new(),
@@ -1140,7 +1164,7 @@ impl Inputs {
                 let raw = unsafe {
                     core::slice::from_raw_parts(
                         lanes_tab.as_ptr().cast::<u8>(),
-                        lanes_tab.len() * RS_LANE_BYTES as usize,
+                        rs_lane_table_bytes(lanes_tab.len() as u64) as usize,
                     )
                 };
                 put(at.lanes, raw, "staged rs lanes")?;
@@ -1464,7 +1488,13 @@ impl Inputs {
 
         let rs = match (rs, rs_at) {
             (Some((pages, toks)), Some(at)) => {
-                copy(at.lanes, table_lanes.max(lanes) as usize * 16)?;
+                // A lane's whole `RsLane`, its extended-run place with it:
+                // a shorter copy leaves the last lanes' tails as an earlier
+                // fire staged them.
+                copy(
+                    at.lanes,
+                    rs_lane_table_bytes(u64::from(table_lanes.max(lanes))) as usize,
+                )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
                 Some(RsHandles {
@@ -1523,11 +1553,13 @@ impl Inputs {
         })
     }
 
-    /// Stages a fire's group masks: per mask its byte offsets a group, then
-    /// its bits. The offsets run to `table_lanes + 1` entries, as the
-    /// fire's group bounds do (`Staged::table_lanes`): the groups past the
-    /// fire's last are empty and repeat its last offset, so the kernel's
-    /// table is one entry a staged group.
+    /// Stages a fire's group masks, the `i`th ragged attention's into the
+    /// slab's `i`th stretch: its byte offsets a group, then its bits, at the
+    /// addresses every fire's take (a body reads them as data). The offsets
+    /// run to `table_lanes + 1` entries, as the fire's group bounds do
+    /// (`Staged::table_lanes`): the groups past the fire's last are empty
+    /// and repeat its last offset, so the kernel's table is one entry a
+    /// staged group.
     pub fn stage_group_masks(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -1541,67 +1573,55 @@ impl Inputs {
         if masks.is_empty() {
             return Ok(Vec::new());
         }
-        let mut image: Vec<u8> = Vec::new();
-        let mut placed = Vec::with_capacity(masks.len());
-        for (_, _, mask) in masks {
+        let Some(at) = self.group_masks else {
+            return Err(crate::error::Fault::Ceiling {
+                what: "group mask stretches, which this load reserved none of (no class it \
+                       serves reads a lane's group mask)",
+                need: masks.len() as u64,
+                have: 0,
+            });
+        };
+        if masks.len() as u64 > at.feeds {
+            return Err(crate::error::Fault::Ceiling {
+                what: "group mask stretches this load reserved, one a ragged attention",
+                need: masks.len() as u64,
+                have: at.feeds,
+            });
+        }
+        let offsets = u64::from(table_lanes) + 1;
+        let base = self.store.ptr();
+        let mut handles = Vec::with_capacity(masks.len());
+        for (slot, (q, kv, mask)) in masks.iter().enumerate() {
             // The kernels read a mask's offsets as 64-bit.
-            let indptr = image.len();
             let mut wide: Vec<i64> = mask.indptr.iter().map(|&at| i64::from(at)).collect();
             let last = wide.last().copied().unwrap_or(0);
-            wide.resize(wide.len().max(table_lanes as usize + 1), last);
-            image.extend_from_slice(i64_bytes_of(&wide));
-            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
-            let bits = image.len();
-            image.extend_from_slice(&mask.bits);
-            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
-            placed.push((indptr, bits));
-        }
-        if self
-            .group_masks
-            .as_ref()
-            .is_none_or(|held| held.bytes() < image.len())
-        {
-            let grown = Buffer::zeroed(image.len().next_power_of_two())?;
-            if let Some(old) = self.group_masks.replace(grown) {
-                self.outgrown.push(old);
+            wide.resize(wide.len().max(offsets as usize), last);
+            let indptr_need = wide.len() as u64 * 8;
+            let bits_need = mask.bits.len() as u64;
+            if indptr_need > at.indptr_bytes || bits_need > at.bits_bytes {
+                return Err(crate::error::Fault::Ceiling {
+                    what: "bytes of a group mask stretch this load reserved",
+                    need: indptr_need + bits_need,
+                    have: at.indptr_bytes + at.bits_bytes,
+                });
             }
+            let indptr = at.at + slot as u64 * at.stride;
+            let bits = indptr + at.indptr_bytes;
+            self.store.stage(stream, indptr, i64_bytes_of(&wide))?;
+            self.store.stage(stream, bits, &mask.bits)?;
+            handles.push(GroupMaskHandles {
+                q: *q,
+                kv: *kv,
+                bits: Tensor::new(
+                    base + bits,
+                    u32::try_from(at.bits_bytes).unwrap_or(u32::MAX),
+                    1,
+                    Dtype::U8,
+                ),
+                indptr: i64s(base + indptr, u32::try_from(wide.len()).unwrap_or(u32::MAX)),
+            });
         }
-        let buffer = self
-            .group_masks
-            .as_mut()
-            .expect("the group mask buffer was just sized");
-        buffer.stage(stream, 0, &image)?;
-        let base = buffer.ptr();
-        // A tensor's rows are a u32: a group mask past them is refused by
-        // name, never cut short.
-        let rows = |what: &str, len: usize| {
-            u32::try_from(len).map_err(|_| {
-                crate::error::Fault::program(
-                    "inputs::group_masks",
-                    format!("a group mask's {what} reach {len}, past the {} a table holds", u32::MAX),
-                )
-            })
-        };
-        masks
-            .iter()
-            .zip(placed)
-            .map(|((q, kv, mask), (indptr, bits))| {
-                Ok(GroupMaskHandles {
-                    q: *q,
-                    kv: *kv,
-                    bits: Tensor::new(
-                        base + bits as u64,
-                        rows("bytes", mask.bits.len().max(1))?,
-                        1,
-                        Dtype::U8,
-                    ),
-                    indptr: i64s(
-                        base + indptr as u64,
-                        rows("offsets", mask.indptr.len().max(table_lanes as usize + 1))?,
-                    ),
-                })
-            })
-            .collect()
+        Ok(handles)
     }
 
     #[must_use]
@@ -1662,5 +1682,25 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `u32` is `Copy`, no padding or niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(test)]
+mod rs_lane_table_tests {
+    use super::rs_lane_table_bytes;
+    use kernels_cuda::runtime::channel::RsLane;
+
+    /// The staged lane table is the lanes' `RsLane`s byte for byte: what the
+    /// slab lays and a fire copies is what the table's lanes take, every
+    /// field to the last lane's `ext`.
+    #[test]
+    fn the_staged_rs_lane_table_is_its_lanes_whole() {
+        let lanes = [RsLane::INERT; 67];
+        assert_eq!(
+            rs_lane_table_bytes(lanes.len() as u64) as usize,
+            std::mem::size_of_val(&lanes)
+        );
+        let last = std::ptr::addr_of!(lanes[66].ext) as usize - lanes.as_ptr() as usize;
+        assert!(last + 4 <= rs_lane_table_bytes(lanes.len() as u64) as usize);
     }
 }

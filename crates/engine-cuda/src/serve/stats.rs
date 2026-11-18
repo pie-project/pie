@@ -26,9 +26,15 @@ impl Shell {
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
+        // A load with no staging attention never asks its width.
+        let stages = self.staging.contains(&true);
         crate::window::Staging {
             regions: &self.staging,
-            from: self.device.ctx().tuning().compressed_prefill_from,
+            from: if stages {
+                self.device.ctx().tuning().compressed_prefill_from()
+            } else {
+                0
+            },
         }
     }
 
@@ -94,9 +100,22 @@ impl Shell {
         self.graphs
     }
 
+    /// The rungs this load weighed its top by and the estimate it weighed
+    /// them with: what a check of the estimate reads.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
+    }
+
+    /// The key of the body the last fire replayed (`None` till one has).
+    #[must_use]
+    pub fn replayed_body(&self) -> Option<&record::BodyKey> {
+        self.cache.replayed()
     }
 
     #[must_use]
@@ -311,6 +330,13 @@ impl Shell {
     /// From here on lanes name their slots by slot ref.
     pub fn take_refs(&mut self) {
         self.pools.take_refs();
+    }
+
+    /// The record a lane bound to none reads and writes, where lanes name
+    /// refs and the load holds state: the null record, ref 0.
+    #[must_use]
+    pub fn null_record(&self) -> Option<u32> {
+        (self.pools.by_refs() && self.pools.has_state()).then_some(0)
     }
 
     /// Copies a working set's recurrent record from slot `src` onto `dst`,

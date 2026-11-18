@@ -39,36 +39,16 @@ pub struct FireLimits {
     pub max_readouts: u32,
 }
 
+/// What a load states beside its chunk pool ([`ChunkFacts`], which holds
+/// every count, size and tier of its state).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolFacts {
-    pub kv_pages: u32,
-    pub kv_page_size: u32,
-    pub state_slots: u32,
-    pub state_slot_bytes: u64,
-    /// Buffer pages of `kv_page_size` unfolded rows, a pool beside the state
-    /// slots.
-    #[serde(default)]
-    pub buffer_pages: u32,
     pub adapter_banks: u32,
-    /// The window the model's sliding rows are read through; zero when it
-    /// declares no windowed row.
+    /// The window the model's sliding rows are read through, a fact of the
+    /// model: an engine that pages its sliding rows in full states no window
+    /// list for it. Zero when the model declares no windowed row.
     #[serde(default)]
     pub window_tokens: u32,
-    /// The tiers below the device: host pages kv can be suspended into by
-    /// `kv_copy`, and slot-file pages `kv_copy` serves to and from
-    /// `MemoryDomain::LocalDisk`. Zero means the engine serves no such
-    /// copies.
-    #[serde(default)]
-    pub host_kv_pages: u32,
-    #[serde(default)]
-    pub disk_kv_pages: u32,
-    /// The slot files are kept across runs (`disk_kv_persistent`).
-    #[serde(default)]
-    pub disk_kv_persistent: bool,
-    /// And what they held when the last run left is there still: they were
-    /// found with the meta this load would write.
-    #[serde(default)]
-    pub disk_kv_kept: bool,
     /// The engine would rather a lane already decoding claim its next pages
     /// before a prompt waiting to be seated does, and a prompt wait for a
     /// lane to finish rather than suspend one. False keeps the runtime's
@@ -85,19 +65,6 @@ pub struct PoolFacts {
     /// apart, than a wave start together and run to its end together.
     #[serde(default)]
     pub seat_spread: bool,
-}
-
-impl PoolFacts {
-    /// Keeps only the tier capacity every rank of `ranks` has: a group moves
-    /// what all of them can hold.
-    pub fn least_tiers(&mut self, ranks: impl Iterator<Item = PoolFacts>) {
-        for rank in ranks {
-            self.host_kv_pages = self.host_kv_pages.min(rank.host_kv_pages);
-            self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
-            self.disk_kv_persistent &= rank.disk_kv_persistent;
-            self.disk_kv_kept &= rank.disk_kv_kept;
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

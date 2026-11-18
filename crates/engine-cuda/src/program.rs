@@ -42,6 +42,26 @@ struct Batch {
 }
 
 impl Program {
+    /// Whether it reads a capturing lane's rows (`crate::scores`).
+    #[must_use]
+    pub fn reads_scores(&self) -> bool {
+        self.plan
+            .outputs()
+            .iter()
+            .any(|(name, _)| crate::scores::captured(name))
+    }
+
+    /// What an instance keeps in the pool: its item, and past it a
+    /// capturing lane's rows of `score_bytes` where it reads them.
+    fn held(&self, score_bytes: u64) -> Held {
+        let held = Held::of(&self.plan.package.channels);
+        if self.reads_scores() {
+            held.with_scores(score_bytes)
+        } else {
+            held
+        }
+    }
+
     fn batch(&mut self, extents: Extents) -> Result<&mut Batch> {
         if let Some(at) = self
             .batches
@@ -191,6 +211,9 @@ pub struct Plane {
     /// The engine's lane arenas, where a sampler's blocks meet
     /// ([`launch::Arenas`]): laid at load ([`Plane::set_arenas`]).
     arenas: launch::Arenas,
+    /// A capturing lane's rows, which a program reading them keeps in its
+    /// instance's item (`crate::scores`); 0 where the load captures none.
+    score_bytes: u64,
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
@@ -244,6 +267,38 @@ impl FireBytes {
     }
 }
 
+/// A program's registration between [`Plane::prepare`] and
+/// [`Plane::finish`]: what its build makes, off the engine's thread.
+#[derive(Debug)]
+pub struct Pending {
+    hash: u64,
+    work: Work,
+}
+
+#[derive(Debug)]
+enum Work {
+    /// The plane held the program when it was prepared.
+    Registered,
+    Planned {
+        plan: Box<ExecPlan>,
+        planned: Box<compile::Planned>,
+        built: std::result::Result<(), eta_exec::Failure>,
+    },
+}
+
+impl Pending {
+    /// Compiles, or reads from disk, the regions the plane holds no code
+    /// for: NVRTC (hiprtc) and the kernel cache's files, nothing of the
+    /// engine's and no context, so any thread runs it.
+    pub fn build(&mut self) {
+        if let Work::Planned { planned, built, .. } = &mut self.work
+            && let compile::Planned::Build(build) = planned.as_mut()
+        {
+            *built = build.build();
+        }
+    }
+}
+
 impl Default for Plane {
     fn default() -> Plane {
         Plane::new(Disk::disabled())
@@ -273,6 +328,7 @@ impl Plane {
             term: engine::GuestTerm::default(),
             laid: Vec::new(),
             arenas: launch::Arenas::default(),
+            score_bytes: 0,
         }
     }
 
@@ -283,6 +339,18 @@ impl Plane {
     }
 
     /// The lane arenas the load laid.
+    /// A capturing lane's rows take `bytes` of a reader's item.
+    pub fn set_score_bytes(&mut self, bytes: u64) {
+        self.score_bytes = bytes;
+    }
+
+    /// Where instance `id`'s capturing lane's rows lie now, its key row
+    /// first; `None` for an instance whose program reads none.
+    #[must_use]
+    pub fn score_rows(&self, id: InstanceId) -> Option<u64> {
+        self.instances.get(&id)?.scores
+    }
+
     pub fn set_arenas(&mut self, arenas: launch::Arenas) {
         self.arenas = arenas;
     }
@@ -447,35 +515,89 @@ impl Plane {
         Ok(())
     }
 
+    /// A program's registration, whole: [`Plane::prepare`], its build and
+    /// [`Plane::finish`] on this thread.
     pub fn register(
         &mut self,
         context: &Context,
         registration: &ProgramRegistration,
     ) -> Result<ProgramId> {
-        if let Some(&existing) = self.by_hash.get(&registration.program_hash) {
-            return Ok(existing);
+        let mut pending = self.prepare(context, registration)?;
+        pending.build();
+        self.finish(pending)
+    }
+
+    /// A program's registration, first step, on the engine's thread: the
+    /// program adopted and its build planned ([`compile::Cache::plan`]).
+    /// The build ([`Pending::build`]) runs on any thread; the program is
+    /// registered at [`Plane::finish`].
+    pub fn prepare(
+        &mut self,
+        context: &Context,
+        registration: &ProgramRegistration,
+    ) -> Result<Pending> {
+        if self.by_hash.contains_key(&registration.program_hash) {
+            return Ok(Pending {
+                hash: registration.program_hash,
+                work: Work::Registered,
+            });
         }
         let plan = adopt_launch_package_with(registration.launch.clone(), Boundaries::CUDA)?;
-        let compiled = self.cache.compile(
+        let planned = self.cache.plan(
             registration.program_hash,
             &plan,
             &registration.emitted_kernels,
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
+        Ok(Pending {
+            hash: registration.program_hash,
+            work: Work::Planned {
+                plan: Box::new(plan),
+                planned: Box::new(planned),
+                built: Ok(()),
+            },
+        })
+    }
+
+    /// A program's registration, last step, on the engine's thread: its
+    /// regions' modules loaded and the program registered. A program
+    /// registered since it was prepared is that one.
+    pub fn finish(&mut self, pending: Pending) -> Result<ProgramId> {
+        if let Some(&existing) = self.by_hash.get(&pending.hash) {
+            return Ok(existing);
+        }
+        let Work::Planned {
+            plan,
+            planned,
+            built,
+        } = pending.work
+        else {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "program {:#x} was registered and closed since",
+                    pending.hash
+                ),
+            ));
+        };
+        let compiled = match *planned {
+            compile::Planned::Ready(compiled) => compiled,
+            compile::Planned::Build(build) => self.cache.install(build, built)?,
+        };
         let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
             id,
             Program {
                 id,
-                hash: registration.program_hash,
-                plan,
+                hash: pending.hash,
+                plan: *plan,
                 compiled,
                 batches: Vec::new(),
             },
         );
-        self.by_hash.insert(registration.program_hash, id);
+        self.by_hash.insert(pending.hash, id);
         Ok(id)
     }
 
@@ -505,7 +627,9 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         program.batch(extents)?;
         let program = &*program;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let held = program.held(self.score_bytes);
+        let place = slots.place(&held, span)?;
+        let scores = held.score_at.map(|at| place.instance + at);
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let mut session = match Session::bind(
@@ -537,6 +661,7 @@ impl Plane {
                 geometry,
                 ids: ids.to_vec(),
                 slots,
+                scores,
             },
         );
         Ok(id)
@@ -546,7 +671,7 @@ impl Plane {
     pub fn held(&self, program_id: ProgramId) -> Result<Held> {
         self.programs
             .get(&program_id)
-            .map(|program| Held::of(&program.plan.package.channels))
+            .map(|program| program.held(self.score_bytes))
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
@@ -557,9 +682,9 @@ impl Plane {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
-            let place = bound
-                .slots
-                .place(&Held::of(&program.plan.package.channels), span)?;
+            let held = program.held(self.score_bytes);
+            let place = bound.slots.place(&held, span)?;
+            bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
         }
         Ok(())
@@ -575,7 +700,9 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program("program::plane", format!("instance {id}'s program is gone"))
         })?;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let held = program.held(self.score_bytes);
+        let place = slots.place(&held, span)?;
+        bound.scores = held.score_at.map(|at| place.instance + at);
         bound.session.rebase(&place)?;
         bound.slots = slots;
         Ok(())
@@ -1132,6 +1259,9 @@ struct Bound {
     geometry: GeometryClass,
     ids: Vec<ChannelId>,
     slots: Slots,
+    /// Where its lane's captured score rows lie now, for a program that
+    /// reads them.
+    scores: Option<u64>,
 }
 
 /// The address of a guest item of the stated bytes in the named slots of a

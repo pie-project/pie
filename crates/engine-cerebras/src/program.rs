@@ -93,20 +93,49 @@ pub struct Plane {
 
 impl Plane {
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
+        self.finish(Plane::adopt(registration))
+    }
+
+    /// A registration's compile, on any thread: the program adopted, or
+    /// why it is refused, by its hash.
+    pub fn adopt(registration: &ProgramRegistration) -> Result<ExecPlan, Refusal> {
+        let hash = registration.program_hash;
+        let plan = eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
+            Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
+        })?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
-                registration.program_hash,
+                "program 0x{hash:016x} calls a semantic boundary this backend does not implement: {}",
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
+        Ok(plan)
+    }
+
+    /// A registration's last step, on the engine's thread: the adopted
+    /// program's id, or its compile's refusal.
+    pub fn finish(&mut self, adopted: Result<ExecPlan, Refusal>) -> Result<ProgramId, Refusal> {
+        let plan = adopted?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
         tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
+    }
+
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        Ok(())
     }
 
     #[must_use]
@@ -709,7 +738,11 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
+        Dtype::Bool => Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
@@ -717,16 +750,15 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
     })
 }
 
-fn runs_of(row: &[u8]) -> Vec<u32> {
+fn runs_of(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
@@ -817,7 +849,7 @@ impl Plane {
                         value.dtype()
                     )));
                 };
-                out.mask = Some(cells.into_iter().map(|cell| cell != 0).collect());
+                out.mask = Some(cells);
                 continue;
             }
             let slot = match binding.port {

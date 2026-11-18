@@ -103,6 +103,10 @@ pub(super) enum LaneCommit {
     },
 }
 
+/// The lanes a frame settled inside `submit` faulted, step by step, as its
+/// engine told them before `submit` returned.
+type InlineFaults = Arc<std::sync::Mutex<Vec<(usize, Vec<::engine::LaneFault>)>>>;
+
 const LANE_PANICKED: &str = "the engine lane panicked serving this request";
 const NO_BACKEND: &str = "engine has no backend installed";
 
@@ -138,7 +142,8 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             .enumerate()
             .find_map(|(at, lane)| {
                 let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
-                    .fixed
+                    .record
+                    .pieces()
                     .iter()
                     .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
                     .collect();
@@ -181,7 +186,10 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::Pool { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
-                QueuedItem::RegisterProgram { response, .. } => {
+                QueuedItem::PrepareProgram { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
+                QueuedItem::FinishProgram { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
                 QueuedItem::FireFacts { response, .. } => {
@@ -375,22 +383,20 @@ impl Lane {
             HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
+        let inline_faults: InlineFaults = Arc::default();
         if let Some(engine) = engine.as_mut() {
             if let Err(error) = engine.bind_thread() {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
             engine.on_tapped(crate::offload::stream::sink());
             if engine.settles_asynchronously() {
-                engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
+                engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, mut outcome: engine::StepOutcome| {
                     // What lanes wrote is kept before their step is published
                     // settled, so the fires that asked find it.
-                    let outcome = match outcome {
-                        engine::StepOutcome::Wrote(writes) => {
-                            crate::pipeline::fire::record_kv_writes(writes);
-                            engine::StepOutcome::Committed
-                        }
-                        outcome => outcome,
-                    };
+                    let writes = std::mem::take(&mut outcome.wrote);
+                    if !writes.is_empty() {
+                        crate::pipeline::fire::record_kv_writes(writes);
+                    }
                     let _ = landed_tx.send(LaneRequest::Landed {
                         frame: at.frame,
                         step: at.step,
@@ -399,11 +405,19 @@ impl Lane {
                 }));
             } else {
                 // A frame settled inside `submit` answers through its
-                // result. What its lanes wrote is told here before `submit`
-                // returns, so it is kept before the frame's cells settle.
-                engine.on_complete(std::sync::Arc::new(|_, outcome| {
-                    if let engine::StepOutcome::Wrote(writes) = outcome {
-                        crate::pipeline::fire::record_kv_writes(writes);
+                // result. What its lanes wrote, and which faulted, is told
+                // here before `submit` returns, so it is kept before the
+                // frame's cells settle.
+                let faulted = Arc::clone(&inline_faults);
+                engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                    if !outcome.wrote.is_empty() {
+                        crate::pipeline::fire::record_kv_writes(outcome.wrote);
+                    }
+                    if !outcome.faulted.is_empty() {
+                        faulted
+                            .lock()
+                            .unwrap()
+                            .push((at.step as usize, outcome.faulted));
                     }
                 }));
             }
@@ -463,6 +477,7 @@ impl Lane {
                                         &mut stash,
                                         &broker,
                                         &settlements,
+                                        &inline_faults,
                                         &mut landed_instances,
                                     )
                                 })
@@ -562,7 +577,8 @@ impl Lane {
             | QueuedItem::CloseChannels { .. }
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
-            | QueuedItem::RegisterProgram { .. }
+            | QueuedItem::PrepareProgram { .. }
+            | QueuedItem::FinishProgram { .. }
             | QueuedItem::FireFacts { .. }
             | QueuedItem::StandingAfter { .. } => LaneCommit::None,
         }
@@ -601,9 +617,12 @@ impl Lane {
         stash: &mut Option<LaneRequest>,
         broker: &crate::engine::CompletionBroker,
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
+        inline_faults: &InlineFaults,
         landed: &mut HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
+
+        inline_faults.lock().unwrap().clear();
 
         if stash.is_none()
             && let Ok(queued) = launch_rx.try_recv()
@@ -679,8 +698,26 @@ impl Lane {
         }
 
         if !asynchronous {
-            for step in &frame.steps {
-                completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
+            // The lanes the engine told faulted fail their own fires; every
+            // other fire of the frame commits.
+            let faulted = std::mem::take(&mut *inline_faults.lock().unwrap());
+            for (at, step) in frame.steps.iter().enumerate() {
+                let faults: Vec<::engine::LaneFault> = faulted
+                    .iter()
+                    .filter(|(step, _)| *step == at)
+                    .flat_map(|(_, faults)| faults.iter().cloned())
+                    .collect();
+                if faults.is_empty() {
+                    completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
+                } else {
+                    completion::settle_fires(
+                        &step.terminal_cells,
+                        &step.completions,
+                        &step.member_lanes,
+                        &faults,
+                        "frame settle",
+                    );
+                }
             }
             return Ok(SubmissionCompletion::ready());
         }
@@ -694,6 +731,7 @@ impl Lane {
             .map(|(step, wakes)| completion::LandingStep {
                 cells: step.terminal_cells.clone(),
                 completions: step.completions.clone(),
+                member_lanes: step.member_lanes.clone(),
                 wakes,
             })
             .collect();
@@ -749,15 +787,30 @@ impl Lane {
                     }
                 }
             }
-            QueuedItem::RegisterProgram { program, response } => {
+            QueuedItem::PrepareProgram { program, response } => {
+                // Its host codegen ran off this thread before it was sent.
+                let prepared =
+                    backend(engine).and_then(|engine| Ok(engine.prepare_program(&program)?));
+                let _ = response.send(prepared);
+                LaneCommit::None
+            }
+            QueuedItem::FinishProgram { prepared, response } => {
                 let registered = backend(engine).and_then(|engine| {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
-                    let program_id = engine.register_program(plan)?;
+                    let program_id = engine.finish_program(prepared)?;
                     // What an instance of it holds in the pool, asked once
-                    // at registration.
-                    if let Some(roles) = roles_of(engine_idx) {
-                        crate::store::roles::learn_program(&roles, &**engine, program_id)?;
+                    // at registration. A program whose facts are not
+                    // learned is released: the registration fails whole.
+                    if let Some(roles) = roles_of(engine_idx)
+                        && let Err(error) =
+                            crate::store::roles::learn_program(&roles, &**engine, program_id)
+                    {
+                        let released = engine.close_program(program_id);
+                        return Err(match released {
+                            Ok(()) => anyhow!("its facts: {error}; released"),
+                            Err(also) => anyhow!(
+                                "its facts: {error}; and releasing program {program_id}: {also}"
+                            ),
+                        });
                     }
                     Ok(program_id)
                 });

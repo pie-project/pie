@@ -69,7 +69,7 @@ impl Run<'_> {
                             i,
                             k,
                             linear::skinny::Epilogue::Geglu,
-                            self.ctx().tuning().gemm_skinny_rows,
+                            self.ctx().tuning().gemm_skinny_rows(),
                         )
                     {
                         return linear::skinny::skinny_bf16(
@@ -221,7 +221,7 @@ impl Run<'_> {
                         n,
                         k,
                         epilogue,
-                        self.ctx().tuning().gemm_skinny_rows,
+                        self.ctx().tuning().gemm_skinny_rows(),
                     ) {
                         return linear::skinny::skinny_bf16(
                             self.ctx(),
@@ -314,7 +314,7 @@ impl Run<'_> {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from()
                         || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
                         linear::affine::tiled::matmul
@@ -337,7 +337,7 @@ impl Run<'_> {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from()
                         || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
                         linear::affine::tiled::lm_head
@@ -1240,7 +1240,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::matmul_via_dense
                 } else {
                     linear::affine::matmul
@@ -1275,7 +1275,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::lm_head_via_dense
                 } else {
                     linear::affine::lm_head

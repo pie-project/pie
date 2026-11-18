@@ -396,12 +396,12 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         page_size: 16,
         context: 64,
         slots: 4,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            pin: Some((Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
         cache_dir: None,
@@ -673,12 +673,12 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         page_size: 16,
         context: 64,
         slots: 4,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            pin: Some((Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
         cache_dir: None,

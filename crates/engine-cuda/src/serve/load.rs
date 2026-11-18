@@ -14,12 +14,12 @@ use crate::exports::{
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
 use crate::record::Bodies as GraphCache;
-use crate::store::Pools;
 use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
+use crate::store::{KvSize, Pools, StatedKv};
 use crate::weights::Weights;
 
-use super::{Boot, Golden, Graphs, Released, Shell};
+use super::{Boot, Golden, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -45,62 +45,64 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // What the card may hold while this load runs, resolved here before the
     // load takes anything: every later reading of its room is under it.
     let ceiling = crate::store::load_ceiling(boot.allowance, true)?;
+    let (major, minor) = device.capability();
+    let measured = crate::chip::facts(
+        u32::try_from(major).unwrap_or(0),
+        u32::try_from(minor).unwrap_or(0),
+        device.device().num_sm,
+    );
+    let (resolved, report) =
+        crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
     let chip = match boot.knobs.chip.clone() {
-        Some(chip) => chip,
+        // A pinned profile pins decisions, not the device: the rates it
+        // leaves unstated are this device's, as its own profile states them.
+        Some(chip) => {
+            let mut tuned = resolved.tuned().clone();
+            tuned.lay(chip.tuned());
+            chip.with_tuned(tuned)
+        }
         None => {
-            let (major, minor) = device.capability();
-            let measured = crate::chip::facts(
-                u32::try_from(major).unwrap_or(0),
-                u32::try_from(minor).unwrap_or(0),
-                device.device().num_sm,
-            );
-            let (chip, report) =
-                crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
             crate::chip::SHELF.tell_untuned(device.name(), &report);
-            chip
+            resolved
         }
     };
+    // A device whose profile lacks the roofline's constants measures them
+    // here, before ready, and keeps them in the user's profile.
+    let room = {
+        let (free, total) = crate::store::device_memory()?;
+        crate::device::elastic::room_under(ceiling, free, total)
+    };
+    let chip = crate::rates::ensure(
+        chip,
+        boot.ordinal,
+        device.name(),
+        &measured,
+        boot.knobs.profiles.as_deref(),
+        boot.cache_dir,
+        room,
+    )
+    .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
-    #[cfg(feature = "cuda")]
-    {
-        let user = boot
-            .knobs
-            .profiles
-            .as_deref()
-            .map(|profiles| crate::chip::user_gemm_table(profiles, device.name()));
-        let tactics = kernels_cuda::linear::gemm::install_tactics(
-            crate::chip::gemm_table(device.name()),
-            user,
-        );
-        if let Some((table, here)) = &tactics.stale {
-            eprintln!(
-                "engine-cuda: a dense GEMM tactic table is not read: it was timed under \
-                 `{table}`, and this is `{here}`; `pie tune` on this machine times it again"
-            );
-        }
-        eprintln!(
-            "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
-             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
-            tactics.from_profile, tactics.from_user,
-        );
-    }
     let engine = crate::chip::Engine::of(&chip);
+    // The most rows one prompt lays: its context, where the model keeps a
+    // lane's rows (kv or recurrent state); a model that keeps none (a
+    // diffusion transformer's plan) bounds a lane's rows by nothing the
+    // context sizes, only by the rows the load states. Every rung of the
+    // lattice to it is a candidate: the fire top (`engine::load::fire_top`)
+    // is chosen among them below, that bound and memory its only bounds. A
+    // check's load sized for one kind of its fires lays the rungs to their
+    // rows.
+    let prompt_rows = if boot.trace.caches.is_empty() && boot.budget.max_tokens > 0 {
+        boot.budget.max_tokens
+    } else {
+        boot.context.max(1)
+    };
+    let lattice_top = match boot.knobs.every_rung {
+        Some(super::EveryRung::To(rows)) => rows,
+        _ => prompt_rows,
+    };
     if boot.budget.max_tokens == 0 {
-        let params: u64 = boot
-            .trace
-            .params
-            .iter()
-            .map(|p| p.shape.iter().product::<u64>())
-            .sum();
-        boot.budget.max_tokens = match engine.forward_tokens {
-            0 => crate::api::DEFAULT_FORWARD_TOKENS,
-            tokens
-                if params < 2 << 30 || sparse_experts(&boot.trace) || !recurrent(&boot.trace) =>
-            {
-                tokens.max(crate::api::DEFAULT_FORWARD_TOKENS)
-            }
-            tokens => tokens,
-        };
+        boot.budget.max_tokens = lattice_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
         // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -128,7 +130,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     }
     // So do the routed banks it streams an expert at a time.
-    if !boot.knobs.diagnostics.dense_weights && !boot.knobs.diagnostics.dense_experts {
+    if !boot.knobs.dense_weights() && !boot.knobs.diagnostics.dense_experts {
         let banks = crate::store::layout::streamed_experts(&boot.trace);
         match host_copy(boot, &banks)? {
             HostCopy::Filed => {
@@ -152,6 +154,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
+    // Unstated, a load's fires are rungs of the lattice its rates were timed
+    // at: asked other tokens (the walk fit, `engine.fire_rows`, a stated
+    // `max_forward_tokens`), its top is the rung at or below them.
+    if stated_buckets.is_empty() {
+        boot.budget.max_tokens =
+            crate::api::on_lattice(&engine, lattice_top, boot.budget.max_tokens);
+    }
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
         boot.budget.max_tokens,
@@ -176,12 +185,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let tuning = kernels_cuda::tuning::Tuning::of(&chip);
         boot.trace = crate::grouped_decode::rewrite_with(
             boot.trace.clone(),
-            tuning.decode_grouped_prefill_from,
-            tuning.decode_grouped_prefill_lse,
-            tuning.decode_grouped_prefill_window,
+            tuning.decode_grouped_prefill_from(),
+            tuning.decode_grouped_prefill_lse(),
+            tuning.decode_grouped_prefill_window(),
             kernels_cuda::attn::decode_gqa::Gate::of(tuning),
         );
-        boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
+        boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), || tuning.ssm_gdn_out_bf16());
     }
     // A join's independent branches side by side, where the profile forks
     // them onto side streams (`compiler.branches`).
@@ -193,8 +202,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // a product's epilogue is its contraction skeleton's.
     #[cfg(not(feature = "rocm"))]
     let anchored = if profile.synth_anchors && boot.world.size == 1 {
-        let skinny =
-            !profile.synth_regions || kernels_cuda::tuning::Tuning::of(&chip).gemm_skinny_rows > 0;
+        let skinny = !profile.synth_regions
+            || kernels_cuda::tuning::Tuning::of(&chip).gemm_skinny_rows() > 0;
         let (folded, anchored) = crate::synth::fold_anchors_with(boot.trace.clone(), skinny);
         boot.trace = folded;
         anchored
@@ -231,7 +240,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the pinned host tier: a row not cached is read from it in place. Told
     // of the trace as the load runs it: a table whose gather a rewrite
     // above folded into another op is read whole, and stays on the device.
-    if !boot.knobs.diagnostics.dense_weights {
+    if !boot.knobs.dense_weights() {
         let streamed = crate::store::layout::streamed_rows(&boot.trace);
         match host_copy(boot, &streamed)? {
             HostCopy::Filed => {
@@ -316,9 +325,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     let asked_tokens = boot.budget.max_tokens;
     let asked = boot.budget.clone();
-    let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
     let window = crate::store::window_of(&boot.trace)?;
-    let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
+    // A fire of `tokens`' working set (the activation arena, the attention
+    // workspaces and one fire's windowed kv rows) and the launches its
+    // compiled plan issues; the compile's error where it does not compile.
+    let laid = |tokens: u32,
+                voxels: &Option<poem_compiler::VoxelLadder>|
+     -> std::result::Result<(u64, u32), String> {
         let windowed = Paging::of(boot.page_size, boot.context, boot.slots, 1)
             .ok()
             .and_then(|paging| {
@@ -326,12 +339,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             })
             .unwrap_or(u64::MAX);
         let budget = budget_at(tokens);
-        let Ok(compiled) =
+        let compiled =
             poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
-        else {
-            return u64::MAX;
-        };
-        compiled
+                .map_err(|e| e.to_string())?;
+        let bytes = compiled
             .arena
             .bytes
             .saturating_add(crate::inputs::attention_workspace_bytes(
@@ -341,21 +352,95 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 device.toggles(),
                 &crate::exports::schedule_streams(&boot.trace, &compiled),
             ))
-            .saturating_add(windowed)
+            .saturating_add(windowed);
+        let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+        Ok((bytes, launches))
     };
-    let working_at = |tokens: u32| working(tokens, &voxels);
+    let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
+        laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
+    };
+    // The fire top, the ruling's (`crate::top`, `engine::load::fire_top`):
+    // of every bucket of the asked lattice (to the context), each spanning
+    // its fire's working set and needing one sequence beside it, over the
+    // room the card has after the weight tier. The bodies are priced when
+    // they arm, ahead of the cache rows' fill (`store::holds`), and a card
+    // that holds none of them past the rung is refused there by name.
+    let weighed;
+    let tokens = {
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
+        let mut candidates = Vec::new();
+        for rung in budget_at(asked_tokens).buckets {
+            let plan = laid(rung, &voxels).map_err(|why| crate::top::no_plan(&why));
+            let sequence =
+                crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
+            candidates.push(crate::top::Candidate {
+                tokens: rung,
+                plan,
+                beside: sequence,
+            });
+        }
+        // The lanes one fire carries (`Shell::fire_lanes`): the runtime
+        // fires a wider wave as fires of this many, and a rung's check fire
+        // (`RungFacts::check_fire`) lays its rows over them.
+        let fire_lanes = match engine.fire_lanes {
+            0 => boot.budget.max_lanes,
+            cap => boot.budget.max_lanes.min(cap),
+        };
+        let rungs = crate::top::rung_facts(
+            &candidates,
+            boot.budget.max_lanes,
+            fire_lanes,
+            after_weights,
+            |rows| rows,
+        );
+        let counts = crate::top::counts(&boot.trace)?;
+        let row_tile = crate::top::row_tile(&chip);
+        let top = crate::top::choose(
+            &rungs,
+            after_weights,
+            prompt_rows,
+            &chip.rates(),
+            Some(row_tile.clone()),
+            device.name(),
+            &counts,
+        )?;
+        eprintln!(
+            "engine-cuda: {}",
+            engine::load::line_of(
+                &top,
+                top.tokens,
+                top.span_bytes,
+                after_weights,
+                chip.tuned()
+            )
+        );
+        weighed = engine::load::estimate(&counts, &chip.rates())
+            .ok()
+            .map(|mut estimate| {
+                estimate.rates = estimate.rates.with_row_tile(row_tile);
+                estimate
+            })
+            .map(|estimate| crate::top::Weighed {
+                rungs: rungs.clone(),
+                estimate,
+                live: after_weights,
+                fire_top: top.tokens,
+            });
+        let widest = crate::top::widest(&rungs).unwrap_or(top.tokens);
+        match boot.knobs.every_rung {
+            None => top.tokens,
+            // Past the top (`engine::load::check::laid_top`), so a top set
+            // too low shows in the check.
+            Some(super::EveryRung::PastTop) => {
+                let lattice: Vec<u32> = rungs.iter().map(|r| r.tokens).collect();
+                engine::load::check::laid_top(&lattice, top.tokens).min(widest)
+            }
+            Some(super::EveryRung::To(_)) => widest,
+        }
+    };
+    // The derived voxel rung's room is still the configured share of the
+    // card past the weights (`engine.working_set_percent`).
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
-    let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
-    // The halving can land a whole step short: the widest bucket of the asked
-    // lattice past it that still fits serves more rows a fire.
-    let tokens = budget_at(asked_tokens)
-        .buckets
-        .iter()
-        .copied()
-        .filter(|&rows| rows > tokens && rows < asked_tokens)
-        .rev()
-        .find(|&rows| working_at(rows) <= share)
-        .unwrap_or(tokens);
     let voxels = match voxels.clone() {
         Some(ladder) if derive_voxels => {
             let floor = ladder.max_clips;
@@ -382,18 +467,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         after_weights
             .saturating_sub(working(tokens, &voxels))
             .saturating_sub(seat)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
     });
     if tokens != asked_tokens {
-        eprintln!(
-            "engine-cuda: a fire of {asked_tokens} tokens is served at {tokens}: at \
-             {asked_tokens} the activation arena, attention workspaces and one fire's windowed \
-             kv rows take {} MiB of the \
-             {} MiB this card has after the weight tier under the load's allowance, and \
-             the cache rows, graph bodies and guest programs need the other half.",
-            working_at(asked_tokens) >> 20,
-            after_weights >> 20,
-        );
         boot.budget = budget_at(tokens);
     }
     boot.voxels = voxels;
@@ -492,21 +567,22 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         asked,
         stated_buckets: !stated_buckets.is_empty(),
         ceiling,
+        weighed,
     })
 }
 
 /// The token and lane budgets fitted to what the card has with the weights
 /// resident. What a fire's working set takes at those budgets (the
 /// activation arena, the attention workspaces, the decoded-weight tiles, the
-/// guests' programs, the capturing lanes' score planes and the readout
-/// indices) is held to half of the card past the weights, the half `bake`
-/// sizes the token budget against before the weights are down, and to what
-/// leaves one sequence and the bodies' floor beside it. The tile yields
-/// first, held to the widest plane fired at token rows (a plane past it is
-/// served by the fused-dequant arm), then the token budget halves toward its
-/// floor, then the lanes halve toward one, and what their cut frees grows the
-/// token budget back toward `asked`'s, the budget before `bake` cut it at the
-/// asked lanes; `Pools::fit_the_card` still refuses past that.
+/// guests' programs and the readout indices) is held to half of the card
+/// past the weights, the half `bake` sizes the token budget against before
+/// the weights are down, and to what leaves one sequence beside it. The
+/// tile yields first, held to the widest plane fired at token rows (a plane
+/// past it is served by the fused-dequant arm), then the token budget
+/// halves toward its floor, then the lanes halve toward one, and what their
+/// cut frees grows the token budget back toward `asked`'s, the budget
+/// before `bake` cut it at the asked lanes; `Pools::fit_the_card` still
+/// refuses past that.
 #[allow(clippy::too_many_arguments)]
 /// Where the weight cache's copy of a streamable weight lies off the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -700,14 +776,12 @@ fn refit(
                     .saturating_mul(8),
             )
     };
-    // What one sequence and the bodies' floor leave a fire, and within it the
+    // What one sequence leaves a fire, and within it the
     // half the cache rows are owed when the floors can still reach it.
     let room_at = |tokens: u32, owed: bool| -> Result<u64> {
         let sequence =
             crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, tokens))?;
-        let room = live
-            .saturating_sub(sequence)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+        let room = live.saturating_sub(sequence);
         Ok(if owed {
             room.min(live / 100 * u64::from(engine.working_set_percent))
         } else {
@@ -718,7 +792,7 @@ fn refit(
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
         let mut tokens = asked_tokens;
         while tokens > floor && working_at(asked_lanes, tokens, scoped) > room_at(tokens, owed)? {
-            tokens = (tokens / 2).max(floor);
+            tokens = crate::api::on_lattice(&engine, asked.max_tokens, tokens / 2).max(floor);
         }
         let room = room_at(tokens, owed)?;
         let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
@@ -728,14 +802,20 @@ fn refit(
         // 1024 rows at 1024 lanes, then the lanes to 512: one 717-token prompt a fire.
         // Back at 8192 rows: pf64-512 7.05k -> 10.35k tok/s (vLLM 9.03k at 1024
         // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
-        let mut tokens = tokens;
-        while lanes < asked_lanes && tokens < asked.max_tokens {
-            let wider = tokens.saturating_mul(2).min(asked.max_tokens);
-            if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
-                break;
-            }
-            tokens = wider;
-        }
+        // The rows grow back toward the top rung the load chose, never past it:
+        // the lattice's top above it is a rung the choice already weighed and
+        // passed over, and what the load reserved for (the activation span,
+        // the guests' carve) is the chosen top's.
+        let tokens = if lanes < asked_lanes {
+            widened(
+                tokens,
+                asked_tokens,
+                |rows| crate::api::on_lattice(&engine, asked.max_tokens, rows),
+                |wider| Ok(working_at(lanes, wider, scoped) <= room_at(wider, owed)?),
+            )?
+        } else {
+            tokens
+        };
         let room = room_at(tokens, owed)?;
         Ok((working_at(lanes, tokens, scoped) <= room).then_some((tokens, lanes)))
     };
@@ -774,9 +854,8 @@ fn refit(
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
          workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
-         rows are owed and what one sequence at the declared context and the bodies' floor \
-         need.",
-        asked.max_tokens,
+         rows are owed and what one sequence at the declared context needs.",
+        asked_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
     );
@@ -785,6 +864,26 @@ fn refit(
     let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, profile)?;
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
     Ok((compiled, budgets, tiles_of(&planes, scoped)))
+}
+
+/// The rows a fire whose lanes were cut grows back to: doubling on the
+/// lattice (`on`, the rung at or below) while the wider fire `fits`, up to
+/// `top`, the rung the load chose and reserved for, and never past it.
+fn widened(
+    tokens: u32,
+    top: u32,
+    on: impl Fn(u32) -> u32,
+    mut fits: impl FnMut(u32) -> Result<bool>,
+) -> Result<u32> {
+    let mut tokens = tokens;
+    while tokens < top {
+        let wider = on(tokens.saturating_mul(2).min(top));
+        if wider <= tokens || !fits(wider)? {
+            break;
+        }
+        tokens = wider;
+    }
+    Ok(tokens)
 }
 
 impl Shell {
@@ -809,6 +908,7 @@ impl Shell {
             asked,
             stated_buckets,
             ceiling,
+            weighed,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -834,21 +934,42 @@ impl Shell {
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
-        let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::room_under(ceiling, free_before, device_total)
-        });
-        let paging = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            crate::store::page_ceiling(&boot.trace, boot.page_size, boot.context, pool_bytes)?,
-        )?
-        .windowed(
-            crate::store::window_of(&boot.trace)?,
-            boot.budget.max_tokens,
-        )
-        .seated(boot.budget.max_lanes)
-        .spare(engine.window_spare);
+        // Stated tokens are the pages they fill; else every page the stated
+        // bytes, or the card's room before the weights land, could hold.
+        let pages = match boot.kv_budget {
+            Some(KvSize::Tokens(tokens)) => {
+                let pages = StatedKv::pages_for(tokens, boot.page_size);
+                let sequence = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
+                if pages < sequence {
+                    return Err(Fault::Residency(format!(
+                        "`[engine.memory] kv_device_tokens = {tokens}` fills {pages} kv pages \
+                         of {} tokens, and one sequence at the {}-token context takes \
+                         {sequence}; state at least {} tokens or a shorter `[engine] \
+                         max_context`",
+                        boot.page_size,
+                        boot.context,
+                        sequence * u64::from(boot.page_size),
+                    )));
+                }
+                pages
+            }
+            stated => crate::store::page_ceiling(
+                &boot.trace,
+                boot.page_size,
+                boot.context,
+                match stated {
+                    Some(KvSize::Bytes(bytes)) => bytes,
+                    _ => crate::device::elastic::room_under(ceiling, free_before, device_total),
+                },
+            )?,
+        };
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, pages)?
+            .windowed(
+                crate::store::window_of(&boot.trace)?,
+                boot.budget.max_tokens,
+            )
+            .seated(boot.budget.max_lanes)
+            .spare(engine.window_spare);
         // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
@@ -868,7 +989,10 @@ impl Shell {
             decoded_dense,
             &boot.trace,
             paging,
-            boot.kv_budget,
+            match boot.kv_budget {
+                Some(KvSize::Bytes(bytes)) => Some(bytes),
+                _ => None,
+            },
         )?;
 
         if boot.knobs.diagnostics.arm_trace {
@@ -901,7 +1025,7 @@ impl Shell {
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
+        if device.ctx().tuning().fp8_o_down() && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
         // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy;
@@ -909,35 +1033,44 @@ impl Shell {
         // rows carry their own exponents do.
         #[cfg(feature = "cuda")]
         if !kernels_cuda::linear::gemm_sm100::supported()
-            && (device.ctx().tuning().gemm_fp8_shadow
+            && (device.ctx().tuning().gemm_fp8_shadow()
                 || kernels_cuda::linear::moe::fp8_w8a8_capable())
         {
-            let mixed = !device.ctx().tuning().gemm_fp8_shadow;
+            let mixed = !device.ctx().tuning().gemm_fp8_shadow();
             weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_mx && !kernels_cuda::linear::gemm_sm100::supported() {
+        if device.ctx().tuning().gemm_fp8_mx() && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.spread_fp8_dense(&boot.trace, device.stream())?;
         }
+        // A load with no MXFP4 bank asks nothing of the copies below.
+        #[cfg(feature = "cuda")]
+        let mxfp4 = boot
+            .trace
+            .params
+            .iter()
+            .any(|param| param.dtype == poem_ir::Dtype::Mxfp4);
         // `kernel.moe.mxfp4_fp8_from`: MXFP4 banks keep a block-FP8 copy.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().mxfp4_fp8_from > 0
+        if mxfp4
             && !kernels_cuda::linear::gemm_sm100::supported()
             && kernels_cuda::linear::moe::fp8_w8a8_capable()
+            && device.ctx().tuning().mxfp4_fp8_from() > 0
         {
             weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
         }
         // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().mxfp4_bf16_from > 0
+        if mxfp4
             && kernels_cuda::jit::cache::arch() == Some("sm_90")
+            && device.ctx().tuning().mxfp4_bf16_from() > 0
         {
             weights.copy_mxfp4_banks_bf16(
                 &boot.trace,
                 device.stream(),
-                device.ctx().tuning().mxfp4_bf16_down,
-                device.ctx().tuning().mxfp4_bf16_keep,
+                device.ctx().tuning().mxfp4_bf16_down(),
+                device.ctx().tuning().mxfp4_bf16_keep(),
             )?;
         }
         if boot.knobs.diagnostics.arm_trace {
@@ -946,6 +1079,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        let (graphs, recording) = boot.knobs.modes();
         let (compiled, budgets, tiles) = refit(
             &mut boot,
             &device,
@@ -1033,8 +1167,12 @@ impl Shell {
         // partials are sized for the lanes, not the widest fire's rows.
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
+        let stated_feeds = crate::exports::stated_feeds(&boot.trace, &feeds.ragged);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
+            plain: plain_of(
+                &landing,
+                &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
+            ),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
@@ -1109,7 +1247,7 @@ impl Shell {
             } else {
                 boot.residency.cached_experts()
             },
-            !boot.knobs.diagnostics.dense_weights,
+            !boot.knobs.dense_weights(),
             boot.knobs.diagnostics.one_window,
         )?;
         if boot.knobs.diagnostics.arm_trace {
@@ -1173,14 +1311,6 @@ impl Shell {
                 })
                 .collect(),
         );
-        // Committed whole: a fire reading out past one row a lane (a verify
-        // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.scores_from(&boot.trace).max(
-            compiled
-                .arena_forked
-                .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
-        );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
@@ -1191,18 +1321,14 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        // What each carve laid at the end reads before its scores.
-        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
-            .chain(compiled.arena_forked.as_ref())
-            .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
-            .collect();
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        // The arena is backed here, at load, out of the elastic pool the
-        // allowance leaves past the weights: one it does not hold refuses
-        // the load by name.
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs);
+        // The arena is backed here, at load, whole, out of the elastic pool
+        // the allowance leaves past the weights: every carve a fire lays,
+        // wherever in the span, and a fire reading out past one row a lane
+        // (a verify reads every row), so no fire grows it. One the pool
+        // does not hold refuses the load by name.
         arena
-            .ensure(&mut pools, unscored)
+            .ensure(&mut pools, arena_bytes)
             .map_err(|why| match why {
                 Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
                     Fault::Residency(format!(
@@ -1322,9 +1448,22 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A stretch a packing an attention stating a mask reads.
+            stated_feeds.len(),
         )?;
 
-        let exports = Exports::of(&boot.trace, &compiled)?;
+        let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
+        // A capturing lane's rows are its reader's; the fire stages only
+        // their addresses, one a lane of the widest window it lays.
+        let capture = crate::scores::CaptureLayout::of(
+            &exports,
+            boot.context,
+            boot.page_size,
+            crate::window::lane_capacity(boot.budget.max_lanes),
+        );
+        if let Some(layout) = &capture {
+            programs.set_score_bytes(layout.row_bytes());
+        }
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
@@ -1379,6 +1518,7 @@ impl Shell {
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
         let mut shell = Shell {
+            weighed,
             device,
             accounting,
             trace: boot.trace,
@@ -1405,6 +1545,7 @@ impl Shell {
             page_tables,
             masked,
             group_masked,
+            stated_feeds,
             wide,
             feeds,
             adapter_fact,
@@ -1422,12 +1563,13 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            capture,
             // Lent at the stand-in span until laid, as the readout rows
             // are: the size-only walk stages into it and copies nothing.
             expert_staged: expert_staging.at(crate::sizing::STAND_IN),
             expert_staging,
             exports,
-            graphs: engine.graphs,
+            graphs,
             copies: engine.copies,
             seated_first: engine.seated_first,
             seat_to_end: engine.seat_to_end,
@@ -1439,10 +1581,10 @@ impl Shell {
                 engine.prefill_lattice_from,
                 engine.prefill_lattice_steps,
             )),
-            pad: engine.recording.pad(),
+            pad: recording.pad(),
             golden_arm: Golden::Off,
-            bodies: engine.recording.bodies(),
-            bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies: recording.bodies(),
+            bodies_mem: 0,
             bodies_record: None,
             bodies_from_record: false,
             arming_at_load: false,
@@ -1456,6 +1598,7 @@ impl Shell {
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
+            arm_group_mask: false,
             arm_deferred: false,
             card: (0, 0),
             held_for_fires: 0,
@@ -1474,27 +1617,17 @@ impl Shell {
             tap_sink: None,
             airborne,
             owed: super::Owed::new(),
+            guest_faults: Vec::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        if !shell.graphs.records() {
+        if !shell.graphs.records() || !shell.bodies {
             eprintln!(
-                "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
-                 walks eagerly (~470 kernel launches of host time per decode step) \
-                 with nothing captured; a profile serves `on` with bodies",
-                match shell.graphs {
-                    Graphs::Off => "off",
-                    Graphs::Shaped => "shaped",
-                    Graphs::On => "on",
-                }
-            );
-        } else if !shell.bodies {
-            eprintln!(
-                "engine-cuda: engine.recording keeps no bodies under engine.graphs = on, a \
-                 diagnostic arm — bodies are the only recorded path, so every fire walks \
-                 eagerly (~470 kernel launches of host time per decode step) with nothing \
-                 captured; a profile serves `bodies`"
+                "engine-cuda: a test's pinned modes ({:?}, {recording:?}): every fire \
+                 walks eagerly (~470 kernel launches of host time per decode step) with \
+                 nothing captured",
+                shell.graphs
             );
         }
         // The cache rows are declared last, from what the card has left: once
@@ -1545,9 +1678,10 @@ impl Shell {
         }
         let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
         // The bodies are held what they took when this deployment last
-        // armed whole, where it is recorded; the configured `bodies_mem` is
-        // the ceiling and what a first boot holds. One number: arming's
-        // allowance is the hold.
+        // armed whole, where it is recorded; with no record, everything the
+        // card has past one working set, and the cache rows fill what they
+        // leave once they are captured. One number: arming's allowance is
+        // the hold, a load fact like the span, and no figure is chosen.
         let mut recorded = false;
         if shell.records_bodies()
             && let Some(dir) = boot.cache_dir
@@ -1566,16 +1700,15 @@ impl Shell {
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
                         "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, their captures {} \
-                         MiB, when this deployment last armed whole (bodies_mem {} MiB)",
-                        held.min(shell.bodies_mem) >> 20,
+                         MiB, when this deployment last armed whole",
+                        held >> 20,
                         measured.bodies,
                         measured.bytes >> 20,
                         measured.captured >> 20,
-                        shell.bodies_mem >> 20,
                     );
                 }
-                shell.bodies_from_record = held < shell.bodies_mem;
-                shell.bodies_mem = shell.bodies_mem.min(held);
+                shell.bodies_from_record = true;
+                shell.bodies_mem = held;
             }
             shell.bodies_record = Some(record);
         }
@@ -1584,13 +1717,7 @@ impl Shell {
         // in for the figure.
         shell.measuring =
             shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
-        let bodies = if shell.measuring {
-            crate::store::MEASURING
-        } else if shell.records_bodies() {
-            shell.bodies_mem as u64
-        } else {
-            0
-        };
+        let bodies = shell.bodies_hold();
         let resident = footprint(&shell);
         // What the kernels' scratch slabs take, walked size-only through
         // the compositions the lattice fires before the range is first
@@ -1659,27 +1786,10 @@ impl Shell {
                 shell.pools.fresh()
             );
         }
-        // The carves laid at the activation's end, backed where the range
-        // now lies (the fit may have reserved it anew).
-        shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
-        let afforded = fitted.bodies;
-        if shell.measuring {
-            // Arming is allowed all the card has past the least range.
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        } else if afforded < bodies {
-            eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
-                 with the weights, activations and inputs resident, one sequence at the declared \
-                 context and the guests' programs seated, {} MiB is left for the graph bodies \
-                 and the cache rows together; the rows take what the bodies leave of it once \
-                 they are captured.",
-                bodies >> 20,
-                afforded >> 20,
-                fitted.spare >> 20,
-            );
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        }
+        // Arming is allowed what the fit held the bodies: a record's figure,
+        // or all the card has past the least range.
+        shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         Ok(Staged {
             shell,
             rank: boot.world.rank,
@@ -1710,9 +1820,9 @@ impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
     /// the readout rows' table, the voxel store, the rs fold predicates and
-    /// the host-resident experts' staging and the guests' samplers' lane
-    /// arenas, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 6] {
+    /// the host-resident experts' staging, the guests' samplers' lane
+    /// arenas and the capture rows' tables, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 7] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
@@ -1720,6 +1830,9 @@ impl Shell {
             self.predicate.bytes(),
             self.expert_staging.bytes(),
             self.lane_arenas_bytes(),
+            self.capture
+                .as_ref()
+                .map_or(0, |layout| layout.table_bytes() as u64),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1739,8 +1852,16 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts + arenas;
+        let [
+            inputs,
+            readouts,
+            voxels,
+            predicates,
+            experts,
+            arenas,
+            scores,
+        ] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas + scores;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1758,6 +1879,12 @@ impl Shell {
             at: base + inputs + readouts + voxels + predicates + experts,
             bytes: arenas,
         });
+        if let Some(layout) = self.capture.as_mut() {
+            layout.lay(base + inputs + readouts + voxels + predicates + experts + arenas);
+        }
+        // The kernels a guest's wave fires are the engine's, not the
+        // program's: loaded here, before ready, so no first fire builds them.
+        kernels_cuda::runtime::channel::load_wave_kernels()?;
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",
@@ -1869,14 +1996,11 @@ impl Staged {
             // state's chunks then end where the activation starts, so what
             // a rung lends and what lies under it are one span.
             let fitted = shell.pools.fit_the_card(
-                shell.bodies_mem as u64,
+                shell.bodies_hold(),
                 shell.held_for_fires,
                 false,
                 &resident,
             )?;
-            // The fit may have reserved the range anew: the carves laid at
-            // the activation's end are backed where it now lies.
-            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
             fitted
         } else {
@@ -1887,7 +2011,7 @@ impl Staged {
             // load that records no bodies has fired none, and keeps the
             // whole span for its fires; one that arms later and lends no
             // rung keeps the bodies' allowance out as well.
-            let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+            let bodies = if deferred { shell.bodies_hold() } else { 0 };
             let settled = shell.records_bodies() && !deferred;
             shell
                 .pools
@@ -1902,6 +2026,21 @@ impl Staged {
         // driver's lock stalls no fire of this one's), and the pool the
         // runtime is stated is the pool the card backed.
         shell.back_whole()?;
+        if let Some(kv) = shell.pools.stated_kv() {
+            eprintln!(
+                "engine-cuda: kv_device_tokens = {}: the device pool holds {} kv pages of {} \
+                 tokens ({} asked), {} chunks of {} MiB: {} for the kv pages and the shapes \
+                 beside them, {} for the weights held whole",
+                kv.tokens,
+                shell.pools.paging().pages(),
+                kv.page_tokens,
+                kv.pages,
+                kv.chunks(),
+                kv.chunk_bytes >> 20,
+                kv.kv_chunks,
+                kv.weight_chunks,
+            );
+        }
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
@@ -1949,33 +2088,6 @@ impl Staged {
     }
 }
 
-/// Whether `trace` carries a recurrent state (a gated delta or Mamba
-/// mixer): the narrower profile fire serves those; a dense attention model's
-/// prefill GEMMs are compute-bound and run best at the full 8192 rows.
-fn recurrent(trace: &poem_ir::Trace) -> bool {
-    trace
-        .nodes
-        .iter()
-        .any(|node| matches!(node.op, poem_ir::Operation::Ssm(_)))
-}
-
-fn sparse_experts(trace: &poem_ir::Trace) -> bool {
-    let dims = |v: poem_ir::ValueId| match &trace.values[v.0 as usize].ty {
-        poem_ir::Ty::Tensor { shape, .. } => shape.clone(),
-        poem_ir::Ty::Struct(_) => Vec::new(),
-    };
-    trace.nodes.iter().any(|node| match node.op {
-        poem_ir::Operation::Linear(poem_ir::Linear::MoeSelect { bank, routes, .. }) => {
-            matches!(
-                (dims(bank).first(), dims(routes).last()),
-                (Some(poem_ir::Dim::Const(experts)), Some(poem_ir::Dim::Const(top_k)))
-                    if *experts > 2 * *top_k
-            )
-        }
-        _ => false,
-    })
-}
-
 fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
     Footprint {
         total: device_total,
@@ -1999,6 +2111,20 @@ impl Shell {
         &self.expert_staging
     }
 
+    /// What the fit holds the bodies ahead of the cache rows' fill: none on
+    /// a load that records none; what they took when this deployment last
+    /// armed whole, where that is recorded; else everything past one working
+    /// set ([`crate::store::MEASURING`]).
+    fn bodies_hold(&self) -> u64 {
+        if !self.records_bodies() {
+            0
+        } else if self.bodies_from_record {
+            self.bodies_mem as u64
+        } else {
+            crate::store::MEASURING
+        }
+    }
+
     /// The device's memory as this load holds it now ([`ledger`]).
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {
@@ -2017,7 +2143,6 @@ impl Shell {
         let fitted = self
             .pools
             .fit_the_card(hold, self.held_for_fires, false, &resident)?;
-        self.arena.ensure_rungs(&mut self.pools)?;
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;
@@ -2480,6 +2605,8 @@ pub(super) struct Baked {
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).
     pub(super) ceiling: u64,
+    /// The rungs the top was weighed of, and the estimate that weighed them.
+    pub(super) weighed: Option<crate::top::Weighed>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
@@ -2533,4 +2660,53 @@ fn activation_rungs(
         }
     }
     Ok(rungs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::widened;
+
+    /// A lattice to 13778, as the MI300X laid it.
+    const LATTICE: [u32; 21] = [
+        512, 1024, 2048, 2234, 2436, 2656, 2897, 3159, 3445, 3757, 4096, 4467, 4871, 5312, 5793,
+        6317, 6889, 7513, 8192, 9742, 13778,
+    ];
+
+    fn on(rows: u32) -> u32 {
+        LATTICE
+            .iter()
+            .copied()
+            .filter(|rung| *rung <= rows)
+            .max()
+            .unwrap_or(LATTICE[0])
+    }
+
+    /// A tight-budget load whose lanes were cut grows its fire back to the
+    /// top rung it chose (3445), not to the lattice's top (13778) that every
+    /// wider fire would also fit: what it reserved is the chosen top's.
+    #[test]
+    fn a_cut_fire_grows_back_to_the_chosen_top_and_no_further() {
+        let mut asked = Vec::new();
+        let rows = widened(1024, 3445, on, |wider| {
+            asked.push(wider);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(rows, 3445);
+        assert!(asked.iter().all(|wider| *wider <= 3445), "{asked:?}");
+    }
+
+    /// It stops at the widest rung that fits below the top.
+    #[test]
+    fn a_cut_fire_stops_where_the_wider_fire_does_not_fit() {
+        let rows = widened(512, 3445, on, |wider| Ok(wider <= 2048)).unwrap();
+        assert_eq!(rows, 2048);
+    }
+
+    /// At the top already, nothing widens.
+    #[test]
+    fn a_fire_at_its_top_stays() {
+        let rows = widened(3445, 3445, on, |_| panic!("nothing past the top is asked")).unwrap();
+        assert_eq!(rows, 3445);
+    }
 }

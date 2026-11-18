@@ -57,6 +57,56 @@ pub fn ring_facts(
     })
 }
 
+/// A registration prepared on the engine's thread ([`Plane::prepare_register`]):
+/// [`Registering::compile`] runs its compile on any thread.
+pub struct Registering {
+    hash: u64,
+    step: Step,
+}
+
+enum Step {
+    Registered(ProgramId),
+    Held(ExecPlan, Compiled),
+    Run(ExecPlan, compile::Job),
+}
+
+/// A registration compiled ([`Registering::compile`]), for
+/// [`Plane::finish_register`] on the engine's thread.
+pub struct Registered {
+    hash: u64,
+    step: Done,
+}
+
+enum Done {
+    Registered(ProgramId),
+    Held(ExecPlan, Compiled),
+    Built(ExecPlan, compile::Built),
+}
+
+// SAFETY: a registration in flight holds its plan, its compiled stages
+// (immutable libraries and pipeline states, which Metal states safe from any
+// thread) and a compile job (`compile::Job`); one thread holds it at a time.
+#[allow(unsafe_code)]
+unsafe impl Send for Registering {}
+#[allow(unsafe_code)]
+unsafe impl Send for Registered {}
+
+impl Registering {
+    /// Builds the libraries and pipelines the cache did not hold: the slow
+    /// half of a registration, on whatever thread runs it.
+    #[must_use]
+    pub fn compile(self) -> Registered {
+        Registered {
+            hash: self.hash,
+            step: match self.step {
+                Step::Registered(id) => Done::Registered(id),
+                Step::Held(plan, compiled) => Done::Held(plan, compiled),
+                Step::Run(plan, job) => Done::Built(plan, job.run()),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Program {
     pub id: ProgramId,
@@ -86,6 +136,11 @@ pub struct Plane {
     /// The readout rows a lane may take in one fire: what an instance's
     /// row table is laid for.
     rows: u32,
+    /// The bytes a capturing lane's score rows take
+    /// (`crate::serve::CaptureLayout`): state of each instance of a program
+    /// that reads them out, held in its `Instance` slots after its tables;
+    /// 0 where the load reads out no scores.
+    capture: u64,
     next_program: u64,
     next_instance: u64,
 }
@@ -111,6 +166,7 @@ impl Plane {
             lanes: 64,
             arms: 1,
             rows: 1,
+            capture: 0,
             next_program: 1,
             next_instance: 1,
         }
@@ -216,11 +272,27 @@ impl Plane {
         context: &Context,
         registration: &ProgramRegistration,
     ) -> Result<ProgramId> {
+        let registering = self.prepare_register(context, registration)?;
+        self.finish_register(registering.compile())
+    }
+
+    /// The first half of a registration, on the engine's thread
+    /// (`engine::Engine::prepare_program`): the program held already, or
+    /// its plan and the compile of the stages the cache does not hold,
+    /// which [`Registering::compile`] runs on any thread.
+    pub fn prepare_register(
+        &mut self,
+        context: &Context,
+        registration: &ProgramRegistration,
+    ) -> Result<Registering> {
         if let Some(&existing) = self.by_hash.get(&registration.program_hash) {
-            return Ok(existing);
+            return Ok(Registering {
+                hash: registration.program_hash,
+                step: Step::Registered(existing),
+            });
         }
         let plan = adopt_launch_package(registration.launch.clone())?;
-        let compiled = self.cache.compile(
+        let planned = self.cache.plan(
             context,
             registration.program_hash,
             &plan,
@@ -228,19 +300,40 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
+        Ok(Registering {
+            hash: registration.program_hash,
+            step: match planned {
+                compile::Planned::Held(compiled) => Step::Held(plan, compiled),
+                compile::Planned::Run(job) => Step::Run(plan, job),
+            },
+        })
+    }
 
+    /// The second half, on the engine's thread
+    /// (`engine::Engine::finish_program`): the compiled program taken in and
+    /// its id. A program of the same hash registered meanwhile answers that
+    /// one's id.
+    pub fn finish_register(&mut self, registered: Registered) -> Result<ProgramId> {
+        if let Some(&existing) = self.by_hash.get(&registered.hash) {
+            return Ok(existing);
+        }
+        let (plan, compiled) = match registered.step {
+            Done::Registered(id) => return Ok(id),
+            Done::Held(plan, compiled) => (plan, compiled),
+            Done::Built(plan, built) => (plan, self.cache.finish(built)?),
+        };
         let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
             id,
             Program {
                 id,
-                hash: registration.program_hash,
+                hash: registered.hash,
                 plan,
                 compiled,
             },
         );
-        self.by_hash.insert(registration.program_hash, id);
+        self.by_hash.insert(registered.hash, id);
         Ok(id)
     }
 
@@ -266,6 +359,7 @@ impl Plane {
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let adopted = self.seats_for(&program.plan, channels)?;
+        let capture = self.capture_of(program);
         let session = match Session::bind(
             &program.compiled,
             &program.plan,
@@ -274,6 +368,7 @@ impl Plane {
             &adopted,
             pooled,
             self.rows,
+            capture,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -306,6 +401,47 @@ impl Plane {
     /// The most lanes one fire flies, the frames in flight and the
     /// readout rows a lane may take in one fire: what the tables a binding
     /// opens are laid for.
+    /// The bytes a capturing lane's score rows take, held by each instance
+    /// of a program reading them out as its own state.
+    pub fn set_capture(&mut self, bytes: u64) {
+        self.capture = bytes;
+    }
+
+    /// The score-row bytes an instance of `program` holds: the load's rows
+    /// where it reads them out, none where it does not.
+    fn capture_of(&self, program: &Program) -> u64 {
+        if reads_scores(&program.plan) {
+            self.capture
+        } else {
+            0
+        }
+    }
+
+    /// Where `instance`'s score rows lie now (after a park, an unpark or
+    /// an evacuation as before): their buffer and byte offset there, `None`
+    /// where it holds none.
+    pub fn capture_row(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<(crate::device::Buffer, u64)>> {
+        Ok(self
+            .session_of(instance)?
+            .capture_row()
+            .map(|(buffer, offset)| (buffer.clone(), offset)))
+    }
+
+    /// Reads `into.len()` bytes of `instance`'s score rows from byte `at`.
+    pub fn read_capture(&self, instance: InstanceId, at: u64, into: &mut [u8]) -> Result<()> {
+        self.session_of(instance)?.read_capture(at, into)
+    }
+
+    fn session_of(&self, instance: InstanceId) -> Result<&Session> {
+        self.instances
+            .get(&instance)
+            .map(|bound| &bound.session)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {instance}")))
+    }
+
     pub fn set_flight(&mut self, lanes: u32, arms: usize, rows: u32) {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
@@ -402,6 +538,7 @@ impl Plane {
             &program.compiled,
             program.plan.package.channels.len(),
             self.rows,
+            self.capture_of(program),
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
         if layout.slots > instance_per_chunk {
@@ -686,6 +823,8 @@ impl Plane {
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
+        // A member reading the scores out holds its lane's score rows in its
+        // instance's slots (`Plane::facts`), not in the fire's term.
         Ok(engine::FireFacts {
             a_lane: Session::scratch_for(&program.compiled, extents)?,
             // Its batch tables stand beside every fire, laid once a set
@@ -1030,6 +1169,13 @@ struct Bound {
 /// handed out from the top down (`next`), never under `floor` (the backed
 /// span's bottom). A stage starts again from the top, since stages fire one
 /// after another and none reads another's scratch.
+/// Whether `plan` reads a capturing lane's score rows out.
+fn reads_scores(plan: &ExecPlan) -> bool {
+    plan.outputs()
+        .into_iter()
+        .any(|(name, _)| matches!(name, "attn.scores" | "attn.scores.pages"))
+}
+
 #[derive(Debug, Clone)]
 pub struct GuestCarve {
     buffer: crate::device::Buffer,
@@ -1632,7 +1778,7 @@ mod tests {
     #[test]
     fn a_beam_step_answers_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::beam_stage;
+        use eta_compiler::contract::{Accuracy, beam_stage};
         use eta_compiler::plan::compile_bound;
         let Ok(context) = Context::bind() else {
             eprintln!("no device: skipping");
@@ -1702,8 +1848,8 @@ mod tests {
                     .take(channel)
                     .expect("a channel reads")
                     .expect("the channel holds a cell");
-                if &got != want {
-                    wrong.push(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", case.name));
+                if let Err(why) = case.agrees(channel, &got, want, Accuracy::METAL_PRECISE, 1) {
+                    wrong.push(why);
                 }
             }
         }
@@ -1793,7 +1939,7 @@ mod tests {
     #[test]
     fn beam_steps_answer_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::contract::{Accuracy, beam_stage, wire};
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
         use eta_compiler::plan::compile_bound;
         const STEPS: u32 = 16;
@@ -1881,13 +2027,10 @@ mod tests {
                     };
                     let want = wire(&want);
                     let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
-                            case.name,
-                            &got[..got.len().min(16)],
-                            &want[..want.len().min(16)]
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: carried {why}"));
                         break 'steps;
                     }
                 }
@@ -1899,11 +2042,10 @@ mod tests {
                         .take(channel)
                         .expect("reads")
                         .expect("a cell");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
-                            case.name
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: {why}"));
                         break 'steps;
                     }
                 }
@@ -1917,7 +2059,7 @@ mod tests {
     #[test]
     fn beam_steps_with_a_prompt_past_a_word_answer_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::contract::{Accuracy, beam_stage, wire};
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
         use eta_compiler::plan::compile_bound;
         const STEPS: u32 = 16;
@@ -2024,13 +2166,10 @@ mod tests {
                     };
                     let want = wire(&want);
                     let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
-                            case.name,
-                            &got[..got.len().min(16)],
-                            &want[..want.len().min(16)]
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: carried {why}"));
                         break 'steps;
                     }
                 }
@@ -2042,11 +2181,10 @@ mod tests {
                         .take(channel)
                         .expect("reads")
                         .expect("a cell");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
-                            case.name
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: {why}"));
                         break 'steps;
                     }
                 }

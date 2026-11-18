@@ -109,6 +109,8 @@ impl Mapping {
     /// a miss, from the page cache, so a load whose weights lie in the pool
     /// keeps no host copy of them resident.
     pub fn release(&self) {
+        // The advice is unix's; elsewhere the OS trims the mapping's pages.
+        #[cfg(unix)]
         // SAFETY: a read-only private file mapping; dropping its pages makes
         // the next read fault them back in from the file, unchanged.
         let _ = unsafe {

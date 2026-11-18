@@ -6,6 +6,7 @@ mod common_llm;
 
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
 mod a_channel_slot_parks_and_returns_whole;
+mod a_cold_registration_compiles_while_a_lane_fires;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
@@ -22,6 +23,8 @@ mod a_registered_channel_carries_one_cell_across_its_instances;
 mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_adapter_lies_in_its_slots;
+mod a_carried_history_copies_none_of_the_pool;
+mod a_guest_reading_no_plane_is_refused_at_registration;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod host_bank;
 mod kernels_act;

@@ -56,9 +56,54 @@ pub fn moved_ends(package: &LaunchPackage) -> std::collections::BTreeSet<(u32, b
     ends
 }
 
+/// A program as its registration's compile adopted it, on any thread: its
+/// plan and its stages' dispatches ([`crate::guest::Compiled`]).
+pub struct Adopted {
+    pub plan: eta_exec::ExecPlan,
+
+    pub form: crate::guest::Compiled,
+}
+
+/// What a registration's compile makes for [`Programs::finish`]: the
+/// program adopted, or why its registration is refused.
+pub type Prepared = Result<Adopted, Refusal>;
+
+/// A registration's compile, on any thread ([`engine::Engine::prepare_program`]):
+/// `registration`'s launch package adopted and its stages lowered to the
+/// calls the backend built at load; refused by the program's hash where it
+/// does not interpret or a stage has no device form (a guest pass runs on
+/// the device whole or not at all, and these engines run no other).
+pub fn adopt(registration: &ProgramRegistration) -> Prepared {
+    let hash = registration.program_hash;
+    let plan = eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
+        Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
+    })?;
+    if !plan.executable {
+        return Err(Refusal::Program(format!(
+            "program 0x{hash:016x} calls a semantic boundary this backend does not implement: {}",
+            plan.reject_reason.as_deref().unwrap_or("no reason given")
+        )));
+    }
+    let form = crate::guest::Compiled::of(&plan.package).map_err(|why| {
+        Refusal::Program(format!("program 0x{hash:016x} has no device form: {why}"))
+    })?;
+    Ok(Adopted { plan, form })
+}
+
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal>;
+    /// A registration's last step, on the engine's thread: the adopted
+    /// program's id assigned and its form held; a compile that refused
+    /// refuses here.
+    fn finish(&mut self, prepared: Prepared) -> Result<ProgramId, Refusal>;
+
+    /// Releases `id`, which no instance binds (`Engine::close_program`).
+    fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal>;
+
+    /// A registration whole, on the calling thread.
+    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
+        self.finish(adopt(registration))
+    }
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 
@@ -280,16 +325,15 @@ pub fn lane_mask(
 
 /// A row of bool cells as alternating run lengths, the first of cells unset.
 #[must_use]
-pub fn mask_runs(row: &[u8]) -> Vec<u32> {
+pub fn mask_runs(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
@@ -332,9 +376,11 @@ pub fn decode(
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => {
-            eta_exec::Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect())
-        }
+        Dtype::Bool => eta_exec::Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => eta_exec::Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => eta_exec::Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => eta_exec::Value::F32(words().map(f32::from_le_bytes).collect()),

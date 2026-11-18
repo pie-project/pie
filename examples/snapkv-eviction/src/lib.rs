@@ -67,8 +67,6 @@ struct Output {
     needle_pages: Vec<u32>,
     /// Per-page attention mass from the observation window, device-folded.
     page_mass: Vec<String>,
-    /// Attention layers folded into the row (`planes / heads`, declared).
-    layers_observed: u32,
     /// Total mass over the live prefix — one distribution per layer, so this
     /// must come out at `layers_observed`.
     score_mass: f32,
@@ -85,20 +83,16 @@ async fn main(input: Input) -> Result<Output> {
     if !(0.0..=1.0).contains(&input.depth) {
         return Err("depth must be between 0.0 and 1.0".into());
     }
-    let layers = scores.layers.max(1);
-    // The output states how each layer's row factors: a run of `score_kv`
-    // keys per query head. Folding over a head count of the guest's own
-    // misreads a model with another one.
-    let [heads, score_kv] = scores.planes[..] else {
-        return Err(format!(
-            "attn.scores states its row as planes {:?}, not [query heads, keys]",
-            scores.planes
-        ));
-    };
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
+    let score_pages = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores.pages")
+        .ok_or("this model reads out no page scores")?
+        .width;
 
     // Varied: one repeated sentence makes a small model predict the loop, not the content.
     const FILLER: [&str; 6] = [
@@ -176,11 +170,9 @@ async fn main(input: Input) -> Result<Output> {
         let logits = intrinsics::output(0, "logits");
         tok_out_p.put(reduce_argmax(logits));
 
-        // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-        let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
+        let pages = reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]);
         // Exact: `kv_max = p_max * page_size`.
-        let per_page = reduce_sum(reshape(&folded, [p_max, page_size]));
+        let per_page = gather(&pages, iota(p_max));
         page_mass_out.put(&per_page);
         total_out.put(reshape(reduce_sum(&per_page), [1]));
     });
@@ -277,7 +269,6 @@ async fn main(input: Input) -> Result<Output> {
             .iter()
             .map(|m| format!("{m:.5}"))
             .collect(),
-        layers_observed: layers,
         score_mass,
         count: generated.len(),
     })

@@ -369,20 +369,8 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
-        // each rank pins and opens its own tiers; the group moves what all of them hold
-        let mut tiers = answers
-            .first()
-            .map(|loaded| loaded.caps.pools)
-            .unwrap_or_default();
-        tiers.least_tiers(answers.iter().map(|loaded| loaded.caps.pools));
-        for loaded in &mut answers {
-            let pools = &mut loaded.caps.pools;
-            pools.host_kv_pages = tiers.host_kv_pages;
-            pools.disk_kv_pages = tiers.disk_kv_pages;
-            pools.disk_kv_persistent = tiers.disk_kv_persistent;
-            pools.disk_kv_kept = tiers.disk_kv_kept;
-        }
-        // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
+        // The shared pool's tiers (CONTRACT-BC 22): each rank pins and opens
+        // its own, and the group moves what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
                 .iter()
@@ -391,9 +379,15 @@ impl Engine for Group {
                 .unwrap_or(0)
         };
         let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
+        let every = |of: fn(&engine::chunk::ChunkFacts) -> bool| {
+            answers.iter().all(|loaded| of(&loaded.caps.chunks))
+        };
+        let (persistent, kept) = (every(|c| c.disk_persistent), every(|c| c.disk_kept));
         for loaded in &mut answers {
             loaded.caps.chunks.host_chunks = host_chunks;
             loaded.caps.chunks.disk_chunks = disk_chunks;
+            loaded.caps.chunks.disk_persistent = persistent;
+            loaded.caps.chunks.disk_kept = kept;
         }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
@@ -410,6 +404,43 @@ impl Engine for Group {
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let registration = registration.clone();
         self.lead(move |rank| rank.register_program(&registration))
+    }
+
+    /// Each rank plans its own build, and the compile builds every rank's
+    /// in turn; each rank loads its own modules at the finish.
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let mut compiles = Vec::with_capacity(self.ranks.len());
+        for rank in 0..self.ranks.len() {
+            compiles.push(self.on(rank, |cuda| cuda.prepare_program(registration))?);
+        }
+        Ok(Box::new(move || {
+            let built: Vec<engine::Prepared> =
+                compiles.into_iter().map(|compile| compile()).collect();
+            engine::Prepared(Box::new(built))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(built) = prepared.0.downcast::<Vec<engine::Prepared>>() else {
+            return Err(Error::Program(
+                "a prepared program this group did not prepare".to_string(),
+            ));
+        };
+        let mut ids = Vec::with_capacity(built.len());
+        for (rank, prepared) in built.into_iter().enumerate() {
+            ids.push(self.on(rank, |cuda| cuda.finish_program(prepared))?);
+        }
+        Ok(ids.swap_remove(0))
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        for rank in 0..self.ranks.len() {
+            self.on(rank, |cuda| cuda.close_program(program))?;
+        }
+        Ok(())
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

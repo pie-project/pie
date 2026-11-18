@@ -1168,7 +1168,8 @@ fn host_cuts_from(
     tail: u32,
     start: u32,
 ) -> Vec<(u32, u32)> {
-    let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+    let rows =
+        |lane: &crate::engine::FireLane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
         return vec![(0, req.lanes.first().map_or(0, rows))];
     };
@@ -1279,7 +1280,7 @@ fn rows_of_lanes(
             }
             lane.kv.held += from;
             let len = lane.kv.held + (to - from);
-            lane.kv.pages.truncate(len.div_ceil(page.max(1)) as usize);
+            lane.pages.truncate(len.div_ceil(page.max(1)) as usize);
             if last {
                 if let ::engine::Readout::Rows(read) = &mut lane.readout {
                     for row in read.iter_mut() {
@@ -2667,30 +2668,52 @@ fn stamp_lane_words(
     device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
-    let media: Vec<u32> = req.media.iter().map(|media| media.lane).collect();
-    for (at, lane) in req.lanes.iter_mut().enumerate() {
-        let rows = device_rows
-            .and_then(|rows| rows.get(at).copied())
-            .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
-        let on = of
-            .get(at)
-            .and_then(|&pass_lane| switched.on.get(pass_lane))
-            .map_or(&[][..], Vec::as_slice);
-        let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
-            .adapted(lane.adapter.is_some())
-            .drafting(on.contains(&poem_ir::Builtin::Drafts))
-            .capturing_scores(on.contains(&poem_ir::Builtin::Scores))
-            .with_media(media.contains(&(at as u32)))
-            .starting(starts(lane));
-        let switches = of
-            .get(at)
-            .and_then(|&pass_lane| switched.lanes.get(pass_lane))
-            .map_or(&[][..], Vec::as_slice);
-        let request = switches.iter().fold(request, |request, (name, value)| {
-            request.switched(name, value)
-        });
-        lane.word = model.word(&request);
+    let requests = lane_requests(req, switched, of, fire_wide_mask, device_rows);
+    for (lane, request) in req.lanes.iter_mut().zip(&requests) {
+        lane.word = model.word(request);
     }
+}
+
+/// What each lane of `req` asks of the model ([`stamp_lane_words`]). A lane
+/// captures its attention scores only on the fire that runs the pass's
+/// program, the one reading them: an earlier cut of a cut pass carries the
+/// adapter alone, and scores it captured would have no reader.
+fn lane_requests(
+    req: &crate::engine::FireRequest,
+    switched: &Switched,
+    of: &[usize],
+    fire_wide_mask: bool,
+    device_rows: Option<&[u32]>,
+) -> Vec<poem::Request> {
+    let media: Vec<u32> = req.media.iter().map(|media| media.lane).collect();
+    req.lanes
+        .iter()
+        .enumerate()
+        .map(|(at, lane)| {
+            let rows = device_rows
+                .and_then(|rows| rows.get(at).copied())
+                .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
+            let on = of
+                .get(at)
+                .and_then(|&pass_lane| switched.on.get(pass_lane))
+                .map_or(&[][..], Vec::as_slice);
+            let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
+                .adapted(lane.adapter.is_some())
+                .drafting(on.contains(&poem_ir::Builtin::Drafts))
+                .capturing_scores(
+                    req.boundary_program && on.contains(&poem_ir::Builtin::Scores),
+                )
+                .with_media(media.contains(&(at as u32)))
+                .starting(starts(lane));
+            let switches = of
+                .get(at)
+                .and_then(|&pass_lane| switched.lanes.get(pass_lane))
+                .map_or(&[][..], Vec::as_slice);
+            switches.iter().fold(request, |request, (name, value)| {
+                request.switched(name, value)
+            })
+        })
+        .collect()
 }
 
 /// Whether the lane's recurrent state is empty, as the engine reads its reset.
@@ -2781,7 +2804,7 @@ pub(crate) fn map_lane_pages(
         if lanes.iter().all(|&lane| {
             req.lanes
                 .get(lane)
-                .is_none_or(|lane| lane.kv.pages.is_empty())
+                .is_none_or(|lane| lane.pages.is_empty())
         }) {
             continue;
         }
@@ -2790,7 +2813,7 @@ pub(crate) fn map_lane_pages(
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
             };
-            map_pages(&mut lane.kv.pages, &table)?;
+            map_pages(&mut lane.pages, &table)?;
         }
     }
     Ok(())
@@ -2830,7 +2853,7 @@ fn stamp_lane_translation(
         let table = working_set_flat_table(stores, *ws)?;
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
-                lane.kv.translation.clone_from(&table);
+                lane.translation.clone_from(&table);
             }
         }
     }
@@ -4278,6 +4301,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 "a lane whose fold the device counts asks for its report"
             );
             rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
+            rs::apply_pinned(
+                &mut req,
+                stores.pinned_kv.as_ref(),
+                stores.pinned_state.as_ref(),
+                Some(&rs_prepared),
+            );
             checkpoints_here.extend(
                 rs_prepared
                     .snapshots
@@ -5417,9 +5446,12 @@ async fn fire_device_geometry<C: FireContext>(
         boundary_program: true,
         lanes: resolved_qo_indptr
             .windows(2)
-            .map(|span| ::engine::Lane {
-                tokens: vec![0; (span[1] - span[0]) as usize],
-                ..::engine::Lane::default()
+            .map(|span| {
+                ::engine::Lane {
+                    tokens: vec![0; (span[1] - span[0]) as usize],
+                    ..::engine::Lane::default()
+                }
+                .into()
             })
             .collect(),
         carried: counted.carried,
@@ -5577,6 +5609,12 @@ async fn fire_device_geometry<C: FireContext>(
         "a lane whose fold the device counts asks for its report"
     );
     rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
+    rs::apply_pinned(
+        &mut req,
+        stores.pinned_kv.as_ref(),
+        stores.pinned_state.as_ref(),
+        Some(&rs_prepared),
+    );
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
@@ -6493,6 +6531,7 @@ mod cut_tests {
     fn cut_every_case() {
         a_long_plain_pass_is_cut_on_page_boundaries();
         only_the_last_cut_runs_the_program();
+        only_the_last_cut_captures_scores();
         a_masked_pass_is_cut_with_its_rows_masks();
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
@@ -6520,10 +6559,10 @@ mod cut_tests {
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {
-        let mut lane = ::engine::Lane::decode(0, 0, 1, 0);
+        let mut lane: crate::engine::FireLane = ::engine::Lane::decode(0, 0, 1, 0).into();
         lane.tokens = (0..rows).map(|t| t + 100).collect();
         lane.kv.held = held;
-        lane.kv.pages = (0..(held + rows).div_ceil(page)).collect();
+        lane.pages = (0..(held + rows).div_ceil(page)).collect();
         lane.readout = ::engine::Readout::Last;
         let mut req = crate::engine::FireRequest::one(lane);
         req.boundary_program = true;
@@ -6570,7 +6609,7 @@ mod cut_tests {
         let first = rows_of_lanes(&req, &[Some((0, 27))], false, 16);
         let lane = &first.lanes[0];
         assert_eq!(
-            (lane.kv.held, lane.tokens.len(), lane.kv.pages.len()),
+            (lane.kv.held, lane.tokens.len(), lane.pages.len()),
             (5, 27, 2)
         );
         assert_eq!(lane.tokens[0], 100);
@@ -6582,12 +6621,47 @@ mod cut_tests {
         let tail = rows_of_lanes(&req, &[Some((91, 100))], true, 16);
         let lane = &tail.lanes[0];
         assert_eq!(
-            (lane.kv.held, lane.tokens.len(), lane.kv.pages.len()),
+            (lane.kv.held, lane.tokens.len(), lane.pages.len()),
             (96, 9, 7)
         );
         assert_eq!(lane.tokens[0], 191);
         assert!(matches!(lane.readout, ::engine::Readout::Last));
         assert!(tail.boundary_program);
+    }
+
+    /// A pass whose program reads its attention scores, cut into several
+    /// fires: only the last runs the program, so only its lanes capture
+    /// them; an earlier cut's would have no reader attached.
+    fn only_the_last_cut_captures_scores() {
+        let req = prefill_lane(5, 100, 16);
+        let switched = Switched {
+            lanes: vec![Vec::new()],
+            on: vec![vec![poem_ir::Builtin::Scores]],
+            tails: vec![0],
+            rows_read: true,
+        };
+        let cuts = host_cuts(&req, true, 32, 16, &[], 0);
+        assert_eq!(cuts.len(), 4, "the pass is cut");
+        let captures: Vec<bool> = cuts
+            .iter()
+            .enumerate()
+            .map(|(at, &cut)| {
+                let last = at + 1 == cuts.len();
+                let piece = rows_of_lanes(&req, &[Some(cut)], last, 16);
+                assert_eq!(piece.boundary_program, last);
+                let requests = lane_requests(&piece, &switched, &[0], false, None);
+                assert_eq!(requests.len(), 1);
+                requests[0].captures_scores()
+            })
+            .collect();
+        assert_eq!(
+            captures,
+            [false, false, false, true],
+            "only the fire carrying the reading program captures scores"
+        );
+        // The pass uncut is its own last fire: it captures.
+        let whole = lane_requests(&req, &switched, &[0], false, None);
+        assert!(whole[0].captures_scores());
     }
 
     fn a_pass_with_media_is_cut_before_its_first_span() {
@@ -6802,21 +6876,24 @@ pub(crate) mod fold_tests {
 
     fn request(lanes: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: (0..lanes).map(|_| ::engine::Lane::default()).collect(),
+            lanes: (0..lanes).map(|_| crate::engine::FireLane::default()).collect(),
             ..crate::engine::FireRequest::default()
         }
     }
 
     fn rows(held: u32, tokens: &[u32]) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: vec![::engine::Lane {
-                tokens: tokens.to_vec(),
-                kv: ::engine::KvDelta {
-                    held,
-                    ..Default::default()
-                },
-                ..::engine::Lane::default()
-            }],
+            lanes: vec![
+                ::engine::Lane {
+                    tokens: tokens.to_vec(),
+                    kv: ::engine::KvDelta {
+                        held,
+                        ..Default::default()
+                    },
+                    ..::engine::Lane::default()
+                }
+                .into(),
+            ],
             ..crate::engine::FireRequest::default()
         }
     }
@@ -7165,7 +7242,7 @@ pub(crate) mod fold_tests {
         let pass = lanes_on(&stores, ws, &[&cell, &cell]);
         // Three rows and four, from slot 4.
         let mut req = crate::engine::FireRequest {
-            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows)).collect(),
+            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows).into()).collect(),
             ..crate::engine::FireRequest::default()
         };
         let landings = [landing(4, 3), landing(4, 4)];
@@ -7369,10 +7446,9 @@ pub(crate) mod fold_tests {
         let found = stores.kv.lock().folded(ws).unwrap();
         let state = rs.map(|rs| stores.rs.lock().unwrap().frozen(rs).unwrap());
         let mut req = crate::engine::FireRequest {
-            lanes: vec![rows_of(
-                slots.start as u32,
-                (slots.end - slots.start) as usize,
-            )],
+            lanes: vec![
+                rows_of(slots.start as u32, (slots.end - slots.start) as usize).into(),
+            ],
             ..crate::engine::FireRequest::default()
         };
         if let Some(rs) = rs {
@@ -9302,14 +9378,17 @@ mod unfolded_tests {
 
     fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: vec![::engine::Lane {
-                tokens: vec![0; rows as usize],
-                kv: ::engine::KvDelta {
-                    held,
-                    ..Default::default()
-                },
-                ..::engine::Lane::default()
-            }],
+            lanes: vec![
+                ::engine::Lane {
+                    tokens: vec![0; rows as usize],
+                    kv: ::engine::KvDelta {
+                        held,
+                        ..Default::default()
+                    },
+                    ..::engine::Lane::default()
+                }
+                .into(),
+            ],
             ..crate::engine::FireRequest::default()
         }
     }

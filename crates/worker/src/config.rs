@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 
 /// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
-/// Keys that are retired: each refuses a file that still states it, saying
-/// what became of it.
-pub mod retired;
 /// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
 
@@ -54,26 +51,34 @@ impl Config {
     ///
     /// Pure: no file IO, no env, no clap.
     pub fn parse(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s).map_err(|e| {
-            if let Some(refusal) = retired::explain(e.message(), None) {
-                let line = e
-                    .span()
-                    .map(|span| s[..span.start].matches('\n').count() + 1);
-                match line {
-                    Some(line) => anyhow::anyhow!("parse config: line {line}: {refusal}"),
-                    None => anyhow::anyhow!("parse config: {refusal}"),
-                }
-            } else if s.contains("[[model]]") {
-                anyhow::anyhow!(
-                    "parse config: {e}\n\
-                     hint: pie serves exactly one model — use a single `[model]` table, \
-                     not a `[[model]]` list."
-                )
-            } else {
-                anyhow::anyhow!("parse config: {e}")
+        Self::parse_file(s, None)
+    }
+
+    /// [`Config::parse`] of the file at `path`: a key no section declares
+    /// is refused by the file, line and dotted key, to be deleted.
+    pub fn parse_file(s: &str, path: Option<&Path>) -> Result<Self> {
+        let at = |line: Option<usize>| {
+            let file = path.map_or_else(|| "config".to_string(), |p| p.display().to_string());
+            line.map_or(file.clone(), |line| format!("{file}:{line}"))
+        };
+        let cfg: Config = toml::from_str(s).map_err(|e| match unknown_field(e.message()) {
+            Some(field) => {
+                let start = e.span().map(|span| span.start);
+                let table = start.map(|start| table_at(s, start)).unwrap_or_default();
+                let line = start.map(|start| s[..start].matches('\n').count() + 1);
+                anyhow::anyhow!("{}: {}", at(line), unknown_key(&table, field))
             }
+            None => anyhow::anyhow!("{}: {e}", at(None)),
         })?;
-        cfg.validate()?;
+        cfg.validate()
+            .map_err(|e| match e.downcast_ref::<UnknownKey>() {
+                Some(UnknownKey { table, field }) => anyhow::anyhow!(
+                    "{}: {}",
+                    at(line_of(s, table, field)),
+                    unknown_key(table, field)
+                ),
+                None => e,
+            })?;
         Ok(cfg)
     }
 
@@ -423,12 +428,86 @@ fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// A key no section of the config declares: in `table` (dotted, empty at
+/// the top), named `field`.
+#[derive(Debug)]
+struct UnknownKey {
+    table: String,
+    field: String,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&unknown_key(&self.table, &self.field))
+    }
+}
+
+impl std::error::Error for UnknownKey {}
+
+/// The refusal of an unknown key, whatever key it is.
+fn unknown_key(table: &str, field: &str) -> String {
+    let key = if table.is_empty() {
+        field.to_string()
+    } else {
+        format!("{table}.{field}")
+    };
+    format!("unknown key `{key}`; delete it (it isn't a setting)")
+}
+
+/// The field a deserializer's "unknown field" error names.
+fn unknown_field(message: &str) -> Option<&str> {
+    message.strip_prefix("unknown field `")?.split('`').next()
+}
+
+/// The table (dotted) a TOML document's byte `at` lies in: the last header
+/// before it.
+fn table_at(text: &str, at: usize) -> String {
+    let mut table = String::new();
+    for line in text[..at.min(text.len())].lines() {
+        if let Some(header) = header(line) {
+            table = header;
+        }
+    }
+    table
+}
+
+/// The table a header line opens, `[a.b]` or `[[a.b]]`.
+fn header(line: &str) -> Option<String> {
+    let line = line.trim();
+    let inner = line
+        .strip_prefix("[[")
+        .and_then(|l| l.strip_suffix("]]"))
+        .or_else(|| line.strip_prefix('[').and_then(|l| l.strip_suffix(']')))?;
+    Some(
+        inner
+            .split('.')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// The line (from 1) where `field` is stated in `table`.
+fn line_of(text: &str, table: &str, field: &str) -> Option<usize> {
+    let mut current = String::new();
+    for (at, line) in text.lines().enumerate() {
+        if let Some(header) = header(line) {
+            current = header;
+            continue;
+        }
+        let stated = line.split('=').next().map(str::trim);
+        if current == table && stated == Some(field) {
+            return Some(at + 1);
+        }
+    }
+    None
+}
+
 /// `[model] rope_scaling`: the YaRN a deployment stretches its model's
 /// native context by.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RopeScalingConfig {
-    #[serde(alias = "type")]
     pub rope_type: String,
     pub factor: f64,
     #[serde(default)]
@@ -509,9 +588,7 @@ pub struct ModelConfig {
     /// an `adapter.toml` and the plane files it names.
     #[serde(default)]
     pub adapter_dir: String,
-    /// Dtype weights are materialized in. Separate from `activation_dtype`
-    /// (in `[engine]`, the dtype compute happens in) — narrower weights and
-    /// wider compute is a normal combination.
+    /// Dtype weights are materialized in.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
     /// How many adapter seats this deployment intends to use, and which
@@ -846,11 +923,6 @@ pub struct EngineConfig {
     /// experts, which the busiest experts' replicas fill.
     #[serde(default)]
     pub expert_replicas: u32,
-    /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
-    /// `weight_dtype`: a deployment can store weights narrower than it
-    /// computes.
-    #[serde(default = "default_activation_dtype")]
-    pub activation_dtype: String,
     /// The longest sequence (prompt + output) one lane holds, in tokens: a
     /// product limit, not a memory one. Omit for the model's own context,
     /// shortened to what the device holds where one sequence at it would
@@ -877,6 +949,13 @@ pub struct MemoryConfig {
     /// The most device memory this load takes (`"20GiB"`), per device, for
     /// a device shared with another process. Omit to use the whole device.
     pub budget_device: Option<ByteSize>,
+    /// The tokens of kv the device holds (`3248 * page size`), for a run
+    /// that must compare at a fixed cache: the device pool holds exactly
+    /// the pages they fill, beside the weights and the shapes it always
+    /// holds, and the load is refused where `budget_device` (or the whole
+    /// device) cannot hold that. Omit to size the cache by what the device
+    /// has. cuda only.
+    pub kv_device_tokens: Option<u64>,
     /// The most pinned host memory suspended kv pages and state slots may
     /// take (`"32GiB"`), shared by the tensor-parallel ranks. Omit for every
     /// seat at full context, within half of what the host has free (so
@@ -908,6 +987,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             budget_device: None,
+            kv_device_tokens: None,
             budget_host: None,
             budget_disk: None,
             disk_path: None,
@@ -930,6 +1010,7 @@ impl MemoryConfig {
                 budget: self.budget_device.map(|b| b.as_bytes()),
             },
             device_kv_budget: None,
+            device_kv_tokens: self.kv_device_tokens,
             host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
             kv_seats: None,
             disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
@@ -957,6 +1038,11 @@ impl MemoryConfig {
             "engine.memory.governor_backoff must be in (0.0, 1.0]: the share kept each \
              congested stretch, 1.0 to never yield"
         );
+        ensure!(
+            self.kv_device_tokens != Some(0),
+            "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
+             holds or omit the key"
+        );
         for (key, budget) in [
             ("budget_device", self.budget_device),
             ("budget_host", self.budget_host),
@@ -973,8 +1059,7 @@ impl MemoryConfig {
 }
 
 impl EngineConfig {
-    /// The named engine's own keys as its options struct. A retired key is
-    /// refused with what became of it.
+    /// The named engine's own keys as its options struct.
     ///
     /// # Errors
     ///
@@ -982,13 +1067,15 @@ impl EngineConfig {
     pub fn options_as<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         toml::Value::Table(self.options.clone())
             .try_into()
-            .map_err(|e: toml::de::Error| {
-                let why = retired::explain(e.message(), Some(self.kind))
-                    .unwrap_or_else(|| e.to_string());
-                anyhow::anyhow!(
-                    "invalid [engine] options for engine type {:?}: {why}",
+            .map_err(|e: toml::de::Error| match unknown_field(e.message()) {
+                Some(field) => anyhow::Error::new(UnknownKey {
+                    table: "engine".to_string(),
+                    field: field.to_string(),
+                }),
+                None => anyhow::anyhow!(
+                    "invalid [engine] options for engine type {:?}: {e}",
                     self.kind,
-                )
+                ),
             })
     }
 
@@ -999,6 +1086,12 @@ impl EngineConfig {
             "engine.max_context = 0 holds no sequence; omit it for the model's own context"
         );
         self.memory.validate()?;
+        ensure!(
+            self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,
+            "engine.memory.kv_device_tokens sizes the cuda engine's device pool; the {} engine \
+             does not size its pool by tokens, so omit the key",
+            self.kind.as_str()
+        );
         match self.kind {
             EngineKind::Cuda => {
                 self.options_as::<CudaEngineOptions>()?;
@@ -1061,9 +1154,6 @@ fn default_tp_size() -> u32 {
 }
 fn default_ep_size() -> u32 {
     1
-}
-fn default_activation_dtype() -> String {
-    "bfloat16".to_string()
 }
 /// Accept either a single string or a list of strings.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -1137,94 +1227,9 @@ device = ["metal:0"]
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
-        the_memory_keys_are_seven_and_prefixed();
-        a_retired_key_is_refused_with_its_fate();
+        the_memory_keys_are_eight_and_prefixed();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
-    }
-
-    /// Every retired key, stated where main read it, is refused with what
-    /// became of it, on the line that states it; a typo is still only
-    /// unknown, and the keys that replaced them load.
-    fn a_retired_key_is_refused_with_its_fate() {
-        const ENGINE_KEYS: &[&str] = &[
-            "max_model_len",
-            "max_forward_tokens",
-            "max_forward_requests",
-            "max_state_slots",
-            "kv_page_size",
-            "device_memory",
-            "pipeline_cache",
-        ];
-        for r in retired::RETIRED {
-            let kind = r.engine.unwrap_or(EngineKind::Metal).as_str();
-            let line = format!("{} = 1", r.key);
-            let (model, engine) = if ENGINE_KEYS.contains(&r.key) {
-                ("", line.as_str())
-            } else {
-                (line.as_str(), "")
-            };
-            let toml = format!(
-                "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n{model}\n\
-                 [engine]\ntype = \"{kind}\"\ndevice = [\"{kind}:0\"]\n{engine}\n"
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
-            let refusal = retired::refusal_for(r.key, r.engine).unwrap();
-            assert!(err.contains(&refusal), "{}: {err}", r.key);
-            assert!(!err.contains("unknown field"), "{}: {err}", r.key);
-            if !model.is_empty() {
-                assert!(err.contains("line 4: "), "{}: {err}", r.key);
-            }
-        }
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_model_len = 8192",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("`max_model_len` was renamed to `max_context` in `[engine]`"),
-            "{err}"
-        );
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_forward_requests = 64",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("`max_forward_requests` is no longer a setting: "),
-            "{err}"
-        );
-
-        // The negative control: a key that was never a setting is only
-        // unknown, and names no fate.
-        for (at, typo) in [
-            ("source = \"Qwen/Qwen3-0.6B\"", "max_contxt = 8192"),
-            ("device = [\"metal:0\"]", "max_contxt = 8192"),
-        ] {
-            let err = Config::parse(&MINIMAL_METAL.replace(at, &format!("{at}\n{typo}")))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("unknown field `max_contxt`") && !err.contains("renamed"),
-                "{err}"
-            );
-        }
-
-        // What replaced them loads, and the vulkan engine keeps the
-        // `pipeline_cache` the wgpu engine retired.
-        let current = MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_context = 8192",
-        ) + "\n[engine.memory]\nbudget_host = \"8GiB\"\nbudget_disk = \"20GiB\"\n\
-              disk_path = \"/nvme\"\ndisk_persistent = false\n";
-        let cfg = Config::parse(&current).expect("the current keys load");
-        assert_eq!(cfg.engine.max_context, Some(8192));
-        assert_eq!(cfg.engine.memory.budget_host, Some(ByteSize::from_mib(8 * 1024)));
-        let vulkan = "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n\
-                      [engine]\ntype = \"vulkan\"\ndevice = [\"vulkan:0\"]\n\
-                      pipeline_cache = \"/tmp/p.bin\"\n";
-        Config::parse(vulkan).expect("vulkan reads pipeline_cache");
+        activation_dtype_is_an_unknown_key();
     }
 
     fn an_empty_memory_table_is_the_dedicated_machine() {
@@ -1260,9 +1265,26 @@ device = ["metal:0"]
             let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
             assert!(Config::parse(&toml).is_err(), "{bad} should be refused");
         }
+
+        // The kv tokens reach the cuda engine's load; another engine, which
+        // does not size its pool by them, refuses the key by name.
+        let cuda = MINIMAL_METAL
+            .replace("\"metal\"", "\"cuda\"")
+            .replace("metal:0", "cuda:0");
+        let tokens = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 51968\n");
+        let cfg = Config::parse(&tokens).unwrap();
+        assert_eq!(cfg.engine.memory.residency().device_kv_tokens, Some(51968));
+        let metal = format!("{MINIMAL_METAL}\n[engine.memory]\nkv_device_tokens = 51968\n");
+        let refused = Config::parse(&metal).expect_err("metal refuses the key");
+        assert!(
+            format!("{refused:#}").contains("kv_device_tokens"),
+            "{refused:#}"
+        );
+        let zero = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 0\n");
+        assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
-    fn the_memory_keys_are_seven_and_prefixed() {
+    fn the_memory_keys_are_eight_and_prefixed() {
         let keys: Vec<String> = schema::fields(EngineKind::Cuda)
             .into_iter()
             .map(|field| field.key)
@@ -1272,6 +1294,7 @@ device = ["metal:0"]
             keys,
             [
                 "engine.memory.budget_device",
+                "engine.memory.kv_device_tokens",
                 "engine.memory.budget_host",
                 "engine.memory.budget_disk",
                 "engine.memory.disk_path",
@@ -1284,6 +1307,54 @@ device = ["metal:0"]
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
     /// shell, which posts frames to a host queue, takes more.
+    /// Nothing reads a compute dtype from the config: a file that states
+    /// one is refused as it would be for any key no struct declares.
+    fn activation_dtype_is_an_unknown_key() {
+        let file = std::path::Path::new("/etc/pie/config.toml");
+        // An engine's own key, read through its options struct: lines 6-9
+        // are `[engine]`, `type`, `device`, the dropped key.
+        let err = Config::parse_file(
+            &MINIMAL_METAL.replace(
+                "device = [\"metal:0\"]",
+                "device = [\"metal:0\"]\nactivation_dtype = \"bfloat16\"",
+            ),
+            Some(file),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "/etc/pie/config.toml:9: unknown key `engine.activation_dtype`; delete it (it \
+             isn't a setting)"
+        );
+        // Any other section's: the deserializer's own span.
+        let err = Config::parse_file(
+            &MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                "source = \"Qwen/Qwen3-0.6B\"\nmax_contxt = 8",
+            ),
+            Some(file),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "/etc/pie/config.toml:5: unknown key `model.max_contxt`; delete it (it isn't a \
+             setting)"
+        );
+        let err = Config::parse(&MINIMAL_METAL.replace(
+            "[engine]",
+            "[engine.memory]\nbudget_dev = \"1GiB\"\n[engine]",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with("config:7: unknown key `engine.memory.budget_dev`"),
+            "{err}"
+        );
+        Config::parse(MINIMAL_METAL).expect("without it, the file loads");
+    }
+
     fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
         for (depth, ok) in [(15, true), (16, false)] {
             let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");

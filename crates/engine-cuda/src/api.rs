@@ -201,7 +201,7 @@ impl Cuda {
         // the routed banks it takes an expert at a time: the plan seats none
         // itself.
         let diagnostics = &self.boot.knobs.diagnostics;
-        let cached = if diagnostics.dense_weights || diagnostics.dense_experts {
+        let cached = if self.boot.knobs.dense_weights() || diagnostics.dense_experts {
             Vec::new()
         } else {
             crate::store::layout::streamed_experts(trace)
@@ -235,6 +235,7 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        self.validate_captures(frame)?;
         if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
             && frame.steps.iter().any(|step| {
                 replay
@@ -413,9 +414,36 @@ pub(crate) fn lattice(
     }
 }
 
-/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
-/// profile states them.
+/// The rows a patch ladder is derived from when a load states no tokens.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
+/// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
+/// points below it and `top` itself. With `top` the load's context, the
+/// candidates a load with no stated buckets weighs its fire top among.
+#[must_use]
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
+    default_lattice(
+        top,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
+}
+
+/// The widest rung of [`rung_lattice`] to `top` at or below `tokens` (its
+/// first where none is): a load asked other tokens (the walk fit,
+/// `engine.fire_rows`, a stated `max_forward_tokens`, a refit) lays no last
+/// point off the grid.
+#[must_use]
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine, top);
+    lattice
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= tokens)
+        .unwrap_or(lattice[0])
+}
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
@@ -605,17 +633,49 @@ impl Engine for Cuda {
             width_free(&trace.name),
         )?;
         let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let kv_budget = match (residency.device_kv_budget, residency.device_kv_tokens) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Load(
+                    "the load states the device pool both in bytes (`device_kv_budget`) and \
+                     in kv tokens (`[engine.memory] kv_device_tokens`); state one"
+                        .into(),
+                ));
+            }
+            (Some(bytes), None) => Some(crate::store::KvSize::Bytes(bytes)),
+            (None, Some(tokens)) => Some(crate::store::KvSize::Tokens(tokens)),
+            (None, None) => None,
+        };
+        // Every rank on the host seats its own tier: a tensor-parallel
+        // group's and each expert-parallel rank's.
+        let ranks = self.boot.world.size * self.expert.size;
+        let max_tokens = if budgets.max_tokens == 0 {
+            16_384
+        } else {
+            budgets.max_tokens
+        };
+        // The host tier's staging ring is page-locked here, before anything
+        // measures the device: on an integrated device the ring and the
+        // device draw on the same memory, and what the ring holds is then
+        // gone from the driver's free bytes and Windows' commit alike. A
+        // ring that cannot be pinned refuses the load, here and not after
+        // ready.
+        let ring = crate::store::staging_ring_for(
+            &trace,
+            budgets.page_size,
+            budgets.max_context,
+            max_tokens,
+            residency.host_kv_budget,
+            ranks,
+        )
+        .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
+        .map_err(fault)?;
         let mut budgets = budgets;
-        if budgets.context_declared && residency.device_kv_budget.is_none() {
+        if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
                 &trace,
                 budgets.page_size,
                 budgets.max_context,
-                if budgets.max_tokens == 0 {
-                    16_384
-                } else {
-                    budgets.max_tokens
-                },
+                max_tokens,
                 residency.device,
                 plan.device_demand(),
             )
@@ -648,9 +708,9 @@ impl Engine for Cuda {
             voxels,
             page_size: budgets.page_size,
             context: budgets.max_context,
-            context_declared: budgets.context_declared && residency.device_kv_budget.is_none(),
+            context_declared: budgets.context_declared && kv_budget.is_none(),
             slots: budgets.slots,
-            kv_budget: residency.device_kv_budget,
+            kv_budget,
             allowance: residency.device,
             ordinal: if ordinal >= 0 {
                 ordinal
@@ -684,14 +744,13 @@ impl Engine for Cuda {
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
-        let host_kv_pages = shell
+        shell
             .seat_host_kv(
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
                 budgets.max_context,
-                // Every rank on the host seats its own: a tensor-parallel
-                // group's and each expert-parallel rank's.
-                self.boot.world.size * self.expert.size,
+                ranks,
+                ring,
             )
             .map_err(fault)?;
         let kv_handle = if residency.kv_export {
@@ -699,7 +758,7 @@ impl Engine for Cuda {
         } else {
             None
         };
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -714,6 +773,7 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
+        chunk_facts.record_bytes = shell.state_slot_bytes();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -742,11 +802,6 @@ impl Engine for Cuda {
                 codegen_backend: Some(CODEGEN.to_string()),
             },
             pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: shell.state_slot_bytes(),
-                buffer_pages: shell.buffer_pages(),
                 adapter_banks: shell
                     .banks()
                     .iter()
@@ -754,10 +809,6 @@ impl Engine for Cuda {
                     .min()
                     .unwrap_or(0),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
-                host_kv_pages,
-                disk_kv_pages,
-                disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
-                disk_kv_kept: shell.disk_kv_kept(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
@@ -1037,6 +1088,40 @@ impl Engine for Cuda {
             .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
     }
 
+    /// The program adopted and its build planned here; its regions compile
+    /// (NVRTC, or the kernel cache's files) in the returned compile, off
+    /// the engine's thread, while fires go on. Their modules load into the
+    /// context at [`Engine::finish_program`].
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let prepared = self
+            .loaded_mut()
+            .and_then(|shell| shell.prepare_program(registration).map_err(fault));
+        let mut pending = self.refused(prepared)?;
+        Ok(Box::new(move || {
+            pending.build();
+            engine::Prepared(Box::new(pending))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(pending) = prepared.0.downcast::<crate::program::Pending>() else {
+            return Err(Error::Program(
+                "a prepared program CUDA did not prepare".to_string(),
+            ));
+        };
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.finish_program(*pending).map_err(fault));
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
+    }
+
     fn settles_asynchronously(&self) -> bool {
         true
     }
@@ -1305,6 +1390,19 @@ impl Engine for Cuda {
 }
 
 impl Cuda {
+    /// Refuses a step whose capturing lane no reading program is attached
+    /// at ([`engine::fire::Step::validate_captures`]).
+    fn validate_captures(&self, frame: &FrameSubmission) -> EngineResult<()> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(());
+        };
+        let facts = &shell.trace().facts;
+        for step in &frame.steps {
+            step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+        }
+        Ok(())
+    }
+
     /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
     fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
         if result.is_err() {
@@ -1319,6 +1417,7 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        self.validate_captures(frame)?;
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
@@ -1421,7 +1520,9 @@ impl Cuda {
         // differ.
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
-            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+            !lane.tables.is_empty()
+                || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
+                || !lane.slot_copies.is_empty()
         });
         if by_refs {
             shell.take_refs();
@@ -1435,9 +1536,25 @@ impl Cuda {
         }
         // Each lane's record: the one it reads and the one its fire writes.
         let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        // The lanes stated to carry no state: they read and write the null
+        // record.
+        let mut nulls: Vec<bool> = Vec::with_capacity(submission.lanes.len());
         let mut forked: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
-            let record = match lane.fixed.as_slice() {
+            let pieces = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces.as_slice(),
+                engine::fire::LaneRecord::Null => &[],
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => &[],
+            };
+            nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
+            let record = match pieces {
                 [] => None,
                 [(shape, pieces)] if *shape == FIXED => {
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
@@ -1474,8 +1591,7 @@ impl Cuda {
             }
             records.push(record);
         }
-        // The lane's list refs are its table of pages, or, where a program
-        // places its rows, the table that translates the program's pages.
+        // The lane's refs of `shape`: the kv list's, or a window list's.
         fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
             lane.tables
                 .iter()
@@ -1492,6 +1608,14 @@ impl Cuda {
                     .collect()
             })
             .collect();
+        // A lane's list kind says what its list table holds: its pages, or
+        // the working set's mapped pages its program's page indexes address
+        // (a device-geometry instance's lane).
+        let placed: Vec<bool> = submission
+            .lanes
+            .iter()
+            .map(|lane| lane.list == engine::fire::ListKind::Translation)
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1504,27 +1628,30 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: match table(lane, LIST) {
-                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.pages,
+                    pages: if placed[at] {
+                        &[]
+                    } else {
+                        table(lane, LIST).unwrap_or(&[])
                     },
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    held: table(lane, LIST)
+                        .filter(|_| !placed[at])
+                        .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
                     kv_less: lane.kv_less,
-                    translation: match table(lane, LIST) {
-                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.translation,
+                    translation: if placed[at] {
+                        table(lane, LIST).unwrap_or(&[])
+                    } else {
+                        &[]
                     },
-                    window: match table(lane, WINDOW) {
-                        Some(refs) if by_refs => refs,
-                        _ => &lane.kv.window,
-                    },
-                    more_windows: if by_refs { &more_windows[at] } else { &[] },
+                    window: table(lane, WINDOW).unwrap_or(&[]),
+                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_slot: records[at]
+                        .map(|(_, written)| written)
+                        .or(nulls[at].then_some(0)),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {

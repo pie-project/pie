@@ -89,9 +89,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
-    let chip = engine_cuda::chip::profile(&format!(
-        "[engine]\ngraphs = \"off\"\n[fuse]\nmoe_mega = {mega}\n"
-    ));
+    let chip = engine_cuda::chip::profile(&format!("[fuse]\nmoe_mega = {mega}\n"));
     let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
         contract: &contract,
@@ -102,12 +100,13 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -135,6 +134,15 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
 fn a_declined_mega_moe_answers_what_its_legs_answer() {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    // A backend whose fusions hold no mega-MoE (ROCm) never forms one, so
+    // it has no declined one to answer for.
+    if !engine_cuda::FUSIONS
+        .iter()
+        .any(|rule| rule.kernel() == "fused.moe_mega")
+    {
+        eprintln!("skipping: this backend forms no `fused.moe_mega`");
         return;
     }
     for name in ROWS {

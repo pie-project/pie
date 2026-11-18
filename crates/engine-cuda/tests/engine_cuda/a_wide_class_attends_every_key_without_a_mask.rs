@@ -112,12 +112,12 @@ fn shell(trace: Trace, path: &Path, graphs: Graphs) -> Shell {
         page_size: 16,
         context: 256,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(graphs, None)),
+            pin: Some((graphs, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

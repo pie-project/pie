@@ -413,7 +413,7 @@ fn fa2_prefill_with(
     // the product need not read.
     let head = plan.shape.head_dim;
     let [lk, lv] = pool.live;
-    let widths = if ctx.tuning().fa2_live
+    let widths = if ctx.tuning().fa2_live()
         && kv_width(pool) == fa2::KvWidth::BF16
         && pool.live != [head; 2]
         && lk <= head

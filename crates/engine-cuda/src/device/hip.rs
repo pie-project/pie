@@ -529,6 +529,15 @@ pub mod rt {
         // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventSynchronize(event) })
     }
+    pub unsafe fn cudaEventElapsedTime(
+        ms: *mut f32,
+        start: cudaEvent_t,
+        stop: cudaEvent_t,
+    ) -> cudaError {
+        // SAFETY: `hipEventElapsedTime` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
+        cudaError::of(unsafe { hip::hipEventElapsedTime(ms, start, stop) })
+    }
     pub unsafe fn cudaEventQuery(event: cudaEvent_t) -> cudaError {
         // SAFETY: `hipEventQuery` takes the same arguments with the same
         // contract, which the caller of this fn upholds.

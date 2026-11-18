@@ -726,8 +726,14 @@ impl Shell {
             }
             (groups, packings)
         };
-        let group_masks =
-            self.group_masks_of(lanes, &composition, &group_of_lane, &packings, &clips_of)?;
+        let group_masks = self.group_masks_of(
+            lanes,
+            &composition,
+            &group_of_lane,
+            &packings,
+            &clips_of,
+            arming && self.arm_group_mask,
+        )?;
 
         let mut merge_lands: Vec<MergeLand> = Vec::new();
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
@@ -1671,7 +1677,8 @@ impl Shell {
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
         )
-        .with_rs(rs_body);
+        .with_rs(rs_body)
+        .with_group_mask(!group_masks.is_empty());
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
@@ -1780,9 +1787,21 @@ impl Shell {
         // the classes do (a mixed bucket-256 fire's two classes rung 256
         // each), and the carve a fire of the bucket takes (the forked arena,
         // an activation rung) holds no more readout rows than its tokens.
+        // An unlisted ladder (a class no plain request lands, as a DiT's) is
+        // the whole-bucket body: every class present at the bucket.
+        let whole: Vec<(u32, u32)>;
+        let rungs = if ladder.rungs().is_empty() {
+            whole = token_axis
+                .classes
+                .present_in_order()
+                .map(|class| (class, token_axis.bucket))
+                .collect();
+            whole.as_slice()
+        } else {
+            ladder.rungs()
+        };
         let (last_rows, every_row) =
-            ladder
-                .rungs()
+            rungs
                 .iter()
                 .fold((0, 0), |(last, every), &(class, rung)| {
                     match self.exports.readback(class as usize) {
@@ -2040,6 +2059,13 @@ impl Shell {
         })
     }
 
+    /// A fire's group masks, one a packing an attention stating a mask
+    /// reads, in the load's order (`Shell::stated_feeds`;
+    /// `Inputs::stage_group_masks` stages the `i`th in the `i`th stretch),
+    /// or none where no lane states one and `every` is not asked: a fire
+    /// with a mask reads one in every ragged attention (a body is captured
+    /// reading them all), its lanes stating none admitting every row of
+    /// their group. An arming fire asks `every` for a masked twin.
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],
@@ -2047,6 +2073,7 @@ impl Shell {
         group_of_lane: &[i32],
         packings: &[poem_exec::fire::Packed],
         clips_of: &[Option<crate::voxels::Clips<'_>>],
+        every: bool,
     ) -> Result<
         Vec<(
             poem_ir::Selection,
@@ -2069,14 +2096,15 @@ impl Shell {
                     })
             })
             .collect();
-        if stated.iter().all(Option::is_none) {
+        if !every && stated.iter().all(Option::is_none) {
             return Ok(Vec::new());
         }
-        if self.feeds.ragged.is_empty() {
+        if self.stated_feeds.is_empty() {
             return Err(Fault::program(
                 "serve::mask",
-                "a kv-less lane states an attention mask and this model packs no attention \
-                 group; the mask applies to group-packed `attention.ragged` only",
+                "a kv-less lane states an attention mask and this model states none on any \
+                 attention: only a group-packed `attention.ragged` its text spells \
+                 `stated_group_mask()` reads one",
             ));
         }
         let patch = self
@@ -2093,8 +2121,16 @@ impl Shell {
             guests[row.source as usize] =
                 poem_exec::fire::guest_rows(row, clips, patch).map_err(poem_exec::Error::Fire)?;
         }
-        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
-            stated.iter().map(Option::as_ref).collect();
+        let stated: Vec<poem_exec::fire::LaneMask> = stated
+            .into_iter()
+            .zip(&guests)
+            .map(|(mask, guest)| {
+                mask.unwrap_or_else(|| poem_exec::fire::LaneMask {
+                    rows: vec![vec![0..u64::MAX]; guest.count as usize],
+                })
+            })
+            .collect();
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> = stated.iter().map(Some).collect();
         let packed = |select: poem_ir::Selection| {
             packings
                 .iter()
@@ -2107,8 +2143,10 @@ impl Shell {
                 })
         };
         let mut staged = Vec::new();
-        for &(q, kv) in &self.feeds.ragged {
-            if let Some(mask) = poem_exec::fire::group_mask(
+        for &(q, kv) in &self.stated_feeds {
+            // An attention none of the fire's lanes reach reads no row of
+            // its stretch.
+            let mask = poem_exec::fire::group_mask(
                 composition.lanes(),
                 group_of_lane,
                 packed(q)?,
@@ -2117,9 +2155,11 @@ impl Shell {
                 &guests,
             )
             .map_err(poem_exec::Error::Fire)?
-            {
-                staged.push((q, kv, mask));
-            }
+            .unwrap_or_else(|| poem_exec::fire::GroupMask {
+                bits: Vec::new(),
+                indptr: vec![0],
+            });
+            staged.push((q, kv, mask));
         }
         Ok(staged)
     }

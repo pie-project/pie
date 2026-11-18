@@ -1189,6 +1189,23 @@ impl Layout {
         self.shape(kind)
             .map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
     }
+
+    /// The chunks every weight the caches stream takes held whole: each
+    /// shape's atoms in whole chunks of its own, as
+    /// `Pools::preseat_plan` seats them.
+    #[must_use]
+    pub fn weight_chunks(&self) -> u64 {
+        let whole = |atoms: u32, per_chunk: u32| u64::from(atoms.div_ceil(per_chunk.max(1)));
+        self.rows
+            .iter()
+            .map(|shape| whole(shape.blocks, shape.per_chunk))
+            .chain(
+                self.experts
+                    .iter()
+                    .map(|shape| whole(shape.count(), shape.per_chunk)),
+            )
+            .sum()
+    }
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {

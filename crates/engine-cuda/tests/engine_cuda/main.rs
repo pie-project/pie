@@ -33,10 +33,12 @@ mod guest;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
+mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_buffer_frees_after_another_context_closes;
+mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]
 mod a_capture_survives_a_load_on_another_thread;
 mod a_cell_table_reads_each_rows_patch_and_group;
@@ -50,6 +52,7 @@ mod a_double_block_fires_two_streams_through_the_engine;
 #[cfg(feature = "cuda")]
 mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
 mod a_four_rank_group_fires_a_sharded_plan;
+mod a_faulted_epilogue_faults_its_own_lanes;
 mod a_fragmented_window_gets_a_view_per_run;
 mod a_fused_geglu_reads_its_affine_bank_as_planes;
 #[cfg(feature = "cuda")]
@@ -96,3 +99,4 @@ mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;
 mod the_operators_fraction_sizes_the_pool;
+mod the_score_rows_are_the_oracles;

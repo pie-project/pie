@@ -1,13 +1,15 @@
 #![cfg(feature = "cuda")]
 
-//! `attn.score_capture` against the host softmax: each lane's mass over its
-//! first `kv_max` keys, averaged over its last `observe` query rows, a run a
-//! head, written at the lane's row of a `[lanes, heads * kv_max]` plane.
+//! `attn.score_capture` against the host softmax: each capturing lane's
+//! mass a key of the context, averaged over its last `observe` query rows
+//! and its query heads, added into the key row its table names (none for a
+//! lane the table names 0), zeroed first for the first layer's; and
+//! `attn.score_pages`, that row summed a page.
 
 use crate::common::attn_ref::{col, pool, ten};
 use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg};
-use dtype::Dtype::{Bf16, F32, I32};
+use dtype::Dtype::{Bf16, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 
@@ -18,7 +20,8 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let (qh, kvh, d) = (4usize, 2usize, 128usize);
     // (new rows, cached rows) a lane: a prefill, a decode, a fresh prompt.
     let reqs = [(5usize, 20usize), (1, 33), (2, 0)];
-    let (observe, lane_offset, kv_max) = (3usize, 1usize, 40usize);
+    // The context past a lane's keys and short of another's.
+    let (observe, lane_offset, context) = (3usize, 1usize, 40usize);
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
     let n = reqs.len();
     let (mut qo, mut kv_indptr, mut kv_len, mut last, mut pages) =
@@ -39,14 +42,15 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let (k_raw, k) = lcg.row(cells * width);
     let (q_raw, q) = lcg.row(rows * qw);
 
-    let mut want = vec![9.0f32; (lane_offset + n) * qh * kv_max];
+    // A row a fire lane: the lanes before the capture's keep what they hold.
+    let mut want = vec![9.0f32; (lane_offset + n) * context];
     for (r, &(new, prefix)) in reqs.iter().enumerate() {
         let len = new + prefix;
         let seen = observe.min(new);
         let cell = |t: usize| pages[r][t / PAGE] * PAGE + t % PAGE;
+        let at = (lane_offset + r) * context;
+        want[at..at + context].fill(0.0);
         for h in 0..qh {
-            let at = ((lane_offset + r) * qh + h) * kv_max;
-            want[at..at + kv_max].fill(0.0);
             for w in 0..seen {
                 let row = qo[r + 1] as usize - seen + w;
                 let reach = len - seen + w + 1;
@@ -60,8 +64,8 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                     .collect();
                 let top = dots.iter().copied().fold(f32::MIN, f32::max);
                 let sum: f32 = dots.iter().map(|x| (x - top).exp()).sum();
-                for (t, x) in dots.iter().enumerate().take(kv_max) {
-                    want[at + t] += (x - top).exp() / sum / seen as f32;
+                for (t, x) in dots.iter().enumerate().take(context) {
+                    want[at + t] += (x - top).exp() / sum / (seen * qh) as f32;
                 }
             }
         }
@@ -123,7 +127,28 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     .expect("the prefill plans");
     plan.stage(&ctx).expect("the plan uploads");
     let at = gpu.up(&want.iter().map(|_| 9.0f32).collect::<Vec<_>>());
-    let mut scores = ten(at, lane_offset + n, qh * kv_max, F32);
+    // Each capturing lane's key row a row of `context` keys, its page row
+    // in a block of its own; the lanes before them have no row.
+    let page_rows = context.div_ceil(PAGE);
+    let page_at = gpu.zeros((lane_offset + n) * page_rows * 4);
+    let table = |base: u64, floats: usize| -> Vec<u64> {
+        (0..lane_offset + n)
+            .map(|lane| {
+                if lane < lane_offset {
+                    0
+                } else {
+                    base + (lane * floats * 4) as u64
+                }
+            })
+            .collect()
+    };
+    let scores = kernels_cuda::attn::score::CaptureRows {
+        keys: gpu.up(&table(at, context)),
+        pages: gpu.up(&table(page_at, page_rows)),
+        lanes: (lane_offset + n) as u32,
+        context: context as u32,
+        page_size: PAGE as u32,
+    };
     kernels_cuda::attn::score::capture(
         &ctx,
         qt,
@@ -131,11 +156,12 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         &kvp,
         d as u32,
         kvh as u32,
+        qh as u32,
         scale,
         observe as u32,
         lane_offset as u32,
-        kv_max as u32,
-        &mut scores,
+        scores,
+        true,
     )
     .expect("the capture fires");
     gpu.sync();
@@ -159,13 +185,63 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                 &pools[0],
                 d as u32,
                 kvh as u32,
+                qh as u32,
                 scale,
                 observe as u32,
                 lane_offset as u32,
-                kv_max as u32,
-                &mut scores,
+                scores,
+                true,
             )
             .expect("the capture fires");
         },
     );
+
+    // The first layer's capture zeroes the row (`agrees` left it poisoned)
+    // and the next layer's adds into what it left.
+    for zero in [true, false] {
+        kernels_cuda::attn::score::capture(
+            &ctx,
+            qt,
+            &plan,
+            &kvp,
+            d as u32,
+            kvh as u32,
+            qh as u32,
+            scale,
+            observe as u32,
+            lane_offset as u32,
+            scores,
+            zero,
+        )
+        .expect("the capture fires");
+    }
+    kernels_cuda::attn::score::pages(&ctx, scores, lane_offset as u32, n as u32)
+        .expect("the pages sum");
+    gpu.sync();
+    let summed: Vec<f32> = gpu.down(at, want.len());
+    // The capturing lanes' rows (`agrees` poisons the rest).
+    let capturing = lane_offset * context..;
+    for (i, (g, w)) in summed[capturing.clone()]
+        .iter()
+        .zip(&want[capturing])
+        .enumerate()
+    {
+        assert!(
+            (g - 2.0 * w).abs() <= 4e-3,
+            "summed at {i}: got {g}, want {}",
+            2.0 * w
+        );
+    }
+    let paged: Vec<f32> = gpu.down(page_at, (lane_offset + n) * page_rows);
+    for lane in lane_offset..lane_offset + n {
+        for p in 0..page_rows {
+            let keys = &summed[lane * context..(lane + 1) * context];
+            let want: f32 = keys[p * PAGE..((p + 1) * PAGE).min(context)].iter().sum();
+            let got = paged[lane * page_rows + p];
+            assert!(
+                (got - want).abs() <= 1e-5,
+                "lane {lane} page {p}: got {got}, want {want}"
+            );
+        }
+    }
 }

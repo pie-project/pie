@@ -83,6 +83,10 @@ impl Serve for Api {
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
+        // A device whose profile lacks the roofline's constants measures
+        // them here, before ready, and keeps them in the user's profile.
+        // No bound on one submission is stated on Vulkan yet.
+        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
         Ok((device, tuning))
     }
 
@@ -181,6 +185,7 @@ impl Serve for Api {
             let seq = shell.airborne.enter();
             let counts = shell.airborne.clone();
             let done = prepared.done.take();
+            let fed = prepared.fed_check.clone();
             let recording = shell
                 .shelf
                 .recorder
@@ -209,17 +214,15 @@ impl Serve for Api {
                 recording
                     .kept
                     .replay(Some(Box::new(move |refused: Option<String>| {
-                        counts.leave();
-                        if let Some(done) = done.as_ref() {
-                            let outcome = match &refused {
-                                None => done.settled(),
-                                Some(why) => engine::StepOutcome::Faulted(format!(
-                                    "vulkan replay for frame {} step {}: {why}",
-                                    done.at.frame, done.at.step
-                                )),
-                            };
-                            (done.sink)(done.at, outcome);
+                        // What the fire embedded is read back before its
+                        // count is left: its arm may be taken again then.
+                        if let Some(fed) = fed.as_ref() {
+                            fed.landed(refused.is_none());
                         }
+                        if let Some(done) = done.as_ref() {
+                            done.tell(refused, "vulkan replay");
+                        }
+                        counts.leave();
                     })))
             });
             let pending = match pending {
@@ -268,22 +271,21 @@ impl Serve for Api {
             keep,
             counts,
             done,
+            fed_check,
             ..
         } = launch;
         shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
         let on_done: Box<dyn Fn(Option<String>) + Send + 'static> =
             Box::new(move |refused: Option<String>| {
-                counts.leave();
-                if let Some(done) = done.as_ref() {
-                    let outcome = match &refused {
-                        None => done.settled(),
-                        Some(why) => engine::StepOutcome::Faulted(format!(
-                            "vulkan command buffer for frame {} step {}: {why}",
-                            done.at.frame, done.at.step
-                        )),
-                    };
-                    (done.sink)(done.at, outcome);
+                // What the fire embedded is read back before its count is
+                // left: its arm may be taken again then.
+                if let Some(fed) = fed_check.as_ref() {
+                    fed.landed(refused.is_none());
                 }
+                if let Some(done) = done.as_ref() {
+                    done.tell(refused, "vulkan command buffer");
+                }
+                counts.leave();
             });
         match keep {
             Some(key) => frame.into_kept().and_then(|kept| {
@@ -326,7 +328,13 @@ impl Serve for Api {
         let Some(flight) = shell.inflight.pop_front() else {
             return Ok(());
         };
-        if let Err(fault) = flight.api.pending.wait() {
+        let waited = flight.api.pending.wait();
+        // The arm's token seat is read back at the landing: it is written
+        // again only once that read is done.
+        if let Some(fed) = &flight.fed_check {
+            fed.wait();
+        }
+        if let Err(fault) = waited {
             shell.arms.give(flight.arm);
             return Err(match fault {
                 Fault::Device { call, why } => Fault::Device {

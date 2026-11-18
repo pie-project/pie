@@ -480,8 +480,8 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// The four profiles the old `memory_tolerance` named, as the two keys
-    /// state them.
+    /// The profiles `governor_backoff` documents, with
+    /// `governor_release_idle` on.
     const AGGRESSIVE: Tolerance = Tolerance {
         backoff: 0.9,
         release_idle: true,

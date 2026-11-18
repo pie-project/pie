@@ -77,6 +77,18 @@ fn fire_and_compare(graphs: Graphs) {
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the frame settles");
+    // Armed, the fire replays a body that reads its mask: one captured
+    // without a mask would land every row of its group.
+    if matches!(graphs, Graphs::On) {
+        let shell = rig.engine.shell().expect("the load holds a shell");
+        let key = shell
+            .replayed_body()
+            .expect("an armed load replays a body for the masked fire");
+        assert!(
+            key.group_mask,
+            "the masked fire replayed {key}, a body captured with no group mask"
+        );
+    }
     let readouts = &ticket.steps[0].readouts;
     assert_eq!(readouts.len(), 3);
     for (at, readout) in readouts.iter().enumerate() {
@@ -97,4 +109,37 @@ fn a_stated_group_mask_reads_only_the_rows_it_admits_every_case() {
     }
     fire_and_compare(Graphs::Shaped);
     fire_and_compare(Graphs::On);
+}
+
+/// The same layer whose model states no lane's mask on its attention: a
+/// lane's mask is refused by name, and the load lays no mask stretch.
+#[test]
+fn a_mask_over_an_attention_stating_none_is_refused() {
+    if !engine_cuda::device::present() {
+        eprintln!("no device: skipping");
+        return;
+    }
+    let trace = common_encoder::unstated_trace();
+    let weights = Weights::random(&trace, 13);
+    let mut rig = Rig::load_trace(trace, &weights, 64, vec![16, 32, 64], Graphs::On);
+    let n = ROWS[0];
+    let mut rng = Lcg::seeded(17);
+    let x: Vec<f32> = (0..n * WIDTH as usize).map(|_| bf(rng.unit())).collect();
+    let handles = rig.lane(n as u32);
+    rig.publish(handles.instance, 0, &x);
+    let mut stated = lane(&rig, 0, &handles, 0);
+    stated.kv_less = true;
+    stated.mask = Some(Masking::Rows((0..n).map(|i| row_mask(0, i, n)).collect()));
+    let refused = rig
+        .engine
+        .submit(&frame(vec![stated], vec![attach(0, &handles)]))
+        .and_then(|mut ticket| rig.engine.settle_frame(&mut ticket).map(|()| ticket));
+    let why = match refused {
+        Ok(_) => panic!("a lane's mask over an attention stating none fired"),
+        Err(why) => why.to_string(),
+    };
+    assert!(
+        why.contains("stated_group_mask()"),
+        "the refusal names what the model must state: {why}"
+    );
 }

@@ -7,7 +7,9 @@ pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
 const HANDLES_PER_ARENA: u64 = 256;
 
-const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
+/// The driver's safety floor under the measured capacity: one size on
+/// every backend.
+const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
 /// The handle a flat arena's units carry: they are backed by the arena's
 /// one allocation, and own nothing to release.
@@ -32,15 +34,11 @@ pub const fn mapped_on_demand() -> bool {
 /// out of the range by name; once arming ends nothing allocates on the
 /// device.
 #[must_use]
-pub const fn safety_floor_bytes(total: u64) -> u64 {
-    if !mapped_on_demand() {
-        return 0;
-    }
-    let tenth = total / 10;
-    if SAFETY_FLOOR_BYTES < tenth {
+pub const fn safety_floor_bytes() -> u64 {
+    if mapped_on_demand() {
         SAFETY_FLOOR_BYTES
     } else {
-        tenth
+        0
     }
 }
 
@@ -50,7 +48,7 @@ pub const fn safety_floor_bytes(total: u64) -> u64 {
 pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 {
     allowance
         .room(total, total.saturating_sub(free))
-        .saturating_sub(safety_floor_bytes(total))
+        .saturating_sub(safety_floor_bytes())
 }
 
 /// What a card of `total` bytes may hold in all while a load under
@@ -75,7 +73,7 @@ pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
     ceiling
         .min(total)
         .saturating_sub(total.saturating_sub(free))
-        .saturating_sub(safety_floor_bytes(total))
+        .saturating_sub(safety_floor_bytes())
 }
 
 #[must_use]
@@ -157,18 +155,13 @@ impl PhysicalPool {
     pub fn open(device: i32, ceiling: u64) -> Result<PhysicalPool> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
             let granularity = allocation_granularity(device)?;
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
+            let (free, total) = crate::device::card::memory()?;
             let beside = Beside::read()?;
             if !beside.said.is_empty() {
                 eprintln!("engine-cuda: outside the pool, {}", beside.said);
             }
-            let budget = room_under(ceiling, free as u64, total as u64);
+            let budget = room_under(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -236,13 +229,8 @@ impl PhysicalPool {
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            Ok(room_under(self.ceiling, free as u64, total as u64).saturating_sub(reserve))
+            let (free, total) = crate::device::card::memory()?;
+            Ok(room_under(self.ceiling, free, total).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
@@ -304,14 +292,8 @@ impl PhysicalPool {
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let available =
-                room_under(self.ceiling, free as u64, total as u64) / LOGICAL_PAGE_BYTES;
+            let (free, total) = crate::device::card::memory()?;
+            let available = room_under(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())
@@ -1160,6 +1142,13 @@ impl Range {
     ) -> Result<Commit> {
         // A size-only walk backs nothing and holds nothing (`crate::sizing`).
         if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
+        // A span held from `from` already covering `bytes` leaves what is
+        // held as it is, and what is held is backed: nothing to commit. A
+        // bind holds the same span again on every program it lays, and the
+        // walk below spells out every unit of the range to find that out.
+        if self.held(from) >= bytes {
             return Ok(Commit::Committed);
         }
         let mut held = self.held.clone();

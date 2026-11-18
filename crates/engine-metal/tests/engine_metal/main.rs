@@ -1,6 +1,10 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_bank_past_2_gib_reads_its_last_rows;
+mod a_cold_registration_compiles_while_lanes_fire;
+mod a_mixed_fires_last_rows_are_each_lanes_own;
+mod a_prewarmed_program_registers_off_thread_without_compiling;
+mod a_faulted_epilogue_fails_its_own_lanes_alone;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
@@ -19,9 +23,11 @@ mod a_page_in_an_uncommitted_chunk_is_refused_by_name;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_pool_serves_the_same_logits;
+mod a_score_reader_holds_its_rows_through_a_park;
 mod a_settled_fires_fold_is_told_before_it_returns;
 mod a_stated_position_bounds_no_key;
 mod a_stale_frozen_length_replays_from_where_the_record_stands;
+mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
@@ -62,6 +68,7 @@ mod the_register_routed_mlp_answers_the_per_route_path;
 mod the_register_rows_match_affine_dots;
 mod the_rotated_packed_kv_serves;
 mod the_rs_scratch_is_the_widest_layers;
+mod the_score_rows_are_the_oracles;
 mod the_selector_reads_out_the_reference_walk;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
