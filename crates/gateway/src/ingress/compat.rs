@@ -145,6 +145,21 @@ fn completion_prompt(body: &Value) -> Option<&str> {
     }
 }
 
+/// A completion's one prompt given as token ids: an array of integers, or
+/// an array of one such array.
+fn completion_token_ids(body: &Value) -> Option<Value> {
+    let ids = |v: &Value| {
+        v.as_array()
+            .filter(|ids| !ids.is_empty() && ids.iter().all(Value::is_u64))
+            .map(|_| v.clone())
+    };
+    let prompt = body.get("prompt")?;
+    ids(prompt).or_else(|| match prompt.as_array()?.as_slice() {
+        [one] => ids(one),
+        _ => None,
+    })
+}
+
 /// In order, so a later turn's text starts with an earlier one's.
 fn prompt_text(body: &Value) -> Option<String> {
     fn gather(value: &Value, text: &mut String) {
@@ -333,14 +348,20 @@ async fn relay(
         }
     };
     let mut props = props(&headers, &body);
-    if uri.path() == "/v1/completions"
-        && !props.contains_key(client_api::props::RAW_PROMPT)
-        && let Some(text) = completion_prompt(&body)
-    {
-        props.insert(
-            client_api::props::RAW_PROMPT.to_string(),
-            Value::String(text.to_string()),
-        );
+    if uri.path() == "/v1/completions" {
+        if !props.contains_key(client_api::props::RAW_PROMPT)
+            && let Some(text) = completion_prompt(&body)
+        {
+            props.insert(
+                client_api::props::RAW_PROMPT.to_string(),
+                Value::String(text.to_string()),
+            );
+        }
+        if !props.contains_key(client_api::props::PROMPT_TOKENS)
+            && let Some(ids) = completion_token_ids(&body)
+        {
+            props.insert(client_api::props::PROMPT_TOKENS.to_string(), ids);
+        }
     }
     let launch = Launch {
         state,
@@ -755,6 +776,20 @@ mod tests {
             assert!(path.starts_with("/v1"), "{path}");
             assert!(!inferlet.is_empty());
         }
+    }
+
+    #[test]
+    fn a_completion_prompt_of_token_ids_is_stated_as_them() {
+        assert_eq!(
+            completion_token_ids(&json!({"prompt": [5, 6]})),
+            Some(json!([5, 6]))
+        );
+        assert_eq!(
+            completion_token_ids(&json!({"prompt": [[5, 6]]})),
+            Some(json!([5, 6]))
+        );
+        assert_eq!(completion_token_ids(&json!({"prompt": [[5], [6]]})), None);
+        assert_eq!(completion_token_ids(&json!({"prompt": "abc"})), None);
     }
 
     #[test]
