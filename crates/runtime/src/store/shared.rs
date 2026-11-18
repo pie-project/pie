@@ -224,8 +224,40 @@ fn rung_granted(engine: usize) -> u32 {
 /// pass's key: what moves the activation rung (a pool sits at its smallest
 /// rung while none asks past it).
 static RUNG_WANTS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<usize, std::collections::BTreeMap<u64, u32>>>,
+    Mutex<
+        std::collections::HashMap<usize, std::collections::BTreeMap<u64, (u32, Option<uuid::Uuid>)>>,
+    >,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The processes with a bind under way, each with how many: what they ask
+/// of the rung cannot fire until the bind lands ([`binding`]).
+static BINDING: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// A bind of process `pid` under way, held until it lands or is refused:
+/// meanwhile the process's asks of the rung hold no cut to the guest
+/// terms' fit ([`firing_wanted_rows`]), since none of its fires can run
+/// before the bind, which may itself wait on that cut.
+#[must_use = "the bind counts while it is held"]
+pub struct Binding(uuid::Uuid);
+
+/// Process `pid` binds from here until the guard drops.
+pub fn binding(pid: uuid::Uuid) -> Binding {
+    *BINDING.lock().unwrap().entry(pid).or_default() += 1;
+    Binding(pid)
+}
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        let mut binding = BINDING.lock().unwrap();
+        if let Some(count) = binding.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                binding.remove(&self.0);
+            }
+        }
+    }
+}
 
 static RUNG_WANT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -240,13 +272,20 @@ pub struct RungWant {
 /// Asks that fires on `engine` carry `rows`; the pool's walker raises the
 /// rung that holds them where room allows ([`RungWalk`]).
 pub fn want_rows(engine: usize, rows: u32) -> RungWant {
+    want_rows_by(engine, rows, None)
+}
+
+/// [`want_rows`] for process `pid`'s pass: the ask holds a cut to the
+/// guest terms' fit only while the process has no bind under way
+/// ([`binding`]).
+pub fn want_rows_by(engine: usize, rows: u32, pid: Option<uuid::Uuid>) -> RungWant {
     let key = RUNG_WANT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RUNG_WANTS
         .lock()
         .unwrap()
         .entry(engine)
         .or_default()
-        .insert(key, rows);
+        .insert(key, (rows, pid));
     RungWant { engine, key }
 }
 
@@ -271,7 +310,7 @@ pub fn hold_for_process(pid: uuid::Uuid, engine: usize, rows: Option<u32>) {
     let mut wants = PROCESS_WANTS.lock().unwrap();
     match rows {
         Some(rows) => {
-            wants.insert(pid, want_rows(engine, rows));
+            wants.insert(pid, want_rows_by(engine, rows, Some(pid)));
         }
         None => {
             wants.remove(&pid);
@@ -371,7 +410,28 @@ pub fn wanted_rows(engine: usize) -> u32 {
         .lock()
         .unwrap()
         .get(&engine)
-        .and_then(|wants| wants.values().copied().max())
+        .and_then(|wants| wants.values().map(|&(rows, _)| rows).max())
+        .unwrap_or(0)
+}
+
+/// [`wanted_rows`] of the asks that can fire: none of a process with a
+/// bind under way ([`binding`]). What holds a cut to the guest terms' fit:
+/// a bind never waits on its own process's ask, nor on one of a process
+/// still binding.
+#[must_use]
+pub fn firing_wanted_rows(engine: usize) -> u32 {
+    let binding = BINDING.lock().unwrap();
+    RUNG_WANTS
+        .lock()
+        .unwrap()
+        .get(&engine)
+        .and_then(|wants| {
+            wants
+                .values()
+                .filter(|(_, pid)| pid.is_none_or(|pid| !binding.contains_key(&pid)))
+                .map(|&(rows, _)| rows)
+                .max()
+        })
         .unwrap_or(0)
 }
 

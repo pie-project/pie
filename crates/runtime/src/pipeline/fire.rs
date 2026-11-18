@@ -1109,7 +1109,7 @@ fn ask_rung(
     // Held before the cap is read: the walker takes no cap down past an
     // ask, and `raise_now` lifts one it took before, both in the pool's
     // lock.
-    let want = crate::store::shared::want_rows(engine, rows);
+    let want = crate::store::shared::want_rows_by(engine, rows, Some(pid));
     let fund = stores.shared.clone().map(|shared| {
         let kv = stores.kv.clone();
         Box::new(move |rows: u32| {
@@ -3964,8 +3964,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
-        // Only a lone lane's rest is cut again once a raise lands.
-        let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
+        // Only a lone lane's rest is cut again: wider once a raise lands
+        // (where it was cut in pieces), narrower once the cap came down
+        // under it (a single piece too).
+        let lone = full.lanes.len() == 1;
+        let recuttable = lone && cuts.len() > 1;
         // A piece that would not cut to the rung asks for its own width,
         // and one that carries more rows than its own for those.
         let pieces: Vec<FireRows> = cuts
@@ -4058,7 +4061,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut advanced = vec![false; groups.len()];
         let mut at = 0;
         while at < cuts.len() {
-            if recuttable && at > 0 {
+            let narrowed = lone && crate::store::shared::fire_cap(engine) < cut_at;
+            if (recuttable && at > 0) || narrowed {
                 // While the raise is pending the pass runs no further ahead
                 // of the device than a few pieces, so what is left is cut at
                 // the raised rung once it lands.
@@ -4089,7 +4093,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let recut = (cap > cut_at && at + 1 < cuts.len()) || cap < cut_at;
                 if recut && (!framed || at % frame_size == 0) {
                     cut_at = cap;
-                    let start = cuts[at - 1][0].map_or(0, |(_, to)| to);
+                    let start = at
+                        .checked_sub(1)
+                        .and_then(|before| cuts[before][0])
+                        .map_or(0, |(_, to)| to);
                     let rest = host_cuts_from(
                         &full,
                         cuttable,

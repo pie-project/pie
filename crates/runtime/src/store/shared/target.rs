@@ -271,7 +271,7 @@ impl SharedGrow {
                         // asks are gone.
                         // The passes' asks only: the live lanes' count
                         // takes in the binds' own processes.
-                        let passes = super::wanted_rows(self.engine);
+                        let passes = super::firing_wanted_rows(self.engine);
                         if tokens < now && pool.lifted(pool.pool().rung_of(passes)) > tokens {
                             tracing::info!(
                                 engine = self.engine,
@@ -864,6 +864,73 @@ mod tests {
         drop(queued);
         grow.walk_rung().await;
         assert!(super::super::fire_cap(ENGINE) <= 256, "cut to the fit");
+    }
+
+    /// The cold-start shapes of Mac's od-r7k and od-r7l runs: passes asking
+    /// wider than the guest terms' fit, then binds counting their terms.
+    /// Asks that can fire (od-r7k: the passes' processes bound) hold the
+    /// cut to the fit, so their fires go at the rung the engine holds; asks
+    /// of processes still binding (od-r7l: every asker among the binders)
+    /// hold nothing, so the cut is taken and the binds go on; once a bind
+    /// lands its process's ask counts again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_asks_that_can_fire_hold_a_cut_to_the_guest_terms_fit() {
+        let narrowed = |shared: &Shared| {
+            let mut pool = shared.lock().unwrap();
+            let key = super::super::programs::FireKey {
+                program: ::engine::ProgramId(1),
+                extents: ::engine::BindExtents::default(),
+            };
+            let fixed = 55 * pool.pool().chunk_bytes();
+            pool.fire_facts_learned(
+                key,
+                &::engine::FireFacts {
+                    fixed,
+                    ..::engine::FireFacts::default()
+                },
+            );
+            pool.instance_bound(::engine::InstanceId(1), key);
+            assert_eq!(pool.fit_cap(), 256);
+        };
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        // od-r7k: two bound processes' passes ask 1024 rows.
+        const BOUND: usize = 9215;
+        let shared: Shared = Arc::new(std::sync::Mutex::new(super::super::tests::pool()));
+        let grow = SharedGrow::new(0, BOUND, shared.clone()).with_live_lanes(|| 64);
+        let asks = [
+            super::super::want_rows_by(BOUND, 1024, Some(a)),
+            super::super::want_rows_by(BOUND, 1024, Some(b)),
+        ];
+        narrowed(&shared);
+        grow.walk_rung().await;
+        assert_eq!(super::super::fire_cap(BOUND), u32::MAX, "held for the asks that can fire");
+        drop(asks);
+        grow.walk_rung().await;
+        assert!(super::super::fire_cap(BOUND) <= 256, "their fires ran: cut to the fit");
+
+        // od-r7l: the askers are binding too, as are the rest (64 live).
+        const BINDING: usize = 9216;
+        let shared: Shared = Arc::new(std::sync::Mutex::new(super::super::tests::pool()));
+        let grow = SharedGrow::new(0, BINDING, shared.clone()).with_live_lanes(|| 64);
+        let binds = [super::super::binding(a), super::super::binding(b)];
+        let _asks = [
+            super::super::want_rows_by(BINDING, 1024, Some(a)),
+            super::super::want_rows_by(BINDING, 1024, Some(b)),
+        ];
+        assert_eq!(super::super::firing_wanted_rows(BINDING), 0);
+        narrowed(&shared);
+        grow.walk_rung().await;
+        assert!(
+            super::super::fire_cap(BINDING) <= 256,
+            "no ask of a process still binding holds the cut: the binds go on"
+        );
+        drop(binds);
+        assert_eq!(
+            super::super::firing_wanted_rows(BINDING),
+            1024,
+            "bound, its ask counts again"
+        );
     }
 
     /// A raise the walk found no room for is not tried again on its next

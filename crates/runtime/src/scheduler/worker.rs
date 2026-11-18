@@ -1178,6 +1178,10 @@ impl SchedulerHandle {
             .program_id(pipeline_id.unwrap_or_default(), program)
             .await?;
         bind.binding.program = program_id;
+        // Until the bind lands, none of the process's fires can run: its
+        // asks of the rung hold no cut to the guest terms' fit, which this
+        // bind (and every other) may wait on.
+        let _binding = crate::store::shared::binding(pipeline_id.unwrap_or_default());
         // The fire term of the program at these extents counts while the
         // bind is under way, and the activation the fires may take holds it
         // before the bind is sent (`store::shared::programs`). The engine is
