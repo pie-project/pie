@@ -1770,7 +1770,14 @@ impl Pools {
         // A stated pool's pages are counted beside the records it was
         // sized with, as [`StatedKv::of`] counted them.
         let records = self.stated_kv.map_or(0, |kv| kv.records);
-        let fits = pages_in(layout, &self.paging, kv_chunks, records, floor, self.ceiling);
+        let fits = pages_in(
+            layout,
+            &self.paging,
+            kv_chunks,
+            records,
+            floor,
+            self.ceiling,
+        );
         // A pool stated for more than this fit holds keeps the pages of
         // what it stated: the runtime names them, and a count that moved
         // under live tables would not be the one they were laid by.
@@ -5259,113 +5266,148 @@ mod tests {
 
     // Qwen3-0.6B, `kv_device_tokens = 16384`, 16 seats, on the A6000: the
     // pool was sized for 1024 pages (117 chunks) and the fit backed 1017,
-    // and 16000 tokens backed 990 of 1000. The claim was the chunks' bytes
-    // while the room it left them was counted in the range's map units, and
-    // in pages of each part rounded apart, so the growth of backing them
-    // came past it and the fit gave up a chunk or two. The claim is what
-    // backing them grows the range by, and the room counted once: what the
-    // pool is sized for is what it backs.
+    // and 16000 tokens backed 990 of 1000; Qwen3-8B, 53853 tokens, backed
+    // 3344 of 3366 pages (424 chunks of 18 MiB). The claim was the chunks'
+    // bytes while the room it left them was counted in the range's map
+    // units, and in pages of each part rounded apart, so the growth of
+    // backing them came past it and the fit gave up chunks. The claim is
+    // what backing them grows the range by, and the room counted once: what
+    // the pool is sized for is what it backs.
     fn stated_tokens_are_backed_whole_at_every_seat_count() {
         const MIB: u64 = 1 << 20;
-        const PAGE: u64 = elastic::LOGICAL_PAGE_BYTES;
-        // Qwen3-0.6B's kv page (28 layers, 8 heads of 128, 16 tokens of
-        // bf16 keys and values), nine a chunk; a recurrent record of 3 MiB
-        // in two pieces, so the records the seats take are chunks too.
-        let page_bytes = 28 * 2 * 8 * 128 * 16 * 2;
-        let chunk = 9 * page_bytes + 4096;
-        let shape = |id, tokens, slot_bytes: u64| layout::SlotShape {
-            id,
-            tokens,
-            slot_bytes,
-            per_chunk: u32::try_from(chunk / slot_bytes).expect("a count"),
-            grain: slot_bytes,
-            window: None,
-            rows: Vec::new(),
-            pools: Vec::new(),
-        };
-        let layout = layout::Layout {
-            chunk_bytes: chunk,
-            segment_chunks: 4,
-            list: Some(shape(layout::LIST, 16, page_bytes)),
-            windows: Vec::new(),
-            fixed: Some(layout::FixedShape {
-                slot: shape(layout::FIXED, 0, 3 * MIB / 2),
-                pieces: 2,
-                rows: Vec::new(),
-                tables: Vec::new(),
-            }),
-            rs: None,
-            instance: shape(layout::INSTANCE, 0, layout::INSTANCE_SLOT),
-            channel: shape(layout::CHANNEL, 0, layout::CHANNEL_SLOT),
-            rows: Vec::new(),
-            experts: Vec::new(),
-        };
-        // A range mapped in units of 32 MiB, no multiple of the chunk: the
-        // last unit of a pool reaches past its last chunk.
-        let unit = 32 * MIB;
-        let units = |bytes: u64| bytes.div_ceil(unit) * unit;
+        // A kv page of 16 bf16 tokens' keys and values over 8 heads of 128.
+        let kv_page = |layers: u64| layers * 2 * 8 * 128 * 16 * 2;
+        // Qwen3-0.6B (28 layers), nine pages a chunk, with a recurrent
+        // record of 3 MiB in two pieces so the records the seats take are
+        // chunks too; Qwen3-8B (36 layers), eight pages a chunk of 18 MiB,
+        // dense.
+        let small = kv_page(28);
+        let large = kv_page(36);
+        let cases: [(&str, u64, u64, bool, &[u32], &[u64]); 2] = [
+            (
+                "Qwen3-0.6B",
+                small,
+                9 * small + 4096,
+                true,
+                &[1, 4, 16, 32],
+                &[16_000, 16_384],
+            ),
+            ("Qwen3-8B", large, 8 * large, false, &[0, 1, 16], &[53_853]),
+        ];
         let mut short_before = 0;
-        for seats in [1, 4, 16, 32] {
-            for tokens in [16_000, 16_384] {
-                let paging = Paging::of(16, 4096, seats, 1).expect("a paging");
-                let kv = StatedKv::of(&layout, &paging, tokens);
-                let at = format!("{seats} seats, {tokens} tokens");
-                // The pages its chunks hold are the pages asked, counted as
-                // the fit counts them: beside the same records.
-                assert_eq!(
-                    pages_in(&layout, &paging, kv.kv_chunks, kv.records, 1, kv.pages),
-                    kv.pages,
-                    "{at}"
-                );
-                assert!(
-                    pages_in(&layout, &paging, kv.kv_chunks - 1, kv.records, 1, kv.pages)
-                        < kv.pages,
-                    "{at}: a chunk fewer holds fewer"
-                );
-                // A fit before arming: the activation's span (a held prefix
-                // backed, the rest still to back) and the null chunk's unit
-                // backed; the bodies hold every byte past the claim; the
-                // card has a few GiB free past what the range backs.
-                let activation = 40 * MIB;
-                let unheld = 24 * MIB;
-                let backed = unit + (activation - unheld);
-                let free = 6 * 1024 * MIB + 12_345;
-                let programs = 96 * MIB;
-                let live = free + backed - activation;
-                let growth = (units(kv.bytes()) - unit) / PAGE;
-                let claim = claim_of(growth, PAGE, backed, activation - unheld);
-                for bodies in [MEASURING, 512 * MIB] {
-                    let (bodies, programs) =
-                        holds(claim, live, bodies, programs).expect("the card holds them");
-                    let room = live - bodies - programs;
-                    assert!(
-                        kv.admit(room, claim, unit).is_ok(),
-                        "{at}: the claim is admitted"
-                    );
-                    let have = growth_room(free, unheld, bodies + programs, PAGE);
-                    assert!(growth <= have, "{at}: backing every chunk stated fits");
-                    if bodies == MEASURING {
-                        assert_eq!(growth, have, "{at}: and is all it was held");
+        for (model, page_bytes, chunk, record, seat_counts, token_counts) in cases {
+            let shape = |id, tokens, slot_bytes: u64| layout::SlotShape {
+                id,
+                tokens,
+                slot_bytes,
+                per_chunk: u32::try_from(chunk / slot_bytes).expect("a count"),
+                grain: slot_bytes,
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            };
+            let layout = layout::Layout {
+                chunk_bytes: chunk,
+                segment_chunks: 4,
+                list: Some(shape(layout::LIST, 16, page_bytes)),
+                windows: Vec::new(),
+                fixed: record.then(|| layout::FixedShape {
+                    slot: shape(layout::FIXED, 0, 3 * MIB / 2),
+                    pieces: 2,
+                    rows: Vec::new(),
+                    tables: Vec::new(),
+                }),
+                rs: None,
+                instance: shape(layout::INSTANCE, 0, layout::INSTANCE_SLOT),
+                channel: shape(layout::CHANNEL, 0, layout::CHANNEL_SLOT),
+                rows: Vec::new(),
+                experts: Vec::new(),
+            };
+            // Ranges mapped in units no multiple of the chunk: the last unit
+            // of a pool reaches past its last chunk.
+            for unit in [32 * MIB, 64 * MIB] {
+                for &seats in seat_counts {
+                    for &tokens in token_counts {
+                        let at = format!(
+                            "{model}, {seats} seats, {tokens} tokens, units of {} MiB",
+                            unit >> 20
+                        );
+                        if stated_backs_what_it_asks(&layout, unit, seats, tokens, &at) {
+                            short_before += 1;
+                        }
                     }
                 }
-                // Claimed as the chunks' bytes, the same pool came short.
-                let (bodies, programs) =
-                    holds(kv.bytes(), live, MEASURING, programs).expect("held");
-                if growth > growth_room(free, unheld, bodies + programs, PAGE) {
-                    short_before += 1;
-                }
-                // A card short of the claim refuses by the key, with what
-                // backing takes.
-                let refused = kv
-                    .admit(claim - 1, claim, unit)
-                    .expect_err("a byte short refuses");
-                assert!(
-                    refused.to_string().contains(&format!("backs in {claim} bytes")),
-                    "{refused}"
-                );
             }
         }
         assert!(short_before > 0, "the chunks' bytes alone came short");
+    }
+
+    /// Asserts a pool of `tokens` stated tokens beside `seats` records, in
+    /// a range mapped in units of `unit`, is backed whole by the fit's
+    /// arithmetic; returns whether its chunks' bytes alone came short.
+    fn stated_backs_what_it_asks(
+        layout: &layout::Layout,
+        unit: u64,
+        seats: u32,
+        tokens: u64,
+        at: &str,
+    ) -> bool {
+        const MIB: u64 = 1 << 20;
+        const PAGE: u64 = elastic::LOGICAL_PAGE_BYTES;
+        let units = |bytes: u64| bytes.div_ceil(unit) * unit;
+        let paging = Paging::of(16, 4096, seats, 1).expect("a paging");
+        let kv = StatedKv::of(layout, &paging, tokens);
+        // The pages its chunks hold are the pages asked, counted as the fit
+        // counts them: beside the same records.
+        assert_eq!(
+            pages_in(layout, &paging, kv.kv_chunks, kv.records, 1, kv.pages),
+            kv.pages,
+            "{at}"
+        );
+        assert!(
+            pages_in(layout, &paging, kv.kv_chunks - 1, kv.records, 1, kv.pages) < kv.pages,
+            "{at}: a chunk fewer holds fewer"
+        );
+        // A fit before arming: the activation's span (a held prefix backed,
+        // the rest still to back) and the null chunk's unit backed; the
+        // bodies hold every byte past the claim; the card has GiBs free
+        // past what the range backs.
+        let activation = 40 * MIB;
+        let unheld = 24 * MIB;
+        let backed = unit + (activation - unheld);
+        let free = 24 * 1024 * MIB + 12_345;
+        let programs = 96 * MIB;
+        let live = free + backed - activation;
+        let growth = (units(kv.bytes()) - unit) / PAGE;
+        let claim = claim_of(growth, PAGE, backed, activation - unheld);
+        for bodies in [MEASURING, 512 * MIB] {
+            let (bodies, programs) =
+                holds(claim, live, bodies, programs).expect("the card holds them");
+            let room = live - bodies - programs;
+            assert!(
+                kv.admit(room, claim, unit).is_ok(),
+                "{at}: the claim is admitted"
+            );
+            let have = growth_room(free, unheld, bodies + programs, PAGE);
+            assert!(growth <= have, "{at}: backing every chunk stated fits");
+            if bodies == MEASURING {
+                assert_eq!(growth, have, "{at}: and is all it was held");
+            }
+        }
+        // A card short of the claim refuses by the key, with what backing
+        // takes.
+        let refused = kv
+            .admit(claim - 1, claim, unit)
+            .expect_err("a byte short refuses");
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("backs in {claim} bytes")),
+            "{refused}"
+        );
+        // Claimed as the chunks' bytes, the same pool came short.
+        let (bodies, programs) = holds(kv.bytes(), live, MEASURING, programs).expect("held");
+        growth > growth_room(free, unheld, bodies + programs, PAGE)
     }
 
     // `kv_device_tokens` sized from outside the fit missed the list's
