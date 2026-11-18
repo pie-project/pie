@@ -387,32 +387,4 @@ __global__ void moe_bias_sum(
     out[i] = Elem<T>::from_f32(acc);
 }
 
-template <class T>
-__global__ void reorder_moe_aligned_output(
-    const T* __restrict__ aligned_out,
-    const i32* __restrict__ sorted_route_ids,
-    T* __restrict__ route_out,
-    int num_routes,
-    int aligned_rows,
-    int hidden,
-    int shared_row_begin,
-    int num_tokens,
-    T* __restrict__ shared_out)
-{
-    const int h = blockIdx.y * blockDim.x + threadIdx.x;
-    const int row = blockIdx.x;
-    if (h >= hidden || row >= aligned_rows) return;
-    const T v = aligned_out[static_cast<long long>(row) * hidden + h];
-    if (shared_row_begin >= 0 && row >= shared_row_begin) {
-        const int t = row - shared_row_begin;
-        if (t < num_tokens) {
-            shared_out[static_cast<long long>(t) * hidden + h] = v;
-        }
-        return;
-    }
-    const int route = sorted_route_ids[row];
-    if (route >= num_routes) return;
-    route_out[static_cast<long long>(route) * hidden + h] = v;
-}
-
 }

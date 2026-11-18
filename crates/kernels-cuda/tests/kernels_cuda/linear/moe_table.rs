@@ -84,8 +84,14 @@ fn bf16_bank(g: &mut Gpu, lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> 
     g.up(&raw)
 }
 
+/// `g`'s context, priced on the tests' roofline.
 fn ctx_of(g: &Gpu) -> Ctx {
-    g.ctx()
+    let ctx = g.ctx();
+    let tuning = ctx.tuning();
+    ctx.with_tuning(kernels_cuda::tuning::Tuning {
+        roof: crate::common::roof(),
+        ..tuning
+    })
 }
 
 #[test]

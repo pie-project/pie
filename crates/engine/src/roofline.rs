@@ -252,16 +252,18 @@ impl Constants {
             .and_then(|waves| waves(m, n, k))
             .zip(self.gemm_full_by_rows.as_deref());
         match stated {
-            Some((waves, full)) => flops / rate_on(full, m, n, k) * wave_fill(waves),
+            Some((waves, full)) => {
+                flops / profile::fire::gemm_rate(full, m, n, k) * wave_fill(waves)
+            }
             None => flops / self.gemm_rate(m, n, k),
         }
     }
 
     /// The matmul rate at `m` rows of an `n x k` plane, as the curve was
-    /// timed ([`rate_on`]).
+    /// timed ([`profile::fire::gemm_rate`]).
     #[must_use]
     pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
-        rate_on(&self.gemm_by_rows, m, n, k)
+        profile::fire::gemm_rate(&self.gemm_by_rows, m, n, k)
     }
 
     /// The rows a matmul of `m x n x k` computes: `m` padded to its
@@ -343,32 +345,6 @@ impl Constants {
         };
         self.launch_ns + self.gemm_compute_ns(m, n, k).max(read)
     }
-}
-
-/// The matmul rate a curve of rates by rows at each width states at `m`
-/// rows of an `n x k` plane: each width's curve at the timed rows at or
-/// below `m` (its first below that), in `log width` at `sqrt(n k)` between
-/// the widths, clamped past them.
-fn rate_on(curves: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
-    let at = |curve: &[(u32, f64)]| -> f64 {
-        curve
-            .iter()
-            .rev()
-            .find(|&&(rows, _)| rows <= m)
-            .or(curve.first())
-            .map_or(f64::INFINITY, |&(_, r)| r)
-    };
-    let width: Vec<(u32, f64)> = curves.iter().map(|(w, c)| (*w, at(c))).collect();
-    let square = (f64::from(n) * f64::from(k)).sqrt();
-    // Past the widest width, its last span's slope in log width carries
-    // on (a wider plane fills more tiles); never below the widest's rate.
-    if let [.., (w0, r0), (w1, r1)] = width[..]
-        && square > f64::from(w1)
-    {
-        let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
-        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
-    }
-    profile::fire::interpolate(&width, square).unwrap_or(f64::INFINITY)
 }
 
 /// `work` at `rate` as a dispatch of `workgroups` runs it on a device
