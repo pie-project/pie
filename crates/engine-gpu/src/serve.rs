@@ -1022,7 +1022,7 @@ impl<B: Serve> Shell<B> {
         // the context, `FireEstimate::fire_top`); a fire never runs past the
         // pick.
         let device_profile = tuning.profile().clone();
-        let rated = device_profile.rates().complete();
+        let rated = device_profile.rates().complete(&crate::rates::KEYS);
         let counts = if rated {
             Some(crate::top::counts(&boot.trace)?)
         } else {

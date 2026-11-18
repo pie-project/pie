@@ -951,6 +951,8 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             hbm_gbps: Some(400.0),
             elementwise_gbps: None,
             launch_ns: None,
+            few_row_tflops: None,
+            workgroups_per_core: None,
         }
     );
 
@@ -1014,18 +1016,26 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`elementwise_gbps` and `scan_gelems`, not `flops`",
+            "`few_row_tflops` and `workgroups_per_core`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`scan_gelems`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`workgroups_per_core`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",
             "not `attn_flops_per_ns_by_keys_and_dim`",
         ),
         ("[rates]\nbytes_per_ns = 1.0\n", "not `bytes_per_ns`"),
+        (
+            "[rates]\nfew_row_tflops = 0\n",
+            "`rates.few_row_tflops` is a positive number",
+        ),
+        (
+            "[rates]\nworkgroups_per_core = -3.3\n",
+            "`rates.workgroups_per_core` is a positive number",
+        ),
         (
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",

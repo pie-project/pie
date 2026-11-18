@@ -43,6 +43,19 @@
 use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
+/// The `[rates]` keys this backend's estimate weighs a fire by (of
+/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
+/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
+/// choice on CUDA or ROCm reads them, so a load measures neither.
+pub const KEYS: [&str; 6] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+];
+
 /// The `[provenance]` entry a measurement of `device`'s rates writes beside
 /// them (`engine::rates::provenance`): how this backend measured them.
 #[must_use]
@@ -108,7 +121,7 @@ fn ensure_by(
         check: &check,
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, save, Some(room), None, |_max_submit| {
+    engine::rates::rates_at_load(chip, &KEYS, save, Some(room), None, |_max_submit| {
         Ok(engine::rates::Measured {
             rates: measure(&measure_chip)?,
             unsettled: false,
@@ -484,6 +497,8 @@ mod on_device {
                 hbm_gbps: Some(tenth(bytes)),
                 elementwise_gbps: Some(tenth(elementwise)),
                 scan_gelems: Some(tenth(scan)),
+                few_row_tflops: None,
+                workgroups_per_core: None,
             },
             attn_by_dim,
         })
@@ -995,6 +1010,8 @@ mod ensure_tests {
             hbm_gbps: Some(600.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
+            few_row_tflops: None,
+            workgroups_per_core: None,
         }
     }
 
@@ -1006,7 +1023,10 @@ mod ensure_tests {
         let facts = crate::chip::facts(8, 9, 142);
         let room = engine::rates::step_bytes();
         let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
-        assert!(!chip.rates().complete(), "no file states this card's rates");
+        assert!(
+            !chip.rates().complete(&KEYS),
+            "no file states this card's rates"
+        );
         let mut times = 0;
         let first = ensure_by(chip, device, &facts, Some(&home), room, |_| {
             times += 1;

@@ -14,6 +14,17 @@
 //! tile (`ceil(m / TM) · TM`, `TM` the tile rows of the algorithm the
 //! backend runs at that shape: [`RowTile`]). The per-row ops run at their
 //! own measured bandwidth.
+//!
+//! Two device facts weigh the choice between kernels of one op. A matmul
+//! of decode-shaped rows (4 to 256) runs at `few_row_tflops`, the rate of
+//! the kernel serving picks there ([`Constants::few_row_ns`]). A dispatch
+//! of `W` workgroups fills the device's `S = workgroups_per_core · cores`
+//! slots only in part where `W < S`: its compute takes `work / rate ·
+//! max(1, S / W)` ([`Constants::wave_ns`]), the one wave-fill rule every
+//! choice reads (the prefill attention's per-row against tiled kernel now;
+//! the few-row matmul's selection and CUDA's wave rule next). Neither is
+//! read as unbounded where unstated: a choice that needs one and finds it
+//! unstated is refused by its key.
 
 use std::sync::Arc;
 
@@ -34,6 +45,10 @@ pub struct Constants {
     pub bytes_per_ns: f64,
     pub elementwise_bytes_per_ns: f64,
     pub scan_elements_per_ns: f64,
+    /// `few_row_tflops` in flops a ns, where stated.
+    pub few_row_flops_per_ns: Option<f64>,
+    /// `workgroups_per_core`, where stated.
+    pub workgroups_per_core: Option<f64>,
     /// The rows a matmul pads to at a shape.
     pub row_tile: RowTile,
 }
@@ -47,6 +62,8 @@ impl std::fmt::Debug for Constants {
             .field("bytes_per_ns", &self.bytes_per_ns)
             .field("elementwise_bytes_per_ns", &self.elementwise_bytes_per_ns)
             .field("scan_elements_per_ns", &self.scan_elements_per_ns)
+            .field("few_row_flops_per_ns", &self.few_row_flops_per_ns)
+            .field("workgroups_per_core", &self.workgroups_per_core)
             .finish_non_exhaustive()
     }
 }
@@ -59,6 +76,8 @@ impl PartialEq for Constants {
             && self.bytes_per_ns == other.bytes_per_ns
             && self.elementwise_bytes_per_ns == other.elementwise_bytes_per_ns
             && self.scan_elements_per_ns == other.scan_elements_per_ns
+            && self.few_row_flops_per_ns == other.few_row_flops_per_ns
+            && self.workgroups_per_core == other.workgroups_per_core
             && Arc::ptr_eq(&self.row_tile, &other.row_tile)
     }
 }
@@ -69,8 +88,13 @@ impl Constants {
     /// curve and the scan rate are read as unbounded where unstated, and the
     /// estimate asks for them only where the model attends or scans. A
     /// matmul pads nothing until [`Constants::with_row_tile`] states its
-    /// backend's tile.
+    /// backend's tile. A rate stated at or below zero, or not finite, is
+    /// refused by its key as an unstated one is
+    /// (`crate::rates::unmeasured`): nothing divides by it.
     pub fn of(rates: &profile::fire::Rates) -> Result<Constants, &'static str> {
+        if let Some((key, _)) = crate::rates::unmeasured(rates) {
+            return Err(key);
+        }
         let flops = |curve: &Vec<(u32, f64)>| -> Vec<(u32, f64)> {
             curve.iter().map(|&(x, t)| (x, t * 1e3)).collect()
         };
@@ -91,6 +115,8 @@ impl Constants {
             bytes_per_ns: rates.hbm_gbps.ok_or("hbm_gbps")?,
             elementwise_bytes_per_ns: rates.elementwise_gbps.ok_or("elementwise_gbps")?,
             scan_elements_per_ns: rates.scan_gelems.unwrap_or(f64::INFINITY),
+            few_row_flops_per_ns: rates.few_row_tflops.map(|t| t * 1e3),
+            workgroups_per_core: rates.workgroups_per_core,
             row_tile: Arc::new(|_, _, _| 1),
         })
     }
@@ -167,6 +193,47 @@ impl Constants {
         self.launch_ns + over(flops, rate).max(over(bytes, self.bytes_per_ns))
     }
 
+    /// The few-row matmul's rate (`few_row_tflops`) in flops a ns, or its
+    /// key where the profile states none.
+    pub fn few_row_rate(&self) -> Result<f64, &'static str> {
+        self.few_row_flops_per_ns.ok_or("few_row_tflops")
+    }
+
+    /// A matmul of decode-shaped `m x n x k` (4 to 256 rows) reading
+    /// `bytes`, on the kernel serving picks there: its launch and the
+    /// longer of its weight reads and its flops (its rows padded to its
+    /// kernel's tile, [`Constants::gemm_flops`]) at `few_row_tflops`; the
+    /// key where the profile states none.
+    pub fn few_row_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> Result<f64, &'static str> {
+        let rate = self.few_row_rate()?;
+        Ok(self.dispatch_ns(self.gemm_flops(m, n, k), rate, bytes))
+    }
+
+    /// The workgroups the device holds at once for a kernel's full rate
+    /// over `cores` compute units, `S = workgroups_per_core · cores`; the
+    /// key where the profile states none.
+    pub fn full_rate_workgroups(&self, cores: u32) -> Result<f64, &'static str> {
+        let per = self.workgroups_per_core.ok_or("workgroups_per_core")?;
+        Ok(per * f64::from(cores.max(1)))
+    }
+
+    /// The compute of `work` at `rate` (work a ns, the kernel's full rate)
+    /// as a dispatch of `workgroups` over `cores` units runs it: `work /
+    /// rate · max(1, S / workgroups)`, `S` the device's
+    /// [`Constants::full_rate_workgroups`]. The one wave-fill rule every
+    /// choice between kernels reads.
+    pub fn wave_ns(
+        &self,
+        work: f64,
+        rate: f64,
+        workgroups: u32,
+        cores: u32,
+    ) -> Result<f64, &'static str> {
+        let full = self.full_rate_workgroups(cores)?;
+        let fill = (full / f64::from(workgroups.max(1))).max(1.0);
+        Ok(if work > 0.0 { work / rate * fill } else { 0.0 })
+    }
+
     /// A matmul of `m x n x k` reading `bytes` (its weight plane).
     #[must_use]
     pub fn gemm_ns(&self, m: u32, n: u32, k: u32, bytes: f64) -> f64 {
@@ -206,6 +273,8 @@ mod tests {
             bytes_per_ns: 700.0,
             elementwise_bytes_per_ns: 400.0,
             scan_elements_per_ns: 2_000.0,
+            few_row_flops_per_ns: Some(4_000.0),
+            workgroups_per_core: Some(3.3),
             row_tile: Arc::new(|_, _, _| 1),
         }
     }
@@ -256,5 +325,98 @@ mod tests {
             900.0 + flops / 202_000.0
         );
         assert_eq!(c.dispatch_ns(0.0, 1.0, 0.0), 900.0);
+    }
+
+    #[test]
+    fn a_few_row_matmul_runs_at_its_own_rate_past_its_weight_reads() {
+        let c = constants();
+        let plane = 2.0 * 1024.0 * 1024.0;
+        // 8 rows of a 1024 plane: 16.8 MFLOP at 4 TFLOP/s (4.19 us) against
+        // 2 MiB at 700 GB/s (3.0 us): the compute binds.
+        let flops = 2.0 * 8.0 * 1024.0 * 1024.0;
+        assert_eq!(
+            c.few_row_ns(8, 1024, 1024, plane),
+            Ok(900.0 + flops / 4_000.0)
+        );
+        // One row: the read binds.
+        assert_eq!(
+            c.few_row_ns(1, 1024, 1024, plane),
+            Ok(900.0 + plane / 700.0)
+        );
+        let unstated = Constants {
+            few_row_flops_per_ns: None,
+            ..constants()
+        };
+        assert_eq!(
+            unstated.few_row_ns(8, 1024, 1024, plane),
+            Err("few_row_tflops")
+        );
+    }
+
+    #[test]
+    fn a_dispatch_short_of_the_device_s_workgroups_pays_for_the_slots_it_leaves() {
+        let c = constants();
+        // 80 units at 3.3 a unit: 264 workgroups fill the device.
+        assert!((c.full_rate_workgroups(80).unwrap() - 264.0).abs() < 1e-9);
+        // 264 or more: the work at its rate.
+        assert_eq!(c.wave_ns(1e6, 1e3, 264, 80), Ok(1e3));
+        assert_eq!(c.wave_ns(1e6, 1e3, 1000, 80), Ok(1e3));
+        // 66, a quarter: four times as long.
+        assert!((c.wave_ns(1e6, 1e3, 66, 80).unwrap() - 4e3).abs() < 1e-6);
+        let unstated = Constants {
+            workgroups_per_core: None,
+            ..constants()
+        };
+        assert_eq!(
+            unstated.wave_ns(1e6, 1e3, 66, 80),
+            Err("workgroups_per_core")
+        );
+    }
+
+    #[test]
+    fn a_rate_stated_at_nothing_is_refused_by_its_key() {
+        let all = profile::fire::Rates {
+            launch_ns: Some(900),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0)])]),
+            attn_tflops_by_keys: Some(vec![(512, 50.0)]),
+            hbm_gbps: Some(700.0),
+            elementwise_gbps: Some(500.0),
+            scan_gelems: Some(2000.0),
+            few_row_tflops: Some(4.0),
+            workgroups_per_core: Some(3.3),
+        };
+        assert!(Constants::of(&all).is_ok());
+        for (bad, key) in [
+            (
+                profile::fire::Rates {
+                    few_row_tflops: Some(0.0),
+                    ..all.clone()
+                },
+                "few_row_tflops",
+            ),
+            (
+                profile::fire::Rates {
+                    workgroups_per_core: Some(f64::NAN),
+                    ..all.clone()
+                },
+                "workgroups_per_core",
+            ),
+            (
+                profile::fire::Rates {
+                    attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+                    ..all.clone()
+                },
+                "attn_tflops_by_keys",
+            ),
+            (
+                profile::fire::Rates {
+                    hbm_gbps: Some(-1.0),
+                    ..all.clone()
+                },
+                "hbm_gbps",
+            ),
+        ] {
+            assert_eq!(Constants::of(&bad).err(), Some(key));
+        }
     }
 }
