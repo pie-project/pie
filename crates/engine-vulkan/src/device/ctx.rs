@@ -630,15 +630,26 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
 /// What the host can still give the process now, as [`host_ceiling`]
 /// reads it at bind.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn read_host_room() -> std::result::Result<i64, String> {
-    engine_gpu::host_memory::room()
-        .map(|room| room.net())
-        .map_err(|fault| fault.to_string())
+fn host_room_reader() -> engine::HostRoom {
+    // lmkd's line is read once, here, at bind; each tick reads only
+    // /proc/meminfo.
+    match engine_gpu::host_memory::reader() {
+        Ok(reader) => std::sync::Arc::new(move || {
+            reader
+                .read()
+                .map(|room| room.net())
+                .map_err(|fault| fault.to_string())
+        }),
+        Err(fault) => {
+            let why = fault.to_string();
+            std::sync::Arc::new(move || Err(why.clone()))
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn read_host_room() -> std::result::Result<i64, String> {
-    Err("this host has no reader of its available memory".to_string())
+fn host_room_reader() -> engine::HostRoom {
+    std::sync::Arc::new(|| Err("this host has no reader of its available memory".to_string()))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1077,7 +1088,7 @@ impl Context {
     #[must_use]
     pub fn host_room(&self) -> Option<engine::HostRoom> {
         self.core.ceiling?;
-        Some(std::sync::Arc::new(read_host_room))
+        Some(host_room_reader())
     }
 
     #[must_use]
