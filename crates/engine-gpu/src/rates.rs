@@ -17,9 +17,9 @@
 //!   width, through the kernel serving picks at those rows, its rows padded
 //!   to that kernel's tile, for `few_row_tflops`
 //!   (`engine::rates::few_row_rate`);
-//! - its tiled prefill attention at `engine::rates::ATTN_SHAPE`'s heads over
-//!   each of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at
-//!   the longest keys, said beside it), for `attn_tflops_by_keys` (every
+//! - its tiled prefill attention at `engine::rates::ATTN_SHAPE`'s heads,
+//!   each of `engine::rates::ATTN_DIMS` wide, over its keys
+//!   (`engine::rates::attn_keys`), for `attn_tflops_by_dim_keys` (every
 //!   point past a fire's tile rows, so a served fire takes it there too);
 //! - the same kernel at one tile a head over the longest keys, against the
 //!   time the curve's rate gives its work, for `workgroups_per_core` (the
@@ -522,35 +522,38 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .iter()
         .flat_map(|(_, curve)| curve.iter().map(|&(_, rate)| rate))
         .fold(0.0, f64::max);
-    let mut attn = Vec::new();
-    for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
-        let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
-        rig.release();
-        let Some(rate) = dropped(&rig, rate, say)? else {
-            continue;
-        };
-        say(&format!(
-            "[rates]: attention {keys} keys d 128: {:.1} TFLOP/s",
-            rate / 1e3
-        ));
-        attn.push((keys, rate));
+    // The attention curve at each head width of `engine::rates::ATTN_DIMS`,
+    // over its own keys: from the narrowest whose shape is compute-bound on
+    // this device (its matmul peak over its bandwidth), whatever rows the
+    // matmul curve reached.
+    let mut attn_by_dim = Vec::new();
+    for d in engine::rates::ATTN_DIMS {
+        let mut curve = Vec::new();
+        for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
+            let shape = engine::rates::ATTN_SHAPE.at(keys).with_dim(d);
+            let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+            rig.release();
+            let Some(rate) = dropped(&rig, rate, say)? else {
+                continue;
+            };
+            say(&format!(
+                "[rates]: attention {keys} keys d {d}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((keys, rate));
+        }
+        // A width whose every point was past the bound states none.
+        if !curve.is_empty() {
+            attn_by_dim.push((d, curve));
+        }
     }
-    let longest = attn
-        .last()
-        .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
-    for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
-        let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
-        rig.release();
-        let Some(rate) = dropped(&rig, rate, say)? else {
-            continue;
-        };
-        say(&format!(
-            "[rates]: attention {longest} keys d {d}: {:.1} TFLOP/s",
-            rate / 1e3
-        ));
-    }
+    // The occupancy is the 128-wide curve's (its tile at the shape's own
+    // head width).
+    let attn: Vec<(u32, f64)> = attn_by_dim
+        .iter()
+        .find(|&&(d, _)| d == engine::rates::ATTN_SHAPE.head_dim)
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default();
     let workgroups_per_core = occupancy(&mut rig, tactics, tier, timer, &attn, launch, say)?;
     rig.release();
     let elementwise = elementwise(&mut rig, timer, launch)?;
@@ -570,7 +573,12 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                 .map(|(w, curve)| (w, tflops(curve)))
                 .collect()
         }),
-        attn_tflops_by_keys: (!attn.is_empty()).then(|| tflops(attn)),
+        attn_tflops_by_dim_keys: (!attn_by_dim.is_empty()).then(|| {
+            attn_by_dim
+                .into_iter()
+                .map(|(d, curve)| (d, tflops(curve)))
+                .collect()
+        }),
         hbm_gbps: Some(bytes_per_ns),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),

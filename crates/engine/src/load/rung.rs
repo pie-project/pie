@@ -260,7 +260,7 @@ impl FireEstimate {
         // The attention at the rate its kernel reaches at a row's keys.
         let attention = over(
             tokens * keys * self.attn_flops_per_row_key,
-            c.attn_rate(fire.keys_per_lane),
+            c.attn_rate(self.attn_head_dim, fire.keys_per_lane),
         );
         let kv = over(keys_read * self.kv_bytes_per_key, c.bytes_per_ns);
         if self.attn_flops_per_row_key > 0.0 {
@@ -659,7 +659,7 @@ mod tests {
         crate::roofline::Constants {
             launch_ns,
             gemm_by_rows: vec![(1, vec![(1, 2.0)])],
-            attn_by_keys: vec![(1, 0.5)],
+            attn_by_dim_keys: vec![(1, vec![(1, 0.5)]), (256, vec![(1, 0.5)])],
             bytes_per_ns,
             elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
@@ -1120,7 +1120,10 @@ mod tests {
         // A curve rising with the keys: 16 keys at 2 a ns, a quarter the time.
         let rising = FireEstimate {
             rates: crate::roofline::Constants {
-                attn_by_keys: vec![(1, 0.5), (16, 2.0)],
+                attn_by_dim_keys: vec![
+                    (1, vec![(1, 0.5), (16, 2.0)]),
+                    (256, vec![(1, 0.5), (16, 2.0)]),
+                ],
                 ..constants(3.0, 4.0)
             },
             ..e

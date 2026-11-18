@@ -22,8 +22,9 @@
 //!   heuristic algorithm on CUDA, hipBLASLt's on ROCm), after the warm-up;
 //!   its launches rotate through `engine::rates::weights_at` weight planes,
 //!   past every last-level cache.
-//! - `attn_tflops_by_keys`: the paged prefill attention at [`ATTN_SHAPE`]'s
-//!   heads over each of `engine::rates::ATTN_KEYS` keys, causal, in pages of
+//! - `attn_tflops_by_dim_keys`: the paged prefill attention at
+//!   [`ATTN_SHAPE`]'s heads, each of `engine::rates::ATTN_DIMS` wide, over
+//!   each of `engine::rates::ATTN_KEYS` keys, causal, in pages of
 //!   [`PAGE`], head width 128 (64 and 256 timed at the longest keys and said
 //!   beside it); its launches rotate through `engine::rates::attn_sets_at`
 //!   sets of q rows and kv pages.
@@ -152,8 +153,8 @@ pub const ROUNDS: usize = 5;
 pub const LAUNCH_ROUNDS: usize = 15;
 
 /// What a rates step measured: the rates, and the attention's rate at the
-/// longest keys at each head width of `engine::rates::ATTN_DIMS` (TFLOP/s),
-/// said beside them.
+/// longest keys at each head width of `engine::rates::ATTN_DIMS` (TFLOP/s,
+/// each width curve's last), said beside them.
 pub struct Measured {
     pub rates: Rates,
     pub attn_by_dim: Vec<(u32, f64)>,
@@ -446,20 +447,21 @@ mod on_device {
             }
             gemm.push((w, curve));
         }
+        // The attention curve at each head width of
+        // `engine::rates::ATTN_DIMS`, over `engine::rates::ATTN_KEYS`.
         let mut attn = Vec::new();
-        for keys in engine::rates::ATTN_KEYS {
-            let rate = attention(&device, &clock, &random, &mut held, keys, 128, gap)?;
-            attn.push((keys, rate));
-        }
-        let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
-        let mut attn_by_dim = Vec::new();
         for d in engine::rates::ATTN_DIMS {
-            let rate = match attn.last() {
-                Some(&(_, rate)) if d == 128 => rate,
-                _ => attention(&device, &clock, &random, &mut held, longest, d, gap)?,
-            };
-            attn_by_dim.push((d, rate / 1e3));
+            let mut curve = Vec::new();
+            for keys in engine::rates::ATTN_KEYS {
+                let rate = attention(&device, &clock, &random, &mut held, keys, d, gap)?;
+                curve.push((keys, rate));
+            }
+            attn.push((d, curve));
         }
+        let attn_by_dim: Vec<(u32, f64)> = attn
+            .iter()
+            .filter_map(|(d, c)| c.last().map(|&(_, rate)| (*d, rate / 1e3)))
+            .collect();
         let elementwise = elementwise(device.ctx(), &clock, &random, &mut held, gap)?;
         let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
         let bytes = copy(stream, &clock, gap)?;
@@ -492,7 +494,11 @@ mod on_device {
                         .map(|(w, curve)| (w, tflops(curve)))
                         .collect(),
                 ),
-                attn_tflops_by_keys: Some(tflops(attn)),
+                attn_tflops_by_dim_keys: Some(
+                    attn.into_iter()
+                        .map(|(d, curve)| (d, tflops(curve)))
+                        .collect(),
+                ),
                 hbm_gbps: Some(tenth(bytes)),
                 elementwise_gbps: Some(tenth(elementwise)),
                 scan_gelems: Some(tenth(scan)),
@@ -1057,7 +1063,7 @@ mod ensure_tests {
         Rates {
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
-            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 50.0), (8192, 300.0)])]),
             hbm_gbps: Some(600.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),

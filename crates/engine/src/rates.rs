@@ -15,10 +15,10 @@
 //! - `gemm_tflops_by_rows`: a bf16 matmul of each of [`GEMM_WIDTHS`]
 //!   columns and depth at each of [`GEMM_ROWS`], [`gemm_flops`] over its
 //!   time.
-//! - `attn_tflops_by_keys`: the backend's prefill attention at
-//!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] keys (one sequence
-//!   attending itself, its pages laid in [`attn_page_order`]),
-//!   [`attn_flops`] over its time.
+//! - `attn_tflops_by_dim_keys`: the backend's prefill attention at
+//!   [`ATTN_SHAPE`]'s heads, each of [`ATTN_DIMS`] wide, over each of its
+//!   keys ([`attn_keys`]; one sequence attending itself, its pages laid in
+//!   [`attn_page_order`]), [`attn_flops`] over its time.
 //! - `hbm_gbps`: a copy of device memory, every byte read and written.
 //! - `elementwise_gbps`: the per-row ops a fire runs between its matmuls, a
 //!   norm and the gated activation at [`ELEMENTWISE_SHAPE`], their bytes
@@ -60,7 +60,10 @@ pub fn step_bytes() -> u64 {
         + weights_at(GEMM_WIDTH, GEMM_WIDTH) as u64 * bf16(w * w)
         + bf16(widest * w);
     let attn = {
-        let s = ATTN_SHAPE.at(ATTN_KEYS[ATTN_KEYS.len() - 1]);
+        let widest = ATTN_DIMS[ATTN_DIMS.len() - 1];
+        let s = ATTN_SHAPE
+            .at(ATTN_KEYS[ATTN_KEYS.len() - 1])
+            .with_dim(widest);
         let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
         let kv = 2 * u64::from(s.keys.div_ceil(16) * 16) * u64::from(s.kv_heads * s.head_dim);
         ATTN_SET_BYTES as u64 + bf16(q + kv) + bf16(q)
@@ -370,12 +373,12 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
-    if let Some(found) = rates
-        .attn_tflops_by_keys
-        .as_deref()
-        .and_then(|curve| point("attn_tflops_by_keys", "keys", curve))
-    {
-        return Some(found);
+    if let Some(widths) = &rates.attn_tflops_by_dim_keys {
+        for (d, curve) in widths {
+            if let Some((key, at)) = point("attn_tflops_by_dim_keys", "keys", curve) {
+                return Some((key, format!("{at} (head_dim {d})")));
+            }
+        }
     }
     for (key, v) in [
         ("hbm_gbps", rates.hbm_gbps),
@@ -888,10 +891,10 @@ pub fn attn_page_order(pages: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The head widths of the models served (64 for the small and older ones,
-/// 128 for most, 256 for Qwen3.5's and Gemma's global layers). The curve is
-/// 128's; the step times the others at its longest keys and says them
-/// beside it, so a width whose rate departs from it shows.
+/// The head widths the attention curve is timed at: those of the models
+/// served (64 for the small and older ones, 128 for most, 256 for
+/// Qwen3.5's and Gemma's global layers). A model's width is read between
+/// them; one outside them is refused at load by name.
 pub const ATTN_DIMS: [u32; 3] = [64, 128, 256];
 
 impl AttnShape {
@@ -1412,7 +1415,7 @@ mod tests {
         profile::fire::Rates {
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
-            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 50.0), (8192, 150.0)])]),
             hbm_gbps: Some(700.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
@@ -1553,11 +1556,10 @@ mod tests {
             "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
         );
         // A rate stated as array rows: the table read whole and rewritten.
-        let rows =
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\n";
+        let rows = "api = 1\n\n[rates]\nattn_tflops_by_dim_keys = [\n  [128, [[512, 4.0],\n    [1024, 5.0]]],\n]\n";
         assert_eq!(
             saved_text(Some(rows), &measured, &how),
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [[512, 4.0], [1024, 5.0]]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+            "api = 1\n\n[rates]\nattn_tflops_by_dim_keys = [\n  [128, [[512, 4.0], [1024, 5.0]]],\n]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
         // A table of a schema this pie outlived (Nov 16's keys): replaced
         // whole, none of it kept, so no key is written twice.
@@ -1870,10 +1872,10 @@ mod tests {
             ),
             (
                 profile::fire::Rates {
-                    attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 150.0)]),
+                    attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 0.0), (8192, 150.0)])]),
                     ..all()
                 },
-                "`[rates] attn_tflops_by_keys` at 512 keys as 0",
+                "`[rates] attn_tflops_by_dim_keys` at 512 keys as 0 (head_dim 128)",
             ),
         ] {
             let save = SaveTo {
@@ -1901,12 +1903,12 @@ mod tests {
         // Stated in a profile, it is refused by the same key: the roofline
         // divides by none of it.
         let stated = profile::fire::Rates {
-            attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 0.0)])]),
             ..all()
         };
         assert_eq!(
             crate::roofline::Constants::of(&stated).err(),
-            Some("attn_tflops_by_keys")
+            Some("attn_tflops_by_dim_keys")
         );
         let nan = profile::fire::Rates {
             hbm_gbps: Some(f64::NAN),
@@ -2196,7 +2198,7 @@ mod tests {
         let rates = profile::fire::Rates {
             launch_ns: Some(3500),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
-            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 60.0), (8192, 120.0)])]),
             hbm_gbps: Some(800.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),

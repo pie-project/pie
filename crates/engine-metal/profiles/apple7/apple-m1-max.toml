@@ -22,7 +22,11 @@ gemm_tflops_by_rows = [
   [2048, [[256, 4.7], [512, 5.1], [1024, 5.2], [2048, 5.2], [4096, 5.3], [8192, 5.3]]],
   [4096, [[256, 5.1], [512, 5.2], [1024, 5.3], [2048, 5.3], [4096, 5.3], [8192, 5.3]]],
 ]
-attn_tflops_by_keys = [[512, 4.4], [1024, 3.9], [2048, 4.3], [4096, 4.8], [8192, 5.6]]
+# The d 128 curve as measured before the curve was timed at every head
+# width; the 64- and 256-wide ones come with this device's re-measure.
+attn_tflops_by_dim_keys = [
+  [128, [[512, 4.4], [1024, 3.9], [2048, 4.3], [4096, 4.8], [8192, 5.6]]],
+]
 hbm_gbps = 379.4
 elementwise_gbps = 261.6
 scan_gelems = 90.0

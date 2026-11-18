@@ -414,8 +414,11 @@ pub fn estimate(
     rates: &profile::fire::Rates,
 ) -> Result<FireEstimate, &'static str> {
     let constants = crate::roofline::Constants::of(rates)?;
-    if counts.attn_flops_per_row_key > 0 && rates.attn_tflops_by_keys.is_none() {
-        return Err("attn_tflops_by_keys");
+    // An attending model is priced at its own head width, between the
+    // widths the curve was timed at; none stated, or a width outside them,
+    // is refused by the key (`choose_shaped` names the width).
+    if counts.attn_flops_per_row_key > 0 && !constants.attn_measures(counts.attn_head_dim) {
+        return Err("attn_tflops_by_dim_keys");
     }
     if counts.state_elements_per_row > 0 && rates.scan_gelems.is_none() {
         return Err("scan_gelems");
@@ -447,6 +450,14 @@ pub enum Refused {
     NoRates { device: String, key: &'static str },
     /// No rung offered is feasible.
     NoRung(NoRung),
+    /// The model's attention heads are `head_dim` wide, outside the widths
+    /// the device's attention curve was timed at (`measured`): no width's
+    /// curve prices another's.
+    NoAttnWidth {
+        device: String,
+        head_dim: u32,
+        measured: Vec<u32>,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -459,6 +470,16 @@ impl fmt::Display for Refused {
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
+            Refused::NoAttnWidth {
+                device,
+                head_dim,
+                measured,
+            } => write!(
+                f,
+                "device {device}: the model's attention heads are {head_dim} wide, and its \
+                 profile's `[rates] attn_tflops_by_dim_keys` times heads {measured:?} wide; no \
+                 other width's curve prices them; `pie tune <backend> --rates` measures it"
+            ),
         }
     }
 }
@@ -519,6 +540,21 @@ pub fn choose_shaped(
         device: device.to_owned(),
         key,
     };
+    if counts.attn_flops_per_row_key > 0
+        && let Some(widths) = rates.attn_tflops_by_dim_keys.as_ref()
+    {
+        let measured: Vec<u32> = widths.iter().map(|&(d, _)| d).collect();
+        let within = measured.first().zip(measured.last()).is_some_and(|(&lo, &hi)| {
+            (lo..=hi).contains(&counts.attn_head_dim)
+        });
+        if !within {
+            return Err(Refused::NoAttnWidth {
+                device: device.to_owned(),
+                head_dim: counts.attn_head_dim,
+                measured,
+            });
+        }
+    }
     let mut estimate = estimate(counts, rates).map_err(refused)?;
     estimate.rates = shape(estimate.rates).map_err(refused)?;
     let top = super::rung::fire_top(rungs, live, &estimate, context).map_err(Refused::NoRung)?;
@@ -585,7 +621,9 @@ pub fn measured_line(tuned: &profile::fire::Tuned) -> Option<String> {
         r.gemm_tflops_by_rows
             .as_ref()
             .map_or(0.0, |w| w.iter().map(|(_, c)| top(c)).fold(0.0, f64::max)),
-        r.attn_tflops_by_keys.as_deref().map_or(0.0, top),
+        r.attn_tflops_by_dim_keys
+            .as_ref()
+            .map_or(0.0, |w| w.iter().map(|(_, c)| top(c)).fold(0.0, f64::max)),
         r.hbm_gbps.unwrap_or(0.0),
         r.elementwise_gbps.unwrap_or(0.0),
         r.scan_gelems.unwrap_or(0.0),
@@ -646,7 +684,7 @@ mod tests {
         profile::fire::Rates {
             launch_ns: Some(5),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 5.0), (4096, 10.0)])]),
-            attn_tflops_by_keys: Some(vec![(2048, 7.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(2048, 7.0)])]),
             hbm_gbps: Some(100.0),
             elementwise_gbps: Some(50.0),
             scan_gelems: None,
@@ -687,14 +725,14 @@ mod tests {
         assert_eq!(
             (
                 e.rates.gemm_by_rows.clone(),
-                e.rates.attn_by_keys.clone(),
+                e.rates.attn_by_dim_keys.clone(),
                 e.rates.bytes_per_ns,
                 e.rates.elementwise_bytes_per_ns,
                 e.rates.launch_ns
             ),
             (
                 vec![(4096, vec![(256, 5_000.0), (4096, 10_000.0)])],
-                vec![(2048, 7_000.0)],
+                vec![(128, vec![(2048, 7_000.0)])],
                 100.0,
                 50.0,
                 5.0
@@ -727,9 +765,9 @@ mod tests {
                 },
             ),
             (
-                "attn_tflops_by_keys",
+                "attn_tflops_by_dim_keys",
                 profile::fire::Rates {
-                    attn_tflops_by_keys: None,
+                    attn_tflops_by_dim_keys: None,
                     ..rates()
                 },
             ),
@@ -761,7 +799,7 @@ mod tests {
             ..counts()
         };
         let no_attn = profile::fire::Rates {
-            attn_tflops_by_keys: None,
+            attn_tflops_by_dim_keys: None,
             ..rates()
         };
         assert!(estimate(&attending_nothing, &no_attn).is_ok());
@@ -771,26 +809,39 @@ mod tests {
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            attn_tflops_by_keys: None,
+            attn_tflops_by_dim_keys: None,
             ..rates()
         };
         let err = choose(&rungs, 1 << 33, u32::MAX, &rates, "Card X", &counts()).unwrap_err();
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \
-             attn_tflops_by_keys` is unstated (or stated at nothing), so nothing weighs its top \
+             attn_tflops_by_dim_keys` is unstated (or stated at nothing), so nothing weighs its top \
              rung; `pie tune <backend> --rates` measures it"
         );
         // A rate that settled at nothing is refused by the same name, never
         // divided by.
         let zero = profile::fire::Rates {
-            attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 4.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 0.0), (8192, 4.0)])]),
             ..self::rates()
         };
         let err = choose(&rungs, 1 << 33, u32::MAX, &zero, "Card X", &counts()).unwrap_err();
         assert!(
-            err.to_string().contains("`[rates] attn_tflops_by_keys`"),
+            err.to_string().contains("`[rates] attn_tflops_by_dim_keys`"),
             "{err}"
+        );
+        // A model whose heads are wider than any width timed is refused by
+        // its width, never priced on the 128 curve.
+        let wide = Counts {
+            attn_head_dim: 256,
+            ..counts()
+        };
+        let err = choose(&rungs, 1 << 33, u32::MAX, &self::rates(), "Card X", &wide).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "device Card X: the model's attention heads are 256 wide, and its profile's \
+             `[rates] attn_tflops_by_dim_keys` times heads [128] wide; no other width's curve \
+             prices them; `pie tune <backend> --rates` measures it"
         );
     }
 

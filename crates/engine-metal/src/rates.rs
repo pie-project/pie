@@ -49,7 +49,7 @@ use profile::fire::Rates;
 pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
-    "attn_tflops_by_keys",
+    "attn_tflops_by_dim_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
@@ -742,25 +742,21 @@ pub fn measure(
         }
         gemm.push((w, curve));
     }
-    // The attention curve at d 128; the other widths at the longest keys.
+    // The attention curve at each head width of `engine::rates::ATTN_DIMS`.
     let mut attn = Vec::new();
-    for keys in engine::rates::ATTN_KEYS {
-        bench.handles = Handles::new();
-        let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(keys), gap)?;
-        say(&format!(
-            "  prefill attention, {keys} rows over {keys} keys, d 128: {:.4} TFLOP/s",
-            rate / 1e3
-        ));
-        attn.push((keys, rate / 1e3));
-    }
-    let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
-    for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
-        bench.handles = Handles::new();
-        let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(longest).with_dim(d), gap)?;
-        say(&format!(
-            "  prefill attention, {longest} rows over {longest} keys, d {d}: {:.4} TFLOP/s",
-            rate / 1e3
-        ));
+    for d in engine::rates::ATTN_DIMS {
+        let mut curve = Vec::new();
+        for keys in engine::rates::ATTN_KEYS {
+            bench.handles = Handles::new();
+            let rate =
+                bench.attention_flops(engine::rates::ATTN_SHAPE.at(keys).with_dim(d), gap)?;
+            say(&format!(
+                "  prefill attention, {keys} rows over {keys} keys, d {d}: {:.4} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((keys, rate / 1e3));
+        }
+        attn.push((d, curve));
     }
     bench.handles = Handles::new();
     let elementwise = bench.elementwise_bytes(gap)?;
@@ -775,7 +771,7 @@ pub fn measure(
     Ok(Rates {
         launch_ns: Some(launch),
         gemm_tflops_by_rows: Some(gemm),
-        attn_tflops_by_keys: Some(attn),
+        attn_tflops_by_dim_keys: Some(attn),
         hbm_gbps: Some(bytes),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),

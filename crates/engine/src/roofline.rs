@@ -67,7 +67,8 @@ pub struct Constants {
     /// ascending in width.
     pub gemm_by_rows: Vec<(u32, Vec<(u32, f64)>)>,
     /// Attention flops a ns (the rectangle's) by keys.
-    pub attn_by_keys: Vec<(u32, f64)>,
+    /// `(head_dim, [(keys, flops a ns)])`, ascending in head width.
+    pub attn_by_dim_keys: Vec<(u32, Vec<(u32, f64)>)>,
     pub bytes_per_ns: f64,
     pub elementwise_bytes_per_ns: f64,
     pub scan_elements_per_ns: f64,
@@ -96,7 +97,7 @@ impl std::fmt::Debug for Constants {
             .field("launch_ns", &self.launch_ns)
             .field("gemm_by_rows", &self.gemm_by_rows)
             .field("gemm_full_by_rows", &self.gemm_full_by_rows)
-            .field("attn_by_keys", &self.attn_by_keys)
+            .field("attn_by_dim_keys", &self.attn_by_dim_keys)
             .field("bytes_per_ns", &self.bytes_per_ns)
             .field("elementwise_bytes_per_ns", &self.elementwise_bytes_per_ns)
             .field("scan_elements_per_ns", &self.scan_elements_per_ns)
@@ -111,7 +112,7 @@ impl PartialEq for Constants {
         self.launch_ns == other.launch_ns
             && self.gemm_by_rows == other.gemm_by_rows
             && self.gemm_full_by_rows == other.gemm_full_by_rows
-            && self.attn_by_keys == other.attn_by_keys
+            && self.attn_by_dim_keys == other.attn_by_dim_keys
             && self.bytes_per_ns == other.bytes_per_ns
             && self.elementwise_bytes_per_ns == other.elementwise_bytes_per_ns
             && self.scan_elements_per_ns == other.scan_elements_per_ns
@@ -158,10 +159,10 @@ impl Constants {
                 .iter()
                 .map(|(w, c)| (*w, flops(c)))
                 .collect(),
-            attn_by_keys: rates
-                .attn_tflops_by_keys
+            attn_by_dim_keys: rates
+                .attn_tflops_by_dim_keys
                 .as_ref()
-                .map(flops)
+                .map(|widths| widths.iter().map(|(d, c)| (*d, flops(c))).collect())
                 .unwrap_or_default(),
             bytes_per_ns: rates.hbm_gbps.ok_or("hbm_gbps")?,
             elementwise_bytes_per_ns: rates.elementwise_gbps.ok_or("elementwise_gbps")?,
@@ -292,10 +293,39 @@ impl Constants {
         }
     }
 
-    /// The attention rate at `keys` keys a row.
+    /// Whether `head_dim` lies within the head widths the attention curve
+    /// was timed at: what [`Constants::attn_rate`] reads between, never past.
     #[must_use]
-    pub fn attn_rate(&self, keys: u32) -> f64 {
-        profile::fire::interpolate(&self.attn_by_keys, f64::from(keys)).unwrap_or(f64::INFINITY)
+    pub fn attn_measures(&self, head_dim: u32) -> bool {
+        match (self.attn_by_dim_keys.first(), self.attn_by_dim_keys.last()) {
+            (Some(&(lo, _)), Some(&(hi, _))) => (lo..=hi).contains(&head_dim),
+            _ => false,
+        }
+    }
+
+    /// The attention rate of `head_dim`-wide heads at `keys` keys a row:
+    /// each measured width's curve at `keys`, linear in `log head_dim`
+    /// between the two widths around it (a width measured, its own curve).
+    /// A width outside them has no rate here (`NaN`): the estimate refuses
+    /// such a model first ([`Constants::attn_measures`]); unbounded where no
+    /// curve is stated (a model that attends nothing).
+    #[must_use]
+    pub fn attn_rate(&self, head_dim: u32, keys: u32) -> f64 {
+        if self.attn_by_dim_keys.is_empty() {
+            return f64::INFINITY;
+        }
+        if !self.attn_measures(head_dim) {
+            return f64::NAN;
+        }
+        let at = |curve: &[(u32, f64)]| {
+            profile::fire::interpolate(curve, f64::from(keys)).unwrap_or(f64::INFINITY)
+        };
+        let width: Vec<(u32, f64)> = self
+            .attn_by_dim_keys
+            .iter()
+            .map(|(d, c)| (*d, at(c)))
+            .collect();
+        profile::fire::interpolate(&width, f64::from(head_dim)).unwrap_or(f64::NAN)
     }
 
     /// A dispatch's cost: its launch and the longer of `flops` over `rate`
@@ -394,7 +424,10 @@ mod tests {
         Constants {
             launch_ns: 900.0,
             gemm_by_rows: vec![(1024, curve(0.5)), (4096, curve(1.0))],
-            attn_by_keys: vec![(512, 50_000.0), (8192, 400_000.0)],
+            attn_by_dim_keys: vec![
+                (128, vec![(512, 50_000.0), (8192, 400_000.0)]),
+                (256, vec![(512, 100_000.0), (8192, 800_000.0)]),
+            ],
             bytes_per_ns: 700.0,
             elementwise_bytes_per_ns: 400.0,
             scan_elements_per_ns: 2_000.0,
@@ -424,7 +457,14 @@ mod tests {
         // Past the widest width: its last span's slope (1024 to 4096 at 1024
         // rows, 80 to 160) carries on: 16384 square two more octaves, 240.
         assert!((c.gemm_rate(1024, 16384, 16384) - 240_000.0).abs() < 1e-6);
-        assert!((c.attn_rate(2048) - 225_000.0).abs() < 1e-6);
+        assert!((c.attn_rate(128, 2048) - 225_000.0).abs() < 1e-6);
+        // Between the widths measured, linear in log width: 181 is halfway
+        // from 128 to 256 (log 2), so halfway in rate.
+        assert!((c.attn_rate(181, 2048) - 337_500.0).abs() < 2_000.0);
+        assert!((c.attn_rate(256, 2048) - 450_000.0).abs() < 1e-6);
+        // Past them: no rate, never another width's.
+        assert!(c.attn_rate(64, 2048).is_nan() && !c.attn_measures(64));
+        assert!(c.attn_rate(512, 2048).is_nan() && !c.attn_measures(512));
     }
 
     #[test]
@@ -541,7 +581,7 @@ mod tests {
         let all = profile::fire::Rates {
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0)])]),
-            attn_tflops_by_keys: Some(vec![(512, 50.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 50.0)])]),
             hbm_gbps: Some(700.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
@@ -566,10 +606,10 @@ mod tests {
             ),
             (
                 profile::fire::Rates {
-                    attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+                    attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 0.0)])]),
                     ..all.clone()
                 },
-                "attn_tflops_by_keys",
+                "attn_tflops_by_dim_keys",
             ),
             (
                 profile::fire::Rates {

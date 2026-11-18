@@ -90,7 +90,9 @@ pub fn choose(
             Refused::NoRung(no) => {
                 format!("{no}; this device binds no more than {} MiB", binding >> 20)
             }
-            refused @ Refused::NoRates { .. } => refused.to_string(),
+            refused @ (Refused::NoRates { .. } | Refused::NoAttnWidth { .. }) => {
+                refused.to_string()
+            }
         })
     })
 }
@@ -161,8 +163,8 @@ mod tests {
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
-            "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\nattn_tflops_by_keys = \
-                 [[2048, 1.0]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
+            "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\nattn_tflops_by_dim_keys = \
+                 [[128, [[2048, 1.0]]]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
         );
         let err = choose(
             &none,

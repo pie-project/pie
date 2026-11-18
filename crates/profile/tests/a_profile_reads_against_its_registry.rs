@@ -916,7 +916,7 @@ api = 1
 device = "Apple M9"
 [rates]
 gemm_tflops_by_rows = [[4096, [[256, 20.0], [4096, 50]]]]   # 50 TFLOP/s wide
-attn_tflops_by_keys = [[2048, 20.0]]
+attn_tflops_by_dim_keys = [[128, [[2048, 20.0]]]]
 scan_gelems = 3000.0
 hbm_gbps = 400              # 400 GB/s
 "#;
@@ -946,7 +946,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
         p.rates(),
         profile::fire::Rates {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
-            attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(2048, 20.0)])]),
             scan_gelems: Some(3000.0),
             hbm_gbps: Some(400.0),
             elementwise_gbps: None,
@@ -1012,7 +1012,15 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "[rates]\ngemm_tflops_by_rows = [[4096, [[256, 1.0]]], [1024, [[256, 1.0]]]]\n",
             "a non-empty list of [width, [[rows, TFLOP/s], ...]] pairs, ascending in width",
         ),
-        ("[rates]\nattn_tflops_by_keys = []\n", "not an empty list"),
+        (
+            "[rates]\nattn_tflops_by_dim_keys = []\n",
+            "[head_dim, [[keys, TFLOP/s], ...]] pairs, ascending in head_dim, not an empty list",
+        ),
+        // The d128-only curve of before: a key this pie no longer reads.
+        (
+            "[rates]\nattn_tflops_by_keys = [[512, 1.0]]\n",
+            "not `attn_tflops_by_keys`",
+        ),
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",

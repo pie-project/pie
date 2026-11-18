@@ -53,7 +53,12 @@ pub fn rates(
             .map(|(w, c)| format!("w {w}: {}", curve(&Some(c.clone()))))
             .collect::<Vec<_>>()
             .join("; "),
-        curve(&r.attn_tflops_by_keys),
+        r.attn_tflops_by_dim_keys
+            .iter()
+            .flatten()
+            .map(|(d, c)| format!("d {d}: {}", curve(&Some(c.clone()))))
+            .collect::<Vec<_>>()
+            .join("; "),
         engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1],
         measured
             .attn_by_dim

@@ -245,7 +245,7 @@ mod tests {
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 249.0)])]),
-            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 100.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 50.0), (8192, 100.0)])]),
             hbm_gbps: Some(654.0),
             elementwise_gbps: Some(400.0),
             launch_ns: Some(1620),

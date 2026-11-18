@@ -17,7 +17,10 @@
 //!   [4096, [[256, 90.0], [8192, 210.0]]],
 //! ]
 //! # prefill attention TFLOP/s by keys (one sequence attending itself, d 128)
-//! attn_tflops_by_keys = [[512, 60.0], [2048, 200.0], [8192, 400.0]]
+//! attn_tflops_by_dim_keys = [
+//!   [128, [[512, 60.0], [2048, 200.0], [8192, 400.0]]],
+//!   [256, [[512, 80.0], [8192, 450.0]]],
+//! ]
 //! hbm_gbps = 650.0         # a streaming copy, read + write
 //! elementwise_gbps = 450.0 # the per-row ops (rmsnorm, swiglu) as served
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
@@ -45,9 +48,12 @@ pub struct Rates {
     /// strictly ascending in rows.
     pub gemm_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
     /// Prefill attention TFLOP/s (the full rectangle's flops, four a query
-    /// element a key) by keys, one sequence attending itself: `(keys,
-    /// TFLOP/s)`, strictly ascending in keys.
-    pub attn_tflops_by_keys: Option<Vec<(u32, f64)>>,
+    /// element a key) by keys at each head width the rates step times, one
+    /// sequence attending itself: `(head_dim, [(keys, TFLOP/s)])`, ascending
+    /// in head width, each curve strictly ascending in keys. A model's
+    /// width is read between the widths measured; one outside them is
+    /// refused, never priced on another width's curve.
+    pub attn_tflops_by_dim_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
     /// Device memory GB/s, achieved by a streaming copy (read plus write).
     pub hbm_gbps: Option<f64>,
     /// GB/s the per-row ops (a norm, the gated activation) achieve as a
@@ -85,7 +91,7 @@ pub struct Rates {
 pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
-    "attn_tflops_by_keys",
+    "attn_tflops_by_dim_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
@@ -100,7 +106,9 @@ impl Rates {
         Rates {
             launch_ns: self.launch_ns.or(below.launch_ns),
             gemm_tflops_by_rows: self.gemm_tflops_by_rows.or(below.gemm_tflops_by_rows),
-            attn_tflops_by_keys: self.attn_tflops_by_keys.or(below.attn_tflops_by_keys),
+            attn_tflops_by_dim_keys: self
+                .attn_tflops_by_dim_keys
+                .or(below.attn_tflops_by_dim_keys),
             hbm_gbps: self.hbm_gbps.or(below.hbm_gbps),
             elementwise_gbps: self.elementwise_gbps.or(below.elementwise_gbps),
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
@@ -124,10 +132,10 @@ impl Rates {
                 .gemm_tflops_by_rows
                 .clone()
                 .filter(|_| has("gemm_tflops_by_rows")),
-            attn_tflops_by_keys: self
-                .attn_tflops_by_keys
+            attn_tflops_by_dim_keys: self
+                .attn_tflops_by_dim_keys
                 .clone()
-                .filter(|_| has("attn_tflops_by_keys")),
+                .filter(|_| has("attn_tflops_by_dim_keys")),
             hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
             elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
             scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
@@ -146,7 +154,7 @@ impl Rates {
         let unstated = |key: &str| match key {
             "launch_ns" => self.launch_ns.is_none(),
             "gemm_tflops_by_rows" => self.gemm_tflops_by_rows.is_none(),
-            "attn_tflops_by_keys" => self.attn_tflops_by_keys.is_none(),
+            "attn_tflops_by_dim_keys" => self.attn_tflops_by_dim_keys.is_none(),
             "hbm_gbps" => self.hbm_gbps.is_none(),
             "elementwise_gbps" => self.elementwise_gbps.is_none(),
             "scan_gelems" => self.scan_gelems.is_none(),
@@ -170,27 +178,21 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
-        if let Some(widths) = &self.gemm_tflops_by_rows {
-            let curves: Vec<String> = widths
-                .iter()
-                .map(|(w, c)| {
-                    let points: Vec<String> =
-                        c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
-                    format!("  [{w}, [{}]],\n", points.join(", "))
-                })
-                .collect();
-            let _ = writeln!(out, "gemm_tflops_by_rows = [\n{}]", curves.concat());
-        }
-        let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
-            if let Some(points) = v {
-                let points: Vec<String> = points
+        let mut curves = |key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
+            if let Some(widths) = v {
+                let curves: Vec<String> = widths
                     .iter()
-                    .map(|(x, r)| format!("[{x}, {r:?}]"))
+                    .map(|(w, c)| {
+                        let points: Vec<String> =
+                            c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
+                        format!("  [{w}, [{}]],\n", points.join(", "))
+                    })
                     .collect();
-                let _ = writeln!(out, "{key} = [{}]", points.join(", "));
+                let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
             }
         };
-        curve("attn_tflops_by_keys", &self.attn_tflops_by_keys);
+        curves("gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
+        curves("attn_tflops_by_dim_keys", &self.attn_tflops_by_dim_keys);
         let mut float = |key: &str, v: Option<f64>| {
             if let Some(v) = v {
                 let _ = writeln!(out, "{key} = {v:?}");
@@ -345,7 +347,7 @@ mod tests {
                 (1024, vec![(256, 40.0), (8192, 150.0)]),
                 (4096, vec![(256, 90.5), (8192, 210.0)]),
             ]),
-            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
+            attn_tflops_by_dim_keys: Some(vec![(128, vec![(512, 60.0), (8192, 400.0)])]),
             hbm_gbps: Some(654.4),
             elementwise_gbps: Some(450.0),
             scan_gelems: Some(2684.3),
@@ -361,7 +363,7 @@ mod tests {
             rates.toml(),
             "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
-             attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
+             attn_tflops_by_dim_keys = [\n  [128, [[512, 60.0], [8192, 400.0]]],\n]\nhbm_gbps = 654.4\n\
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\n"
         );
