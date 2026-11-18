@@ -82,8 +82,10 @@ const MEMORY: &str = r#"
 # budget_disk           = "200GiB"  # the tier is always on
 # disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
 # disk_persistent       = false     # keep the disk tier as cache for the next run
-# governor_backoff      = 1.0       # share kept each congested stretch; 1.0 never yields
-# governor_release_idle = false     # give back memory demand stopped asking for
+# yield                 = 0.0       # in [0, 1]: device target = floor + (budget - floor)
+#                                   #   * (1 - yield * OS memory pressure); 0 holds the budget
+# Idle cache has no time-based expiry: with no worker policy it stays until a
+# demand needs its room, then goes in retention-key / least-recently-used order.
 "#;
 
 const RUNTIME: &str = r#"

@@ -62,7 +62,7 @@ use super::slots::{
     Demand, Holder, RungEvacuation, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
     SlotShape,
 };
-use crate::governor::{Demand as Asked, Growth};
+use crate::governor::Growth;
 
 /// The pool behind an engine's stores, shared by every store and the
 /// governor; each call takes the lock for itself, innermost of every store
@@ -2252,10 +2252,10 @@ impl SharedPool {
     /// What is asked of the pool, in bytes: the slots held and wanted, the
     /// reserved chunks, and the top span, committed from the load.
     #[must_use]
-    pub fn demand(&self) -> Asked {
+    pub fn demand(&self) -> Demand {
         let Demand { live, wanted } = self.pool.demand();
         let fixed = self.fixed_bytes();
-        Asked {
+        Demand {
             wanted: wanted + fixed,
             live: live + fixed,
         }
@@ -2294,9 +2294,7 @@ impl SharedPool {
     pub fn growth(&self) -> Growth {
         match self.growth {
             SegmentGrowth::Fixed => Growth::Fixed,
-            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic {
-                least_cut: self.segment_bytes(),
-            },
+            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic,
         }
     }
 }
