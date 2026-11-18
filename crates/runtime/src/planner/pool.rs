@@ -95,10 +95,11 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = chunks;
         0
     }
-    /// The device pages the working sets of `pids` take together, or will
-    /// once on the device: their kv pages, each page they share once, with
-    /// the pages they reserved past those they map; their state; their
-    /// instances' slots (tables, rings, guest state). Pages are the room's
+    /// The device pages the working sets of `pids` take together now, with
+    /// their next step: their kv pages resident on the device, each page
+    /// they share once, with the pages they reserved past those they map;
+    /// their state; their instances' slots (tables, rings, guest state). A
+    /// set parked below the device takes none until it comes back. Pages are the room's
     /// unit: what is not kv counts as the pages it keeps out of the pool.
     /// What admission weighs ([`super::ResidencyPlanner::admits`]).
     fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {

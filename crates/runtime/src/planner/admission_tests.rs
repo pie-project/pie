@@ -25,9 +25,6 @@ impl PoolPort for SizedPool {
     fn drop_disallowed(&self) -> usize {
         0
     }
-    fn idle_below_device(&self) -> (u32, u32) {
-        (0, 0)
-    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: (self.total, self.total),
@@ -54,6 +51,9 @@ impl PoolPort for SizedPool {
     }
     fn reclaimable_idle(&self) -> u32 {
         0
+    }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
     }
     fn suspend_capable(&self) -> bool {
         false
@@ -370,4 +370,42 @@ async fn saturated_is_the_admission_rule_idle_cache_is_room() {
     running.pop();
     settle().await;
     assert!(!gate.saturated(), "one left: a next one fits");
+}
+
+/// A stated seat count stays a cap: room is weighed only past it. Four
+/// stated seats, seven processes whose working sets all fit: four hold
+/// execution, the higher key among them, and the three others wait for a
+/// seat however much room stands free.
+#[tokio::test(flavor = "current_thread")]
+async fn stated_seats_cap_admission_whatever_room_stands() {
+    let _schedule = schedule::TEST_LOCK.write().await;
+    let lower: Vec<ProcessId> = (0..6).map(|_| ProcessId::new_v4()).collect();
+    let high = ProcessId::new_v4();
+    let mut keys: HashMap<ProcessId, i64> = lower.iter().map(|pid| (*pid, 1)).collect();
+    keys.insert(high, 9);
+    schedule::install(Some(Table::new(
+        keys,
+        None,
+        std::collections::HashMap::new(),
+        None,
+    )));
+    let sized: Vec<(ProcessId, u64)> = lower.iter().chain([&high]).map(|pid| (*pid, 1)).collect();
+    let (_planner, gate) = device(1_000, &sized, 0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    ask(&gate, &lower, &tx);
+    ask(&gate, &[high], &tx);
+    settle().await;
+    gate.add_permits(4);
+    settle().await;
+    let mut running = drain(&mut rx);
+    assert_eq!(running.len(), 4, "four stated seats, room for all seven");
+    assert!(
+        running.iter().any(|(pid, _)| *pid == high),
+        "the higher key holds one"
+    );
+    running.pop();
+    settle().await;
+    assert_eq!(drain(&mut rx).len(), 1, "a freed seat lets one more in");
+    drop(running);
+    schedule::install(None);
 }

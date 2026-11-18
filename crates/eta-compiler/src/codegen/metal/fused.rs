@@ -16,6 +16,7 @@ use super::intrinsics::{
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{library_region_valid, outputs_bindable, used_channel_slots};
 use crate::codegen::fault::{FUSED_GEOMETRY_MISMATCH, M3_THREADS_EXCEEDED};
+use crate::codegen::lane_scratch::LANE_SCRATCH;
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
@@ -193,7 +194,11 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device M1ValueDesc* all_descriptors [[buffer(1)]],\n");
     source.push_str("    const device M1OpParams* params [[buffer(2)]],\n");
     source.push_str("    const device uint* offsets [[buffer(3)]],\n");
-    source.push_str("    device uchar* all_scratch [[buffer(4)]],\n");
+    let _ = writeln!(
+        source,
+        "    const device ulong* {} [[buffer({})]],",
+        LANE_SCRATCH.name, LANE_SCRATCH.metal_buffer
+    );
     source.push_str("    const device M3GroupLayout* layout [[buffer(5)]],\n");
     source.push_str("    const device uint* channel_bindings [[buffer(6)]],\n");
     source.push_str("    device uchar* pending_flags [[buffer(7)]],\n");
@@ -247,7 +252,7 @@ pub fn emit_grouped_fused_region(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(
-        "  device uchar* scratch = all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);\n",
+        "  device uchar* scratch = reinterpret_cast<device uchar*>(lane_scratch[dispatch_lane]);\n",
     );
     source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(

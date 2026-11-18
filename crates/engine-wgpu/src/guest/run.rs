@@ -77,18 +77,18 @@ impl<'a> OnDevice<'a> {
                 // Row `r` of a root read at lane `k` is lane `k + r`'s
                 // readout row, each through its own seat.
                 let rows = engine_gpu::guest::run::row_seats(&self.seats, root, values)?;
-                let heap = self.session.heap(at).ok_or_else(|| Fault::Program {
+                let (heap, base) = self.session.heap(at).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("stage {at} has no heap"),
                 })?;
-                let (mut into, _) = self
+                let (into, _) = self
                     .session
                     .span(at, local)
                     .expect("the span was just read");
+                let mut into = base + into;
                 for (seat, values) in rows {
                     if seat.dtype != Dtype::Bf16 {
-                        let heap = heap.clone();
-                        frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
+                        frame.copy(seat.seat, seat.at, heap, into, u64::from(values) * 4)?;
                     } else {
                         self.widen
                             .encode(&frame, seat.seat, seat.at, heap, into, values)?;

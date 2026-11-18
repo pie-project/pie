@@ -64,7 +64,7 @@ pub enum Launched {
 
 /// Whether stage `index` of `compiled` launches kernels (and so holds
 /// launch tables).
-fn launches(compiled: &Compiled, index: usize) -> bool {
+pub(crate) fn launches(compiled: &Compiled, index: usize) -> bool {
     compiled
         .stages
         .get(index)
@@ -133,20 +133,6 @@ impl Session {
             }
         }
         Ok(widest)
-    }
-
-    /// The span bytes the batch tables of `lanes` lanes take for every
-    /// launching stage of `compiled` ([`super::launch::Batch::bytes_for`]).
-    #[must_use]
-    pub fn batch_bytes_for(compiled: &Compiled, channels: usize, lanes: u32, rows: u32) -> u64 {
-        let channels = u32::try_from(channels).unwrap_or(u32::MAX);
-        compiled
-            .plans
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| launches(compiled, *index))
-            .map(|(_, plan)| super::launch::Batch::bytes_for(plan, channels, lanes, rows))
-            .sum()
     }
 
     /// The stages this instance carries, launching or not.
@@ -509,7 +495,7 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
         at: Stage,
-        carve: &super::GuestCarve,
+        scratch: Option<super::launch::ScratchAt>,
     ) -> Result<Fired> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -534,11 +520,11 @@ impl Session {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
-            // Its scratch from the guest region's top, zeroed on the GPU in
-            // the frame of the stage's first region: the one queue orders it
-            // after whatever frame still reads the span, with no submission
-            // or wait of its own.
-            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?);
+            // Its own scratch (its state's first frame in flight): a
+            // standalone fire drains every frame before it.
+            prepared.seat_scratch(scratch.clone().ok_or_else(|| {
+                Fault::program("program::session", "an instance fires a stage and holds no scratch")
+            })?)?;
             for (at, region) in stage.regions.iter().enumerate() {
                 prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
             }

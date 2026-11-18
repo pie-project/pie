@@ -158,21 +158,29 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
     shell
         .commit_segments(segments)
         .expect("the first segment commits");
-    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let slots = guest.slots(
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
+    );
+    let extents = Extents {
+        row_count: ROWS,
+        token_count: ROWS,
+        sampled_rows: ROWS,
+        query_len: ROWS,
+        ..Extents::default()
+    };
+    let (scratch, pair) = guest.places(
+        (program, extents),
+        &shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
     );
     shell
         .bind_program(
             program,
             &[],
-            Extents {
-                row_count: ROWS,
-                token_count: ROWS,
-                sampled_rows: ROWS,
-                query_len: ROWS,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::DecodeEnvelope,
             PortMask::of(&[Port::EmbedTokens, Port::Positions]),
             &vec![None; count],
@@ -180,6 +188,8 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
+                scratch,
+                pair,
             },
         )
         .expect("the instance binds")

@@ -8,6 +8,7 @@ pub mod code_object;
 pub mod kfd;
 pub mod lt;
 pub mod lt_grouped;
+pub mod lt_kernel;
 mod msgpack;
 pub mod rt;
 pub mod sys;

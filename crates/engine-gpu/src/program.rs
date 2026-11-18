@@ -150,12 +150,22 @@ pub trait Programs<B: Serve>: Default {
     fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal>;
 
     /// Binds an instance; its device half in the slots its binding names,
-    /// where a model is loaded.
+    /// where a model is loaded, its pair's state at the binding's `pair`
+    /// place as `layout` lays it ([`crate::guest::state`]).
     fn bind(
         &mut self,
         binding: &InstanceBinding,
         place: Option<&Place<'_, B>>,
+        layout: &crate::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal>;
+
+    /// The score room of `instance`'s pair, where its program reads
+    /// captured scores: a fire carrying its lanes may lay its capturing
+    /// lanes' rows there ([`crate::guest::state`]).
+    fn scores(&self, instance: InstanceId) -> Option<crate::serve::DeviceCell<B>> {
+        let _ = instance;
+        None
+    }
 
     /// Before an evacuation moves chunks: every guest pass the plane has
     /// yet to put on the queue is on it, so none binds a chunk's old place

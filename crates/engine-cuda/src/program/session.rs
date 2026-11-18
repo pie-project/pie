@@ -585,13 +585,13 @@ impl Session {
         Ok(())
     }
 
-    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>) -> Result<()> {
+    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>, scratch: u64) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
         };
         let commit = self.commits[minted.slot].device();
         for prepared in stages {
-            let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
+            let lane = prepared.stage_lane(&self.rings, &minted.before, commit, scratch)?;
             for name in &self.row_sets {
                 let Some(slot) = prepared.slot_of(name, 0).filter(|_| prepared.reads(name, 0))
                 else {
