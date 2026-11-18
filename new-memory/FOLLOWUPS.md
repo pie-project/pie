@@ -160,7 +160,7 @@ on Metal; (2) if it fails, a per-page release on that page's own fire / copy
 completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
 
 
-## F19. An evacuation's rebase stops at the first instance it cannot place
+## F20. An evacuation's rebase stops at the first instance it cannot place
 
 engine-cuda's `Plane::rebase` (program.rs) re-addresses every bound
 instance after an evacuation, parked ones included, whose `bound.slots`
