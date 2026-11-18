@@ -786,9 +786,26 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
+    // A yield that moves some pool needs the system's memory pressure: with
+    // none to read, the load is refused by name rather than yielding
+    // nothing. At yield 0, or where every pool is laid whole, nothing is
+    // read.
+    let moves = governed.iter().any(crate::governor::run::yield_applies);
+    let source = if moves {
+        crate::governor::source_for(memory_yield, ::engine::pressure::Source::of_this_system)
+    } else {
+        Ok(None)
+    };
+    let source = match source {
+        Ok(source) => source,
+        Err(why) => {
+            scheduler_shutdown.shutdown().await.ok();
+            return Err(anyhow::anyhow!(why));
+        }
+    };
     for (engine, steered) in governed.into_iter().enumerate() {
         let room = rooms.get_mut(engine).and_then(Option::take);
-        crate::governor::run::start(steered, memory_yield, room);
+        crate::governor::run::start(steered, memory_yield, room, source.clone());
     }
     // Each host kv tier's target follows the host's memory pressure by the
     // same rule and yield.

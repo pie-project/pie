@@ -8,8 +8,17 @@ use super::{Governor, Growth, Limits, PoolTarget, Reader, Retarget, Signal, TICK
 /// front of it settles its windows on the governor's tick. Where the engine
 /// states a reader of the host's room (`room`, its share of the host's one
 /// ledger), every pool that can move is held within it.
-pub fn start(pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>) {
-    crate::rt::spawn(watch(pool, yields, room));
+/// `source` is the pressure source the load's yield needs
+/// ([`super::source_for`]), read where the pool moves.
+pub fn start(pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>, source: Option<super::Source>) {
+    crate::rt::spawn(watch(pool, yields, room, source));
+}
+
+/// Whether `yield` moves `pool` at all: one its engine states can shrink,
+/// and shared. XLA's and wgpu's are laid whole at load.
+#[must_use]
+pub fn yield_applies(pool: &Shared<Steered>) -> bool {
+    pool.growth() != Growth::Fixed && pool.with(|pool| pool.inner().is_shared())
 }
 
 /// One host's room, shared by every pool on it. A reading is what the host
@@ -151,6 +160,11 @@ pub struct Steer {
     /// Whether the pool held its hard limit at the last turn that moved it,
     /// so reaching it and leaving it are each named once.
     at_limit: Option<bool>,
+    /// Whether the yield's target stood under what the pool held at the
+    /// last turn, so each crossing is named once, never a tick.
+    under: Option<bool>,
+    /// The pressure reading's source, for that line.
+    source: &'static str,
 }
 
 /// Where the host's room leaves a pool: what the log names at info when it
@@ -201,6 +215,8 @@ impl Steer {
             ceiling: None,
             noted: None,
             at_limit: None,
+            under: None,
+            source: "none read",
         }
     }
 
@@ -210,6 +226,57 @@ impl Steer {
     pub fn with_room(mut self, pool: &impl PoolTarget, room: Option<PoolRoom>) -> Self {
         self.room = room.filter(|_| pool.growth() != Growth::Fixed);
         self
+    }
+
+    /// Names the pressure reading's source in the crossing line.
+    #[must_use]
+    pub const fn with_source(mut self, source: &'static str) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Whether the yield's target stood under what the pool held at the
+    /// last turn.
+    #[must_use]
+    pub const fn under(&self) -> Option<bool> {
+        self.under
+    }
+
+    /// Names, at info, the yield's target crossing what the pool holds: an
+    /// edge each way, never a tick.
+    fn note_target(&mut self, pressure: f64, target: u64, held: u64) {
+        let under = target < held;
+        if self.under == Some(under) {
+            return;
+        }
+        let first = self.under.is_none();
+        self.under = Some(under);
+        if first && !under {
+            return;
+        }
+        let limits = self.governor.limits();
+        let (floor, budget) = (limits.floor, limits.hard_limit);
+        if under {
+            tracing::info!(
+                pressure,
+                source = self.source,
+                target_mib = target >> 20,
+                held_mib = held >> 20,
+                floor_mib = floor >> 20,
+                budget_mib = budget >> 20,
+                "the system's memory pressure brings the device target under what the pool holds: it gives the difference back"
+            );
+        } else {
+            tracing::info!(
+                pressure,
+                source = self.source,
+                target_mib = target >> 20,
+                held_mib = held >> 20,
+                floor_mib = floor >> 20,
+                budget_mib = budget >> 20,
+                "the device target is at or over what the pool holds again"
+            );
+        }
     }
 
     /// Whether the pool is held within the host's room.
@@ -352,12 +419,15 @@ impl Steer {
         pool: &mut impl PoolTarget,
         pressure: f64,
         signal: &mut impl FnMut(Signal),
-    ) -> u64 {
+    ) -> Turn {
         self.read_room(pool);
         let yields = self.governor.yields().yields();
         if !yields && self.ceiling.is_none() {
             pool.ticked();
-            return self.governor.target();
+            return Turn {
+                target: self.governor.target(),
+                answer: Retarget::Reached,
+            };
         }
         // The system refusing memory is its own word that it has none to
         // give: full pressure, for a pool that yields to it.
@@ -366,17 +436,29 @@ impl Steer {
         } else {
             pressure
         };
+        let held_before = pool.held();
         let target = self.governor.tick(pressure);
+        if yields {
+            self.note_target(pressure, target, held_before);
+        }
         let target = self.ceiling.map_or(target, |ceiling| target.min(ceiling));
         let limits = *self.governor.limits();
         let segments = within(&limits, target);
-        match pool.retarget(segments) {
+        let answer = pool.retarget(segments);
+        match answer {
             Retarget::Reached => {
                 if self.short.take().is_some() {
                     signal(Signal::Eased);
                 }
             }
             Retarget::NoRoom { held } => {
+                if self.short.is_none() {
+                    tracing::info!(
+                        held_mib = held.saturating_mul(limits.segment_bytes) >> 20,
+                        target_mib = segments.saturating_mul(limits.segment_bytes) >> 20,
+                        "the pool holds more than its target and has no room to evacuate into: the rest is live; tier pressure to the policy"
+                    );
+                }
                 if self.short != Some(held) {
                     self.short = Some(held);
                     signal(Signal::TierPressure {
@@ -392,8 +474,15 @@ impl Steer {
         }
         self.note_limit(held, &limits);
         pool.ticked();
-        target
+        Turn { target, answer }
     }
+}
+
+/// What one turn asked of the pool and how it answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turn {
+    pub target: u64,
+    pub answer: Retarget,
 }
 
 /// The segments `target` comes to, the floor's at least.
@@ -401,10 +490,18 @@ fn within(limits: &Limits, target: u64) -> u64 {
     limits.segments(target.min(limits.hard_limit))
 }
 
-async fn watch(mut pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>) {
-    let mut steer = Steer::new(&pool, yields).with_room(&pool, room);
+async fn watch(
+    mut pool: Shared<Steered>,
+    yields: Yield,
+    room: Option<PoolRoom>,
+    source: Option<super::Source>,
+) {
+    let named = source.as_ref().map_or("none read", super::Source::name);
+    let mut steer = Steer::new(&pool, yields)
+        .with_room(&pool, room)
+        .with_source(named);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
-    let mut system = said(engine, yields, &steer, shared);
+    let mut system = said(&pool, engine, yields, &steer, shared, source);
     // A shared pool that does not yield may take every segment its range
     // holds: its walker commits them ahead of the waiters that need them,
     // off the fire path, and never gives them back. Held within the host's
@@ -430,16 +527,38 @@ async fn watch(mut pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>)
     loop {
         interval.tick().await;
         let pressure = system.as_mut().map_or(0.0, |system| system.read());
-        steer.turn(&mut pool, pressure, &mut |signal| {
+        let held = pool.held();
+        let turn = steer.turn(&mut pool, pressure, &mut |signal| {
             steered::signal(engine, signal);
         });
+        // Once per read that reached the source: its own value, the reading,
+        // and what the pool made of the target.
+        if let Some(raw) = system.as_mut().and_then(Reader::take_fresh) {
+            tracing::debug!(
+                engine,
+                raw,
+                pressure,
+                target_mib = turn.target >> 20,
+                held_mib = held >> 20,
+                answer = ?turn.answer,
+                "pressure read"
+            );
+        }
         read_ledger(&pool, engine);
     }
 }
 
 /// States in the load log what the device target follows, and opens the
-/// system's pressure reader where the pool yields to it.
-fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Reader> {
+/// system's pressure reader where the pool yields to it. The load refused
+/// a yield with no source before this runs ([`super::source_for`]).
+fn said(
+    pool: &Shared<Steered>,
+    engine: usize,
+    yields: Yield,
+    steer: &Steer,
+    shared: bool,
+    source: Option<super::Source>,
+) -> Option<Reader> {
     if !yields.yields() {
         tracing::info!(
             engine,
@@ -455,21 +574,39 @@ fn said(engine: usize, yields: Yield, steer: &Steer, shared: bool) -> Option<Rea
         );
         return None;
     }
-    let system = Reader::of_this_system();
+    let mut system = source.map(Reader::new);
     let limits = steer.governor().limits();
-    match &system {
-        Some(system) => tracing::info!(
+    match &mut system {
+        Some(system) => {
+            let pressure = system.read();
+            // The floor is the load's own promise: one lane at the full
+            // declared context, the reserved chunks, the activation span
+            // and the held dense weights. A long max_context raises it,
+            // and with it lowers how far yield can press.
+            let (parts, weights) = pool.with(|pool| {
+                (pool.inner().floor_parts(), pool.cache().pinned_bytes())
+            });
+            let mib = |bytes: Option<u64>| bytes.map_or(0, |bytes| bytes >> 20);
+            tracing::info!(
+                engine,
+                yields = yields.share(),
+                source = system.source().name(),
+                pressure,
+                floor_mib = limits.floor >> 20,
+                lane_kv_mib = mib(parts.map(|parts| parts.lane_bytes)),
+                max_context = parts.map_or(0, |parts| parts.max_context),
+                reserved_mib = mib(parts.map(|parts| parts.reserved_bytes)),
+                activation_mib = mib(parts.map(|parts| parts.act_bytes)),
+                dense_weights_mib = weights >> 20,
+                budget_mib = limits.hard_limit >> 20,
+                target_mib = limits.target(yields, pressure) >> 20,
+                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights"
+            );
+        }
+        None => tracing::error!(
             engine,
             yields = yields.share(),
-            source = system.source().name(),
-            floor_mib = limits.floor >> 20,
-            budget_mib = limits.hard_limit >> 20,
-            "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure)"
-        ),
-        None => tracing::info!(
-            engine,
-            yields = yields.share(),
-            "this system states no memory pressure: it reads 0, and the device target is the budget"
+            "the pool yields but was handed no pressure source: the load should have refused"
         ),
     }
     system
@@ -626,6 +763,59 @@ mod tests {
         let mut steer = Steer::new(&pool, Yield::NONE);
         assert!(pressed(&mut steer, &mut pool, 1.0).is_empty());
         assert_eq!(pool.segments(), 1000);
+    }
+
+    /// The pressure from the system's source, changed mid-run (the file
+    /// source a test writes): the pool gives back down to the rule's target
+    /// as it rises, the crossing named once, and takes its budget back as
+    /// it falls.
+    #[test]
+    fn a_pool_follows_a_pressure_source_changed_mid_run() {
+        let dir = std::env::temp_dir().join(format!("pie-govfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        std::fs::write(&path, "0").unwrap();
+        let source = super::super::Source::File(path.clone());
+        let mut reader = super::super::Reader::new(source.clone());
+        let host = Host::new(5000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap()).with_source(source.name());
+        let turn = |steer: &mut Steer, pool: &mut Pool, reader: &mut super::super::Reader| {
+            let pressure = reader.read();
+            let mut signals = Vec::new();
+            steer.turn(pool, pressure, &mut |signal| signals.push(signal));
+            signals
+        };
+        assert!(turn(&mut steer, &mut pool, &mut reader).is_empty());
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.under(), Some(false));
+        // An app takes memory: the system reads 0.62.
+        std::fs::write(&path, "0.62").unwrap();
+        turn(&mut steer, &mut pool, &mut reader);
+        // 100 + 900 * 0.38 = 442.
+        assert_eq!(pool.segments(), 442, "given back to the target");
+        assert_eq!(steer.under(), Some(true), "the crossing, named once");
+        // The pool holds what nothing can evacuate: tier pressure, then
+        // eased once the policy freed it.
+        std::fs::write(&path, "1").unwrap();
+        pool.pinned = 300;
+        assert_eq!(
+            turn(&mut steer, &mut pool, &mut reader),
+            vec![Signal::TierPressure {
+                held_bytes: 300 * MIB,
+                target_bytes: 100 * MIB,
+            }]
+        );
+        assert_eq!(steer.under(), Some(true));
+        pool.pinned = 0;
+        assert_eq!(turn(&mut steer, &mut pool, &mut reader), vec![Signal::Eased]);
+        assert_eq!(pool.segments(), 100);
+        // The app goes: the budget comes back.
+        std::fs::write(&path, "0").unwrap();
+        turn(&mut steer, &mut pool, &mut reader);
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.under(), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// What each engine states of its device pool decides whether `yield`

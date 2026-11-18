@@ -740,6 +740,8 @@ pub struct SharedPool {
     records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
+    /// That longest context, in tokens.
+    max_context: u32,
     /// A raise is applied here and its chunks' copy is not yet the
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
@@ -1013,6 +1015,7 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
+            max_context,
             copying: None,
             raise_from: None,
             told: 0,
@@ -2268,6 +2271,19 @@ impl SharedPool {
         u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()
     }
 
+    /// What [`Self::floor`] is made of, for the load log.
+    #[must_use]
+    pub fn floor_parts(&self) -> FloorParts {
+        let chunk = self.pool.chunk_bytes();
+        let act = self.pool.act_max().max(self.pool.act_reserved());
+        FloorParts {
+            lane_bytes: u64::from(self.least_chunks) * chunk,
+            max_context: self.max_context,
+            reserved_bytes: u64::from(self.pool.reserved_chunks()) * chunk,
+            act_bytes: u64::from(act) * chunk,
+        }
+    }
+
     /// Bytes below which one lane cannot run: one working set at the longest
     /// context, the reserved chunks and the top span.
     #[must_use]
@@ -2297,6 +2313,16 @@ impl SharedPool {
             SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic,
         }
     }
+}
+
+/// The parts of a shared pool's floor: one lane's state at the longest
+/// context, the reserved chunks and the activation span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorParts {
+    pub lane_bytes: u64,
+    pub max_context: u32,
+    pub reserved_bytes: u64,
+    pub act_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
