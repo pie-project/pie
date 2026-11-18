@@ -50,8 +50,8 @@ fn the_readout_seat_is_the_readout_ceilings_rows_not_the_tokens() {
 }
 
 wgpu_held! {
-    "a wgpu load with segments this small commits only the first segment before a step that \
-     needs two: the step is under investigation",
+    "a wgpu load with segments this small names its fires (Shell::name) over seat-addressed kv \
+     pages past the one segment it commits first: Pools::kv_pages refuses them",
     /// A device whose largest buffer is short of the load's widest reservation
     /// gets a narrower top rung whose every reservation fits that buffer, and
     /// the load serves at it.

@@ -140,6 +140,29 @@ pub fn sized(
     })
 }
 
+/// The widest of `rungs` (`(tokens, act chunks, left)`: a top rung's span
+/// in chunks of `chunk_bytes`, and the bytes the device leaves a load cut
+/// to it) whose span and one working set of `least_chunks` lie in the pool
+/// `left` gives (or `kv_budget` of state beside the span), cut into
+/// segments of at most `binding` bytes with the span whole in the last
+/// ([`sized`]). `None`: not even the least rung's does.
+#[must_use]
+pub fn widest_rung(
+    rungs: &[(u32, u32, u64)],
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    least_chunks: u32,
+    binding: u64,
+) -> Option<u32> {
+    rungs
+        .iter()
+        .filter(|&&(_, act, left)| {
+            sized(left, kv_budget, chunk_bytes, act, least_chunks, binding).is_ok()
+        })
+        .map(|&(tokens, _, _)| tokens)
+        .max()
+}
+
 /// The u32 words of a segment of `segment_chunks` chunks of `chunk_bytes`,
 /// which every kernel reading the pool is told: a segment too long for the
 /// count is refused at the load, never stated short.
@@ -523,6 +546,34 @@ mod tests {
         // the widest last segment.
         assert_eq!(segment_chunks(chunk, 64, 64 << 20, 16), None);
         assert_eq!(segment_chunks(chunk, 64, 1 << 30, 63), None);
+    }
+
+    /// Qwen3-0.6B on an Adreno phone: 3803136-byte chunks, a 1 GiB largest
+    /// buffer (282 chunks), one working set of 129, and the room its
+    /// capacity leaves past the weights about 400 chunks. A pool of one
+    /// binding holds no top over 153 chunks beside the working set, and two
+    /// segments each holding the span need it at most 197 (400 / 2 - 3): the
+    /// 10240 and 4096 rungs (266, 230) fit neither, and the top is the widest
+    /// below them. With the room of a desktop card every rung fits.
+    #[test]
+    fn the_top_rung_is_the_widest_whose_span_and_working_set_fit_the_pool() {
+        const GIB: u64 = 1 << 30;
+        let (chunk, binding, least) = (3_803_136u64, GIB, 129u32);
+        let left = 400 * chunk;
+        let rungs = [(1024, 120), (2048, 180), (4096, 230), (10240, 266)].map(|(t, a)| (t, a, left));
+        assert_eq!(super::widest_rung(&rungs, None, chunk, least, binding), Some(2048));
+        for (tokens, act) in [(4096u32, 230u32), (10240, 266)] {
+            assert!(
+                super::sized(left, None, chunk, act, least, binding).is_err(),
+                "the {tokens} rung's span of {act} chunks fits no pool of this room"
+            );
+        }
+        // Short of even the least rung's: no top.
+        let short = rungs.map(|(t, a, _)| (t, a, 200 * chunk));
+        assert_eq!(super::widest_rung(&short, None, chunk, least, binding), None);
+        // A desktop card's room holds the widest.
+        let roomy = rungs.map(|(t, a, _)| (t, a, 8000 * chunk));
+        assert_eq!(super::widest_rung(&roomy, None, chunk, least, binding), Some(10240));
     }
 
     /// Qwen3.5-0.8B on wgpu at a 12 GiB budget: 2304000-byte chunks, a

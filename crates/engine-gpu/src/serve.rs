@@ -1063,6 +1063,19 @@ impl<B: Serve> Shell<B> {
             )
         };
         let binding = device.max_buffer();
+        let arms = u32::try_from(boot.runahead.frames().max(1)).unwrap_or(u32::MAX);
+        // What the device leaves a pool once the weights it holds are laid:
+        // every plane but those the token tables stream.
+        let pool_left = {
+            let planes = crate::weights::plane_bytes(&boot.trace)?;
+            let held: u64 = planes
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| !streamed.contains(at))
+                .map(|(_, bytes)| *bytes)
+                .sum();
+            device.left().saturating_sub(held)
+        };
         // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
         let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
         let (compiled, mut span, out, out_width, pixels, readouts) = loop {
@@ -1201,34 +1214,64 @@ impl<B: Serve> Shell<B> {
             };
             // Every reservation a rung's fires need in one binding: its span,
             // and each arm's readout seat, pixel plane and inputs store for
-            // the fires cut to it.
+            // the fires cut to it. Those arms' reservations and the weights
+            // come out of what the device leaves the pool.
             let pixel_bytes = pixels.iter().map(|plane| plane.4).max().unwrap_or(0);
             let feeds = poem_exec::feeds::Feeds::of(&boot.trace, &compiled);
+            let reserved = |tokens: u32| {
+                let cut = crate::arena::bounded_budget(&budgets.tokens, tokens);
+                let seat = readout_seat(&readouts, &cut, budgets.max_voxels(), span.capture());
+                let store = lay_inputs(&cut, &compiled, &feeds, span.capture().is_some()).bytes();
+                (seat, store)
+            };
             let spans: Vec<(u32, u64)> = span
                 .rungs()
                 .iter()
                 .map(|rung| {
-                    let cut = crate::arena::bounded_budget(&budgets.tokens, rung.tokens);
-                    let seat = readout_seat(&readouts, &cut, budgets.max_voxels(), span.capture());
-                    let store =
-                        lay_inputs(&cut, &compiled, &feeds, span.capture().is_some()).bytes();
+                    let (seat, store) = reserved(rung.tokens);
                     (rung.tokens, rung.bytes().max(seat).max(pixel_bytes).max(store))
                 })
                 .collect();
-            match crate::arena::bound_top(&spans, binding) {
+            // The rungs whose reservations lie in one binding, each with the
+            // span's chunks and the bytes the device leaves its pool.
+            let rooms: Vec<(u32, u32, u64)> = span
+                .act_chunks(chunk)
+                .into_iter()
+                .filter(|&(tokens, _)| {
+                    spans
+                        .iter()
+                        .any(|&(rung, bytes)| rung == tokens && bytes <= binding)
+                })
+                .map(|(tokens, act)| {
+                    let (seat, store) = reserved(tokens);
+                    let arms_bytes = u64::from(arms) * (seat + pixel_bytes + store);
+                    (tokens, act, pool_left.saturating_sub(arms_bytes))
+                })
+                .collect();
+            let widest =
+                crate::store::pool::widest_rung(&rooms, kv_budget, chunk, least_chunks, binding);
+            match widest {
                 Some(widest) if widest < top => {
                     unbounded.get_or_insert((top, spans));
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
                     boot.budget = budgets.tokens.clone();
                 }
                 Some(_) => break (compiled, span, out, out_width, pixels, readouts),
-                None => {
-                    return Err(Fault::Ceiling {
-                        what: "bytes of one binding the least rung's reservations take",
-                        need: spans.iter().map(|&(_, bytes)| bytes).min().unwrap_or(0),
-                        have: binding,
-                    });
-                }
+                // The least rung's reservations past one binding, or its span
+                // and one working set past the pool the device leaves.
+                None => match rooms.first() {
+                    None => {
+                        return Err(Fault::Ceiling {
+                            what: "bytes of one binding the least rung's reservations take",
+                            need: spans.iter().map(|&(_, bytes)| bytes).min().unwrap_or(0),
+                            have: binding,
+                        });
+                    }
+                    Some(&(_, act, left)) => {
+                        crate::store::pool::sized(left, kv_budget, chunk, act, least_chunks, binding)?;
+                        unreachable!("the least rung's pool was refused above");
+                    }
+                },
             }
         };
         if let Some((asked, spans)) = unbounded {
@@ -1236,7 +1279,8 @@ impl<B: Serve> Shell<B> {
                 asked,
                 top = budgets.tokens.max_tokens,
                 spans = ?spans,
-                "the top rung is bounded by this device's largest binding: {} MiB",
+                "the top rung is bounded by this device's largest binding ({} MiB) and the pool \
+                 its room leaves",
                 binding >> 20
             );
         }
