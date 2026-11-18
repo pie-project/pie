@@ -111,16 +111,12 @@ fn in_a_fresh_process(order: &str) -> Vec<(u64, (usize, u64))> {
         .env(CHILD, order)
         .output()
         .expect("the child runs");
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "the {order} child failed:\n{text}");
     text.lines()
         .filter_map(|line| line.split_once("[census] ").map(|(_, rest)| rest))
         .map(|rest| {
-            let n: Vec<u64> = rest
-                .split_whitespace()
-                .map(|x| x.parse().expect("a number"))
-                .collect();
+            let n: Vec<u64> = rest.split_whitespace().map(|x| x.parse().expect("a number")).collect();
             (n[0], (n[1] as usize, n[2]))
         })
         .collect()
@@ -144,10 +140,7 @@ fn a_loads_census_is_its_own_in_either_order() {
     eprintln!("first 128 then 256: {ab:?}; first 256 then 128: {ba:?}");
     for width in [128u64, 256] {
         let of = |runs: &[(u64, (usize, u64))]| {
-            runs.iter()
-                .find(|(w, _)| *w == width)
-                .map(|(_, c)| *c)
-                .expect("a census")
+            runs.iter().find(|(w, _)| *w == width).map(|(_, c)| *c).expect("a census")
         };
         assert!(of(&ab).0 > 0, "the load at {width} arms bodies");
         assert_eq!(

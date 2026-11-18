@@ -627,10 +627,7 @@ impl Engine for Group {
     }
 
     /// Lands once every rank's copy has.
-    fn copy_slots(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-    ) -> EngineResult<engine::CopyCompletion> {
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         let copy = copy.clone();
         let each = self.each(move |rank| rank.copy_slots(&copy))?;
         Ok(engine::completion::all(each))

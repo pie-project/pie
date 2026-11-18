@@ -33,27 +33,29 @@ mod guest;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
+mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
+mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_bound_guest_holds_its_scratch_as_state;
 mod a_buffer_frees_after_another_context_closes;
+mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]
 mod a_capture_survives_a_load_on_another_thread;
 mod a_cell_table_reads_each_rows_patch_and_group;
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
-mod a_closed_contexts_kept_memory_serves_the_next;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_copy_lands_before_its_slots_change_hands;
 mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_decode_envelope_packs_its_device_mask_into_each_lane;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
-mod a_double_block_fires_two_streams_through_the_engine;
 mod a_dropped_shell_takes_its_queues_with_it;
-mod a_faulted_epilogue_faults_its_own_lanes;
+mod a_double_block_fires_two_streams_through_the_engine;
 #[cfg(feature = "cuda")]
 mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
 mod a_four_rank_group_fires_a_sharded_plan;
+mod a_faulted_epilogue_faults_its_own_lanes;
 mod a_fragmented_window_gets_a_view_per_run;
 mod a_fused_geglu_reads_its_affine_bank_as_planes;
 #[cfg(feature = "cuda")]
@@ -66,7 +68,6 @@ mod a_joined_projection_answers_what_its_legs_answer;
 mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_loads_census_is_its_own_in_either_order;
 mod a_missing_or_misshapen_input_feed_is_refused_by_name;
-mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_padded_row_writes_nothing;
 mod a_prefill_past_the_gemvs_grid_is_served;
@@ -79,7 +80,6 @@ mod a_second_fire_reads_the_input_cells_it_was_handed;
 mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
-mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_stored_k_quant_row_serves_as_stored;
 mod a_synthesized_region_serves_the_logits_of_its_ops;
 mod a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it;

@@ -145,15 +145,9 @@ const NVRTC_OPTIONS: [&std::ffi::CStr; 5] = [
 /// a build with no runtime compiler, which compiles nothing.
 fn compile_options() -> Vec<&'static [u8]> {
     #[cfg(feature = "rocm")]
-    return HIPRTC_OPTIONS
-        .iter()
-        .map(|option| option.as_bytes())
-        .collect();
+    return HIPRTC_OPTIONS.iter().map(|option| option.as_bytes()).collect();
     #[cfg(feature = "cuda")]
-    return NVRTC_OPTIONS
-        .iter()
-        .map(|option| option.to_bytes())
-        .collect();
+    return NVRTC_OPTIONS.iter().map(|option| option.to_bytes()).collect();
     #[cfg(not(any(feature = "rocm", feature = "cuda")))]
     Vec::new()
 }
@@ -177,8 +171,7 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
                 .copied()
                 .chain(flag.as_deref())
                 .collect();
-            let code = match hip::compile("ptir_fused_region", source, architecture, &options, &[])
-            {
+            let code = match hip::compile("ptir_fused_region", source, architecture, &options, &[]) {
                 Ok(built) if built.code.is_empty() => {
                     return Err(Failure::Retryable {
                         reason: "hiprtc produced an empty code object".into(),

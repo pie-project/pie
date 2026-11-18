@@ -379,7 +379,8 @@ pub fn declared_context_that_fits(
     // alone; a fire's rows past it are the activations' half, weighed per
     // rung once the rung is ruled (`window_fire_bytes`).
     let one = |pages: u32| -> Result<u64> {
-        let paging = Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
+        let paging =
+            Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     let ceiling = load_ceiling(allowance, false)?;
@@ -2262,7 +2263,8 @@ impl Pools {
     pub fn guest_state(&self, per_instance: u64, per_pair: u64) -> Result<engine::GuestState> {
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes.max(1);
-        let run = u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
+        let run =
+            u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
         if run > layout.segment_chunks {
             return Err(Fault::Ceiling {
                 what: "chunks of a segment a guest's state lies in, one run",

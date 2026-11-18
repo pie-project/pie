@@ -65,9 +65,10 @@ fn seated() -> (Shell, tempfile::TempDir) {
     shell
         .commit_segments(facts.segments.max.min(4))
         .expect("the segments commit");
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), 16, 256, Some(crate::POOL), 1)
-        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-        .expect("the staging ring pins");
+    let ring =
+        engine_cuda::store::staging_ring_for(shell.trace(), 16, 256, Some(crate::POOL), 1)
+            .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+            .expect("the staging ring pins");
     shell
         .seat_host_kv(Some(crate::POOL), 1, 256, 1, ring)
         .expect("the host tier seats");

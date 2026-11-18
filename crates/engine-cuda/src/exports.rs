@@ -19,8 +19,8 @@ impl Exports {
         context: u32,
         page_size: u32,
     ) -> Result<Exports> {
-        let outputs = poem_exec::feeds::class_outputs(trace, compiled, context, page_size)
-            .map_err(Fault::Recipe)?;
+        let outputs =
+            poem_exec::feeds::class_outputs(trace, compiled, context, page_size).map_err(Fault::Recipe)?;
         if outputs.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),

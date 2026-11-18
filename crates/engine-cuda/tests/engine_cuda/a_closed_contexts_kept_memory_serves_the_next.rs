@@ -42,10 +42,7 @@ fn a_closed_contexts_kept_memory_serves_the_next() {
             .flat_map(|&bytes| (0..4).map(move |_| bytes))
             .map(|bytes| Buffer::zeroed(bytes).expect("a buffer"))
             .collect();
-        let reused = taken
-            .iter()
-            .filter(|buffer| given.contains(&buffer.ptr()))
-            .count();
+        let reused = taken.iter().filter(|buffer| given.contains(&buffer.ptr())).count();
         second
             .synchronize()
             .expect("the second context's stream drains");

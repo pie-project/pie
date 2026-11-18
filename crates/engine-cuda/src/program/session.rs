@@ -545,7 +545,11 @@ impl Session {
                 continue;
             }
             let rows = read(name, 0) && !reads.iter().any(|&(n, l)| n == name && l > 0);
-            let lanes = self.outputs.iter().filter(|((n, _), _)| n == name).count() as u32;
+            let lanes = self
+                .outputs
+                .iter()
+                .filter(|((n, _), _)| n == name)
+                .count() as u32;
             if !rows || *at >= lanes {
                 return Err(Fault::program(
                     "program::session",
@@ -589,9 +593,7 @@ impl Session {
         for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit, scratch)?;
             for name in &self.row_sets {
-                let Some(slot) = prepared
-                    .slot_of(name, 0)
-                    .filter(|_| prepared.reads(name, 0))
+                let Some(slot) = prepared.slot_of(name, 0).filter(|_| prepared.reads(name, 0))
                 else {
                     continue;
                 };

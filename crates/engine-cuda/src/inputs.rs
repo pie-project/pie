@@ -472,7 +472,10 @@ fn inject_tokens(
     let words = injects
         .iter()
         .all(|inject| inject.bytes % 4 == 0 && inject.dst_off % 4 == 0);
-    if injects.len() < GATHERED_INJECTS || !words || crate::device::alloc::is_capturing(stream) {
+    if injects.len() < GATHERED_INJECTS
+        || !words
+        || crate::device::alloc::is_capturing(stream)
+    {
         for inject in injects {
             crate::device::copy_d2d(stream, tokens + inject.dst_off, inject.src, inject.bytes)?;
         }

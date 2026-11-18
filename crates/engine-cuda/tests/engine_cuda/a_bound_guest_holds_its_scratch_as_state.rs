@@ -229,10 +229,7 @@ fn a_bound_guest_holds_its_scratch_as_state() {
             assert!(
                 matches!(
                     (&scratch, &pair),
-                    (
-                        engine::ScratchPlace::Run { .. },
-                        engine::ScratchPlace::Run { .. }
-                    )
+                    (engine::ScratchPlace::Run { .. }, engine::ScratchPlace::Run { .. })
                 ),
                 "a small guest's state lies in runs of Instance slots: {scratch:?} {pair:?}"
             );
@@ -316,7 +313,8 @@ fn a_bound_guest_holds_its_scratch_as_state() {
         // Its own lane's greatest logit (bf16 logits tie: either index).
         let most = got[lane].iter().copied().fold(f32::MIN, f32::max);
         assert_eq!(
-            got[lane][argmax as usize], most,
+            got[lane][argmax as usize],
+            most,
             "lane {lane}'s epilogue put {argmax}, not an argmax of its own logits"
         );
     }
