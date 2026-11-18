@@ -3584,3 +3584,74 @@ a `limit`. Each lowers into the steps the routed layer already has:
   matvec bank, added to the down projection's sum.
 
 Not built.
+
+### P1.d: the annealer (opt-in)
+
+`place::anneal` runs after the search, but only when it is asked for:
+- `wafer-compile stream --anneal <moves> [--anneal-seed N] [--anneal-units 1]`;
+- `[cerebras.wafer] anneal = <moves>` for compile on load.
+
+Until 1539 calibrates the link term on the chip, it is off by default. Off, a program is the
+search's byte for byte: `stream::write_stream` and `compile_decode` call `anneal::maybe`, which
+returns nothing.
+
+- **State:** every block's origin over `place::stream::problem`'s blocks. The K / V columns
+  always move. With `--anneal-units 1` the units move too, except the lane prologue's unit
+  (the lane bus runs from it along row 0).
+- **Moves:**
+  - translate a block, by up to 256 PEs, shrinking with the temperature;
+  - swap two units of one footprint;
+  - relocate a K / V column beside or below one of its block's units.
+- **Energy:** the link term's estimate, plus a million cycles for each PE of overlap or each
+  PE past `Bounds::system`. A unit's footprint covers its roots and weight PEs, plus its
+  helpers under its rest columns.
+  - Each row-stream gap costs its CX roots' Manhattan distance, plus four hops per wire when
+    the next unit is not right after the last on its rows (the bundle's staircase).
+  - Each attending unit's K / V round trip costs its rows times twice its head root's
+    Manhattan distance to the column's root, at `HOP` (`CHAIN_HOP`, 2 cycles) a hop.
+  - The program's own price reads no position: it is the same constant before and after.
+- **Schedule:**
+  - the starting temperature is the mean change of 256 moves that clash with nothing;
+  - it falls geometrically to 1e-4 of that over the moves;
+  - a seeded xorshift drives the moves, so a run is deterministic for a seed;
+  - 60 s of wall clock cuts a run short, and the report says so.
+- **Keeping a result:**
+  - The bests found on the way are moved to the search's corner (with no block pinned, a
+    translate costs the same) and laid best first, at most 8.
+  - Units where the search put them keep their row stream as laid
+    (`place::stream::relay`). Units moved get their gaps stated as waypoints
+    (`place::stream::relay_routed`).
+  - A K / V column whose block's units moved apart is laid at its own root, its links
+    routed.
+  - The first placement that routes, colours, lays and validates, with a routed link term no
+    more than the search's, is kept. Otherwise the search's program is kept and the report
+    says why.
+- **Co-resident readings** (`anneal::pack`): seeded from `pack_shapes`. Its moves translate a
+  reading or change its shape; its energy is the shapes' prices plus the penalties, with the
+  bounding box breaking ties.
+
+**Results** (1M moves, seed 1, K / V columns only unless stated):
+
+| program | price (cycles) | links: search's → kept | change of the step | time | beyond the band layout |
+|---|---|---|---|---|---|
+| qwen3-sim units | 31,018 | 140 → 52 | −0.28% | 0.2 s | yes: K / V columns beside their units |
+| qwen3-sim units, units free | 31,018 | 140 → 36 | −0.33% | 0.2 s | yes: units off their band order |
+| Qwen3-0.6B units (29 units, 448 K / V columns) | 389,581 | 5,056 → 3,832 | −0.31% | 6.1 s | yes; 700 x 564 → 700 x 540 |
+| flux2-mini denoise (64 rows) | 3,819,002 | 36,448 → 22,624 | −0.36% | 0.3 s | yes |
+| klein denoise (64 rows, 33 units, 600 K / V columns) | 21,826,649 | 421,354 kept | 0 | 23 s | estimate 9.59M → 8.30M, but no candidate colours in 21 |
+| klein co-resident (text, denoise, VAE) | — | 640 x 1,025 kept | 0 | — | no nets: the packing is already the cheapest |
+
+Every placement kept passes the check with no new kind of warning, and every run stays inside
+the 60 s budget.
+
+Where it stops:
+- **Klein's denoise:** moving K / V columns among the units sends their links through other
+  units' columns. There a class meets all 21 colours, and the energy has no term for colours a
+  PE. The next step is a colour-pressure term, the classes routed through a PE.
+- **Units free on Qwen3-0.6B:** the row stream's bundles (64 wires of one class a gap) do not
+  route once their gaps turn; the router reports thousands of over-uses. So units stay fixed by
+  default.
+- **minimax-sim:** it needs G1's unpushed lowering; on origin its units overflow a PE before
+  any placement.
+- **The calibration:** every gain above is the link term's. 1539 measures whether a row's
+  K / V round trip costs what the term says.
