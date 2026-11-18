@@ -483,7 +483,7 @@ async fn watch(
         .with_room(&pool, room)
         .with_source(named);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
-    let mut system = said(engine, yields, &steer, shared, source);
+    let mut system = said(&pool, engine, yields, &steer, shared, source);
     // A shared pool that does not yield may take every segment its range
     // holds: its walker commits them ahead of the waiters that need them,
     // off the fire path, and never gives them back. Held within the host's
@@ -520,6 +520,7 @@ async fn watch(
 /// system's pressure reader where the pool yields to it. The load refused
 /// a yield with no source before this runs ([`super::source_for`]).
 fn said(
+    pool: &Shared<Steered>,
     engine: usize,
     yields: Yield,
     steer: &Steer,
@@ -546,15 +547,28 @@ fn said(
     match &mut system {
         Some(system) => {
             let pressure = system.read();
+            // The floor is the load's own promise: one lane at the full
+            // declared context, the reserved chunks, the activation span
+            // and the held dense weights. A long max_context raises it,
+            // and with it lowers how far yield can press.
+            let (parts, weights) = pool.with(|pool| {
+                (pool.inner().floor_parts(), pool.cache().pinned_bytes())
+            });
+            let mib = |bytes: Option<u64>| bytes.map_or(0, |bytes| bytes >> 20);
             tracing::info!(
                 engine,
                 yields = yields.share(),
                 source = system.source().name(),
                 pressure,
                 floor_mib = limits.floor >> 20,
+                lane_kv_mib = mib(parts.map(|parts| parts.lane_bytes)),
+                max_context = parts.map_or(0, |parts| parts.max_context),
+                reserved_mib = mib(parts.map(|parts| parts.reserved_bytes)),
+                activation_mib = mib(parts.map(|parts| parts.act_bytes)),
+                dense_weights_mib = weights >> 20,
                 budget_mib = limits.hard_limit >> 20,
                 target_mib = limits.target(yields, pressure) >> 20,
-                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure)"
+                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights"
             );
         }
         None => tracing::error!(

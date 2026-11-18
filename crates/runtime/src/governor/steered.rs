@@ -62,6 +62,14 @@ impl EnginePool {
         (self.model, self.engine)
     }
 
+    /// What the shared pool's floor is made of; `None` on a pinned pool.
+    #[must_use]
+    pub fn floor_parts(&self) -> Option<crate::store::shared::FloorParts> {
+        self.shared
+            .as_ref()
+            .map(|grow| grow.shared().lock().unwrap().floor_parts())
+    }
+
     /// See [`SharedGrow::held_back`]; a pinned pool holds nothing back.
     #[must_use]
     pub fn held_back(&self, held: u64) -> Option<u32> {

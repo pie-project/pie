@@ -84,7 +84,10 @@ const MEMORY: &str = r#"
 # disk_persistent       = false     # keep the disk tier as cache for the next run
 # yield                 = 0.0       # in [0, 1]: device target = floor + (budget - floor)
 #                                   #   * (1 - yield * OS memory pressure); 0 holds the budget;
-#                                   #   above 0 the OS's pressure must be readable (PSI, macOS)
+#                                   #   above 0 the OS's pressure must be readable (PSI, macOS);
+#                                   #   floor = one lane at max_context + reserved + activation
+#                                   #   + dense weights: a long max_context raises it, so yield
+#                                   #   can press less
 # Idle cache has no time-based expiry: with no worker policy it stays until a
 # demand needs its room, then goes in retention-key / least-recently-used order.
 "#;
