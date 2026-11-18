@@ -1134,3 +1134,30 @@ fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
     // What reads is untouched: pruning it again drops nothing.
     assert_eq!(r.prune(&kept), (kept.clone(), Vec::new()));
 }
+
+/// A stale inline table is an entry of its table: the keys after it in the
+/// same table are kept, and a stale `[table]` is still removed whole.
+#[test]
+fn a_stale_inline_table_takes_only_itself() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        recording = { use = \"bodies\", mem_mb = 4096 }\n\
+        prefill.chunk = 2048\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        grouped = true\n\
+        \n\
+        [compiler]\n\
+        launch_us = 3.0\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(dropped, ["engine.recording", "kernel.moe"], "{kept}");
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 2, "the chunk and the launch kept: {kept}");
+    assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
+    assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
+    assert!(!kept.contains("group_at") && !kept.contains("grouped"), "{kept}");
+}

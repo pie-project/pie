@@ -790,8 +790,14 @@ impl<'a> Walk<'a> {
         } else {
             format!("under `{parent}`: {}", names(siblings))
         };
+        // A table under its own `[header]` goes whole; an inline one
+        // (`key = { ... }`) is an entry of its table like any other.
+        let line = self.text[..value.span().start]
+            .rfind('\n')
+            .map_or(0, |i| i + 1);
+        let headed = self.text[line..].trim_start().starts_with('[');
         let at = match value.get_ref() {
-            DeValue::Table(_) => Unread::Table(value.span()),
+            DeValue::Table(_) if headed => Unread::Table(value.span()),
             _ => Unread::Entry(value.span()),
         };
         self.unread.push((path.to_string(), at));
