@@ -22,6 +22,9 @@ pub struct Sink<'a> {
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
+    /// The workgroups the direct dispatches encoded so far launch.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    groups: std::cell::Cell<u64>,
 }
 
 impl<'a> Sink<'a> {
@@ -40,7 +43,16 @@ impl<'a> Sink<'a> {
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
+            groups: std::cell::Cell::new(0),
         }
+    }
+
+    /// The workgroups the direct dispatches encoded through this sink launch,
+    /// together: what a kernel's grid fills the device with (the rates
+    /// step's `workgroups_per_core`).
+    #[must_use]
+    pub fn groups(&self) -> u64 {
+        self.groups.get()
     }
 
     fn refuse(fire: Fire, fault: Fault) -> Error {
@@ -280,6 +292,15 @@ impl Sink<'_> {
             height: fire.lanes[1].max(1) as usize,
             depth: fire.lanes[2].max(1) as usize,
         };
+        let launched = [
+            (lanes.width, group.width),
+            (lanes.height, group.height),
+            (lanes.depth, group.depth),
+        ]
+        .iter()
+        .map(|&(n, per)| n.div_ceil(per.max(1)) as u64)
+        .product::<u64>();
+        self.groups.set(self.groups.get() + launched);
         encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
         Ok(())
     }

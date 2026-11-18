@@ -44,15 +44,17 @@ use profile::fire::Rates;
 
 
 /// The rates this backend's estimate weighs a fire by, of
-/// `profile::fire::KEYS`: what its load measures where its chip's profile
-/// states none.
-pub const KEYS: [&str; 6] = [
+/// `profile::fire::KEYS` (all eight): what its load measures where its
+/// chip's profile states none.
+pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
+    "few_row_tflops",
+    "workgroups_per_core",
 ];
 
 /// The widest fire this backend's lattice reaches: the tokens a served
@@ -163,6 +165,32 @@ impl Bench<'_> {
             encode(&sink, at).map_err(|e| e.to_string())?;
         }
         frame.commit_timed().map_err(|e| e.to_string())
+    }
+
+    /// The workgroups one of what `encode` fills launches, from an encode the
+    /// device never runs (its frame is dropped uncommitted).
+    fn groups_of(
+        &self,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
+    ) -> Result<u64, String> {
+        let frame = self.device.frame().map_err(|e| e.to_string())?;
+        let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
+        encode(&sink, 0).map_err(|e| e.to_string())?;
+        Ok(sink.groups())
+    }
+
+    /// The workgroups an `m x n x k` matmul launches on the kernel serving
+    /// picks there.
+    fn matmul_groups(&self, m: u32, n: u32, k: u32, weight: Tensor) -> Result<u64, String> {
+        let (a, y) = (
+            self.operand(u64::from(m) * u64::from(k) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(n) * 2)?,
+        );
+        let (at, yt) = (
+            self.tensor(&a, m, k, Dtype::Bf16)?,
+            self.tensor(&y, m, n, Dtype::Bf16)?,
+        );
+        self.groups_of(&|sink, _| gemm::matmul(sink, self.tuning, at, weight, yt))
     }
 
     /// The GPU seconds one of what `encode` fills takes as serving runs it,
@@ -646,6 +674,8 @@ pub fn measure(
     // (engine::rates::weights_at: 768 MiB, at least 12, so each repeat
     // streams its weight as a layer's matmul does).
     let mut gemm = Vec::new();
+    let mut few_row = None;
+    let mut per_core = None;
     for w in engine::rates::GEMM_WIDTHS {
         bench.handles = Handles::new();
         let plane = operand(&bench.pattern, (w * w) as usize * 2);
@@ -664,6 +694,65 @@ pub fn measure(
                 rate / 1e3
             ));
             curve.push((m, rate / 1e3));
+        }
+        if w == engine::rates::GEMM_WIDTH {
+            // `few_row_tflops`: the matmul at decode-shaped rows on the kernel
+            // serving picks there. Its time is its launch and the longer of
+            // its weight reads and its flops at that rate
+            // (`roofline::Constants::few_row_ns`; Metal pads no rows), so
+            // flops over time reaches the rate where the weights no longer
+            // bind it and stays under it everywhere: the rate is the most
+            // any of the rows reads.
+            let mut most = 0f64;
+            for m in FEW_ROWS {
+                let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
+                say(&format!(
+                    "  bf16 matmul {m} x {w} x {w} (few rows): {:.4} TFLOP/s",
+                    rate / 1e3
+                ));
+                most = most.max(rate);
+            }
+            few_row = Some(most / 1e3);
+            // `workgroups_per_core`: the curve's first rows (its kernel at a
+            // compute-bound depth, `k = w`) over as few columns as launch at
+            // most one workgroup a core, timed against the same work at the
+            // rate the curve states there (`engine::rates::workgroups_per_core`).
+            let cores = device
+                .cores()
+                .ok_or("the device states no core count, so no workgroups a core")?;
+            let m = engine::rates::GEMM_ROWS[0];
+            let full = curve
+                .iter()
+                .find(|&&(rows, _)| rows == m)
+                .map(|&(_, tflops)| tflops * 1e3)
+                .ok_or("the curve has no rate at its first rows")?;
+            let mut n = w;
+            let mut groups = bench.matmul_groups(m, n, w, tensors[0])?;
+            while groups > u64::from(cores) && n > 1 {
+                n /= 2;
+                groups = bench.matmul_groups(m, n, w, tensors[0])?;
+            }
+            if groups == 0 || groups > u64::from(cores) {
+                return Err(format!(
+                    "a {m} x {n} x {w} matmul launches {groups} workgroups over {cores} cores: \
+                     no shape of it launches one a core or fewer"
+                ));
+            }
+            let narrow: Vec<Tensor> = weights
+                .iter()
+                .map(|(_, b)| bench.tensor(b, n, w, Dtype::Bf16))
+                .collect::<Result<_, String>>()?;
+            let rate = bench.matmul_flops(m, n, w, &narrow, gap)?;
+            let flops = engine::rates::gemm_flops(m, n, w);
+            let groups = u32::try_from(groups).map_err(|e| e.to_string())?;
+            per_core = engine::rates::workgroups_per_core(groups, cores, flops / rate, flops / full);
+            say(&format!(
+                "  bf16 matmul {m} x {n} x {w}, {groups} workgroups over {cores} cores: \
+                 {:.4} TFLOP/s against {:.4} at full width, {:.2} workgroups a core",
+                rate / 1e3,
+                full / 1e3,
+                per_core.unwrap_or(f64::NAN)
+            ));
         }
         gemm.push((w, curve));
     }
@@ -704,10 +793,14 @@ pub fn measure(
         hbm_gbps: Some(bytes),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
-        few_row_tflops: None,
-        workgroups_per_core: None,
+        few_row_tflops: few_row,
+        workgroups_per_core: per_core,
     })
 }
+
+/// The decode-shaped rows `few_row_tflops` is timed at: 4 to 256, the rows
+/// below the matmul curve's first.
+const FEW_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
 
 #[cfg(test)]
 mod lattice_tests {
