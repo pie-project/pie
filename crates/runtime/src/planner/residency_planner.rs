@@ -532,8 +532,7 @@ impl ResidencyPlanner {
     }
 
     /// What the demand heading the queue may demote: idle cache keyed at
-    /// or below its process's key, and its own. A process the policy has
-    /// not keyed yet (its row not landed) carries no key to bound it.
+    /// or below its process's key, and its own.
     pub(super) fn head_bound(&self) -> Option<crate::store::kv::DemoteBound> {
         let up_to = self.head_key()?;
         let pid = self.with_counts(|inner| inner.unmet_head().map(|(_, w)| w.pid))?;
@@ -543,18 +542,19 @@ impl ResidencyPlanner {
         })
     }
 
-    /// The policy key of the process whose demand heads the queue, where the
-    /// installed table names it: what it may take from others is keyed at
-    /// or below it. `None` (no bound) for a process no row keys yet: a
-    /// default placeholder would bound a fresh arrival below every kept set.
+    /// The policy key of the process whose demand heads the queue: what it
+    /// may take from others is keyed at or below it. One no row names yet
+    /// carries the key the installed table gives a fresh process (its
+    /// default); it may still move higher-keyed sets down a tier where
+    /// nothing running will free room (the liveness rule), never discard
+    /// them. `None` (no bound) where no table is installed: every key is
+    /// alike then.
     pub(super) fn head_key(&self) -> Option<i64> {
-        let (pid, key) = self.with_counts(|inner| {
+        let key = self.with_counts(|inner| {
             let (_, waiter) = inner.unmet_head()?;
-            inner.procs.get(&waiter.pid).map(|proc| (waiter.pid, proc.key))
+            inner.procs.get(&waiter.pid).map(|proc| proc.key)
         })?;
-        crate::policy::schedule::current()
-            .is_some_and(|table| table.names(pid))
-            .then_some(key)
+        crate::policy::schedule::current().map(|_| key)
     }
 
     pub(super) fn re_arm_idle_reclaim(&self) {
