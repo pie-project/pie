@@ -764,6 +764,11 @@ pub struct SharedPool {
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
+    /// The head of the guest binds waiting for room, its need as `(run,
+    /// pieces)`: runs of `run` adjacent chunks inside one segment. The walk
+    /// commits while they do not stand free ([`Self::walk_goal`]), not only
+    /// while their slot count is short.
+    guest_head: Option<(u32, u32)>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
     /// The engine whose rung gate this pool publishes the rung it holds
@@ -1014,6 +1019,7 @@ impl SharedPool {
             told_from: None,
             lowering: None,
             span_commit_blocked: false,
+            guest_head: None,
             programs: programs::ProgramFires::default(),
             engine: None,
         };
@@ -2153,7 +2159,16 @@ impl SharedPool {
             .demand()
             .wanted
             .saturating_sub(self.pool.demand().live);
-        let ahead = self.ahead_target(short);
+        let mut ahead = self.ahead_target(short);
+        // The head guest bind's runs: free chunks enough for its slots may
+        // still hold no run of its length, scattered by the binds before
+        // it; a fresh segment holds them whole, so the walk commits one
+        // more while they do not stand free.
+        if let Some((run, pieces)) = self.guest_head
+            && self.pool.free_chunk_runs(run) < pieces
+        {
+            ahead = ahead.max(mapped + 1);
+        }
         tracing::trace!(
             target,
             mapped,
@@ -2185,6 +2200,18 @@ impl SharedPool {
     /// answer.
     pub fn block_span_commit(&mut self, blocked: bool) {
         self.span_commit_blocked = blocked;
+    }
+
+    /// The head guest bind's need, `(run, pieces)`; `None` where none waits
+    /// ([`crate::store::roles::Roles::take_guest`]).
+    pub fn set_guest_head(&mut self, need: Option<(u32, u32)>) {
+        self.guest_head = need;
+    }
+
+    /// The head guest bind's need, `(run, pieces)`, where one waits.
+    #[must_use]
+    pub fn guest_head(&self) -> Option<(u32, u32)> {
+        self.guest_head
     }
 
     /// Whether a refused `commit_span` waits for room to be freed.

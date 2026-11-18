@@ -887,7 +887,8 @@ fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
         channels: vec![plans[0].id],
         ..InstanceBinding::default()
     };
-    let taken = super::take_bind(Some(&roles), engine, &binding, |id| held_ids.contains(&id)).unwrap();
+    let taken =
+        super::take_bind(Some(&roles), engine, &binding, |id| held_ids.contains(&id), None).unwrap();
     let mut rings = super::take_rings(Some(&roles), engine, &plans).unwrap().into_iter();
     super::register_taken(
         Some(&roles),
