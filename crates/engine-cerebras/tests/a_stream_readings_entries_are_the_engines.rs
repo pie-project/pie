@@ -77,6 +77,7 @@ fn compile(trace: &Trace, gold: &Path, out: &Path) {
         round16: true,
         upto: None,
         taps: Vec::new(),
+        anneal: Default::default(),
     };
     kernels_cerebras::stream::compile(trace, &o, out, Some(gold)).expect("the program compiles");
 }

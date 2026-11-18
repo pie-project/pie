@@ -3587,9 +3587,12 @@ Not built.
 
 ### P1.d: the annealer (opt-in)
 
-`place::anneal` runs after the search, but only when it is asked for:
-- `wafer-compile stream --anneal <moves> [--anneal-seed N] [--anneal-units 1]`;
-- `[cerebras.wafer] anneal = <moves>` for compile on load.
+`place::anneal` runs after the search, but only when it is asked for. The ask is an
+`anneal::Anneal` (moves a block, a seed, whether units move) passed to the compile entry
+points, never process state: `stream::Options::anneal`, and `compile_decode`'s `anneal`.
+- `wafer-compile stream --anneal <moves a block> [--anneal-seed N] [--anneal-units 1]`;
+- `[cerebras.wafer] anneal = <moves a block>` for compile on load (`prepare.rs` sets it on
+  each wanted reading's `Options`, and on the unit program kept; its sizing compiles run off).
 
 Until 1539 calibrates the link term on the chip, it is off by default. Off, a program is the
 search's byte for byte: `stream::write_stream` and `compile_decode` call `anneal::maybe`, which
@@ -3614,13 +3617,16 @@ returns nothing.
   - the starting temperature is the mean change of 256 moves that clash with nothing;
   - it falls geometrically to 1e-4 of that over the moves;
   - a seeded xorshift drives the moves, so a run is deterministic for a seed;
-  - 60 s of wall clock cuts a run short, and the report says so.
+  - a run's budget is its moves a block times the program's blocks (units and K / V
+    columns), so its result is the same for a budget on any machine;
+  - wall clock is only a safety stop (600 s): past it the run is abandoned and the search's
+    program kept, with the report saying so. It never truncates a result.
 - **Keeping a result:**
   - The bests found on the way are moved to the search's corner (with no block pinned, a
     translate costs the same) and laid best first, at most 8.
   - Units where the search put them keep their row stream as laid
-    (`place::stream::relay`). Units moved get their gaps stated as waypoints
-    (`place::stream::relay_routed`).
+    (`place::stream::relay`). Units moved get their gaps from the bundle router
+    (`place::bundle`).
   - A K / V column whose block's units moved apart is laid at its own root, its links
     routed.
   - The first placement that routes, colours, lays and validates, with a routed link term no
@@ -3641,8 +3647,8 @@ returns nothing.
 | klein denoise (64 rows, 33 units, 600 K / V columns) | 21,826,649 | 421,354 kept | 0 | 23 s | estimate 9.59M → 8.30M, but no candidate colours in 21 |
 | klein co-resident (text, denoise, VAE) | — | 640 x 1,025 kept | 0 | — | no nets: the packing is already the cheapest |
 
-Every placement kept passes the check with no new kind of warning, and every run stays inside
-the 60 s budget.
+Every placement kept passes the check with no new kind of warning, and every run finishes
+well inside the safety stop.
 
 Where it stops:
 - **Klein's denoise:** moving K / V columns among the units sends their links through other

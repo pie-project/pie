@@ -343,6 +343,7 @@ fn flux_2_minis_vae_on_the_fabric() {
                 round16: true,
                 upto: None,
                 taps: Vec::new(),
+                anneal: Default::default(),
             };
             kernels_cerebras::stream::compile_reading(&trace, &o, &out.join(r))
                 .unwrap_or_else(|e| panic!("{r}: {e}"));

@@ -148,7 +148,13 @@ fn main() {
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(1);
             match kernels_cerebras::stream::compile_decode(
-                &trace, positions, lanes, true, None, &out,
+                &trace,
+                positions,
+                lanes,
+                true,
+                None,
+                &Default::default(),
+                &out,
             ) {
                 Ok(p) => line(
                     name,
@@ -184,6 +190,7 @@ fn main() {
                 round16: true,
                 upto: None,
                 taps: Vec::new(),
+                anneal: Default::default(),
             };
             let out = dir.join(reading.replace('.', "_"));
             match kernels_cerebras::stream::compile_reading(&trace, &o, &out) {

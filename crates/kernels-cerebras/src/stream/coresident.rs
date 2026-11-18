@@ -400,6 +400,7 @@ mod tests {
                 round16: true,
                 upto: None,
                 taps: Vec::new(),
+                anneal: Default::default(),
             };
             sizes.push(
                 crate::stream::compile_reading(&trace, &o, &tmp.0.as_path().join(n))
@@ -468,13 +469,23 @@ mod tests {
             round16: true,
             upto: None,
             taps: Vec::new(),
+            anneal: Default::default(),
         };
         let (w0, _) = crate::stream::compile_reading(&mini, &o, &dir.join("text")).unwrap();
         let q = poem_compiler::catalog::repository()
             .parse("qwen3-0.6b-bf16-kv-bf16-l1")
             .expect("qwen3 parses")
             .trace(poem_ir::Platform::Cerebras);
-        crate::stream::compile_decode(&q, 64, 1, true, None, &dir.join("decode")).unwrap();
+        crate::stream::compile_decode(
+            &q,
+            64,
+            1,
+            true,
+            None,
+            &Default::default(),
+            &dir.join("decode"),
+        )
+        .unwrap();
         let read = |p: &std::path::Path| -> serde_json::Value {
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };

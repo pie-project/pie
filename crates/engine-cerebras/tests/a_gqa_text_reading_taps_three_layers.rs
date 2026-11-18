@@ -111,6 +111,7 @@ fn the_gqa_miniatures_text_files() {
         round16: true,
         upto: None,
         taps: Vec::new(),
+        anneal: Default::default(),
     };
     kernels_cerebras::stream::compile(&t, &o, &out.join("prog"), Some(&gold))
         .expect("the text reading compiles");

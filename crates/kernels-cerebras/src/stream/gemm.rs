@@ -2136,6 +2136,7 @@ mod tests {
             round16: false,
             upto: None,
             taps: Vec::new(),
+            anneal: Default::default(),
         };
         let t = trace("flux2-mini-bf16-kv-bf16");
         let l = lower(&t, &o, &[]).unwrap_or_else(|e| panic!("{e}"));
@@ -2191,6 +2192,7 @@ mod tests {
             round16: true,
             upto: None,
             taps: Vec::new(),
+            anneal: Default::default(),
         };
         let t = trace("flux2-mini-gqa-bf16-kv-bf16");
         let l = lower(&t, &o, &[]).unwrap_or_else(|e| panic!("{e}"));
@@ -2235,6 +2237,7 @@ mod tests {
             round16: true,
             upto: None,
             taps: Vec::new(),
+            anneal: Default::default(),
         };
         let t = trace("flux2-mini-bf16-kv-bf16");
         let one = program(&t, &o, &[], Some((32, 4, 4)), (762, 1172), 1)

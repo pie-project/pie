@@ -293,6 +293,9 @@ pub struct Options {
     pub round16: bool,
     pub upto: Option<usize>,
     pub taps: Vec<u32>,
+    /// The annealing placer after the search ([`crate::place::anneal::Anneal`]; off: the
+    /// search's placement, byte for byte).
+    pub anneal: crate::place::anneal::Anneal,
 }
 
 /// What [`compile_pinned`] pins besides [`Options`] (the default: nothing).
@@ -369,8 +372,8 @@ fn write_stream(
     out: &std::path::Path,
     gold: Option<&std::path::Path>,
 ) -> R<()> {
-    // (the annealer's placement where it is enabled: GENERIC.md, "Free placement")
-    let annealed = crate::place::anneal::maybe(p)?;
+    // (the annealer's placement where `o` asks: GENERIC.md, "Free placement")
+    let annealed = crate::place::anneal::maybe(p, &o.anneal)?;
     let p = annealed.as_ref().map_or(p, |(q, _)| q);
     let e = crate::emit::stream::emit(p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -413,6 +416,7 @@ pub fn compile_decode(
     lanes: u32,
     round16: bool,
     upto: Option<usize>,
+    anneal: &crate::place::anneal::Anneal,
     out: &std::path::Path,
 ) -> R<build::Program> {
     let classes = program::decode_classes(trace, lanes.max(1));
@@ -430,8 +434,8 @@ pub fn compile_decode(
         false,
         crate::floorplan::stream::Bounds::system(),
     )?;
-    // (the annealer's placement where it is enabled: GENERIC.md, "Free placement")
-    let p = match crate::place::anneal::maybe(&p)? {
+    // (the annealer's placement where `anneal` asks: GENERIC.md, "Free placement")
+    let p = match crate::place::anneal::maybe(&p, anneal)? {
         Some((q, _)) => q,
         None => p,
     };
@@ -807,6 +811,7 @@ pub fn wanted(trace: &Trace, rows: u32, voxels: Option<u32>, steps: u32) -> Vec<
                 round16: true,
                 upto: None,
                 taps: Vec::new(),
+                anneal: Default::default(),
             };
             let class_rows = match (is_grid, latent_rows) {
                 (false, Some(n)) => latent.iter().map(|c| (c.clone(), n)).collect(),
@@ -986,7 +991,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-kda-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let t = trace("kimik3-tiny-bf16-mxfp4-kv-bf16");
-        let p = compile_decode(&t, 64, 1, true, None, &dir).unwrap_or_else(|e| panic!("{e}"));
+        let p = compile_decode(&t, 64, 1, true, None, &Default::default(), &dir)
+            .unwrap_or_else(|e| panic!("{e}"));
         let j =
             p.kv.first()
                 .and_then(|ks| ks.units.first())

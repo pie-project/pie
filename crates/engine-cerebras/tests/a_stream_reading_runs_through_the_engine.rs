@@ -60,6 +60,7 @@ fn compile(trace: &Trace, dir: &Path, gold: Option<&Path>) {
         round16: true,
         upto: None,
         taps: Vec::new(),
+        anneal: Default::default(),
     };
     kernels_cerebras::stream::compile(trace, &o, dir, gold).expect("the program compiles");
 }
@@ -474,6 +475,7 @@ fn a_batch_of_twos_entries_are_its_requests_in_turn() {
         round16: true,
         upto: None,
         taps: Vec::new(),
+        anneal: Default::default(),
     };
     let p = kernels_cerebras::stream::gemm::program(&trace, &o, &[], None, (762, 1172), 2)
         .expect("a batch of two places");

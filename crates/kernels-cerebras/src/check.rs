@@ -1145,6 +1145,7 @@ mod tests {
             round16: true,
             upto: None,
             taps: Vec::new(),
+            anneal: Default::default(),
         };
         let trace = |m: &str| {
             poem_compiler::catalog::repository()

@@ -386,11 +386,13 @@ pub fn stream_programs(
         .map_err(io(&cache.root))?;
     let mut names = Vec::new();
     let mut hasher = blake3::Hasher::new();
-    // the annealer, where the config asks (its placement in the files hashed below)
-    kernels_cerebras::place::anneal::enable(cfg.wafer.anneal.unwrap_or(0), 1, false);
     // the readings' programs chosen together: each one's regime and shape, the cheapest request
     // (the schedule's steps of the denoiser) of those that place together on the fabric
-    let wanted = stream::wanted(trace, rows, voxels, schedule_steps(trace));
+    let mut wanted = stream::wanted(trace, rows, voxels, schedule_steps(trace));
+    // the annealer, where the config asks (its placement in the files hashed below)
+    for w in &mut wanted {
+        w.o.anneal = anneal(cfg);
+    }
     let t0 = std::time::Instant::now();
     let (chosen, refused) =
         stream::compile_together(trace, &wanted, &|r| stage.path().join(slug(r)))?;
@@ -576,11 +578,13 @@ pub fn unit_program(
         .tempdir_in(&cache.root)
         .map_err(io(&cache.root))?;
     let dir = stage.path().join("decode");
-    kernels_cerebras::place::anneal::enable(0, 1, false);
-    let compile = |at: u32, b: u32| {
+    // the search's placement while sizing; the annealer, where the config asks, for the
+    // program kept alone
+    let compile = |at: u32, b: u32, a: &kernels_cerebras::place::anneal::Anneal| {
         let _ = std::fs::remove_dir_all(&dir);
-        stream::compile_decode(trace, at, b, true, None, &dir)
+        stream::compile_decode(trace, at, b, true, None, a, &dir)
     };
+    let off = kernels_cerebras::place::anneal::Anneal::off();
     // the most positions that fit one lane: the most a compile takes, by bisection (or the
     // stated ones)
     let (mut hi, mut lo) = match positions {
@@ -588,14 +592,14 @@ pub fn unit_program(
         None => UNIT_POSITIONS,
     };
     let mut at = hi;
-    if let Err(e) = compile(hi, 1) {
+    if let Err(e) = compile(hi, 1, &off) {
         if lo == hi {
             return Err(e);
         }
-        compile(lo, 1)?;
+        compile(lo, 1, &off)?;
         while hi > lo + lo.max(16) / 8 {
             let mid = lo + (hi - lo) / 2;
-            match compile(mid, 1) {
+            match compile(mid, 1, &off) {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid,
             }
@@ -612,7 +616,7 @@ pub fn unit_program(
             let mut best = (f64::MAX, 1);
             let mut b = 1;
             while b <= most.max(1) {
-                if let Ok(p) = compile(at, b) {
+                if let Ok(p) = compile(at, b, &off) {
                     let per = kernels_cerebras::cost::stream::time(&p).cycles / f64::from(b);
                     tracing::info!(
                         lanes = b,
@@ -628,11 +632,7 @@ pub fn unit_program(
             best.1
         }
     };
-    // the annealer for the program kept alone, where the config asks
-    kernels_cerebras::place::anneal::enable(cfg.wafer.anneal.unwrap_or(0), 1, false);
-    let kept = compile(at, lanes);
-    kernels_cerebras::place::anneal::enable(0, 1, false);
-    kept?;
+    compile(at, lanes, &anneal(cfg))?;
     let mut hasher = blake3::Hasher::new();
     let mut files = walk(&dir)?;
     files.sort();
@@ -753,5 +753,15 @@ pub fn plane(landed: &Landed, name: &str, count: usize) -> Vec<f32> {
             .collect()
     } else {
         Vec::new()
+    }
+}
+
+/// The annealing placer as `cfg` asks (`wafer.anneal`: moves a block, seed 1; off unless
+/// stated).
+fn anneal(cfg: &Config) -> kernels_cerebras::place::anneal::Anneal {
+    kernels_cerebras::place::anneal::Anneal {
+        per_block: cfg.wafer.anneal.unwrap_or(0),
+        seed: 1,
+        units: false,
     }
 }

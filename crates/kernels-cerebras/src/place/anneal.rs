@@ -13,12 +13,12 @@
 //!   row's K / V round trip, at [`super::cost::HOP`] a hop, Manhattan), plus a penalty a PE
 //!   of overlap or past the fabric. The program's own price reads no position, so it is the
 //!   same constant before and after.
-//! - **Determinism:** a seeded generator and a fixed number of moves; the wall clock only cuts a
-//!   run short past its budget (reported).
+//! - **Determinism:** a seeded generator and a budget of moves a block ([`Anneal`]): a budget's
+//!   result is the same on any machine. Past a safety stop of wall time the run is abandoned
+//!   and the search's program kept (reported), never a part of a run's result.
 //!
-//! Off unless asked ([`enable`]): a program is placed as the search placed it, byte for byte.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Off unless asked ([`Anneal`], passed through the compile entry points): a program is placed
+//! as the search placed it, byte for byte.
 
 use super::{BlockKind, Problem, Solution};
 use crate::floor::{Coord, Rect};
@@ -27,12 +27,28 @@ use crate::stream::build::Program;
 
 type R<T> = Result<T, String>;
 
-/// Moves a run makes when enabled (0: off).
-static MOVES: AtomicU64 = AtomicU64::new(0);
-/// The run's seed.
-static SEED: AtomicU64 = AtomicU64::new(1);
-/// Units move too (else the K / V columns alone: the row stream's bundles stay the search's).
-static UNITS: AtomicU64 = AtomicU64::new(0);
+/// What the annealer is asked: off (the default), or moves a block (the run's budget is that
+/// times the program's blocks: deterministic, a program's size its own), a seed, and whether
+/// units move (else the K / V columns alone).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Anneal {
+    pub per_block: u64,
+    pub seed: u64,
+    pub units: bool,
+}
+
+impl Anneal {
+    /// The annealer off: a program placed as the search placed it.
+    #[must_use]
+    pub fn off() -> Anneal {
+        Anneal::default()
+    }
+
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.per_block > 0
+    }
+}
 
 /// The penalty a PE of overlap or past the fabric (cycles).
 const PENALTY: f64 = 1.0e6;
@@ -40,21 +56,10 @@ const PENALTY: f64 = 1.0e6;
 const PULL: f64 = 1e-3;
 /// Placements tried through the router at most (the best estimates found, best first).
 const TRIES: usize = 8;
-/// A run's wall-clock budget (seconds).
-const BUDGET: f64 = 60.0;
-
-/// Turns the placer on for every stream program built after (`moves` 0: off).
-pub fn enable(moves: u64, seed: u64, units: bool) {
-    MOVES.store(moves, Ordering::Relaxed);
-    SEED.store(seed.max(1), Ordering::Relaxed);
-    UNITS.store(u64::from(units), Ordering::Relaxed);
-}
-
-/// The moves a run makes (0: off).
-#[must_use]
-pub fn moves() -> u64 {
-    MOVES.load(Ordering::Relaxed)
-}
+/// A run's safety stop (seconds): past it the run is abandoned and the search's program kept
+/// (reported), never a part of a run's result: below it a budget's result is the same on any
+/// machine.
+const SAFETY: f64 = 600.0;
 
 /// What a run did.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -80,19 +85,14 @@ pub struct Report {
     pub beyond_bands: bool,
 }
 
-/// `p` placed by the annealer where it is enabled ([`enable`]): the program and what the run
-/// did, or `None` where it is off.
-pub fn maybe(p: &Program) -> R<Option<(Program, Report)>> {
-    let n = moves();
-    if n == 0 {
+/// `p` placed by the annealer as `a` asks: the program and what the run did, or `None` where
+/// it is off.
+pub fn maybe(p: &Program, a: &Anneal) -> R<Option<(Program, Report)>> {
+    if !a.is_on() {
         return Ok(None);
     }
-    let (q, r) = stream(
-        p,
-        n,
-        SEED.load(Ordering::Relaxed),
-        UNITS.load(Ordering::Relaxed) != 0,
-    )?;
+    let blocks = (p.stream.units.len() + p.stream.kv.len()) as u64;
+    let (q, r) = stream(p, a.per_block.saturating_mul(blocks), a.seed, a.units)?;
     eprintln!(
         "anneal: links {:.0} -> {:.0} cycles (the price {:.0}), {} moves in {:.1} s{}",
         r.seed_links,
@@ -105,6 +105,25 @@ pub fn maybe(p: &Program) -> R<Option<(Program, Report)>> {
         ))
     );
     Ok(Some((q, r)))
+}
+
+impl Report {
+    /// A run that kept the search's placement.
+    fn off(price: f64, est: f64, moves: u64, seconds: f64) -> Report {
+        Report {
+            price,
+            seed_estimate: est,
+            best_estimate: est,
+            seed_links: 0.0,
+            kept_links: 0.0,
+            moves,
+            accepted: 0,
+            seconds,
+            changed: false,
+            refused: None,
+            beyond_bands: false,
+        }
+    }
 }
 
 /// One term of the energy: the cycles a step its blocks' distance costs.
@@ -321,8 +340,12 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
     // the bests found on the way (the router tries the best first, then the ones before it)
     let mut found: Vec<(f64, Vec<Coord>)> = Vec::new();
     for step in 0..moves {
-        if step % 4096 == 0 && t0.elapsed().as_secs_f64() > BUDGET {
-            break;
+        if step % 4096 == 0 && t0.elapsed().as_secs_f64() > SAFETY {
+            let mut r = Report::off(price, e0, made, t0.elapsed().as_secs_f64());
+            r.refused = Some(format!(
+                "past the {SAFETY:.0} s safety stop: the search's placement kept"
+            ));
+            return Ok((p.clone(), r));
         }
         made += 1;
         let frac = step as f64 / moves as f64;
@@ -780,8 +803,22 @@ mod tests {
             crate::emit::stream::emit(&c).unwrap(),
         );
         assert_eq!(x.files, y.files);
-        // off unless enabled
-        assert!(super::maybe(&p).unwrap().is_none());
+        // off unless asked
+        assert!(super::maybe(&p, &super::Anneal::off()).unwrap().is_none());
+        // asked: a budget of moves a block, the same run on any machine
+        let ask = super::Anneal {
+            per_block: 100,
+            seed: 7,
+            units: false,
+        };
+        let (m, rm) = super::maybe(&p, &ask).unwrap().unwrap();
+        let blocks = (p.stream.units.len() + p.stream.kv.len()) as u64;
+        assert_eq!(rm.moves, 100 * blocks);
+        let (n, _) = super::maybe(&p, &ask).unwrap().unwrap();
+        assert_eq!(
+            crate::emit::stream::emit(&m).unwrap().files,
+            crate::emit::stream::emit(&n).unwrap().files
+        );
     }
 
     /// Co-resident readings (klein's text, denoise and VAE at 64 rows) annealed from

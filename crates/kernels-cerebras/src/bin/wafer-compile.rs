@@ -45,7 +45,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
      [--regime auto|stream|gemm|tiled] [--gemm C,R,KBM] [--batch B | --batch-most B] [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
-     [--anneal <moves> [--anneal-seed N] [--anneal-units 1]] \
+     [--anneal <moves a block> [--anneal-seed N] [--anneal-units 1]] \
      [--cut THIN,SUB,WIDEN,HELP] [--fabric-width W] [--class-rows context=512,latents=4096] \
      [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
 
@@ -315,19 +315,18 @@ fn stream(args: &[String]) -> Result<(), String> {
         .map_or(Ok(64), |r| r.parse())
         .map_err(|e| format!("--rows: {e}"))?;
     let ieee = args.iter().any(|a| a == "--ieee");
-    // the annealer after the search (GENERIC.md, "Free placement"): `--anneal <moves>`,
-    // `--anneal-seed <n>`, `--anneal-units 1` (units move too, not the K / V columns alone)
-    if let Some(m) = get("--anneal") {
-        let moves: u64 = m.parse().map_err(|e| format!("--anneal: {e}"))?;
-        let seed: u64 = get("--anneal-seed")
+    // the annealer after the search (GENERIC.md, "Free placement"): `--anneal <moves a
+    // block>`, `--anneal-seed <n>`, `--anneal-units 1` (units move too, not the K / V columns
+    // alone)
+    let anneal = kernels_cerebras::place::anneal::Anneal {
+        per_block: get("--anneal")
+            .map_or(Ok(0), |m| m.parse())
+            .map_err(|e| format!("--anneal: {e}"))?,
+        seed: get("--anneal-seed")
             .map_or(Ok(1), |v| v.parse())
-            .map_err(|e| format!("--anneal-seed: {e}"))?;
-        kernels_cerebras::place::anneal::enable(
-            moves,
-            seed,
-            get("--anneal-units").is_some_and(|v| v == "1"),
-        );
-    }
+            .map_err(|e| format!("--anneal-seed: {e}"))?,
+        units: get("--anneal-units").is_some_and(|v| v == "1"),
+    };
     let trace = poem_compiler::catalog::repository()
         .parse(&model)
         .ok_or_else(|| format!("no catalog model {model}"))?
@@ -356,6 +355,7 @@ fn stream(args: &[String]) -> Result<(), String> {
             lanes,
             !ieee,
             upto,
+            &anneal,
             std::path::Path::new(&out),
         )?;
         println!(
@@ -546,6 +546,7 @@ fn stream(args: &[String]) -> Result<(), String> {
         round16: !ieee,
         upto,
         taps,
+        anneal,
     };
     // with nothing pinned, the regime and its every choice the engine's compile on load makes
     // (`stream::compile_whole`, by the regimes' expected prices); `--regime stream|gemm` and the
