@@ -560,6 +560,47 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
+    /// Told each time a chunk comes free for state ([`Self::room_watch`]).
+    given: std::sync::Arc<RoomGiven>,
+}
+
+/// Room given back: a chunk opened for state, by a slot's release, a fence
+/// retired, a lower or a commit. A count of the gives, and their event.
+#[derive(Debug, Default)]
+pub struct RoomGiven {
+    gives: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl RoomGiven {
+    fn give(&self) {
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+/// A watch on room given back from when it was taken ([`SlotPool::room_watch`]).
+#[derive(Debug, Clone)]
+pub struct RoomWatch {
+    given: std::sync::Arc<RoomGiven>,
+    seen: u64,
+}
+
+impl RoomWatch {
+    /// Ends once a chunk has come free since the watch was taken: at once
+    /// where one already has.
+    pub async fn given(self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.given.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.given.gives.load(Ordering::Acquire) != self.seen {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SlotPool {
@@ -623,6 +664,7 @@ impl SlotPool {
             holders: HashMap::new(),
             waiters: HashMap::new(),
             runs: HashMap::new(),
+            given: std::sync::Arc::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -673,10 +715,31 @@ impl SlotPool {
     /// Brings `chunk`'s place in [`Self::open`] up to date.
     fn reopen(&mut self, chunk: u32) {
         if self.openable(chunk) {
-            self.open.set(chunk);
+            if !self.open.get(chunk) {
+                self.open.set(chunk);
+                self.given.give();
+            }
         } else {
             self.open.clear(chunk);
         }
+    }
+
+    /// A watch on room given back from now on: what a rise short of free
+    /// room waits on.
+    #[must_use]
+    pub fn room_watch(&self) -> RoomWatch {
+        RoomWatch {
+            seen: self.given.gives.load(std::sync::atomic::Ordering::Acquire),
+            given: std::sync::Arc::clone(&self.given),
+        }
+    }
+
+    /// The span's chunks under `rung`'s activation that hold state: what a
+    /// rise to `rung` must move out ([`Self::plan_rung`]).
+    #[must_use]
+    pub fn held_in_span(&self, rung: u32) -> u32 {
+        let limit = self.total - self.act_chunks(rung);
+        u32::try_from(self.held_in(limit, self.state_limit()).len()).unwrap_or(u32::MAX)
     }
 
     // ---- accounting ----

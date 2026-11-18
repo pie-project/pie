@@ -156,7 +156,10 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
     assert_eq!(after, before);
     assert_eq!(pool.rung(), 256);
     assert_eq!(pool.span_short(256), 0);
-    assert_eq!(pool.room().act_chunks, 1);
+    // The span is the largest rung's; what the smallest leaves of it is
+    // lent, the zero term taking none of it.
+    let room = pool.room();
+    assert_eq!((room.act_chunks, room.lent_chunks), (12, 11));
     let mut walk = RungWalk::default();
     assert_eq!(
         walk.step(&pool, 256, 256, 256, 1, 1).unwrap(),

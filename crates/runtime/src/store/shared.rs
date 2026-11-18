@@ -523,11 +523,17 @@ pub struct PoolRoom {
     pub chunk_bytes: u64,
     pub total_chunks: u32,
     pub reserved_chunks: u32,
-    /// The activation set aside under the smallest rung.
+    /// The activation's span: the largest rung's, which a rise takes back
+    /// whatever a lowered rung lent of it.
     pub act_chunks: u32,
+    /// The span's chunks the smallest rung lends to state where they can
+    /// be backed: room a grant may use while the rung is down, never room
+    /// the pool promises, since a rise takes them back.
+    pub lent_chunks: u32,
     /// The chunks the weights' pinned slots take.
     pub weight_chunks: u32,
-    /// What is left for kv and state: no move frees more.
+    /// What is left for kv and state below the span: no move frees more,
+    /// and no rung takes it.
     pub state_chunks: u32,
     /// `state_chunks` as kv list slots (pages).
     pub list_slots: u32,
@@ -1193,29 +1199,28 @@ impl SharedPool {
                 u32::try_from(slots.div_ceil(u64::from(spc.max(1)))).unwrap_or(u32::MAX)
             })
             .sum();
-        let act_chunks = pool.act_chunks(0);
         // What state can ever be backed in, not the range: below the span,
         // the chunks under what the engine binds that lie in segments the
-        // pool may map ([`Self::backable_below_span`]); in the span, what
-        // the smallest rung leaves, where it is backed while the engine
-        // holds anything back.
+        // pool may map ([`Self::backable_below_span`]). The kv facts count
+        // the same (`ChunkFacts::kv_device_pages`): what the smallest rung
+        // leaves of the span, where it is backed, is lent, and a rise takes
+        // it back.
         let span_backable = !pool.span_on_demand() || pool.ceiling() >= pool.total_chunks();
-        let lent = if span_backable {
-            pool.act_max()
+        let lent_chunks = if span_backable {
+            pool.act_max().saturating_sub(pool.act_chunks(0))
         } else {
-            act_chunks
+            0
         };
         let state_chunks = self
             .backable_below_span()
-            .saturating_add(lent)
             .saturating_sub(pool.reserved_chunks())
-            .saturating_sub(act_chunks)
             .saturating_sub(weight_chunks);
         PoolRoom {
             chunk_bytes: pool.chunk_bytes(),
             total_chunks: pool.total_chunks(),
             reserved_chunks: pool.reserved_chunks(),
-            act_chunks,
+            act_chunks: pool.act_max(),
+            lent_chunks,
             weight_chunks,
             state_chunks,
             list_slots: self.list.map_or(0, |list| {
