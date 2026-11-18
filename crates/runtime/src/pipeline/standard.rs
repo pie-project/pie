@@ -210,8 +210,12 @@ pub fn traces(
 /// # Errors
 ///
 /// A sampler that does not trace or register, by name: the load fails
-/// rather than build it after ready.
-pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::ProgramRegistration>> {
+/// rather than build it after ready. `rows` is the most rows one of the
+/// engine's fires binds, the bound a prompt's channel registers at.
+pub fn registrations(
+    backend: Option<&str>,
+    rows: u32,
+) -> anyhow::Result<Vec<::engine::ProgramRegistration>> {
     let model = crate::model::model();
     let lane = model
         .lane(&[])
@@ -234,7 +238,7 @@ pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::Prog
         .map_err(anyhow::Error::msg)?
         .into_iter()
         .map(|(name, traced)| {
-            let registration = registration(traced, &outputs)
+            let registration = registration(traced, &outputs, rows)
                 .map_err(|error| anyhow::anyhow!("the standard sampler `{name}`: {error}"))?;
             Ok(super::program::with_host_codegen(&registration, backend).into_owned())
         })
@@ -244,8 +248,9 @@ pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::Prog
 fn registration(
     traced: Traced,
     outputs: &[OutputDecl],
+    rows: u32,
 ) -> anyhow::Result<::engine::ProgramRegistration> {
-    let program = super::program::register(traced.encode(), vec![outputs.to_vec()])?;
+    let program = super::program::register(traced.encode(), vec![outputs.to_vec()], rows)?;
     Ok(::engine::ProgramRegistration {
         program_hash: program.hash,
         launch: program.launch().clone(),
@@ -281,7 +286,7 @@ mod tests {
         let mut registry =
             super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
         let program = registry
-            .register(traced.encode(), vec![outputs()], EngineCaps::default())
+            .register(traced.encode(), vec![outputs()], EngineCaps::default(), 8192)
             .expect("registers");
         if backend == "wgsl" {
             let calls = wgsl::step_calls();

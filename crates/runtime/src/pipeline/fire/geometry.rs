@@ -763,8 +763,15 @@ pub fn map_geometry_evaluated_with(
         (Port::Slots, g.slots.as_mut()),
     ] {
         let Some(rows) = rows else { continue };
-        if spanned == 0 {
-            rows.clear();
+        // A row-extent channel is declared at the program's row bound and
+        // carries the instance's rows, then `ROW_PAD`: the CSR spans the
+        // live ones, and the padding is no row of the fire's.
+        let padded = rows.len() > spanned
+            && rows[spanned..]
+                .iter()
+                .all(|&row| row == crate::pipeline::program::ROW_PAD);
+        if spanned == 0 || padded {
+            rows.truncate(spanned);
         } else if rows.len() != spanned {
             return Err(EvaluatedGeometryError::BadValue {
                 port,
@@ -975,6 +982,7 @@ mod tests {
         a_decode_stating_no_slots_is_not_pooled();
         a_decode_another_pass_lays_out_is_pooled_device_geometry();
         a_fold_list_states_every_lanes_fold_or_a_fold_a_lane();
+        a_row_bound_prompt_embeds_its_live_rows();
     }
 
     /// A fold list of one entry is every lane's fold and a longer one a
@@ -1055,6 +1063,49 @@ mod tests {
                 other => panic!("a fold list short of its lanes maps: {other:?}"),
             }
         }
+    }
+
+    /// A prompt whose tokens' channel is declared at the row bound: past the
+    /// rows the indptr spans it carries `ROW_PAD`, which no fire embeds;
+    /// tokens past the span that are not padding are refused as before.
+    fn a_row_bound_prompt_embeds_its_live_rows() {
+        use eta_compiler::eval::interp::Value;
+        use eta_ir::registry::EngineCaps;
+
+        const MAX: u32 = 8;
+        let mut container = decode(MAX, &[(Port::EmbedIndptr, Shape::vector(2), Dtype::U32)]);
+        container.stages[0].ops.clear();
+        let logits = eta_ir::registry::OutputDecl {
+            name: "logits".into(),
+            axis: eta_ir::registry::Axis::Row,
+            width: 16,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
+            .expect("the prompt binds");
+        let mapped = |live: u32, tokens: Vec<i32>| {
+            let mut known = |channel: u32| {
+                Some(match channel {
+                    0 => Value::I32(tokens.clone()),
+                    _ => Value::U32(vec![0, live]),
+                })
+            };
+            map_geometry_evaluated_with(&bound, &mut known, PortMask::NONE)
+                .map(|(geometry, _)| geometry)
+        };
+        for live in [1u32, 3, MAX] {
+            let mut tokens: Vec<i32> = (1..=live as i32).collect();
+            tokens.resize(MAX as usize, -1);
+            let geometry = mapped(live, tokens).expect("maps");
+            assert_eq!(geometry.token_ids, (1..=live).collect::<Vec<u32>>());
+            assert_eq!(geometry.qo_indptr, vec![0, live]);
+        }
+        assert!(
+            mapped(2, vec![1, 2, 3, -1, -1, -1, -1, -1]).is_err(),
+            "a token past the span that is not padding is refused"
+        );
     }
 
     fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {

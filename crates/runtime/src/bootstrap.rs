@@ -412,7 +412,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for (at, engine) in engine_configs.iter_mut().enumerate() {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
-        let registrations = crate::pipeline::standard::registrations(backend.as_deref())?;
+        let registrations = crate::pipeline::standard::registrations(
+            backend.as_deref(),
+            u32::try_from(engine.limits.max_forward_tokens).unwrap_or(u32::MAX),
+        )?;
         engine
             .engine_backend
             .prewarm_programs(&registrations)

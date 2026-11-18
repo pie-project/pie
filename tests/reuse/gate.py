@@ -43,11 +43,7 @@ TEMPERATURE = ("a sampled request's temperature is a program constant: a channel
                "costs the fused sampler ~20% of a decode step until rank-0 channels lower as "
                "constants")
 STEP4 = "a request's length shapes a key extent (step 4: dynamic key lengths)"
-PROMPT = "a prompt's length is its prefill's token extent until prompts pad to the max pass rows"
 EXPECTED = {
-    "chat-prompt_len": PROMPT,
-    "chat-greedy-prompt_len": PROMPT,
-    "tcb-prompt_len": PROMPT,
     "chat-temperature": TEMPERATURE,
     "tcb-temperature": TEMPERATURE,
     "beam-max_tokens": STEP4 + ": the key pool is prompt + decodes",

@@ -133,6 +133,78 @@ impl TraceContainer {
     pub fn hash(&self) -> u64 {
         super::container_hash(&encode(self))
     }
+
+    /// The channels whose length is a fire's row count rather than part of
+    /// the program: a host-fed (seeded or host-written) `i32` / `u32` vector a
+    /// per-row port binds (tokens, positions, slots: the stage signature's
+    /// `token_count` extent) and no op, extern or input touches, in a pass
+    /// whose every port the host feeds (no op puts a port's channel, and
+    /// each is seeded or host-written). The host then resolves those ports
+    /// from the channel's values, row by row, up to the rows the indptr
+    /// spans; nothing else reads its length.
+    pub fn row_extent_channels(&self) -> Vec<bool> {
+        let mut rows = alloc::vec![false; self.channels.len()];
+        let put = |channel: ChannelIndex| {
+            self.stages.iter().flat_map(|stage| stage.ops.iter()).any(|op| {
+                op.channel_use() == Some((op::ChannelUse::Put, channel))
+            })
+        };
+        let host_fed = self.ports.iter().all(|binding| match binding.source {
+            PortSource::Const { .. } => true,
+            PortSource::Channel(channel) => {
+                !put(channel)
+                    && self.channels.get(channel as usize).is_some_and(|decl| {
+                        decl.seeded || decl.host_role == HostRole::Writer
+                    })
+            }
+        });
+        if !host_fed {
+            return rows;
+        }
+        for binding in &self.ports {
+            if let PortSource::Channel(channel) = binding.source
+                && matches!(binding.port, Port::EmbedTokens | Port::Positions | Port::Slots)
+                && let Some(flag) = rows.get_mut(channel as usize)
+            {
+                *flag = true;
+            }
+        }
+        for (flag, decl) in rows.iter_mut().zip(&self.channels) {
+            *flag &= (decl.seeded || decl.host_role == HostRole::Writer)
+                && decl.host_role != HostRole::Reader
+                && decl.shape.rank() == 1
+                && matches!(decl.dtype, ChanDType::Concrete(Dtype::I32 | Dtype::U32));
+        }
+        let touched = self
+            .stages
+            .iter()
+            .flat_map(|stage| stage.ops.iter())
+            .filter_map(|op| op.channel_use().map(|(_, channel)| channel))
+            .chain(self.externs.iter().map(|binding| binding.chan))
+            .chain(self.inputs.iter().copied());
+        for channel in touched {
+            if let Some(flag) = rows.get_mut(channel as usize) {
+                *flag = false;
+            }
+        }
+        rows
+    }
+
+    /// This program as one identity for every row count: each
+    /// [`row_extent_channels`](Self::row_extent_channels) channel declared
+    /// at `rows`, the most rows one fire binds. A request's own length is
+    /// its channel's data, carried up to that bound (and the indptr states
+    /// the live rows), so programs that differ only in it encode, hash and
+    /// register alike. Returns which channels are so declared.
+    pub fn bind_row_extents(&mut self, rows: u32) -> Vec<bool> {
+        let bound = self.row_extent_channels();
+        for (decl, &bound) in self.channels.iter_mut().zip(&bound) {
+            if bound {
+                decl.shape = Shape::vector(rows);
+            }
+        }
+        bound
+    }
 }
 
 fn wire_len<T>(len: usize, table: &str) -> T

@@ -101,11 +101,22 @@ fn pass(ports: Ports, body: impl Fn() + 'static) -> Traced {
     b.build().expect("traces")
 }
 
-/// The hashes the runtime registers `programs` by.
+/// The most rows one fire binds, as an engine states it
+/// (`model.max-pass-rows()`): what a per-row channel registers at.
+const ROWS: u32 = 8192;
+
+/// The hashes the runtime registers `programs` by: each container with its
+/// per-row channels declared at the row bound
+/// (`TraceContainer::bind_row_extents`).
 fn hashes(programs: &[Traced]) -> Vec<u64> {
     programs
         .iter()
-        .map(|traced| eta_ir::container_hash(&traced.encode()))
+        .map(|traced| {
+            let mut container =
+                eta_ir::container::decode(&traced.encode()).expect("the container decodes");
+            container.bind_row_extents(ROWS);
+            container.hash()
+        })
         .collect()
 }
 
@@ -370,10 +381,8 @@ fn a_compat_temperature_is_still_a_program_constant() {
     one_identity("sampled temperatures", &[SAMPLED, other], compat_decode);
 }
 
-/// The prompt's tokens are shaped by its length until the SDK pads them to
-/// the model's max pass rows (step 2).
+/// The prompt's tokens register at the row bound, whatever its length.
 #[test]
-#[should_panic(expected = "program identity of its own")]
 fn compat_prompts_of_two_lengths_prefill_with_one_program() {
     let other = Sampling {
         prompt: 300,
@@ -693,8 +702,7 @@ fn a_denoise_step_runs_one_program_for_every_schedule() {
 // ── kinds not yet reusable ──────────────────────────────────────────────
 
 /// A prefill of `len` prompt tokens, as every example and the prefill
-/// builtin channel them: one program a prompt length until the SDK pads
-/// prompts to the model's max pass rows (step 2).
+/// builtin channel them.
 fn prefill(len: &usize) -> Vec<Traced> {
     let out = taken([1], dtype::i32, 1);
     vec![pass(Ports::folding(prompt(*len), from([0u32, *len as u32])), move || {
@@ -703,14 +711,13 @@ fn prefill(len: &usize) -> Vec<Traced> {
 }
 
 #[test]
-#[should_panic(expected = "program identity of its own")]
 fn prompts_of_two_lengths_prefill_with_one_program() {
     one_identity("prefill", &[7usize, 300], prefill);
 }
 
-/// json-schema's decode embeds the forced chunk, 1 to 16 tokens: one program
-/// a chunk length until a chunk pads to 16 with its live count in the
-/// indptr (step 2: the runtime takes the live count from the indptr).
+/// json-schema's decode embeds the forced chunk, 1 to 16 tokens, through a
+/// channel the host writes: its length is the chunk's rows, registered at
+/// the row bound.
 fn json_chunk(len: &u32) -> Vec<Traced> {
     let out = taken([1], dtype::i32, CAP);
     let mask = written([VOCAB.div_ceil(32)], dtype::u32);
@@ -722,14 +729,14 @@ fn json_chunk(len: &u32) -> Vec<Traced> {
 }
 
 #[test]
-#[should_panic(expected = "program identity of its own")]
 fn json_schema_chunks_of_two_lengths_decode_with_one_program() {
     one_identity("json-schema decode", &[1u32, 5], json_chunk);
 }
 
 /// constrained-speculative's verify spans the committed tail and the draft:
-/// one program a window until it pads with its live count in the indptr
-/// (step 2).
+/// its tokens and slots register at the row bound, but its readout rows and
+/// its `[window]` output are what the stage computes on, one program a
+/// window until it reads out at the widest window.
 #[test]
 #[should_panic(expected = "program identity of its own")]
 fn constrained_speculative_windows_verify_with_one_program() {

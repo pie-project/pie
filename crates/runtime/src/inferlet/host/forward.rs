@@ -1058,13 +1058,50 @@ impl ProcessCtx {
             )
         };
         {
-            let prog = match crate::pipeline::program::register(container_bytes, readouts) {
+            // The rows one fire binds: what the SDK's `model.max-pass-rows()`
+            // states, and the bound a per-row channel is declared at.
+            let max_rows =
+                u32::try_from(crate::engine::get_spec(0)?.limits.max_forward_tokens)
+                    .unwrap_or(u32::MAX);
+            let prog = match crate::pipeline::program::register(
+                container_bytes,
+                readouts,
+                max_rows,
+            ) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
             let decls = prog.bound.container.channels.clone();
+            // An instance's own declaration of each channel: a row-extent
+            // channel (declared at the program's row bound) at its fill's
+            // length, which the bound caps; the rest as the program states.
+            let mut attached = decls.clone();
+            for (dense, ch) in channels.iter().enumerate() {
+                if !prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    continue;
+                }
+                let cell = self.ctx().table.get(ch)?.cell.clone();
+                let shape = cell.lock().unwrap().shape.clone();
+                let [len] = shape[..] else {
+                    return Ok(Err(format!(
+                        "pipeline: channel {dense} binds a per-row port with shape {shape:?}, \
+                         not a vector"
+                    )));
+                };
+                if len > prog.row_bound {
+                    return Ok(Err(format!(
+                        "pipeline: channel {dense}'s {len} rows exceed the {} rows one fire \
+                         binds (`model.max-pass-rows()`)",
+                        prog.row_bound
+                    )));
+                }
+                if let Some(decl) = attached.get_mut(dense) {
+                    decl.shape = eta_ir::types::Shape::vector(len);
+                }
+                cell.lock().unwrap().row_extent = true;
+            }
             let extern_bindings = decls
                 .iter()
                 .enumerate()
@@ -1145,7 +1182,8 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&decls[i], writes(i), extern_binding) {
+                    if let Err(e) = c.validate_attachment(&attached[i], writes(i), extern_binding)
+                    {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1247,7 +1285,7 @@ impl ProcessCtx {
                     .map(|(name, dir)| (name.as_str(), *dir));
                 if let Err(error) = cell.lock().unwrap().attach(
                     instance_id,
-                    &decls[dense],
+                    &attached[dense],
                     writes(dense),
                     extern_binding,
                 ) {
@@ -1299,6 +1337,17 @@ impl ProcessCtx {
                 let bytes = match cell.peek_seed() {
                     Ok(bytes) => bytes,
                     Err(e) => return Ok(Err(format!("pipeline: channel {dense} seed: {e}"))),
+                };
+                // A row-extent channel's fill, padded to the rows its
+                // program declares.
+                let bytes = if prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    let elem = eta_ir::container::const_elem_size(cell.dtype);
+                    match crate::pipeline::program::pad_row_extent(bytes, elem, prog.row_bound) {
+                        Ok(bytes) => bytes,
+                        Err(e) => return Ok(Err(format!("pipeline: channel {dense}: {e}"))),
+                    }
+                } else {
+                    bytes
                 };
                 instance_seeds.push(crate::pipeline::instance::ChannelSeed {
                     channel: dense as u32,

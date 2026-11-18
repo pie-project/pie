@@ -21,6 +21,10 @@ pub struct ChannelCell {
     pub capacity: u32,
     pub role: Option<HostRole>,
     pub seeded: bool,
+    /// Bound to a program as a row-extent channel: its engine cells are as
+    /// wide as the program's row bound, and a host write fills its own rows
+    /// and pads the rest with `ROW_PAD` bytes.
+    pub row_extent: bool,
     taken_seed: Option<Vec<u8>>,
     endpoint: Option<Arc<ChannelEndpoint>>,
     declared_dtype: Option<ChanDType>,
@@ -99,6 +103,7 @@ impl ChannelCell {
             capacity,
             role: None,
             seeded: false,
+            row_extent: false,
             taken_seed: None,
             endpoint: None,
             declared_dtype: None,
@@ -457,7 +462,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !(self.row_extent && wire_len < cell_bytes) {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -475,7 +480,9 @@ impl ChannelCell {
         if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
-            cell.copy_from_slice(native);
+            let (rows, pad) = cell.split_at_mut(wire_len);
+            rows.copy_from_slice(native);
+            pad.fill(0xff);
         }
         let tail = load_word(binding.word_base, binding.tail_word_index as usize);
         store_word(binding.word_base, binding.tail_word_index as usize, tail);
@@ -514,7 +521,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !(self.row_extent && wire_len < cell_bytes) {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -531,7 +538,9 @@ impl ChannelCell {
         if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
-            cell.copy_from_slice(native);
+            let (rows, pad) = cell.split_at_mut(wire_len);
+            rows.copy_from_slice(native);
+            pad.fill(0xff);
         }
         self.writer_tail += 1;
         store_word(
