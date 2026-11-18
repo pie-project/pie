@@ -892,6 +892,23 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Marks `pid` as waiting at a bind for room, or past it
+    /// ([`super::proc::Proc::bind_waiting`]): waiting, it is a victim as an
+    /// idle process is, and the planner looks again for a head it may now
+    /// fund.
+    pub fn set_bind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: bool) {
+        let changed = self.with_inner(|inner| {
+            inner.procs.get_mut(&pid).is_some_and(|proc| {
+                let was = proc.bind_waiting;
+                proc.bind_waiting = waiting;
+                was != waiting
+            })
+        });
+        if changed && waiting {
+            self.poke();
+        }
+    }
+
     /// Marks `pid` as waiting on its client, or as awake again. Waking a
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
@@ -1247,6 +1264,23 @@ impl ResidencyPlanner {
         }
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// Whether a process's demand waits for room: a kv allocation, a
+    /// restore or a guest bind, unmet. A rise is ordered among them by its
+    /// own key and is not counted: it is what the room it waits on goes to
+    /// in turn, not what a rung walk gives room back for.
+    #[must_use]
+    pub fn demand_waits(&self) -> bool {
+        self.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.is_unmet()
+                    && !matches!(
+                        waiter.kind,
+                        super::wait::WaitKind::Allocation { rise: true, .. }
+                    )
+            })
+        })
     }
 
     pub fn pages_freed(self: &Arc<Self>) {
