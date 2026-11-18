@@ -593,6 +593,11 @@ pub enum IndexScore {
 pub enum RaggedMask {
     None,
     GroupBlockDiagonal,
+    /// Each row attends rows of its own group, narrowed by the mask its lane
+    /// states (`forward.mask` on a kv-less lane), a lane stating none
+    /// attending its whole group. Only an attention the model states so reads
+    /// a lane's mask: a lane's mask over any other is refused.
+    Stated,
     RelativeBias { table: ValueId, max_len: u32 },
 }
 
@@ -600,14 +605,14 @@ impl Part for RaggedMask {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             RaggedMask::RelativeBias { table, .. } => sink.push(*table),
-            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated => {}
         }
     }
     fn outputs(&self, _sink: &mut Vec<ValueId>) {}
     fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
         match self {
             RaggedMask::RelativeBias { table, .. } => sink.push(("table", *table, Expect::F32)),
-            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated => {}
         }
     }
 }

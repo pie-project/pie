@@ -406,13 +406,19 @@ impl Run<'_> {
             } => {
                 let stated = self.group_mask(*q_indptr, *kv_indptr);
                 let mask = match (mask, stated) {
-                    (
-                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
-                        Some(stated),
-                    ) => attn::ragged::RaggedMask::Custom {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => attn::ragged::RaggedMask::Custom {
                         bits: stated.bits,
                         indptr: stated.indptr,
                     },
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_xla::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model states \
+                                     none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
+                    }
                     (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_xla::Error::Backend {
                             op: "attn.ragged",
@@ -422,9 +428,12 @@ impl Run<'_> {
                                 .to_string(),
                         });
                     }
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
-                        attn::ragged::RaggedMask::Segments
-                    }
+                    (
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => attn::ragged::RaggedMask::Segments,
                     (poem_ir::RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),

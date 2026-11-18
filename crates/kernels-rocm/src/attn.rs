@@ -225,9 +225,6 @@ fn fa2_prefill(
             o,
         );
     }
-    if mask.is_some() {
-        return Err(Error::Unsupported { op });
-    }
     let lse_ptr = match &lse {
         Some(lse) => {
             lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
@@ -235,6 +232,24 @@ fn fa2_prefill(
         }
         None => 0,
     };
+    if let Some((bits, indptr)) = mask {
+        return paged::prefill_masked(
+            ctx,
+            op,
+            q,
+            plan,
+            pool,
+            window_left,
+            sm_scale,
+            o,
+            lse_ptr,
+            paged::PrefillMask {
+                bits: bits.ptr,
+                indptr: indptr.ptr,
+                origin: plan.mask_origin.map_or(0, |origin| origin.ptr),
+            },
+        );
+    }
     paged::prefill(
         ctx,
         op,

@@ -109,22 +109,59 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
 }
 
 /// The classes a lane's stated mask reaches over its group's rows: a
-/// ragged attention, unbiased or block-diagonal by group, reads a lane's
-/// mask as its group's (the custom arm). There a mask is the lane's to
-/// state or not (stating none, a row attends every row of its group), so a
-/// plan whose only attention is kv-less takes one too.
+/// ragged attention the model states one on (`RaggedMask::Stated`) reads a
+/// lane's mask as its group's (the custom arm). There a mask is the lane's
+/// to state or not (stating none, a row attends every row of its group); an
+/// attention the model states none on reads none, and costs no mask's room.
 ///
 /// Only a kv-less lane states a group mask, so a class that writes or reads
 /// a cache (a language model's prefill beside its vision tower's ragged
 /// attention) takes none: arming records a masked twin of each body over
 /// these classes, and the rest arm once.
+/// The ragged attentions' packings (`Feeds::ragged`, in their order) that
+/// an attention the model states a mask on reads: the ones a fire stages a
+/// lane's group mask for, a stretch of the inputs slab each. A packing only
+/// attentions stating none read takes no stretch.
+#[must_use]
+pub(crate) fn stated_feeds(
+    trace: &Trace,
+    ragged: &[(poem_ir::Selection, poem_ir::Selection)],
+) -> Vec<(poem_ir::Selection, poem_ir::Selection)> {
+    use poem_ir::{Def, GeomKind, RuntimeInput};
+    let packing = |id: ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Input(RuntimeInput::Geometry {
+            kind: GeomKind::GroupIndptr { select },
+            ..
+        })) => Some(*select),
+        _ => None,
+    };
+    let stated: Vec<(poem_ir::Selection, poem_ir::Selection)> = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                q_indptr,
+                kv_indptr,
+                mask: poem_ir::RaggedMask::Stated,
+                ..
+            }) => packing(*q_indptr).zip(packing(*kv_indptr)),
+            _ => None,
+        })
+        .collect();
+    ragged
+        .iter()
+        .copied()
+        .filter(|feed| stated.contains(feed))
+        .collect()
+}
+
 #[must_use]
 pub(crate) fn group_masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     let ragged = classes_running(trace, compiled, |op| {
         matches!(
             op,
             poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
-                mask: poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                mask: poem_ir::RaggedMask::Stated,
                 ..
             })
         )
