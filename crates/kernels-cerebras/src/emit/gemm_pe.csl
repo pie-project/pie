@@ -8,7 +8,10 @@
 // its turn in index order: the pieces before its own on the forward colour, its own sent
 // both ways (each colour a root's for the send, a pass-through again once drained), the rest
 // on the backward colour. Routes rest as pass-throughs. The weights come up the column from
-// its tape (C_WT, a tree).
+// its tape (C_WT, a tree). The row line's two colours are read on two input queues, each bound
+// once (C_XF on q2, C_XB on q7): a queue rebound between them as a member's turn passed could
+// meet a piece of the other colour at its ramp while a row's PEs drift apart (a band's or a
+// column's work between GEMMs), the ramp held and the column's weights behind it (1550/1551).
 
 var X: u16 = 0;
 var Y: u16 = 0;
@@ -107,7 +110,6 @@ fn gemm(a: u16) void {
   const wa0 = @set_dsd_base_addr(D_wa0, @ptrcast([*]@fp16(), &wb[0]));
   var cp: u16 = 0;
   while (cp < GX) : (cp += 1) {
-    if (cp == X) { fab.iqc(2, C_XB); }
     const kc = if (even) kd else plen(cp, GX, K);
     if (kc == 0) { continue; }
     const nh = rows * kc;
@@ -125,7 +127,7 @@ fn gemm(a: u16) void {
       }
       xsend(xhw(0, nw), nw);
     } else {
-      @mov32(xhw(0, nw), fab.fin(q_xi, nw));
+      if (cp < X) { @mov32(xhw(0, nw), fab.fin(q_xi, nw)); } else { @mov32(xhw(0, nw), fab.fin(q_xb, nw)); }
     }
     var s: u16 = 0;
     while (s < ns) : (s += 1) {
@@ -140,7 +142,6 @@ fn gemm(a: u16) void {
       }
     }
   }
-  fab.iqc(2, C_XF);
   if ((fl & 1) != 0) { rnd(ys, rows * ylw); }
 }
 

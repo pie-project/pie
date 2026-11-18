@@ -836,8 +836,8 @@ mod tests {
         crate::stream::gemm::placed(&l, 32, 8, 8).unwrap_or_else(|e| panic!("{}", e.text()))
     }
 
-    /// The GEMM PE's lines: the row line (iq2, `XF` / `XB`) in its GEMM, the column line (iq6,
-    /// `KF` / `KB`) in its attention.
+    /// The GEMM PE's lines: the column line (iq6, `KF` / `KB`) in its attention; the row line's
+    /// colours each on a queue of its own (no line).
     #[test]
     fn the_gemm_pes_lines() {
         let ls = line_queues(crate::emit::gemm::GPE_OPS);
@@ -851,23 +851,38 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            named,
-            vec![
-                (2, "gemm", vec!["C_XB", "C_XF"]),
-                (6, "attend", vec!["C_KB", "C_KF"])
-            ]
-        );
+        assert_eq!(named, vec![(6, "attend", vec!["C_KB", "C_KF"])]);
     }
 
-    /// As emitted, every GEMM after an attention (the row line rebound on iq2, the attention's
-    /// band-local reductions between) is a window (1550: c5 and c2 at v13 hung); with a row-wide
-    /// all-reduce at the attention's end (v14) or the row line on queues of its own (v16), none.
+    /// With the row line rebound on iq2 (as emitted before its own queues), every GEMM after an
+    /// attention (the attention's band-local reductions between) is a window (1550: c5 and c2 at
+    /// v13 hung); with a row-wide all-reduce at the attention's end (v14), none; as emitted, the
+    /// row line on queues of its own (v16, 1551), none.
     #[test]
-    fn the_row_lines_windows_open_as_emitted_and_shut_by_v14_or_v16() {
+    fn the_row_lines_windows_open_when_rebound_and_shut_by_v14_or_own_queues() {
         let p = mini_gemm();
         let pe = crate::emit::gemm::GPE_OPS;
-        let open = lines(&p, pe);
+        // as emitted: XF and XB each on a queue bound once
+        assert!(
+            line_queues(pe).iter().all(|l| l.func != "gemm"),
+            "the emitted row line rebinds"
+        );
+        assert_eq!(lines(&p, pe), Vec::<String>::new(), "as emitted");
+        // the row line rebound on iq2 at a member's turn and back at the GEMM's end
+        let own = "      if (cp < X) { @mov32(xhw(0, nw), fab.fin(q_xi, nw)); } else { @mov32(xhw(0, nw), fab.fin(q_xb, nw)); }\n";
+        let tail = "  if ((fl & 1) != 0) { rnd(ys, rows * ylw); }\n}";
+        let turn =
+            "    const kc = if (even) kd else plen(cp, GX, K);\n    if (kc == 0) { continue; }";
+        assert!(pe.contains(own) && pe.contains(tail) && pe.contains(turn));
+        let rebound = pe
+            .replace(own, "      @mov32(xhw(0, nw), fab.fin(q_xi, nw));\n")
+            .replace(tail, &format!("  fab.iqc(2, C_XF);\n{tail}"))
+            .replacen(
+                turn,
+                &format!("    if (cp == X) {{ fab.iqc(2, C_XB); }}\n{turn}"),
+                1,
+            );
+        let open = lines(&p, &rebound);
         assert!(
             !open.is_empty() && open.iter().all(|w| w.contains("(H2)")),
             "{open:?}"
@@ -875,20 +890,8 @@ mod tests {
         eprintln!("{} windows; {}", open.len(), open[0]);
         // v14: a one-word row all-reduce after the last key block
         let end = "  t = 0;\n  while (t < TB) : (t += 1) {\n    @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), math.recip(ll[t]));";
-        assert!(pe.contains(end));
-        let v14 = pe.replace(end, &format!("  gseg.allred(md(RT, 1), 1, false);\n{end}"));
+        assert!(rebound.contains(end));
+        let v14 = rebound.replace(end, &format!("  gseg.allred(md(RT, 1), 1, false);\n{end}"));
         assert_eq!(lines(&p, &v14), Vec::<String>::new(), "v14");
-        // v16: XF and XB each on a queue bound once (no rebinding in the GEMM)
-        let v16 = pe
-            .replace("if (cp == X) { fab.iqc(2, C_XB); }", "")
-            .replace(
-                "  fab.iqc(2, C_XF);\n  if ((fl & 1) != 0)",
-                "  if ((fl & 1) != 0)",
-            );
-        assert!(
-            line_queues(&v16).iter().all(|l| l.func != "gemm"),
-            "v16 rebinds"
-        );
-        assert_eq!(lines(&p, &v16), Vec::<String>::new(), "v16");
     }
 }

@@ -509,7 +509,7 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
     let xbh = 2 * p.xbn.div_ceil(2).max(1) + 2;
     let _ = writeln!(
         t,
-        "const q_xi = @get_input_queue(2);\nconst q_wi = @get_input_queue(3);\nconst q_ki = @get_input_queue(6);\nconst q_xo = @get_output_queue(2);\nconst q_co = @get_output_queue(3);\n\
+        "const q_xi = @get_input_queue(2);\nconst q_xb = @get_input_queue(7);\nconst q_wi = @get_input_queue(3);\nconst q_ki = @get_input_queue(6);\nconst q_xo = @get_output_queue(2);\nconst q_co = @get_output_queue(3);\n\
          const matvec = @import_module(\"ops/mv.csl\");\n\
          const gseg = @import_module(\"gseg.csl\", .{{ .fab = fab, .C_A0 = {}, .C_A1 = {}, .C_RB = {C_RB}, .C_BB = {C_BB} }});\n\
          const C_XF: u16 = {C_XF};\nconst C_XB: u16 = {C_XB};\nconst C_WT: u16 = {C_WT};\nconst C_KF: u16 = {C_KF};\nconst C_KB: u16 = {C_KB};",
@@ -629,7 +629,7 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
     for s in &exports {
         let _ = writeln!(t, "  @export_symbol({s}_p, \"{s}\");");
     }
-    t.push_str("  @initialize_queue(q_xi, .{ .color = @get_color(C_XF) });\n  @initialize_queue(q_wi, .{ .color = @get_color(C_WT) });\n  @initialize_queue(q_ki, .{ .color = @get_color(C_KF) });\n  @initialize_queue(q_xo, .{ .color = @get_color(C_XF) });\n  @initialize_queue(q_co, .{ .color = @get_color(C_KF) });\n}\n");
+    t.push_str("  @initialize_queue(q_xi, .{ .color = @get_color(C_XF) });\n  @initialize_queue(q_xb, .{ .color = @get_color(C_XB) });\n  @initialize_queue(q_wi, .{ .color = @get_color(C_WT) });\n  @initialize_queue(q_ki, .{ .color = @get_color(C_KF) });\n  @initialize_queue(q_xo, .{ .color = @get_color(C_XF) });\n  @initialize_queue(q_co, .{ .color = @get_color(C_KF) });\n}\n");
     t
 }
 
