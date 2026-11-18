@@ -1711,3 +1711,86 @@ fn a_pair_a_bind_reuses_does_not_park_under_it() {
     roles.lock().unwrap().close_instance(first);
     let _ = held(&device);
 }
+
+/// Gemma 4 E4B on the M5 under the fence: room a guest bind waits for comes
+/// free only as the fire last naming it retires, and that retire told no
+/// one, so with no segment to commit the bind waited for ever. The pool
+/// now tells as the room actually comes free: an instance's run of four,
+/// let go while a fire at epoch 5 names it, does not bind the waiter at the
+/// close (it is fenced); `retire_through(5)` wakes it, and it binds there,
+/// no segment committed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_bind_waiting_for_fenced_room_binds_as_the_fire_retires() {
+    const ENGINE: usize = 65;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    // A run of four, the only one the bind could take, then every other
+    // committed chunk filled.
+    let (held_program, mut held_engine) = runs_of(13, 4, 1, 5000);
+    let held = bind_as(&roles, &mut held_engine, held_program, 7).expect("a run of four");
+    fill_with_singles(&roles);
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0);
+    let prefix = device.lock().unwrap().pool().prefix_segments();
+
+    let (long, long_engine) = runs_of(8, 4, 1, 0);
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let wait = {
+        let (roles, device, engine) = (roles.clone(), device.clone(), long_engine.clone());
+        super::bind_when_resident(
+            holder(1),
+            {
+                let roles = roles.clone();
+                move || std::future::ready(bind_as(&roles, &mut engine.borrow_mut(), long, 1))
+            },
+            || std::future::pending::<Result<(), String>>(),
+            move |prefix, run| {
+                let device = device.clone();
+                async move { super::grow_for_guest(&device, ENGINE, prefix, run).await }
+            },
+            {
+                let roles = roles.clone();
+                move || Some(roles.lock().unwrap().room_watch())
+            },
+            {
+                let roles = roles.clone();
+                move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces
+            },
+            |_, _| false,
+            |_, _| std::future::pending::<Result<(), String>>(),
+            {
+                let roles = roles.clone();
+                move || {
+                    let roles = roles.clone();
+                    async move { super::guest_turn(&roles, holder(1)).await }
+                }
+            },
+            {
+                let roles = roles.clone();
+                move || roles.lock().unwrap().leave_guest_queue(holder(1))
+            },
+        )
+    };
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending(), "it waits for room");
+
+    // A fire at epoch 5 names the held instance; it closes while that fire
+    // is in flight: its run is fenced, not free.
+    roles.lock().unwrap().touch(held, 5);
+    roles.lock().unwrap().close_instance(held);
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "fenced");
+    assert!(futures::poll!(wait.as_mut()).is_pending(), "the close does not bind it");
+    assert!(long_engine.borrow().bindings.is_empty());
+
+    // The fire retires: the run is free, the pool tells, and it binds there.
+    device.lock().unwrap().pool_mut().retire_through(5);
+    let std::task::Poll::Ready(bound) = futures::poll!(wait.as_mut()) else {
+        panic!("the retire did not wake it: room came free and no one was told");
+    };
+    bound.expect("it binds as the fire retires");
+    assert_eq!(long_engine.borrow().bindings.len(), 1);
+    assert_eq!(
+        device.lock().unwrap().pool().prefix_segments(),
+        prefix,
+        "no segment committed"
+    );
+    assert!(roles.lock().unwrap().guest_queue().is_empty());
+}

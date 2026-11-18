@@ -604,8 +604,9 @@ pub struct Roles {
     /// The guest (program, extents) pairs whose room has been stated
     /// ([`Self::take_instance`]): each states it once, at its first bind.
     stated: std::collections::HashSet<FireKey>,
-    /// Told each time guest state's device room is given back
-    /// ([`Self::room_watch`]).
+    /// Told each time the device pool's room actually comes free: the
+    /// pool's own signal ([`super::slots::RoomGiven`]), retires and fenced
+    /// chunks included ([`Self::room_watch`]).
     freed: Arc<Freed>,
     /// The guest binds waiting for room, in arrival order: only the head
     /// takes guest room, and the walk's demand counts its need
@@ -620,12 +621,9 @@ pub struct Roles {
     turns: Arc<Freed>,
 }
 
-/// Device room given back: a count of the gives, and their event.
-#[derive(Debug, Default)]
-pub struct Freed {
-    gives: std::sync::atomic::AtomicU64,
-    notify: tokio::sync::Notify,
-}
+/// Device room given back: a count of the gives, and their event (the
+/// pool's own, [`super::slots::RoomGiven`]).
+pub type Freed = super::slots::RoomGiven;
 
 /// A watch on device room given back from when it was taken: what a bind
 /// short of room waits on ([`bind_when_resident`]).
@@ -677,7 +675,7 @@ impl Roles {
             held: Vec::new(),
             chunk_slots,
             stated: std::collections::HashSet::new(),
-            freed: Arc::default(),
+            freed: device.lock().unwrap().pool().room_given(),
             guest_queue: std::collections::VecDeque::new(),
             turns: Arc::default(),
         })
@@ -921,14 +919,6 @@ impl Roles {
         }
     }
 
-    /// Tells the binds waiting on room ([`Self::room_watch`]) to look again.
-    fn tell_room(&self) {
-        self.freed
-            .gives
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.freed.notify.notify_waiters();
-    }
-
     /// `holder`'s guest bind leaves the queue of binds waiting for room:
     /// it bound, was refused by name, or its process is gone. Where it was
     /// the head, the pool no longer counts its need, and the next bind is
@@ -1005,18 +995,12 @@ impl Roles {
         self.guest_queue.push_back((holder, need));
     }
 
-    /// Gives back `parts` a closed or parked item held on `on`: guest state
-    /// given back on the device is the room a bind short of it waits on
-    /// ([`Self::room_watch`]), and its waiters are told.
+    /// Gives back `parts` a closed or parked item held on `on`. A bind short
+    /// of room is told by the pool as the room actually comes free
+    /// ([`super::slots::RoomGiven`]): at once, or once the last fire naming
+    /// it retires, not here while it may still be fenced.
     fn give_freeing(&self, on: &Shared, parts: &[Part]) {
         self.give(on, parts);
-        if Arc::ptr_eq(on, &self.device)
-            && parts
-                .iter()
-                .any(|part| part.dead() && !part.refs.is_empty())
-        {
-            self.tell_room();
-        }
     }
 
     /// Takes the slots of every part, all or none: a whole part's fresh
@@ -2371,15 +2355,32 @@ where
             }
             continue;
         }
-        if let Some(&RolesError::GuestGrow { prefix, run, .. }) = error.downcast_ref::<RolesError>()
+        if let Some(RolesError::GuestGrow {
+            prefix, run, room: short, ..
+        }) = error.downcast_ref::<RolesError>()
         {
+            let (prefix, run) = (*prefix, *run);
+            let pieces = short.chunk_runs().1;
             tracing::debug!(%pid, %error, "a bind waits on a segment commit");
-            // A commit, or room given back (its runs may stand free in it):
-            // either ends the wait, and it binds again.
+            // A commit, or room the pool gives back in which its runs now
+            // stand free (a slot let go at once, or as the fire naming it
+            // retires): either ends the wait, and it binds again. Room
+            // given back short of its runs only looks again, under the
+            // lock, and sends nothing to the lane.
             let freed = async {
-                match watch {
-                    Some(watch) => watch.freed().await,
-                    None => std::future::pending().await,
+                let Some(mut watch) = watch else {
+                    return std::future::pending().await;
+                };
+                loop {
+                    let next = room();
+                    watch.freed().await;
+                    if fits(run, pieces) {
+                        return;
+                    }
+                    match next {
+                        Some(next) => watch = next,
+                        None => return std::future::pending().await,
+                    }
                 }
             };
             tokio::select! {

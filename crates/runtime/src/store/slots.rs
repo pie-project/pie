@@ -451,6 +451,24 @@ impl ShapeState {
     }
 }
 
+/// Room a pool gives back: a count of the gives and their event. Told by
+/// the pool itself wherever room actually comes free (a slot given back,
+/// at once or as the fire it waited on retires; a fenced chunk reopened),
+/// so no caller can free room and forget to tell; read by whatever waits
+/// for room (`crate::store::roles::RoomWatch`).
+#[derive(Debug, Default)]
+pub struct RoomGiven {
+    pub gives: std::sync::atomic::AtomicU64,
+    pub notify: tokio::sync::Notify,
+}
+
+impl RoomGiven {
+    pub fn tell(&self) {
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
 /// See the module docs.
 #[derive(Clone, Debug)]
 pub struct SlotPool {
@@ -514,6 +532,10 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
+    /// Told whenever room actually comes free ([`RoomGiven`]): a slot given
+    /// back, at once or as the fire it waited on retires, and a fenced
+    /// chunk reopened. The one source a wait for room reads.
+    given: std::sync::Arc<RoomGiven>,
 }
 
 impl SlotPool {
@@ -569,6 +591,7 @@ impl SlotPool {
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
             fenced: Bits::new(total, false),
+            given: std::sync::Arc::default(),
             ceiling: total,
             segments,
             held: 0,
@@ -1773,9 +1796,14 @@ impl SlotPool {
         if epoch == u64::MAX {
             due.append(&mut self.fences);
         }
+        let mut reopened = false;
         for chunk in due.into_values().flatten() {
             self.fenced.clear(chunk);
             self.reopen(chunk);
+            reopened = true;
+        }
+        if reopened {
+            self.given.tell();
         }
         let later = self.pending.split_off(&(epoch.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
@@ -1792,6 +1820,12 @@ impl SlotPool {
     }
 
     /// Slots let go and waiting on a fire.
+    /// What the pool tells as room comes free ([`RoomGiven`]).
+    #[must_use]
+    pub fn room_given(&self) -> std::sync::Arc<RoomGiven> {
+        std::sync::Arc::clone(&self.given)
+    }
+
     pub fn pending_slots(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
     }
@@ -1914,6 +1948,7 @@ impl SlotPool {
             state.spare.push(meta.frame);
             self.close_chunk(slot.chunk, physical);
         }
+        self.given.tell();
     }
 
     fn close_chunk(&mut self, logical: u32, physical: u32) {
