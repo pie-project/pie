@@ -3280,6 +3280,56 @@ mod tests {
         a_launch_waits_for_the_copy_queued_ahead_of_it();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
+        a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
+    }
+
+    /// The lane refuses by name a step whose token rows (or lanes) pass the
+    /// rung the engine holds, before the engine sees it (this engine panics
+    /// on any submit); one within it goes on to the engine.
+    fn a_step_wider_than_the_rung_the_engine_holds_never_reaches_it() {
+        const ENGINE: usize = 9207;
+        crate::store::shared::set_engine_rows_for_test(ENGINE, 2);
+        let mut lane = Lane::spawn(
+            ENGINE,
+            Some(Box::new(PanickingEngine)),
+            Arc::new(SchedulerStats::default()),
+        );
+        let frame = |lanes: u32| crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: (0..lanes)
+                        .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
+                        .collect(),
+                    attachments: Vec::new(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: Vec::new(),
+                completions: Vec::new(),
+                member_lanes: Vec::new(),
+                instances: vec![::engine::InstanceId(0); lanes as usize],
+            }],
+        };
+        let answer = |lanes: u32| {
+            let reply = lane.fire(frame(lanes), false);
+            crate::rt::block_on(async {
+                crate::rt::time::timeout(Duration::from_secs(10), reply).await
+            })
+            .expect("answered")
+            .expect("answered")
+        };
+        let Err(wide) = answer(3) else {
+            panic!("past the rung: refused");
+        };
+        assert!(
+            wide.contains("3 token rows") && wide.contains("the rung the engine was told"),
+            "refused by name: {wide}"
+        );
+        let Err(narrow) = answer(2) else {
+            panic!("the engine panics on what reaches it");
+        };
+        assert!(narrow.contains("panic"), "it reached the engine: {narrow}");
+        let _ = lane.shutdown();
     }
 
     /// A browser's single thread lands the batch a close waits on only after

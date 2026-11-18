@@ -132,6 +132,25 @@ fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
 /// engine's shared pool that is not handed out (its chunk not open for the
 /// shape, or the slot free in it) is refused, saying which: a page table
 /// entry the engine would read or write through unassigned memory.
+/// A step of `frame` wider than the rung the engine holds, `held` rows
+/// ([`crate::store::shared::engine_rows`]): its token rows or its lanes
+/// past them. The engine lays a fire's inputs for the rung it was told, so
+/// such a step would run its tables past their regions; it is refused by
+/// name before the engine stages anything.
+fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
+    frame.steps.iter().enumerate().find_map(|(at, step)| {
+        let rows = step.submission.rows();
+        let lanes = u32::try_from(step.submission.lanes.len()).unwrap_or(u32::MAX);
+        (rows > held || lanes > held).then(|| {
+            format!(
+                "step {at} of a fire takes {rows} token rows over {lanes} lanes, past the \
+                 {held} rows of the activation rung the engine holds: no step wider than the \
+                 rung the engine was told reaches it"
+            )
+        })
+    })
+}
+
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()) {
@@ -464,10 +483,15 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let fault = unassigned_ref(engine_idx, &frame);
+                        let fault = past_rung(
+                            crate::store::shared::engine_rows(engine_idx),
+                            &frame,
+                        )
+                        .or_else(|| unassigned_ref(engine_idx, &frame));
                         let result = match engine.as_mut() {
-                            // A fire naming a slot nobody was handed is
-                            // refused before the engine reads it.
+                            // A fire wider than the rung the engine holds,
+                            // or naming a slot nobody was handed, is refused
+                            // before the engine reads it.
                             _ if fault.is_some() => Err(fault.unwrap_or_default()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
