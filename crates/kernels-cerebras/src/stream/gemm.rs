@@ -851,6 +851,9 @@ pub enum Refusal {
     Region(String),
     /// Any other.
     Other(String),
+    /// A line's window open ([`crate::check::hazard::lines`]): the program would hang; the
+    /// reason given before any other.
+    Window(String),
 }
 
 impl Refusal {
@@ -862,7 +865,8 @@ impl Refusal {
             | Refusal::Segment(m)
             | Refusal::Q(m)
             | Refusal::Region(m)
-            | Refusal::Other(m) => m,
+            | Refusal::Other(m)
+            | Refusal::Window(m) => m,
         }
     }
 
@@ -899,7 +903,8 @@ impl From<Refusal> for String {
             | Refusal::Segment(m)
             | Refusal::Q(m)
             | Refusal::Region(m)
-            | Refusal::Other(m) => m,
+            | Refusal::Other(m)
+            | Refusal::Window(m) => m,
         }
     }
 }
@@ -912,9 +917,31 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     Ok(p)
 }
 
-/// [`place`] but the weight streams (their words counted, a search's candidate).
-#[allow(clippy::too_many_lines)]
+/// [`place`] but the weight streams (their words counted, a search's candidate). Refused where
+/// a line's queue is left open to a colour it is not bound to ([`crate::check::hazard::lines`]:
+/// a PE's ramp held, the row stopped; 1550).
 pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> Result<GemmProgram, Refusal> {
+    let p = laid(l, c, r, kbm)?;
+    let open = crate::check::hazard::lines(&p, crate::emit::gemm::GPE_OPS);
+    if let Some(w) = open.first() {
+        return Err(Refusal::Window(refuse(
+            &l.trace,
+            format!(
+                "{w}{}",
+                if open.len() > 1 {
+                    format!(" (and {} more)", open.len() - 1)
+                } else {
+                    String::new()
+                }
+            ),
+        )));
+    }
+    Ok(p)
+}
+
+/// [`placed`] but the line windows' check.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn laid(l: &Lowering, c: u32, r: u32, kbm: u32) -> Result<GemmProgram, Refusal> {
     let t = &l.trace;
     let per = l.request_rows();
     let total = per * l.batch.max(1);
@@ -1646,6 +1673,7 @@ pub fn candidates(
     let mut all: Vec<(f64, GemmProgram)> = Vec::new();
     // the reason given: its message, and whether it is a cut that does not divide evenly
     let mut why: Option<(String, bool)> = None;
+    let mut window: Option<String> = None;
     // the columns first: a candidate's regions print at its chunk
     let mut ok_c: BTreeMap<u32, bool> = BTreeMap::new();
     for (c, r, kbm) in cands {
@@ -1682,7 +1710,11 @@ pub fn candidates(
                 if e.ends_columns() {
                     ok_c.insert(c, false);
                 }
-                // (the reason a cut that divides evenly fails, before one that does not)
+                // (a line's window first: no other cut mends it; then the reason a cut that
+                // divides evenly fails, before one that does not)
+                if let Refusal::Window(m) = &e {
+                    window = Some(m.clone());
+                }
                 if why.as_ref().is_none_or(|w| w.1 && !e.uneven()) {
                     let uneven = e.uneven();
                     why = Some((e.into(), uneven));
@@ -1690,7 +1722,7 @@ pub fn candidates(
             }
         }
     }
-    let why = why.map(|w| w.0).unwrap_or_default();
+    let why = window.or(why.map(|w| w.0)).unwrap_or_default();
     Ok((all, why))
 }
 

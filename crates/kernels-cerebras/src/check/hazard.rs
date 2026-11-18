@@ -818,7 +818,7 @@ mod tests {
     }
 
     /// flux2-mini's denoise in the GEMM regime, laid at 32 x 8 PEs, key blocks of 8 (as `m2`),
-    /// as emitted.
+    /// as emitted, its line windows not checked.
     fn mini_gemm() -> crate::stream::gemm::GemmProgram {
         let o = crate::stream::Options {
             reading: "denoise".into(),
@@ -833,7 +833,7 @@ mod tests {
             .unwrap()
             .trace(poem_ir::Platform::Cerebras);
         let l = crate::stream::gemm::lower(&t, &o, &[]).unwrap_or_else(|e| panic!("{e}"));
-        crate::stream::gemm::placed(&l, 32, 8, 8).unwrap_or_else(|e| panic!("{}", e.text()))
+        crate::stream::gemm::laid(&l, 32, 8, 8).unwrap_or_else(|e| panic!("{}", e.text()))
     }
 
     /// The GEMM PE's lines: the column line (iq6, `KF` / `KB`) in its attention; the row line's
