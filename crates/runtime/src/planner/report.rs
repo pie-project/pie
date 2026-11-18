@@ -147,6 +147,8 @@ impl ResidencyPlanner {
             proc.state = Residency::Resident;
             proc.progressed = false;
             proc.roles_short = None;
+            proc.roles_free_retry = None;
+            proc.roles_free_short = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
             Some(proc.signal.clone())
@@ -219,6 +221,11 @@ impl ResidencyPlanner {
                     pieces: need.1,
                     pages,
                 });
+                // It went again on free runs of this need and was short all
+                // the same: the need understates its unpark.
+                if proc.roles_free_retry.take() == Some(need) {
+                    proc.roles_free_short = Some(need);
+                }
             }
         });
         self.requeue_restore(pid);

@@ -5731,6 +5731,7 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        self.pools.weights_ready()?;
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.stage(step)

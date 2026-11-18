@@ -3169,3 +3169,88 @@ async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_
         "the chunks' occupant is moved for the restore's run"
     );
 }
+
+/// Mac Pro's M5 livelock (7929eb792, 500 at once): nothing resident, the
+/// head restore short of role slots, and free runs of its need standing,
+/// so the planner sent it again, its unpark came back short (the need
+/// understated what the unpark takes), and so on 20 million times, never
+/// reclaiming the idle cache that held the device. A restore sent again
+/// on free runs of a need and short of that need once more marks it
+/// understated; a different need does not.
+#[test]
+fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let restoring = |planner: &Arc<ResidencyPlanner>, retried: Option<(u32, u32)>| {
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Restoring;
+            proc.roles_free_retry = retried;
+        });
+    };
+    restoring(&planner, Some((2, 1)));
+    planner.requeue_restore_roles(pid, (1, 1));
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
+        None,
+        "a different need: not understated"
+    );
+    restoring(&planner, Some((1, 1)));
+    planner.requeue_restore_roles(pid, (1, 1));
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
+        Some((1, 1)),
+        "short again on free runs of the same need: understated"
+    );
+    assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_retry), None);
+}
+
+/// The same livelock, the planner's side: the head restore's need is known
+/// to understate its unpark, and free runs of it stand; with nothing
+/// resident, it is no reason to send the restore again. Room is made for
+/// it: the idle cache holding chunks is reclaimed.
+#[tokio::test(flavor = "current_thread")]
+async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..4, 64));
+    pool.free.lock().extend(4..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let restoring = ProcessId::new_v4();
+    planner.register(restoring);
+    planner.note_admitted(restoring);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+        proc.roles_free_short = Some((1, 1));
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(pool.guest_room_free(1, 1), "free runs of its need stand");
+    assert!(planner.with_inner(|inner| inner.fleet_stalled()), "nothing resident");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if pool.cache.lock().is_empty() {
+            break;
+        }
+    }
+    assert!(pool.cache.lock().is_empty(), "the idle cache is reclaimed for it");
+    assert_eq!(
+        planner.stats.restore_roles_short.load(Ordering::Relaxed),
+        0,
+        "and no restore was sent on the understated need"
+    );
+}
