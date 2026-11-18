@@ -132,7 +132,6 @@ async = true
 # num_threads = 8          # simulator threads (default: the host's available parallelism; refused where the host cannot tell)
 
 [engine.wafer]             # all optional
-# preset = "9b"            # a named plan, a debug override (else the search's)
 # build = "never"          # refuse a program the cache does not hold (a chip session)
 # tiles = "memory"         # cut the checkpoint for each load instead of caching the cut
 
@@ -141,6 +140,7 @@ async = true
 [engine.debug]             # bench settings only; a load logs them
 # program = "<linked dir>"           # open this program instead of building one
 # weights = "<dir>[:<prefix>]"       # place these staged tiles instead of cutting the checkpoint
+# preset = "9b"                      # a named plan instead of the search's
 # set = "G2=12"                      # overrides of the plan's keys
 # levers = "DIAG:1,TSTAMP:1"         # kernel levers past the plan's
 ```

@@ -205,15 +205,14 @@ pub struct CerebrasEngineOptions {
     /// the engine's default (off).
     #[serde(rename = "async")]
     pub asynchronous: Option<bool>,
-    /// `[engine.wafer]`: `preset` (the family's preset by name, else the first that builds),
-    /// `build` (`"on_load"`, or `"never"`: refuse a program not compiled before), `tiles`
+    /// `[engine.wafer]`: `build` (`"on_load"`, or `"never"`: refuse a program not compiled before), `tiles`
     /// (`"cache"`, or `"memory"`: cut for each load). Checked by the engine at boot.
     pub wafer: Option<toml::Table>,
     /// `[engine.toolchain]`: where the SDK image's toolchain is when off its default layout
     /// (`cslc`, `cslang_root`, `python`, `sdk_lib`, `compile_timeout`).
     pub toolchain: Option<toml::Table>,
     /// `[engine.debug]`: bench and experiment settings (`program`, `link`, `stream_fabric`,
-    /// `weights`, `set`, `levers`, `stream_processes`); a load with any logs them.
+    /// `weights`, `preset`, `set`, `levers`, `stream_processes`); a load with any logs them.
     pub debug: Option<toml::Table>,
 }
 

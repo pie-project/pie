@@ -234,7 +234,7 @@ pub fn prepare(
         tracing::warn!(settings = ?knobs, "cerebras: debug settings in force");
     }
     let ask = Ask {
-        preset: cfg.wafer.preset.clone(),
+        preset: knobs.preset.clone(),
         set: knobs.set.clone(),
         positions: max_model_len,
     };

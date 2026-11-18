@@ -60,8 +60,6 @@ impl Default for Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Wafer {
-    /// The family's preset by name (else the first that builds).
-    pub preset: Option<String>,
     pub build: Build,
     pub tiles: Tiles,
     /// A stream reading's rows a class a step (a diffusion poem's text, context and latent
@@ -114,7 +112,10 @@ pub struct Debug {
     /// Place these staged tiles (`<dir>` or `<dir>:<file prefix>`) instead of cutting the
     /// checkpoint.
     pub weights: Option<String>,
-    /// Overrides of the preset's keys (`K=V,...`).
+    /// A named plan instead of the search's (`kernels_cerebras::pins`: a measured program's or
+    /// a simulator plan's name).
+    pub preset: Option<String>,
+    /// Overrides of the plan's keys (`K=V,...`).
     pub set: String,
     /// Kernel levers past the preset's (`K:V,...`).
     pub levers: String,
@@ -168,12 +169,14 @@ mod tests {
         assert_eq!(c, Config::default());
         let c = of(
             "[cerebras]\ncmaddr = \"10.0.0.1:9000\"\nlookahead = 32\nasync = true\n\
-                    [cerebras.wafer]\npreset = \"9b\"\nbuild = \"never\"\n\
-                    [cerebras.toolchain]\ncompile_timeout = 600\n",
+                    [cerebras.wafer]\nbuild = \"never\"\n\
+                    [cerebras.toolchain]\ncompile_timeout = 600\n\
+                    [cerebras.debug]\npreset = \"9b\"\n",
         )
         .unwrap();
         assert_eq!(c.lookahead, Some(32));
         assert_eq!(c.wafer.build, Build::Never);
+        assert_eq!(c.debug().preset.as_deref(), Some("9b"));
         assert_eq!(c.toolchain.compile_timeout, Some(600));
         assert_eq!(Config::parse(c.render().unwrap().as_bytes()).unwrap(), c);
     }
