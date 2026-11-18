@@ -1,3 +1,4 @@
+use super::ProcessId;
 use std::collections::HashSet;
 
 use crate::store::rs::RsUnits;
@@ -16,6 +17,98 @@ pub struct ChunkStats {
     pub pages: (u32, u32),
     /// The state slots' and buffer (or ring) pages', `(free, total)`.
     pub rs: (RsUnits, RsUnits),
+}
+
+/// Physical chunks of a shared pool by what holds them
+/// ([`PoolPort::chunk_occupants`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkMap {
+    /// Each chunk some candidate's pages lie in: the slots it holds in
+    /// all, and each candidate's pages there that would leave the device
+    /// with it.
+    pub held: Vec<ChunkHeld>,
+    /// The chunks free now.
+    pub free: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkHeld {
+    pub chunk: u32,
+    pub used: u32,
+    pub by: Vec<(ProcessId, u32)>,
+}
+
+impl ChunkHeld {
+    /// Whether evicting its candidates empties it: every slot it holds is
+    /// theirs to move (no cache entry's, no running set's but theirs).
+    #[must_use]
+    pub fn emptiable(&self) -> bool {
+        self.by.iter().map(|&(_, pages)| pages).sum::<u32>() >= self.used
+    }
+
+    fn pages(&self) -> u32 {
+        self.by.iter().map(|&(_, pages)| pages).sum()
+    }
+}
+
+impl ChunkMap {
+    /// The processes whose eviction empties the cheapest `pieces` disjoint
+    /// runs of `run` adjacent chunks, each chunk free or emptiable
+    /// ([`ChunkHeld::emptiable`]), cost the pages moved; `None` where no
+    /// such runs stand.
+    #[must_use]
+    pub fn cheapest_runs(&self, run: u32, pieces: u32) -> Option<Vec<ProcessId>> {
+        let run = run.max(1);
+        let free: std::collections::BTreeSet<u32> = self.free.iter().copied().collect();
+        let held: std::collections::BTreeMap<u32, &ChunkHeld> = self
+            .held
+            .iter()
+            .filter(|chunk| chunk.emptiable())
+            .map(|chunk| (chunk.chunk, chunk))
+            .collect();
+        let cost = |chunk: u32| -> Option<u32> {
+            if free.contains(&chunk) {
+                Some(0)
+            } else {
+                held.get(&chunk).map(|held| held.pages())
+            }
+        };
+        // Every window of `run` adjacent chunks each free or emptiable, by
+        // its cost; then the cheapest disjoint ones.
+        let starts: std::collections::BTreeSet<u32> =
+            free.iter().chain(held.keys()).copied().collect();
+        let mut windows: Vec<(u32, u32)> = starts
+            .iter()
+            .filter_map(|&first| {
+                (first..first + run)
+                    .map(cost)
+                    .try_fold(0u32, |sum, cost| cost.map(|cost| sum + cost))
+                    .map(|sum| (sum, first))
+            })
+            .collect();
+        windows.sort_unstable();
+        let mut taken: Vec<(u32, u32)> = Vec::new();
+        for (sum, first) in windows {
+            if taken.len() as u32 == pieces {
+                break;
+            }
+            if taken.iter().all(|&(_, at)| first + run <= at || at + run <= first) {
+                taken.push((sum, first));
+            }
+        }
+        if (taken.len() as u32) < pieces {
+            return None;
+        }
+        let mut pids: Vec<ProcessId> = taken
+            .iter()
+            .flat_map(|&(_, first)| first..first + run)
+            .filter_map(|chunk| held.get(&chunk))
+            .flat_map(|held| held.by.iter().map(|&(pid, _)| pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        Some(pids)
+    }
 }
 
 pub trait PoolPort: Send + Sync + 'static {
@@ -94,6 +187,14 @@ pub trait PoolPort: Send + Sync + 'static {
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         let _ = chunks;
         0
+    }
+    /// Which of `pids` hold device kv pages in which physical chunk of a
+    /// shared pool, and the chunks free now ([`ChunkMap`]): what a bind
+    /// short of whole chunks finds emptiable by evicting them. Empty where
+    /// the pool keeps no chunks.
+    fn chunk_occupants(&self, pids: &[ProcessId]) -> ChunkMap {
+        let _ = pids;
+        ChunkMap::default()
     }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
@@ -260,6 +361,69 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| shared.lock().unwrap().pool().free_chunk_runs(run) >= pieces)
+    }
+
+    fn chunk_occupants(&self, pids: &[ProcessId]) -> ChunkMap {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return ChunkMap::default();
+        };
+        let Some(shared) = stores.shared.clone() else {
+            return ChunkMap::default();
+        };
+        let sets =
+            crate::inferlet::process::residency::kv_working_sets_for(pids, self.model, self.engine);
+        // The guest state they hold in Instance chunks (dead between fires,
+        // given back at their park), read before the pools' locks: the
+        // roles take the device pool's lock themselves.
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_chunk_slots(pids))
+            .unwrap_or_default();
+        // The kv lock first, then the shared pool's: the order kv takes.
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-chunks", |kv| {
+            let pool = shared.lock().unwrap();
+            let Some(list) = pool.list() else {
+                return ChunkMap::default();
+            };
+            let mut by: std::collections::BTreeMap<u32, (u32, Vec<(ProcessId, u32)>)> =
+                std::collections::BTreeMap::new();
+            for (&pid, sets) in pids.iter().zip(sets) {
+                let Some(sets) = sets else {
+                    continue;
+                };
+                let mut counts: std::collections::BTreeMap<u32, u32> = Default::default();
+                for page in kv.movable_resident_pages(&sets) {
+                    let slot = pool.slot(list.pool, page.0);
+                    if let Some(physical) = pool.pool().physical(slot.chunk) {
+                        *counts.entry(physical).or_default() += 1;
+                        by.entry(physical)
+                            .or_insert_with(|| (pool.pool().chunk_used(slot.chunk), Vec::new()));
+                    }
+                }
+                for (physical, pages) in counts {
+                    by.get_mut(&physical).expect("entered").1.push((pid, pages));
+                }
+            }
+            for (logical, pid, slots) in guest {
+                if let Some(physical) = pool.pool().physical(logical) {
+                    let entry = by
+                        .entry(physical)
+                        .or_insert_with(|| (pool.pool().chunk_used(logical), Vec::new()));
+                    match entry.1.iter_mut().find(|(held, _)| *held == pid) {
+                        Some((_, count)) => *count += slots,
+                        None => entry.1.push((pid, slots)),
+                    }
+                }
+            }
+            ChunkMap {
+                held: by
+                    .into_iter()
+                    .map(|(chunk, (used, by))| ChunkHeld { chunk, used, by })
+                    .collect(),
+                free: pool.pool().open_chunks(),
+            }
+        })
     }
 
     fn chunks_as_pages(&self, chunks: u32) -> u32 {

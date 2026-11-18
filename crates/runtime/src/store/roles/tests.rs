@@ -166,6 +166,23 @@ pub(crate) struct FakeEngine {
     /// The instances it closed: as the engine's plane, it holds them no
     /// longer and refuses a rebind of one by name.
     closed: Vec<InstanceId>,
+    /// Channels closed while an instance was still bound on them: kept
+    /// registered until the last such instance closes
+    /// (`Engine::close_channel`).
+    closing: Vec<ChannelId>,
+    /// Channels released: a rebind of one is refused by name, as an engine
+    /// that no longer holds the channel refuses it.
+    released: Vec<ChannelId>,
+}
+
+impl FakeEngine {
+    /// Whether an instance it has not closed is bound on channel `id`
+    /// (instance `k + 1` is the `k`th binding).
+    fn bound_on(&self, id: ChannelId) -> bool {
+        self.bindings.iter().enumerate().any(|(k, binding)| {
+            binding.channels.contains(&id) && !self.closed.contains(&InstanceId(k as u64 + 1))
+        })
+    }
 }
 
 impl Engine for FakeEngine {
@@ -301,13 +318,37 @@ impl Engine for FakeEngine {
                 "program::plane: no instance {id}"
             )));
         }
+        if let Rebind::Channel { id, .. } = &rebind
+            && self.released.contains(id)
+        {
+            return Err(::engine::Error::Program(format!(
+                "channel {id} is not registered on this engine"
+            )));
+        }
         self.rebinds.push(rebind);
         Ok(())
     }
 
     fn close_instance(&mut self, id: InstanceId) -> ::engine::Result<u64> {
         self.closed.push(id);
+        let closing = std::mem::take(&mut self.closing);
+        for channel in closing {
+            if self.bound_on(channel) {
+                self.closing.push(channel);
+            } else {
+                self.released.push(channel);
+            }
+        }
         Ok(0)
+    }
+
+    fn close_channel(&mut self, id: ChannelId) -> ::engine::Result<()> {
+        if self.bound_on(id) {
+            self.closing.push(id);
+        } else {
+            self.released.push(id);
+        }
+        Ok(())
     }
 }
 
@@ -508,6 +549,75 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
     assert_eq!(held(&device), before);
 }
 
+/// A channel the lane closes while its process is parked, with an instance
+/// still bound on it: the engine keeps it registered (closing), the roles
+/// keep its slots, the restore's rebind of its ring is served, and the
+/// instance's close then releases it in the engine and its slots here.
+#[test]
+fn a_channel_closed_while_parked_is_rebound_at_unpark_and_freed_with_its_instance() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0, "the instance and its channel parked");
+
+    // The lane closes the channel while it is parked: the engine first,
+    // then the roles, as `QueuedItem::CloseChannels` runs.
+    engine.close_channel(channel).unwrap();
+    roles.lock().unwrap().close_channel(channel);
+    assert!(
+        !roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Channel(channel))
+            .is_empty(),
+        "a closed channel's ring stays owned while its instance is bound"
+    );
+
+    // The restore: the closed channel comes back with its instance and is
+    // rebound, as the lane runs it.
+    let stale = unpark(&roles, 1);
+    assert!(
+        stale
+            .iter()
+            .any(|rebind| matches!(rebind, Rebind::Channel { id, .. } if *id == channel)),
+        "the closed channel's ring moved with its instance: {stale:?}"
+    );
+    for rebind in stale {
+        crate::store::roles::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(()))
+            .expect("every rebind of the restore is served, the closed channel's too");
+    }
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+    assert!(engine.rebinds.contains(&Rebind::Channel {
+        id: channel,
+        slots: roles.lock().unwrap().slots(Owner::Channel(channel)),
+    }));
+    assert!(!engine.released.contains(&channel));
+
+    // The instance's close releases the channel: in the engine, then its
+    // slots here, all of them back.
+    close_on_lane(&roles, &mut engine, instance);
+    assert!(engine.released.contains(&channel));
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Channel(channel))
+            .is_empty(),
+        "the closed channel's ring goes back with its last instance"
+    );
+    assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), before);
+}
+
 #[test]
 fn an_item_closed_while_parked_gives_back_its_host_slots() {
     let Pools {
@@ -681,7 +791,19 @@ fn a_ring_past_a_slot_registers_parks_and_unparks_as_one_run() {
         .find(|copy| copy.shape == CHANNEL)
         .unwrap()
         .clone();
-    assert!(adjacent(&ring.host, PER_CHUNK), "a run on the host too");
+    // The copy carries every channel item of the process; the ring's own
+    // run (where its device run lies in the copy) is a run on the host too.
+    // Its single-slot items lie in a chunk of their own, never beside it.
+    let at = ring
+        .device
+        .iter()
+        .position(|&slot| slot == slots[0])
+        .expect("the ring's run in the copy");
+    assert_eq!(&ring.device[at..at + slots.len()], &slots[..]);
+    assert!(
+        adjacent(&ring.host[at..at + slots.len()], PER_CHUNK),
+        "a run on the host too"
+    );
     roles.lock().unwrap().commit(park);
     let unpark = roles
         .lock()
