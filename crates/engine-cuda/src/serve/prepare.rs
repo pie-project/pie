@@ -186,6 +186,58 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+/// What a class of a body's ladder reads out at its rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyReads {
+    /// Its lanes' last rows, through the readout plane: one a lane.
+    Last,
+    /// A drafter's verify (a class no plain request lands): a row it checks
+    /// a lane, up to the readouts a lane takes, through the readout plane.
+    Verify,
+    /// Every row of its rung, off a tokens-shaped plane.
+    Rows,
+}
+
+/// The readout rows a body carries, and what makes them up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BodyReadouts {
+    last: u32,
+    verified: u32,
+    every: u32,
+    ceiling: u32,
+}
+
+/// The readout rows a body of `reads` (each class's reading at its rung)
+/// carries. The readout plane's rows (last rows and verified rows) are the
+/// lanes', which every class of the fire shares: summed over the classes,
+/// they are capped once at `plane`, the rows the arena lays the plane for,
+/// so the carve never passes the slot. Rows read off a tokens-shaped plane
+/// add on; no readout passes the fire's `bucket`.
+fn body_readouts(
+    reads: &[(BodyReads, u32)],
+    lane_ceiling: u32,
+    max_lanes: u32,
+    per_lane: u32,
+    plane: u32,
+    bucket: u32,
+) -> BodyReadouts {
+    let (mut last, mut verified, mut every) = (0u32, 0u32, 0u32);
+    for &(reads, rung) in reads {
+        match reads {
+            BodyReads::Last => last += rung.min(lane_ceiling),
+            BodyReads::Verify => verified += rung.min(lane_ceiling.saturating_mul(per_lane)),
+            BodyReads::Rows => every += rung,
+        }
+    }
+    let readout = (last.min(max_lanes) + verified).min(plane);
+    BodyReadouts {
+        last,
+        verified,
+        every,
+        ceiling: (readout + every).min(bucket),
+    }
+}
+
 /// The rows a fire's kernels write through its readout plane: a readout as
 /// tall as the fire is launched at the fire's bucket, so the plane must
 /// hold the bucket, not only the rows read out.
@@ -1800,27 +1852,37 @@ impl Shell {
         } else {
             ladder.rungs()
         };
-        let (last_rows, every_row) =
-            rungs
-                .iter()
-                .fold((0, 0), |(last, every), &(class, rung)| {
-                    match self.exports.readback(class as usize) {
-                        Some(out) if !out.decl.readout => (last, every + rung),
-                        None if !self.exports.reads_readout_rows() => (last, every + rung),
-                        _ if !self.landing[class as usize]
-                            .iter()
-                            .any(poem_ir::Request::plain) =>
-                        {
-                            let per_lane = self.budget.readouts_per_lane.max(1);
-                            (
-                                last,
-                                every + rung.min(lane_ceiling.saturating_mul(per_lane)),
-                            )
-                        }
-                        _ => (last + rung.min(lane_ceiling), every),
+        let per_lane = self.budget.readouts_per_lane.max(1);
+        let reads: Vec<(BodyReads, u32)> = rungs
+            .iter()
+            .map(|&(class, rung)| {
+                let reads = match self.exports.readback(class as usize) {
+                    Some(out) if !out.decl.readout => BodyReads::Rows,
+                    None if !self.exports.reads_readout_rows() => BodyReads::Rows,
+                    _ if !self.landing[class as usize]
+                        .iter()
+                        .any(poem_ir::Request::plain) =>
+                    {
+                        BodyReads::Verify
                     }
-                });
-        let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
+                    _ => BodyReads::Last,
+                };
+                (reads, rung)
+            })
+            .collect();
+        let BodyReadouts {
+            last: last_rows,
+            verified,
+            every: every_row,
+            ceiling: readout_ceiling,
+        } = body_readouts(
+            &reads,
+            lane_ceiling,
+            max_lanes,
+            per_lane,
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budget)).unwrap_or(u32::MAX),
+            composition.bucket(),
+        );
         let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
         let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
         // Why a fire of a load that records bodies walks its plan, for the
@@ -1847,8 +1909,8 @@ impl Shell {
                 if bodied && !readouts_fit {
                     format!(
                         "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
-                         {last_rows} last rows under {max_lanes} lanes, {every_row} every row, \
-                         lane ceiling {lane_ceiling})",
+                         {last_rows} last rows under {max_lanes} lanes, {verified} verified \
+                         rows, {every_row} every row, lane ceiling {lane_ceiling})",
                         readout_rows.len(),
                         composition.lane_count(),
                         readout_ceiling,
@@ -2167,7 +2229,34 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_cell, fold_held, readout_extent};
+    use super::{BodyReads, body_readouts, fold_cell, fold_held, readout_extent};
+
+    /// A mixed fire of two classes no plain request lands (a drafter's
+    /// verifies) at the load's lanes reads out no more rows than the arena
+    /// lays the readout plane for: the lanes the two classes share are
+    /// counted once, not a class each (the size-only walk of bucket 256
+    /// carved 64 rows into qwen35-tiny's 32-row logits slot).
+    #[test]
+    fn a_mixed_body_reads_out_no_more_than_the_readout_plane_holds() {
+        const MAX_LANES: u32 = 2;
+        const PER_LANE: u32 = 16;
+        let plane = MAX_LANES * PER_LANE;
+        let verifies = [(BodyReads::Verify, 256), (BodyReads::Verify, 256)];
+        let body = body_readouts(&verifies, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
+        assert_eq!(body.ceiling, plane, "{body:?}");
+        // Last rows beside the verifies share the plane too.
+        let mixed = [(BodyReads::Last, 256), (BodyReads::Verify, 256)];
+        let body = body_readouts(&mixed, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
+        assert!(body.ceiling <= plane, "{body:?}");
+        // Rows off a tokens-shaped plane are no readout plane's: bounded by
+        // the bucket alone.
+        let rows = [(BodyReads::Verify, 256), (BodyReads::Rows, 64)];
+        let body = body_readouts(&rows, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
+        assert_eq!(body.ceiling, plane + 64, "{body:?}");
+        let rows = [(BodyReads::Rows, 256), (BodyReads::Last, 2)];
+        let body = body_readouts(&rows, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
+        assert_eq!(body.ceiling, 256, "{body:?}");
+    }
 
     #[test]
     fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
