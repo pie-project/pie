@@ -1061,6 +1061,8 @@ async fn a_throughput_rung_gives_room_back_to_waiting_binds_and_rises_once_none_
     grow.walk_rung().await;
     assert_eq!(fire_cap(ENGINE), 1, "cut to the live lane's rung");
     grant_rung(ENGINE, 1);
+    // Behind the retire fence, as every lower.
+    grow.walk_rung().await;
     grow.walk_rung().await;
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),

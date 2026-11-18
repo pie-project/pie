@@ -219,10 +219,13 @@ impl ResidencyPlanner {
         // of adjacent chunks): pages moved anywhere free none of them, so
         // the occupants of the cheapest chunks it could take, each free or
         // emptied whole by evicting them, are the picks, every one of them.
-        let shape = self.with_inner(|inner| match inner.queue.get(&victims.head).map(|w| &w.kind) {
-            Some(WaitKind::BindRoom { run, pieces, .. }) => Some((*run, *pieces)),
-            _ => None,
-        });
+        let shape =
+            self.with_inner(
+                |inner| match inner.queue.get(&victims.head).map(|w| &w.kind) {
+                    Some(WaitKind::BindRoom { run, pieces, .. }) => Some((*run, *pieces)),
+                    _ => None,
+                },
+            );
         let candidates = victims.preferred();
         let map = shape.map(|_| {
             let pids: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
@@ -630,6 +633,7 @@ impl ResidencyPlanner {
                 outcome,
                 notify,
                 yielded,
+                ..
             } = &mut waiter.kind
             else {
                 return ServeOutcome::Stale(rs);
@@ -710,7 +714,11 @@ mod chunk_picks_tests {
     #[test]
     fn a_bind_short_of_a_chunk_evicts_the_occupants_of_the_cheapest_emptiable_one() {
         let map = ChunkMap {
-            held: vec![held(1, 5, &[(1, 5)]), held(2, 4, &[(2, 2)]), held(3, 3, &[(3, 3)])],
+            held: vec![
+                held(1, 5, &[(1, 5)]),
+                held(2, 4, &[(2, 2)]),
+                held(3, 3, &[(3, 3)]),
+            ],
             free: vec![],
         };
         assert_eq!(map.cheapest_runs(1, 1), Some(vec![pid(3)]));
@@ -732,10 +740,13 @@ mod chunk_picks_tests {
         let mut pids = map.cheapest_runs(2, 1).unwrap();
         pids.sort_unstable();
         assert_eq!(pids, vec![pid(2), pid(3)], "7 and 8: two pages to move");
-        assert_eq!(map.cheapest_runs(2, 2), Some(vec![pid(1), pid(2), pid(3)]).map(|mut v| {
-            v.sort_unstable();
-            v
-        }));
+        assert_eq!(
+            map.cheapest_runs(2, 2),
+            Some(vec![pid(1), pid(2), pid(3)]).map(|mut v| {
+                v.sort_unstable();
+                v
+            })
+        );
         assert_eq!(map.cheapest_runs(3, 1), None, "no three adjacent");
     }
 
@@ -758,13 +769,20 @@ mod chunk_picks_tests {
         let (picked, wanted, occupants) =
             chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
         assert_eq!(occupants, vec![pid(3)]);
-        assert_eq!(picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(), vec![pid(3)]);
+        assert_eq!(
+            picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(),
+            vec![pid(3)]
+        );
         assert_eq!(wanted.pages, u32::MAX, "every occupant is picked");
         let (kept, same, _) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
         assert_eq!(kept.len(), 3);
         assert_eq!(same, deficit);
         let none = ChunkMap::default();
         let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
-        assert_eq!((kept.len(), same), (3, deficit), "no chunk empties: as before");
+        assert_eq!(
+            (kept.len(), same),
+            (3, deficit),
+            "no chunk empties: as before"
+        );
     }
 }

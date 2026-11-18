@@ -1884,7 +1884,10 @@ impl SlotPool {
             .partial
             .iter()
             .map(|(&class, chunks)| {
-                let free = chunks.iter().map(|&(std::cmp::Reverse(used), _, _)| u64::from(state.spc() - used)).sum();
+                let free = chunks
+                    .iter()
+                    .map(|&(std::cmp::Reverse(used), _, _)| u64::from(state.spc() - used))
+                    .sum();
                 (class, chunks.len(), free)
             })
             .collect()
@@ -2387,8 +2390,14 @@ impl SlotPool {
             assert_eq!(free + meta.used, state.spc());
             let partial = meta.used < state.spc();
             assert_eq!(
-                state.partial.get(&meta.class).is_some_and(|chunks| chunks
-                    .contains(&(Reverse(meta.used), physical, logical))),
+                state
+                    .partial
+                    .get(&meta.class)
+                    .is_some_and(|chunks| chunks.contains(&(
+                        Reverse(meta.used),
+                        physical,
+                        logical
+                    ))),
                 partial
             );
             assert!(
@@ -2806,7 +2815,13 @@ mod tests {
     /// fixed shape, eleven of them free for state (the null chunk and the
     /// top segment's activation aside).
     fn run_pool() -> SlotPool {
-        SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
+        SlotPool::new(facts_with(
+            16,
+            4,
+            4,
+            &[(ShapeKind::Fixed, 1024)],
+            &[(16, 4)],
+        ))
     }
 
     /// A freed run's hole is one the next run of its length takes exactly:
@@ -2819,11 +2834,20 @@ mod tests {
         let a = pool.acquire_run(holder, 0, 483).unwrap();
         let singles = pool.acquire(holder, 0, 10).unwrap();
         let b = pool.acquire_run(holder, 0, 483).unwrap();
-        assert_eq!(a[0].chunk, b[0].chunk, "two runs of one length share a chunk");
-        assert!(singles.iter().all(|slot| slot.chunk != a[0].chunk), "no single among runs");
+        assert_eq!(
+            a[0].chunk, b[0].chunk,
+            "two runs of one length share a chunk"
+        );
+        assert!(
+            singles.iter().all(|slot| slot.chunk != a[0].chunk),
+            "no single among runs"
+        );
         pool.release(holder, &a, 0);
         let again = pool.acquire_run(holder, 0, 483).unwrap();
-        assert_eq!(again, a, "the next run of its length takes the hole exactly");
+        assert_eq!(
+            again, a,
+            "the next run of its length takes the hole exactly"
+        );
         pool.check();
     }
 
@@ -2840,7 +2864,11 @@ mod tests {
         pool.release(holder, &b, 0);
         assert_eq!(pool.free_chunks(), free, "the chunk is whole again");
         let other = pool.acquire_run(holder, 0, 700).unwrap();
-        assert_eq!(pool.free_chunks(), free - 1, "a run of another length opens it");
+        assert_eq!(
+            pool.free_chunks(),
+            free - 1,
+            "a run of another length opens it"
+        );
         assert_eq!(other.len(), 700);
         pool.check();
     }
@@ -2864,7 +2892,9 @@ mod tests {
         // Holes scattered among the single slots: no run of 483 there.
         let scattered: Vec<Slot> = singles.iter().step_by(2).copied().collect();
         pool.release(holder, &scattered, 0);
-        let second = pool.acquire_run(holder, 0, 483).expect("the run's own chunk holds it");
+        let second = pool
+            .acquire_run(holder, 0, 483)
+            .expect("the run's own chunk holds it");
         assert_eq!(second[0].chunk, first[0].chunk);
         pool.check();
     }

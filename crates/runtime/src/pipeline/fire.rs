@@ -1068,9 +1068,8 @@ impl RungAsk {
             quorum: self.quorum,
         };
         let kv = self.kv.clone();
-        let epoch_now = move || {
-            crate::store::registry::with_kv_lock(&kv, "rung-rise", |kv| kv.current_epoch())
-        };
+        let epoch_now =
+            move || crate::store::registry::with_kv_lock(&kv, "rung-rise", |kv| kv.current_epoch());
         let mover = crate::store::shared::programs::LaneMover {
             engine,
             epoch_now: &epoch_now,
@@ -5286,7 +5285,14 @@ async fn fire_device_geometry<C: FireContext>(
         return Ok(Err(refusal));
     }
     let rows = counted.ask();
-    let rung_ask = ask_rung(&stores, ws.engine, pid, quorum_pipeline_id, rows as usize, rows);
+    let rung_ask = ask_rung(
+        &stores,
+        ws.engine,
+        pid,
+        quorum_pipeline_id,
+        rows as usize,
+        rows,
+    );
     if let Some(ask) = rung_ask.as_ref()
         && let Err(refusal) = ask.wait(rows).await
     {
@@ -5818,13 +5824,6 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
-    /// Yields until `task` has run as far as it can without an event.
-    async fn settle_tasks() {
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// A stale grant is quoted again on drift (the demand changed), not by
     /// count, and refused when stale against the demand it was quoted for.
     #[test]
@@ -6330,8 +6329,6 @@ mod static_admission_tests {
 /// held until room is given back.
 #[cfg(test)]
 mod rung_wait_tests {
-    use std::sync::{Arc, Mutex};
-
     /// The MTP k=4 stall: a device-carried decode's fires of two rows sat
     /// queued behind a rung the walker had lowered to one row, since the
     /// scheduler's lane count asks one row a lane and nothing asked for
@@ -6395,8 +6392,8 @@ mod rung_wait_tests {
         assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
 
         // A two-row pass is cut and its fire staged under that cap.
-        let ask =
-            super::ask_rung(&stores, ENGINE, pid, pid, 2, 2).expect("two rows ask whatever the cap");
+        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2)
+            .expect("two rows ask whatever the cap");
         assert_eq!(ask.wait(2).await, Ok(()));
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
         ask.until_settled(&fire);

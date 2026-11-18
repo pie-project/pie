@@ -93,7 +93,10 @@ fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
     park_allocation(&mut inner, pids[0], 4);
     let (key, waiter) = inner.unmet_head().expect("a head");
     assert_eq!(key.0.seq, 1, "the older kv waiter before the younger rise");
-    assert!(matches!(waiter.kind, WaitKind::Allocation { rise: false, .. }));
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: false, .. }
+    ));
 
     let (mut inner, pids) = fleet(&[
         (1, Residency::Resident, true),
@@ -103,7 +106,10 @@ fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
     park_rise(&mut inner, pids[0], 8);
     let (key, waiter) = inner.unmet_head().expect("a head");
     assert_eq!(key.0.seq, 1, "the older rise before the younger kv waiter");
-    assert!(matches!(waiter.kind, WaitKind::Allocation { rise: true, .. }));
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: true, .. }
+    ));
 }
 
 /// A restore whose role slots found no room is queued again, a waiter: it

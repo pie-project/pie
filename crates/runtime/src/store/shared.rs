@@ -326,9 +326,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let goal = pool.rung_for(rows);
     // A throughput raise is ordered after every process demand waiting for
     // room: while one waits it takes no room ([`SharedPool::demand_waits`]).
-    if pool.demand_waits(waits)
-        && pool.pool().act_chunks(goal) > pool.pool().act_reserved()
-    {
+    if pool.demand_waits(waits) && pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
         return;
     }
     let lifted = |rung: u32| {

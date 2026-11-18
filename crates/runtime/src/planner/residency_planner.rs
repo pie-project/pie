@@ -1275,7 +1275,10 @@ impl ResidencyPlanner {
         self.with_inner(|inner| {
             inner.queue.values().any(|waiter| {
                 waiter.is_unmet()
-                    && !matches!(waiter.kind, super::wait::WaitKind::Allocation { rise: true, .. })
+                    && !matches!(
+                        waiter.kind,
+                        super::wait::WaitKind::Allocation { rise: true, .. }
+                    )
             })
         })
     }
