@@ -557,6 +557,9 @@ impl Arena {
         if self.base != 0 {
             return Ok(());
         }
+        // Read only where a device allocates (its refusal names the pool).
+        #[cfg(not(feature = "device"))]
+        let _ = pool;
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
