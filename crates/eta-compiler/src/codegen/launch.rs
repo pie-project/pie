@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use eta_ir::container::{ChanDType, ExternDir, HostRole, PortSource};
 use eta_ir::op::{ChannelIndex, tags};
 use eta_ir::registry::{Port, Stage};
-use eta_ir::types::{Dtype, RngKind, ValueType, from_wire};
+use eta_ir::types::{Dtype, RngKind, ValueType, from_wire, to_wire};
 use eta_ir::validate::{BoundTrace, Direction};
 
 use crate::plan::{
@@ -78,6 +78,31 @@ impl LaunchOp {
     /// Every value the op reads, by the wire's rule ([`eta_ir::wire::reads`]).
     pub fn reads(&self) -> impl Iterator<Item = u32> + '_ {
         eta_ir::wire::reads(self.tag, &self.args, self.pred_payload)
+    }
+
+    /// The op this launch op is, its value ids the package's: what the
+    /// interpreter ([`crate::eval::interp::eval_op`]) evaluates. `None` for
+    /// a tag, dtype, shape or predicate the wire does not decode.
+    #[must_use]
+    pub fn to_op(&self) -> Option<eta_ir::op::Op> {
+        eta_ir::wire::OpWire {
+            tag: self.tag,
+            chan: self.channel.map_or(-1, i64::from),
+            name_idx: u16::try_from(self.name_index).ok()?,
+            args: self.args.clone(),
+            results: u32::from(self.result_count),
+            imm: self.imm,
+            imm2: self.imm2,
+            imm3: self.imm3,
+            pred_tag: self.pred_tag,
+            pred_payload: self.pred_payload,
+            lit_dtype: to_wire(self.lit_dtype)?,
+            lit_bits: self.lit_bits,
+            dtype: to_wire(self.dtype)?,
+            shape: self.shape.clone(),
+            kind: self.rng_kind as u8,
+        }
+        .to_op()
     }
 }
 

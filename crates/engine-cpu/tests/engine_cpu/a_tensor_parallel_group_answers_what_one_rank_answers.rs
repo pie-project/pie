@@ -108,6 +108,10 @@ fn word(trace: &Trace, tokens: usize) -> u64 {
 
 const PROMPT: [u32; 9] = [7, 300, 41, 511, 2, 96, 257, 13, 404];
 const NEXT: u32 = 77;
+/// The keys a lane holds, so a run of the score capture a query head.
+const CONTEXT: u32 = 64;
+/// The kv page a page's score sums.
+const PAGE: u32 = 16;
 
 /// A step's logits and its attention scores, a layer after another.
 type Read = [Vec<f32>; 2];
@@ -125,7 +129,9 @@ fn read(outs: Vec<Output>) -> Read {
 
 /// The prefill's and the decode's reads of one forward, `group` its rank.
 fn steps(trace: &Trace, group: Option<Group>) -> [Read; 2] {
-    let mut me = Forward::new(trace.clone(), group, &plane).expect("the micro loads");
+    let mut me = Forward::new(trace.clone(), group, &plane)
+        .expect("the micro loads")
+        .at_context(CONTEXT, PAGE);
     let first = me
         .step(&PROMPT, 0, word(trace, PROMPT.len()))
         .expect("the prefill runs");
@@ -168,14 +174,14 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
         assert_eq!(logits.len(), 512, "a micro's vocabulary");
         assert!(logits.iter().all(|v| v.is_finite()), "one rank's logits");
         let keys = PROMPT.len() + s;
-        assert_eq!(scores.len(), 4 * 8 * 2048, "a run per layer and head");
-        for run in scores.chunks(2048) {
-            let mass: f32 = run[..keys].iter().sum();
-            assert!(
-                (mass - 1.0).abs() < 1e-4 && run[keys..].iter().all(|&v| v == 0.0),
-                "a head's mass is over the keys it holds: {mass}"
-            );
-        }
+        let context = CONTEXT as usize;
+        assert_eq!(scores.len(), context, "one mass a key of the context");
+        // Each of the 4 layers adds its heads' average, a mass of one.
+        let mass: f32 = scores[..keys].iter().sum();
+        assert!(
+            (mass - 4.0).abs() < 1e-3 && scores[keys..].iter().all(|&v| v == 0.0),
+            "the row is the layers' mass over the keys the lane holds: {mass}"
+        );
     }
     for ranks in [2u32, 4, 8] {
         let split = lowered(&package, ranks);

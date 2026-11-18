@@ -3,9 +3,9 @@
 //! and the ids the paged kernels read slots by.
 //!
 //! A lane names slots by slot ref (`logical chunk * slots a chunk + index`).
-//! Until the runtime hands those out, a lane names today's page ids, and
-//! [`Seating`] seats each on a slot the first time it is named: the lowest
-//! free chunk opened for its shape, as the runtime's pool will.
+//! A lane that names no refs names page ids, and [`Seating`] seats each on a
+//! slot the first time it is named: the lowest free chunk opened for its
+//! shape, as the runtime's pool does.
 
 use engine::chunk::{ChunkTable, Evacuation};
 
@@ -475,7 +475,8 @@ impl Chunks {
         // anew inside that allocation by every fit after that fits in it;
         // only a fit that needs more (a measuring load's, past the least
         // range it armed over) allocates it again.
-        if self.range.flat_allocated() && u64::from(total) + u64::from(self.act) <= self.room_chunks()
+        if self.range.flat_allocated()
+            && u64::from(total) + u64::from(self.act) <= self.room_chunks()
         {
             return self.relay(pool, total, self.act, self.act_asked, held);
         }
@@ -1094,6 +1095,7 @@ impl Chunks {
                         }),
                 )
                 .collect(),
+            record_bytes: 0,
         }
     }
 }

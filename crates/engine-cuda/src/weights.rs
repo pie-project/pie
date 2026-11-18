@@ -357,15 +357,7 @@ pub(crate) fn release_pages(plane: &[u8]) {
     let first = at.next_multiple_of(PAGE);
     let end = (at + plane.len()) / PAGE * PAGE;
     if end > first {
-        // SAFETY: whole pages inside a live read-only file mapping; the
-        // advice drops their resident copies and changes no contents.
-        unsafe {
-            libc::madvise(
-                first as *mut core::ffi::c_void,
-                end - first,
-                libc::MADV_DONTNEED,
-            );
-        }
+        crate::device::alloc::drop_file_pages(first, end - first);
     }
 }
 

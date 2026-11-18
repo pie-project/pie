@@ -22,10 +22,6 @@ pub struct Diagnostics {
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
-    /// States no weight shape: every table and routed bank the weight cache
-    /// would stream stays dense on the device, as a load that predates the
-    /// cache seats it.
-    pub dense_weights: bool,
     /// States no expert shape: the routed banks stay dense on the device,
     /// while the tables streamed by their rows are stated.
     pub dense_experts: bool,
@@ -71,7 +67,6 @@ impl Default for Diagnostics {
             fuse_chains: true,
             sync_guard: None,
             chunk_bytes: None,
-            dense_weights: false,
             dense_experts: false,
             untabled_experts: false,
             one_window: false,
@@ -127,9 +122,6 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
-        if self.dense_weights {
-            words.push("dense-weights".to_string());
-        }
         if self.dense_experts {
             words.push("dense-experts".to_string());
         }
@@ -160,7 +152,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
-     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
      `dense-experts`, `untabled-experts`, `one-window`, `tier-inline`";
 
 impl std::str::FromStr for Diagnostics {
@@ -185,7 +177,6 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
-                "dense-weights" => diag.dense_weights = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "untabled-experts" => diag.untabled_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,

@@ -508,7 +508,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
     let n = vocab as usize;
     let mut counts = vec![0.0f32; n];
     let mut present = vec![0.0f32; n];
-    let mut mask = vec![1u8; n];
+    let mut mask = vec![true; n];
     let mut words = vec![u32::MAX; n.div_ceil(32)];
     for (i, u) in noise(seed ^ 0x55, 64, 0.0, n as f32)
         .into_iter()
@@ -518,7 +518,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
         match i % 4 {
             0 => counts[at] += 1.0,
             1 => present[at] = 1.0,
-            2 => mask[at] = 0,
+            2 => mask[at] = false,
             _ => words[at / 32] &= !(1 << (at % 32)),
         }
     }
@@ -889,6 +889,13 @@ fn corners() -> (TraceContainer, Vec<u32>) {
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cs);
     let cp = p.op(Op::CumProd(table));
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cp);
+    // Integer scans wrap, as the interpreter's do.
+    for (value, dtype) in [(a, Dtype::I32), (ua, Dtype::U32)] {
+        for op in [Op::CumSum(value), Op::CumProd(value)] {
+            let c = p.op(op);
+            put(&mut p, v, dtype, c);
+        }
+    }
     let pos_y = p.op(Op::Abs(y));
     for op in [
         Op::Exp(y),
@@ -974,13 +981,15 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         -3,
-        1,
-        1,
+        -1,
+        i32::MIN,
         4,
         i32::MAX,
         15,
     ];
-    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, 17, 1, -5, -1, 15];
+    // Division corners, beside the others: MIN / -1 wraps, x / 0 is 0,
+    // MIN / MIN, -1 / MAX.
+    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, i32::MAX, i32::MIN, -5, -1, 15];
     let ua = vec![
         7,
         u32::MAX,
@@ -993,13 +1002,14 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         3,
-        1,
-        1,
+        u32::MAX,
+        u32::MAX,
         40,
         12,
         15,
     ];
-    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 17, 1, 5, 3, 15];
+    // u32::MAX / 1, u32::MAX / u32::MAX.
+    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 1, u32::MAX, 5, 3, 15];
     vec![
         (0, Value::F32(x)),
         (1, Value::F32(y)),
@@ -1064,7 +1074,7 @@ fn registration_compiles_every_pass(device: &Device) {
     stages.top = lanes;
     stages.pool_rows = i64::from(pool_rows);
     stages.sink_row = pool_rows - 8;
-    stages.plane_reads = vec![(
+    stages.planes = vec![(
         read.name.clone(),
         read.rows,
         read.width,
@@ -1806,7 +1816,7 @@ fn a_sampler_registers_on_a_served_model() {
     let mut model = Model::load_with("qwen3-30b-a3b-mini", None, 512, 7, None);
     let device = model.engine.shell().expect("loaded").device();
     let (misses, held) = (device.misses(), device.compiled());
-    let reads = model.engine.shell().expect("loaded").plane_reads();
+    let reads = model.engine.shell().expect("loaded").guest_planes();
     let (container, _) = carrying(model.vocab);
     let plan = plan_of(container, model.vocab);
     let t = std::time::Instant::now();

@@ -81,12 +81,12 @@ fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
         page_size: PAGE,
         context: 256,
         slots: MAX_BEAMS,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

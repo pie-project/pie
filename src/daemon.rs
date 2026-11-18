@@ -82,6 +82,11 @@ impl Ctx {
         &self.config
     }
 
+    /// The config file the role read.
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Calls `reload` with the config file read anew on every SIGHUP, for
     /// as long as the process runs. A file that does not read is logged and
     /// skipped.

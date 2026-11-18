@@ -15,6 +15,15 @@ impl Run<'_> {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
+    /// The fire's capturing lanes' rows: a score op runs only in a fire one
+    /// of whose lanes captures.
+    fn capture_seat(&self) -> Result<crate::run::CaptureSeat, kernels_metal::Error> {
+        self.bindings().capture.ok_or_else(|| kernels_metal::Error::Backend {
+            op: "attn.score_capture",
+            detail: "this fire runs a score capture and none of its lanes captures".to_string(),
+        })
+    }
+
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
         match op {
             Attn::ScoreCapture {
@@ -23,23 +32,44 @@ impl Run<'_> {
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
-                scores,
-            } => attn::score::capture(
-                self.ctx(),
-                self.ragged(*q),
-                &self.prefill_plan_over(*plan, *cache),
-                self.pool(*cache),
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *observe,
-                *kv_max,
-                self.requests(),
-                self.tensor(*scores),
-            ),
+                into,
+                ..
+            } => {
+                let seat = self.capture_seat()?;
+                attn::score::capture(
+                    self.ctx(),
+                    self.ragged(*q),
+                    &self.prefill_plan_over(*plan, *cache),
+                    self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *observe,
+                    seat.keys,
+                    *q_heads,
+                    into.is_none(),
+                    self.requests(),
+                    attn::score::CaptureRows {
+                        rows: seat.keys_at,
+                        first: self.window().span.lane_offset,
+                    },
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let seat = self.capture_seat()?;
+                attn::score::pages(
+                    self.ctx(),
+                    seat.keys_at,
+                    seat.pages_at,
+                    self.window().span.lane_offset,
+                    seat.keys,
+                    seat.page_size,
+                    self.requests(),
+                )
+            }
             Attn::Voxel {
                 q,
                 k,
@@ -760,15 +790,23 @@ impl Run<'_> {
                     return Ok(());
                 }
                 let mask = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
-                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(stated)) => {
-                        attn::ragged::RaggedMask::Custom {
-                            bits: stated.bits,
-                            indptr: stated.indptr,
-                        }
+                    (RaggedMask::Stated, Some(stated)) => attn::ragged::RaggedMask::Custom {
+                        bits: stated.bits,
+                        indptr: stated.indptr,
+                    },
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model states \
+                                     none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
                     }
-                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, None) => {
-                        attn::ragged::RaggedMask::Segments
-                    }
+                    (
+                        RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated,
+                        None,
+                    ) => attn::ragged::RaggedMask::Segments,
                     (RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_metal::Error::Backend {
                             op: "attn.ragged",

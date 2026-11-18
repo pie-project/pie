@@ -26,6 +26,21 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Where a capturing lane's rows lie: its reader's, through the fire's
+    /// tables (`crate::scores`).
+    fn capture_rows(
+        &self,
+        op: &'static str,
+    ) -> Result<kernels_cuda::attn::score::CaptureRows, kernels_cuda::Error> {
+        self.bindings()
+            .score_rows
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "this load captures no attention scores, so it laid no row tables"
+                    .to_string(),
+            })
+    }
+
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
             Attn::ScoreCapture {
@@ -34,10 +49,11 @@ impl Run<'_> {
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
-                scores,
+                into,
+                ..
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
@@ -48,11 +64,21 @@ impl Run<'_> {
                     &self.pool(*cache),
                     *head_dim,
                     *kv_heads,
+                    *q_heads,
                     *sm_scale,
                     *observe,
                     self.window().span().lane_offset,
-                    *kv_max,
-                    &mut self.tensor(*scores),
+                    self.capture_rows("attn.score_capture")?,
+                    into.is_none(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let span = self.window().span();
+                kernels_cuda::attn::score::pages(
+                    self.ctx(),
+                    self.capture_rows("attn.score_pages")?,
+                    span.lane_offset,
+                    span.lanes,
                 )
             }
             Attn::Voxel {
@@ -579,7 +605,7 @@ impl Run<'_> {
             } => {
                 // A floor stays 0 unless the profile turns bounded replay on;
                 // then only the fused kernels read it.
-                if floor.is_some() && self.ctx().tuning().compressed_replay {
+                if floor.is_some() && self.ctx().tuning().compressed_replay() {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attn.prefill",
                         detail: "the window is held above a replay floor, which only the fused \
@@ -1351,15 +1377,23 @@ impl Run<'_> {
                     .zip(packing(*kv_indptr))
                     .and_then(|(q, kv)| self.group_mask(q, kv));
                 let mask = match (mask, stated) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        kernels_cuda::attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
                     (
-                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
-                        Some(stated),
-                    ) => kernels_cuda::attn::ragged::RaggedMask::Custom {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
-                    },
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
-                        kernels_cuda::attn::ragged::RaggedMask::None
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => kernels_cuda::attn::ragged::RaggedMask::None,
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_cuda::Error::Backend {
+                            op: "attn.ragged",
+                            detail: STATED_ONLY.to_string(),
+                        });
                     }
                     (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_cuda::Error::Backend {
@@ -1462,3 +1496,9 @@ impl Run<'_> {
         }
     }
 }
+
+/// Why a lane's mask over an attention its model does not state one on
+/// (`RaggedMask::Stated`) is refused.
+const STATED_ONLY: &str = "a lane states an attention mask over an attention its model states \
+                           none on: only an attention the model text spells \
+                           `stated_group_mask()` reads a lane's mask";

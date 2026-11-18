@@ -85,9 +85,8 @@ fn a_settled_fires_fold_is_told_before_it_returns() {
         std::thread::current().id(),
         "told on the settling thread, not Metal's completion thread"
     );
-    let engine::StepOutcome::Wrote(writes) = outcome else {
-        panic!("the fire's reports, not {outcome:?}");
-    };
+    assert!(outcome.faulted.is_empty(), "no lane faulted: {outcome:?}");
+    let writes = &outcome.wrote;
     assert_eq!(writes.len(), 1, "one reporting lane");
     assert_eq!(writes[0].tag, 7);
     assert_eq!(writes[0].fold, Some(3), "the fold the fire froze");

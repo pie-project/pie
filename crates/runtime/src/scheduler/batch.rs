@@ -282,7 +282,7 @@ pub(crate) fn build_batch_request(
                     });
                     groups + u32::try_from(local).unwrap_or(u32::MAX)
                 });
-                lane
+                lane.lane
             }));
             groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
@@ -380,7 +380,7 @@ pub(crate) fn build_frame_submission(
             }
             let lanes = || group.iter().flat_map(|req| req.request.lanes.iter());
             let prefill_lanes = lanes().filter(|lane| lane.tokens.len() > 1).count();
-            let kv_len_max = lanes().map(|lane| lane.kv.pages.len()).max().unwrap_or(0);
+            let kv_len_max = lanes().map(|lane| lane.pages.len()).max().unwrap_or(0);
             (tokens, page_refs, prefill_lanes, kv_len_max)
         });
         let build = build_batch_request(&mut group, page_size, stats);
@@ -425,6 +425,7 @@ pub(crate) fn build_frame_submission(
             },
             terminal_cells: build.terminal_cells,
             completions: build.completions,
+            member_lanes: build.member_lane_indptr,
             instances,
         });
         flattened.extend(group);
@@ -1035,7 +1036,7 @@ mod tests {
             ..FireRequest::default()
         };
         two.lanes[1].rs_reset = engine::fire::RsReset::Fresh;
-        let expected = two.lanes.clone();
+        let expected: Vec<::engine::Lane> = two.lanes.iter().map(|lane| lane.lane.clone()).collect();
 
         let step = build_batch_request(
             &mut [pending(two, InstanceId(1))],
@@ -1163,7 +1164,7 @@ mod tests {
     fn a_device_geometry_member_seriates_into_the_suffix() {
         let mut pooled = decode(11, 3);
         pooled.geometry = GeometryClass::DeviceGeometry;
-        pooled.lanes[0].kv.pages.clear();
+        pooled.lanes[0].pages.clear();
 
         let (frame, flattened) = build_frame_submission(
             vec![vec![

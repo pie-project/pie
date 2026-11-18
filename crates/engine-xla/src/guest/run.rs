@@ -86,13 +86,72 @@ pub struct Stages {
     /// go.
     pub pool_rows: i64,
     pub sink_row: u32,
-    /// Every plane a fire returns, as a stage reads it (`Shell::plane_reads`):
-    /// output, rows, width, layers, readout flag, dtype.
-    pub plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    /// Every plane a fire of the load can return, as a stage reads it
+    /// (`Shell::guest_planes`): output, rows, width, layers, readout flag,
+    /// dtype. A registration's outputs are checked against these, and each
+    /// stage compiled for them.
+    pub planes: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    /// Stages a fire compiled (`Stages::get` past `compile_all`): a defect.
+    pub fire_compiles: u64,
 }
 
 /// A rung's stage as a compile thread leaves it.
 type Built = std::sync::Mutex<Option<Result<Arc<Staged>, String>>>;
+
+/// A stage shape a pass can take: the stage, its batch, its carried
+/// channels.
+pub type Want = (usize, Batch, Vec<u32>);
+
+/// The stages `wanted` names, compiled side by side on any thread (a
+/// registration's, off the engine's): in `wanted`'s order. The first
+/// refusal refuses them all.
+pub fn compile_wanted(
+    device: &Device,
+    package: &LaunchPackage,
+    wanted: &[Want],
+    pool_rows: i64,
+) -> Result<Vec<Arc<Staged>>, String> {
+    // Compiles admitted into the host memory free now (held programs
+    // already take theirs), as the warm ladder's are.
+    let admission = Admission::new(available_memory().unwrap_or(u64::MAX));
+    let started = std::time::Instant::now();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, wanted.len().clamp(1, 8));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((at, batch, c)) = wanted.get(i) else {
+                        break;
+                    };
+                    let staged =
+                        stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
+                    if let Ok(mut slot) = built[i].lock() {
+                        *slot = Some(staged);
+                    }
+                }
+            });
+        }
+    });
+    let staged = (built.into_iter())
+        .map(|built| {
+            built
+                .into_inner()
+                .map_err(|_| "a stage compile panicked".to_string())?
+                .ok_or("a stage was never compiled")?
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    tracing::info!(
+        programs = wanted.len(),
+        seconds = started.elapsed().as_secs_f32(),
+        "guest stages compiled"
+    );
+    Ok(staged)
+}
 
 /// Stage `at` of `package` lowered for `batch` and compiled.
 fn stage(
@@ -136,8 +195,8 @@ fn stage(
 impl Stages {
     /// Stage `at` of `package` for `batch`, as registration compiled it
     /// (`Stages::compile_all`). A shape registration did not reach
-    /// compiles here, which a load warm-up sealed reports as a program
-    /// outside the ladder (WARM_STRICT refuses it).
+    /// compiles here, inside the fire, counted (`fire_compiles`) and, where
+    /// the load sealed its ladder, a miss (WARM_STRICT refuses it).
     pub fn get(
         &mut self,
         device: &Device,
@@ -151,17 +210,23 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
+        // Registration compiled every shape a fire of the load takes: one
+        // compiled here waits a fire on it.
+        self.fire_compiles += 1;
+        tracing::warn!(
+            stage = at,
+            lanes = batch.lanes,
+            compiles = self.fire_compiles,
+            "a guest stage compiled inside a fire, past its program's registration"
+        );
         let staged = stage(device, package, at, batch, carried, self.pool_rows, None)?;
         self.map.insert(slot, Arc::clone(&staged));
         Ok(staged)
     }
 
-    /// Compiles every stage of `package` for every shape a pass can take:
-    /// each lane rung up to the widest fire (`top`), each combination of
-    /// the planes its outputs can be read off (the fires the warm ladder
-    /// traced, `plane_reads`), with the `carried` channels in the pool;
-    /// and one lane with none carried (an instance that steps alone).
-    /// Side by side; the first refusal refuses the program.
+    /// Compiles every stage of `package` for every shape a pass can take
+    /// (`Stages::wanted`), in place: a registration whole, on the calling
+    /// thread. The first refusal refuses the program.
     pub fn compile_all(
         &mut self,
         device: &Device,
@@ -169,6 +234,24 @@ impl Stages {
         key: [u8; 32],
         carried: &[u32],
     ) -> Result<(), String> {
+        let wanted = self.wanted(package, key, carried)?;
+        let staged = compile_wanted(device, package, &wanted, self.pool_rows)?;
+        self.install(key, wanted, staged);
+        Ok(())
+    }
+
+    /// Every shape a pass of `package` can take that no stage compiled yet
+    /// serves: each lane rung up to the widest fire (`top`), each
+    /// combination of the planes its outputs can be read off (the load's,
+    /// `planes`), with the `carried` channels in the pool; and one lane
+    /// with none carried (an instance that steps alone). A stage reading an
+    /// output no fire returns refuses the program.
+    pub fn wanted(
+        &self,
+        package: &LaunchPackage,
+        key: [u8; 32],
+        carried: &[u32],
+    ) -> Result<Vec<Want>, String> {
         let top = padded(self.top as usize);
         let rungs: Vec<u32> =
             std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
@@ -177,7 +260,27 @@ impl Stages {
         for at in 0..package.stages.len() {
             let mut combos: Vec<Vec<Read>> = vec![Vec::new()];
             for (name, lane) in lower::outputs(package, at) {
-                let options: Vec<Read> = (self.plane_reads.iter())
+                // Every output a stage reads is a plane a fire of this load
+                // returns on the device, of the dtype it reads: else the
+                // program is refused here, at its registration, and a pass
+                // never finds an output unbound.
+                let wants: Vec<Dtype> = (package.values.iter())
+                    .filter(|v| {
+                        v.source == ValueOrigin::Output && v.output.as_deref() == Some(&name)
+                    })
+                    .map(|v| v.dtype)
+                    .collect();
+                if !self
+                    .planes
+                    .iter()
+                    .any(|p| p.0 == name && wants.iter().all(|&d| d == p.5))
+                {
+                    return Err(format!(
+                        "stage {at} reads output `{name}` ({wants:?}), which no fire of this load \
+                         returns on the device as that"
+                    ));
+                }
+                let options: Vec<Read> = (self.planes.iter())
                     .filter(|p| p.0 == name)
                     .map(|p| Read {
                         name: name.clone(),
@@ -189,9 +292,6 @@ impl Stages {
                         dtype: p.5,
                     })
                     .collect();
-                if options.is_empty() {
-                    continue;
-                }
                 combos = combos
                     .into_iter()
                     .flat_map(|c| {
@@ -215,47 +315,22 @@ impl Stages {
             let slot = (key, *at, batch.clone(), c.clone());
             !self.map.contains_key(&slot) && seen.insert(slot)
         });
-        let pool_rows = self.pool_rows;
-        // Compiles admitted into the host memory free now (held programs
-        // already take theirs), as the warm ladder's are.
-        let admission = Admission::new(available_memory().unwrap_or(u64::MAX));
-        let started = std::time::Instant::now();
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .clamp(1, wanted.len().clamp(1, 8));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((at, batch, c)) = wanted.get(i) else {
-                            break;
-                        };
-                        let staged =
-                            stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
-                        if let Ok(mut slot) = built[i].lock() {
-                            *slot = Some(staged);
-                        }
-                    }
-                });
-            }
-        });
+        Ok(wanted)
+    }
+
+    /// The pool's rows, which a stage that carries cells takes.
+    #[must_use]
+    pub fn pool_rows(&self) -> i64 {
+        self.pool_rows
+    }
+
+    /// Stages `compile_wanted` made for `wanted`, held from now on.
+    pub fn install(&mut self, key: [u8; 32], wanted: Vec<Want>, staged: Vec<Arc<Staged>>) {
         let count = wanted.len();
-        for ((at, batch, c), built) in wanted.into_iter().zip(built) {
-            let staged = built
-                .into_inner()
-                .map_err(|_| "a stage compile panicked".to_string())?
-                .ok_or("a stage was never compiled")??;
+        for ((at, batch, c), staged) in wanted.into_iter().zip(staged) {
             self.map.insert((key, at, batch, c), staged);
         }
-        tracing::info!(
-            programs = count,
-            seconds = started.elapsed().as_secs_f32(),
-            "guest stages compiled at registration"
-        );
-        Ok(())
+        tracing::info!(programs = count, "guest stages compiled at registration");
     }
 
     /// What a pass of the program `key` names takes on the device beyond
@@ -376,7 +451,7 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
             let base = out.len();
             out.resize(base + n.div_ceil(32), 0);
             for (j, &b) in v.iter().enumerate() {
-                if b != 0 {
+                if b {
                     out[base + j / 32] |= 1 << (j % 32);
                 }
             }
@@ -391,7 +466,7 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
         Dtype::I32 => Value::I32(words[..n].iter().map(|&w| w as i32).collect()),
         Dtype::Bool => Value::Bool(
             (0..n)
-                .map(|j| ((words[j / 32] >> (j % 32)) & 1) as u8)
+                .map(|j| (words[j / 32] >> (j % 32)) & 1 != 0)
                 .collect(),
         ),
         _ => Value::U32(words[..n].to_vec()),
@@ -772,7 +847,7 @@ fn const_root(root: &eta_compiler::codegen::launch::LaunchValue) -> Value {
     match root.dtype {
         Dtype::I32 => Value::I32(vec![root.literal_bits as i32]),
         Dtype::U32 => Value::U32(vec![root.literal_bits]),
-        Dtype::Bool => Value::Bool(vec![u8::from(root.literal_bits != 0)]),
+        Dtype::Bool => Value::Bool(vec![root.literal_bits != 0]),
         _ => Value::F32(vec![f32::from_bits(root.literal_bits)]),
     }
 }

@@ -183,7 +183,9 @@ fn fault(fault: Fault) -> Error {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::FitShort(_) | Fault::UnderCarve { .. } => {
+            Error::Impossible(fault.to_string())
+        }
     }
 }
 
@@ -595,7 +597,7 @@ impl Engine for Metal {
         // where its budget is stated (it frees room in the pool's heap, not
         // memory), and suspended slots otherwise go straight to disk.
         shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -619,7 +621,7 @@ impl Engine for Metal {
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
-        let pools = shell.pool_facts(disk_kv_pages);
+        let pools = shell.pool_facts();
         let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
 
@@ -805,6 +807,12 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        if let Some(shell) = self.shell.as_ref() {
+            let facts = &shell.trace().facts;
+            for step in &frame.steps {
+                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+            }
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         // A frame's rows are held while it is the open one: the steps of one
@@ -947,6 +955,49 @@ impl Engine for Metal {
         self.loaded_mut()?
             .prewarm_programs(registrations)
             .map_err(fault)
+    }
+
+    /// The plan here; the libraries and pipelines in the compile, off this
+    /// thread (cold, a sampler's take 0.1-0.4 s on an M1 Max).
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registering = self
+            .loaded_mut()?
+            .prepare_program(registration)
+            .map_err(fault)?;
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(registering.compile()))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let registered = prepared
+            .0
+            .downcast::<crate::program::Registered>()
+            .map_err(|_| {
+                engine::Error::Program("a prepared program this engine did not prepare".into())
+            })?;
+        let shell = self.loaded_mut()?;
+        let before = shell.program_compilations();
+        let id = shell.finish_program(*registered).map_err(fault)?;
+        // The compile's regions count at the finish: a registration after
+        // ready that compiled guest code is one the prewarm did not prepare.
+        let built = shell.program_compilations() - before;
+        if built > 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            tracing::warn!(
+                program = id.0,
+                regions = built,
+                "metal: a registration after ready compiled guest code the prewarm did not"
+            );
+        }
+        Ok(id)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
     }
 
     fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {
@@ -1243,9 +1294,11 @@ impl Metal {
                 ))
             })?;
         }
-        // A lane stating its slot tables names its kv pages and its state
-        // record there; until the runtime states them, the legacy fields
-        // carry the same slot refs.
+        // A lane names its kv pages, its window pages and its state record
+        // in its slot tables (CONTRACT-BC 4): this engine states one shared
+        // pool, so the runtime states them. A device-geometry lane's list
+        // table is its working set's whole mapped table, which its ports'
+        // page indexes translate through.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
@@ -1258,11 +1311,9 @@ impl Metal {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            // One table a window list, in the load's order; until the
-            // runtime states them, the legacy window pages are the first
-            // list's.
+            // One table a window list, in the load's order.
             let lists = shell.pool_layout().window_lists().count();
-            let mut windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
+            let windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
                 .iter()
                 .map(|id| {
                     lane.tables
@@ -1272,23 +1323,34 @@ impl Metal {
                         .unwrap_or_default()
                 })
                 .collect();
-            if let Some(first) = windows.first_mut()
-                && first.is_empty()
-            {
-                first.clone_from(&lane.kv.window);
-            }
             window_of.push(windows);
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
+            // A load that holds state is told every lane's record: its
+            // pieces, or none (the null record).
+            let fixed: Option<Vec<[u32; 2]>> = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                    .map(|(_, pieces)| pieces.clone()),
+                engine::fire::LaneRecord::Null => shell
+                    .null_record()
+                    .map(|null| null.iter().map(|&r| [r, r]).collect()),
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => None,
+            };
+            let fixed = fixed.as_ref();
+            run_of.push(fixed.and_then(|pieces| {
                 pieces
                     .iter()
                     .any(|&[run, cow]| run != cow)
                     .then(|| pieces.iter().map(|&[run, _]| run).collect())
             }));
-            record_of.push(fixed.map(|(_, pieces)| {
+            record_of.push(fixed.map(|pieces| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
                 for &[run, cow] in pieces {
@@ -1323,9 +1385,8 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
-                        .then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&[]),
+                    held: pages_of[at].is_some().then_some(lane.kv.held),
                     folded: lane.kv.folded,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
@@ -1335,10 +1396,14 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: &lane.kv.translation,
+                    translation: match lane.list {
+                        engine::fire::ListKind::Translation => {
+                            pages_of[at].as_deref().unwrap_or(&[])
+                        }
+                        engine::fire::ListKind::Pages => &[],
+                    },
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
                     refs: true,
                     record: record_of[at].as_deref(),

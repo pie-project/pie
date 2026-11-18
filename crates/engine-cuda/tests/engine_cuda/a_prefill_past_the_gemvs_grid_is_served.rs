@@ -176,9 +176,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
     } else {
         format!("moe.tc5 = {tc5}\n")
     };
-    let chip = engine_cuda::chip::profile(&format!(
-        "[kernel]\nmoe.grouped = {grouped}\n{tc5}[engine]\ngraphs = \"off\"\n"
-    ));
+    let chip = engine_cuda::chip::profile(&format!("[kernel]\nmoe.grouped = {grouped}\n{tc5}"));
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -189,12 +187,13 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

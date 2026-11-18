@@ -10,11 +10,13 @@ pub mod api;
 pub mod arena;
 pub mod blob;
 pub mod boot;
+pub mod check;
 pub mod checkpoint_serving;
 pub mod chip;
 pub mod comm;
 pub mod device;
 mod dispatch;
+pub mod dissect;
 pub mod ep;
 mod error;
 pub mod experts;
@@ -27,9 +29,11 @@ pub mod lockstep;
 pub mod mask;
 pub mod narrow;
 pub mod program;
+pub mod rates;
 pub mod record;
 pub mod replay;
 pub mod run;
+pub mod scores;
 pub mod serve;
 pub mod settle;
 pub mod sizing;
@@ -39,6 +43,7 @@ pub mod staged_h2d;
 pub mod store;
 pub mod synth;
 pub mod tap;
+pub mod top;
 pub mod tune;
 pub mod voxels;
 pub mod weights;
@@ -178,8 +183,8 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, Golden, Graphs, Knobs, Lane, Media,
-    Recording, Seal, Seated, Shell,
+    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, Recording, Seal,
+    Seated, Shell,
 };
 
 pub use blob::{

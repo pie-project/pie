@@ -13,7 +13,7 @@ mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
+pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, Recording};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
@@ -54,10 +54,13 @@ use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
-use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
+use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
 pub struct Shell {
+    /// The rungs the load weighed its top by and the estimate it weighed
+    /// them with (`None` where the profile states no rates).
+    weighed: Option<crate::top::Weighed>,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -90,6 +93,9 @@ pub struct Shell {
     /// The classes a stated mask reaches as a group's (a ragged attention):
     /// a lane there states one or none.
     group_masked: poem_ir::ClassSet,
+    /// The ragged packings an attention stating a mask reads, a fire's
+    /// group masks staged in their order (`exports::stated_feeds`).
+    stated_feeds: Vec<(poem_ir::Selection, poem_ir::Selection)>,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
@@ -111,6 +117,9 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// Where a fire's capturing lanes write their readers' rows: `None`
+    /// where the trace captures none (`crate::scores`).
+    capture: Option<crate::scores::CaptureLayout>,
     /// The run a fire stages a host-resident bank's experts in, bounded at
     /// load and laid with the staged inputs (`experts::staging`).
     expert_staging: crate::experts::staging::Staging,
@@ -169,6 +178,10 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
+    /// The arming fire's ragged attentions read a group mask: its lanes
+    /// state every row of their group admitted, and its body is the masked
+    /// twin (`record::BodyKey::group_mask`).
+    arm_group_mask: bool,
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),
@@ -204,6 +217,8 @@ pub struct Shell {
     tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
     owed: Owed,
+    /// The guest passes of the step under way that faulted their lanes.
+    guest_faults: Vec<GuestFault>,
     /// Landed events of reaped batches, for the next to record.
     spare_events: Vec<crate::device::graph::Event>,
     /// Where a device-counted fold left each recurrent slot, ahead of the
@@ -539,8 +554,10 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
-    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
+    /// first used, behind the staging `ring` the load pinned before it
+    /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
+    /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
     /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
@@ -552,6 +569,7 @@ impl Shell {
         seats: u32,
         context: u32,
         ranks: u32,
+        ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -591,7 +609,7 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget, whole)?;
+        self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
@@ -804,6 +822,31 @@ impl Shell {
         self.programs.prewarm(&self.device, registrations)
     }
 
+    /// A program's registration, first step ([`crate::program::Plane::prepare`]):
+    /// its build runs off the engine's thread.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Pending> {
+        // The regions it plans to build that no prewarm or earlier
+        // registration built: each a module built after ready.
+        let before = self.programs.built_late();
+        let prepared = self.programs.prepare(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        if late != 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+        }
+        prepared
+    }
+
+    /// A program's registration, last step ([`crate::program::Plane::finish`]).
+    pub fn finish_program(
+        &mut self,
+        pending: crate::program::Pending,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish(pending)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
@@ -816,16 +859,6 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
-        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
-            program
-                .plan
-                .outputs()
-                .iter()
-                .any(|(name, _)| *name == "attn.scores")
-        });
-        if reads_scores {
-            self.arena.ensure_whole(&mut self.pools)?;
-        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -934,6 +967,14 @@ impl Shell {
         })
     }
 
+    /// Where instance `instance`'s capturing lane's rows lie now: its key
+    /// row of the load's context, then its page row (`crate::scores`).
+    /// `None` for an instance whose program reads none.
+    #[must_use]
+    pub fn score_rows(&self, instance: engine::InstanceId) -> Option<u64> {
+        self.programs.score_rows(instance)
+    }
+
     /// The address of a guest item of `bytes` in `refs`, where they lie now.
     pub fn guest_span(
         &self,
@@ -1012,6 +1053,11 @@ impl Shell {
     ) -> Result<Option<&mut ProgramSession>> {
         self.reap_landed_guests()?;
         Ok(self.programs.instance_mut(instance_id))
+    }
+
+    /// Releases a registered program no instance binds.
+    pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
+        self.programs.close_program(id)
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
@@ -1141,6 +1187,33 @@ impl Shell {
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
         Ok(std::mem::take(&mut settled.pixels))
+    }
+
+    /// [`Shell::fire`] of text lanes timed to its landing: the time from
+    /// its preparation to the device's last work done, its logits read back
+    /// after (the check of the estimate's fire, `crate::check`).
+    pub fn fire_landed(
+        &mut self,
+        lanes: &[Lane<'_>],
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let began = std::time::Instant::now();
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &seated,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        self.device.synchronize()?;
+        let landed = began.elapsed();
+        Shell::read_out(self, &mut settled)?;
+        Ok((landed, std::mem::take(&mut settled.logits)))
     }
 
     pub fn fire_media(

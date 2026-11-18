@@ -70,6 +70,8 @@ class MemoryConfig:
     engine measures the device and uses all of it."""
     # The most device memory the load takes ("20GiB"), per device.
     budget_device: Optional[str] = None
+    # The kv tokens the device holds exactly (cuda); omit to fill the device.
+    kv_device_tokens: Optional[int] = None
     # Pinned host bytes for suspended kv; omit for every seat at full context.
     budget_host: Optional[str] = None
     # Disk bytes suspended kv spills to below the host (the only tier on metal
@@ -96,7 +98,6 @@ class EngineConfig:
     type: str = "cuda"
     device: list[str] = field(default_factory=list)
     tensor_parallel_size: Optional[int] = None
-    activation_dtype: Optional[str] = None
     # The longest sequence one lane holds; omit for the model's own context.
     max_context: Optional[int] = None
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -173,10 +174,6 @@ class Config:
     def to_toml(self) -> str:
         """The document `pie serve --config` reads: one table a section,
         `[engine]` with the engine's options beside its common keys."""
-        for name, fate in _RETIRED_ENV.items():
-            if name in os.environ:
-                raise ValueError(f"{name} {fate}")
-
         def put(table: dict, key: str, value) -> None:
             if value is not None:
                 table[key] = value
@@ -210,7 +207,6 @@ class Config:
         e = self.engine
         engine: dict = {"type": e.type, "device": e.device}
         put(engine, "tensor_parallel_size", e.tensor_parallel_size)
-        put(engine, "activation_dtype", e.activation_dtype)
         put(engine, "max_context", e.max_context)
         for key, value in e.options.items():
             if key in engine or key == "memory":
@@ -235,17 +231,6 @@ class Config:
         _emit_table(buf, "sandbox", _block(self.sandbox), leading_newline=True)
         _emit_table(buf, "cluster", cluster, leading_newline=True)
         return buf.getvalue().lstrip("\n")
-
-
-# Environment variables `to_toml` once read, refused by name rather than
-# left unread; the worker refuses its retired config keys the same way.
-_RETIRED_ENV = {
-    "PIE_MAX_MODEL_LEN": "was renamed to PIE_MAX_CONTEXT",
-    "PIE_DEVICE_KV_BUDGET": (
-        "is no longer read: the kv pages take what the device holds past the "
-        "weights and the fires; PIE_BUDGET_DEVICE caps what the whole load takes"
-    ),
-}
 
 
 def _block(obj) -> dict:

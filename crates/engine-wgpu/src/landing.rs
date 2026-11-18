@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::device::{Buffer, OnDone};
 use engine_gpu::error::Fault;
 use engine_gpu::serve::ReadSpan;
-use engine_gpu::settle::{Airborne, Done};
+use engine_gpu::settle::{Airborne, Done, merged};
 
 #[cfg(feature = "wgpu")]
 pub type Guests = crate::program::Guests;
@@ -68,22 +68,33 @@ struct Landing {
     mailbox: Mailbox,
     counts: Airborne,
     done: Option<Done>,
+    fed: Option<engine_gpu::settle::FedCheck>,
 }
 
 impl Landing {
-    fn run_guests(&mut self, worker: &Worker) -> Option<String> {
-        let guests = self.guests.take()?;
+    /// Runs the step's guest passes, each on its own: the lanes of each
+    /// pass that faulted.
+    fn run_guests(&mut self, worker: &Worker) -> Vec<engine::LaneFault> {
+        let Some(guests) = self.guests.take() else {
+            return Vec::new();
+        };
         if self.read.is_err() {
-            return None;
+            return Vec::new();
         }
         #[cfg(feature = "wgpu")]
         {
             let jobs = guests.jobs(&self.seat, &self.layout, self.pixels.as_ref());
             tracing::debug!(seq = self.seq, guests = jobs.len(), "landing: guests run");
-            worker
-                .run_all(jobs)
-                .err()
-                .map(|refusal| refusal.to_string())
+            let mut faulted = engine::StepOutcome::committed();
+            for crate::program::Faulted {
+                lanes,
+                instance,
+                refusal,
+            } in worker.run_all(jobs)
+            {
+                faulted.fault_lanes(lanes, Some(instance), &refusal.to_string());
+            }
+            faulted.faulted
         }
         #[cfg(not(feature = "wgpu"))]
         {
@@ -92,7 +103,7 @@ impl Landing {
         }
     }
 
-    fn finish(self, guest_fault: Option<String>) {
+    fn finish(self, guest_faults: Vec<engine::LaneFault>) {
         let Landing {
             seq,
             arm,
@@ -100,15 +111,24 @@ impl Landing {
             mailbox,
             counts,
             done,
+            fed,
             ..
         } = self;
         tracing::debug!(seq, arm, ok = read.is_ok(), "landing: rows back");
+        // What the fire embedded is read back before the step is posted:
+        // its arm may be taken again then.
+        if let Some(fed) = &fed {
+            fed.landed(read.is_ok());
+        }
         let (rows, refused, failed) = match read {
-            Ok(rows) => (rows, guest_fault, false),
+            Ok(rows) => (rows, None, false),
             Err(why) => (Vec::new(), Some(why), true),
         };
         if let Some(why) = &refused {
-            tracing::warn!(seq, arm, failed, %why, "landing: the step faulted");
+            tracing::warn!(seq, arm, %why, "landing: the step was lost");
+        }
+        for fault in &guest_faults {
+            tracing::warn!(seq, arm, lane = fault.lane, why = %fault.reason, "landing: a guest pass faulted its lane");
         }
         let parked = {
             let mut post = mailbox.lock().expect("mailbox lock poisoned");
@@ -130,14 +150,10 @@ impl Landing {
             "landing: posted to the mailbox"
         );
         if let Some(done) = done {
-            let outcome = match refused {
-                None => done.settled(),
-                Some(why) => engine::StepOutcome::Faulted(format!(
-                    "wgpu command buffer for frame {} step {}: {why}",
-                    done.at.frame, done.at.step
-                )),
-            };
-            (done.sink)(done.at, outcome);
+            match refused {
+                Some(why) => done.tell(Some(why), "wgpu command buffer"),
+                None => (done.sink)(done.at, merged(done.settled(), guest_faults)),
+            }
         }
     }
 }
@@ -162,12 +178,9 @@ struct WorkerState {
 
 impl Worker {
     #[cfg(feature = "wgpu")]
-    fn run_all(
-        &self,
-        mut jobs: Vec<crate::program::Job>,
-    ) -> Result<(), engine_gpu::program::Refusal> {
+    fn run_all(&self, mut jobs: Vec<crate::program::Job>) -> Vec<crate::program::Faulted> {
         if jobs.len() == 1 {
-            return jobs.pop().expect("one job")();
+            return jobs.pop().expect("one job")().err().into_iter().collect();
         }
         let (tx, rx) = crate::device::host::channel::unbounded();
         let expected = jobs.len();
@@ -183,19 +196,15 @@ impl Worker {
             }
         }
         drop(tx);
-        let mut verdict = Ok(());
+        let mut faulted = Vec::new();
         for _ in 0..expected {
             match rx.recv() {
                 Ok(Ok(())) => {}
-                Ok(Err(refusal)) => {
-                    if verdict.is_ok() {
-                        verdict = Err(refusal);
-                    }
-                }
+                Ok(Err(fault)) => faulted.push(fault),
                 Err(_) => break,
             }
         }
-        verdict
+        faulted
     }
 
     #[cfg(feature = "wgpu")]
@@ -233,7 +242,7 @@ impl Worker {
             }
         };
         if let Some(landing) = inline {
-            landing.finish(None);
+            landing.finish(Vec::new());
         }
     }
 
@@ -257,6 +266,7 @@ pub(crate) fn on_done(
     mailbox: Mailbox,
     counts: Airborne,
     done: Option<Done>,
+    fed: Option<engine_gpu::settle::FedCheck>,
     worker: Worker,
 ) -> OnDone {
     let Seat {
@@ -282,6 +292,7 @@ pub(crate) fn on_done(
             mailbox,
             counts,
             done,
+            fed,
         });
     };
     Box::new(move |refused: Option<String>| {
@@ -294,4 +305,47 @@ pub(crate) fn on_done(
             }),
         }
     })
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod tests {
+    use engine::InstanceId;
+    use engine_gpu::program::Refusal;
+
+    use super::Worker;
+    use crate::program::{Faulted, Job};
+
+    /// A step's guest passes run each on its own: one faulting does not
+    /// stop the others, and each that faulted is told with its own lanes
+    /// and instance, not the first fault for the whole step.
+    #[test]
+    fn each_guest_pass_faults_its_own_lanes() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let jobs: Vec<Job> = (0..4u32)
+            .map(|lane| {
+                let ran = std::sync::Arc::clone(&ran);
+                let job: Job = Box::new(move || {
+                    ran.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if lane == 1 || lane == 3 {
+                        Err(Faulted {
+                            lanes: lane..lane + 1,
+                            instance: InstanceId(100 + u64::from(lane)),
+                            refusal: Refusal::Program(format!("lane {lane}: guard")),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                });
+                job
+            })
+            .collect();
+        let mut faulted = Worker::default().run_all(jobs);
+        faulted.sort_by_key(|fault| fault.lanes.start);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::Acquire), 4, "every pass ran");
+        let told: Vec<(u32, u64)> = faulted
+            .iter()
+            .map(|fault| (fault.lanes.start, fault.instance.0))
+            .collect();
+        assert_eq!(told, [(1, 101), (3, 103)]);
+    }
 }

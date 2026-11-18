@@ -229,8 +229,12 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
-    RegisterProgram {
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     FireFacts {
@@ -467,10 +471,18 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
-    /// Registers a program with the engine, and learns what an instance
-    /// of it holds in the pool and what its fires take.
-    RegisterProgram {
+    /// A program's registration, first step: the engine checks it and
+    /// hands back its compile (`Engine::prepare_program`), which runs off
+    /// the lane while the lane fires on.
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    /// A program's registration, last step: the engine takes what its
+    /// compile made (`Engine::finish_program`), and the lane learns what an
+    /// instance of it holds in the pool.
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     /// Asks the engine what fires of a program bound at given extents take
@@ -861,18 +873,74 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<
-        HashMap<
-            u64,
-            (
-                ::engine::ProgramId,
-                ::eta_compiler::codegen::launch::LaunchPackage,
-            ),
-        >,
-    >,
+    /// Each program registered or registering, by its content hash, with
+    /// its launch package (a hash collision is refused by name): one
+    /// registration a program, however many binds ask for it at once.
+    program_ids: Mutex<HashMap<u64, (Known, ::eta_compiler::codegen::launch::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     device_domain: ::engine::MemoryDomain,
+    /// The backend a registration's host codegen emits for, off the
+    /// engine's thread (`EngineSpec::codegen_backend`).
+    codegen_backend: Option<String>,
+}
+
+/// What a bind finds of a program by its content hash.
+enum Known {
+    /// Registered: its id.
+    Ready(::engine::ProgramId),
+    /// Its registration under way: the answer every bind of it waits for.
+    Registering(tokio::sync::watch::Receiver<Option<Answer>>),
+}
+
+/// A registration's answer, as each bind waiting on it takes it.
+type Answer = std::result::Result<::engine::ProgramId, String>;
+
+/// Answers a registration's waiters when it is dropped unanswered (its
+/// task cancelled or panicking): the in-flight entry goes, and each waiter
+/// is refused by the program's hash, so a later bind registers it afresh.
+struct Unanswered {
+    handle: SchedulerHandle,
+    hash: u64,
+    answer: Option<tokio::sync::watch::Sender<Option<Answer>>>,
+}
+
+impl Unanswered {
+    fn answer(mut self, answer: Answer) {
+        {
+            let mut ids = self.handle.inner.program_ids.lock().unwrap();
+            match answer {
+                Ok(id) => {
+                    if let Some(entry) = ids.get_mut(&self.hash) {
+                        entry.0 = Known::Ready(id);
+                    }
+                }
+                Err(_) => {
+                    ids.remove(&self.hash);
+                }
+            }
+        }
+        if let Some(sender) = self.answer.take() {
+            let _ = sender.send(Some(answer));
+        }
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(sender) = self.answer.take() {
+            self.handle
+                .inner
+                .program_ids
+                .lock()
+                .unwrap()
+                .remove(&self.hash);
+            let _ = sender.send(Some(Err(format!(
+                "program 0x{:016x}: its registration ended unanswered",
+                self.hash
+            ))));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -934,6 +1002,115 @@ impl SchedulerHandle {
             .map_err(|_| anyhow!("scheduler channel closed"))
     }
 
+    /// Registers `program`: its host codegen on a blocking thread, then
+    /// the lane hands back its compile, which runs on a blocking thread
+    /// while the lane fires on, and the lane then makes it the program. Its
+    /// instances bind once this answers. Every failure names the program's
+    /// hash; an engine's prepare holds nothing its finish must undo, so a
+    /// compile that panics leaves nothing behind.
+    async fn register(&self, program: ProgramRegistration) -> Result<::engine::ProgramId> {
+        let hash = program.program_hash;
+        let program = match self.inner.codegen_backend.clone() {
+            Some(backend) => crate::rt::spawn_blocking(move || {
+                let coded = match crate::pipeline::program::with_host_codegen(
+                    &program,
+                    Some(backend.as_str()),
+                ) {
+                    std::borrow::Cow::Owned(coded) => Some(coded),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                coded.unwrap_or(program)
+            })
+            .await
+            .map_err(|e| anyhow!("program 0x{hash:016x}: its host codegen did not finish: {e}"))?,
+            None => program,
+        };
+        let compile = self
+            .request(|response| SchedulerItem::PrepareProgram {
+                program: Box::new(program),
+                response,
+            })
+            .await?
+            .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))?;
+        let prepared = crate::rt::spawn_blocking(compile)
+            .await
+            .map_err(|e| anyhow!("program 0x{hash:016x}: its compile did not finish: {e}"))?;
+        self.request(|response| SchedulerItem::FinishProgram { prepared, response })
+            .await?
+            .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))
+    }
+
+    /// The id of `program`, registered once however many binds ask at
+    /// once: the first registers it in a task of its own, which a bind's
+    /// cancellation does not stop (its finish is always reached, so no
+    /// compile is lost and no prepared program is left behind), and every
+    /// bind waits on its answer.
+    async fn program_id(
+        &self,
+        pid: ProcessId,
+        program: ProgramRegistration,
+    ) -> Result<::engine::ProgramId> {
+        self.program_id_with(pid, program, |this, program| async move {
+            this.register(program).await
+        })
+        .await
+    }
+
+    /// [`SchedulerHandle::program_id`], registering by `register`.
+    async fn program_id_with<F, Fut>(
+        &self,
+        pid: ProcessId,
+        program: ProgramRegistration,
+        register: F,
+    ) -> Result<::engine::ProgramId>
+    where
+        F: FnOnce(SchedulerHandle, ProgramRegistration) -> Fut,
+        Fut: std::future::Future<Output = Result<::engine::ProgramId>> + Send + 'static,
+    {
+        let hash = program.program_hash;
+        let mut answer = {
+            let mut ids = self.inner.program_ids.lock().unwrap();
+            match ids.get(&hash) {
+                Some((_, launch)) if launch != &program.launch => {
+                    return Err(anyhow!("program hash collision for 0x{hash:016x}"));
+                }
+                Some((Known::Ready(id), _)) => return Ok(*id),
+                Some((Known::Registering(answer), _)) => answer.clone(),
+                None => {
+                    let (sender, answer) = tokio::sync::watch::channel(None);
+                    ids.insert(
+                        hash,
+                        (Known::Registering(answer.clone()), program.launch.clone()),
+                    );
+                    let this = self.clone();
+                    let unanswered = Unanswered {
+                        handle: self.clone(),
+                        hash,
+                        answer: Some(sender),
+                    };
+                    let registering = register(this, program);
+                    crate::rt::spawn(async move {
+                        let registered = registering.await;
+                        unanswered.answer(registered.map_err(|e| format!("{e:#}")));
+                    });
+                    answer
+                }
+            }
+        };
+        let answered = crate::inferlet::process::said(
+            "bind: register the program",
+            pid,
+            answer.wait_for(Option::is_some),
+        )
+        .await
+        .map_err(|_| anyhow!("program 0x{hash:016x}: its registration ended unanswered"))?;
+        match &*answered {
+            Some(Ok(id)) => Ok(*id),
+            Some(Err(why)) => Err(anyhow!("{why}")),
+            None => Err(anyhow!("program 0x{hash:016x}: its registration ended unanswered")),
+        }
+    }
+
     pub(crate) fn stats(&self) -> Arc<SchedulerStats> {
         Arc::clone(&self.inner.stats)
     }
@@ -985,40 +1162,9 @@ impl SchedulerHandle {
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
     ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
-        let program_hash = program.program_hash;
-        let cached = {
-            let program_ids = self.inner.program_ids.lock().unwrap();
-            match program_ids.get(&program_hash) {
-                Some((program_id, launch)) => {
-                    if launch != &program.launch {
-                        return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
-                    }
-                    Some(*program_id)
-                }
-                None => None,
-            }
-        };
-        let program_id = match cached {
-            Some(program_id) => program_id,
-            None => {
-                let launch = program.launch.clone();
-                let program_id = crate::inferlet::process::said(
-                    "bind: register the program",
-                    pipeline_id.unwrap_or_default(),
-                    self.request(|response| SchedulerItem::RegisterProgram {
-                        program: Box::new(program),
-                        response,
-                    }),
-                )
-                .await??;
-                self.inner
-                    .program_ids
-                    .lock()
-                    .unwrap()
-                    .insert(program_hash, (program_id, launch));
-                program_id
-            }
-        };
+        let program_id = self
+            .program_id(pipeline_id.unwrap_or_default(), program)
+            .await?;
         bind.binding.program = program_id;
         // The fire term of the program at these extents counts while the
         // bind is under way, and the activation the fires may take holds it
@@ -1185,6 +1331,9 @@ impl BatchScheduler {
                 accepting: AtomicBool::new(true),
                 stats: Arc::clone(&stats),
                 device_domain: crate::scheduler::device_domain(engine_idx),
+                codegen_backend: crate::engine::get_spec(engine_idx)
+                    .ok()
+                    .and_then(|spec| spec.codegen_backend),
             }),
         };
         crate::scheduler::install_scheduler_handle(engine_id, handle.clone());
@@ -1626,7 +1775,8 @@ impl BatchScheduler {
                 QueuedItem::PreLaunchCopy {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
-                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
+                QueuedItem::PrepareProgram { .. } => "PrepareProgram".to_string(),
+                QueuedItem::FinishProgram { .. } => "FinishProgram".to_string(),
                 QueuedItem::FireFacts { key, .. } => format!("FireFacts({key})"),
                 QueuedItem::StandingAfter { binding, .. } => {
                     format!("StandingAfter(program {})", binding.program)
@@ -1826,8 +1976,11 @@ impl BatchScheduler {
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
             }
-            SchedulerItem::RegisterProgram { program, response } => {
-                pending.push_back(QueuedItem::RegisterProgram { program, response });
+            SchedulerItem::PrepareProgram { program, response } => {
+                pending.push_back(QueuedItem::PrepareProgram { program, response });
+            }
+            SchedulerItem::FinishProgram { prepared, response } => {
+                pending.push_back(QueuedItem::FinishProgram { prepared, response });
             }
             SchedulerItem::FireFacts { key, response } => {
                 pending.push_back(QueuedItem::FireFacts { key, response });
@@ -1969,7 +2122,8 @@ impl BatchScheduler {
             QueuedItem::CopyTracked { .. }
                 | QueuedItem::HostKv { .. }
                 | QueuedItem::Pool { .. }
-                | QueuedItem::RegisterProgram { .. }
+                | QueuedItem::PrepareProgram { .. }
+                | QueuedItem::FinishProgram { .. }
                 | QueuedItem::FireFacts { .. }
                 | QueuedItem::StandingAfter { .. }
         )
@@ -2917,6 +3071,24 @@ mod tests {
             "panicking"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -2951,10 +3123,13 @@ mod tests {
     fn fire_of(seats: std::ops::Range<u32>, rows: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
             lanes: seats
-                .map(|slot| ::engine::Lane {
-                    slot,
-                    tokens: vec![7; rows],
-                    ..Default::default()
+                .map(|slot| {
+                    ::engine::Lane {
+                        slot,
+                        tokens: vec![7; rows],
+                        ..Default::default()
+                    }
+                    .into()
                 })
                 .collect(),
             ..Default::default()
@@ -3152,6 +3327,7 @@ mod tests {
                         },
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
+                        member_lanes: Vec::new(),
                         instances: vec![::engine::InstanceId(0)],
                     }],
                 },
@@ -3188,6 +3364,24 @@ mod tests {
     impl engine::Engine for ExhaustedEngine {
         fn kind(&self) -> &'static str {
             "exhausted"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -3228,6 +3422,7 @@ mod tests {
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
+                    member_lanes: Vec::new(),
                     instances: vec![::engine::InstanceId(0)],
                 }],
             },
@@ -3269,6 +3464,24 @@ mod tests {
             "inline"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3301,7 +3514,7 @@ mod tests {
                         frame: id,
                         step: step as u32,
                     },
-                    ::engine::StepOutcome::Wrote(wrote),
+                    ::engine::StepOutcome::wrote(wrote),
                 );
             }
             Ok(engine::FrameTicket {
@@ -3336,6 +3549,7 @@ mod tests {
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
+                    member_lanes: Vec::new(),
                     instances: Vec::new(),
                 }],
             },
@@ -3357,6 +3571,235 @@ mod tests {
         let (_engine, _channels) = lane.shutdown();
     }
 
+    /// Why [`LaneFaultEngine`]'s faulting lane faulted.
+    const GUARD: &str = "guest epilogue faulted: stage 0: guard";
+
+    /// An engine whose guest pass of one instance faults: it tells the step
+    /// with that instance's lanes in `faulted` and commits the rest, settling off the
+    /// submit (`asynchronous`) or inside it. With `lost` it refuses the
+    /// whole frame instead, before any lane runs.
+    struct LaneFaultEngine {
+        sink: Option<::engine::CompletionSink>,
+        asynchronous: bool,
+        faulting: Option<::engine::InstanceId>,
+        lost: bool,
+        next: u64,
+    }
+
+    impl engine::Engine for LaneFaultEngine {
+        fn kind(&self) -> &'static str {
+            "lane-fault"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn settles_asynchronously(&self) -> bool {
+            self.asynchronous
+        }
+
+        fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+            self.sink = Some(sink);
+        }
+
+        fn submit(
+            &mut self,
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            if self.lost {
+                return Err(engine::Error::Device("the device is lost".into()));
+            }
+            let id = ::engine::FrameId(self.next);
+            self.next += 1;
+            let sink = self.sink.clone().expect("a sink before the first submit");
+            for (step, fired) in frame.steps.iter().enumerate() {
+                let mut outcome = ::engine::StepOutcome::committed();
+                for attachment in fired
+                    .attachments
+                    .iter()
+                    .filter(|a| Some(a.instance) == self.faulting)
+                {
+                    outcome.fault_lanes(
+                        attachment.lane..attachment.lane + attachment.lanes,
+                        Some(attachment.instance),
+                        GUARD,
+                    );
+                }
+                sink(
+                    ::engine::StepDone {
+                        frame: id,
+                        step: step as u32,
+                    },
+                    outcome,
+                );
+            }
+            Ok(engine::FrameTicket {
+                id,
+                steps: frame.steps.iter().map(|_| Default::default()).collect(),
+            })
+        }
+    }
+
+    /// One step of fires, a lane each, each the pass of its own instance
+    /// of `instances`; and the fires' completions.
+    fn step_of(
+        instances: &[u64],
+    ) -> (crate::engine::FrameFire, Vec<crate::engine::WorkItemCompletion>) {
+        let lanes = u32::try_from(instances.len()).expect("a few lanes");
+        let completions: Vec<_> = (0..lanes)
+            .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
+            .collect();
+        let instance = |lane: u32| ::engine::InstanceId(instances[lane as usize]);
+        let fire = crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: (0..lanes)
+                        .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
+                        .collect(),
+                    attachments: (0..lanes)
+                        .map(|lane| ::engine::Attachment {
+                            lane,
+                            lanes: 1,
+                            instance: instance(lane),
+                            adapter_only: false,
+                        })
+                        .collect(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
+                completions: completions.clone(),
+                member_lanes: (0..=lanes).collect(),
+                instances: (0..lanes).map(instance).collect(),
+            }],
+        };
+        (fire, completions)
+    }
+
+    /// Fires `fire` on `lane` and waits out its frame: its answer, and
+    /// each fire's result once it settled.
+    fn fire_and_settle(
+        lane: &Lane,
+        fire: crate::engine::FrameFire,
+        completions: &[crate::engine::WorkItemCompletion],
+    ) -> (std::result::Result<(), String>, Vec<std::result::Result<(), String>>) {
+        let answer = within("the launch is answered", lane.fire(fire, false))
+            .expect("the launch is answered");
+        let answer = match answer {
+            Ok(frame) => within("the frame settles", frame).map_err(|error| format!("{error:#}")),
+            Err(error) => Err(error),
+        };
+        let fires = completions
+            .iter()
+            .map(|completion| {
+                if !completion.is_settled() {
+                    // A frame settled inside `submit` resolves its fires as
+                    // the worker retires it.
+                    completion.resolve_landed("test retire");
+                }
+                within("the fire settles", completion.clone()).map_err(|error| format!("{error:#}"))
+            })
+            .collect();
+        (answer, fires)
+    }
+
+    /// A guest epilogue faulting on one lane of four fails that lane's fire
+    /// alone, by the engine's reason; the other three commit, and fire on.
+    fn one_faulted_lane_fails_its_own_fire_alone(asynchronous: bool) {
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(LaneFaultEngine {
+                sink: None,
+                asynchronous,
+                faulting: Some(::engine::InstanceId(102)),
+                lost: false,
+                next: 0,
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (fire, completions) = step_of(&[100, 101, 102, 103]);
+        let (frame, fires) = fire_and_settle(&lane, fire, &completions);
+        assert_eq!(frame, Ok(()), "the frame is not failed by one lane's fault");
+        for (at, fired) in fires.iter().enumerate() {
+            if at == 2 {
+                let why = fired.as_ref().expect_err("the faulted lane's fire fails");
+                assert!(why.contains(GUARD), "by the engine's reason: {why}");
+                assert!(why.contains("lane 2"), "naming its lane: {why}");
+                assert!(why.contains("instance 102"), "naming its instance: {why}");
+            } else {
+                assert_eq!(fired, &Ok(()), "lane {at} commits");
+            }
+        }
+
+        // The three go on: their next fires commit, and nothing of theirs
+        // was poisoned by the fourth's fault.
+        let (fire, completions) = step_of(&[100, 101, 103]);
+        let (frame, fires) = fire_and_settle(&lane, fire, &completions);
+        assert_eq!(frame, Ok(()));
+        assert!(fires.iter().all(Result::is_ok), "the three fire on: {fires:?}");
+        let _ = lane.shutdown();
+    }
+
+    #[test]
+    fn a_faulted_lane_fails_its_own_fire_alone_off_the_submit() {
+        one_faulted_lane_fails_its_own_fire_alone(true);
+    }
+
+    #[test]
+    fn a_faulted_lane_fails_its_own_fire_alone_inside_the_submit() {
+        one_faulted_lane_fails_its_own_fire_alone(false);
+    }
+
+    /// A submit refused before any lane ran fails every fire of its frame.
+    #[test]
+    fn a_refused_submit_fails_every_fire_of_its_frame() {
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(LaneFaultEngine {
+                sink: None,
+                asynchronous: true,
+                faulting: None,
+                lost: true,
+                next: 0,
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (fire, completions) = step_of(&[100, 101, 102, 103]);
+        let answer = within("the launch is answered", lane.fire(fire, false))
+            .expect("the launch is answered");
+        let Err(why) = answer else {
+            panic!("a lost device refuses the frame");
+        };
+        assert!(why.contains("the device is lost"), "{why}");
+        for completion in &completions {
+            assert_eq!(
+                completion.resolve_from_terminal().ok(),
+                Some(crate::engine::completion::WorkItemAttemptOutcome::Failed),
+                "every fire of the refused frame fails"
+            );
+        }
+        let _ = lane.shutdown();
+    }
+
     /// What [`HoldingEngine`] answers it holds back once it took a resident
     /// set.
     const HELD: u64 = 96 << 20;
@@ -3366,6 +3809,24 @@ mod tests {
     impl engine::Engine for HoldingEngine {
         fn kind(&self) -> &'static str {
             "holding"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -3421,5 +3882,143 @@ mod tests {
         );
         assert!(port.idle(), "asked nothing more");
         let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// A handle on no scheduler: what a program's registration by content
+    /// hash keeps, driven by a registration of the test's own.
+    fn bare_handle() -> SchedulerHandle {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SchedulerHandle {
+            inner: Arc::new(SchedulerControl {
+                tx,
+                active_senders: AtomicUsize::new(0),
+                shutdown_wait: Condvar::new(),
+                shutdown_gate: Mutex::new(()),
+                program_ids: Mutex::new(HashMap::new()),
+                accepting: AtomicBool::new(true),
+                stats: Arc::new(SchedulerStats::default()),
+                device_domain: ::engine::MemoryDomain::HostPinned,
+                codegen_backend: None,
+            }),
+        }
+    }
+
+    async fn never_registers() -> Result<::engine::ProgramId> {
+        panic!("a program found by its hash registers again")
+    }
+
+    async fn panics_registering() -> Result<::engine::ProgramId> {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        panic!("the compile panics")
+    }
+
+    fn registration(hash: u64) -> ProgramRegistration {
+        ProgramRegistration {
+            program_hash: hash,
+            ..ProgramRegistration::default()
+        }
+    }
+
+    /// Binds asking at once for one program they find unregistered wait on
+    /// one registration: one compile, one id, and a later bind finds it.
+    #[test]
+    fn concurrent_binds_of_one_new_program_register_it_once() {
+        let handle = bare_handle();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let ids = crate::rt::block_on(async {
+            let binds = (0..8).map(|_| {
+                let registered = Arc::clone(&registered);
+                handle.program_id_with(ProcessId::default(), registration(0xd0d0), |_, _| {
+                    async move {
+                        registered.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(::engine::ProgramId(7))
+                    }
+                })
+            });
+            futures::future::join_all(binds).await
+        });
+        for id in ids {
+            assert_eq!(id.expect("each bind gets the id"), ::engine::ProgramId(7));
+        }
+        assert_eq!(registered.load(Ordering::SeqCst), 1, "one registration");
+        let again = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xd0d0),
+            |_, _| never_registers(),
+        ));
+        assert_eq!(again.expect("found"), ::engine::ProgramId(7));
+        let mut colliding = registration(0xd0d0);
+        colliding.launch.plans.push(Default::default());
+        let collided = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            colliding,
+            |_, _| never_registers(),
+        ));
+        assert!(
+            collided.expect_err("refused").to_string().contains("collision"),
+            "a hash collision is refused by name"
+        );
+    }
+
+    /// A bind dropped while its program compiles does not stop the
+    /// registration: it reaches its end, and the next bind finds the id.
+    #[test]
+    fn a_registration_outlives_the_bind_that_started_it() {
+        let handle = bare_handle();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        crate::rt::block_on(async {
+            let bind = handle.program_id_with(ProcessId::default(), registration(0xc0c0), |_, _| {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    done.store(true, Ordering::SeqCst);
+                    Ok(::engine::ProgramId(9))
+                }
+            });
+            assert!(
+                crate::rt::time::timeout(Duration::from_millis(10), bind)
+                    .await
+                    .is_err(),
+                "the bind is dropped mid-compile"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        assert!(finished.load(Ordering::SeqCst), "the registration finished");
+        let found = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xc0c0),
+            |_, _| never_registers(),
+        ));
+        assert_eq!(found.expect("found"), ::engine::ProgramId(9));
+    }
+
+    /// A registration that panics refuses each bind waiting on it by the
+    /// program's hash, and leaves no entry: the next bind registers afresh.
+    #[test]
+    fn a_registration_that_panics_is_refused_by_name_and_forgotten() {
+        let handle = bare_handle();
+        let refused = crate::rt::block_on(async {
+            let binds = (0..3).map(|_| {
+                handle.program_id_with(ProcessId::default(), registration(0xbad1), |_, _| {
+                    panics_registering()
+                })
+            });
+            futures::future::join_all(binds).await
+        });
+        for bind in refused {
+            let why = bind.expect_err("refused").to_string();
+            assert!(why.contains("0x000000000000bad1"), "by name: {why}");
+        }
+        assert!(
+            !handle.inner.program_ids.lock().unwrap().contains_key(&0xbad1),
+            "no entry is left"
+        );
+        let retried = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xbad1),
+            |_, _| async { Ok(::engine::ProgramId(3)) },
+        ));
+        assert_eq!(retried.expect("registers afresh"), ::engine::ProgramId(3));
     }
 }

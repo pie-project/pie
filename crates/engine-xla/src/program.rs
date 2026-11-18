@@ -1,8 +1,9 @@
 //! The eta program plane, from engine-wgpu's plane without its wgpu device half.
-//! A program whose stages lower to StableHLO (`crate::guest`) runs its
-//! passes on the device (`Plane::fire_guests`), instances of one program
-//! batched into one executable per stage; any other runs in the host
-//! interpreter.
+//! A program runs its passes on the device (`Plane::fire_guests`),
+//! instances of one program batched into one executable per stage; one with
+//! a stage that does not lower to StableHLO (`crate::guest`), or that reads
+//! an output no fire of the load returns on the device, is refused at its
+//! registration.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -15,9 +16,7 @@ type Placed = (Arc<ExecPlan>, [u8; 32], Vec<crate::guest::run::Bound>);
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{
-    ChannelState, ExecPlan, HostOp, InterpInstance, Interpreted, PassInputs, StepOutcome, Value,
-};
+use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
@@ -93,7 +92,6 @@ impl Instance {
 #[derive(Default)]
 pub(crate) struct Tally {
     device: AtomicU64,
-    interpreted: AtomicU64,
 }
 
 /// A step's completion: `sink(at, ..)` runs once every hold on it is
@@ -101,9 +99,17 @@ pub(crate) struct Tally {
 /// step waits on), with the first fault any of them reported.
 pub(crate) struct Latch {
     at: engine::StepDone,
+    /// The step's lanes: every one faulted where the step faults.
+    lanes: u32,
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
+    /// A fault of the whole step (its fire, a device event): every lane.
     fault: std::sync::Mutex<Option<String>>,
+    /// Each attached instance's lanes of the step, where its pass's fault
+    /// lands (`Latch::fault_instances`).
+    spans: std::sync::Mutex<Vec<(InstanceId, std::ops::Range<u32>)>>,
+    /// The lanes whose instance's pass faulted; the rest commit.
+    lane_faults: std::sync::Mutex<engine::StepOutcome>,
     /// What the step's reported lanes wrote, told when it lands.
     writes: std::sync::Mutex<Vec<engine::KvWrites>>,
     /// The step's outcome once every hold is released: `Some(fault)`.
@@ -113,12 +119,19 @@ pub(crate) struct Latch {
 
 impl Latch {
     /// A latch holding once, for the submitter.
-    pub(crate) fn new(at: engine::StepDone, sink: Option<engine::CompletionSink>) -> Arc<Latch> {
+    pub(crate) fn new(
+        at: engine::StepDone,
+        lanes: u32,
+        sink: Option<engine::CompletionSink>,
+    ) -> Arc<Latch> {
         Arc::new(Latch {
             at,
+            lanes,
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
+            spans: std::sync::Mutex::new(Vec::new()),
+            lane_faults: std::sync::Mutex::new(engine::StepOutcome::committed()),
             writes: std::sync::Mutex::new(Vec::new()),
             landed: std::sync::Mutex::new(None),
             done: std::sync::Condvar::new(),
@@ -136,6 +149,32 @@ impl Latch {
 
     pub(crate) fn hold(&self) {
         self.holds.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The step's attached instances and the lanes each one's pass is for.
+    pub(crate) fn seat_spans(&self, spans: Vec<(InstanceId, std::ops::Range<u32>)>) {
+        *self.spans.lock().expect("spans lock poisoned") = spans;
+    }
+
+    /// `instances`' passes faulted for `why`: their lanes fault, every
+    /// other lane of the step commits. An instance the step does not seat
+    /// faults the whole step.
+    pub(crate) fn fault_instances(&self, instances: &[InstanceId], why: &str) {
+        let spans = self.spans.lock().expect("spans lock poisoned");
+        let mut faults = self.lane_faults.lock().expect("lane faults lock poisoned");
+        for instance in instances {
+            match spans.iter().find(|(id, _)| id == instance) {
+                Some((_, lanes)) => faults.fault_lanes(lanes.clone(), Some(*instance), why),
+                None => {
+                    self.fault
+                        .lock()
+                        .expect("fault lock poisoned")
+                        .get_or_insert_with(|| {
+                            format!("instance {instance}, which the step does not seat: {why}")
+                        });
+                }
+            }
+        }
     }
 
     /// The step's reported lanes wrote `writes`: told with its landing.
@@ -170,15 +209,19 @@ impl Latch {
                 self.at,
                 match fault.clone() {
                     None => {
-                        let writes =
-                            std::mem::take(&mut *self.writes.lock().expect("writes lock poisoned"));
-                        if writes.is_empty() {
-                            engine::StepOutcome::Committed
-                        } else {
-                            engine::StepOutcome::Wrote(writes)
-                        }
+                        let mut outcome = engine::StepOutcome::wrote(std::mem::take(
+                            &mut *self.writes.lock().expect("writes lock poisoned"),
+                        ));
+                        outcome.faulted = std::mem::take(
+                            &mut self
+                                .lane_faults
+                                .lock()
+                                .expect("lane faults lock poisoned")
+                                .faulted,
+                        );
+                        outcome
                     }
-                    Some(why) => engine::StepOutcome::Faulted(why),
+                    Some(why) => engine::StepOutcome::lost(self.lanes, why),
                 },
             );
         }
@@ -194,6 +237,15 @@ struct Flight {
     out_words: usize,
     puts: Vec<crate::guest::run::DeferredPut>,
     poison: Vec<Arc<AtomicBool>>,
+}
+
+/// A landed flight's outcome on its step: a fault lands on the lanes of
+/// the instances it committed for.
+fn landed(latch: &Latch, instances: &[InstanceId], outcome: Result<(), String>) {
+    if let Err(why) = outcome {
+        latch.fault_instances(instances, &why);
+    }
+    latch.release(Ok(()));
 }
 
 /// Guest passes in flight. A flight lands on the plugin's thread when its
@@ -240,6 +292,7 @@ impl Flights {
         self: &Arc<Self>,
         deferred: crate::guest::run::Deferred,
         poison: Vec<Arc<AtomicBool>>,
+        instances: Vec<InstanceId>,
         latch: Option<&Arc<Latch>>,
     ) {
         let crate::guest::run::Deferred {
@@ -281,13 +334,14 @@ impl Flights {
                 drop(unsafe { Box::from_raw(dst) });
                 let outcome = self.land(id, Err(why.to_string()), None);
                 if let Some(latch) = latch {
-                    latch.release(outcome);
+                    landed(latch, &instances, outcome);
                 }
                 return;
             }
         };
         let flights = Arc::clone(self);
         let hold = latch.cloned();
+        let theirs = instances.clone();
         let landing = Landing(dst);
         let keep = Arc::clone(&out);
         let registered = event.on_ready(move |done| {
@@ -300,7 +354,7 @@ impl Flights {
                 Some(keep),
             );
             if let Some(latch) = hold {
-                latch.release(outcome);
+                landed(&latch, &theirs, outcome);
             }
         });
         if let Err(why) = registered {
@@ -308,7 +362,7 @@ impl Flights {
             // freed under a copy that may still be writing them.
             let outcome = self.land(id, Err(why.to_string()), None);
             if let Some(latch) = latch {
-                latch.release(outcome);
+                landed(latch, &instances, outcome);
             }
         }
     }
@@ -488,10 +542,18 @@ impl Plane {
         self.stages.sink_row = sink_row;
     }
 
-    /// Every plane a fire returns, as a guest stage reads it: what
-    /// registration compiles each stage for.
-    pub fn seat_reads(&mut self, reads: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
-        self.stages.plane_reads = reads;
+    /// Every plane a fire of the load can return (`Shell::guest_planes`):
+    /// what a registration checks every output its program reads against
+    /// and compiles each stage for.
+    pub fn seat_planes(&mut self, planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
+        self.stages.planes = planes;
+    }
+
+    /// Guest stages a fire compiled: a shape its program's registration
+    /// did not, which is a defect (a registration is its program's ready).
+    #[must_use]
+    pub fn fire_compiles(&self) -> u64 {
+        self.stages.fire_compiles
     }
 
     /// Registers a program; where every stage lowers (its device form),
@@ -503,6 +565,21 @@ impl Plane {
         registration: &ProgramRegistration,
         device: Option<&crate::device::Device>,
     ) -> Result<ProgramId, Refusal> {
+        let pending = self.prepare(registration)?;
+        let staged = match device {
+            Some(device) => pending.compile(device),
+            None => Ok(Vec::new()),
+        };
+        self.finish(pending, staged)
+    }
+
+    /// A registration's first step, on the engine's thread: the program
+    /// interprets and every stage lowers (else refused by name), and the
+    /// stage shapes its passes take are named; nothing compiles yet. Its
+    /// compile ([`Pending::compile`]) runs on any thread, and
+    /// [`Plane::finish`] makes it the program. Until then no instance of
+    /// it binds.
+    pub fn prepare(&mut self, registration: &ProgramRegistration) -> Result<Pending, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
@@ -512,30 +589,79 @@ impl Plane {
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
+        // A guest runs on the device or is refused here, by name. Nothing
+        // of the plane's is touched until the finish, which assigns the id:
+        // a prepare whose compile never finishes leaves nothing behind.
+        let form = crate::guest::form_of(&plan.package).map_err(|why| {
+            Refusal::Program(format!(
+                "a stage of program 0x{:016x} does not lower on XLA: {why}",
+                registration.program_hash
+            ))
+        })?;
+        let wanted = self
+            .stages
+            .wanted(&plan.package, form.key, &form.pooled())
+            .map_err(|why| {
+                Refusal::Program(format!(
+                    "a stage of program 0x{:016x} does not compile: {why}",
+                    registration.program_hash
+                ))
+            })?;
+        Ok(Pending {
+            hash: registration.program_hash,
+            form,
+            plan: Arc::new(plan),
+            wanted,
+            pool_rows: self.stages.pool_rows(),
+        })
+    }
+
+    /// A registration's last step, on the engine's thread: the stages its
+    /// compile made held, and the program registered; a compile that
+    /// refused refuses it.
+    pub fn finish(
+        &mut self,
+        pending: Pending,
+        staged: Result<Vec<Arc<crate::guest::run::Staged>>, String>,
+    ) -> Result<ProgramId, Refusal> {
+        let Pending {
+            hash,
+            form,
+            plan,
+            wanted,
+            ..
+        } = pending;
+        let staged = staged.map_err(|why| {
+            Refusal::Program(format!(
+                "a stage of program 0x{hash:016x} does not compile: {why}"
+            ))
+        })?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
+        let key = form.key;
+        self.forms.hold(id, Ok(form));
+        if !staged.is_empty() {
+            self.stages.install(key, wanted, staged);
+        }
+        tracing::debug!(program = id.0, "guest program registered");
+        self.programs.insert(id, plan);
+        Ok(id)
+    }
 
-        let admitted = self.forms.admit(id, &plan.package);
-        if admitted
-            && let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
-            && let Err(why) =
-                self.stages
-                    .compile_all(device, &plan.package, form.key, &form.pooled())
-        {
-            self.forms.forget(id);
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
             return Err(Refusal::Program(format!(
-                "a stage of program 0x{:016x} does not compile: {why}",
-                registration.program_hash
+                "program {id} still has an instance bound"
             )));
         }
-        tracing::debug!(
-            program = id.0,
-            device_form = admitted,
-            why = self.forms.refusal(id).map(ToString::to_string),
-            "guest program registered"
-        );
-        self.programs.insert(id, Arc::new(plan));
-        Ok(id)
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        self.forms.forget(id);
+        Ok(())
     }
 
     #[must_use]
@@ -1213,14 +1339,21 @@ impl Plane {
         pool: &mut Option<crate::pjrt::Buffer>,
         at: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, pool, None, at)
+        let (ran, faults) = self.fire_guests_with(device, attachments, kept, pool, None, at)?;
+        match faults.into_iter().next() {
+            Some((_, why)) => Err(Refusal::Program(why)),
+            None => Ok(ran),
+        }
     }
 
     /// `fire_guests`, with each device group's last stage left in flight
     /// when `latch` is given: its puts land when their download does (and
     /// release a hold on `latch` then), and the next fire's `embed_tokens`
     /// can read them where they are. Every pass still in flight lands
-    /// before this one binds its roots.
+    /// before this one binds its roots. Answers which attachments ran on
+    /// the device and each instance whose pass faulted, with why: its
+    /// lanes fault, the others' passes stand. A pass that lands later
+    /// places its fault on `latch`.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn fire_guests_with(
         &mut self,
@@ -1230,7 +1363,7 @@ impl Plane {
         pool: &mut Option<crate::pjrt::Buffer>,
         latch: Option<&Arc<Latch>>,
         point: Stage,
-    ) -> Result<Vec<bool>, Refusal> {
+    ) -> Result<(Vec<bool>, Vec<(InstanceId, String)>), Refusal> {
         use crate::guest::run::{Member, OnDevice, bound, step_group, step_group_deferred};
         self.flights.wait_all();
         let members: Vec<InstanceId> = attachments.iter().map(|&(id, _)| id).collect();
@@ -1269,7 +1402,7 @@ impl Plane {
                 }
             }
         }
-        let mut first_error: Option<Refusal> = None;
+        let mut faults: Vec<(InstanceId, String)> = Vec::new();
         let mut note = |outcome: StepOutcome, instance: InstanceId, program: ProgramId| {
             let why = match outcome {
                 StepOutcome::Committed => return,
@@ -1280,7 +1413,7 @@ impl Plane {
                     format!("instance {instance} (program {program}) faulted: {why}")
                 }
             };
-            first_error.get_or_insert(Refusal::Program(why));
+            faults.push((instance, why));
         };
         let mut ran = vec![false; attachments.len()];
         if shared {
@@ -1404,14 +1537,17 @@ impl Plane {
                     (outcomes, None)
                 };
                 if let Some(deferred) = deferred {
-                    let poison: Vec<Arc<AtomicBool>> = deferred
+                    let instances: Vec<InstanceId> = deferred
                         .members
                         .iter()
                         .filter_map(|&m| order.get(m))
-                        .filter_map(|(_, id, _)| self.instances.get(id))
+                        .map(|(_, id, _)| *id)
+                        .collect();
+                    let poison: Vec<Arc<AtomicBool>> = (instances.iter())
+                        .filter_map(|id| self.instances.get(id))
                         .map(|seat| Arc::clone(&seat.poisoned))
                         .collect();
-                    self.flights.launch(deferred, poison, latch);
+                    self.flights.launch(deferred, poison, instances, latch);
                 }
                 for ((at, id, program), outcome) in order.into_iter().zip(outcomes) {
                     ran[at] = true;
@@ -1423,36 +1559,22 @@ impl Plane {
         if on_device > 0 && self.tally.device.fetch_add(on_device, Ordering::AcqRel) == 0 {
             tracing::info!(passes = on_device, "a guest pass ran on the device");
         }
-        // The rest in the interpreter, over the host copy of their rows.
+        // Registration refused every program whose outputs a fire does not
+        // return on the device (`Stages::compile_all`), and every program
+        // with a stage that does not lower: an attachment that did not run
+        // is a fault, not a pass for another path.
         for (at, &(instance, lane)) in attachments.iter().enumerate() {
-            if ran[at] {
-                continue;
-            }
-            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
-            if let (Some(kept), Some(seat)) = (kept, self.instances.get(&instance)) {
-                for (name, k) in seat.plan.outputs() {
-                    let read = kept.lane_value(lane as usize + k as usize, name);
-                    if let Some(value) = read.map_err(Refusal::Program)? {
-                        outputs.push((name.to_string(), k, value));
-                    }
-                }
-            }
-            if let Some(held) = self.instances.get_mut(&instance)
-                && let Err(why) = cells_to_host(held, pool.as_ref())
-            {
-                held.inst.poisoned = true;
-                first_error.get_or_insert(Refusal::Program(why));
-                continue;
-            }
-            let outcome = self.fire_interpreted(instance, &outputs, point);
-            if let Err(why) = outcome {
-                first_error.get_or_insert(why);
+            if !ran[at] {
+                faults.push((
+                    instance,
+                    format!(
+                        "instance {instance} at lane {lane}: its outputs are not on the device in \
+                         this fire, which its registration checked they would be"
+                    ),
+                ));
             }
         }
-        match first_error {
-            Some(why) => Err(why),
-            None => Ok(ran),
-        }
+        Ok((ran, faults))
     }
 
     #[must_use]
@@ -1460,38 +1582,6 @@ impl Plane {
         self.instances
             .get(&instance)
             .is_some_and(|seat| seat.plan.prologue_runs())
-    }
-
-    /// One pass of `instance` in the interpreter, its outputs read as
-    /// `outputs` (name, the pass's lane, value).
-    #[doc(hidden)]
-    pub fn fire_interpreted(
-        &mut self,
-        instance: InstanceId,
-        outputs: &[(String, u32, Value)],
-        at: Stage,
-    ) -> Result<(), Refusal> {
-        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        let inputs = PassInputs { outputs };
-        let outcome =
-            eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
-        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
-        if let Some(live) = &self.live {
-            live.tally(engine::live::Tally::Fallback, 1);
-        }
-        let program = seat.program;
-        match outcome {
-            StepOutcome::Committed => Ok(()),
-            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) blocked on channel {channel}"
-            ))),
-            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) faulted: {why}"
-            ))),
-        }
     }
 
     /// Waits for the in-flight cell `ring`'s next read would find, when
@@ -1514,11 +1604,8 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn tally(&self) -> (u64, u64) {
-        (
-            self.tally.device.load(Ordering::Acquire),
-            self.tally.interpreted.load(Ordering::Acquire),
-        )
+    pub fn tally(&self) -> u64 {
+        self.tally.device.load(Ordering::Acquire)
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
@@ -1548,7 +1635,7 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
+        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0).collect()),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
@@ -1556,16 +1643,15 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
     })
 }
 
-fn runs_of(row: &[u8]) -> Vec<u32> {
+fn runs_of(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
@@ -1662,7 +1748,7 @@ impl Plane {
                         value.dtype()
                     )));
                 };
-                out.mask = Some(cells.into_iter().map(|cell| cell != 0).collect());
+                out.mask = Some(cells);
                 continue;
             }
             let slot = match binding.port {
@@ -1809,14 +1895,14 @@ mod latch_tests {
             frame: engine::fire::FrameId(1),
             step: 0,
         };
-        let latch = Latch::new(at, None);
+        let latch = Latch::new(at, 1, None);
         latch.hold();
         latch.release(Ok(()));
         let late = std::sync::Arc::clone(&latch);
         let event = std::thread::spawn(move || late.release(Err("the fire failed".into())));
         assert_eq!(latch.wait().as_deref(), Some("the fire failed"));
         event.join().expect("the event thread");
-        let clean = Latch::new(at, None);
+        let clean = Latch::new(at, 1, None);
         clean.release(Ok(()));
         assert_eq!(clean.wait(), None);
     }
@@ -1839,7 +1925,7 @@ mod latch_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             into.lock().expect("heard lock").push(outcome);
         });
-        let latch = Latch::new(at, Some(sink));
+        let latch = Latch::new(at, 1, Some(sink));
         latch.hold();
         latch.report(vec![engine::KvWrites::default()]);
         latch.release(Ok(()));
@@ -1849,11 +1935,36 @@ mod latch_tests {
         let heard = heard.lock().expect("heard lock");
         assert_eq!(heard.len(), 1, "the sink heard the step before the settle woke");
         assert!(
-            matches!(heard[0], engine::StepOutcome::Wrote(_)),
+            !heard[0].wrote.is_empty() && heard[0].faulted.is_empty(),
             "with its fold reports: {:?}",
             heard[0]
         );
         drop(heard);
         event.join().expect("the event thread");
+    }
+}
+
+/// A program a registration prepared ([`Plane::prepare`]): what its
+/// compile, on any thread, compiles, and what [`Plane::finish`] holds.
+pub struct Pending {
+    hash: u64,
+    /// Its form: every stage lowers.
+    form: Arc<crate::guest::Compiled>,
+    plan: Arc<ExecPlan>,
+    wanted: Vec<crate::guest::run::Want>,
+    pool_rows: i64,
+}
+
+impl Pending {
+    /// Every stage shape the program's passes take, compiled on `device`
+    /// (on whatever thread calls this).
+    pub fn compile(
+        &self,
+        device: &crate::device::Device,
+    ) -> Result<Vec<Arc<crate::guest::run::Staged>>, String> {
+        if self.wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::guest::run::compile_wanted(device, &self.plan.package, &self.wanted, self.pool_rows)
     }
 }

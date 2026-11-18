@@ -116,8 +116,9 @@ its host and mixed cases took 35 minutes; Nemotron's three cases take a
 minute and a half, DeepSeek V4's most of the rest. Not measured case by case.
 
 `golden_rows` covers the row tables (host / cached / mixed, bitwise base).
-The older probes load with the diagnostic `dense-weights` (no weight shape
-stated), so they still compare the engine's other paths with base.
+The older probes load with the test pin `Knobs::dense_weights` (feature
+`test-pins`, no weight shape stated), so they still compare the engine's
+other paths with base.
 
 ## Not built, and known gaps
 

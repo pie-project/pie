@@ -152,7 +152,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
@@ -160,7 +160,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         // body records it, and capturing every composition of eleven rows
         // twice was most of this test's time.
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::profile("[engine]\ngraphs = \"off\"\n")),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

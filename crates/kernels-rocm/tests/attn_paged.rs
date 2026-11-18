@@ -993,3 +993,236 @@ fn attn_paged_relative_bias() {
         }
     }
 }
+
+/// Probe (by hand, `--ignored --nocapture`): a decode's attention planned
+/// eagerly (`enable_cuda_graph` false) against the plan a captured body
+/// takes (true), at 1 / 8 / 64 lanes over 512 and 4096 keys, Qwen3-0.6B's
+/// and Qwen3-8B's heads, microseconds a launch.
+#[test]
+#[ignore = "a probe run by hand"]
+fn decode_eager_against_body_probe() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    let cus = kernels_rocm::hip::multiprocessors(0).unwrap();
+    for (name, c) in [
+        ("0.6B", Case::new(16, 8, 128, 16, false)),
+        ("8B", Case::new(32, 8, 128, 16, false)),
+    ] {
+        let max_grid = attn::paged::decode_max_grid_size(c.kv_heads, cus);
+        for lanes in [1u32, 8, 64] {
+            for keys in [512u32, 4096] {
+                let kv_lens = vec![keys; lanes as usize];
+                let cache = cache(&gpu, &c, &kv_lens, 7);
+                let qv: Vec<f32> = values((lanes * c.q_heads * c.head_dim) as usize, 3, 1.0)
+                    .into_iter()
+                    .map(round_bf16)
+                    .collect();
+                let q = || RaggedTensor {
+                    data: gpu.tensor(&qv, lanes, c.q_heads * c.head_dim, Dtype::Bf16),
+                    indptr: gpu.column(&(0..=lanes as i32).collect::<Vec<_>>()),
+                };
+                let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
+                let mut line = format!("[decode] {name} lanes {lanes:>2} keys {keys:>4}:");
+                for (arm, graph) in [("eager", false), ("body", true)] {
+                    let built = plan::plan_decode(
+                        &cache.page_indptr,
+                        &kv_len,
+                        plan::Shape {
+                            num_requests: lanes,
+                            lane_offset: 0,
+                            num_q_heads: c.q_heads,
+                            num_kv_heads: c.kv_heads,
+                            head_dim: c.head_dim,
+                            page_size: c.page_size,
+                            hnd_layout: c.hnd,
+                        },
+                        plan::Live {
+                            requests: lanes,
+                            lane_offset: 0,
+                            row_offset: 0,
+                            rows: lanes,
+                        },
+                        None,
+                        graph,
+                        max_grid,
+                        plan::Toggles::of(kernels_rocm::tuning::Tuning::DEFAULT),
+                        &device,
+                        workspace(&gpu),
+                    )
+                    .unwrap();
+                    built.stage(&ctx).unwrap();
+                    let q = q();
+                    let mut o = gpu.zeros(lanes, c.q_heads * c.head_dim, Dtype::Bf16);
+                    let us = gpu.time(200, || {
+                        attn::decode(&ctx, q, &built, &cache.pool, None, c.head_dim, 0.0, &mut o)
+                            .unwrap();
+                    });
+                    line.push_str(&format!(
+                        "  {arm} {us:7.1} us (split={} items={})",
+                        built.info.split_kv, built.info.padded_batch_size
+                    ));
+                }
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
+/// The masked prefill reads each request's two segments as the custom mask
+/// states them: its committed run (keys below its origin) whole, cut at the
+/// row's position unless its word is wide, and its buffer (keys from its
+/// origin) by the bits of its plane, `qo · (kv − origin) + (key − origin)`
+/// from byte `indptr[req]`, least bit first.
+#[test]
+fn attn_paged_masked_prefill() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    for c in [Case::new(8, 4, 128, 16, false), Case::new(16, 4, 256, 16, false), Case::new(8, 2, 64, 16, false)] {
+        // A causal request over a prefix whose committed run ends at 45, and
+        // a wide one that reads only its buffer's bits.
+        let qo_lens = [37u32, 5];
+        let prefix = [60u32, 0];
+        let origins = [45u32, 0];
+        let wide = [false, true];
+        let n = qo_lens.len() as u32;
+        let kv_lens: Vec<u32> = qo_lens.iter().zip(&prefix).map(|(q, p)| q + p).collect();
+        let cache = cache(&gpu, &c, &kv_lens, 23);
+        let total: u32 = qo_lens.iter().sum();
+        let qv: Vec<f32> = values((total * c.q_heads * c.head_dim) as usize, 7, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let mut qo_indptr = vec![0i32];
+        for &l in &qo_lens {
+            qo_indptr.push(qo_indptr.last().unwrap() + l as i32);
+        }
+        // Each request's plane of bits, and what a row reads.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut bit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % 3 != 0
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut indptr: Vec<i64> = Vec::new();
+        let mut reads: Vec<Vec<Vec<bool>>> = Vec::new();
+        for r in 0..n as usize {
+            let (kv, qo, origin) = (kv_lens[r] as usize, qo_lens[r] as usize, origins[r] as usize);
+            let width = kv - origin;
+            let mut plane = vec![false; qo * width];
+            for t in 0..qo {
+                for j in 0..width {
+                    // Every row keeps its own key, so none reads nothing.
+                    plane[t * width + j] = bit() || origin + j == kv - qo + t;
+                }
+            }
+            indptr.push(bytes.len() as i64);
+            let mut packed = vec![0u8; plane.len().div_ceil(8)];
+            for (i, &b) in plane.iter().enumerate() {
+                if b {
+                    packed[i / 8] |= 1 << (i % 8);
+                }
+            }
+            bytes.extend(packed);
+            reads.push(
+                (0..qo)
+                    .map(|t| {
+                        (0..kv)
+                            .map(|key| {
+                                let causal_ok = wide[r] || key <= kv - qo + t;
+                                let bits_ok = key < origin || plane[t * width + key - origin];
+                                causal_ok && bits_ok
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        indptr.push(bytes.len() as i64);
+        let words: Vec<u32> = origins
+            .iter()
+            .zip(&wide)
+            .map(|(&o, &w)| o | if w { 1 << 31 } else { 0 })
+            .collect();
+        let q = RaggedTensor {
+            data: gpu.tensor(&qv, total, c.q_heads * c.head_dim, Dtype::Bf16),
+            indptr: gpu.column(&qo_indptr),
+        };
+        let shape = plan::Shape {
+            num_requests: n,
+            lane_offset: 0,
+            num_q_heads: c.q_heads,
+            num_kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            page_size: c.page_size,
+            hnd_layout: c.hnd,
+        };
+        let live = plan::Live {
+            requests: n,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: total,
+        };
+        let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
+        let mut built = plan::plan_prefill(
+            &qo_indptr,
+            &cache.page_indptr,
+            &kv_len,
+            total,
+            shape,
+            live,
+            None,
+            false,
+            false,
+            Some(gpu.upload(&indptr, n + 1, 1, Dtype::I64)),
+            &device,
+            plan::Toggles::default(),
+            workspace(&gpu),
+        )
+        .unwrap();
+        built.mask_origin = Some(gpu.upload(&words, n, 1, Dtype::U32));
+        built.stage(&ctx).unwrap();
+        let mask = gpu.upload(&bytes, 1, bytes.len() as u32, Dtype::U8);
+        let mut o = gpu.zeros(total, c.q_heads * c.head_dim, Dtype::Bf16);
+        attn::masked(&ctx, q, &built, mask, &cache.pool, None, c.head_dim, 0.0, &mut o).unwrap();
+        let got = gpu.read(&o);
+        let (hq, hk, d) = (c.q_heads as usize, c.kv_heads as usize, c.head_dim as usize);
+        let (g, row, scale) = (hq / hk, hq * d, 1.0 / (d as f64).sqrt());
+        for r in 0..n as usize {
+            for t in 0..qo_lens[r] as usize {
+                let at = qo_indptr[r] as usize + t;
+                let qrow = &qv[at * row..(at + 1) * row];
+                let keys: Vec<usize> = (0..kv_lens[r] as usize).filter(|&k| reads[r][t][k]).collect();
+                let mut want = vec![0f32; row];
+                for head in 0..hq {
+                    let kh = head / g;
+                    let s: Vec<f64> = keys
+                        .iter()
+                        .map(|&k| {
+                            (0..d)
+                                .map(|j| f64::from(qrow[head * d + j]) * f64::from(cache.keys[r][(k * hk + kh) * d + j]))
+                                .sum::<f64>()
+                                * scale
+                        })
+                        .collect();
+                    let m = s.iter().cloned().fold(f64::MIN, f64::max);
+                    let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                    let z: f64 = e.iter().sum();
+                    for j in 0..d {
+                        let acc: f64 = keys
+                            .iter()
+                            .zip(&e)
+                            .map(|(&k, w)| w * f64::from(cache.vals[r][(k * hk + kh) * d + j]))
+                            .sum();
+                        want[head * d + j] = (acc / z) as f32;
+                    }
+                }
+                let tag = format!("masked prefill d{d} g{g} req {r} token {t} wide {}", wide[r]);
+                close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
+            }
+        }
+    }
+}

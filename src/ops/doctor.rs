@@ -197,7 +197,7 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
             )];
         }
     };
-    let worker = match worker::standalone::derive_standalone(&combined) {
+    let worker = match worker::standalone::derive_standalone(&combined, Some(path)) {
         Ok((_controller, _gateway, worker)) => worker,
         Err(e) => {
             return vec![(

@@ -1123,7 +1123,7 @@ pub fn voxel_over(
 /// when `per_head`), decode and prefill lanes read only those blocks; a
 /// masked lane reads every key. With `scores`, the lanes capturing scores
 /// read theirs out as `attn.scores` ([`score_capture`]'s, over their last 32
-/// query rows and first 2048 keys).
+/// query rows and the keys of the load's context).
 ///
 /// The host plans are the compiler's: each kind's is built once a trace,
 /// over the lanes of that kind and outside any layer, and every layer asking
@@ -1335,21 +1335,36 @@ pub fn attend(
     };
     if scores {
         const OBSERVE: u32 = 32;
-        const KV_MAX: u32 = 2048;
+        // Each layer adds into the row the layers before it filled; the
+        // recorder reads the last one out when the trace is done
+        // (`attn.scores` and `attn.scores.pages`).
+        let rec = inputs.recorder();
+        let into = rec.carried(SCORE_ROW);
         let captured = score_capture(
-            q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, OBSERVE, KV_MAX,
+            q,
+            inputs,
+            kv,
+            q_heads,
+            kv_heads,
+            head_dim,
+            sm_scale,
+            OBSERVE,
+            into.as_ref(),
         );
-        // A `KV_MAX` run per query head: the guest folds over the heads the
-        // output states, never a count of its own.
-        crate::output_in_planes("attn.scores", &captured, None, &[q_heads, KV_MAX]);
+        rec.carry(SCORE_ROW, &captured);
     }
     o
 }
 
-/// The attention mass of each lane capturing scores (`fact::scores`) over
-/// its first `kv_max` keys of `kv`, averaged over the lane's last `observe`
-/// query rows of `q`: `[lanes, q_heads * kv_max]`, a `kv_max` run per query
-/// head.
+/// The row a trace's score captures add into, layer after layer.
+pub(crate) const SCORE_ROW: &str = "attn.scores row";
+
+/// The attention mass a key of each lane capturing scores (`fact::scores`)
+/// over the keys of `kv` the load's context holds, averaged over the lane's
+/// last `observe` query rows of `q` and over its query heads, added to
+/// `into`'s row (an earlier layer's) or to a zeroed one: `[capturing,
+/// context]`, one row a capturing lane in lane order. No arena holds it:
+/// each row lies in the reading program's guest region.
 #[allow(clippy::too_many_arguments)]
 pub fn score_capture(
     q: &Value,
@@ -1360,7 +1375,7 @@ pub fn score_capture(
     head_dim: u32,
     sm_scale: f32,
     observe: u32,
-    kv_max: u32,
+    into: Option<&Value>,
 ) -> Value {
     let rec = inputs.recorder();
     let rows = poem_ir::Guard::and(q.cond(), rec.guard_of(&crate::fact::scores()));
@@ -1374,12 +1389,11 @@ pub fn score_capture(
     });
     let q = crate::record::Refine::refined(q, scoring.rows().clone());
     let scores = rec.fresh(Ty::Tensor {
-        shape: vec![
-            Dim::Lanes,
-            Dim::Const(u64::from(q_heads) * u64::from(kv_max)),
-        ],
+        shape: vec![Dim::Capturing, Dim::ContextTimes(1)],
         dtype: Dtype::F32,
     });
+    let mut ins = vec![&q, &plan];
+    ins.extend(into);
     rec.push(
         Attn::ScoreCapture {
             q: q.id(),
@@ -1387,14 +1401,33 @@ pub fn score_capture(
             cache: inputs.kv(kv),
             head_dim,
             kv_heads,
+            q_heads,
             sm_scale,
             observe,
-            kv_max,
+            into: into.map(Value::id),
             scores: scores.id(),
         },
-        &[&q, &plan],
+        &ins,
     );
     scores
+}
+
+/// Each capturing lane's key row `keys` summed a kv page of the load's:
+/// `[capturing, context pages]`.
+pub fn score_pages(keys: &Value) -> Value {
+    let rec = keys.rec();
+    let pages = rec.fresh(Ty::Tensor {
+        shape: vec![Dim::Capturing, Dim::ContextPages],
+        dtype: Dtype::F32,
+    });
+    rec.push(
+        Attn::ScorePages {
+            keys: keys.id(),
+            pages: pages.id(),
+        },
+        &[keys],
+    );
+    pages
 }
 
 /// Whether any row of `x` can be one `rows` holds for.

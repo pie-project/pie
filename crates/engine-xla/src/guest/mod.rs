@@ -1,7 +1,7 @@
 //! Device forms of eta guest programs: every stage of a program lowered to
 //! StableHLO (`lower`), compiled per batch shape and run on the device
-//! (`run`). A program any of whose stages does not lower is refused a device
-//! form and runs in the host interpreter.
+//! (`run`). A program any of whose stages does not lower is refused at its
+//! registration, by name: there is no other path for its passes.
 
 pub mod lower;
 pub mod run;
@@ -184,21 +184,30 @@ pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
     Ok(())
 }
 
+/// `package`'s form where every stage lowers, else why not; touches no
+/// plane, so a registration's prepare holds nothing its finish must undo.
+pub fn form_of(package: &LaunchPackage) -> Result<Arc<Compiled>, Refused> {
+    admits(package)?;
+    let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
+    Ok(Arc::new(Compiled {
+        key,
+        stages: package.stages.len(),
+        carried: carried_channels(package),
+        carried_words: carried_words(package),
+        fed: fed_channels(package),
+    }))
+}
+
 impl Forms {
     pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
-        match admits(package) {
-            Ok(()) => {
-                let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
-                self.compiled.insert(
-                    program,
-                    Arc::new(Compiled {
-                        key,
-                        stages: package.stages.len(),
-                        carried: carried_channels(package),
-                        carried_words: carried_words(package),
-                        fed: fed_channels(package),
-                    }),
-                );
+        self.hold(program, form_of(package))
+    }
+
+    /// Holds `program`'s form ([`form_of`]), or why it has none.
+    pub fn hold(&mut self, program: ProgramId, form: Result<Arc<Compiled>, Refused>) -> bool {
+        match form {
+            Ok(compiled) => {
+                self.compiled.insert(program, compiled);
                 true
             }
             Err(why) => {

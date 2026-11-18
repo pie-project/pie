@@ -60,7 +60,14 @@ impl Serve for Api {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = crate::tuning::Tuning::new(chip, device.cores());
+        let tuning = crate::tuning::Tuning::new(chip, device.cores())
+            .with_workgroup_bytes(device.workgroup_bytes());
+        // A device whose profile lacks the roofline's constants measures
+        // them here, before ready, and keeps them in the user's profile (a
+        // browser masks its adapter, so no profile states its rates, and
+        // keeps them for its load alone). No bound on one submission is
+        // stated on wgpu yet.
+        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
         Ok((device, tuning))
     }
 
@@ -176,6 +183,7 @@ impl Serve for Api {
             pixels,
             counts,
             done,
+            fed_check,
             ..
         } = launch;
         let arm = prepared.arm;
@@ -205,6 +213,7 @@ impl Serve for Api {
             std::sync::Arc::clone(&shell.shelf.mailbox),
             counts,
             done,
+            fed_check,
             shell.shelf.worker.clone(),
         );
         let pending = frame.commit_async(None)?;

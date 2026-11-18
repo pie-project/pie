@@ -68,9 +68,18 @@ struct SyntheticMedia {
 
 /// A synthetic lane's class and row count.
 type LaneRows = (usize, u32);
+/// What a body is armed for beyond its composition: how its lanes treat
+/// their recurrent rows, and whether its ragged attentions read a group
+/// mask.
+#[derive(Debug, Clone, Copy)]
+struct Treatment {
+    rs: record::RsBody,
+    group_mask: bool,
+}
+
 /// A lattice being armed: the targets left, and what arming has counted.
 pub(super) struct Arming {
-    targets: std::collections::VecDeque<(u32, BodySynth, record::RsBody)>,
+    targets: std::collections::VecDeque<(u32, BodySynth, Treatment)>,
     top: Option<u32>,
     unfireable: Vec<String>,
     verify: bool,
@@ -108,6 +117,8 @@ pub(super) struct Arming {
     /// away.
     profiled: usize,
     ballot: Ballot,
+    /// When arming began.
+    began: std::time::Instant,
 }
 
 impl Arming {
@@ -1041,10 +1052,10 @@ impl Shell {
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
-                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB (or the card) arms no \
+                    "engine-cuda: WARNING: the bodies' hold of {} MiB arms no \
                      lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
-                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
-                     bodies_mem or free the card.",
+                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Free \
+                     the card.",
                     self.bodies_mem >> 20,
                     rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
                     need(&buckets) >> 20,
@@ -1058,7 +1069,7 @@ impl Shell {
         }
         if buckets.len() < was.len() {
             eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB (or the card) arms every key at {fine} \
+                "engine-cuda: the bodies' hold of {} MiB arms every key at {fine} \
                  bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
                  {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
                  lattice, {} MiB left).",
@@ -1255,9 +1266,19 @@ impl Shell {
         // them, not only a drafter's: a guest that drafts for itself (MTP,
         // with no drafts output the load can see) verifies on the plain
         // classes, and it registers after the load arms.
+        //
+        // A composition over a class that reads a lane's group mask is
+        // recorded once more reading one (`record::BodyKey::group_mask`): a
+        // fire whose lanes state a mask replays that body, and the rest the
+        // maskless one.
         let buffering = self.buffers.is_some();
         let rungs = self.rs_rungs();
-        let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
+        let group_masked = if self.stated_feeds.is_empty() {
+            poem_ir::ClassSet::default()
+        } else {
+            self.group_masked.clone()
+        };
+        let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
             .flat_map(|(bucket, target)| {
                 let class = match &target {
@@ -1276,9 +1297,24 @@ impl Shell {
                 } else {
                     &[record::RsBody::Folds]
                 };
+                let masks: &[bool] = if target
+                    .lanes()
+                    .0
+                    .iter()
+                    .any(|&(class, _)| group_masked.contains(class))
+                {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
                 treatments
                     .iter()
-                    .map(move |rs| (bucket, target.clone(), *rs))
+                    .flat_map(|&rs| {
+                        masks
+                            .iter()
+                            .map(move |&group_mask| Treatment { rs, group_mask })
+                    })
+                    .map(move |treatment| (bucket, target.clone(), treatment))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1308,8 +1344,9 @@ impl Shell {
         // not (the correction's waist, a slab a lane), which a fire must
         // find laid like any other.
         let adapts = self.adapters().slots().seats() > 0;
-        'targets: for (bucket, target, rs) in &targets {
-            self.arm_rs = *rs;
+        'targets: for (bucket, target, treatment) in &targets {
+            self.arm_rs = treatment.rs;
+            self.arm_group_mask = treatment.group_mask;
             let (lanes, media) = target.lanes();
             let adapted: Vec<LaneRows> = lanes
                 .iter()
@@ -1338,11 +1375,13 @@ impl Shell {
                 }
             }
         }
+        // The voxel walk is a plain fire: no recurrent treatment, no mask.
+        self.arm_rs = record::RsBody::Folds;
+        self.arm_group_mask = false;
         if walked.is_ok() {
             walked = self.size_voxels();
         }
         let footprint = crate::sizing::end();
-        self.arm_rs = record::RsBody::Folds;
         walked.map(|()| Some(footprint))
     }
 
@@ -1465,6 +1504,7 @@ impl Shell {
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
+            began: std::time::Instant::now(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1474,8 +1514,8 @@ impl Shell {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
-        while let Some((bucket, target, rs)) = st.targets.pop_front() {
-            self.arm_target(&mut st, bucket, target, rs)?;
+        while let Some((bucket, target, treatment)) = st.targets.pop_front() {
+            self.arm_target(&mut st, bucket, target, treatment)?;
         }
         self.arm_end(st)
     }
@@ -1485,7 +1525,7 @@ impl Shell {
         st: &mut Arming,
         bucket: u32,
         target: BodySynth,
-        rs: record::RsBody,
+        treatment: Treatment,
     ) -> Result<()> {
         // A record says the lattice fit whole: it arms as recorded.
         if !st.priced && !st.from_record && st.narrower(bucket, &target) {
@@ -1509,7 +1549,8 @@ impl Shell {
         if st.dropped.contains(&bucket) {
             return Ok(());
         }
-        self.arm_rs = rs;
+        self.arm_rs = treatment.rs;
+        self.arm_group_mask = treatment.group_mask;
         // Past its kind's widest bucket a target captures cold: the top
         // bucket's fires made what its warm fire would.
         self.arm_cold = st.narrower(bucket, &target) && !st.verify;
@@ -1749,6 +1790,7 @@ impl Shell {
 
     fn arm_end(&mut self, mut st: Arming) -> Result<()> {
         self.arm_rs = record::RsBody::Folds;
+        self.arm_group_mask = false;
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a
@@ -1791,7 +1833,10 @@ impl Shell {
             refusals: stats.tally.refusals,
             seal,
         };
-        eprintln!("engine-cuda: {report}");
+        eprintln!(
+            "engine-cuda: {report}; armed in {:.1} s",
+            st.began.elapsed().as_secs_f64()
+        );
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
@@ -1802,14 +1847,18 @@ impl Shell {
         // The record: written where every rung armed, at what the bodies
         // took and what their captures took; dropped, and said, where a record's
         // allowance armed short of whole.
+        let took = stats.census.bytes as u64;
+        let captured = st.took.unwrap_or(took);
+        if !st.verify {
+            // What this arming took, the allowance a re-arm within the same
+            // load starts from ([`Shell::rearm_bodies`]) and a measuring
+            // load's refit holds: a load with no record to keep (no cache
+            // directory) measures all the same.
+            self.bodies_took = captured.max(took);
+        }
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
         {
-            let took = stats.census.bytes as u64;
-            let captured = st.took.unwrap_or(took);
-            // What this arming took, the allowance a re-arm within the same
-            // load starts from ([`Shell::rearm_bodies`]).
-            self.bodies_took = captured.max(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
@@ -2100,7 +2149,7 @@ impl core::fmt::Display for Armed {
                         spare >> 20
                     ),
                     None if self.belted => "record::MAX_BODIES".to_string(),
-                    None => "[engine] bodies_mem".to_string(),
+                    None => "the bodies' hold".to_string(),
                 },
                 self.never_from,
             )?,
@@ -2127,7 +2176,7 @@ impl core::fmt::Display for Armed {
 /// bucket and recurrent rows' treatment, the top bucket, and the keys no
 /// synthetic fire reaches.
 struct LatticeTargets {
-    targets: Vec<(u32, BodySynth, record::RsBody)>,
+    targets: Vec<(u32, BodySynth, Treatment)>,
     top: Option<u32>,
     unfireable: Vec<String>,
 }

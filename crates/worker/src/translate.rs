@@ -149,17 +149,12 @@ fn build_model(
         .map(|(group, g)| {
             let disk_kept = kept_disk(&user.engine.memory, group, &g);
             runtime::bootstrap::EngineConfig {
-                total_pages: g.caps.pools.kv_pages as usize,
                 chunks: g.caps.chunks.clone(),
                 window_tokens: g.caps.pools.window_tokens,
-                cpu_pages: g.caps.pools.host_kv_pages as usize,
-                disk_pages: g.caps.pools.disk_kv_pages,
                 disk_kept,
-                rs_cache_slots: g.caps.pools.state_slots as usize,
                 seated_first: g.caps.pools.seated_first,
                 seat_to_end: g.caps.pools.seat_to_end,
                 seat_spread: g.caps.pools.seat_spread,
-                rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 draft_block: g.caps.draft_block,
                 draft_mask_token: g.caps.draft_mask_token,
                 draft_proposals_from: g.caps.draft_proposals_from,
@@ -190,7 +185,7 @@ fn build_model(
         memory_tolerance: user.engine.memory.tolerance(),
         name: m.name.clone(),
         model_id: engines_facts,
-        kv_page_size: group0_caps.pools.kv_page_size as usize,
+        kv_page_size: group0_caps.chunks.page_tokens() as usize,
         tokenizer_path,
         metadata,
         engines,
@@ -206,17 +201,17 @@ fn kept_disk(
     group: usize,
     g: &crate::backend::GroupEngine,
 ) -> Option<runtime::bootstrap::KeptDisk> {
-    let pools = &g.caps.pools;
-    match (&g.disk_kv_dir, pools.disk_kv_persistent) {
+    let chunks = &g.caps.chunks;
+    match (&g.disk_kv_dir, chunks.disk_persistent) {
         (Some(dir), true) => Some(runtime::bootstrap::KeptDisk {
             journal: dir.join(format!("g{group}.journal")),
-            kept: pools.disk_kv_kept,
+            kept: chunks.disk_kept,
         }),
         _ => {
             if memory.disk_persistent {
                 tracing::warn!(
                     engine = %g.backend.kind(),
-                    disk_pages = pools.disk_kv_pages,
+                    disk_pages = chunks.kv_disk_pages(),
                     "disk_persistent: this engine keeps no disk tier across runs; it is scratch"
                 );
             }

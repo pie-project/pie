@@ -65,16 +65,27 @@ device = []
 # sees it. Off, no build writes those bytes.
 test-slot-fill = []
 
+# A test build's pins (`Knobs::pin`, `Knobs::dense_weights`): fires launched
+# eagerly, or a load with no weight shape. No profile or config reaches them;
+# serving captures every fire. The crate's own tests turn it on below.
+test-pins = []
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
+engine-cuda = { path = ".", features = ["test-pins"] }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 tempfile = "3"
+engine-cpu = { path = "../engine-cpu" }
 
 [lints]
 workspace = true

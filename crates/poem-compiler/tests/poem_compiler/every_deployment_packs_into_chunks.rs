@@ -275,12 +275,11 @@ fn row(name: &str, recipe: &ChunkRecipe) -> String {
     #[allow(clippy::cast_precision_loss)]
     let fixed = fixed as f64 / f64::from(1u32 << 20);
     format!(
-        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.1} | {:.2} |",
+        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.2} |",
         human(recipe.chunk_bytes),
         recipe.shapes(),
         per.join("/"),
         recipe.chunks_per_ws(),
-        recipe.cow_chunks(),
         recipe.waste.percent()
     )
 }
@@ -298,9 +297,7 @@ fn every_deployment_packs_into_chunks_on_both_presets() {
         let profile = on(chunk);
         let mut worst: Option<(f64, String)> = None;
         println!("\n## {preset}\n");
-        println!(
-            "| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | CoW chunks/pool | waste % |"
-        );
+        println!("| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | waste % |");
         println!("|---|---|---|---|---|---|---|---|");
         for (deployment, trace) in &traces {
             let recipe = match chunk::plan(trace, &budgets, &profile) {
@@ -411,8 +408,7 @@ fn fixed_overhead(recipe: &ChunkRecipe) -> f64 {
     else {
         panic!("no fixed record")
     };
-    let sets = u64::from(recipe.profile.concurrency) * u64::from(FIXED_SETS_PER_WS)
-        + u64::from(recipe.cow_sets());
+    let sets = u64::from(recipe.profile.concurrency) * u64::from(FIXED_SETS_PER_WS);
     let per = recipe.chunk_bytes / bytes;
     let slots = sets * u64::from(*pieces_per_ws);
     let held = slots as f64 * recipe.chunk_bytes as f64 / per as f64;
@@ -509,6 +505,31 @@ fn planned_on(name: &str, chunk: ChunkProfile) -> (Trace, ChunkRecipe) {
     let trace = deployment.trace(Platform::Cuda);
     let recipe = chunk::plan(&trace, &Budgets::of(Budget::default()), &on(chunk)).unwrap();
     (trace, recipe)
+}
+
+/// A fork's copy-on-write record is taken from the pool when the fork
+/// writes: how many lanes a fire may run sizes nothing of the pool, so a
+/// hybrid's recipe is the same at any fire width.
+#[test]
+fn a_hybrids_state_pool_is_sized_without_the_fire_width() {
+    let deployment =
+        catalog::deployment("qwen35-d0.8b-vision-mtp-bf16-kv-bf16").expect("the hybrid is listed");
+    let trace = deployment.trace(Platform::Cuda);
+    for (preset, chunk) in PRESETS {
+        let at = |max_lanes: u32| {
+            let budgets = Budgets::of(Budget {
+                max_lanes,
+                ..Budget::default()
+            });
+            chunk::plan(&trace, &budgets, &on(chunk)).unwrap()
+        };
+        let narrow = at(1);
+        assert!(
+            narrow.fixed().is_some(),
+            "{preset}: the hybrid keeps a record"
+        );
+        assert_eq!(narrow, at(512), "{preset}");
+    }
 }
 
 /// The rs list's runs.

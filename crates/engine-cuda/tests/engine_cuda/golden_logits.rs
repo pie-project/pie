@@ -8,13 +8,12 @@
 //! that must not move a logit (a memory layout, an address) is proven by
 //! the same hashes before and after it.
 //!
-//! A dense product's cuBLAS algorithm is the one the profile's tactic tables
-//! name, or cuBLAS's own pick where they name none; nothing is timed at load,
-//! so every run sums each product in the same order. The probe reads the
-//! user's table under the cache shared across runs (`PIE_GOLDEN_CACHE/profiles`,
-//! the cache by default `pie-golden-cache` under the system's temp dir) over
-//! the device profile's checked-in one. Each model is served twice in its
-//! process, and the second serving is the one hashed.
+//! A dense product's kernel is chosen by its shape alone (a streaming
+//! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
+//! at load, so every run sums each product in the same order. The cache is
+//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
+//! under the system's temp dir). Each model is served twice in its process,
+//! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
 //! which seeds each model's checkpoint into the cache's `fixtures` without a
@@ -107,8 +106,19 @@ fn fnv(name: &str) -> u64 {
     fnv_bytes(FNV, name.as_bytes())
 }
 
-/// The hash of a step's logits, bit for bit.
+/// The hash of a step's logits, bit for bit. `PIE_GOLDEN_LOGITS=<dir>`
+/// also writes each row hashed, in order, as `<n>.f32` (little-endian): two
+/// runs' rows at a step whose top parts, to weigh the parting against the
+/// row's drift.
 fn hash_logits(logits: &[f32]) -> u64 {
+    if let Some(dir) = std::env::var_os("PIE_GOLDEN_LOGITS") {
+        static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let at = AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the logits directory");
+        std::fs::write(dir.join(format!("{at}.f32")), bytes).expect("a logits row is written");
+    }
     logits
         .iter()
         .fold(FNV, |hash, v| fnv_bytes(hash, &v.to_bits().to_le_bytes()))
@@ -449,7 +459,8 @@ fn load_under(
                 .and_then(|mib| mib.parse::<u64>().ok())
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
-        },
+        }
+        .map(engine_cuda::store::KvSize::Bytes),
         allowance,
         context_declared: false,
         ordinal: 0,
@@ -476,10 +487,7 @@ fn knobs() -> engine_cuda::Knobs {
     // `PIE_GOLDEN_EAGER`: no graph captured and no body recorded; every
     // fire walks its plan. The logits are a recorded body's.
     if std::env::var_os("PIE_GOLDEN_EAGER").is_some() {
-        knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        ));
+        knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
@@ -489,7 +497,7 @@ fn knobs() -> engine_cuda::Knobs {
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
-    knobs.diagnostics.dense_weights = true;
+    knobs.dense_weights = true;
     knobs
 }
 
@@ -500,10 +508,7 @@ fn knobs() -> engine_cuda::Knobs {
 /// match bit for bit.
 fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
     if std::env::var_os("PIE_GOLDEN_RS_EAGER").is_some() {
-        knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        ));
+        knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
     knobs
 }
@@ -935,8 +940,12 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     if stated.is_some() {
         resident("before it is seated");
     }
+    let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
+    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, CONTEXT, host, 1)
+        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+        .expect("the staging ring pins");
     shell
-        .seat_host_kv(Some(stated.map_or(1 << 30, |mib| mib << 20)), 1, CONTEXT, 1)
+        .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
     if stated.is_some() {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1601,6 +1610,139 @@ fn golden_pair_buffered() {
     }
 }
 
+/// Every lane of a fire replaying its own buffered rows answers as it does
+/// replaying alone, the fire's last lanes too: each lane's whole staged
+/// `RsLane` (where its replay lies and its place in the extended run) is
+/// the one the fire stages, never an earlier fire's left in the table.
+#[test]
+fn every_lane_of_a_wide_replaying_fire_replays_its_own_rows() {
+    use engine::fire::{FoldLen, RsVerb};
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FLOOR: f32 = 0.05;
+    const LANES: u32 = 4;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(LANES, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        // As many slots as lanes: a fire's lane table spans the slots, so
+        // the last lanes' tails lie where a short copy stops.
+        slots: LANES,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        // Walked eagerly, as a fire no body carries is (a masked class's,
+        // a beam's): its lane table is staged at its own lanes, not a
+        // body's carve.
+        knobs: engine_cuda::Knobs {
+            pin: Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off))),
+            ..engine_cuda::Knobs::default()
+        },
+        cache_dir: Some(&cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{model} loads: {why}"));
+    let page = rs_page(&mut shell);
+    // Lane `lane`'s buffered rows: a length and tokens of its own, so each
+    // lane replays apart from every other and lies at its own place.
+    let history = |lane: u32| -> Vec<u32> {
+        (0..3 + 2 * lane)
+            .map(|at| (17 + lane * 53 + at * 37) % 256)
+            .collect()
+    };
+    let buffer = |slot: u32, rows: u32| RsVerb::Buffer {
+        pages: (0..rows.div_ceil(page)).map(|at| slot * 16 + at).collect(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(0),
+        lineage: engine::fire::Lineage::Set,
+    };
+    let fire = |shell: &mut Shell, lanes: &[(u32, Vec<u32>, RsVerb)]| -> Vec<Vec<f32>> {
+        let seated: Vec<engine_cuda::Seated<'_>> = lanes
+            .iter()
+            .map(|(slot, tokens, rs)| engine_cuda::Seated {
+                rs: rs.clone(),
+                ..engine_cuda::Seated::of(Lane {
+                    slot: *slot,
+                    word: fixture.trace.facts.word(&Request::new(
+                        u32::try_from(tokens.len()).expect("a count"),
+                        false,
+                    )),
+                    tokens,
+                })
+            })
+            .collect();
+        shell.fire_media(&seated, &[], &[]).expect("the fire runs")
+    };
+    // Each lane buffers its history on slot `base + lane`, then replays it
+    // under one more row, alone or (its slot opened anew and its history
+    // buffered again) in one fire with every other lane, after the lone
+    // fires left their lane tables behind.
+    let replay_row = |lane: u32| vec![(200 + lane * 11) % 256];
+    let stage = |shell: &mut Shell, base: u32| {
+        for lane in 0..LANES {
+            let slot = base + lane;
+            shell.open(slot).expect("the slot opens");
+            let rows = history(lane);
+            let k = rows.len() as u32;
+            fire(shell, &[(slot, rows, buffer(slot, k))]);
+        }
+    };
+    stage(&mut shell, 0);
+    let alone: Vec<Vec<f32>> = (0..LANES)
+        .map(|lane| {
+            let k = history(lane).len() as u32;
+            fire(&mut shell, &[(lane, replay_row(lane), buffer(lane, k + 1))]).swap_remove(0)
+        })
+        .collect();
+    stage(&mut shell, 0);
+    let together = fire(
+        &mut shell,
+        &(0..LANES)
+            .map(|lane| {
+                let slot = lane;
+                let k = history(lane).len() as u32;
+                (slot, replay_row(lane), buffer(slot, k + 1))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let spread = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let apart: Vec<String> = alone
+        .iter()
+        .zip(&together)
+        .enumerate()
+        .filter_map(|(lane, (a, b))| {
+            let d = spread(a, b);
+            eprintln!("{model}: replaying lane {lane} of {LANES} beside the rest vs alone: {d:.4}");
+            (d > FLOOR).then(|| format!("lane {lane}: {d}"))
+        })
+        .collect();
+    assert!(
+        apart.is_empty(),
+        "{model}: lanes of a wide replaying fire answer apart from alone: {apart:?}"
+    );
+}
+
 fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract, String> {
     let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
     poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -1702,12 +1844,11 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             tokens,
             kv: KvDelta {
                 held: fed,
-                pages: pages.clone(),
                 ..KvDelta::default()
             },
             rs,
             tables: vec![(ids[0], pages.clone())],
-            fixed: vec![(ids[2], record.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(ids[2], record.clone())]),
             slot_copies: if copies.is_empty() {
                 Vec::new()
             } else {
@@ -1874,7 +2015,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // The table's rows alone: the model's routed experts dense, as the
     // base engine seats them.
     let mut knobs = knobs();
-    knobs.diagnostics.dense_weights = false;
+    knobs.dense_weights = false;
     knobs.diagnostics.dense_experts = true;
     let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
@@ -2022,7 +2163,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let began = std::time::Instant::now();
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
     let mut knobs = knobs();
-    knobs.diagnostics.dense_weights = false;
+    knobs.dense_weights = false;
     knobs.weights_held = told;
     let mut shell = load_with(fixture, cache, knobs);
     let loaded = began.elapsed();
@@ -2353,7 +2494,7 @@ fn load_lanes(
         page_size: PAGE,
         context: CONTEXT,
         slots: lanes,
-        kv_budget,
+        kv_budget: kv_budget.map(engine_cuda::store::KvSize::Bytes),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
@@ -2476,12 +2617,9 @@ fn served_two_sets(
     use engine::chunk::SlotKind;
     use engine::fire::RsReset;
     let mut knobs = knobs();
-    knobs.chip = match serving {
-        Serving::Recorded => knobs.chip,
-        Serving::Eager => Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        )),
+    knobs.pin = match serving {
+        Serving::Recorded => knobs.pin,
+        Serving::Eager => Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off))),
     };
     let mut shell = load_with(fixture, cache, knobs);
     // As a worker boots it: the fitted pool backed whole, its facts stated.
@@ -2598,84 +2736,6 @@ fn golden_eager_resume() {
         );
         small_pool_arms(&fixture, &cache);
     }
-}
-
-/// A load and its serving time no dense GEMM tactic: two loads of one model
-/// with fresh, empty user tables pick the same tactics (the checked-in
-/// table's, or cuBLAS's own) and serve bit-identical logits, and the
-/// process timed nothing. Under `time_tactics` (as `pie tune` runs) the same
-/// load times what the tables lack, which is the control: a model the
-/// checked-in table does not cover, so there is something to time.
-#[cfg(feature = "cuda")]
-#[test]
-#[ignore = "a probe run by hand: see the module's doc"]
-fn golden_two_fresh_loads_time_nothing() {
-    if !engine_cuda::device::present() {
-        eprintln!("skipping: no CUDA device on this machine");
-        return;
-    }
-    let cache = cache_dir();
-    // A model whose products the checked-in table does not hold, so the
-    // control has something to time: `PIE_GOLDEN_FRESH`.
-    let model =
-        std::env::var("PIE_GOLDEN_FRESH").unwrap_or_else(|_| "qwen38-flash-next-mini".to_string());
-    let fixture = fixture(&model, &cache);
-    let dir_of =
-        |n: u32| std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
-    // The probe's homes go when it ends, passing or not.
-    struct Homes<F: Fn(u32) -> std::path::PathBuf>(F);
-    impl<F: Fn(u32) -> std::path::PathBuf> Drop for Homes<F> {
-        fn drop(&mut self) {
-            for n in 0..3 {
-                let _ = std::fs::remove_dir_all((self.0)(n));
-            }
-        }
-    }
-    let _homes = Homes(dir_of);
-    let fresh = |n: u32| {
-        let dir = dir_of(n);
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut knobs = knobs();
-        knobs.profiles = Some(dir);
-        knobs
-    };
-    let serve = |knobs: engine_cuda::Knobs| {
-        let mut shell = load_with(&fixture, &cache, knobs);
-        shell.open(0).expect("slot 0 opens");
-        let prompt: Vec<u32> = (0..64u32).map(|t| (t * 7 + 11) % 1000).collect();
-        let word = fixture.trace.facts.word(&Request::new(64, false));
-        let mut rows = shell
-            .fire_media(
-                &[Seated::of(Lane {
-                    slot: 0,
-                    word,
-                    tokens: &prompt,
-                })],
-                &[],
-                &[],
-            )
-            .expect("the prompt fires");
-        rows.swap_remove(0)
-    };
-    let before = kernels_cuda::linear::gemm::timed();
-    let first = serve(fresh(0));
-    let second = serve(fresh(1));
-    let timed = kernels_cuda::linear::gemm::timed() - before;
-    println!(
-        "golden {model}-fresh-loads: timed {timed} product(s); logits equal: {}",
-        first == second
-    );
-    assert_eq!(timed, 0, "a load timed {timed} dense GEMM product(s)");
-    assert!(first == second, "two fresh loads served different logits");
-    kernels_cuda::linear::gemm::time_tactics(true);
-    let _ = serve(fresh(2));
-    kernels_cuda::linear::gemm::time_tactics(false);
-    let control = kernels_cuda::linear::gemm::timed() - before;
-    println!("golden {model}-fresh-loads: under time_tactics a load timed {control}");
-    assert!(
-        control > 0,
-        "a load under time_tactics timed nothing, so this probe's model shows nothing"
-    );
 }
 
 /// One lane's state after a fire of `tokens` that buffers them all past a
@@ -2853,7 +2913,7 @@ fn golden_budget_probe() {
         for &budget in &budgets {
             let mut knobs = knobs();
             if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
-                knobs.diagnostics.dense_weights = false;
+                knobs.dense_weights = false;
                 knobs.diagnostics.untabled_experts = true;
             }
             let allowance = engine::Allowance {
@@ -2890,7 +2950,7 @@ fn least_budget(
     let knobs = || {
         let mut knobs = knobs();
         if untabled {
-            knobs.diagnostics.dense_weights = false;
+            knobs.dense_weights = false;
             knobs.diagnostics.untabled_experts = true;
         }
         knobs
@@ -2923,8 +2983,11 @@ fn least_budget(
 }
 
 /// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
+/// A prefill longer than the rows one fire carries under the load's budget
+/// goes in fires of at most that many, the last one's logits the step's.
 fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
     shell.open(0).expect("slot 0 opens");
+    let most = usize::try_from(shell.budget().max_tokens.max(1)).expect("a count");
     let mut fed = 0u32;
     let mut last = None;
     let mut steps = Vec::with_capacity(STAGED_SCRIPT.len());
@@ -2934,7 +2997,11 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
             Step::Decode => vec![last.expect("a decode follows a step")],
         };
         fed += u32::try_from(tokens.len()).expect("a count");
-        let logits = fire(shell, trace, &tokens);
+        let logits = tokens
+            .chunks(most)
+            .map(|chunk| fire(shell, trace, chunk))
+            .last()
+            .expect("a step fires some rows");
         last = Some(argmax(&logits));
         steps.push(logits);
     }
@@ -2977,7 +3044,7 @@ fn golden_staged_experts() {
 
         let staged = || {
             let mut knobs = knobs();
-            knobs.diagnostics.dense_weights = false;
+            knobs.dense_weights = false;
             knobs.diagnostics.untabled_experts = true;
             knobs
         };
@@ -3084,5 +3151,71 @@ fn golden_staged_experts() {
             said.contains(&format!("{} bytes of staged experts", staging.bytes())),
             "{model}: and the bytes: {said}"
         );
+    }
+}
+
+/// The decisions `model` reads served over [`SCRIPT`] under the profile the
+/// probe's loads resolve: those a dispatch consulted for its shapes and kinds.
+fn read_set(model: &str, cache: &Path) -> Vec<&'static str> {
+    let (name, facts) = engine_cuda::chip::probe(0).expect("a CUDA device answers");
+    let (profile, _) = engine_cuda::chip::resolve(&name, &facts, knobs().profiles.as_deref());
+    let fixture = fixture(model, cache);
+    let mut knobs = knobs();
+    knobs.chip = Some(profile.clone());
+    let mut shell = load_with(&fixture, cache, knobs);
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = 0;
+    for step in SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        last = argmax(&fire(&mut shell, &fixture.trace, &tokens));
+    }
+    drop(shell);
+    profile.read()
+}
+
+/// A kernel decision only a routed, recurrent, MLA, indexed or NVFP4 model
+/// can reach.
+fn family_only(id: &str) -> bool {
+    [
+        "kernel.moe.",
+        "kernel.ssm.",
+        "kernel.mla.",
+        "kernel.sdpa.mla",
+        "kernel.sdpa.index",
+        "kernel.sdpa.compressed",
+    ]
+    .iter()
+    .any(|p| id.starts_with(p))
+        || id.contains("nvfp4")
+}
+
+/// A dense bf16 model reads no routed, recurrent, MLA, indexed or NVFP4
+/// decision, so `pie tune` times none of them on it; a routed model (the
+/// control) reads its routed ones. `PIE_GOLDEN_MODELS` names more models
+/// whose read sets are printed. Fixtures as [`golden_fixtures`].
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_dense_model_reads_no_routed_or_recurrent_decision() {
+    let cache = cache_dir();
+    let dense = read_set("qwen3-0.6b", &cache);
+    println!("reads qwen3-0.6b {dense:?}");
+    let stray: Vec<&str> = dense.iter().copied().filter(|id| family_only(id)).collect();
+    assert!(stray.is_empty(), "qwen3-0.6b reads {stray:?}");
+    assert!(dense.contains(&"kernel.gemm.skinny_rows"), "{dense:?}");
+    let routed = read_set("gptoss-20b-mini-u4g64-mxfp4-kv-bf16", &cache);
+    println!("reads gptoss-20b-mini-u4g64-mxfp4-kv-bf16 {routed:?}");
+    assert!(
+        routed.iter().any(|id| id.starts_with("kernel.moe.")),
+        "the routed control reads no routed decision: {routed:?}"
+    );
+    if std::env::var_os("PIE_GOLDEN_MODELS").is_some() {
+        for model in models() {
+            println!("reads {model} {:?}", read_set(&model, &cache));
+        }
     }
 }

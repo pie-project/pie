@@ -24,27 +24,29 @@ pub mod memory;
 pub mod placement;
 pub mod ports;
 pub mod program;
+pub mod rates;
+pub mod roofline;
 pub mod rs;
 pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
-pub use channel::{
-    ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel,
-};
+pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
     ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRole, SlotRun, SlotShape,
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
+    CompletionSink, Engine, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone, StepOutcome,
+    TapGroups, TapSink, Tapped,
 };
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
+    LaneReadout, LaneRecord, ListKind, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot,
+    RsVerb, Serves, Step,
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{
