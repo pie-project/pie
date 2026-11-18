@@ -892,6 +892,23 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Marks `pid` as waiting at a bind for room, or past it
+    /// ([`super::proc::Proc::bind_waiting`]): waiting, it is a victim as an
+    /// idle process is, and the planner looks again for a head it may now
+    /// fund.
+    pub fn set_bind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: bool) {
+        let changed = self.with_inner(|inner| {
+            inner.procs.get_mut(&pid).is_some_and(|proc| {
+                let was = proc.bind_waiting;
+                proc.bind_waiting = waiting;
+                was != waiting
+            })
+        });
+        if changed && waiting {
+            self.poke();
+        }
+    }
+
     /// Marks `pid` as waiting on its client, or as awake again. Waking a
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {

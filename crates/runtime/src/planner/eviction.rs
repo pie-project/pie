@@ -305,10 +305,16 @@ impl ResidencyPlanner {
                     proc.admitted
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
+                        // Waiting at a bind for room, it makes no progress
+                        // until room comes: it yields as an idle one does,
+                        // to a prompt not yet seated too.
                         && if seating {
-                            proc.idle || proc.held
+                            proc.idle || proc.held || proc.bind_waiting
                         } else {
-                            proc.rank() > head_rank || proc.idle || proc.held
+                            proc.rank() > head_rank
+                                || proc.idle
+                                || proc.held
+                                || proc.bind_waiting
                         }
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)

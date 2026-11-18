@@ -798,12 +798,19 @@ impl Roles {
         };
         let (chunks, pieces) = part.chunk_runs();
         let mut device = self.device.lock().unwrap();
-        let pool = device.pool_mut();
         let free = match room {
             GuestRoom::Runs { free_runs, .. } => free_runs,
             GuestRoom::Slots { .. } => 0,
         };
-        let committable = pool.committable_runs(chunks);
+        // Runs a commit could make, only where one can come: at the
+        // governor's target the walk commits nothing, and a bind short of
+        // room goes to the planner (BindShort) instead of waiting on it.
+        let committable = if device.commit_can_come() {
+            device.pool().committable_runs(chunks)
+        } else {
+            0
+        };
+        let pool = device.pool_mut();
         let room = room.with_committable(committable);
         if free.saturating_add(committable) < pieces {
             if heads {
@@ -2151,6 +2158,7 @@ pub async fn bind_when_resident<T, E, B, W, G, P, Q>(
     planned: impl Fn(u32, u32) -> P,
     turn: impl Fn() -> Q,
     leave: impl Fn(),
+    waiting: impl Fn(bool),
 ) -> anyhow::Result<T>
 where
     E: std::fmt::Display,
@@ -2169,9 +2177,21 @@ where
         }
     }
     let _leaves = Leaves(&leave);
+    // Waiting for room, the process yields to the planner as an idle one
+    // does (`waiting`); past the wait, however it ends, it no longer does.
+    let waits = || waiting(true);
+    struct Ends<'a, F: Fn(bool)>(&'a F);
+    impl<F: Fn(bool)> Drop for Ends<'_, F> {
+        fn drop(&mut self) {
+            (self.0)(false);
+        }
+    }
+    let _ends = Ends(&waiting);
     loop {
         // Taken before the bind: room given back meanwhile is not lost.
         let watch = room();
+        // Binding again, it is no victim while the bind is under way.
+        waiting(false);
         let error = match bind().await {
             Ok(bound) => return Ok(bound),
             Err(error) => error,
@@ -2179,6 +2199,7 @@ where
         if let Some(RolesError::GuestQueued { head }) = error.downcast_ref::<RolesError>() {
             let head = *head;
             tracing::debug!(%pid, %head, "a guest bind waits behind an earlier one");
+            waits();
             turn().await;
             continue;
         }
@@ -2217,6 +2238,7 @@ where
             // stand free: it is sent again on the room it waits for, never
             // on any give.
             tracing::debug!(%pid, %error, "a bind waits in the planner for room");
+            waits();
             let freed = async {
                 let Some(mut watch) = watch else {
                     return std::future::pending().await;
@@ -2243,11 +2265,21 @@ where
             }
             continue;
         }
-        if let Some(&RolesError::GuestGrow { prefix, run, .. }) = error.downcast_ref::<RolesError>()
+        if let Some(RolesError::GuestGrow {
+            prefix, run, room: short, ..
+        }) = error.downcast_ref::<RolesError>()
         {
+            let (prefix, run) = (*prefix, *run);
+            let pieces = short.chunk_runs().1;
             tracing::debug!(%pid, %error, "a bind waits on a segment commit");
-            // A commit, or room given back (its runs may stand free in it):
-            // either ends the wait, and it binds again.
+            waits();
+            // A commit, room given back (its runs may stand free in it), or
+            // the planner's serve: any ends the wait, and it binds again.
+            // The planner is asked too, as for a bind short of room
+            // (`planned`): where the governor's target stops the walk
+            // committing after all, it is the only one that makes room
+            // (idle cache dropped, a resident parked), and it parks no one
+            // for a grow that is coming.
             let freed = async {
                 match watch {
                     Some(watch) => watch.freed().await,
@@ -2261,6 +2293,11 @@ where
                     }
                 }
                 () = freed => {}
+                made = planned(run, pieces) => {
+                    if let Err(why) = made {
+                        return Err(error.context(format!("its wait for room ended: {why}")));
+                    }
+                }
             }
             continue;
         }

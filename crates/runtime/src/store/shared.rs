@@ -769,6 +769,9 @@ pub struct SharedPool {
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
     /// while their slot count is short.
     guest_head: Option<(u32, u32)>,
+    /// The governor's segment target the walk steers this pool to, shared
+    /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
+    walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
     /// The engine whose rung gate this pool publishes the rung it holds
@@ -1020,6 +1023,7 @@ impl SharedPool {
             lowering: None,
             span_commit_blocked: false,
             guest_head: None,
+            walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
         };
@@ -2205,6 +2209,26 @@ impl SharedPool {
     /// ([`crate::store::roles::Roles::take_guest`]).
     pub fn set_guest_head(&mut self, need: Option<(u32, u32)>) {
         self.guest_head = need;
+    }
+
+    /// The walk's target, shared ([`Self::commit_can_come`]).
+    pub fn walked_to(&mut self, target: Arc<std::sync::atomic::AtomicU32>) {
+        self.walk_target = Some(target);
+    }
+
+    /// Whether the walk would commit a segment now: its goal (a pinned
+    /// count, else the governor's target) is past what is mapped. At the
+    /// target nothing commits, however many segments the pool's own
+    /// limits leave uncommitted. Without a walk (a pool none steers), as
+    /// the pool's limits say.
+    #[must_use]
+    pub fn commit_can_come(&self) -> bool {
+        let Some(target) = &self.walk_target else {
+            return true;
+        };
+        let goal = target::pinned_segments()
+            .unwrap_or_else(|| target.load(std::sync::atomic::Ordering::Acquire));
+        goal > self.mapped_segments()
     }
 
     /// The head guest bind's need, `(run, pieces)`, where one waits.
