@@ -84,9 +84,14 @@ impl Serve for Api {
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
         // A device whose profile lacks the roofline's constants measures
-        // them here, before ready, and keeps them in the user's profile.
-        // No bound on one submission is stated on Vulkan yet.
-        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
+        // them here, before ready, and keeps them in the user's profile,
+        // each submission within the platform's stated bound on one.
+        let tuning = crate::rates::at_load(
+            &device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::STATED_SUBMIT_BOUND,
+        )?;
         Ok((device, tuning))
     }
 

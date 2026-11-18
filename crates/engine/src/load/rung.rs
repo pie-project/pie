@@ -656,6 +656,8 @@ mod tests {
             bytes_per_ns,
             elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
+            few_row_flops_per_ns: None,
+            workgroups_per_core: None,
             row_tile: std::sync::Arc::new(|_, _, _| 1),
         }
     }
@@ -776,6 +778,38 @@ mod tests {
         assert_eq!(top(4096), 2048);
         // A context of 1024 holds no prompt of 2048: the knee itself.
         assert_eq!(top(1024), 1024);
+    }
+
+    /// A per-row cost that rises at a kernel switch (the Adreno 840's gemv
+    /// to tiled at 4 rows, 1.9x a row) and falls past it is no saturation:
+    /// the fire top is the argmax over the whole lattice, so it walks past
+    /// the rise to where the rate is highest.
+    #[test]
+    fn the_fire_top_walks_past_a_rise_in_cost_a_row_at_a_kernel_switch() {
+        let (e, at) = summed(0, 1.0);
+        let e = FireEstimate {
+            rates: crate::roofline::Constants {
+                gemm_by_rows: vec![(
+                    1024,
+                    vec![
+                        (1, 400.0),
+                        (2, 800.0),
+                        (4, 420.0),
+                        (8, 840.0),
+                        (64, 2000.0),
+                        (512, 4000.0),
+                        (2048, 5000.0),
+                    ],
+                )],
+                ..e.rates
+            },
+            dense_bytes: 1 << 20,
+            gemm_shapes: vec![GemmShape::dense(1024, 1024, 2 * 1024 * 1024, 1 << 21)],
+            ..e
+        };
+        let rungs = [1, 2, 4, 8, 64, 512, 2048].map(|t| at(t, 0));
+        let top = fire_top(&rungs, 1 << 30, &e, 4096).unwrap().tokens;
+        assert_eq!(top, 2048);
     }
 
     /// A rung no wider than its lanes is weighed decode-shaped (a lane a

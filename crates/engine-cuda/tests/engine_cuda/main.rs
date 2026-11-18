@@ -48,6 +48,7 @@ mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_decode_envelope_packs_its_device_mask_into_each_lane;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
+mod a_dropped_shell_takes_its_queues_with_it;
 mod a_double_block_fires_two_streams_through_the_engine;
 #[cfg(feature = "cuda")]
 mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
