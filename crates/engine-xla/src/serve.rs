@@ -330,6 +330,13 @@ pub struct Shell {
     /// The readout rows of every fire shape traced, the rows a guest stage's
     /// readout plane comes in (`Shell::readouts`).
     readouts: std::collections::BTreeSet<u32>,
+    /// The warm ladder walked this load: a fire of the lanes it lays fires
+    /// of is refused when its program was not built before ready.
+    laddered: bool,
+    /// The classes of the drafting lanes the ladder lays, every row read out.
+    drafting: Vec<usize>,
+    /// The drafts a drafting lane's window carries past its token.
+    draft_depth: u32,
     /// The programs that gather a readout plane's host-read rows apart, by
     /// the plane's rows and width, and every such plane the ladder traced.
     gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
@@ -1076,6 +1083,9 @@ impl Shell {
             shaped: std::collections::HashMap::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
+            laddered: false,
+            drafting: Vec::new(),
+            draft_depth: 0,
             gathers: std::collections::HashMap::new(),
             gather_shapes: std::collections::BTreeSet::new(),
             readout_specs: readout_specs.clone(),
@@ -1694,32 +1704,59 @@ impl Shell {
     /// by how the runtime happened to cut its lanes. `None` when a class
     /// present reads more than tokens (a mask, an adapter, media),
     /// or the padding does not fit the rows or the lanes.
-    fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
+    /// The class of a lane the warm ladder lays fires of: one that reads
+    /// only tokens (no mask, adapter, media or guest input) and its last row
+    /// or every row, in a class that reads no more. `None` for any other.
+    fn ladder_class(&self, seated: &Seated<'_>) -> Option<usize> {
         let classes = &self.compiled.classes;
+        if seated.media.is_some()
+            || seated.mask.is_some()
+            || seated.adapter.is_some()
+            || seated.kv_less
+            // a lane reads its last row, or every row (a drafting lane's
+            // window or prompt)
+            || seated.readout.is_some_and(|r| {
+                r.len() != 1 && !r.iter().copied().eq(0..seated.lane.tokens.len() as u32)
+            })
+            || !seated.inputs.is_empty()
+        {
+            return None;
+        }
+        let class = classes.class_of(seated.lane.word & classes.mask)?;
+        let reads_input =
+            (self.dit.feeds().inputs.iter()).any(|(_, readers)| readers.contains(class));
+        (!self.masked.contains(class)
+            && !self.wide.contains(class)
+            && !self.corrected.contains(class)
+            && !reads_input)
+            .then_some(class)
+    }
+
+    /// Whether the warm ladder lays every fire of these lanes' kind: lanes
+    /// of ladder classes that each take a token and its drafts at most (a
+    /// decode, a drafting lane's window), laid at every page bound. A
+    /// prompt's fire takes the page bound of the context its lanes hold,
+    /// which the ladder lays one of (it lays prompts fresh), and a plain
+    /// lane reading every row puts the fire's readout count at any rung:
+    /// those are built and counted until both are data.
+    fn ladder_lays(&self, lanes: &[Seated<'_>]) -> bool {
+        lanes.iter().all(|seated| {
+            self.ladder_class(seated).is_some_and(|class| {
+                if self.drafting.contains(&class) {
+                    seated.lane.tokens.len() as u32 <= 1 + self.draft_depth
+                } else {
+                    seated.lane.tokens.len() == 1 && seated.readout.is_none_or(|r| r.len() == 1)
+                }
+            })
+        })
+    }
+
+    fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();
         for seated in lanes {
-            if seated.media.is_some()
-                || seated.mask.is_some()
-                || seated.adapter.is_some()
-                || seated.kv_less
-                // a lane reads its last row, or every row (a drafting lane's
-                // window or prompt)
-                || seated.readout.is_some_and(|r| {
-                    r.len() != 1 && !r.iter().copied().eq(0..seated.lane.tokens.len() as u32)
-                })
-                || !seated.inputs.is_empty()
-            {
-                return None;
-            }
+            let class = self.ladder_class(seated)?;
             let word = seated.lane.word;
-            let class = classes.class_of(word & classes.mask)?;
-            if self.masked.contains(class)
-                || self.wide.contains(class)
-                || self.corrected.contains(class)
-            {
-                return None;
-            }
             let rows = seated.lane.tokens.len() as u32;
             match by.iter_mut().find(|(c, ..)| *c == class) {
                 Some(entry) => {
@@ -2810,6 +2847,25 @@ impl Shell {
         let program = match found {
             Some(program) => program,
             None => {
+                // After the seal, a fire of lanes the warm ladder lays fires
+                // of is one it laid: a program built now is a shape the
+                // ladder missed, refused by name rather than compiled on the
+                // serving path. (A masked, adapted or media lane's fire is
+                // built and counted.)
+                if self.laddered && self.device.is_sealed() && self.ladder_lays(lanes) {
+                    let lane_rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+                    return Err(Fault::Program {
+                        at: "serve::ladder",
+                        why: format!(
+                            "a fire of {} rows (bucket {}) over {} lanes, lane rows {lane_rows:?}, \
+                             page bound {max_pages}, is outside the warm ladder the load \
+                             built: no program is built after ready",
+                            descriptor.rows,
+                            descriptor.bucket,
+                            descriptor.lanes.len()
+                        ),
+                    });
+                }
                 let program = self.trace_fire(
                     &slots,
                     &caches,

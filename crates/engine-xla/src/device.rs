@@ -558,6 +558,13 @@ impl Device {
 
     /// Marks the warm ladder done: every program wanted from now on is
     /// counted (and logged) as a miss.
+    /// Whether the load sealed its programs: a serving fire's program built
+    /// since is a ladder miss.
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn seal(&self) {
         if let Some(dir) = &self.disk {
             let held = self.set.lock().expect("cache set lock poisoned").len();
