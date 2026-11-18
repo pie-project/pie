@@ -2422,3 +2422,48 @@ async fn arriving_pages_do_not_hold_a_stalled_fleet() {
     planner.plan();
     assert_eq!(planner.stats.arrival_waits.load(Ordering::Relaxed), 0);
 }
+
+/// A span walk funding a bind asks the planner for pages; its process
+/// suspended meanwhile, the planner answers at once (`Yield`). The ask is
+/// made again only once the process is resident again: asked again at once,
+/// the walk spun on its tokio worker with no await between asks, and the
+/// planner's own task, woken on that worker, never ran again (the L40S
+/// over-demand livelock: every waiter parked with pages free).
+#[tokio::test(flavor = "current_thread")]
+async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_again() {
+    use futures::FutureExt;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (pid, peer) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [pid, peer] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // A peer waits, so the ask is contended and parks rather than taking.
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            peer,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        );
+        inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+    });
+    let mut asked = Box::pin(crate::store::shared::programs::fund_with(
+        &planner, pid, pid, 2,
+    ));
+    assert!(
+        asked.as_mut().now_or_never().is_none(),
+        "a suspended process's ask came back at once, to be asked again at once"
+    );
+    let signal = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Resident;
+        proc.signal.clone()
+    });
+    signal.notify_waiters();
+    assert_eq!(asked.await, Ok(false), "resident again, it asks again");
+}
