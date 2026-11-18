@@ -3,12 +3,6 @@
 
 use profile::{Decision, Profile, Registry};
 
-/// Whether routed matmuls over bf16 or f16 banks take the grouped GEMM once
-/// an expert's routes pay for it; off, every route reads its expert alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.grouped", flag, default = true, tune = search)]
-pub struct MoeGrouped;
-
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
@@ -284,19 +278,6 @@ pub struct MoeMxfp4MmaPerFrom(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_run_until", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeMxfp4RunUntil(pub u32);
-
-/// The fewest routes a routed bf16 select runs on the graph-safe grouped
-/// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
-/// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
-/// captured graph, so this is their only fast route. 0 never.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.bf16_mma_from", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct MoeBf16MmaFrom(pub u32);
-
-/// The most routes the bf16 grouped mma.sync kernel takes (0 never).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.bf16_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct MoeBf16MmaUntil(pub u32);
 
 /// Whether the register-dequant mxfp4 select turns its codes into f16 with
 /// the e2m1 converts of the arch-specific Blackwells (`linear/moe_w4_cvt.cuh`)
@@ -715,11 +696,6 @@ pub struct GemmHeuristics(pub u32);
 #[decision(id = "kernel.gemm.skinny_rows", constant(range(0..=64)), default = 64, tune = search)]
 pub struct GemmSkinnyRows(pub u32);
 
-/// Routes an expert must average before bf16/f16 routed matmuls group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.group_at", constant(range(1..=4096)), default = 4, tune = search)]
-pub struct MoeGroupAt(pub u32);
-
 /// Routes per expert above which mxfp4 routed matmuls group: the grouped
 /// kernels read an expert once per batch, the by-route one once per route
 /// at the card's streaming rate.
@@ -944,7 +920,6 @@ pub struct SdpaMergeWarp;
 
 pub fn register(registry: &mut Registry) {
     registry
-        .add::<MoeGrouped>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
         .add::<DecodeChunkFloor128>()
@@ -961,7 +936,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmWorkspaceMb>()
         .add::<GemmHeuristics>()
         .add::<GemmSkinnyRows>()
-        .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
         .add::<MoeAffineWmma>()
@@ -989,8 +963,6 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaFrom>()
         .add::<MoeMxfp4MmaPerFrom>()
         .add::<MoeMxfp4RunUntil>()
-        .add::<MoeBf16MmaFrom>()
-        .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4F16>()
         .add::<MoeMxfp4CvtKsplitUntil>()
@@ -1094,6 +1066,9 @@ macro_rules! tuning {
             /// The profile's read flags, one a field: `None` for values
             /// built by hand.
             pub reads: Reads,
+            /// The device's roofline, which a kernel with several legs
+            /// prices them by: [`Roof::UNSTATED`] for values built by hand.
+            pub roof: Roof,
         }
 
         #[allow(non_camel_case_types)]
@@ -1101,7 +1076,7 @@ macro_rules! tuning {
 
         impl Tuning {
             /// The registry defaults; a test holds the two equal.
-            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* reads: Reads(None) };
+            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* reads: Reads(None), roof: Roof::UNSTATED };
 
             /// `profile`'s values, unread until a dispatch consults one.
             #[must_use]
@@ -1110,6 +1085,7 @@ macro_rules! tuning {
                 Tuning {
                     $($field: tuning!(@peek profile, $how $($decision)::+),)*
                     reads: Reads(Some(Box::leak(marks.into_boxed_slice()))),
+                    roof: Roof::of(&profile.rates()),
                 }
             }
 
@@ -1156,6 +1132,86 @@ impl PartialEq for Reads {
 
 impl Eq for Reads {}
 
+/// The roofline a kernel prices its legs by: what a dependent launch adds,
+/// device memory's bytes a ns, and the matmul's flops a ns by rows at each
+/// square width. A load's are its profile's `[rates]`, every one stated
+/// before it fires (`engine::rates::rates_at_load`). Each distinct set is
+/// kept once for the process (a load's tuning is copied onto every stream it
+/// opens, and `pie tune` builds one a candidate).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Roof(Option<&'static RoofRates>);
+
+/// What a [`Roof`] states.
+#[derive(Debug, PartialEq)]
+pub struct RoofRates {
+    pub launch_ns: f64,
+    pub bytes_per_ns: f64,
+    /// Matmul flops a ns by rows at each square width, ascending in width.
+    pub gemm_by_rows: Vec<(u32, Vec<(u32, f64)>)>,
+}
+
+impl Eq for RoofRates {}
+
+impl RoofRates {
+    /// The matmul's flops a ns at `m` rows of an `n x k` plane.
+    #[must_use]
+    pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
+        profile::fire::gemm_rate(&self.gemm_by_rows, m, n, k)
+    }
+}
+
+impl Roof {
+    /// No rates: a tuning built by hand.
+    pub const UNSTATED: Roof = Roof(None);
+
+    /// `rates`' roofline, [`Roof::UNSTATED`] where it lacks the launch, the
+    /// bandwidth or the matmul curves.
+    #[must_use]
+    pub fn of(rates: &profile::fire::Rates) -> Roof {
+        let (Some(launch_ns), Some(gbps), Some(curves)) = (
+            rates.launch_ns,
+            rates.hbm_gbps,
+            rates.gemm_tflops_by_rows.as_ref(),
+        ) else {
+            return Roof::UNSTATED;
+        };
+        let flops = |c: &Vec<(u32, f64)>| c.iter().map(|&(m, t)| (m, t * 1e3)).collect();
+        Roof::stated(RoofRates {
+            launch_ns: launch_ns as f64,
+            bytes_per_ns: gbps,
+            gemm_by_rows: curves.iter().map(|(w, c)| (*w, flops(c))).collect(),
+        })
+    }
+
+    /// `rates` as a roofline.
+    #[must_use]
+    pub fn stated(rates: RoofRates) -> Roof {
+        static KEPT: std::sync::Mutex<Vec<&'static RoofRates>> = std::sync::Mutex::new(Vec::new());
+        let mut kept = KEPT.lock().expect("roof lock poisoned");
+        if let Some(&have) = kept.iter().find(|&&have| *have == rates) {
+            return Roof(Some(have));
+        }
+        let have: &'static RoofRates = Box::leak(Box::new(rates));
+        kept.push(have);
+        Roof(Some(have))
+    }
+
+    /// The rates, `None` for [`Roof::UNSTATED`].
+    #[must_use]
+    pub const fn rates(self) -> Option<&'static RoofRates> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Roof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(rates) => write!(f, "Roof({rates:?})"),
+            None => f.write_str("Roof(unstated)"),
+        }
+    }
+}
+
 impl std::fmt::Debug for Reads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(if self.0.is_some() {
@@ -1167,7 +1223,6 @@ impl std::fmt::Debug for Reads {
 }
 
 tuning! {
-    moe_grouped: bool = true, on MoeGrouped;
     mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
     mxfp4_wmma: bool = true, on MoeMxfp4Wmma;
     decode_chunk_floor_128: bool = false, on DecodeChunkFloor128;
@@ -1186,7 +1241,6 @@ tuning! {
     gemm_workspace_mb: u32 = 8, get GemmWorkspaceMb;
     gemm_heuristics: u32 = 8, get GemmHeuristics;
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;
-    moe_group_at: u32 = 4, get MoeGroupAt;
     mxfp4_grouped_reuse: u32 = 2, get MoeMxfp4GroupedReuse;
     affine_grouped: bool = true, on MoeAffineGrouped;
     affine_wmma: bool = true, on MoeAffineWmma;
@@ -1214,8 +1268,6 @@ tuning! {
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
     mxfp4_mma_per_from: u32 = 0, get MoeMxfp4MmaPerFrom;
     mxfp4_run_until: u32 = 16, get MoeMxfp4RunUntil;
-    bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
-    bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     moe_mxfp4_f16: bool = false, on MoeMxfp4F16;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;

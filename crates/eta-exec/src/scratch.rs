@@ -1,4 +1,5 @@
 use super::extent::ValueDesc;
+pub use eta_compiler::codegen::temporary::TemporaryNeed;
 
 mod lifetime;
 
@@ -154,6 +155,59 @@ pub fn whole_value_temporaries(descriptors: &[ValueDesc]) -> Option<u64> {
         .fold(1, u64::max)
         .checked_mul(size_of::<u32>() as u64)
         .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
+}
+
+/// A stage's temporary area: the widest of the whole-value rule
+/// ([`whole_value_temporaries`]) and what each region's emitter publishes
+/// it takes (`needs`, [`TemporaryNeed`]), evaluated against `descriptors`.
+/// An emitter that publishes none passes none. Refused by name where a
+/// need names a value the stage does not hold, or the bytes pass a `u64`.
+pub fn stage_temporaries(
+    descriptors: &[ValueDesc],
+    needs: &[TemporaryNeed],
+) -> Result<u64, TemporaryRefused> {
+    let whole = whole_value_temporaries(descriptors).ok_or(TemporaryRefused::Overflow)?;
+    needs.iter().try_fold(whole, |widest, need| {
+        let rows = match need.per_row {
+            Some((value, bytes)) => u64::from(
+                descriptors
+                    .get(value as usize)
+                    .ok_or(TemporaryRefused::NoValue { value })?
+                    .rows,
+            )
+            .checked_mul(bytes)
+            .ok_or(TemporaryRefused::Overflow)?,
+            None => 0,
+        };
+        let below = if need.above_whole { whole } else { 0 };
+        let bytes = need
+            .fixed
+            .checked_add(rows)
+            .and_then(|bytes| bytes.checked_add(below))
+            .ok_or(TemporaryRefused::Overflow)?;
+        Ok(widest.max(bytes))
+    })
+}
+
+/// Why [`stage_temporaries`] refuses a stage's temporary area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryRefused {
+    /// A region's need is a row count of a value the stage does not hold.
+    NoValue { value: u32 },
+    /// The bytes pass a `u64`.
+    Overflow,
+}
+
+impl core::fmt::Display for TemporaryRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoValue { value } => write!(
+                f,
+                "a region's temporary need counts the rows of value {value}, which the stage does not hold"
+            ),
+            Self::Overflow => write!(f, "a stage's temporary area passes a u64"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -611,6 +665,59 @@ mod tests {
             dtype: 0,
             dims: [0; MAX_RANK],
         }
+    }
+
+    /// The stage's temporary area is the widest of the whole-value rule and
+    /// what each region's emitter publishes: a short vector's select keeps
+    /// its fixed state below the rule's bytes, a top-k takes so much a row
+    /// of its input, an emitter that publishes none takes the rule alone,
+    /// and a need naming a value the stage lacks, or past a u64, is refused
+    /// by name.
+    #[test]
+    fn a_stage_s_temporaries_take_the_widest_published_need() {
+        let short = [desc(16)];
+        let whole = whole_value_temporaries(&short).unwrap();
+        assert_eq!(whole, 16 * 16);
+        assert_eq!(stage_temporaries(&short, &[]), Ok(whole), "none published: the rule");
+        let select = TemporaryNeed {
+            fixed: 51_200,
+            per_row: None,
+            above_whole: true,
+        };
+        assert_eq!(stage_temporaries(&short, &[select]), Ok(51_200 + whole));
+        let mut rows = desc(16);
+        rows.rows = 4;
+        let topk = TemporaryNeed {
+            fixed: 15,
+            per_row: Some((0, 14_360)),
+            above_whole: false,
+        };
+        assert_eq!(stage_temporaries(&[rows], &[topk]), Ok(15 + 4 * 14_360));
+        assert_eq!(
+            stage_temporaries(&short, &[select, topk]),
+            Ok((51_200 + whole).max(15 + 14_360)),
+            "the widest region's"
+        );
+        // A wide value's rule covers a small need.
+        let wide = [desc(1 << 20)];
+        assert_eq!(
+            stage_temporaries(&wide, &[topk]),
+            Ok(whole_value_temporaries(&wide).unwrap())
+        );
+        let stray = TemporaryNeed {
+            per_row: Some((3, 8)),
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(
+            stage_temporaries(&short, &[stray]),
+            Err(TemporaryRefused::NoValue { value: 3 })
+        );
+        let past = TemporaryNeed {
+            fixed: u64::MAX,
+            above_whole: true,
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(stage_temporaries(&short, &[past]), Err(TemporaryRefused::Overflow));
     }
 
     fn life(def: u32, last: u32) -> Lifetime {

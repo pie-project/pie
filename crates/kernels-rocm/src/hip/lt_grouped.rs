@@ -356,7 +356,7 @@ fn current_device() -> c_int {
 }
 
 /// Where hipBLASLt keeps its kernel libraries.
-fn library_dirs() -> Vec<PathBuf> {
+pub(super) fn library_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(p) = std::env::var_os("HIPBLASLT_TENSILE_LIBPATH") {
         dirs.push(PathBuf::from(p));

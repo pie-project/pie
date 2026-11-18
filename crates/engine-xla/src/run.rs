@@ -107,8 +107,10 @@ pub struct FireBindings {
 
     /// Each token row's pool row and lane the last guest pass put its token
     /// in (row `-1`: the host staged it in `tokens`): the fire gathers them
-    /// at its start, before any read of `tokens`.
-    pub token_words: Option<(Tensor, Tensor)>,
+    /// at its start, before any read of `tokens`. Staged at every fire, all
+    /// `-1` where no guest pass fed one, so a fed fire and a host-fed one
+    /// of the same shape are one program.
+    pub token_words: (Tensor, Tensor),
 
     /// Each row's stated position: what the rotary ops read.
     pub positions: Tensor,

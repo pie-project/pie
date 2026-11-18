@@ -649,11 +649,6 @@ impl Engine for Cuda {
         // Every rank on the host seats its own tier: a tensor-parallel
         // group's and each expert-parallel rank's.
         let ranks = self.boot.world.size * self.expert.size;
-        let max_tokens = if budgets.max_tokens == 0 {
-            16_384
-        } else {
-            budgets.max_tokens
-        };
         // The host tier's staging ring is page-locked here, before anything
         // measures the device: on an integrated device the ring and the
         // device draw on the same memory, and what the ring holds is then
@@ -664,7 +659,6 @@ impl Engine for Cuda {
             &trace,
             budgets.page_size,
             budgets.max_context,
-            max_tokens,
             residency.host_kv_budget,
             ranks,
         )
@@ -676,7 +670,6 @@ impl Engine for Cuda {
                 &trace,
                 budgets.page_size,
                 budgets.max_context,
-                max_tokens,
                 residency.device,
                 plan.device_demand(),
             )
@@ -933,16 +926,16 @@ impl Engine for Cuda {
         Ok(readout_facts())
     }
 
-    fn fire_facts(
+    fn guest_state(
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
-    ) -> EngineResult<engine::program::FireFacts> {
+    ) -> EngineResult<engine::GuestState> {
         match self.shell.as_ref() {
             Some(shell) => shell
-                .fire_facts(program, self::extents(extents))
+                .guest_state(program, self::extents(extents))
                 .map_err(fault),
-            None => Ok(engine::program::FireFacts::default()),
+            None => Ok(engine::GuestState::default()),
         }
     }
 
@@ -981,10 +974,20 @@ impl Engine for Cuda {
                 id,
                 instance,
                 rings,
+                scratch,
+                pair,
                 ..
             } => self
                 .loaded_mut()?
-                .rebind_program(id, crate::program::Slots { instance, rings })
+                .rebind_program(
+                    id,
+                    crate::program::Slots {
+                        instance,
+                        rings,
+                        scratch,
+                        pair,
+                    },
+                )
                 .map_err(fault),
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
@@ -1275,6 +1278,8 @@ impl Engine for Cuda {
                 crate::program::Slots {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
+                    scratch: binding.scratch.clone(),
+                    pair: binding.pair.clone(),
                 },
             )
             .map_err(fault)?;
@@ -1303,8 +1308,8 @@ impl Engine for Cuda {
         if let Some(held) = held {
             shell.release_adapter(held);
         }
-        // CUDA lays its guests' tables in the fire's span: it keeps none
-        // standing.
+        // CUDA lays its guests' tables in their pairs' state, which the
+        // runtime holds: it keeps none standing.
         shell.close_program_instance(id).map_err(fault)?;
         Ok(0)
     }

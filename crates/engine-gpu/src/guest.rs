@@ -13,6 +13,7 @@ use eta_compiler::codegen::wgsl;
 pub mod held;
 pub mod run;
 pub mod session;
+pub mod state;
 pub mod widen;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -150,7 +150,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let mut guide = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
     let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)), req.choice);
-    if req.raw_prompt.is_some() {
+    if req.raw_prompt.is_some() || req.prompt_tokens.is_some() {
         demux.verbatim();
     }
     let mut out = Output {

@@ -996,6 +996,8 @@ impl<'a> Walk<'a> {
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "scan_gelems" => &mut rates.scan_gelems,
+                "few_row_tflops" => &mut rates.few_row_tflops,
+                "workgroups_per_core" => &mut rates.workgroups_per_core,
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1014,8 +1016,9 @@ impl<'a> Walk<'a> {
                         k.span().start,
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
-                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps` and \
-                             `scan_gelems`, not `{other}`"
+                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
+                             `scan_gelems`, `few_row_tflops` and `workgroups_per_core`, not \
+                             `{other}`"
                         ),
                     );
                     continue;

@@ -1208,17 +1208,11 @@ impl ProcessCtx {
                     why,
                     needs_mask_port: prog.bound.container.ports.iter().any(|binding| {
                         matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                            && matches!(
-                                binding.source,
-                                eta_ir::container::PortSource::Channel(_)
-                            )
+                            && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
                     }),
                 };
-                let bound = host_geometry::classify(
-                    program,
-                    spec.device_geometry_port_mask,
-                    spec.kind,
-                );
+                let bound =
+                    host_geometry::classify(program, spec.device_geometry_port_mask, spec.kind);
                 if let Some(qo_indptr) = &bound.devgeo {
                     tracing::info!(
                         "device-carried decode ({} lane(s), {} row(s)) re-publishes \

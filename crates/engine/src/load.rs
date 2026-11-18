@@ -14,7 +14,7 @@ pub use rung::{
     model_class, pick, scored, shape_table, top_rung,
 };
 pub use top::{
-    Counts, Kept, Refused, choose, choose_tiled, estimate, line_of, measured_line, rectangle,
+    Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line, rectangle,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

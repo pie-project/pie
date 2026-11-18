@@ -792,9 +792,24 @@ impl Registry {
                 }
                 None
             }
-            Event::Started(pid) => self
-                .set(pid, State::Running)
-                .map(|id| Edge::Started(id.to_string())),
+            Event::Waiting(pid, tokens) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id)
+                    && proc.state == State::Pending
+                {
+                    proc.cached_tokens = Some(tokens);
+                }
+                None
+            }
+            Event::Started(pid) => {
+                // Its fires count what they map in from here.
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id) {
+                    proc.cached_tokens = None;
+                }
+                self.set(pid, State::Running)
+                    .map(|id| Edge::Started(id.to_string()))
+            }
             Event::Paused(pid) => self
                 .set(pid, State::Paused)
                 .map(|id| Edge::Paused(id.to_string())),
@@ -1197,7 +1212,16 @@ impl Plane for Snapshot {
                     "waited-ms" => int(Some(proc.times(now_ms(), live).1)),
                     "worker" => Some(Value::Text(WORKER.into())),
                     "restarts" => Some(Value::Int(proc.restarts as i64)),
-                    // What its fires mapped in, once one has looked.
+                    // Two meanings, by state. Pending: the leading tokens of
+                    // its prompt some kv store holds now, on any tier, kept up
+                    // as the cache changes (store::waiting); only a prompt
+                    // the runtime has at arrival (`prompt-tokens`, or a
+                    // completion's `raw-prompt`) is looked up, so a chat
+                    // request reads none while it waits: rank it by
+                    // cached-tokens-estimate. A policy that ranks waiting work
+                    // by this one (lpm) passes chat over. Running and after:
+                    // the tokens its fires mapped in from the cache, none
+                    // until one has looked.
                     "cached-tokens" => int(proc.cached_tokens),
                     // What the cache holds of its prompt text, guessed.
                     "cached-tokens-estimate" => int(proc

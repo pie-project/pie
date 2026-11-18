@@ -839,7 +839,10 @@ mod tests {
         let want = super::super::want_rows(ENGINE, 200);
         grow.ticked();
         grow.walk_rung().await;
-        assert!(super::super::fire_cap(ENGINE) >= 200, "raised for the queued work");
+        assert!(
+            super::super::fire_cap(ENGINE) >= 200,
+            "raised for the queued work"
+        );
         assert_eq!(super::super::engine_rows(ENGINE), 256);
         drop(want);
         // Lowered under the class again, the told rung 256 with 512's
@@ -848,7 +851,11 @@ mod tests {
         let _want = super::super::want_rows(ENGINE, 300);
         grow.block_raise_for_test();
         grow.walk_rung().await;
-        assert_eq!(super::super::fire_cap(ENGINE), 512, "the class's rung needs no room");
+        assert_eq!(
+            super::super::fire_cap(ENGINE),
+            512,
+            "the class's rung needs no room"
+        );
         assert_eq!(super::super::engine_rows(ENGINE), 512);
     }
 

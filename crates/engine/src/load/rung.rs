@@ -110,7 +110,9 @@ impl RungFacts {
 /// dispatch's work is the longer of its compute and its memory traffic: a
 /// matmul plane's flops, its rows padded to its kernel's tile, over the
 /// measured matmul rate at its rows and width
-/// (`crate::roofline::Constants::gemm_compute_ns`)
+/// (`crate::roofline::Constants::gemm_compute_ns`), or where the backend's
+/// few-rows kernel serves it at `few_row_tflops` under the wave rule over
+/// that kernel's grid (`crate::roofline::Constants::matmul_compute_ns`),
 /// or its read; an attention layer's flops over the measured attention rate
 /// at its keys, or its kv read; a scan layer's state steps; a per-row op's
 /// bytes over the per-row ops' measured bandwidth. `launch_ns` is what a
@@ -195,10 +197,17 @@ impl FireEstimate {
                     self.rates.padded_rows(rows, s.n, s.k)
                 };
                 let flops = f64::from(computed) * s.flops_per_row as f64;
-                let ns = if flops > 0.0 {
-                    flops / self.rates.gemm_rate(rows, s.n, s.k)
+                // A dense plane the backend's few-rows kernel serves at
+                // `few_row_tflops` over its grid; a routed bank's on the
+                // grouped kernel the curve stands for.
+                let ns = if s.routed {
+                    if flops > 0.0 {
+                        flops / self.rates.gemm_rate(rows, s.n, s.k)
+                    } else {
+                        0.0
+                    }
                 } else {
-                    0.0
+                    self.rates.matmul_compute_ns(rows, s.n, s.k, flops)
                 };
                 (s.n, s.k, ns)
             })
@@ -238,13 +247,11 @@ impl FireEstimate {
         // The readout: one dispatch, the head's read or its compute.
         // The head's bytes are the readout's alone, not the trunk's read.
         let head_read = over(self.head_bytes as f64, c.bytes_per_ns);
-        let readout = over(
+        let readout = c.matmul_compute_ns(
+            fire.sampled,
+            self.readout_flops as u32 / (2 * self.readout_depth.max(1)),
+            self.readout_depth,
             f64::from(fire.sampled) * self.readout_flops,
-            c.gemm_rate(
-                fire.sampled,
-                self.readout_flops as u32 / (2 * self.readout_depth.max(1)),
-                self.readout_depth,
-            ),
         );
         if self.readout_flops > 0.0 {
             dispatched += floored(readout.max(head_read), 1);
@@ -656,7 +663,12 @@ mod tests {
             bytes_per_ns,
             elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
+            few_row_flops_per_ns: None,
+            workgroups_per_core: None,
             row_tile: std::sync::Arc::new(|_, _, _| 1),
+            few_rows: None,
+            gemm_waves: None,
+            gemm_full_by_rows: None,
         }
     }
 

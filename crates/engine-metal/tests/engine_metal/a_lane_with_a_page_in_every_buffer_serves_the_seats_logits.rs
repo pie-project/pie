@@ -36,6 +36,7 @@ fn load(fixture: &Fixture, kv_budget: Option<u64>) -> Shell {
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
         profiles: None,
+        top: engine_metal::Top::EveryRung,
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))

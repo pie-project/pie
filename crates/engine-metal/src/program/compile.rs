@@ -1056,7 +1056,8 @@ mod tests {
                     .iter()
                     .map(|value| describe(value, &Extents::default()).expect("static"))
                     .collect();
-                let run = launch::published_launches(plan, &published, &descriptors);
+                let run = launch::published_launches(plan, &published, &descriptors)
+                    .expect("the temporary area is stated");
                 let lifetimes =
                     eta_exec::value_lifetimes(plan, &run).expect("every node launched or idle");
                 let laid = launch::lay_out_launches(plan, &run, &descriptors).expect("fits");
