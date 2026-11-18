@@ -968,7 +968,9 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
 pub struct SaveTo<'a> {
     pub path: std::path::PathBuf,
     pub provenance: (&'static str, String),
-    pub check: &'a dyn Fn(&str) -> Result<(), String>,
+    /// The backend's registry: what the saved file is read against, and
+    /// what of it a load no longer reads ([`profile::Registry::prune`]).
+    pub registry: &'a profile::Registry,
 }
 
 /// The user's file of a device, `existing` (none where there is none yet),
@@ -1132,13 +1134,26 @@ pub fn rates_at_load(
             rates.missing(keys)
         ));
     }
-    // The user's file gains what this load measured, the keys no layer
-    // stated, and how: nothing else.
+    // The user's file is this load's own output: it keeps every section and
+    // key this pie still reads (a person's own decisions), drops each it no
+    // longer reads (said, by name), gains what this load measured and how.
     let saved_to = match save {
         Some(save) => {
-            let existing = std::fs::read_to_string(&save.path).ok();
+            let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
+                let (kept, dropped) = save.registry.prune(&text);
+                for key in dropped {
+                    eprintln!(
+                        "user profile {}: dropped `{key}`, no longer read",
+                        save.path.display()
+                    );
+                }
+                kept
+            });
             let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
-            (save.check)(&text).map_err(|why| {
+            let check = save
+                .registry
+                .parse(&text, "the measured rates", profile::Strict::User);
+            check.map_err(|why| {
                 format!(
                     "{}: the measured rates would not read back: {why}",
                     save.path.display()
@@ -1346,7 +1361,7 @@ mod tests {
     fn a_load_without_the_constants_measures_saves_and_says_so() {
         let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
-        let check = |_: &str| Ok(());
+        let registry = profile::Registry::new("toy", &[], &[]);
         // A checked-in launch, nothing else: the rest measured, the launch
         // kept, each submission under the budget asked.
         let stated = profile::fire::Rates {
@@ -1360,7 +1375,7 @@ mod tests {
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             Some(std::time::Duration::from_millis(5)),
@@ -1417,19 +1432,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
         let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         assert!(!first.rates().complete(&profile::fire::KEYS));
-        let check = |text: &str| {
-            registry
-                .parse(text, "saved", profile::Strict::User)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
         let measured = rates_at_load(
             first,
             &profile::fire::KEYS,
             Some(SaveTo {
                 path: SHELF.user_path(&dir, "Card X"),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             None,
@@ -1499,10 +1508,12 @@ mod tests {
         );
     }
 
-    /// The Spark's user file of Nov 16 (the old schema's keys) is refused at
-    /// resolve, so the load measures every key; the file is rewritten with
-    /// its [rates] whole (the old table gone, its other sections kept), and
-    /// the next boot reads it and measures nothing.
+    /// The Spark's user file of Nov 16 (the old schema's [rates] keys and a
+    /// decision this pie removed) is refused at resolve, so the load
+    /// measures every key; the file is rewritten as the load's own output
+    /// (the removed decision dropped and said, the old table replaced
+    /// whole, what reads kept), and the next boot reads it clean and
+    /// measures nothing.
     #[test]
     fn an_old_schema_user_file_is_measured_rewritten_whole_and_read_next() {
         static SHELF: profile::Shelf = profile::Shelf {
@@ -1517,26 +1528,21 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "api = 1\n\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n\
-             bytes_per_ns = 650.0\nlaunch_ns = 900\n\n[provenance]\nrates = \"Nov 16\"\n",
+            "api = 1\n\n[engine]\ngraphs = \"on\"\n\n[rates]\n\
+             bf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 650.0\n\
+             launch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"Nov 16\"\n",
         )
         .unwrap();
         let (first, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         assert!(!report.rejected.is_empty(), "the old file is refused");
         assert!(!first.rates().complete(&profile::fire::KEYS));
-        let check = |text: &str| {
-            registry
-                .parse(text, "saved", profile::Strict::User)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
         let measured = rates_at_load(
             first,
             &profile::fire::KEYS,
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             None,
@@ -1552,6 +1558,9 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("launch_ns").count(), 1, "{text}");
         assert!(!text.contains("bytes_per_ns"), "{text}");
+        // The decision this pie no longer reads dropped; what reads kept.
+        assert!(!text.contains("graphs"), "{text}");
+        assert!(text.contains("source = \"me\""), "{text}");
         let (second, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
@@ -1779,7 +1788,7 @@ mod tests {
     fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
         let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
-        let check = |_: &str| Ok(());
+        let registry = profile::Registry::new("toy", &[], &[]);
         for (zero, says) in [
             (
                 profile::fire::Rates {
@@ -1806,7 +1815,7 @@ mod tests {
             let save = SaveTo {
                 path: path.clone(),
                 provenance: ("rates", "\"measured at load\"".to_string()),
-                check: &check,
+                registry: &registry,
             };
             let err = rates_at_load(
                 chip(profile::fire::Rates::default()),
