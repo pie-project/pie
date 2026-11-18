@@ -194,11 +194,13 @@ pub fn fixture_deployed(
     let trace = package
         .trace(model, deploy, model, backend::PLATFORM)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
-    // `$PIE_VK_FIXTURES` (`$PIE_WGPU_FIXTURES`) keeps the written
-    // checkpoints across runs (they are written from the trace alone, the
-    // same bits every time).
+    // The written checkpoints are the same bits every time (written from the
+    // trace alone), so every run shares one directory: a run per process
+    // used to leave its own copy behind (gigabytes each), and per-test runs
+    // filled the disk. `$PIE_VK_FIXTURES` (`$PIE_WGPU_FIXTURES`) names
+    // another.
     let dir = std::env::var_os(backend::FIXTURES).map_or_else(
-        || std::env::temp_dir().join(format!("pie-{}-pool-{}", backend::NAME, std::process::id())),
+        || std::env::temp_dir().join(format!("pie-{}-fixtures", backend::NAME)),
         PathBuf::from,
     );
     std::fs::create_dir_all(&dir).expect("the fixture dir");
@@ -218,12 +220,17 @@ pub fn fixture_deployed(
     if !container.exists() {
         // Written aside and renamed in: tests running at once may each
         // write it, and none opens a file half written.
-        let aside = dir.join(format!("{stem}.{:?}.part", std::thread::current().id()));
+        let aside = dir.join(format!(
+            "{stem}.{}.{:?}.part",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         if encoded {
             let floats = dir.join(format!("{stem}.floats.zt"));
             if !floats.exists() {
                 let seeded = dir.join(format!(
-                    "{stem}.floats.{:?}.part",
+                    "{stem}.floats.{}.{:?}.part",
+                    std::process::id(),
                     std::thread::current().id()
                 ));
                 write_checkpoint(&seeded, &trace);
