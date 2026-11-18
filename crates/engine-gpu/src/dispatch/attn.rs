@@ -192,7 +192,7 @@ impl<B: Backend> Run<'_, B> {
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
             // A fire's capturing lanes, compacted through its capture table:
-            // their rows lie in the fire's guest region whatever the
+            // their rows lie in a pair's score room whatever the
             // window, so a capture fires once a fire, in its region's first
             // launch.
             Attn::ScoreCapture {
