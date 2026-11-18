@@ -92,10 +92,7 @@ impl ChunkMap {
             if taken.len() as u32 == pieces {
                 break;
             }
-            if taken
-                .iter()
-                .all(|&(_, at)| first + run <= at || at + run <= first)
-            {
+            if taken.iter().all(|&(_, at)| first + run <= at || at + run <= first) {
                 taken.push((sum, first));
             }
         }
