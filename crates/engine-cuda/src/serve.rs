@@ -862,7 +862,7 @@ impl Shell {
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
-        let id = self.programs.bind(
+        self.programs.bind(
             program_id,
             seeds,
             extents,
@@ -872,64 +872,21 @@ impl Shell {
             adopted,
             ids,
             slots,
-            &|role, refs, bytes| pools.guest_span(role, refs, bytes),
+            &|item, bytes| pools.guest_item(item, bytes),
             stream,
-        )?;
-        // What its fires lay under the state's end is backed before any
-        // flies: a bind the card has no room for is refused here.
-        if let Err(refused) = self.back_programs() {
-            self.programs.close_instance(id)?;
-            return Err(refused);
-        }
-        Ok(id)
+        )
     }
 
-    /// The lanes a fire of `rung` tokens carries of a guest program, as the
-    /// runtime counts them (`engine::Engine::fire_facts`).
-    fn program_lanes(&self, rung: u32) -> u32 {
-        rung.min(self.fire_lanes())
-    }
-
-    /// Backs, for every rung, what the programs bound now lay under the
-    /// state's end at it: what the activation's span has no room for under
-    /// that rung's carve.
-    fn back_programs(&mut self) -> Result<()> {
-        let under_state = self
-            .arena
-            .every_rung(self.compiled.arena_forked.as_ref(), self.budget.max_tokens)
-            .into_iter()
-            .map(|(rung, under)| {
-                let term = self.programs.fire_term(self.program_lanes(rung));
-                self.pools.program_bytes_under_state(under, term)
-            })
-            .max()
-            .unwrap_or(0);
-        self.pools.hold_under_state(under_state)
-    }
-
-    /// Points the guests' programs at where a fire of `tokens` tokens and
-    /// `lanes` lanes lays them: under its own carve.
-    pub(crate) fn point_programs(&mut self, tokens: u64, lanes: u64) -> Result<()> {
-        let span = program_span(
-            &self.arena,
-            &self.pools,
-            &self.programs,
-            self.compiled.arena_forked.as_ref(),
-            (self.budget.max_tokens, self.fire_lanes()),
-            tokens,
-            lanes,
-        )?;
-        self.programs.set_span(span);
-        Ok(())
-    }
-
-    /// What a fire of `program` bound at `extents` takes of a fire's span.
-    pub fn fire_facts(
+    /// What `program` bound at `extents` holds as state, as the pool lays
+    /// it: each instance's lane scratch and its pair's tables
+    /// ([`crate::program::Plane::pair_room`]).
+    pub fn guest_state(
         &self,
         program: engine::ProgramId,
         extents: eta_exec::Extents,
-    ) -> Result<engine::program::FireFacts> {
-        Ok(self.programs.fire_bytes(program, extents)?.facts())
+    ) -> Result<engine::GuestState> {
+        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and
@@ -999,7 +956,7 @@ impl Shell {
     pub fn rebase_programs(&mut self) -> Result<()> {
         let pools = &self.pools;
         self.programs
-            .rebase(&|role, refs, bytes| pools.guest_span(role, refs, bytes))
+            .rebase(&|item, bytes| pools.guest_item(item, bytes))
     }
 
     /// Instance `id`'s items lie in `slots` now.
@@ -1009,9 +966,8 @@ impl Shell {
         slots: crate::program::Slots,
     ) -> Result<()> {
         let pools = &self.pools;
-        self.programs.rebind(id, slots, &|role, refs, bytes| {
-            pools.guest_span(role, refs, bytes)
-        })
+        self.programs
+            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes))
     }
 
     /// Settles the guest batches whose steps have landed: their channels'
@@ -1425,21 +1381,4 @@ impl EnqueuedPhase for Enqueued<'_> {
     fn launches(&self) -> u32 {
         self.launches
     }
-}
-
-/// Where a fire of `tokens` tokens and `lanes` lanes lays its guests'
-/// programs: under its own carve, in what the runtime keeps free of state
-/// at the fire's rung (`store::Pools::program_span`). `limits`: the load's
-/// most tokens and the most lanes a fire carries.
-pub(crate) fn program_span(
-    arena: &crate::arena::Arena,
-    pools: &crate::store::Pools,
-    programs: &ProgramPlane,
-    forked: Option<&poem_compiler::ArenaMap>,
-    limits: (u32, u32),
-    tokens: u64,
-    lanes: u64,
-) -> Result<(u64, u64)> {
-    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0);
-    pools.program_span(under, programs.fire_term(rung.min(limits.1)))
 }

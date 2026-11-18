@@ -6,20 +6,21 @@
 //! the fire compacts its capturing lanes), the second reading pages too.
 //! Each capturing lane's key row (`attn.scores`, a mass a key of the load's
 //! context summed over the layers) and page row (`attn.scores.pages`) is the
-//! oracle's for the same tokens at two contexts. The rows lie in the fire's
-//! guest region, not the arena: the span lays nothing for them, a fire that
-//! captures takes no device byte past what the load reserved, and a lane
-//! reading no scores reads none. A fire records as any other: the capture
-//! table is staged at its arm's fixed seat, and the capturing lanes' pattern
-//! is part of the fire's slot table, so the recording a pattern keys binds
-//! its own rows.
+//! oracle's for the same tokens at two contexts. The rows lie in a reading
+//! pair's score room in the pool (`guest::state`), not the arena: the span
+//! lays nothing for them, a fire that captures takes no device byte past
+//! what the load reserved, and a lane reading no scores reads none. A fire
+//! records as any other: the capture table is staged at its arm's fixed
+//! seat, and the capturing lanes' pattern is part of the fire's slot table,
+//! so the recording a pattern keys binds its own rows.
 
 use engine_cpu::forward::{Output, Values};
 use engine_cpu::Forward;
 use poem::Request;
 use poem_ir::Trace;
 
-use crate::backend::{Lane, Seated};
+use crate::backend::{Lane, Seated, Shell};
+use engine_gpu::serve::DeviceCell;
 use crate::model_logits::{PAGE, fixture, load, load_lanes, seeded_bf16};
 
 const MODEL: &str = "qwen3-micro-text";
@@ -30,6 +31,27 @@ fn word(trace: &Trace, rows: u32, captures: bool) -> u64 {
     trace
         .facts
         .word(&Request::new(rows, false).capturing_scores(captures))
+}
+
+/// The score room a pair reading `attn.scores` keeps (`Shell::score_room`),
+/// laid as the runtime would: a run of whole chunks right under the span.
+fn room(shell: &Shell) -> DeviceCell<crate::backend::Api> {
+    let bytes = shell.score_room([(KEYS, 0u32)]);
+    assert!(bytes > 0, "a read of `{KEYS}` keeps a score room");
+    let pools = shell.pools();
+    let layout = pools.layout();
+    let run = u32::try_from(bytes.div_ceil(layout.chunk_bytes)).expect("a run of chunks");
+    let first = layout.total_chunks - pools.span_chunks() - run;
+    let (buffer, at) = pools.chunk_place(first).expect("the room's chunks are committed");
+    assert!(
+        at / layout.chunk_bytes + u64::from(run) <= u64::from(layout.segment_chunks),
+        "the room lies in one segment"
+    );
+    DeviceCell {
+        buffer: buffer.clone(),
+        at,
+        bytes,
+    }
 }
 
 /// A lane's capture: none, its key row, or its key and page rows.
@@ -106,6 +128,7 @@ fn served(context: u32, pattern: &[Reads]) {
     let Some(mut shell) = load(&fixture, context) else {
         return;
     };
+    let room = room(&shell);
     let lanes = lanes(pattern);
     let n = lanes.len();
     let reads: Vec<Vec<String>> = lanes
@@ -149,6 +172,7 @@ fn served(context: u32, pattern: &[Reads]) {
             .map(|lane| Seated {
                 held: Some(held[lane]),
                 reads: &reads[lane],
+                scores: lanes[lane].1.then_some(&room),
                 ..Seated::of(Lane {
                     slot: lane as u32,
                     word: word(trace, tokens[lane].len() as u32, lanes[lane].1),
@@ -299,20 +323,24 @@ fn the_arena_holds_no_score_row() {
 /// planes): the attention mass a key of the load's context, summed over the
 /// layers and averaged over the query heads, and that summed a kv page of
 /// the load's own (its chunk recipe's, not the boot's). A fire of 256 lanes,
-/// one capturing, lays that lane's rows alone.
+/// one capturing, lays that lane's rows alone. The load's fire top is a
+/// rung a prompt of its context holds (`engine::load::fire_top`), and a
+/// lane carries a token, so the context holds the fire's 261 tokens: at a
+/// smaller one the load carries fewer lanes than the fire asks.
 #[test]
 fn the_score_rows_are_the_oracles() {
     const LANES: u32 = 256;
-    const CONTEXT: u32 = 64;
+    const CONTEXT: u32 = 512;
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
     let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, LANES, 512) else {
         return;
     };
+    let room = room(&shell);
     let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     let one: Vec<Vec<u32>> = (1..LANES).map(|lane| vec![(lane * 7) % 256]).collect();
     let reads = vec![KEYS.to_string(), PAGES.to_string()];
-    let fire = |shell: &mut crate::backend::Shell, captures: bool| {
+    let fire = |shell: &mut Shell, captures: bool| {
         let seated: Vec<Seated<'_>> = (0..LANES)
             .map(|slot| {
                 let tokens: &[u32] = if slot == 0 { &prompt } else { &one[slot as usize - 1] };
@@ -320,6 +348,7 @@ fn the_score_rows_are_the_oracles() {
                 Seated {
                     held: Some(0),
                     reads: if capturing { &reads } else { &[] },
+                    scores: capturing.then_some(&room),
                     ..Seated::of(Lane {
                         slot,
                         word: word(trace, tokens.len() as u32, capturing),

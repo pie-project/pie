@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::inner::Inner;
+use super::inner::{Inner, RestoreGate};
 use super::proc::{Proc, Residency};
 use super::wait::{EntryKey, WaitKind, Waiter};
 
@@ -37,6 +37,23 @@ fn park_allocation(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey
             notify: Arc::new(Notify::new()),
             outcome: None,
             yielded: false,
+            rise: false,
+        },
+    )
+}
+
+fn park_rise(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey {
+    inner.enqueue(
+        pid,
+        WaitKind::Allocation {
+            demand: Demand {
+                kv_pages,
+                rs: RsUnits::default(),
+            },
+            notify: Arc::new(Notify::new()),
+            outcome: None,
+            yielded: false,
+            rise: true,
         },
     )
 }
@@ -60,6 +77,76 @@ fn planner_every_case() {
     a_restore_holds_the_head_when_no_allocation_is_unmet();
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
+    a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters();
+}
+
+/// A rise that cannot fire narrower is a keyed demand of its process: beside
+/// a kv waiter, the older process's ask is served first, whichever it is;
+/// no rise queues anonymously ahead of, or behind, the waiters it starves.
+fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_rise(&mut inner, pids[1], 8);
+    park_allocation(&mut inner, pids[0], 4);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older kv waiter before the younger rise");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: false, .. }
+    ));
+
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_allocation(&mut inner, pids[1], 4);
+    park_rise(&mut inner, pids[0], 8);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older rise before the younger kv waiter");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: true, .. }
+    ));
+}
+
+/// A restore whose role slots found no room is queued again, a waiter: it
+/// is not served on spare pages alone (the room it lacks is not pages),
+/// goes again on a completion's credit, and, the fleet stalled with
+/// nothing completing, has a resident evicted for it. Without the flag the
+/// same spare pages serve it.
+fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Evicted, true),
+        (2, Residency::Resident, true),
+    ]);
+    park_restore(&mut inner, pids[0], 4);
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Serve,
+        "control"
+    );
+    inner.procs.get_mut(&pids[0]).unwrap().roles_short = true;
+    assert!(!inner.fleet_stalled());
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Wait,
+        "spare pages are no room"
+    );
+    inner.completion_credit = 1;
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Serve,
+        "a completion's credit"
+    );
+    assert_eq!(inner.completion_credit, 0);
+    // The resident waits on an allocation too: nothing will complete, so
+    // it is evicted for the restore.
+    park_allocation(&mut inner, pids[1], 1);
+    assert!(inner.fleet_stalled());
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict);
 }
 
 fn a_restore_yields_the_head_to_a_younger_allocation() {

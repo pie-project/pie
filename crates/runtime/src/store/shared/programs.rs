@@ -715,12 +715,7 @@ pub async fn take_raise(
                 super::ask_walk(mover.engine());
                 None
             }
-            Some(at)
-                if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.copying().is_some() =>
-            {
-                None
-            }
+            Some(at) if !pool.raise_owed(at) || pool.copying().is_some() => None,
             Some(at) => {
                 let stood = pool.stands_at(at);
                 pool.plan_raise(at).ok().and_then(|evacuation| {
@@ -903,7 +898,9 @@ impl Funder for Planner {
 }
 
 /// `pid`'s ask of `pages` kv pages of `planner` for a span short of room,
-/// as a waiter of `quorum`.
+/// as a waiter of `quorum`: a rise that cannot fire narrower (a program's
+/// fire term, a piece no cut brings under the rung held), keyed by its
+/// process ([`crate::planner::ResidencyPlanner::acquire_rise`]).
 ///
 /// Suspended meanwhile, the process has nothing to ask until it is
 /// resident again: the planner answers its ask at once (`Yield`), and asked
@@ -918,11 +915,7 @@ pub async fn fund_with(
     quorum: uuid::Uuid,
     pages: u32,
 ) -> Result<bool, String> {
-    let demand = crate::planner::Demand {
-        kv_pages: pages,
-        rs: crate::store::rs::RsUnits::default(),
-    };
-    match planner.acquire(pid, quorum, demand).await {
+    match planner.acquire_rise(pid, quorum, pages).await {
         Ok(crate::planner::Acquired::Granted(grant)) => {
             // Given back at once: the raise takes the room it freed.
             drop(grant);

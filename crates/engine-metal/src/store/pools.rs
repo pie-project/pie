@@ -1168,6 +1168,29 @@ impl Pools {
         Ok((view, at, host, slot_bytes))
     }
 
+    /// Bytes `[at, at + bytes)` from the start of slot ref `slot` of shape
+    /// `id` (inside its chunk): the buffer they lie in, their byte offset
+    /// there, and their host runs `(from, len, address)`, one a placement
+    /// heap they cross (a chunk, and a slot in it, may cross a heap's end;
+    /// the view holds them in one span either way).
+    pub fn span_runs(
+        &self,
+        id: ShapeId,
+        slot: u32,
+        at: u64,
+        bytes: u64,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>)> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, slot)?;
+        let global = u64::from(chunk) * self.layout.chunk_bytes
+            + u64::from(index) * shape.slot_bytes
+            + at;
+        self.pool.admit(chunk)?;
+        let runs = self.pool.host_runs(global, bytes)?;
+        let (view, offset) = self.pool.view_at(global);
+        Ok((view.clone(), offset, runs))
+    }
+
     /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
     /// there, its bytes' host runs `(from, len, address)` (one a heap they
     /// cross) and its bytes.
@@ -1184,6 +1207,69 @@ impl Pools {
         let runs = self.pool.host_runs(global, shape.slot_bytes)?;
         let (view, at) = self.pool.view_at(global);
         Ok((view.clone(), at, runs, shape.slot_bytes))
+    }
+
+    /// The contiguous pieces a guest's state lies in (`engine::ScratchPlace`):
+    /// a run of `Instance` slots in one chunk, or runs of whole chunks, each
+    /// from its first logical chunk. Each piece as the buffer it lies in,
+    /// its offset there, its offset in the pool (what host runs are asked
+    /// by) and its bytes; none for `None`.
+    pub fn guest_pieces(&self, place: &engine::ScratchPlace) -> Result<Vec<GuestPiece>> {
+        match place {
+            engine::ScratchPlace::None => Ok(Vec::new()),
+            engine::ScratchPlace::Run { first, slots } => {
+                let shape = *self.shape(super::layout::INSTANCE)?;
+                let (chunk, index) = self.place(&shape, *first)?;
+                let last = index + slots.saturating_sub(1);
+                if *slots == 0 || last >= shape.per_chunk {
+                    return Err(Fault::Residency(format!(
+                        "a guest's run of {slots} `Instance` slot(s) from ref {first} passes \
+                         its chunk of {} slots",
+                        shape.per_chunk
+                    )));
+                }
+                self.pool.admit(chunk)?;
+                let global = u64::from(chunk) * self.layout.chunk_bytes
+                    + u64::from(index) * shape.slot_bytes;
+                let (view, local) = self.pool.view_at(global);
+                Ok(vec![GuestPiece {
+                    view: view.clone(),
+                    local,
+                    global,
+                    bytes: u64::from(*slots) * shape.slot_bytes,
+                }])
+            }
+            engine::ScratchPlace::Chunks { run, pieces } => pieces
+                .iter()
+                .map(|&logical| {
+                    let physical = self.pool.physical(logical)?;
+                    for at in 0..*run {
+                        self.pool.admit(physical + at)?;
+                    }
+                    let global = u64::from(physical) * self.layout.chunk_bytes;
+                    let (view, local) = self.pool.view_at(global);
+                    Ok(GuestPiece {
+                        view: view.clone(),
+                        local,
+                        global,
+                        bytes: u64::from(*run) * self.layout.chunk_bytes,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The bytes of one `Instance` slot and the slots a chunk holds: what
+    /// the runtime places a guest's state by.
+    pub fn instance_slots(&self) -> Result<(u64, u32)> {
+        let shape = *self.shape(super::layout::INSTANCE)?;
+        Ok((shape.slot_bytes, shape.per_chunk))
+    }
+
+    /// A chunk's bytes.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.layout.chunk_bytes
     }
 
     /// The slots of shape `id` one chunk holds.
@@ -1583,6 +1669,13 @@ impl Pools {
     /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
     pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.pool.read(offset, into)
+    }
+
+    /// `from` written at `offset` of the pool's buffer, on the host; for a
+    /// test that lays bytes it then reads back.
+    #[cfg(test)]
+    pub fn write_span(&mut self, offset: u64, from: &[u8]) -> Result<()> {
+        self.pool.write(offset, from)
     }
 
     /// Backs the range's top `bytes` for a fire's carve ([`Pool::cover`]).
@@ -2078,14 +2171,27 @@ impl Pools {
         self.pool.commit_segments(segments)
     }
 
-    /// Backs the segments the seat runs lie in: what a caller firing
-    /// directly asks.
-    pub fn commit_seats(&mut self) -> Result<()> {
-        let chunks = self.layout.free_chunk();
-        let segments = chunks
-            .div_ceil(self.layout.segment_chunks.max(1))
-            .min(self.pool.segments());
-        self.pool.commit_segments(segments)
+    /// Backs the segments the seat runs lie in, and those a fire's `kv`
+    /// list slots and `state` fixed slots reach past them: what a caller
+    /// firing directly asks, with no runtime committing ahead of it.
+    pub fn commit_seats(&mut self, kv: u32, state: u32) -> Result<()> {
+        let reach = |slots: u32, shape: Option<crate::store::layout::Slots>| {
+            shape.map_or(0, |shape| slots.div_ceil(shape.per_chunk.max(1)))
+        };
+        let chunks = self
+            .layout
+            .free_chunk()
+            .max(reach(kv, self.layout.list))
+            .max(reach(state, self.layout.fixed));
+        let segments = chunks.div_ceil(self.layout.segment_chunks.max(1));
+        // The bottom grows to the segment the span starts in; state past it
+        // lies in that segment, which the span's commit lends to state.
+        let bottom = self.pool.segments() - self.pool.span_segments();
+        self.pool.commit_segments(segments.min(bottom))?;
+        if segments > bottom {
+            self.pool.commit_span(self.pool.span_segments())?;
+        }
+        Ok(())
     }
 
     /// The bottom run of segments backed for state.
@@ -2592,4 +2698,15 @@ mod tables_run_tests {
         let past = pools.kv_pages(&[3], None).expect("the first slot past the tables run");
         assert_eq!(past.len(), 1);
     }
+}
+
+/// One contiguous piece of a guest's state in the pool ([`Pools::guest_pieces`]).
+#[derive(Debug, Clone)]
+pub struct GuestPiece {
+    /// The buffer it lies in, and its offset there.
+    pub view: Buffer,
+    pub local: u64,
+    /// Its offset in the pool: what its host runs are asked by.
+    pub global: u64,
+    pub bytes: u64,
 }

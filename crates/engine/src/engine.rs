@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
@@ -156,10 +156,26 @@ pub type TapSink = std::sync::Arc<dyn Fn(Tapped) + Send + Sync>;
 /// bytes)` of a host kv slot.
 pub type TapGroups = Vec<Vec<(u64, u64)>>;
 
+/// What the host can still give this process now, in bytes, read afresh on
+/// each call: for a device that shares the host's memory, what it has
+/// available less what the platform defends past that and the floor;
+/// negative by what the host is short of that line, which the process gives
+/// back. An error names the reading that could not be taken.
+pub type HostRoom = std::sync::Arc<dyn Fn() -> std::result::Result<i64, String> + Send + Sync>;
+
 pub trait Engine: Send {
     fn kind(&self) -> &'static str;
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
+        None
+    }
+
+    /// The reader of what the host can still give this process, where the
+    /// device shares the host's memory and no budget of the device's says
+    /// what it has: the runtime's governor reads it on its tick and holds
+    /// the pool within what the pool holds plus it. `None`, the default:
+    /// the device has memory of its own, sized at load.
+    fn host_room(&self) -> Option<HostRoom> {
         None
     }
 
@@ -244,6 +260,19 @@ pub trait Engine: Send {
         Ok(FireFacts::default())
     }
 
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]), held while bound, and told to
+    /// the engine in the binding ([`InstanceBinding::scratch`],
+    /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
+    /// at every bind, on the lane, before it is sent. The default states
+    /// none: an engine that lays its guests' scratch in the fire's span
+    /// ([`Self::fire_facts`]) states it there until it moves it here.
+    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
+        let _ = (program, extents);
+        Ok(GuestState::default())
+    }
+
     /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
     /// row beside the model's activation, or none where they land inside
     /// the span already, and the rows a fixed store holds, if any. Asked
@@ -272,6 +301,20 @@ pub trait Engine: Send {
         Ok(0)
     }
 
+    /// Whether [`Engine::register_channel`] takes `registration`: the
+    /// engine then holds the channel's ring (in its `Channel` slots, or
+    /// itself, as a host mirror), and an instance bound on the channel
+    /// reads that ring. `false` where it answers `Unsupported`: the runtime
+    /// keeps the channel alone, and each instance holds its own ring in
+    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
+    /// registration, asked before anything of a bind is taken, so a bind
+    /// that registers a channel takes its instance's rings by it. The
+    /// default holds none, as the default `register_channel` takes none.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        false
+    }
+
     /// The `Channel` slots a registered channel's ring takes, asked before
     /// [`Engine::register_channel`]. `None`: the engine keeps the ring
     /// itself.
@@ -283,9 +326,11 @@ pub trait Engine: Send {
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that
-    /// reads them, which must address the new slots. The default does
-    /// nothing: an engine that states no `Instance` or `Channel` shape is
-    /// never asked.
+    /// reads them, which must address the new slots. A channel closed with
+    /// an instance still bound on it is still registered
+    /// ([`Engine::close_channel`]): its rebind is served like an open one's.
+    /// The default does nothing: an engine that states no `Instance` or
+    /// `Channel` shape is never asked.
     fn rebind_slots(&mut self, rebind: Rebind) -> Result<()> {
         let _ = rebind;
         Ok(())
@@ -306,12 +351,25 @@ pub trait Engine: Send {
 
     /// Closes instance `id`: the engine's standing guest bytes after the
     /// close ([`Engine::standing_after`]), less any set no live instance
-    /// shares any more.
+    /// shares any more. A closed channel this was the last instance bound
+    /// on is released with it ([`Engine::close_channel`]): once this
+    /// returns, the runtime gives the channel's `Channel` slots back.
     fn close_instance(&mut self, id: InstanceId) -> Result<u64> {
         let _ = id;
         Err(self.unsupported("close_instance"))
     }
 
+    /// Closes channel `id`. With no instance bound on it, the channel and
+    /// its endpoint are released now. With an instance still bound on it,
+    /// the channel is only closing: its registration, endpoint and ring
+    /// stay, every instance bound on it keeps reading and writing it, a
+    /// [`Engine::rebind_slots`] of its ring (the runtime parked and
+    /// restored it with those instances) is served as an open channel's,
+    /// and an evacuation that moves its slots rebases it; no new instance
+    /// binds on it. The last such instance's [`Engine::close_instance`]
+    /// releases it. The runtime keeps the channel's `Channel` slots owned
+    /// until then, and gives them back only after that close returns, so
+    /// the engine never addresses slots the runtime handed elsewhere.
     fn close_channel(&mut self, id: ChannelId) -> Result<()> {
         let _ = id;
         Err(self.unsupported("close_channel"))

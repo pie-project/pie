@@ -11,7 +11,7 @@ use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReserva
 use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::PoolPort;
-use super::proc::{Proc, Residency};
+use super::proc::{PendingBind, Proc, Residency};
 use super::rank::Rank;
 use super::reclaim::Reclaim;
 use super::short::{Shortfall, Sink, WeightShed};
@@ -892,6 +892,23 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Marks `pid` as waiting at a bind for room, or past it
+    /// ([`super::proc::Proc::bind_waiting`]): waiting, it is a victim as an
+    /// idle process is, and the planner looks again for a head it may now
+    /// fund.
+    pub fn set_bind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: bool) {
+        let changed = self.with_inner(|inner| {
+            inner.procs.get_mut(&pid).is_some_and(|proc| {
+                let was = proc.bind_waiting;
+                proc.bind_waiting = waiting;
+                was != waiting
+            })
+        });
+        if changed && waiting {
+            self.poke();
+        }
+    }
+
     /// Marks `pid` as waiting on its client, or as awake again. Waking a
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
@@ -1004,6 +1021,44 @@ impl ResidencyPlanner {
 
     pub fn can_pause(&self) -> bool {
         self.port.suspend_capable()
+    }
+
+    /// Suspends `pid` to give back the room its parked items hold on the
+    /// device: a bind of its short of room it holds part of itself would
+    /// wait on itself ([`crate::store::roles::bind_when_resident`]).
+    /// Whether a suspension began. The bind asks `pieces` runs of `run`
+    /// adjacent chunks: its restore waits for them beside its kv pages
+    /// ([`super::proc::Proc::bind_room`]), never served into the same
+    /// shortfall.
+    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId, run: u32, pieces: u32) -> bool {
+        let need = PendingBind {
+            run: run.max(1),
+            pieces,
+            pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
+        };
+        let before = self.stats.evictions_started.load(Ordering::Relaxed);
+        ptrace!(
+            "suspend-for-room pid={} run={} pieces={}",
+            pid,
+            need.run,
+            need.pieces
+        );
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.bind_room = Some(need);
+            }
+        });
+        self.pause(vec![pid], |_| true);
+        // Not suspended, it waits as any bind short of room: no restore
+        // reads the room.
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid)
+                && proc.state == Residency::Resident
+            {
+                proc.bind_room = None;
+            }
+        });
+        self.stats.evictions_started.load(Ordering::Relaxed) > before
     }
 
     /// A worker with no host or disk tier leaves it running.
@@ -1209,6 +1264,23 @@ impl ResidencyPlanner {
         }
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// Whether a process's demand waits for room: a kv allocation, a
+    /// restore or a guest bind, unmet. A rise is ordered among them by its
+    /// own key and is not counted: it is what the room it waits on goes to
+    /// in turn, not what a rung walk gives room back for.
+    #[must_use]
+    pub fn demand_waits(&self) -> bool {
+        self.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.is_unmet()
+                    && !matches!(
+                        waiter.kind,
+                        super::wait::WaitKind::Allocation { rise: true, .. }
+                    )
+            })
+        })
     }
 
     pub fn pages_freed(self: &Arc<Self>) {

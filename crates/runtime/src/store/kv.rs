@@ -186,6 +186,14 @@ pub struct KvStore {
     /// Told when pages may have joined the cache: a fire's pages settle, or
     /// a working set is released and keeps its sealed prefix.
     cached: Arc<tokio::sync::Notify>,
+    /// Told when an entry joins or leaves the cache: what a lookup of a
+    /// waiting prompt's prefix finds may have changed.
+    changed: Arc<tokio::sync::Notify>,
+    /// The page keys on the paths of the entries that joined the cache, and
+    /// of those that left it, since [`Self::take_changes`]; kept only while
+    /// a prompt waits ([`crate::store::waiting::watched`]).
+    joined: HashSet<Hash256>,
+    left: HashSet<Hash256>,
     /// A persistent disk tier's journal, and the slots it names.
     persisted: Option<Persisted>,
     /// How many leading tokens each owner's props ask to keep on disk
@@ -195,9 +203,9 @@ pub struct KvStore {
     /// The last count of reclaimable cache pages, when it was taken and what
     /// the walk took: see [`Self::reclaimable_cache_pages`].
     reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
-    /// The same for idle cache parked on the host: see
-    /// [`Self::host_cache_pages`].
-    host_cached: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
+    /// The same for idle cache below the device: see
+    /// [`Self::below_device_cache_pages`].
+    below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -424,10 +432,13 @@ impl KvStore {
             outstanding: BTreeSet::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
             cached: Arc::new(tokio::sync::Notify::new()),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            joined: HashSet::new(),
+            left: HashSet::new(),
             persisted: None,
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
-            host_cached: std::cell::Cell::new(None),
+            below_cached: std::cell::Cell::new(None),
         }
     }
 
@@ -729,6 +740,7 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
+                self.note_change(entry.path.terminal, false);
                 self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
@@ -923,6 +935,7 @@ impl KvStore {
             self.kept += 1;
             self.list(self.kept, path.terminal);
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
+            self.note_change(path.terminal, true);
         }
     }
 
@@ -1158,7 +1171,7 @@ impl KvStore {
             pages.extend(group);
             records.extend(kept);
         }
-        self.host_cached.set(None);
+        self.below_cached.set(None);
         if pages.is_empty() {
             return None;
         }
@@ -1265,7 +1278,7 @@ impl KvStore {
         let count = txn.pages.len();
         self.host_pool
             .release_reserved(txn.pages.into_iter().map(|(_, host, _)| host).collect());
-        self.host_cached.set(None);
+        self.below_cached.set(None);
         self.end_move(freed);
         tracing::debug!(target: "pie::kv", pages = count, "spilled host to disk");
         count
@@ -1282,21 +1295,27 @@ impl KvStore {
     }
 
     /// Idle cache pages parked on the host that only the cache reads: what
-    /// a host short of room can move on down to disk. A count stands as
-    /// [`Self::reclaimable_cache_pages`]' does.
+    /// a host short of room can move on down to disk.
     pub fn host_cache_pages(&self) -> u32 {
-        if self.host_pool.capacity() == 0 {
-            return 0;
+        self.below_device_cache_pages().0
+    }
+
+    /// Idle cache pages below the device that only the cache reads,
+    /// `(on the host, on disk)`: dropping them frees their slots for any
+    /// demand. A count stands as [`Self::reclaimable_cache_pages`]' does.
+    pub fn below_device_cache_pages(&self) -> (u32, u32) {
+        if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
+            return (0, 0);
         }
-        if let Some((at, took, pages)) = self.host_cached.get()
+        if let Some((at, took, pages)) = self.below_cached.get()
             && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
         {
             return pages;
         }
         let began = Instant::now();
         let roots = self.table.unused_cache_roots();
-        let pages = self.table.cache_only_host_slots(&roots, &[]).len() as u32;
-        self.host_cached.set(Some((began, began.elapsed(), pages)));
+        let pages = self.table.cache_only_below_device(&roots);
+        self.below_cached.set(Some((began, began.elapsed(), pages)));
         pages
     }
 
@@ -1528,6 +1547,7 @@ impl KvStore {
                 decoded: false,
             },
         );
+        self.note_change(node, true);
         true
     }
 
@@ -1604,6 +1624,39 @@ impl KvStore {
     /// working set is released): arm it before looking.
     pub fn cached(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.cached)
+    }
+
+    /// Told when an entry joins or leaves the cache: arm it before looking.
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
+    }
+
+    /// The entry ending at `terminal` joined the cache, or is leaving it
+    /// (before its pages are released): while a prompt waits, its path's
+    /// page keys are kept for [`Self::take_changes`].
+    fn note_change(&mut self, terminal: NodeId, joined: bool) {
+        if crate::store::waiting::watched() {
+            let keys = self
+                .table
+                .path_pages(terminal)
+                .into_iter()
+                .filter_map(|(_, key)| key);
+            if joined {
+                self.joined.extend(keys);
+            } else {
+                self.left.extend(keys);
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// The page keys of the entries that joined the cache and of those that
+    /// left it since the last call, `(joined, left)`.
+    pub fn take_changes(&mut self) -> (HashSet<Hash256>, HashSet<Hash256>) {
+        (
+            std::mem::take(&mut self.joined),
+            std::mem::take(&mut self.left),
+        )
     }
 
     /// Pages may have joined the cache.
@@ -1740,6 +1793,7 @@ impl KvStore {
         if let Some(owner) = owner {
             crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
         }
+        let terminal = path.terminal;
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -1749,6 +1803,20 @@ impl KvStore {
                 decoded,
             },
         );
+        self.note_change(terminal, true);
+    }
+
+    /// The device pages of `working_sets` that would leave the device
+    /// with them: resident, read by none of the running working sets
+    /// outside them, pinned by nothing ([`KvPageTable::movable_resident_pages`]).
+    pub fn movable_resident_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Vec<PhysicalKvPageId> {
+        self.table
+            .movable_resident_pages(working_sets)
+            .map(|pages| pages.into_iter().map(|(_, page)| page).collect())
+            .unwrap_or_default()
     }
 
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {

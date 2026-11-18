@@ -336,7 +336,6 @@ pub(crate) fn skinny_planned(
     plan: SkinnyPlan,
 ) -> Result<(), Error> {
     const OP: &str = "linear.skinny";
-    let (mu, ku) = (m.unsigned_abs(), k.unsigned_abs());
     if !super::skinny::fits(m, n, k) {
         return Err(refuse(
             OP,
@@ -352,15 +351,46 @@ pub(crate) fn skinny_planned(
             return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
         }
     }
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, epilogue, plan)?;
+    let SkinnyPlan { waves, grid, .. } = plan;
+    let cap = match epilogue {
+        SkinnyEpilogue::Softcap(cap) => cap,
+        _ => 0.0,
+    };
+    ctx.fire(
+        OP,
+        Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            ArgValue::Ptr(out),
+            ArgValue::I32(n),
+            ArgValue::I32(k),
+            ArgValue::I32(waves.min(block_waves) as i32),
+            ArgValue::F32(cap),
+        ],
+    )
+}
+
+/// The skinny kernel `plan` walks `m` rows of K `k` on with `epilogue`, its
+/// block's wavefronts and its dynamic LDS bytes.
+fn skinny_kernel(
+    m: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+    plan: SkinnyPlan,
+) -> Result<(&'static crate::jit::Kernel, u32, u32), Error> {
+    const OP: &str = "linear.skinny";
+    let (mu, ku) = (m.unsigned_abs(), k.unsigned_abs());
     let SkinnyPlan {
         yt,
         unrl,
         waves,
         block_waves,
-        grid,
         act_global,
         quad,
         ks,
+        ..
     } = plan;
     let swiglu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
     // The whole-product kernel pads each LDS row a chunk, and its K slices
@@ -396,25 +426,33 @@ pub(crate) fn skinny_planned(
             epilogue.code()
         )
     };
-    let cap = match epilogue {
-        SkinnyEpilogue::Softcap(cap) => cap,
-        _ => 0.0,
-    };
     let smem = if act_global { red } else { staged + red };
-    ctx.fire(
-        OP,
-        Fire::at(kernel("linear/gemv.hip", &symbol))
-            .apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
-        &[
-            ArgValue::Ptr(weight),
-            ArgValue::Ptr(act),
-            ArgValue::Ptr(out),
-            ArgValue::I32(n),
-            ArgValue::I32(k),
-            ArgValue::I32(waves.min(block_waves) as i32),
-            ArgValue::F32(cap),
-        ],
-    )
+    Ok((kernel("linear/gemv.hip", &symbol), block_waves, smem))
+}
+
+/// The blocks of the skinny kernel serving walks `m` rows (1..=8) of a
+/// plain `n x k` bank with one compute unit of the current device holds at
+/// once, at its launch's threads (64 a wavefront, its block's wavefronts)
+/// and LDS: HIP's occupancy calculator over the kernel's registers and LDS
+/// against the compute unit's (`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`).
+pub(crate) fn skinny_resident_blocks(ctx: &Ctx, m: i32, n: i32, k: i32) -> Result<u32, Error> {
+    const OP: &str = "linear.skinny";
+    if !super::skinny::fits(m, n, k) {
+        return Err(refuse(
+            OP,
+            format!("covers 1..=8 rows of K in whole eights, not m={m} n={n} k={k}"),
+        ));
+    }
+    let plan = skinny_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs(),
+        k.unsigned_abs(),
+        false,
+        ctx.tuning().gemm_skinny_quad_from,
+        ctx.multiprocessors(OP)?,
+    );
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, SkinnyEpilogue::Store, plan)?;
+    kernel.resident_blocks(64 * block_waves, smem)
 }
 
 /// The turned kernel's LDS a wavefront: a 16 x 256 bf16 turn.

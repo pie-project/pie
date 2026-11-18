@@ -85,7 +85,7 @@ impl Serve for Api {
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile,
-        // no timed frame past the platform's bound on one submission.
+        // each submission within the platform's stated bound on one.
         let tuning = crate::rates::at_load(
             &device,
             tuning,
@@ -405,8 +405,25 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>, split: Option<u32>) -> 
     // The rung names where its carve and rooms lie in the span: a fire of
     // another rung binds other bytes under the same handles.
     key.shown(&p.rung);
-    key.hashed(&p.caches);
-    key.shown(&p.bindings);
+    // Not how many pages the fire's tables name: a view binds its buffer
+    // to the end, and no dispatch is sized by the pages: a decode's splits
+    // are the shape's, each row's walker splitting its own keys, and a
+    // prefill's dispatches bound no work (`Tactic::prefill_work` is 0 here).
+    // So a recording replays as the fire's keys grow.
+    let mut caches = p.caches.clone();
+    for pool in &mut caches.0 {
+        if let engine_gpu::run::CachePool::Kv(kv) = pool {
+            kv.page_indices.rows = 0;
+        }
+    }
+    key.hashed(&caches);
+    let mut bindings = p.bindings.clone();
+    for geometry in &mut bindings.geometry {
+        if let Some(indices) = geometry.indices.as_mut() {
+            indices.rows = 0;
+        }
+    }
+    key.shown(&bindings);
     key.shown(&p.windows);
     // Not the fire's demand: the pool only checks it against what is
     // committed (a commit forgets every recording), so a recording reads
@@ -415,6 +432,11 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>, split: Option<u32>) -> 
     for lane in p.lanes {
         key.shown(&lane.readout);
         key.shown(&lane.reads);
+        // A score room is its pair's place in the pool, which an unpark
+        // or an evacuation moves: a recording binds the one it was taken at.
+        key.hashed(&lane.scores.map(|room| {
+            (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)
+        }));
     }
 
     key.finish()

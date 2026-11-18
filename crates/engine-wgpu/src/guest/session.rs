@@ -15,9 +15,14 @@ use engine_gpu::guest::session::{
     BINDINGS, CFG_BINDING, STEP_BINDING, StageTables, groups_for, stage_tables, step_stride,
     step_uniforms,
 };
+use engine_gpu::guest::state::{GuestLayout, Side};
 
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
+
+/// Where an instance's or its pair's state lies
+/// ([`engine_gpu::guest::state::Placed`]).
+pub type Pair = engine_gpu::guest::state::Placed<crate::device::Api>;
 
 /// Where an instance's tables go: the `Instance` slots the runtime took
 /// for them, and a table's alignment there.
@@ -27,7 +32,45 @@ pub struct Tables<'a> {
     pub align: u64,
 }
 
-const READ_ONLY: [bool; BINDINGS as usize] = [false, true, true, true, false, false];
+/// What the runtime declares read-only (the tables, storage) or a uniform
+/// (the config), and the same binding declared read_write storage. An
+/// instance's tables and config lie in its pool slots, in the segment buffer
+/// its heap binds read_write, and a WebGPU usage scope takes one buffer one
+/// way only: a stage's module declares them read_write, and its layout binds
+/// every binding read_write storage.
+const WIDENED: [(&str, &str); 4] = [
+    (
+        "@binding(1) var<storage, read>       descs",
+        "@binding(1) var<storage, read_write> descs",
+    ),
+    (
+        "@binding(2) var<storage, read>       params",
+        "@binding(2) var<storage, read_write> params",
+    ),
+    (
+        "@binding(3) var<storage, read>       offs",
+        "@binding(3) var<storage, read_write> offs",
+    ),
+    (
+        "@binding(5) var<uniform>             cfg",
+        "@binding(5) var<storage, read_write> cfg",
+    ),
+];
+
+/// `source` with every binding [`WIDENED`] names declared read_write;
+/// refused by name where the runtime declares one otherwise.
+fn widened(call: usize, source: String) -> std::result::Result<String, String> {
+    WIDENED.iter().try_fold(source, |source, (read, written)| {
+        if source.contains(read) {
+            Ok(source.replace(read, written))
+        } else {
+            Err(format!(
+                "guest step call {call}'s module declares no `{read}`, which this backend \
+                 binds read_write storage beside the heap in the pool's segments"
+            ))
+        }
+    })
+}
 
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
@@ -174,7 +217,9 @@ struct Stage {
     /// in `TABLE_BINDINGS` order.
     tables: [Held; 4],
 
-    heap: Buffer,
+    /// Its heap ([`engine_gpu::guest::state`]): the side whose state it
+    /// lies in, its first byte there and its bytes.
+    heap: (Side, u64, u64),
 
     outbox: Buffer,
 
@@ -191,6 +236,13 @@ pub struct Session {
     /// and whether they are one run.
     slots: Vec<u32>,
     run: bool,
+    /// The instance's state and its pair's ([`engine_gpu::guest::state`]),
+    /// which its stages' heaps and the pair's score room lie in, their
+    /// contents dead between fires.
+    instance: Pair,
+    pair: Pair,
+    /// The score room's first byte in the pair's state and its bytes.
+    scores: Option<(u64, u64)>,
 
     library: Arc<Library>,
 }
@@ -201,7 +253,7 @@ impl std::fmt::Debug for Session {
             .field("stages", &self.stages.len())
             .field(
                 "heap",
-                &self.stages.iter().map(|s| s.heap.bytes()).sum::<u64>(),
+                &self.stages.iter().map(|s| s.heap.2).sum::<u64>(),
             )
             .finish()
     }
@@ -216,6 +268,8 @@ impl Session {
         library: Arc<Library>,
         extents: &Extents,
         tables: &Tables<'_>,
+        [instance, pair]: [Pair; 2],
+        layout: &GuestLayout,
     ) -> Result<Session> {
         if code.len() != plans.len() || args.len() != plans.len() {
             return Err(Fault::Program {
@@ -254,11 +308,36 @@ impl Session {
         let (placed, run) =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
+        if layout.stages.len() != plans.len()
+            || resolved
+                .iter()
+                .zip(&layout.stages)
+                .any(|(stage, &(_, _, bytes))| stage.scratch != bytes)
+            || instance.bytes() < layout.instance
+            || pair.bytes() < layout.pair
+        {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "a guest's state of {} bytes an instance and {} its pair lays heaps {:?}, \
+                     and these {} stage(s) take {:?}",
+                    instance.bytes(),
+                    pair.bytes(),
+                    layout.stages,
+                    plans.len(),
+                    resolved.iter().map(|stage| stage.scratch).collect::<Vec<_>>()
+                ),
+            });
+        }
+        let places = [&instance, &pair];
         let mut stages = Vec::with_capacity(plans.len());
-        for ((lowered, resolved), args) in code.iter().zip(resolved).zip(args) {
+        for (((lowered, resolved), args), &heap) in
+            code.iter().zip(resolved).zip(args).zip(&layout.stages)
+        {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
+            let span = heap_span(places, heap)?;
             stages.push(build_stage(
-                device, &core, &library, &status, resolved, tables, lowered, args,
+                device, &core, &library, &status, resolved, tables, lowered, args, heap, span,
             )?);
         }
 
@@ -268,24 +347,59 @@ impl Session {
             stages,
             slots: tables.slots.to_vec(),
             run,
+            instance,
+            pair,
+            scores: layout.scores,
             library,
         })
     }
 
+    /// The pair's score room, where its program reads captured scores.
+    #[must_use]
+    pub fn scores(&self) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        let (at, bytes) = self.scores?;
+        let (buffer, base) = self.pair.span()?;
+        Some(engine_gpu::serve::DeviceCell {
+            buffer: buffer.clone(),
+            at: base + at,
+            bytes,
+        })
+    }
+
+    /// Stage `stage`'s heap: the segment buffer it lies in, its first byte
+    /// there and its bytes.
+    fn heap_at(&self, stage: usize) -> Result<(&Buffer, u64, u64)> {
+        let stage = self.stages.get(stage).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("stage {stage} is past this package's {}", self.stages.len()),
+        })?;
+        heap_span([&self.instance, &self.pair], stage.heap)
+    }
+
     /// Points the stages' bind groups at the chunks their tables' slots
-    /// sit in now, after an evacuation.
+    /// and the guest's state sit in now, after an evacuation.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
         for stage in &mut self.stages {
             for table in &mut stage.tables {
                 table.rebind(pools)?;
             }
         }
+        self.instance.rebind(pools)?;
+        self.pair.rebind(pools)?;
         self.regroup()
     }
 
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they
-    /// lie in, in order), whose bytes the runtime copied there.
-    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+    /// lie in, in order), whose bytes the runtime copied there, and the
+    /// instance's state and its pair's to `scratch` and `pair`, fresh room
+    /// whose contents are dead.
+    pub fn retarget(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        slots: &[u32],
+        scratch: &engine::program::ScratchPlace,
+        pair: &engine::program::ScratchPlace,
+    ) -> Result<()> {
         if slots.len() != self.slots.len() || (self.run && !consecutive(slots)) {
             return Err(Fault::Program {
                 at: "guest::session",
@@ -307,17 +421,20 @@ impl Session {
             }
         }
         self.slots = slots.to_vec();
+        self.instance.retarget(pools, scratch)?;
+        self.pair.retarget(pools, pair)?;
         self.regroup()
     }
 
     fn regroup(&mut self) -> Result<()> {
+        let places = [&self.instance, &self.pair];
         for stage in &mut self.stages {
             stage.group = group(
                 &self.core,
                 &self.library.binds,
                 &self.status,
                 &stage.tables,
-                &stage.heap,
+                heap_span(places, stage.heap)?,
                 &stage.args,
             )?;
         }
@@ -339,9 +456,11 @@ impl Session {
         ))
     }
 
+    /// Stage `stage`'s heap: the segment buffer it lies in and its first
+    /// byte there.
     #[must_use]
-    pub fn heap(&self, stage: usize) -> Option<&Buffer> {
-        self.stages.get(stage).map(|stage| &stage.heap)
+    pub fn heap(&self, stage: usize) -> Option<(&Buffer, u64)> {
+        self.heap_at(stage).ok().map(|(buffer, at, _)| (buffer, at))
     }
 
     pub fn stage_in(&mut self, stage: usize, value: u32, bytes: &[u8]) -> Result<()> {
@@ -359,14 +478,13 @@ impl Session {
                 ),
             });
         }
-        let stage = &mut self.stages[stage];
-
+        let (heap, base, _) = self.heap_at(stage)?;
         if len.is_multiple_of(4) {
-            stage.heap.write(at, bytes)?;
+            heap.write_shared(base + at, bytes)?;
         } else {
             let mut padded = bytes.to_vec();
             padded.resize(len.next_multiple_of(4) as usize, 0);
-            stage.heap.write(at, &padded)?;
+            heap.write_shared(base + at, &padded)?;
         }
         Ok(())
     }
@@ -416,10 +534,12 @@ impl Session {
                 at: "guest::session",
                 why: format!("value {value} is not stage {stage}'s"),
             })?;
-            let held = self.stages[stage].heap.bytes() - at;
+            let held = self.stages[stage].heap.2 - at;
             layout.push((value, at, cursor, len.next_multiple_of(4).min(held)));
             cursor += len.next_multiple_of(4).min(held);
         }
+        let (heap, base, _) = self.heap_at(stage)?;
+        let heap = heap.clone();
         let Session { status, stages, .. } = self;
         let seat = &mut stages[stage];
         if seat.outbox.bytes() < cursor {
@@ -432,7 +552,7 @@ impl Session {
         }
         frame.copy(status, 0, &seat.outbox, 0, STATUS_SPAN)?;
         for &(_, at, into, len) in &layout {
-            frame.copy(&seat.heap, at, &seat.outbox, into, len)?;
+            frame.copy(&heap, base + at, &seat.outbox, into, len)?;
         }
         seat.outbox_layout = layout
             .into_iter()
@@ -525,14 +645,9 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         .map(|at| wgpu::BindGroupLayoutEntry {
             binding: at,
             visibility: wgpu::ShaderStages::COMPUTE,
+            // Read_write storage, every one ([`WIDENED`]).
             ty: wgpu::BindingType::Buffer {
-                ty: if at == CFG_BINDING {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage {
-                        read_only: READ_ONLY[at as usize],
-                    }
-                },
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
@@ -555,6 +670,7 @@ fn build_call(
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
     let source =
         engine_gpu::guest::step_module(call).ok_or_else(|| format!("no step call {call}"))?;
+    let source = widened(call, source)?;
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
     crate::guest::validated(core, "create_compute_pipeline", || {
@@ -593,7 +709,7 @@ fn group(
     binds: &wgpu::BindGroupLayout,
     status: &Buffer,
     tables: &[Held; 4],
-    heap: &Buffer,
+    (heap, heap_at, heap_bytes): (&Buffer, u64, u64),
     args: &Buffer,
 ) -> Result<wgpu::BindGroup> {
     let [descs, params, offs, cfg] = tables;
@@ -619,7 +735,11 @@ fn group(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: whole(heap),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &heap.slab().buffer,
+                    offset: heap_at,
+                    size: std::num::NonZeroU64::new(heap_bytes),
+                }),
             },
             wgpu::BindGroupEntry {
                 binding: CFG_BINDING,
@@ -665,6 +785,25 @@ impl StepArgs {
     }
 }
 
+/// Where a stage's heap (`heap`: its side, first byte and bytes) lies in
+/// `places` (the instance's state, its pair's): the segment buffer, its
+/// first byte there and its bytes.
+fn heap_span(
+    [instance, pair]: [&Pair; 2],
+    (side, at, bytes): (Side, u64, u64),
+) -> Result<(&Buffer, u64, u64)> {
+    let place = match side {
+        Side::Instance => instance,
+        Side::Pair => pair,
+    };
+    let (buffer, base) = place.span().ok_or_else(|| Fault::Program {
+        at: "guest::session",
+        why: format!("a stage's heap on the {side:?}'s side, which keeps no state"),
+    })?;
+    Ok((buffer, base + at, bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
     core: &Arc<Core>,
@@ -674,11 +813,12 @@ fn build_stage(
     tables: [Held; 4],
     lowered: &engine_gpu::guest::Lowered,
     args: &StepArgs,
+    heap: (Side, u64, u64),
+    span: (&Buffer, u64, u64),
 ) -> Result<Stage> {
     let StageTables {
         descriptors,
         offsets,
-        scratch,
         ..
     } = resolved;
     let steps = lowered
@@ -687,14 +827,13 @@ fn build_stage(
         .map(|step| library.pipeline(step.call))
         .collect::<Result<Vec<_>>>()?;
     let (args, stride) = (args.buffer.clone(), args.stride);
-    let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let outbox = Buffer::with(
         device,
         OUTBOX_FLOOR,
         OUTBOX_KIND,
         engine_gpu::books::owners::GUEST,
     )?;
-    let group = group(core, &library.binds, status, &tables, &heap, &args)?;
+    let group = group(core, &library.binds, status, &tables, span, &args)?;
 
     Ok(Stage {
         group,

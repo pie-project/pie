@@ -232,7 +232,7 @@ pub(super) struct Bound {
 pub(super) const T: f32 = 0.375;
 
 /// The tokens of a pass.
-const ROWS: u32 = 3;
+pub(super) const ROWS: u32 = 3;
 
 /// A model loaded one frame in flight over the miniature's table.
 pub(super) struct Loaded {
@@ -245,6 +245,12 @@ pub(super) struct Loaded {
 
 /// `None` without a device. `tag` names the scratch directory.
 pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
+    loaded_lanes(tag, model, 4)
+}
+
+/// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
+pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
+    let tokens = (lanes * ROWS).next_power_of_two().max(16);
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
@@ -268,14 +274,16 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
             trace: trace.clone(),
             checkpoint: Checkpoint::Path(path),
             budgets: Budgets {
-                max_lanes: 4,
-                max_tokens: 16,
-                buckets: vec![16],
+                max_lanes: lanes,
+                max_tokens: tokens,
+                buckets: vec![tokens],
                 max_adapters: 0,
                 page_size: 16,
-                max_context: 64,
+                // The fire top is a rung a prompt of the context holds
+                // (`engine::load::fire_top`): a context of the fire's tokens.
+                max_context: tokens.max(64),
                 context_declared: false,
-                slots: 4,
+                slots: lanes,
                 max_patches: None,
                 max_images: None,
                 max_voxels: None,
@@ -376,6 +384,8 @@ fn bound_with(
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         },
         &channels,
     );

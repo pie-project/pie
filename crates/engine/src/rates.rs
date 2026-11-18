@@ -25,6 +25,21 @@
 //!   ([`elementwise_bytes`]) over their time together.
 //! - `scan_gelems`: the prefill gated-delta scan and the causal conv before
 //!   it at [`SCAN_SHAPE`], [`scan_elements`] over the two together's time.
+//! - `few_row_tflops`: a bf16 matmul at decode-shaped rows, 4 to 256, on
+//!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
+//!   the curve never weighs it), its flops over its time once its weight
+//!   reads no longer bind it. Measured on every backend.
+//! - `workgroups_per_core`: the workgroups a compute unit holds at once
+//!   for a kernel's full rate. Derived where the device states its
+//!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
+//!   measured where its API hides it (Vulkan, wgpu, Metal): one workgroup
+//!   a head of a kernel at its compute-bound shape, its time against the
+//!   same work at the rate its full curve states ([`workgroups_per_core`]).
+//!
+//! Each backend's estimate weighs a fire by the keys it names
+//! ([`rates_at_load`]'s `keys`, of `profile::fire::KEYS`); a rate measured
+//! or stated at or below zero, or not finite, is refused by its key
+//! ([`unmeasured`]), never saved or divided by.
 
 /// The bytes the rates step lays on the device at once, at most: the
 /// largest of a matmul's rotation and operands, the attention's cold sets,
@@ -71,12 +86,45 @@ pub const GEMM_WIDTHS: [u32; 3] = [1024, 2048, 4096];
 /// The widest of [`GEMM_WIDTHS`].
 pub const GEMM_WIDTH: u32 = GEMM_WIDTHS[GEMM_WIDTHS.len() - 1];
 
-/// The rows the matmul curve is timed at: the lattice's octaves a fire's
-/// prompt reaches, 256 to 8192.
-pub const GEMM_ROWS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+/// The rows the matmul curve is timed at: half octaves (steps of √2,
+/// rounded) from 256 to 8192 rows, the reach of a fire's prompt. An
+/// octave-spaced curve can sit in a library's dips between octaves (an
+/// MI300X's hipBLASLt at width 4096: 523 TFLOP/s at 2048 rows, 599 at
+/// 2896, 556 at 4096), so the shapes between them would be priced from
+/// its dips.
+pub const GEMM_ROWS: [u32; 11] = half_octaves(256);
+
+/// `N` rows at steps of √2 from `from`, rounded to the nearest row: the
+/// even steps `from` doubled, the odd ones those times √2.
+const fn half_octaves<const N: usize>(from: u32) -> [u32; N] {
+    let mut rows = [0; N];
+    let mut i = 0;
+    while i < N {
+        let octave = from << (i / 2);
+        rows[i] = if i % 2 == 0 {
+            octave
+        } else {
+            (octave as f64 * std::f64::consts::SQRT_2 + 0.5) as u32
+        };
+        i += 1;
+    }
+    rows
+}
 
 /// The keys (and rows) the attention curve is timed at.
 pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
+
+/// `workgroups_per_core` from one timed dispatch: `workgroups` of a kernel
+/// over `cores` compute units took `ns`, and the same work at the kernel's
+/// full rate (its work over the rate its full curve states there) takes
+/// `full_ns`. The dispatch ran at `workgroups / S` of its rate, so the
+/// device fills at `S = workgroups · ns / full_ns`, over `cores`. `None`
+/// where a time or the cores are nothing: no rate is made of them.
+#[must_use]
+pub fn workgroups_per_core(workgroups: u32, cores: u32, ns: f64, full_ns: f64) -> Option<f64> {
+    let per = f64::from(workgroups) * ns / full_ns / f64::from(cores);
+    (per.is_finite() && per > 0.0).then_some(per)
+}
 
 /// The per-row ops' shape: `(rows, width)`, a 2048-token fire of a
 /// 4096-wide model; the norm reads and writes rows of `width`, the gated
@@ -234,6 +282,194 @@ pub const LAUNCH_CHAINS: [u32; 2] = [64, 1024];
 #[must_use]
 pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
     ((chain_ns - one_ns) / f64::from(n.max(1))).max(0.0)
+}
+
+/// The first rate of `rates` stated with no measurement behind it: a value
+/// at or below zero, or not finite (a timing that settled at nothing), by
+/// its key and where. A launch of 0 ns is a measurement (a launch the work
+/// hides); nothing divides by it. Such a rate is refused by name wherever
+/// rates are read ([`rates_at_load`], `crate::roofline::Constants::of`):
+/// nothing divides by it.
+#[must_use]
+pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)> {
+    let bad = |v: f64| !(v.is_finite() && v > 0.0);
+    let point = |key: &'static str, unit: &str, curve: &[(u32, f64)]| {
+        curve
+            .iter()
+            .find(|&&(_, v)| bad(v))
+            .map(|&(at, v)| (key, format!("at {at} {unit} as {v}")))
+    };
+    if let Some(widths) = &rates.gemm_tflops_by_rows {
+        for (w, curve) in widths {
+            if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(found) = rates
+        .attn_tflops_by_keys
+        .as_deref()
+        .and_then(|curve| point("attn_tflops_by_keys", "keys", curve))
+    {
+        return Some(found);
+    }
+    for (key, v) in [
+        ("hbm_gbps", rates.hbm_gbps),
+        ("elementwise_gbps", rates.elementwise_gbps),
+        ("scan_gelems", rates.scan_gelems),
+        ("few_row_tflops", rates.few_row_tflops),
+        ("workgroups_per_core", rates.workgroups_per_core),
+    ] {
+        if let Some(v) = v.filter(|&v| bad(v)) {
+            return Some((key, format!("as {v}")));
+        }
+    }
+    None
+}
+
+/// How a rates step admits its frames under the device's bound on one
+/// submission (`max_submit`, where it states one), every engine's rule:
+/// a frame is estimated from its fire's last measured time, and admitted
+/// where that estimate times [`Admission::worst`] fits the bound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub bound: Option<std::time::Duration>,
+    /// Whether the device's clock has settled: the warm-up's rotations
+    /// agreed ([`warm_up`], by [`settle`]'s rule). Frames before it measure
+    /// the clock's ramp, not an estimate's error.
+    pub settled: bool,
+    /// The largest ratio of a settled frame's time to its estimate seen,
+    /// never below 1: a measurement, over every settled frame carrying its
+    /// estimate up, no decay and no window.
+    pub worst: f64,
+}
+
+impl Admission {
+    #[must_use]
+    pub fn new(bound: Option<std::time::Duration>) -> Admission {
+        Admission {
+            bound,
+            settled: false,
+            worst: 1.0,
+        }
+    }
+
+    /// Whether a frame estimated at `estimate_ns` fits the bound at the
+    /// worst ratio seen (always, with no bound or no estimate).
+    #[must_use]
+    pub fn fits(&self, estimate_ns: Option<f64>) -> bool {
+        match (self.bound, estimate_ns) {
+            (Some(cap), Some(e)) => e * self.worst <= cap.as_nanos() as f64,
+            _ => true,
+        }
+    }
+
+    /// The fires a frame of `count` holds at `per_fire_ns` a fire: `count`
+    /// halved until the frame fits; `None` where not even one fire does
+    /// (the shape is past the bound, refused by name).
+    #[must_use]
+    pub fn fires(&self, count: u32, per_fire_ns: Option<f64>) -> Option<u32> {
+        let mut n = count.max(1);
+        loop {
+            if self.fits(per_fire_ns.map(|p| p * f64::from(n))) {
+                return Some(n);
+            }
+            if n == 1 {
+                return None;
+            }
+            n /= 2;
+        }
+    }
+
+    /// A frame landed: `took_ns` against its `estimate_ns`, carried up
+    /// from a frame of no more fires (`upward`). Only a settled device's
+    /// frames move the worst ratio.
+    pub fn landed(&mut self, estimate_ns: Option<f64>, took_ns: f64, upward: bool) {
+        if let Some(e) = estimate_ns.filter(|&e| e > 0.0)
+            && self.settled
+            && upward
+        {
+            self.worst = self.worst.max(took_ns / e);
+        }
+    }
+}
+
+/// The side of the cube the warm-up's size walk ([`warm_side`]) times
+/// first, and the one after it: the walk's first growth is theirs.
+pub const WARM_PROBE: u32 = 1024;
+
+/// The side of the warm-up's cube matmul (`side x side x side`), walked up
+/// by doubling with a real fire timed at each size (`time(side, estimate)`,
+/// ns; `estimate` the walk's own for that fire, none for the two probes):
+/// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
+/// while its fire, estimated from the last one timed by the growth the last
+/// two measured (their time ratio, carried forward: not the flops' ratio),
+/// times `worst`, fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it
+/// is with no bound stated (nothing is walked then). `worst` starts at the
+/// caller's worst ratio of a measured time over its estimate (1 for none)
+/// and rises to each walked fire's measured time over the walk's estimate
+/// of it where that is more: the estimate's own error, measured, stands
+/// under the bound; no factor is tuned. Returns the side and the worst
+/// ratio seen. A phone whose GPU faults a submission past its watchdog
+/// warms on a cube whose fire fits it.
+pub fn warm_side<E>(
+    max_submit: Option<std::time::Duration>,
+    mut worst: f64,
+    mut time: impl FnMut(u32, Option<f64>) -> Result<f64, E>,
+) -> Result<(u32, f64), E> {
+    let Some(cap) = max_submit else {
+        return Ok((WARM_SHAPE.0, worst));
+    };
+    let bound = cap.as_nanos() as f64;
+    let mut before = time(WARM_PROBE / 2, None)?;
+    let mut last = time(WARM_PROBE, None)?;
+    let mut side = WARM_PROBE;
+    if last * worst > bound {
+        return Ok((WARM_PROBE / 2, worst));
+    }
+    while side < WARM_SHAPE.0 {
+        let growth = last / before.max(f64::MIN_POSITIVE);
+        let estimate = last * growth;
+        if estimate * worst > bound {
+            break;
+        }
+        let next = time(side * 2, Some(estimate))?;
+        worst = worst.max(next / estimate.max(f64::MIN_POSITIVE));
+        if next * worst > bound {
+            break;
+        }
+        (before, last, side) = (last, next, side * 2);
+    }
+    Ok((side, worst))
+}
+
+/// The bytes an attention of `shape` moves at least: its queries read and
+/// its output written (each row a query element a head), and its keys' and
+/// values' cells read once.
+#[must_use]
+pub fn attn_bytes(shape: AttnShape) -> f64 {
+    let q = 2.0 * f64::from(shape.rows) * f64::from(shape.q_heads * shape.head_dim) * 2.0;
+    let kv = 2.0 * f64::from(shape.keys) * f64::from(shape.kv_heads * shape.head_dim) * 2.0;
+    q + kv
+}
+
+/// The keys of [`ATTN_KEYS`] the attention curve is timed at on a device
+/// whose ridge is `ridge` (its matmul peak, flops a ns, over its bandwidth,
+/// bytes a ns): from the narrowest whose shape ([`ATTN_SHAPE`] at it) is
+/// compute-bound there (its flops a byte at least the ridge) on, so the
+/// rate is the kernel's compute, not its reads; the widest where none is.
+/// The matmul curve's points play no part.
+#[must_use]
+pub fn attn_keys(ridge: f64) -> Vec<u32> {
+    let bound = |keys: u32| {
+        let s = ATTN_SHAPE.at(keys);
+        attn_flops(s) / attn_bytes(s) >= ridge
+    };
+    let from = ATTN_KEYS
+        .iter()
+        .position(|&k| bound(k))
+        .unwrap_or(ATTN_KEYS.len() - 1);
+    ATTN_KEYS[from..].to_vec()
 }
 
 /// The matmul every backend's rates step warms the device with before it
@@ -408,6 +644,89 @@ pub fn timed_frames<E>(
         per_fire_ns: settled.last,
         capped: settled.capped,
     })
+}
+
+/// Whether the operand sets one owner lays (a width's weight planes, an
+/// attention's q / kv sets, ...) have been touched on the device yet: held
+/// beside the sets, by whatever lays them, and set by [`touch_once`].
+#[derive(Debug, Default)]
+pub struct Touched(std::cell::Cell<bool>);
+
+impl Touched {
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// A set is touched once, by the first point that rotates it: the first
+/// time a point is timed over the `sets` operand sets `touched` stands
+/// for, every one of them is read once on the device, untimed
+/// ([`touch_sets`]), before the point's frames ([`warmed_frames`]); a
+/// later point over the same sets reads them as they are. A set the
+/// device has never read costs its first fire far more than a warm one (on
+/// an M5 Pro a 256 x 1024 x 1024 matmul over 384 fresh 2 MiB planes ran
+/// 112 us a fire against 25 us once they had been read, so the point read
+/// about 5 or about 30 TFLOP/s run to run by whether its few timed fires
+/// fell on planes read before). Touched once, not before every point: a
+/// rotation before each point is that much more load on the device, and
+/// on the M5 Pro it read the widest matmuls 2-5% under the first set's
+/// rates, heat the measurement had added.
+pub fn touch_once<E>(
+    touched: &Touched,
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    if touched.get() {
+        return Ok(());
+    }
+    touch_sets(max_submit, sets, frame)?;
+    touched.0.set(true);
+    Ok(())
+}
+
+/// Every one of the `sets` operand sets a point's fires rotate through,
+/// read once on the device and untimed: `sets` fires in all, in one frame,
+/// or in frames of as many as fit under `max_submit` where the device
+/// states a bound on one submission.
+pub fn touch_sets<E>(
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    let mut left = sets.max(1);
+    let one = frame(1)?;
+    left -= 1;
+    let per = max_submit.map_or(left, |cap| {
+        ((cap.as_nanos() as f64 / one.max(1.0)) as u32).max(1)
+    });
+    while left > 0 {
+        let n = per.min(left);
+        frame(n)?;
+        left -= n;
+    }
+    Ok(())
+}
+
+/// A timed point's frames, the one rule for every point every engine
+/// times: their length settled by [`timed_frames`], then frames of that
+/// length run until their rate stops moving ([`warm_up`]'s rule), so the
+/// point is timed at the clock it holds under its own load, never in a
+/// state an earlier point or an idle gap left behind. Before this every
+/// point but the memory-bound ones went untimed by it, and on an M5 Pro a
+/// few-microsecond matmul read about 5 or about 34 TFLOP/s run to run.
+/// (Its sets touched first, once: [`touch_once`].)
+pub fn warmed_frames<E>(
+    max_submit: Option<std::time::Duration>,
+    estimate_ns: Option<f64>,
+    mut frame: impl FnMut(u32) -> Result<f64, E>,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Frames, E> {
+    let frames = timed_frames(max_submit, estimate_ns, &mut frame, refuse)?;
+    let k = frames.fires;
+    warm_up(|| frame(k).map(|ns| f64::from(k) / ns.max(f64::MIN_POSITIVE)))?;
+    Ok(frames)
 }
 
 /// What a backend's rates step measured, and whether a frame it needed
@@ -649,25 +968,26 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
 pub struct SaveTo<'a> {
     pub path: std::path::PathBuf,
     pub provenance: (&'static str, String),
-    pub check: &'a dyn Fn(&str) -> Result<(), String>,
+    /// The backend's registry: what the saved file is read against, and
+    /// what of it a load no longer reads ([`profile::Registry::prune`]).
+    pub registry: &'a profile::Registry,
 }
 
 /// The user's file of a device, `existing` (none where there is none yet),
-/// with `measured` (only the keys a load measured) added to its `[rates]`
-/// and `provenance` set in its `[provenance]`: nothing else of the file
-/// changes, and nothing of the profile it resolved to is copied into it.
+/// with its `[rates]` table written whole: the rates the file's own table
+/// states where it reads (every key one this pie reads), under `measured`
+/// (only the keys a load measured); a table stating a key this pie does not
+/// read (a schema it outlived) is replaced, none of it kept. `provenance`
+/// is set in its `[provenance]`; nothing else of the file changes, and
+/// nothing of the profile it resolved to is copied into it. The user's file
+/// is the loads' own measured output: no key is spliced into a table it
+/// might already hold.
 #[must_use]
 pub fn saved_text(
     existing: Option<&str>,
     measured: &profile::fire::Rates,
     provenance: &(&'static str, String),
 ) -> String {
-    let keys: Vec<String> = measured
-        .toml()
-        .lines()
-        .skip(1)
-        .map(str::to_string)
-        .collect();
     let entry = format!("{} = {}", provenance.0, provenance.1);
     let mut lines: Vec<String> = existing
         .unwrap_or("api = 1\n")
@@ -688,15 +1008,36 @@ pub fn saved_text(
         }
         end
     };
-    match header(&lines, "rates") {
+    // The old table out, whole, the new one in its place; what of the old
+    // reads stays under the measured.
+    let at = header(&lines, "rates");
+    let mut kept = profile::fire::Rates::default();
+    if let Some(at) = at {
+        let end = table_end(&lines, at);
+        let table = format!("api = 1\n{}\n", lines[at..end].join("\n"));
+        if let Ok(file) = profile::Registry::new("rates", &[], &[]).parse(
+            &table,
+            "the user's [rates]",
+            profile::Strict::User,
+        ) {
+            kept = file.tuned.rates;
+        }
+        lines.drain(at..end);
+    }
+    let table: Vec<String> = measured
+        .clone()
+        .over(kept)
+        .toml()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    match at {
         Some(at) => {
-            let end = table_end(&lines, at);
-            lines.splice(end..end, keys);
+            lines.splice(at..at, table);
         }
         None => {
             lines.push(String::new());
-            lines.push("[rates]".to_string());
-            lines.extend(keys);
+            lines.extend(table);
         }
     }
     match header(&lines, "provenance") {
@@ -724,7 +1065,8 @@ pub fn saved_text(
 }
 
 /// The roofline a load weighs its fires by, one rule for every engine: the
-/// rates `chip`'s layers state where they state every one (a checked-in
+/// rates `chip`'s layers state where they state every one of `keys` (those
+/// the backend's estimate weighs a fire by, of `profile::fire::KEYS`) (a checked-in
 /// profile's over a saved one, `profile::Registry::resolve`); else, before
 /// the load is ready, the device's own, measured by `measure` (the backend's
 /// `pie tune --rates` step, seconds long, its frames sized by
@@ -736,19 +1078,31 @@ pub fn saved_text(
 /// bound unsettled, and the load line says so (`engine::load::line_of`).
 /// The step runs at the start of the load, its buffers of `room` (what the
 /// load's budget leaves the device, where the engine can say): where that
-/// holds less than it lays at most ([`step_bytes`]) the load is refused.
+/// holds less than it lays at most ([`step_bytes`]) the load is refused,
+/// as is a rate the step settled at nothing ([`unmeasured`]), before
+/// anything is saved.
 pub fn rates_at_load(
     chip: profile::Profile,
+    keys: &[&'static str],
     save: Option<SaveTo<'_>>,
     room: Option<u64>,
     max_submit: Option<std::time::Duration>,
     measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
+    // A checked-in file this device takes states a rate this pie does not
+    // read: it was refused whole, and the load is refused by it.
+    if let Some(stale) = &chip.tuned().refused {
+        return Err(format!(
+            "{stale}: a checked-in profile states a rate this pie does not read, and is refused \
+             whole; [rates] holds {:?}",
+            profile::fire::KEYS
+        ));
+    }
     let stated = chip.rates();
-    if stated.missing().is_empty() {
+    if stated.complete(keys) {
         return Ok(chip);
     }
-    let lacked = stated.missing();
+    let lacked = stated.missing(keys);
     // The step lays its buffers before any of the load's: where the load's
     // budget leaves the device less than it lays at most, the load is
     // refused by name, never left to wait for memory.
@@ -767,20 +1121,39 @@ pub fn rates_at_load(
         rates: measured,
         unsettled,
     } = measure(max_submit)?;
-    let rates = stated.over(measured);
-    if !rates.missing().is_empty() {
+    if let Some((key, why)) = unmeasured(&measured) {
         return Err(format!(
-            "the device's rates step measured no {:?}: nothing weighs a fire by them",
-            rates.missing()
+            "the device's rates step measured `[rates] {key}` {why}: nothing weighs a fire by \
+             it, and no rate is divided by"
         ));
     }
-    // The user's file gains what this load measured, the keys no layer
-    // stated, and how: nothing else.
+    let rates = stated.over(measured);
+    if !rates.complete(keys) {
+        return Err(format!(
+            "the device's rates step measured no {:?}: nothing weighs a fire by them",
+            rates.missing(keys)
+        ));
+    }
+    // The user's file is this load's own output: it keeps every section and
+    // key this pie still reads (a person's own decisions), drops each it no
+    // longer reads (said, by name), gains what this load measured and how.
     let saved_to = match save {
         Some(save) => {
-            let existing = std::fs::read_to_string(&save.path).ok();
+            let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
+                let (kept, dropped) = save.registry.prune(&text);
+                for key in dropped {
+                    eprintln!(
+                        "user profile {}: dropped `{key}`, no longer read",
+                        save.path.display()
+                    );
+                }
+                kept
+            });
             let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
-            (save.check)(&text).map_err(|why| {
+            let check = save
+                .registry
+                .parse(&text, "the measured rates", profile::Strict::User);
+            check.map_err(|why| {
                 format!(
                     "{}: the measured rates would not read back: {why}",
                     save.path.display()
@@ -839,6 +1212,128 @@ fn civil(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A point that starts in a slow clock state and leaves it only under
+    /// its own load: its frames' length settles while it is slow, and the
+    /// point is timed only once frames of that length run at the fast rate,
+    /// whatever the doublings saw. (On an M5 Pro a short matmul read about
+    /// 5 or about 34 TFLOP/s run to run: timed without this, by which state
+    /// the gap before it left.)
+    #[test]
+    fn a_point_is_timed_only_once_its_own_load_has_settled_its_clock() {
+        let calls = std::cell::Cell::new(0u32);
+        // Slow (10 ns a fire) for the frames the doublings settle in, then
+        // fast (1 ns a fire) once its own load has lifted the clock.
+        const SLOW: u32 = 3;
+        let frame = |k: u32| -> Result<f64, String> {
+            calls.set(calls.get() + 1);
+            let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
+            Ok(per * f64::from(k))
+        };
+        let settled =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            settled.per_fire_ns, 10.0,
+            "the doublings alone settle in the slow state"
+        );
+        calls.set(0);
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        let settled_at = calls.get();
+        assert!(
+            settled_at > SLOW + 1,
+            "the warm-up ran past the slow state ({settled_at} frames)"
+        );
+        // The next frame of that length reads the fast state.
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
+    }
+
+    /// Points whose fires are slow on any operand set the device has not
+    /// read yet, their rotation longer than the frames their doublings
+    /// settle in: the first point over the sets touches every one of them,
+    /// so it is timed over touched sets only, at their rate, and a second
+    /// point over the same sets touches none again. (On an M5 Pro a 256 x
+    /// 1024 x 1024 matmul over 384 fresh planes read about 5 or about 30
+    /// TFLOP/s run to run, by whether its timed fires fell on planes read
+    /// before.)
+    #[test]
+    fn a_set_is_touched_once_by_the_first_point_that_rotates_it() {
+        const SETS: usize = 384;
+        // A fire on a set read before takes 1 ns, its first one 20 ns.
+        let rig =
+            |touched: &std::cell::RefCell<Vec<bool>>, turn: &super::Rotation, k: u32| -> f64 {
+                (0..k)
+                    .map(|_| {
+                        let at = turn.next(SETS);
+                        if std::mem::replace(&mut touched.borrow_mut()[at], true) {
+                            1.0
+                        } else {
+                            20.0
+                        }
+                    })
+                    .sum()
+            };
+        let touched = std::cell::RefCell::new(vec![false; SETS]);
+        let owner = super::Touched::default();
+        let fires = std::cell::Cell::new(0u32);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            Ok(rig(&touched, &turn, k))
+        };
+        let mut first = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut first).expect("it touches");
+        assert!(touched.borrow().iter().all(|&t| t), "every set was touched");
+        assert!(owner.get(), "the owner holds that its sets are touched");
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        assert_eq!(
+            frames.per_fire_ns, 1.0,
+            "the point settles at the touched sets' rate"
+        );
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the timed frames read touched sets only");
+        // A second point over the same sets: no touch again.
+        fires.set(0);
+        let mut second = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut second).expect("it touches");
+        assert_eq!(
+            fires.get(),
+            0,
+            "a later point over the same sets touches none again"
+        );
+        // Untouched (the doublings alone), the point times first touches:
+        // the case this rule closes.
+        let fresh = std::cell::RefCell::new(vec![false; SETS]);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> { Ok(rig(&fresh, &turn, k)) };
+        let untouched =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            untouched.per_fire_ns, 20.0,
+            "untouched, the doublings time first touches"
+        );
+    }
+
+    /// The touch keeps each of its frames under the device's bound on one
+    /// submission, and still covers every set once.
+    #[test]
+    fn the_touch_keeps_under_the_submission_bound() {
+        let fires = std::cell::Cell::new(0u32);
+        let longest = std::cell::Cell::new(0u32);
+        let mut frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            longest.set(longest.get().max(k));
+            Ok(f64::from(k) * 1000.0)
+        };
+        super::touch_sets(Some(std::time::Duration::from_micros(10)), 95, &mut frame)
+            .expect("it touches");
+        assert_eq!(fires.get(), 95, "every set touched once");
+        assert!(
+            longest.get() <= 10,
+            "no frame past the bound ({} fires)",
+            longest.get()
+        );
+    }
+
     use super::*;
 
     /// A profile of the toy registry stating `rates`.
@@ -857,6 +1352,8 @@ mod tests {
             hbm_gbps: Some(700.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
+            few_row_tflops: Some(4.0),
+            workgroups_per_core: Some(3.3),
         }
     }
 
@@ -864,7 +1361,7 @@ mod tests {
     fn a_load_without_the_constants_measures_saves_and_says_so() {
         let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
-        let check = |_: &str| Ok(());
+        let registry = profile::Registry::new("toy", &[], &[]);
         // A checked-in launch, nothing else: the rest measured, the launch
         // kept, each submission under the budget asked.
         let stated = profile::fire::Rates {
@@ -874,10 +1371,11 @@ mod tests {
         let mut asked = None;
         let p = rates_at_load(
             chip(stated),
+            &profile::fire::KEYS,
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             Some(std::time::Duration::from_millis(5)),
@@ -933,19 +1431,14 @@ mod tests {
         let facts = profile::Facts::of(&registry);
         let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
         let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert!(!first.rates().missing().is_empty());
-        let check = |text: &str| {
-            registry
-                .parse(text, "saved", profile::Strict::User)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
+        assert!(!first.rates().complete(&profile::fire::KEYS));
         let measured = rates_at_load(
             first,
+            &profile::fire::KEYS,
             Some(SaveTo {
                 path: SHELF.user_path(&dir, "Card X"),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             None,
@@ -963,9 +1456,14 @@ mod tests {
         let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(second.rates(), all());
-        let second = rates_at_load(second, None, None, None, |_| -> Result<_, String> {
-            panic!("measured what the first load saved")
-        })
+        let second = rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured what the first load saved") },
+        )
         .unwrap();
         assert!(!second.tuned().measured_this_load);
     }
@@ -982,20 +1480,241 @@ mod tests {
             saved_text(None, &measured, &how),
             "api = 1\n\n[rates]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
-        // A user's file: its decisions kept, its [rates] gaining the key,
-        // its provenance's rates entry replaced, the rest left.
+        // A user's file: its decisions kept, its [rates] written whole (the
+        // key it stated kept under the measured one), its provenance's rates
+        // entry replaced, the rest left.
         let existing = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"old\"\n";
         assert_eq!(
             saved_text(Some(existing), &measured, &how),
             "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
         );
-        // A rate stated as array rows: the key lands after its last row.
+        // A rate stated as array rows: the table read whole and rewritten.
         let rows =
             "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\n";
         assert_eq!(
             saved_text(Some(rows), &measured, &how),
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+            "api = 1\n\n[rates]\nattn_tflops_by_keys = [[512, 4.0], [1024, 5.0]]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
+        // A table of a schema this pie outlived (Nov 16's keys): replaced
+        // whole, none of it kept, so no key is written twice.
+        let old = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 1.0\nlaunch_ns = 900\n\n[provenance]\nrates = \"old\"\n";
+        let all = profile::fire::Rates {
+            launch_ns: Some(1200),
+            ..measured.clone()
+        };
+        assert_eq!(
+            saved_text(Some(old), &all, &how),
+            "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 1200\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+        );
+    }
+
+    /// The Spark's user file of Nov 16 (the old schema's [rates] keys and a
+    /// decision this pie removed) is refused at resolve, so the load
+    /// measures every key; the file is rewritten as the load's own output
+    /// (the removed decision dropped and said, the old table replaced
+    /// whole, what reads kept), and the next boot reads it clean and
+    /// measures nothing.
+    #[test]
+    fn an_old_schema_user_file_is_measured_rewritten_whole_and_read_next() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-old-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "api = 1\n\n[engine]\ngraphs = \"on\"\n\n[rates]\n\
+             bf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 650.0\n\
+             launch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"Nov 16\"\n",
+        )
+        .unwrap();
+        let (first, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert!(!report.rejected.is_empty(), "the old file is refused");
+        assert!(!first.rates().complete(&profile::fire::KEYS));
+        let measured = rates_at_load(
+            first,
+            &profile::fire::KEYS,
+            Some(SaveTo {
+                path: path.clone(),
+                provenance: provenance("toy", "a test"),
+                registry: &registry,
+            }),
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: all(),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        assert!(measured.tuned().measured_this_load);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("launch_ns").count(), 1, "{text}");
+        assert!(!text.contains("bytes_per_ns"), "{text}");
+        // The decision this pie no longer reads dropped; what reads kept.
+        assert!(!text.contains("graphs"), "{text}");
+        assert!(text.contains("source = \"me\""), "{text}");
+        let (second, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert_eq!(second.rates(), all());
+        rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured what the first load saved") },
+        )
+        .unwrap();
+    }
+
+    /// A checked-in file stating a rate this pie does not read is refused
+    /// whole, and the load is refused by its name and the key.
+    #[test]
+    fn a_checked_in_file_with_a_stale_rate_refuses_the_load_by_name() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[(
+                "derived/card-x.toml",
+                "api = 1\n[target]\ndevice = \"Card X\"\n[rates]\nbytes_per_ns = 650.0\n",
+            )],
+            derived: Some(|_, _| "api = 1\n".to_string()),
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let (chip, _) = SHELF.resolve(&registry, "Card X", &facts, None);
+        let err = rates_at_load(chip, &profile::fire::KEYS, None, None, None, |_| {
+            Ok(Measured {
+                rates: all(),
+                unsettled: false,
+            })
+        })
+        .unwrap_err();
+        assert!(err.contains("derived/card-x.toml"), "{err}");
+        assert!(err.contains("`[rates] bytes_per_ns`"), "{err}");
+    }
+
+    /// A cold frame before the clock settles moves nothing: the 840's walk
+    /// at 2048^3 took 23.4 ms against 12.3 ms estimated while its clock
+    /// ramped, and held every admission after it 1.9x high.
+    #[test]
+    fn a_cold_frame_does_not_inflate_later_admissions() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.landed(Some(12.33e6), 23.43e6, true);
+        assert_eq!(a.worst, 1.0);
+        // The attention's frame of 4 at 274 ms each fits at 1096 ms.
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(4));
+        // Settled: its frames count, the largest ratio kept.
+        a.settled = true;
+        a.landed(Some(100e6), 104e6, true);
+        a.landed(Some(100e6), 101e6, true);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+        // A frame carried down (from more fires to fewer) holds its own
+        // submit: it moves nothing.
+        a.landed(Some(1e6), 3e6, false);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+    }
+
+    /// A frame that does not fit halves its fires until it does; only a
+    /// single fire past the bound is refused.
+    #[test]
+    fn a_frame_that_does_not_fit_halves_its_fires() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.settled = true;
+        a.worst = 1.9;
+        // 4 fires of 274 ms: 2083 ms at 1.9x; 2 fit (1042 ms).
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(2));
+        assert_eq!(a.fires(16, Some(100e6)), Some(8));
+        // One fire past the bound: refused.
+        assert_eq!(a.fires(4, Some(1.2e9)), None);
+        // No estimate yet, or no bound: the frame as asked.
+        assert_eq!(a.fires(4, None), Some(4));
+        assert_eq!(Admission::new(None).fires(4, Some(1e12)), Some(4));
+    }
+
+    /// The warm-up's cube walks up while its next fire, estimated from the
+    /// last by the growth the last two measured, fits the device's bound on
+    /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
+    /// KGSL's ~2 s watchdog.
+    #[test]
+    fn the_warm_up_cube_walks_up_while_its_next_fire_fits_the_bound() {
+        let kgsl = Some(std::time::Duration::from_secs(2));
+        // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
+        let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
+        let mut timed = Vec::new();
+        let (side, worst) = warm_side(kgsl, 1.0, |s, _| {
+            timed.push(s);
+            Ok::<f64, ()>(cubic(s))
+        })
+        .unwrap();
+        assert_eq!((side, worst), (8192, 1.0));
+        assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
+        // A device slowing past the flops' growth (each doubling 10x, as a
+        // clock sinking under its power cap): 4096^3 at 300 ms, the next
+        // estimated at 3 s, past the bound: it is never fired.
+        let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
+        let mut timed = Vec::new();
+        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
+            timed.push(s);
+            Ok::<f64, ()>(sinking(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+        // No bound stated: the widest, nothing timed.
+        let side = warm_side(None, 1.0, |_, _| -> Result<f64, ()> {
+            panic!("timed with no bound")
+        });
+        assert_eq!(side, Ok((WARM_SHAPE.0, 1.0)));
+        // The probe itself past the bound: the cube under it.
+        assert_eq!(
+            warm_side(kgsl, 1.0, |_, _| Ok::<f64, ()>(3e9)),
+            Ok((WARM_PROBE / 2, 1.0))
+        );
+        // The walk's own estimate low by 1.3x at 4096 (its fire 1.3x the
+        // growth's): the worst ratio seen is 1.3, and 8192, estimated from
+        // 4096's growth, stands past a 1.5 s bound under it: never fired.
+        let mut timed = Vec::new();
+        let lagging = |side: u32| match side {
+            512 => 0.29e6,
+            1024 => 2.34e6,
+            2048 => 18.75e6,
+            _ => 150e6 * 1.3,
+        };
+        let (side, worst) = warm_side(Some(std::time::Duration::from_millis(1500)), 1.0, |s, _| {
+            timed.push(s);
+            Ok::<f64, ()>(lagging(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert!((worst - 1.3).abs() < 0.01, "{worst}");
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+    }
+
+    /// The attention curve's keys are where its shape is compute-bound on
+    /// the device (its flops a byte past the ridge), from the device's own
+    /// matmul peak and bandwidth: never where a matmul lattice stopped.
+    #[test]
+    fn the_attention_keys_are_compute_bound_and_their_own() {
+        let intensity = |keys: u32| {
+            let s = ATTN_SHAPE.at(keys);
+            attn_flops(s) / attn_bytes(s)
+        };
+        // A ridge every point clears: the whole curve.
+        assert_eq!(attn_keys(1.0), ATTN_KEYS.to_vec());
+        // A ridge past 512 keys' intensity: from the first past it.
+        let ridge = (intensity(512) + intensity(1024)) / 2.0;
+        assert_eq!(attn_keys(ridge), ATTN_KEYS[1..].to_vec());
+        // None compute-bound: the widest alone, never nothing.
+        assert_eq!(attn_keys(f64::MAX), vec![ATTN_KEYS[ATTN_KEYS.len() - 1]]);
     }
 
     #[test]
@@ -1003,6 +1722,7 @@ mod tests {
         let short = step_bytes() - 1;
         let err = rates_at_load(
             chip(profile::fire::Rates::default()),
+            &profile::fire::KEYS,
             None,
             Some(short),
             None,
@@ -1014,13 +1734,134 @@ mod tests {
 
     #[test]
     fn a_load_whose_layers_state_every_constant_measures_nothing() {
-        let p = rates_at_load(chip(all()), None, None, None, |_| -> Result<_, String> {
-            panic!("measured a profile stating every constant")
-        })
+        let p = rates_at_load(
+            chip(all()),
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured a profile stating every constant") },
+        )
         .unwrap();
         assert_eq!(p.rates(), all());
         assert!(!p.tuned().measured_this_load);
         assert_eq!(crate::load::measured_line(p.tuned()), None);
+    }
+
+    /// A backend whose estimate weighs fewer keys measures nothing for the
+    /// rest: a profile stating its six is complete for it, not for one
+    /// weighing all eight.
+    #[test]
+    fn a_load_measures_the_keys_its_backend_weighs_and_no_others() {
+        let six = all().only(&profile::fire::KEYS[..6]);
+        let p = rates_at_load(
+            chip(six.clone()),
+            &profile::fire::KEYS[..6],
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured keys the backend does not weigh") },
+        )
+        .unwrap();
+        assert_eq!(p.rates(), six);
+        let err = rates_at_load(
+            chip(six.clone()),
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: six.clone(),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("measured no [\"few_row_tflops\", \"workgroups_per_core\"]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
+        let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
+        let path = dir.join("vulkan/user/card-x.toml");
+        let registry = profile::Registry::new("toy", &[], &[]);
+        for (zero, says) in [
+            (
+                profile::fire::Rates {
+                    workgroups_per_core: Some(0.0),
+                    ..all()
+                },
+                "`[rates] workgroups_per_core` as 0",
+            ),
+            (
+                profile::fire::Rates {
+                    few_row_tflops: Some(f64::NAN),
+                    ..all()
+                },
+                "`[rates] few_row_tflops` as NaN",
+            ),
+            (
+                profile::fire::Rates {
+                    attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 150.0)]),
+                    ..all()
+                },
+                "`[rates] attn_tflops_by_keys` at 512 keys as 0",
+            ),
+        ] {
+            let save = SaveTo {
+                path: path.clone(),
+                provenance: ("rates", "\"measured at load\"".to_string()),
+                registry: &registry,
+            };
+            let err = rates_at_load(
+                chip(profile::fire::Rates::default()),
+                &profile::fire::KEYS,
+                Some(save),
+                None,
+                None,
+                |_| {
+                    Ok(Measured {
+                        rates: zero,
+                        unsettled: false,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(err.contains(says), "{err}");
+            assert!(!path.exists(), "a refused rate was saved");
+        }
+        // Stated in a profile, it is refused by the same key: the roofline
+        // divides by none of it.
+        let stated = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+            ..all()
+        };
+        assert_eq!(
+            crate::roofline::Constants::of(&stated).err(),
+            Some("attn_tflops_by_keys")
+        );
+        let nan = profile::fire::Rates {
+            hbm_gbps: Some(f64::NAN),
+            ..all()
+        };
+        assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The RTX PRO 4500's tiled attention at one workgroup a head: 264
+    /// workgroups fill its 80 units, 3.3 a unit; a dispatch of 32 ran 8.25x
+    /// the time the full curve states.
+    #[test]
+    fn the_workgroups_a_core_holds_come_from_one_dispatch_against_the_full_rate() {
+        let per = workgroups_per_core(32, 80, 8.25e6, 1e6).unwrap();
+        assert!((per - 3.3).abs() < 1e-9, "{per}");
+        assert_eq!(workgroups_per_core(32, 80, 0.0, 1e6), None);
+        assert_eq!(workgroups_per_core(32, 80, 1e6, 0.0), None);
+        assert_eq!(workgroups_per_core(32, 0, 1e6, 1e6), None);
     }
 
     #[test]
@@ -1121,6 +1962,10 @@ mod tests {
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
         assert!(GEMM_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            GEMM_ROWS,
+            [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]
+        );
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
         assert!(elementwise_sets() >= 2);
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
@@ -1262,6 +2107,8 @@ mod tests {
             hbm_gbps: Some(800.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
+            few_row_tflops: Some(4.5),
+            workgroups_per_core: Some(3.3),
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

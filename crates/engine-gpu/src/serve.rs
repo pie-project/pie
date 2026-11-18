@@ -80,6 +80,11 @@ pub trait Serve: Backend {
     /// of a ring lies on the host.
     const CHANNEL_CELLS: bool;
 
+    /// Whether the backend's fires are walks that fire nothing, a naming
+    /// load's (`named::Named`): a fire of a capturing class then lays its
+    /// score rows nowhere a kernel runs, and asks no pair's room for them.
+    const NAMES: bool = false;
+
     /// The target the backend's kernels are instantiated for.
     const TARGET: kernels_slang::Target;
 
@@ -447,6 +452,11 @@ pub struct Seated<'a, B: Serve> {
     /// The outputs the lane's program reads.
     pub reads: &'a [String],
 
+    /// The score room of the pair whose program reads the lane's scores
+    /// (`guest::state`): where a fire carrying the lane may lay its
+    /// capturing lanes' rows. `None` where no program it runs reads them.
+    pub scores: Option<&'a DeviceCell<B>>,
+
     pub rs: &'a engine::fire::RsVerb,
 
     pub rs_reset: engine::fire::RsReset,
@@ -497,6 +507,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             positions: &[],
             readout: None,
             reads: &[],
+            scores: None,
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_snapshots: &[],
@@ -765,9 +776,10 @@ pub struct Shell<B: Serve> {
     /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
     snaps: Option<B::Buffer>,
     /// The last staged fire's capturing lanes' rows ([`Shell::score_rows`]):
-    /// each one's source lane and the bytes its key row, and its page row
-    /// where it has one, start at in the span's buffer.
-    last_capture: Vec<(u32, u64, Option<u64>)>,
+    /// the segment buffer of the score room they lie in, and each one's
+    /// source lane and the bytes its key row, and its page row where it has
+    /// one, start at there.
+    last_capture: Option<(B::Buffer, Vec<(u32, u64, Option<u64>)>)>,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -1045,7 +1057,7 @@ impl<B: Serve> Shell<B> {
         // the context, `FireEstimate::fire_top`); a fire never runs past the
         // pick.
         let device_profile = tuning.profile().clone();
-        let rated = device_profile.rates().complete();
+        let rated = device_profile.rates().complete(&crate::rates::KEYS);
         let counts = if rated {
             Some(crate::top::counts(&boot.trace)?)
         } else {
@@ -1450,7 +1462,7 @@ impl<B: Serve> Shell<B> {
             let mut pixels = Vec::new();
             for output in &class_outputs {
                 let name = &output.decl.name;
-                // A capturing lane's row lies in its fire's guest region, no
+                // A capturing lane's row lies in a pair's score room, no
                 // arena slot: as wide as the load states it.
                 if let Some(grain) = crate::arena::grain(&compiled.arena, output.values[0]) {
                     readouts.push(ReadoutPlane {
@@ -1517,10 +1529,9 @@ impl<B: Serve> Shell<B> {
             };
             (out_width, pixels, readouts)
         };
-        // A fire lays its capturing lanes' rows in its guest region beside
-        // its carve, and is cut to a rung they fit beside by the term its
-        // programs' reads state (`Shell::capture_term`): a class writes a
-        // capturing row only under the switch such a read sets.
+        // A fire lays its capturing lanes' rows in a reading pair's score
+        // room, which the pair's reads state (`Shell::score_room`): a class
+        // writes a capturing row only under the switch such a read sets.
         for plane in readouts.iter().filter(|plane| plane.captured.is_some()) {
             for class in plane.classes.iter() {
                 let switched = compiled.classes.classes.get(class).is_some_and(|class| {
@@ -1783,7 +1794,7 @@ impl<B: Serve> Shell<B> {
             held: vec![0; slots as usize],
             rs_layout,
             snaps: None,
-            last_capture: Vec::new(),
+            last_capture: None,
             rs_buffers,
             rs_scratch: None,
             out,
@@ -2385,19 +2396,17 @@ impl<B: Serve> Shell<B> {
             .any(|plane| plane.captured.is_some() && plane.classes.contains(class))
     }
 
-    /// What one instance of a program reading `reads` (`(output, lane)`
-    /// each) lays in a fire's guest region (its per-member term): for each
-    /// lane a read of which switches score capture on, a key row of the
-    /// load's context, and a page row where it reads pages; the region's
-    /// alignment once. The switch is the runtime's rule: a read sets it
-    /// where every class writing the output holds it in every word.
+    /// The bytes of score rows a pair of a program reading `reads`
+    /// (`(output, lane)` each) keeps as its state (`guest::state`): where a
+    /// read of it switches score capture on, a key row and a page row of
+    /// the load's context for every lane a fire carries at most, the room
+    /// a fire lays all its capturing lanes' rows in; none where no read
+    /// does. The switch is the runtime's rule: a read sets it where every
+    /// class writing the output holds it in every word.
     #[must_use]
-    pub fn capture_term<'a>(
-        &self,
-        reads: impl IntoIterator<Item = (&'a str, u32)>,
-    ) -> engine::FireFacts {
+    pub fn score_room<'a>(&self, reads: impl IntoIterator<Item = (&'a str, u32)>) -> u64 {
         let Some(rows) = self.span.capture() else {
-            return engine::FireFacts::default();
+            return 0;
         };
         let classes = self.classes();
         let switches = |name: &str| {
@@ -2414,24 +2423,11 @@ impl<B: Serve> Shell<B> {
                         .all(|&word| self.trace.facts.holds(word, poem_ir::Builtin::Scores))
                 })
         };
-        let mut lanes: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
-        for (name, lane) in reads {
-            if switches(name) {
-                *lanes.entry(lane).or_default() |= name == SCORE_PAGES;
-            }
+        if !reads.into_iter().any(|(name, _)| switches(name)) {
+            return 0;
         }
-        if lanes.is_empty() {
-            return engine::FireFacts::default();
-        }
-        let a_lane = lanes
-            .values()
-            .map(|&pages| rows.key_bytes() + if pages { rows.page_bytes() } else { 0 })
-            .sum();
-        engine::FireFacts {
-            a_lane,
-            fixed: crate::arena::CaptureRows::slack(),
-            ..engine::FireFacts::default()
-        }
+        let lanes = self.budgets.tokens.max_lanes;
+        rows.region(lanes, lanes).1
     }
 
     /// Its class's readout rows, else its last float row output, else the `out` output's.
@@ -2627,28 +2623,31 @@ impl<B: Serve> Shell<B> {
         self.pools.page_bytes()
     }
 
-    /// Where `slots` lays each capturing lane's rows: its source lane, and
-    /// the bytes of the span's buffer its key row and page row start at.
-    fn capture_rows(&self, composition: &Composition, slots: &SlotTable) -> Vec<(u32, u64, Option<u64>)> {
-        let Some(rows) = self.span.capture().filter(|_| slots.1.rows() > 0) else {
-            return Vec::new();
-        };
+    /// Where `slots` lays each capturing lane's rows: the segment buffer
+    /// of the score room they lie in, and each one's source lane and the
+    /// bytes of that buffer its key row and page row start at.
+    fn capture_rows(
+        &self,
+        composition: &Composition,
+        slots: &SlotTable,
+    ) -> Option<(B::Buffer, Vec<(u32, u64, Option<u64>)>)> {
+        let rows = self.span.capture().filter(|_| slots.1.rows() > 0)?;
         let start = |grain: crate::arena::Grain| {
             slots.0.iter().enumerate().find_map(|(at, slot)| {
                 let slot = (*slot)?;
                 (crate::arena::grain(&self.compiled.arena, ValueId(at as u32)) == Some(grain))
-                    .then(|| self.handles.get(slot.buf).map(|row| row.offset()))
+                    .then(|| {
+                        self.handles
+                            .get(slot.buf)
+                            .map(|row| (row.buffer().clone(), row.offset()))
+                    })
                     .flatten()
             })
         };
-        let (Some(keys), pages) = (
-            start(crate::arena::Grain::Keys),
-            start(crate::arena::Grain::Pages),
-        ) else {
-            return Vec::new();
-        };
+        let (room, keys) = start(crate::arena::Grain::Keys)?;
+        let pages = start(crate::arena::Grain::Pages).map(|(_, at)| at);
         let scored = &slots.1;
-        composition
+        let laid = composition
             .lanes()
             .iter()
             .enumerate()
@@ -2661,7 +2660,8 @@ impl<B: Serve> Shell<B> {
                     .map(|(page, at)| at + u64::from(page) * rows.page_bytes());
                 Some((row.source, keys + u64::from(key) * rows.key_bytes(), page))
             })
-            .collect()
+            .collect();
+        Some((room, laid))
     }
 
     /// The last fire's capturing lanes' rows, read back where it laid them
@@ -2670,10 +2670,9 @@ impl<B: Serve> Shell<B> {
     /// it captured; a later fire lays its own over them.
     pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
         self.drain()?;
-        let Some(rows) = self.span.capture() else {
+        let (Some(rows), Some((buffer, laid))) = (self.span.capture(), &self.last_capture) else {
             return Ok(Vec::new());
         };
-        let buffer = self.span.buffer()?;
         let read = |at: u64, bytes: u64| -> Result<Vec<f32>> {
             let mut raw = vec![0u8; usize::try_from(bytes).unwrap_or(usize::MAX)];
             buffer.read(at, &mut raw)?;
@@ -2684,8 +2683,7 @@ impl<B: Serve> Shell<B> {
                 .map(|w| f32::from_le_bytes(*w))
                 .collect())
         };
-        self.last_capture
-            .iter()
+        laid.iter()
             .map(|&(source, keys, pages)| {
                 Ok((
                     source,
@@ -4155,7 +4153,7 @@ impl<B: Serve> Shell<B> {
                     .any(|name| name == SCORE_PAGES);
             (captures, pages)
         }));
-        // Each capturing lane's rows by their bases in the guest region's
+        // Each capturing lane's rows by their bases in the score room's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
         let capture_table = self
             .span
@@ -4250,7 +4248,23 @@ impl<B: Serve> Shell<B> {
         // The narrowest rung that holds the fire: its carve at its fixed
         // place under the span's end.
         let rung = self.span.rung_of(fire_rows)?;
-        let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
+        // A fire's capturing lanes' rows lie in the score room of its first
+        // capturing lane's pair, laid for the most lanes a fire carries.
+        let room = composition
+            .lanes()
+            .iter()
+            .enumerate()
+            .filter(|&(lane, _)| scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some())
+            .find_map(|(_, row)| lanes[row.source as usize].scores)
+            .map(|cell| (&cell.buffer, cell.at, cell.bytes));
+        // A naming walk fires nothing: its capturing classes' rows bind the
+        // span's buffer, which no kernel writes.
+        let named = match (room, B::NAMES) {
+            (None, true) => Some(self.span.buffer()?),
+            _ => None,
+        };
+        let room = room.or(named.map(|buffer| (buffer, 0, u64::MAX)));
+        let slots = self.span.slots(&self.handles, rung, fire_rows, scored, room)?;
         self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(
             &self.handles,
@@ -4898,7 +4912,9 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
-        let mut bases: Vec<Option<Vec<u64>>> = vec![None; self.readouts.len()];
+        // Each read plane's buffer (the span's, or a score room's) and every
+        // layer's base in it.
+        let mut bases: Vec<Option<(B::Buffer, Vec<u64>)>> = vec![None; self.readouts.len()];
         for span in prepared.readout_layout.iter().filter(|span| span.rows > 0) {
             let at = span.plane as usize;
             if bases[at].is_some() {
@@ -4906,6 +4922,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             }
             let plane = &self.readouts[at];
             let mut layers = Vec::with_capacity(plane.values.len());
+            let mut buffer = None;
             for value in &plane.values {
                 let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                     what: format!(
@@ -4927,16 +4944,19 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                     ),
                 })?;
                 layers.push(row.offset());
+                buffer.get_or_insert_with(|| row.buffer().clone());
             }
-            bases[at] = Some(layers);
+            bases[at] = buffer.map(|buffer| (buffer, layers));
         }
 
         let layout = prepared.readout_layout.clone();
         for span in layout.iter().filter(|span| span.rows > 0) {
             let plane = &self.readouts[span.plane as usize];
-            let layers = bases[span.plane as usize]
-                .as_deref()
-                .expect("every read plane has a base");
+            let (from, layers) = bases[span.plane as usize]
+                .as_ref()
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("output `{}`, a read plane of no value", plane.output),
+                })?;
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
             let source_row = |k: u32| {
@@ -4949,7 +4969,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             };
             for copy in span_copies(span, layers, row_bytes, source_row) {
                 frame.copy(
-                    self.span.buffer()?,
+                    from,
                     copy.from,
                     &self.readout[prepared.arm],
                     copy.to,

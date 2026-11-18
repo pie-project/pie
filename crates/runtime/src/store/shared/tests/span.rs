@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::governor::{PATIENCE, PoolTarget};
-use crate::store::shared::programs::{Mover, take_raise};
+use crate::store::shared::programs::{Mover, carry_raise, take_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
 struct Lane(Arc<Mutex<FakeEngine>>);
@@ -737,4 +737,109 @@ async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
         1,
         "nothing promised: nothing told"
     );
+}
+
+/// Fires cut under a wide rung are still queued when the walk lowers the
+/// rung and its notice lands; a pass then asks a width of a rung that
+/// shares the lowered rung's chunk class. No queued fire reaches the
+/// engine wider than the rung it was told: the lower narrows what the lane
+/// lets through from the moment its notice goes, and the rung of the class
+/// set aside is told the engine (a raise that moves nothing) before the
+/// cap lifts to it.
+#[tokio::test(flavor = "current_thread")]
+async fn no_fire_wider_than_the_rung_the_engine_was_told_reaches_it() {
+    const ENGINE: usize = 9212;
+    let mut facts = facts();
+    facts.span_backed_on_demand = true;
+    // 256 and 512 one chunk class: the same span set aside for each.
+    facts.act_chunks = vec![(16, 1), (256, 4), (512, 4), (2048, 12)];
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert_eq!(pool.raise_applied(&evacuation).unwrap(), Some((16, 2048)));
+    pool.raise_copied(0);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let _grow = SharedGrow::new(0, ENGINE, shared.clone());
+    let engine = Arc::new(Mutex::new(FakeEngine::on_demand()));
+    // The rung the engine was last told, as it lays a fire's inputs.
+    let held = |engine: &Arc<Mutex<FakeEngine>>| {
+        engine
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                Call::Rung(_, to) => Some(*to),
+                _ => None,
+            })
+            .unwrap_or(2048)
+    };
+    // What the scheduler hands the lane each turn: every queued fire the
+    // cap covers; the lane lets through what the rung it holds covers.
+    let mut queued = vec![1024u32, 297, 298];
+    let mut reached = Vec::new();
+    let turn = |queued: &mut Vec<u32>, reached: &mut Vec<u32>| {
+        let cap = fire_cap(ENGINE);
+        queued.retain(|&rows| {
+            if rows > cap {
+                return true;
+            }
+            assert!(
+                rows <= engine_rows(ENGINE),
+                "{rows} rows past the lane's rung"
+            );
+            assert!(rows <= held(&engine), "{rows} rows past the engine's rung");
+            reached.push(rows);
+            false
+        });
+    };
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+
+    // The walk cuts fires to 256 and, past the retire fence, lowers.
+    let mut walk = RungWalk::default();
+    let step = walk.step(&shared.lock().unwrap(), 256, u32::MAX, u32::MAX, 5, 5);
+    assert_eq!(step.unwrap(), RungStep::Cap(256));
+    set_fire_cap_for_test(ENGINE, 256);
+    turn(&mut queued, &mut reached);
+    let step = walk.step(&shared.lock().unwrap(), 256, 256, 256, 5, 5);
+    assert_eq!(step.unwrap(), RungStep::Wait);
+    let step = walk.step(&shared.lock().unwrap(), 256, 256, 256, 5, 5);
+    assert_eq!(step.unwrap(), RungStep::Lower(256));
+    let notice = shared.lock().unwrap().lower_notice(256).unwrap();
+    assert_eq!(notice, Some((2048, 256)));
+    assert_eq!(engine_rows(ENGINE), 256, "narrowed as the notice goes");
+    turn(&mut queued, &mut reached);
+    engine.lock().unwrap().set_rung(2048, 256).unwrap();
+    shared.lock().unwrap().lower_landed(256).unwrap();
+    turn(&mut queued, &mut reached);
+    assert!(reached.is_empty(), "every queued fire is wider than 256");
+
+    // A pass of 297 rows asks: 512 is of the class set aside, yet the
+    // engine holds 256, so the cap stays until the engine hears 512.
+    raise_now(&shared, ENGINE, 297);
+    assert_eq!(
+        fire_cap(ENGINE),
+        256,
+        "no fire past the rung the engine holds"
+    );
+    turn(&mut queued, &mut reached);
+    let step = walk
+        .step(&shared.lock().unwrap(), 512, 256, 256, 6, 6)
+        .unwrap();
+    let RungStep::Raise { rung, evacuation } = step else {
+        panic!("a rung of the class set aside is a raise: {step:?}");
+    };
+    assert_eq!(rung, 512);
+    assert!(evacuation.moves.is_empty(), "it moves nothing");
+    let notice = shared.lock().unwrap().raise_applied(&evacuation).unwrap();
+    assert_eq!(notice, Some((256, 512)));
+    turn(&mut queued, &mut reached);
+    carry_raise(&shared, &evacuation, notice, &Lane(engine.clone()))
+        .await
+        .unwrap();
+    raise_now(&shared, ENGINE, 297);
+    assert_eq!(fire_cap(ENGINE), 512);
+    turn(&mut queued, &mut reached);
+    assert_eq!(reached, [297, 298]);
+    assert_eq!(queued, [1024], "held until the engine holds its rung");
 }

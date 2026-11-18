@@ -2,6 +2,7 @@ mod beam_stage;
 mod bool_gather;
 mod bool_moves;
 mod fold;
+mod guest_state;
 mod outputs;
 mod port;
 mod readout_rows;

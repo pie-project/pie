@@ -163,6 +163,26 @@ pub(crate) struct FakeEngine {
     adapter: Footprint,
     /// The key of the adapter the next binding lands ([`Engine::adapter_key`]).
     key: Option<u128>,
+    /// The instances it closed: as the engine's plane, it holds them no
+    /// longer and refuses a rebind of one by name.
+    closed: Vec<InstanceId>,
+    /// Channels closed while an instance was still bound on them: kept
+    /// registered until the last such instance closes
+    /// (`Engine::close_channel`).
+    closing: Vec<ChannelId>,
+    /// Channels released: a rebind of one is refused by name, as an engine
+    /// that no longer holds the channel refuses it.
+    released: Vec<ChannelId>,
+}
+
+impl FakeEngine {
+    /// Whether an instance it has not closed is bound on channel `id`
+    /// (instance `k + 1` is the `k`th binding).
+    fn bound_on(&self, id: ChannelId) -> bool {
+        self.bindings.iter().enumerate().any(|(k, binding)| {
+            binding.channels.contains(&id) && !self.closed.contains(&InstanceId(k as u64 + 1))
+        })
+    }
 }
 
 impl Engine for FakeEngine {
@@ -252,6 +272,10 @@ impl Engine for FakeEngine {
         }))
     }
 
+    fn holds_channel(&self, _registration: &ChannelRegistration) -> bool {
+        !self.no_channels
+    }
+
     fn adapter_key(&self, _binding: &InstanceBinding) -> ::engine::Result<Option<u128>> {
         Ok(self.key)
     }
@@ -287,7 +311,43 @@ impl Engine for FakeEngine {
     }
 
     fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+        if let Rebind::Instance { id, .. } = &rebind
+            && self.closed.contains(id)
+        {
+            return Err(::engine::Error::Program(format!(
+                "program::plane: no instance {id}"
+            )));
+        }
+        if let Rebind::Channel { id, .. } = &rebind
+            && self.released.contains(id)
+        {
+            return Err(::engine::Error::Program(format!(
+                "channel {id} is not registered on this engine"
+            )));
+        }
         self.rebinds.push(rebind);
+        Ok(())
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> ::engine::Result<u64> {
+        self.closed.push(id);
+        let closing = std::mem::take(&mut self.closing);
+        for channel in closing {
+            if self.bound_on(channel) {
+                self.closing.push(channel);
+            } else {
+                self.released.push(channel);
+            }
+        }
+        Ok(0)
+    }
+
+    fn close_channel(&mut self, id: ChannelId) -> ::engine::Result<()> {
+        if self.bound_on(id) {
+            self.closing.push(id);
+        } else {
+            self.released.push(id);
+        }
         Ok(())
     }
 }
@@ -465,6 +525,8 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
             slots: now[3..].to_vec(),
         }],
         adapter: Vec::new(),
+        scratch: ::engine::ScratchPlace::None,
+        pair: ::engine::ScratchPlace::None,
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,
@@ -484,6 +546,75 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
     for id in [channel, other_channel] {
         roles.lock().unwrap().close_channel(id);
     }
+    assert_eq!(held(&device), before);
+}
+
+/// A channel the lane closes while its process is parked, with an instance
+/// still bound on it: the engine keeps it registered (closing), the roles
+/// keep its slots, the restore's rebind of its ring is served, and the
+/// instance's close then releases it in the engine and its slots here.
+#[test]
+fn a_channel_closed_while_parked_is_rebound_at_unpark_and_freed_with_its_instance() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0, "the instance and its channel parked");
+
+    // The lane closes the channel while it is parked: the engine first,
+    // then the roles, as `QueuedItem::CloseChannels` runs.
+    engine.close_channel(channel).unwrap();
+    roles.lock().unwrap().close_channel(channel);
+    assert!(
+        !roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Channel(channel))
+            .is_empty(),
+        "a closed channel's ring stays owned while its instance is bound"
+    );
+
+    // The restore: the closed channel comes back with its instance and is
+    // rebound, as the lane runs it.
+    let stale = unpark(&roles, 1);
+    assert!(
+        stale
+            .iter()
+            .any(|rebind| matches!(rebind, Rebind::Channel { id, .. } if *id == channel)),
+        "the closed channel's ring moved with its instance: {stale:?}"
+    );
+    for rebind in stale {
+        crate::store::roles::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(()))
+            .expect("every rebind of the restore is served, the closed channel's too");
+    }
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+    assert!(engine.rebinds.contains(&Rebind::Channel {
+        id: channel,
+        slots: roles.lock().unwrap().slots(Owner::Channel(channel)),
+    }));
+    assert!(!engine.released.contains(&channel));
+
+    // The instance's close releases the channel: in the engine, then its
+    // slots here, all of them back.
+    close_on_lane(&roles, &mut engine, instance);
+    assert!(engine.released.contains(&channel));
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Channel(channel))
+            .is_empty(),
+        "the closed channel's ring goes back with its last instance"
+    );
+    assert_eq!(held(&host), 0);
     assert_eq!(held(&device), before);
 }
 
@@ -660,7 +791,19 @@ fn a_ring_past_a_slot_registers_parks_and_unparks_as_one_run() {
         .find(|copy| copy.shape == CHANNEL)
         .unwrap()
         .clone();
-    assert!(adjacent(&ring.host, PER_CHUNK), "a run on the host too");
+    // The copy carries every channel item of the process; the ring's own
+    // run (where its device run lies in the copy) is a run on the host too.
+    // Its single-slot items lie in a chunk of their own, never beside it.
+    let at = ring
+        .device
+        .iter()
+        .position(|&slot| slot == slots[0])
+        .expect("the ring's run in the copy");
+    assert_eq!(&ring.device[at..at + slots.len()], &slots[..]);
+    assert!(
+        adjacent(&ring.host[at..at + slots.len()], PER_CHUNK),
+        "a run on the host too"
+    );
     roles.lock().unwrap().commit(park);
     let unpark = roles
         .lock()
@@ -861,6 +1004,96 @@ fn a_channel_the_engine_did_not_register_leaves_its_ring_to_the_instance() {
     assert_eq!(rings, vec![(0, 1), (1, 3)]);
 }
 
+/// Binds an instance on channel 0 as a lane binds one that registers the
+/// channel in the same bind: everything taken first, the rings by what the
+/// engine holds ([`super::held_by`]), then the registration, then the bind.
+/// The binding and the bytes of the pool it holds.
+fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
+    let Pools { device, roles, .. } = pools();
+    let before = held(&device);
+    let plans = vec![ChannelRegistration {
+        id: ChannelId(1),
+        capacity: 20,
+        host_role: eta_ir::container::HostRole::Writer,
+        ..ChannelRegistration::default()
+    }];
+    learn_program(&roles, engine, PROGRAM).unwrap();
+    let held_ids = super::held_by(engine, &plans);
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        channels: vec![plans[0].id],
+        ..InstanceBinding::default()
+    };
+    let taken = super::take_bind(
+        Some(&roles),
+        engine,
+        &binding,
+        |id| held_ids.contains(&id),
+        None,
+    )
+    .unwrap();
+    let mut rings = super::take_rings(Some(&roles), engine, &plans)
+        .unwrap()
+        .into_iter();
+    super::register_taken(
+        Some(&roles),
+        engine,
+        &plans[0],
+        Some(holder(1)),
+        rings.next().flatten(),
+        |engine, plan| crate::engine::verbs::register_channel(engine, 0, plan),
+    )
+    .unwrap();
+    super::bind_taken(Some(&roles), engine, &binding, Some(holder(1)), taken).unwrap();
+    (
+        engine.bindings.last().unwrap().clone(),
+        held(&device) - before,
+    )
+}
+
+/// A bind that registers its channel takes the instance's rings by what
+/// the engine holds. Counted as the registration's because this bind
+/// registers it, a channel the engine answers `Unsupported` (Metal, a host
+/// channel) left the instance's ring of it with no slots, and every bind
+/// was refused ("a ring of 2 cells of 448 bytes takes 1 channel slot(s)
+/// and the binding names 0").
+#[test]
+fn a_channel_registered_in_the_same_bind_leaves_its_ring_to_the_instance_where_the_engine_does_not_hold_it()
+ {
+    // Held: ring 0 is the registration's, in the slots its ring took, and
+    // the instance takes only its own ring 1 beside its tables.
+    let mut engine = FakeEngine::default();
+    let (bound, bytes) = bind_registering(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(1, 3)]);
+    assert_eq!(
+        engine.registrations[0].slots.len(),
+        2,
+        "the registration's ring"
+    );
+    assert_eq!(bytes, 3 * 4 * KIB + (3 + 2) * KIB, "no ring is taken twice");
+
+    // Not held: the registration takes nothing, and ring 0 takes slots of
+    // the instance's own.
+    let mut engine = FakeEngine {
+        no_channels: true,
+        ..FakeEngine::default()
+    };
+    let (bound, bytes) = bind_registering(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(0, 1), (1, 3)]);
+    assert!(engine.registrations.is_empty());
+    assert_eq!(bytes, 3 * 4 * KIB + (1 + 3) * KIB);
+}
+
 /// An engine whose program lands an adapter of four planes, a slot each,
 /// keyed `key`.
 fn adapting(key: u128) -> FakeEngine {
@@ -909,7 +1142,10 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
     let first = bind(&roles, &mut engine, Vec::new(), 1);
     let second = bind(&roles, &mut engine, Vec::new(), 2);
     let (a, b) = (engine.bindings[0].clone(), engine.bindings[1].clone());
-    assert_eq!(a.adapter_slots, b.adapter_slots, "one adapter, one set of slots");
+    assert_eq!(
+        a.adapter_slots, b.adapter_slots,
+        "one adapter, one set of slots"
+    );
     assert_eq!(
         held(&device) - before,
         2 * INSTANCE_BYTES + ADAPTER_BYTES,
@@ -1024,4 +1260,231 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     }
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
+}
+
+/// TPU's handles e2e (XLA, a 237-page pool): a restored process's
+/// register+bind found no run for a ring that must lie in one ("no chunk
+/// has 1 adjacent free Channel slots") and failed. A registration short
+/// of a run the budget holds waits for room ([`RolesError::BindShort`],
+/// one free chunk its room), with nothing registered and nothing taken;
+/// once a chunk is let go it registers into a run.
+#[test]
+fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine {
+        ring: Some(run_ring(2)),
+        ..FakeEngine::default()
+    };
+    let (shape, list) = {
+        let pool = device.lock().unwrap();
+        (
+            pool.roles().channel.unwrap().pool,
+            pool.list().unwrap().pool,
+        )
+    };
+    // One chunk of the shape with no two free slots side by side, every
+    // other chunk taken by kv.
+    let mut kv = Vec::new();
+    {
+        let mut pool = device.lock().unwrap();
+        let whole = pool.take_refs(shape, u64::from(PER_CHUNK)).unwrap();
+        let freed: Vec<u32> = whole.iter().copied().step_by(2).collect();
+        pool.give_refs(shape, &freed);
+        while let Some(refs) = pool.take_refs(list, 1) {
+            kv.extend(refs);
+        }
+    }
+    let before = held(&device);
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        ..ChannelRegistration::default()
+    };
+    let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .unwrap_err();
+    let short = error.downcast_ref::<RolesError>().expect("named");
+    assert!(
+        matches!(short, RolesError::BindShort(inner) if matches!(**inner, RolesError::NoRun { .. })),
+        "{error}"
+    );
+    assert_eq!(short.room_runs(), Some((1, 1)), "it waits for a chunk");
+    assert!(super::waits_for_room(&error));
+    assert!(engine.registrations.is_empty(), "nothing registered");
+    assert_eq!(held(&device), before, "nothing taken");
+    // A kv chunk let go: the ring registers into a run.
+    let freed: Vec<u32> = kv.drain(..16).collect();
+    device.lock().unwrap().give_refs(list, &freed);
+    register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .expect("it registers once a chunk is free");
+    assert!(adjacent(&engine.registrations[0].slots, PER_CHUNK));
+}
+
+/// What the lane does for a `CloseInstance`: the engine closes it, then
+/// the roles give its slots back.
+fn close_on_lane(roles: &RolesHandle, engine: &mut FakeEngine, id: InstanceId) {
+    engine.close_instance(id).unwrap();
+    roles.lock().unwrap().close_instance(id);
+}
+
+/// What the planner's restore does: unpark `by`, the copies landed, and
+/// the rebinds read off the roles (run on the lane after).
+fn unpark(roles: &RolesHandle, by: u128) -> Vec<Rebind> {
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(by))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    roles.lock().unwrap().stale(holder(by))
+}
+
+#[test]
+fn an_instance_evicted_under_pressure_is_rebound_on_restore_and_writes_again() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0, "parked on the host");
+    assert!(roles.lock().unwrap().writes_held(instance));
+
+    let stale = unpark(&roles, 1);
+    assert_eq!(stale.len(), 1);
+    for item in stale {
+        rebind(Some(&roles), &mut engine, item, |_, _, _| Ok(())).unwrap();
+    }
+    let now = roles.lock().unwrap().slots(Owner::Instance(instance));
+    assert!(
+        matches!(&engine.rebinds[..], [Rebind::Instance { id, instance: tables, .. }]
+            if *id == instance && tables[..] == now[..3]),
+        "rebound at its new slots: {:?}",
+        engine.rebinds
+    );
+    assert!(
+        !roles.lock().unwrap().writes_held(instance),
+        "it writes again"
+    );
+    let mut wrote = false;
+    pump(Some(&roles), instance, Pump::In, || {
+        wrote = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(wrote);
+
+    close_on_lane(&roles, &mut engine, instance);
+    assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), before);
+}
+
+#[test]
+fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    // Another of its instances, still open, is rebound as ever.
+    let kept = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+
+    let stale = unpark(&roles, 1);
+    assert_eq!(stale.len(), 2);
+    // The lane runs a close queued meanwhile ahead of the restore's
+    // rebinds: the engine holds the instance no longer.
+    close_on_lane(&roles, &mut engine, instance);
+    for item in stale {
+        rebind(Some(&roles), &mut engine, item, |_, _, _| Ok(())).unwrap();
+    }
+    assert!(
+        matches!(&engine.rebinds[..], [Rebind::Instance { id, .. }] if *id == kept),
+        "only the open one is rebound: {:?}",
+        engine.rebinds
+    );
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Instance(instance))
+            .is_empty()
+    );
+    // Asked anyway, the engine refuses it by name.
+    let error = engine
+        .rebind_slots(Rebind::Instance {
+            id: instance,
+            instance: Vec::new(),
+            rings: Vec::new(),
+            adapter: Vec::new(),
+            scratch: ::engine::ScratchPlace::None,
+            pair: ::engine::ScratchPlace::None,
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("no instance {instance}"))
+    );
+
+    close_on_lane(&roles, &mut engine, kept);
+    assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), before);
+}
+
+#[test]
+fn an_instance_closed_while_evicted_or_coming_back_is_never_rebound() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+
+    // Closed while parked: its host slots go back, and the restore has
+    // nothing of it to rebind.
+    let parked = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    close_on_lane(&roles, &mut engine, parked);
+    assert_eq!(held(&host), 0);
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .unwrap()
+            .is_none()
+    );
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+
+    // Closed while its copy back is in flight: once it lands, its slots go
+    // back and it is not among the rebinds.
+    let moving = bind(&roles, &mut engine, Vec::new(), 2);
+    let park = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    roles.lock().unwrap().commit(park);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .unwrap();
+    close_on_lane(&roles, &mut engine, moving);
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().stale(holder(2)).is_empty());
+    assert!(engine.rebinds.is_empty());
+    assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), before);
 }

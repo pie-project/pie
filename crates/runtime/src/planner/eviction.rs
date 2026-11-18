@@ -215,14 +215,41 @@ impl ResidencyPlanner {
             }
         }
         let (model, engine) = self.port.locus();
-        let (picks, unhostable) = self.quote_and_pick(
-            victims.preferred(),
-            victims.deficit,
-            room,
-            victims.rs_pages,
-            model,
-            engine,
-        );
+        // A bind short of whole chunks (a run of slots in a chunk, or runs
+        // of adjacent chunks): pages moved anywhere free none of them, so
+        // the occupants of the cheapest chunks it could take, each free or
+        // emptied whole by evicting them, are the picks, every one of them.
+        let shape = self.with_inner(|inner| match inner.queue.get(&victims.head).map(|w| &w.kind) {
+            Some(WaitKind::BindRoom { run, pieces, .. }) => Some((*run, *pieces)),
+            _ => None,
+        });
+        let candidates = victims.preferred();
+        let map = shape.map(|_| {
+            let pids: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
+            self.port.chunk_occupants(&pids)
+        });
+        let (candidates, wanted, occupants) =
+            chunk_picks(candidates, victims.deficit, shape, map.as_ref());
+        let (mut picks, unhostable) =
+            self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
+        // An occupant with no kv or state to move (only guest scratch,
+        // given back at its park) quotes nothing and is no pick by pages:
+        // it is one all the same, or its chunk does not empty.
+        for pid in occupants {
+            if !picks.iter().any(|&(picked, _)| picked == pid) && !unhostable.contains(&pid) {
+                picks.push((pid, Reclaim::default()));
+            }
+        }
+        if let Some((run, pieces)) = shape {
+            tracing::debug!(
+                run,
+                pieces,
+                picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+                chunks = ?map.as_ref().map(|map| (map.held.len(), map.free.len())),
+                "planner: a bind short of whole chunks: the occupants of the cheapest it could \
+                 take, or none qualified (every chunk holds a slot no candidate moves)"
+            );
+        }
         if !unhostable.is_empty() {
             self.with_inner(|inner| {
                 for pid in &unhostable {
@@ -253,6 +280,11 @@ impl ResidencyPlanner {
         if self.commit_evictions(victims.head, picks, false) {
             // Moves on their way fund it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
+        } else {
+            // Every pick declined at its start: the head is short as with
+            // none, and says so, rather than waiting on moves never begun.
+            tracing::debug!(head = ?victims.head_pid, "planner: no pick could start its move");
+            self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
         }
     }
 
@@ -272,8 +304,14 @@ impl ResidencyPlanner {
             // In-flight moves past what the head's own kv takes free chunks
             // for its state too.
             let spare = expected.pages.saturating_sub(missing);
+            // A bind short of room is short the pages that, moved out
+            // whole, free its chunks: free pages are no runs of chunks. So
+            // is the restore of a process such a bind suspended.
+            let room = inner.room_pages(waiter).saturating_sub(expected.pages);
             let deficit = Reclaim {
-                pages: missing.saturating_sub(expected.pages.saturating_add(free)),
+                pages: missing
+                    .saturating_sub(expected.pages.saturating_add(free))
+                    .saturating_add(room),
                 rs: waiter
                     .rs_need()
                     .add(inner.seating_reserve(waiter.pid, rs_growth, waiter.rs_need(), rs_total))
@@ -299,10 +337,16 @@ impl ResidencyPlanner {
                     proc.admitted
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
+                        // Waiting at a bind for room, it makes no progress
+                        // until room comes: it yields as an idle one does,
+                        // to a prompt not yet seated too.
                         && if seating {
-                            proc.idle || proc.held
+                            proc.idle || proc.held || proc.bind_waiting
                         } else {
-                            proc.rank() > head_rank || proc.idle || proc.held
+                            proc.rank() > head_rank
+                                || proc.idle
+                                || proc.held
+                                || proc.bind_waiting
                         }
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
@@ -313,7 +357,10 @@ impl ResidencyPlanner {
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
                     rank: proc.rank(),
-                    e6_fresh: proc.progressed || proc.idle || proc.held,
+                    // A bind waiter makes no progress until room comes: it
+                    // counts as fresh, as an idle one does, or it is never
+                    // a pick and the bind waits on it for good.
+                    e6_fresh: proc.progressed || proc.idle || proc.held || proc.bind_waiting,
                 })
                 .collect();
             Some((
@@ -321,7 +368,10 @@ impl ResidencyPlanner {
                     head,
                     head_pid: waiter.pid,
                     deficit,
-                    rs_pages: 0,
+                    // The bind's runs are state the head lacks, not kv to
+                    // wait on the supply for: moved now, as nothing else
+                    // frees their chunks.
+                    rs_pages: room,
                     rs_short: RsUnits::default(),
                     restore: matches!(waiter.kind, WaitKind::Restore { .. }),
                     members,
@@ -335,7 +385,9 @@ impl ResidencyPlanner {
         let as_pages = self.port.rs_as_pages(victims.deficit.rs);
         if as_pages > 0 {
             victims.rs_short = victims.deficit.rs;
-            victims.rs_pages = as_pages.saturating_sub(spare);
+            victims.rs_pages = victims
+                .rs_pages
+                .saturating_add(as_pages.saturating_sub(spare));
             victims.deficit.pages = victims.deficit.pages.saturating_add(victims.rs_pages);
             victims.deficit.rs = RsUnits::default();
             if victims.deficit == Reclaim::default() {
@@ -361,9 +413,14 @@ impl ResidencyPlanner {
                 let Some(proc) = inner.procs.get(&pid) else {
                     continue;
                 };
+                // Waiting at a bind for room it makes no progress: it
+                // yields as an idle one does, as the victim set chose it
+                // (dropped here, it was chosen again on every quote and
+                // nothing moved: AMD's wedge).
+                let yields = proc.idle || proc.held || proc.bind_waiting;
                 if proc.state != Residency::Resident
-                    || (proc.rank() <= head_rank && !proc.idle && !proc.held)
-                    || (!proc.progressed && !proc.idle && !proc.held && !e6_relaxed)
+                    || (proc.rank() <= head_rank && !yields)
+                    || (!proc.progressed && !yields && !e6_relaxed)
                 {
                     continue;
                 }
@@ -401,7 +458,7 @@ impl ResidencyPlanner {
                 .unmet_head()
                 .and_then(|(key, waiter)| match waiter.kind {
                     WaitKind::Allocation { .. } => Some((key, waiter.pid)),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 })
         }) else {
             return false;
@@ -477,8 +534,13 @@ impl ResidencyPlanner {
                     let Some((head, waiter)) = inner.unmet_head() else {
                         return (None, Vec::new());
                     };
+                    // Its kv, and the pages that free the runs a bind short
+                    // of room asks, as the victim set counts them.
                     let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    let deficit = missing.saturating_sub(inner.expected_reclaim().pages);
+                    let expected = inner.expected_reclaim().pages;
+                    let deficit = missing
+                        .saturating_sub(expected)
+                        .saturating_add(inner.room_pages(waiter).saturating_sub(expected));
                     if deficit == 0 {
                         return (None, Vec::new());
                     }
@@ -581,6 +643,7 @@ impl ResidencyPlanner {
                 outcome,
                 notify,
                 yielded,
+                ..
             } = &mut waiter.kind
             else {
                 return ServeOutcome::Stale(rs);
@@ -604,5 +667,118 @@ impl ResidencyPlanner {
                 false
             }
         }
+    }
+}
+
+/// The candidates a plan quotes, and what it covers: for a bind short of
+/// whole chunks (`shape`, its run and pieces), the occupants of the
+/// cheapest chunks it could take ([`super::pool::ChunkMap::cheapest_runs`]),
+/// every one of them (the deficit past what they free, so none is left
+/// out); else `candidates` against `deficit`, as pages counted anywhere.
+fn chunk_picks(
+    candidates: Vec<(ProcessId, super::rank::Rank)>,
+    deficit: Reclaim,
+    shape: Option<(u32, u32)>,
+    map: Option<&super::pool::ChunkMap>,
+) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim, Vec<ProcessId>) {
+    let occupants = shape
+        .zip(map)
+        .and_then(|((run, pieces), map)| map.cheapest_runs(run, pieces))
+        .filter(|occupants| !occupants.is_empty());
+    match occupants {
+        Some(occupants) => (
+            candidates
+                .into_iter()
+                .filter(|(pid, _)| occupants.contains(pid))
+                .collect(),
+            Reclaim {
+                pages: u32::MAX,
+                rs: deficit.rs,
+            },
+            occupants,
+        ),
+        None => (candidates, deficit, Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod chunk_picks_tests {
+    use super::super::pool::{ChunkHeld, ChunkMap};
+    use super::*;
+
+    fn pid(n: u128) -> ProcessId {
+        ProcessId::from_u128(n)
+    }
+
+    fn held(chunk: u32, used: u32, by: &[(u128, u32)]) -> ChunkHeld {
+        ChunkHeld {
+            chunk,
+            used,
+            by: by.iter().map(|&(p, pages)| (pid(p), pages)).collect(),
+        }
+    }
+
+    /// Chunk 1 is held by A alone (5 pages), chunk 2 by B and a cache
+    /// entry (B's 2 of 4: not emptiable), chunk 3 by C (3 pages): a bind
+    /// short of one chunk evicts C, the cheapest chunk that empties.
+    #[test]
+    fn a_bind_short_of_a_chunk_evicts_the_occupants_of_the_cheapest_emptiable_one() {
+        let map = ChunkMap {
+            held: vec![held(1, 5, &[(1, 5)]), held(2, 4, &[(2, 2)]), held(3, 3, &[(3, 3)])],
+            free: vec![],
+        };
+        assert_eq!(map.cheapest_runs(1, 1), Some(vec![pid(3)]));
+        // Two chunks: C's and A's, B's never.
+        let mut two = map.cheapest_runs(1, 2).unwrap();
+        two.sort_unstable();
+        assert_eq!(two, vec![pid(1), pid(3)]);
+        assert_eq!(map.cheapest_runs(1, 3), None, "B's chunk does not empty");
+    }
+
+    /// A run of two adjacent chunks: a free chunk beside an emptiable one
+    /// costs only that one's pages; chunks apart are no run.
+    #[test]
+    fn a_run_of_chunks_lies_in_adjacent_chunks_free_or_emptied() {
+        let map = ChunkMap {
+            held: vec![held(4, 6, &[(1, 6)]), held(7, 2, &[(2, 1), (3, 1)])],
+            free: vec![5, 8],
+        };
+        let mut pids = map.cheapest_runs(2, 1).unwrap();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![pid(2), pid(3)], "7 and 8: two pages to move");
+        assert_eq!(map.cheapest_runs(2, 2), Some(vec![pid(1), pid(2), pid(3)]).map(|mut v| {
+            v.sort_unstable();
+            v
+        }));
+        assert_eq!(map.cheapest_runs(3, 1), None, "no three adjacent");
+    }
+
+    /// The plan's candidates for a bind short of a chunk: the chosen
+    /// chunk's occupants only, every one quoted (the deficit past them);
+    /// for any other head, or where no chunk empties, the candidates as
+    /// they were.
+    #[test]
+    fn a_bind_room_head_quotes_exactly_one_chunk_s_occupants() {
+        let rank = |seq: u64| super::super::rank::Rank::of(0, seq);
+        let candidates = vec![(pid(1), rank(1)), (pid(2), rank(2)), (pid(3), rank(3))];
+        let deficit = Reclaim {
+            pages: 7,
+            rs: Default::default(),
+        };
+        let map = ChunkMap {
+            held: vec![held(1, 5, &[(1, 5)]), held(3, 3, &[(3, 3)])],
+            free: vec![],
+        };
+        let (picked, wanted, occupants) =
+            chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
+        assert_eq!(occupants, vec![pid(3)]);
+        assert_eq!(picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(), vec![pid(3)]);
+        assert_eq!(wanted.pages, u32::MAX, "every occupant is picked");
+        let (kept, same, _) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
+        assert_eq!(kept.len(), 3);
+        assert_eq!(same, deficit);
+        let none = ChunkMap::default();
+        let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
+        assert_eq!((kept.len(), same), (3, deficit), "no chunk empties: as before");
     }
 }

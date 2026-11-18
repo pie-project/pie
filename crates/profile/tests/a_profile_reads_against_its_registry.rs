@@ -951,6 +951,8 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             hbm_gbps: Some(400.0),
             elementwise_gbps: None,
             launch_ns: None,
+            few_row_tflops: None,
+            workgroups_per_core: None,
         }
     );
 
@@ -1014,18 +1016,26 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`elementwise_gbps` and `scan_gelems`, not `flops`",
+            "`few_row_tflops` and `workgroups_per_core`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`scan_gelems`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`workgroups_per_core`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",
             "not `attn_flops_per_ns_by_keys_and_dim`",
         ),
         ("[rates]\nbytes_per_ns = 1.0\n", "not `bytes_per_ns`"),
+        (
+            "[rates]\nfew_row_tflops = 0\n",
+            "`rates.few_row_tflops` is a positive number",
+        ),
+        (
+            "[rates]\nworkgroups_per_core = -3.3\n",
+            "`rates.workgroups_per_core` is a positive number",
+        ),
         (
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",
@@ -1081,4 +1091,73 @@ fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
         "{}",
         report.what_was_measured()
     );
+}
+
+/// A user's file a load rewrites keeps every key this pie reads (a person's
+/// own decisions) and drops, by name, each it no longer reads: a removed
+/// decision in a table, one written dotted, a `[rates]` key of an old
+/// schema, a `provenance.measured` item naming a removed decision.
+#[test]
+fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        prefill.chunk = 2048\n\
+        graphs = \"on\"\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        \n\
+        [rates]\n\
+        bytes_per_ns = 650.0\n\
+        hbm_gbps = 700.0\n\
+        \n\
+        [provenance]\n\
+        measured = [\"engine.prefill.chunk\", \"engine.recording\"]\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(
+        dropped,
+        [
+            "engine.graphs",
+            "kernel.moe",
+            "rates.bytes_per_ns",
+            "provenance.measured: engine.recording"
+        ],
+        "{kept}"
+    );
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 1, "the person's chunk kept");
+    assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
+    assert_eq!(file.measured, ["engine.prefill.chunk"]);
+    // What reads is untouched: pruning it again drops nothing.
+    assert_eq!(r.prune(&kept), (kept.clone(), Vec::new()));
+}
+
+/// A stale inline table is an entry of its table: the keys after it in the
+/// same table are kept, and a stale `[table]` is still removed whole.
+#[test]
+fn a_stale_inline_table_takes_only_itself() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        recording = { use = \"bodies\", mem_mb = 4096 }\n\
+        prefill.chunk = 2048\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        grouped = true\n\
+        \n\
+        [compiler]\n\
+        launch_us = 3.0\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(dropped, ["engine.recording", "kernel.moe"], "{kept}");
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 2, "the chunk and the launch kept: {kept}");
+    assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
+    assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
+    assert!(!kept.contains("group_at") && !kept.contains("grouped"), "{kept}");
 }

@@ -37,25 +37,23 @@ pub fn at_load(
 ) -> Result<crate::tuning::Tuning> {
     let chip = tuning.profile().clone();
     let measured = device.chip();
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
         provenance: provenance(&measured.name),
-        check: &check,
+        registry: crate::chip::registry(),
     });
-    let chip =
-        engine::rates::rates_at_load(chip, save, Some(device.left()), max_submit, |max_submit| {
-            measure(device, &tuning, max_submit).map_err(|e| e.to_string())
-        })
-        .map_err(|why| engine_gpu::error::Fault::Device {
-            call: "rates at load",
-            why,
-        })?;
+    let chip = engine::rates::rates_at_load(
+        chip,
+        &engine_gpu::rates::KEYS,
+        save,
+        Some(device.left()),
+        max_submit,
+        |max_submit| measure(device, &tuning, max_submit).map_err(|e| e.to_string()),
+    )
+    .map_err(|why| engine_gpu::error::Fault::Device {
+        call: "rates at load",
+        why,
+    })?;
     Ok(crate::tuning::Tuning::new(chip, device.cores())
         .with_workgroup_bytes(device.workgroup_bytes()))
 }

@@ -38,7 +38,7 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64) -> Facts {
 
 /// 64 chunks of 16 MiB in segments of 8, the lowest two committed; the
 /// largest rung's 12 chunks put segments 6 and 7 under activation.
-fn facts() -> ChunkFacts {
+pub(super) fn facts() -> ChunkFacts {
     let facts = ChunkFacts {
         chunk_bytes: CHUNK,
         total_chunks: TOTAL,
@@ -779,7 +779,8 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     engine
         .evacuate(&SharedPool::rung_moves(&evacuation))
         .unwrap();
-    pool.apply_rung(&evacuation, 10).unwrap();
+    pool.raise_applied(&evacuation).unwrap();
+    pool.raise_copied(10);
     assert_eq!(pool.rung(), 2048);
     assert_eq!(
         (pool.state_chunks_now(), pool.records_capacity()),
@@ -887,9 +888,10 @@ fn classed() -> SharedPool {
 }
 
 /// An idle pool lowered to the smallest rung stays there, the walk never
-/// lowering again within the class it is in.
+/// lowering again within the class it is in; a move up within it is told
+/// the engine, moving nothing.
 #[test]
-fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+fn rungs_sharing_their_chunks_are_one_class_the_walk_never_lowers_within() {
     let mut pool = classed();
     let mut engine = FakeEngine::new();
     assert_eq!(
@@ -914,7 +916,23 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
             "a lower within the class the pool is in"
         );
     }
-    // A goal inside the class only caps fires; none raises the rung.
+    // A goal inside the class sets aside nothing more: past the rung the
+    // engine was told it is a raise that moves nothing (the engine hears
+    // the wider rung before any fire takes it), then the cap lifts.
+    let RungStep::Raise { rung, evacuation } = walk.step(&pool, 16, 1, 1, 40, 40).unwrap() else {
+        panic!("past the rung told: a raise");
+    };
+    assert_eq!(rung, 16);
+    assert!(
+        evacuation.moves.is_empty(),
+        "nothing moves within the class"
+    );
+    assert_eq!(
+        pool.raise_applied(&evacuation).unwrap(),
+        None,
+        "no lane trip"
+    );
+    assert_eq!(pool.told(), 16);
     assert_eq!(
         walk.step(&pool, 16, 1, 1, 40, 40).unwrap(),
         RungStep::Cap(16)
@@ -1009,6 +1027,64 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
     let mut pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_reserved(), 1, "lowered: the span lent");
     assert!(pool.take_records(1).is_some(), "the taker is seated");
+}
+
+/// The stack wedge (MI300X, 500 at once): the rung rose to the largest
+/// while nothing waited, and took the committable room; guest binds then
+/// waited behind it, and the walk held the throughput rung (and asked to
+/// rise again) while they did. A throughput rung is ordered after every
+/// process demand: while one waits the walk comes down at once to what the
+/// live lanes need, its give-back tells the room signal, a throughput raise
+/// asked meanwhile takes nothing, and the rung rises again only once no
+/// demand waits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_throughput_rung_gives_room_back_to_waiting_binds_and_rises_once_none_waits() {
+    const ENGINE: usize = 9306;
+    let mut pool = classed();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    // A cuttable pass asks the largest rung, fundable: nothing waits.
+    let want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+
+    // A guest bind arrives short of room: the walk gives the span back at
+    // once, past the pass's ask and with no patience.
+    let room = shared.lock().unwrap().pool().room_watch();
+    shared.lock().unwrap().set_guest_head(Some((1, 4)));
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "cut to the live lane's rung");
+    grant_rung(ENGINE, 1);
+    // Behind the retire fence, as every lower.
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        1,
+        "lowered: the span given back"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), room.given())
+        .await
+        .expect("the give-back tells the room signal");
+
+    // While the bind waits, a throughput raise takes nothing.
+    raise_now(&shared, ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
+    assert_eq!(fire_cap(ENGINE), 1);
+
+    // The bind lands: the rung rises again for the pass.
+    shared.lock().unwrap().set_guest_head(None);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    drop(want);
 }
 
 /// A fire term appearing that the rung in hand cannot seat beside cuts
@@ -1350,8 +1426,16 @@ fn a_lane_s_list_kind_is_stated_beside_its_table() {
         panic!("three lanes");
     };
     assert_eq!(placed.list, ::engine::ListKind::Translation);
-    assert_eq!(list(placed), Some(vec![7, 8]), "the translation, not the pages");
-    assert_eq!(unattached.list, ::engine::ListKind::Pages, "beside it, pages");
+    assert_eq!(
+        list(placed),
+        Some(vec![7, 8]),
+        "the translation, not the pages"
+    );
+    assert_eq!(
+        unattached.list,
+        ::engine::ListKind::Pages,
+        "beside it, pages"
+    );
     assert_eq!(list(unattached), Some(vec![9]));
     assert_eq!((bare.list, list(bare)), (::engine::ListKind::Pages, None));
 }
@@ -1388,7 +1472,11 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
         "{:?}",
         lanes[0].record
     );
-    assert_eq!(lanes[1].record, ::engine::LaneRecord::Null, "stated: no state");
+    assert_eq!(
+        lanes[1].record,
+        ::engine::LaneRecord::Null,
+        "stated: no state"
+    );
     settle(&mut rs, out.txn);
 
     // The negative control: a pool that lays no record states none.

@@ -53,10 +53,17 @@ impl SharedGrow {
     /// Steers `shared`, engine `engine`'s, from the segments mapped at load.
     #[must_use]
     pub fn new(model: usize, engine: usize, shared: Shared) -> Self {
-        let (mapped, start_cap) = {
-            let pool = shared.lock().unwrap();
-            (pool.mapped_segments(), pool.start_cap())
+        let (mapped, start_cap, target) = {
+            let mut pool = shared.lock().unwrap();
+            pool.steers(engine);
+            let mapped = pool.mapped_segments();
+            // The pool reads the same target: a bind short of room waits on
+            // a commit only where the walk would make one.
+            let target = Arc::new(AtomicU32::new(mapped));
+            pool.walked_to(Arc::clone(&target));
+            (mapped, pool.start_cap(), target)
         };
+        let _ = mapped;
         // Fires start cut to the rung the pool starts at: on a span backed
         // on demand, the smallest, until a raise reaches the engine.
         super::set_fire_cap(engine, start_cap);
@@ -64,7 +71,7 @@ impl SharedGrow {
             model,
             engine,
             shared,
-            target: Arc::new(AtomicU32::new(mapped)),
+            target,
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
@@ -140,8 +147,19 @@ impl SharedGrow {
         super::wanted_rows(self.engine).max((self.live_lanes)())
     }
 
+    /// The rows the walk holds the rung to while a process's demand waits
+    /// for room: the live lanes' decode alone, the narrowest rung the
+    /// admitted work needs; a throughput ask (a cuttable pass's) waits
+    /// behind every process demand.
+    fn waiting_rows(&self) -> u32 {
+        (self.live_lanes)().max(1)
+    }
+
     pub(crate) async fn walk_rung(&self) {
         loop {
+            // Read before the pool's lock: the planner reads the pool under
+            // its own.
+            let planner_waits = super::planner_demand_waits(self.model, self.engine);
             let (current, retired) = self.epochs();
             // What a raise taken below owes the engine, and whether the
             // rung stood under it ([`SharedPool::raise_applied`]).
@@ -154,7 +172,17 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = pool.rung_for(self.walk_rows());
+                // While a process's demand waits for room the rung walks
+                // down to what the admitted work needs, at once, and takes
+                // no room for throughput: each chunk it gives back tells the
+                // pool's room signal, and the planner quotes its head again.
+                let waits = pool.demand_waits(planner_waits);
+                let rows = if waits {
+                    self.waiting_rows()
+                } else {
+                    self.walk_rows()
+                };
+                let goal = pool.rung_for(rows);
                 let cap = super::fire_cap(self.engine);
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
@@ -170,7 +198,7 @@ impl SharedGrow {
                 let tick = self.ticks.load(Ordering::Acquire);
                 // An engine holding a rung the terms no longer fit is
                 // brought down at once too: a bind waits on it.
-                let forced = cap > pool.fit_cap() || pool.told_unfit();
+                let forced = cap > pool.fit_cap() || pool.told_unfit() || (waits && past);
                 let waited = forced || {
                     let mut since = self.idle_since.lock().unwrap();
                     if past {
@@ -195,8 +223,25 @@ impl SharedGrow {
                 let blocked = self.raise_blocked.load(Ordering::Acquire);
                 let step = match step {
                     // A raise refused for room is not tried again until
-                    // room is freed.
-                    Ok(RungStep::Raise { .. }) | Err(_) if blocked => Ok(RungStep::Wait),
+                    // room is freed. One that takes no more room (a rung of
+                    // the class set aside, told the engine) is taken.
+                    Ok(RungStep::Raise { ref evacuation, .. })
+                        if blocked
+                            && pool.pool().act_chunks(evacuation.rung)
+                                > pool.pool().act_reserved() =>
+                    {
+                        Ok(RungStep::Wait)
+                    }
+                    Err(_) if blocked => Ok(RungStep::Wait),
+                    // No throughput raise past what is set aside while a
+                    // process's demand waits.
+                    Ok(RungStep::Raise { ref evacuation, .. })
+                        if waits
+                            && pool.pool().act_chunks(evacuation.rung)
+                                > pool.pool().act_reserved() =>
+                    {
+                        Ok(RungStep::Wait)
+                    }
                     Ok(RungStep::Raise { rung, evacuation }) => {
                         let stood = pool.stands_at(rung);
                         pool.raise_applied(&evacuation).map(|notice| {
@@ -249,7 +294,12 @@ impl SharedGrow {
                         // rung those rows take.
                         let pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        let asked = pool.rung_for(self.walk_rows());
+                        let rows = if pool.demand_waits(planner_waits) {
+                            self.waiting_rows()
+                        } else {
+                            self.walk_rows()
+                        };
+                        let asked = pool.rung_for(rows);
                         if tokens < now && pool.lifted(asked).min(pool.fit_cap()) > tokens {
                             continue;
                         }
@@ -546,6 +596,9 @@ impl SharedGrow {
                     }
                     if let Some(prefix) = commit {
                         self.shared.lock().unwrap().committed(prefix);
+                        // A guest bind short of a run waits on this
+                        // (`roles::grow_for_guest`).
+                        super::rung_changed(self.engine);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
                         {
                             planner.pages_freed();
@@ -579,7 +632,7 @@ impl SharedGrow {
 /// A test hook: while the file `PIE_SHARED_SEGMENTS_FILE` names holds a
 /// number, that many mapped segments stand in for the governor's target, so
 /// a test can force a grow or a shrink (and its evacuation) mid-run.
-fn pinned_segments() -> Option<u32> {
+pub(crate) fn pinned_segments() -> Option<u32> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     let path = PATH
         .get_or_init(|| std::env::var_os("PIE_SHARED_SEGMENTS_FILE").map(Into::into))
@@ -806,6 +859,45 @@ mod tests {
         grow.room_freed();
         grow.walk_rung().await;
         assert_eq!(shared.lock().unwrap().rung(), 2048, "room freed: raised");
+    }
+
+    /// A rung lowered to the smallest with only wider work queued is not
+    /// left there: the work's ask raises it (a rung of the class set
+    /// aside at once, even while a raise waits for room), and the cap
+    /// lifts to the width the work takes, so it is never held for a raise
+    /// nobody asks for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lowered_rung_with_only_wider_work_queued_is_raised_for_it() {
+        const ENGINE: usize = 9211;
+        let mut facts = super::super::tests::facts();
+        facts.act_chunks = vec![(16, 1), (256, 4), (512, 4), (2048, 12)];
+        let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
+        pool.lower_rung(16).unwrap();
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+        assert_eq!(super::super::fire_cap(ENGINE), 16);
+        // Queued: a fire of 200 rows, wider than the rung held.
+        let want = super::super::want_rows(ENGINE, 200);
+        grow.ticked();
+        grow.walk_rung().await;
+        assert!(
+            super::super::fire_cap(ENGINE) >= 200,
+            "raised for the queued work"
+        );
+        assert_eq!(super::super::engine_rows(ENGINE), 256);
+        drop(want);
+        // Lowered under the class again, the told rung 256 with 512's
+        // span set aside; a raise last refused for room.
+        shared.lock().unwrap().lower_rung(256).unwrap();
+        let _want = super::super::want_rows(ENGINE, 300);
+        grow.block_raise_for_test();
+        grow.walk_rung().await;
+        assert_eq!(
+            super::super::fire_cap(ENGINE),
+            512,
+            "the class's rung needs no room"
+        );
+        assert_eq!(super::super::engine_rows(ENGINE), 512);
     }
 
     /// The walk runs on its wakes only: an ask made while it sleeps waits

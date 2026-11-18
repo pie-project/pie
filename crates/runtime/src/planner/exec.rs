@@ -534,7 +534,15 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         };
         (rs, short)
     };
-    if kv.is_none() && rs.is_none() {
+    // The process's instance tables and rings park with its state where the
+    // host has room; what it lacks stays on the device, never dropped. Its
+    // guest scratch, dead between fires, is given back whatever lies below:
+    // a process with nothing else to move still frees its Instance chunks.
+    let roles = stores
+        .roles
+        .as_ref()
+        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
+    if kv.is_none() && rs.is_none() && roles.is_none() {
         if !rs_short.is_zero() {
             // The host lacks rows for its state: nothing moves and nothing
             // is dropped; the head stays parked and the host is short.
@@ -547,12 +555,6 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_found_nothing(pid);
         return;
     }
-    // The process's instance tables and rings park with its state where the
-    // host has room; what it lacks stays on the device, never dropped.
-    let roles = stores
-        .roles
-        .as_ref()
-        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
@@ -617,7 +619,8 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
 /// Tells the engine where `pid`'s unparked instance tables and rings lie
 /// now, on its lane ahead of any fire of theirs: each item's slots
 /// (`Engine::rebind_slots`). An item it refuses stays stale, to be told
-/// again on the next restore.
+/// again on the next restore; one the lane closed since they were read is
+/// not rebound ([`crate::store::roles::rebind`]).
 async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<(), String> {
     let stale = roles.lock().unwrap().stale(pid);
     // The lane marks each rebound and replays the host writes held for it.
@@ -756,10 +759,39 @@ async fn restore(
                     roles: None,
                 },
             );
+            // Room the budget holds but nothing has freed yet: the restore
+            // waits, queued, as an admission does.
+            if matches!(error, crate::store::roles::RolesError::UnparkShort(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
+                planner.requeue_restore_roles(pid);
+                return;
+            }
+            // Its pair is on its way back with another process's restore:
+            // it goes again once that lands, its instances rebound to it.
+            if matches!(error, crate::store::roles::RolesError::PairParked(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for its pair's move");
+                planner.requeue_restore(pid);
+                return;
+            }
             planner.restore_faulted(pid, &format!("roles unpark: {error}"));
             return;
         }
     };
+    // Suspended by a bind short of guest-state room, it comes back only
+    // with room for that bind past what its own items took: else it would
+    // bind short again at once. It waits, queued, as a restore short of
+    // room for its roles.
+    if let Some(need) = planner.pending_bind(pid)
+        && stores
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.lock().unwrap().free_runs(need.run) < need.pieces)
+    {
+        abort(model, engine, Move::Restore { kv, rs, roles });
+        tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
+        planner.requeue_restore_roles(pid);
+        return;
+    }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         planner.restore_faulted(

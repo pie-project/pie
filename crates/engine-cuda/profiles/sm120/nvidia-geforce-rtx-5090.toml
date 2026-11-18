@@ -31,8 +31,6 @@ moe.bf16_gemm_stages = 2
 # the sm_120 switches the RTX PRO 6000 runs (same chip family): bf16 and NVFP4 MoE on the grouped mma.sync
 # kernels, the single-row block-FP8 GEMV, the tensor-core attention, hyper-connection and KDA kernels, the
 # grouped-prefill decode rows, W4A8 MXFP4 selects and block-FP8 dense on cuBLASLt MXFP8
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
 gemm.fp8_gemv_until = 1

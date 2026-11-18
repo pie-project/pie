@@ -18,9 +18,26 @@ pub(super) enum WaitKind {
         notify: Arc<Notify>,
         outcome: Option<Result<AllocationGrant, PlannerError>>,
         yielded: bool,
+        /// An activation rise's room ([`super::ResidencyPlanner::acquire_rise`]):
+        /// its pages are given back at once, so it holds nothing past its
+        /// grant, and the requester's own pages it moves are no ask of its.
+        rise: bool,
     },
     Restore {
         demand: Demand,
+    },
+    /// A bind short of device room for its guest state, `pieces` runs of
+    /// `run` adjacent chunks (`store::roles::RolesError::BindShort`):
+    /// funded as a restore short of room for its roles is, idle cache
+    /// first, then a resident parked by the planner's victim choice;
+    /// `served` once the pool holds the runs free, the bind to take them.
+    /// `pages`: the kv pages that, moved out whole, free its chunks.
+    BindRoom {
+        run: u32,
+        pieces: u32,
+        pages: u32,
+        notify: Arc<Notify>,
+        served: bool,
     },
 }
 
@@ -36,18 +53,30 @@ impl Waiter {
                 outcome, yielded, ..
             } => outcome.is_none() && !yielded,
             WaitKind::Restore { .. } => true,
+            WaitKind::BindRoom { served, .. } => !served,
+        }
+    }
+
+    /// The pages its own room stands for, beside its kv (a bind's runs of
+    /// chunks, [`WaitKind::BindRoom`]).
+    pub(super) fn room_pages(&self) -> u32 {
+        match &self.kind {
+            WaitKind::BindRoom { pages, .. } => *pages,
+            _ => 0,
         }
     }
 
     pub(super) fn kv_need(&self) -> u32 {
         match &self.kind {
             WaitKind::Allocation { demand, .. } | WaitKind::Restore { demand } => demand.kv_pages,
+            WaitKind::BindRoom { .. } => 0,
         }
     }
 
     pub(super) fn rs_need(&self) -> RsUnits {
         match &self.kind {
             WaitKind::Allocation { demand, .. } | WaitKind::Restore { demand } => demand.rs,
+            WaitKind::BindRoom { .. } => RsUnits::default(),
         }
     }
 
@@ -55,6 +84,7 @@ impl Waiter {
         match self.kind {
             WaitKind::Allocation { .. } => "allocation",
             WaitKind::Restore { .. } => "restore",
+            WaitKind::BindRoom { .. } => "bind room",
         }
     }
 }

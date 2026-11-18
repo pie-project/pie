@@ -18,6 +18,7 @@ use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{library_region_valid, outputs_bindable, used_channel_slots};
 use crate::codegen::alias::AliasTable;
 use crate::codegen::fault::M3_THREADS_EXCEEDED;
+use crate::codegen::lane_scratch::LANE_SCRATCH;
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
@@ -47,32 +48,55 @@ pub const fn step_value(step: u32) -> u32 {
 pub const STEP_NODES: u32 = 0xF1;
 /// The low byte of a step table word naming one node of the step before it.
 pub const STEP_NODE: u32 = 0xF0;
+/// The low byte of a step table word `(node << 8) | STEP_VIEW`, after every
+/// step's nodes: a node no step computes, a view of its source's bytes that
+/// every reader resolves through, so its result takes no bytes of its own.
+pub const STEP_VIEW: u32 = 0xF2;
+
+/// What a streamed kernel publishes beside its dispatch words: the nodes
+/// each step computes, in step order, and the nodes it computes in none
+/// because they are views of their sources ([`STEP_VIEW`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepNodes {
+    pub steps: Vec<Vec<u32>>,
+    pub views: Vec<u32>,
+}
 
 /// A streamed region's step table split into its dispatch words and, where
-/// the emitter published them, the nodes each step computes (`None` for a
-/// table with no node lists, or one that names a step out of order).
+/// the emitter published them, the nodes each step computes and the views
+/// none does (`None` for a table with no node lists, or one that names a
+/// step out of order).
 #[must_use]
-pub fn step_node_table(table: &[u32]) -> (&[u32], Option<Vec<Vec<u32>>>) {
+pub fn step_node_table(table: &[u32]) -> (&[u32], Option<StepNodes>) {
     let split = table
         .iter()
-        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE))
+        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE | STEP_VIEW))
         .unwrap_or(table.len());
     let (steps, trailer) = table.split_at(split);
     if trailer.is_empty() {
         return (steps, None);
     }
-    let mut nodes: Vec<Vec<u32>> = Vec::with_capacity(steps.len());
+    let mut published = StepNodes {
+        steps: Vec::with_capacity(steps.len()),
+        views: Vec::new(),
+    };
     for &word in trailer {
+        let nodes = &mut published.steps;
         match word & 0xFF {
-            STEP_NODES if (word >> 8) as usize == nodes.len() => nodes.push(Vec::new()),
-            STEP_NODE if !nodes.is_empty() => nodes.last_mut().expect("opened").push(word >> 8),
+            STEP_NODES if published.views.is_empty() && (word >> 8) as usize == nodes.len() => {
+                nodes.push(Vec::new());
+            }
+            STEP_NODE if published.views.is_empty() && !nodes.is_empty() => {
+                nodes.last_mut().expect("opened").push(word >> 8);
+            }
+            STEP_VIEW => published.views.push(word >> 8),
             _ => return (steps, None),
         }
     }
-    if nodes.len() != steps.len() {
+    if published.steps.len() != steps.len() {
         return (steps, None);
     }
-    (steps, Some(nodes))
+    (steps, Some(published))
 }
 
 #[must_use]
@@ -526,6 +550,38 @@ const MAX_SPLIT_REDUCTIONS: usize = 64;
 /// runtime's `M4_SEL_BYTES` (16 rows of 3200 bytes).
 const SELECT_BYTES: usize = 16 * 3200;
 
+/// A pivot threshold the streamed form runs as a select: one that keeps
+/// so many ranks or so much mass ([`emit_streamed_region`]'s `Plan::Select`).
+#[must_use]
+pub const fn is_streamed_select(tag: u8, pred_tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD
+        && matches!(pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE)
+}
+
+/// What the streamed form of `plan`'s region `region` takes of a lane's
+/// temporary area: each select's [`SELECT_BYTES`] at its bottom, and above
+/// them the split reductions' planes in what the whole-value rule leaves
+/// (`m4_plane_bytes`).
+#[must_use]
+pub fn streamed_temporary_need(
+    plan: &crate::codegen::launch::LaunchStagePlan,
+    region: usize,
+) -> crate::codegen::temporary::TemporaryNeed {
+    let selects = plan.fused.get(region).map_or(0, |region| {
+        region
+            .nodes
+            .iter()
+            .filter_map(|&node| plan.ops.get(node as usize))
+            .filter(|op| is_streamed_select(op.tag, op.pred_tag))
+            .count()
+    });
+    crate::codegen::temporary::TemporaryNeed {
+        fixed: (selects * SELECT_BYTES) as u64,
+        per_row: None,
+        above_whole: true,
+    }
+}
+
 enum Plan {
     Direct {
         base: u32,
@@ -810,7 +866,11 @@ pub(super) fn kernel_head(
     source.push_str("    const device M1ValueDesc* all_descriptors [[buffer(1)]],\n");
     source.push_str("    const device M1OpParams* params [[buffer(2)]],\n");
     source.push_str("    const device uint* offsets [[buffer(3)]],\n");
-    source.push_str("    device uchar* all_scratch [[buffer(4)]],\n");
+    let _ = writeln!(
+        source,
+        "    const device ulong* {} [[buffer({})]],",
+        LANE_SCRATCH.name, LANE_SCRATCH.metal_buffer
+    );
     source.push_str("    const device M3GroupLayout* layout [[buffer(5)]],\n");
     source.push_str("    const device uint* channel_bindings [[buffer(6)]],\n");
     source.push_str("    device uchar* pending_flags [[buffer(7)]],\n");
@@ -872,7 +932,7 @@ pub(super) fn kernel_head(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(
-        "  device uchar* scratch = all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);\n",
+        "  device uchar* scratch = reinterpret_cast<device uchar*>(lane_scratch[dispatch_lane]);\n",
     );
     source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
@@ -1065,13 +1125,7 @@ pub fn emit_streamed_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         let plan = match kind {
-            StepKind::Single
-                if op.tag == tags::PIVOT_THRESHOLD
-                    && matches!(
-                        op.pred_tag,
-                        predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE
-                    ) =>
-            {
+            StepKind::Single if is_streamed_select(op.tag, op.pred_tag) => {
                 Plan::Select {
                     node: node_u32,
                     mode: u32::from(op.pred_tag == predicate_tags::CUMMASS_LE),
@@ -1478,6 +1532,14 @@ pub fn emit_streamed_region(
         table.push((u32::try_from(step).unwrap_or(u32::MAX) << 8) | STEP_NODES);
         table.extend(nodes.iter().map(|&node| (node << 8) | STEP_NODE));
     }
+    table.extend(
+        region
+            .nodes
+            .iter()
+            .map(|node| node.index())
+            .filter(|&node| is_view_reshape(node))
+            .map(|node| ((node as u32) << 8) | STEP_VIEW),
+    );
     Ok((source, table))
 }
 

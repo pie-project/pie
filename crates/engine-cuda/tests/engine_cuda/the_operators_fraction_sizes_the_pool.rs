@@ -135,6 +135,17 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
         (GLOBAL + SLIDING) * 1024,
         "a window that spans the context is no window"
     );
+    // Held between fires, as the staging ring and the declared-context fit
+    // size it: the window's 65 pages and no fire's past them.
+    let held = |context: u32| {
+        let paging = Paging::of(16, context, 1, 1)
+            .expect("a page size of 16 is a paging")
+            .held(window);
+        one_slot_bytes(&trace, paging).expect("the rows size")
+    };
+    assert_eq!(held(34_816), GLOBAL * 34_816 + SLIDING * 16 * 65);
+    assert_eq!(one(34_816) - held(34_816), SLIDING * 16 * 129);
+    assert_eq!(held(1024), one(1024), "a window that spans the context is no window");
     assert_eq!(
         at(34_816).window_pages_at(8 * 2176),
         1 + 65 + 129 + 7 * 2176 / 2,

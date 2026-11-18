@@ -5,7 +5,8 @@ use tokio::sync::Notify;
 
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
 use super::holdings::{swapped_page_count, swapped_rs_units};
-use super::proc::Residency;
+use super::inner::RestoreGate;
+use super::proc::{PendingBind, Residency};
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
@@ -38,6 +39,22 @@ enum Step {
     ServeRestore {
         key: EntryKey,
         pid: ProcessId,
+    },
+    /// The head is a restore whose role slots found no room, and nothing
+    /// else will free any: a resident process is evicted for it.
+    EvictForRoles,
+    /// The head is a restore of a process a bind short of guest-state
+    /// room suspended, its kv gathered: it waits for the room that bind
+    /// asks as the bind would ([`Self::BindRoom`]).
+    RestoreBindRoom {
+        key: EntryKey,
+        need: PendingBind,
+    },
+    /// The head is a bind short of device room for its guest state.
+    BindRoom {
+        key: EntryKey,
+        run: u32,
+        pieces: u32,
     },
     Release(DevicePageReservation),
     Done,
@@ -98,6 +115,9 @@ impl ResidencyPlanner {
         self.reseat_released();
         // Taken once a pass: every grow step of this pass goes on past it.
         let no_grow = self.no_grow.swap(false, Ordering::AcqRel);
+        // The head restore whose pending bind's room was seen free this
+        // pass: what it asks past its kv stands.
+        let mut room_stood: Option<EntryKey> = None;
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
@@ -112,11 +132,14 @@ impl ResidencyPlanner {
                     }
                     return Step::Done;
                 };
+                if let WaitKind::BindRoom { run, pieces, .. } = waiter.kind {
+                    return Step::BindRoom { key, run, pieces };
+                }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 };
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
@@ -142,24 +165,76 @@ impl ResidencyPlanner {
                     Some(_) => Step::ServeAllocationBurst {
                         extra: inner.burst_shortfall(),
                     },
-                    None => {
-                        // A restore goes back once a resident process has
-                        // finished (its credit), or the fleet can do nothing
-                        // else, or the device has room for it and still a
-                        // page for each resident lane's next one: suspended
-                        // processes come back as soon as room appears, every
-                        // one it holds at once, not one a completion.
-                        if inner.completion_credit > 0 {
-                            inner.completion_credit -= 1;
-                        } else if spare < inner.growth_reserve() && !inner.fleet_stalled() {
-                            return Step::Done;
+                    None => match inner.procs.get(&pid).and_then(|proc| proc.bind_room) {
+                        // Its whole need: the room its bind asks too.
+                        Some(need) if room_stood != Some(key) => {
+                            Step::RestoreBindRoom { key, need }
                         }
-                        Step::ServeRestore { key, pid }
-                    }
+                        _ => match inner.restore_gate(pid, spare) {
+                            RestoreGate::Serve => Step::ServeRestore { key, pid },
+                            RestoreGate::Wait => Step::Done,
+                            RestoreGate::Evict => Step::EvictForRoles,
+                        },
+                    },
                 }
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
+                Step::BindRoom { key, run, pieces } => {
+                    // Its runs stand free: the bind takes them.
+                    if self.port.guest_room_free(run, pieces) {
+                        self.serve_bind_room(key);
+                        continue;
+                    }
+                    // Idle cache first, one set or a sweep, and it looks
+                    // again in what that left; then residents are moved for
+                    // it by the planner's victim choice, as for an
+                    // allocation: a bind is new demand, not a restore, and
+                    // it is funded whether or not the fleet has stalled (a
+                    // fleet that keeps decoding never stalls, and the bind
+                    // waited behind it for good).
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        continue;
+                    }
+                    // A grow the walk will make holds its runs: it waits on
+                    // that, moving no one. Only where none is coming (the
+                    // governor's target reached) are residents moved.
+                    let need = Demand {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: RsUnits::default(),
+                    };
+                    if self.wait_on_grow(no_grow, need) {
+                        return true;
+                    }
+                    true
+                }
+                Step::RestoreBindRoom { key, need } => {
+                    // As the bind it suspended for waits: served once the
+                    // runs stand free past its gathered kv, else idle cache
+                    // first, then, the fleet stalled, a resident parked
+                    // for it by the planner's victim choice.
+                    if self.port.guest_room_free(need.run, need.pieces) {
+                        room_stood = Some(key);
+                        continue;
+                    }
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        continue;
+                    }
+                    if !self.with_inner(|inner| inner.fleet_stalled()) {
+                        return false;
+                    }
+                    true
+                }
+                Step::EvictForRoles => {
+                    // Idle cache holds chunks too: one set goes, and the
+                    // restore tries again in what it left, before any
+                    // resident moves for it.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        self.with_inner(|inner| inner.roles_retry_head());
+                        continue;
+                    }
+                    true
+                }
                 Step::Release(stranded) => {
                     drop(stranded);
                     return false;
