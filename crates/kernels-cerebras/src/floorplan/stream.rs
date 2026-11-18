@@ -257,30 +257,16 @@ impl KvColumn {
     }
 
     /// The route from unit `k`'s head root down, and west or east, to the column's root: down
-    /// to the head's turn (the root's row at `sub = 1`), along it, and down to the root.
+    /// to the head's turn (the root's row at `sub = 1`), along it, and down to the root
+    /// ([`crate::place::bundle::kv_link`]).
     #[must_use]
     pub fn link(&self, s: &Stream, k: usize) -> Vec<Coord> {
+        // (the bundle router's: a head's link turns on its own row, so a unit's links do not
+        // cross; a placed root's too)
         let root = self.root(s);
-        if self.at.is_some() {
-            // a placed root: the link's ends, the router's to join ([`crate::place::route`])
-            return vec![s.units[self.units[k]].cy(self.head), root];
-        }
-        let u = &s.units[self.units[k]];
-        let top = u.cy(self.head);
+        let top = s.units[self.units[k]].cy(self.head);
         let turn = s.units[self.units[0]].y + s.py + 2 + self.head;
-        let turn = if top.x == root.x {
-            root.y
-        } else {
-            turn.min(root.y)
-        };
-        let mut pts: Vec<Coord> = (top.y..=turn).map(|y| Coord::new(top.x, y)).collect();
-        let mut x = top.x;
-        while x != root.x {
-            x = if x > root.x { x - 1 } else { x + 1 };
-            pts.push(Coord::new(x, turn));
-        }
-        pts.extend((turn + 1..=root.y).map(|y| Coord::new(root.x, y)));
-        pts
+        crate::place::bundle::kv_link(top, root, turn)
     }
 }
 
@@ -486,12 +472,9 @@ impl Stream {
     /// rows' wires cross.
     #[must_use]
     pub fn wrap(a: &StreamUnit, b: &StreamUnit, j: u32) -> Vec<Coord> {
-        let turn = b.x + 1 + j;
-        let (ya, yb) = (a.y + 1 + j, b.y + 1 + j);
-        let mut pts: Vec<Coord> = (turn..=a.x).rev().map(|x| Coord::new(x, ya)).collect();
-        pts.extend((ya + 1..=yb).map(|y| Coord::new(turn, y)));
-        pts.extend((b.x..turn).rev().map(|x| Coord::new(x, yb)));
-        pts
+        // (the bundle router's staircase down and west)
+        use crate::place::bundle::{Turn, z};
+        z(a.cx(j), b.cx(j), Turn::Column(b.x + 1 + j))
     }
 
     /// Every link of the stream (see the module doc).
@@ -558,11 +541,8 @@ impl Stream {
             let (a, b) = (&self.units[pair_[0]], &self.units[pair_[1]]);
             let wrap = a.y != b.y;
             for j in 0..self.py {
-                let pts = if wrap {
-                    Stream::wrap(a, b, j)
-                } else {
-                    (a.x..=b.x).map(|x| Coord::new(x, a.y + 1 + j)).collect()
-                };
+                // (the bundle router's: a straight row on `b`'s rows, else a staircase)
+                let pts = crate::place::bundle::gap(a, b, self.py, j);
                 let name = if wrap {
                     format!("SW{k}")
                 } else {

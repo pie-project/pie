@@ -24,7 +24,6 @@ use super::{BlockKind, Problem, Solution};
 use crate::floor::{Coord, Rect};
 use crate::floorplan::stream::Stream;
 use crate::stream::build::Program;
-use crate::wiring::Link;
 
 type R<T> = Result<T, String>;
 
@@ -611,17 +610,9 @@ fn placed(
             moved.kv[k] = moved.kv[k].at(root);
         }
     }
-    // (units where the search put them: the row stream's bundles as laid, the K / V links
-    // alone routed)
-    if moved
-        .units
-        .iter()
-        .zip(&s.units)
-        .all(|(a, b)| (a.x, a.y) == (b.x, b.y))
-    {
-        return super::stream::relay(p, moved);
-    }
-    super::stream::relay_routed(p, moved)
+    // (the row stream's gaps and the K / V links laid by the bundle router, wherever the
+    // blocks sit)
+    super::stream::relay(p, moved)
 }
 
 /// Whether `s`'s placement is beyond the band layout: a unit off its band's top, out of path
@@ -638,18 +629,6 @@ fn beyond_bands(s: &Stream) -> bool {
         || s.units
             .windows(2)
             .any(|w| w[0].y != w[1].y && w[0].x == 0 && w[1].x == 0)
-}
-
-/// Every path a stream's row stream lays (its links named `SP` / `SW`): their indices.
-pub(crate) fn row_stream_links(w: &crate::wiring::Wiring) -> Vec<usize> {
-    w.links
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| {
-            matches!(l, Link::Path(p) if p.class.name.starts_with("SP") || p.class.name.starts_with("SW"))
-        })
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// Co-resident readings (blocks with no nets, each a choice of [`super::pack::Shape`]s) annealed

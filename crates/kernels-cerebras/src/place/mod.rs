@@ -11,6 +11,7 @@
 //! reproduced byte for byte by the placer pinned to it.
 
 pub mod anneal;
+pub mod bundle;
 pub mod cost;
 pub mod decode;
 pub mod flow;
