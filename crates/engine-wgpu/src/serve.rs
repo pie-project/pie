@@ -166,8 +166,8 @@ impl Serve for Api {
 
     fn plan(_shell: &mut Shell<Api>, _prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         Ok(Plan::Walk {
-            keep: None,
-            split: false,
+            keep: Err("wgpu keeps no recordings"),
+            split: None,
         })
     }
 

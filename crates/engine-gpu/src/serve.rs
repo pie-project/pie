@@ -163,6 +163,12 @@ pub trait Serve: Backend {
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
+    /// The device's bound on one submission, where its platform states one:
+    /// a submission past it loses the device. `None`: no bound is stated.
+    fn max_submit(_device: &Self::Context) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -195,9 +201,13 @@ pub enum Plan<B: Serve> {
         pixels: PixelSpans,
     },
 
-    /// The step walks; `keep` keeps it under its key, `split` submits it a
-    /// layer at a time.
-    Walk { keep: Option<B::Keep>, split: bool },
+    /// The step walks; `keep` keeps it under its key, or names why it is
+    /// kept by none; `split` submits it in segments of that many layers,
+    /// each its own submit (a kept step keeps each segment to replay).
+    Walk {
+        keep: std::result::Result<B::Keep, &'static str>,
+        split: Option<u32>,
+    },
 }
 
 /// A walked step as [`Serve::submit`] takes it.
@@ -208,8 +218,9 @@ pub struct Launch<'l, B: Serve> {
 
     pub launches: u32,
 
-    /// The host step of each segment the walk's expert stages cut.
-    pub cuts: Vec<crate::store::experts::Cut<B>>,
+    /// What follows each segment the walk's flushes cut: an expert stage's
+    /// host step, or nothing past a split step's segment.
+    pub cuts: Vec<Option<crate::store::experts::Cut<B>>>,
 
     pub pixels: &'l PixelSpans,
 
@@ -656,6 +667,18 @@ pub struct Shell<B: Serve> {
     /// The steps walked and not kept since the last count: each ran its
     /// regions eagerly, with no recording to replay.
     unkept: u64,
+    /// The (reason, classes) of each serving walk kept by no recording
+    /// named so far: each is warned of once ([`Shell::name_unkept`]).
+    unkept_named: std::collections::BTreeSet<(&'static str, Vec<usize>)>,
+    /// The steps walked in segments since the last count
+    /// ([`Shell::split_serving`]).
+    split: u64,
+    /// A step's estimated submit time, where the profile's rates weigh one.
+    submit_time: Option<crate::top::SubmitTime>,
+    /// The device's bound on one submission, where its platform states one
+    /// ([`Serve::max_submit`]): a step estimated past it is submitted in
+    /// segments within it ([`Shell::submit_split`]).
+    max_submit: Option<std::time::Duration>,
 
     /// The most dispatches a walked fire's frame encoded, and the most
     /// launches a walked fire made of its regions, since the last count
@@ -1067,6 +1090,9 @@ impl<B: Serve> Shell<B> {
         // or a check's past it.
         let mut laid: Option<u32> = None;
         let mut weighed: Option<engine::load::check::Weighed> = None;
+        // The estimate the pick weighed its rungs by, which a step's submit
+        // time is weighed by against the device's bound on one submission.
+        let mut estimated: Option<engine::load::FireEstimate> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
@@ -1145,6 +1171,7 @@ impl<B: Serve> Shell<B> {
                 };
                 chosen = Some(pick);
                 laid = Some(lays);
+                estimated = Some(estimate.clone());
                 if boot.check.is_some() {
                     weighed = Some(engine::load::check::Weighed {
                         model: engine::load::model_class(&boot.trace).to_owned(),
@@ -1680,6 +1707,27 @@ impl<B: Serve> Shell<B> {
 
         let weights_stream = weights.streams() || weights.gathered().is_some();
         let shelf = B::shelf(&device, &readout, weights_stream)?;
+        // A step's submit time, where the profile's rates weigh one: the
+        // estimate's launches are the compiled plan's, its layers the
+        // trace's.
+        let max_submit = B::max_submit(&device);
+        let submit_time = estimated.map(|estimate| {
+            let layers: std::collections::BTreeSet<u32> =
+                boot.trace.nodes.iter().filter_map(|node| node.layer).collect();
+            crate::top::SubmitTime::new(
+                estimate,
+                u32::try_from(compiled.template().len()).unwrap_or(u32::MAX),
+                budgets.tokens.max_lanes,
+                u32::try_from(layers.len()).unwrap_or(u32::MAX),
+            )
+        });
+        if max_submit.is_some() && submit_time.is_none() {
+            return Err(Fault::Unbound {
+                what: "the roofline estimate a step's submit time is weighed by against the \
+                       device's bound on one submission: the profile states no complete [rates]"
+                    .to_string(),
+            });
+        }
 
         let mut shell = Shell {
             preseated: Vec::new(),
@@ -1689,6 +1737,10 @@ impl<B: Serve> Shell<B> {
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
+            unkept_named: std::collections::BTreeSet::new(),
+            split: 0,
+            submit_time,
+            max_submit,
             walked: (0, 0),
             walk_only: false,
             weighed,
@@ -2228,6 +2280,75 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// Warns of a serving walk kept by no recording, once for each reason
+    /// and the classes it ran: on a backend that records, it is a fire that
+    /// ran eagerly, which no later fire replays.
+    fn name_unkept(&mut self, p: &Prepared<'_, B>, reason: &'static str) {
+        if !B::RECORDS || self.walk_only {
+            return;
+        }
+        let mut classes = p.classes.clone();
+        classes.sort_unstable();
+        classes.dedup();
+        if !self.unkept_named.insert((reason, classes.clone())) {
+            return;
+        }
+        let rows: u32 = p.seats.iter().map(|seat| seat.rows).sum();
+        let rung = self.span.rungs().get(p.rung).map_or(0, |rung| rung.tokens);
+        tracing::warn!(
+            ?classes,
+            rows,
+            rung,
+            reason,
+            "a serving fire walked kept by no recording: it ran eagerly"
+        );
+    }
+
+    /// The steps walked in segments since the last count: each estimated
+    /// past the device's bound on one submission ([`Shell::submit_split`]).
+    pub fn split_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.split)
+    }
+
+    /// A step's estimated submit time, where the profile's rates weigh one.
+    #[must_use]
+    pub fn submit_time(&self) -> Option<&crate::top::SubmitTime> {
+        self.submit_time.as_ref()
+    }
+
+    /// States the device's bound on one submission in place of what its
+    /// platform states ([`Serve::max_submit`]): where a test weighs a
+    /// step against a bound of its own.
+    pub fn bound_submits(&mut self, bound: std::time::Duration) {
+        self.max_submit = Some(bound);
+    }
+
+    /// The layers one submit of step `p` carries: `None` where the device
+    /// states no bound on one submission or the step's estimated time lies
+    /// within it (the step is submitted whole), else the most layers whose
+    /// share of the estimate does ([`crate::top::SubmitTime::split`]).
+    pub fn submit_split(&self, p: &Prepared<'_, B>) -> Result<Option<u32>> {
+        let Some(bound) = self.max_submit else {
+            return Ok(None);
+        };
+        let Some(time) = &self.submit_time else {
+            return Err(Fault::Unbound {
+                what: "the roofline estimate a step's submit time is weighed by against the \
+                       device's bound on one submission"
+                    .to_string(),
+            });
+        };
+        let rows: u32 = p.seats.iter().map(|seat| seat.rows).sum();
+        let lanes = u32::try_from(p.seats.len()).unwrap_or(u32::MAX);
+        let keys = p
+            .seats
+            .iter()
+            .map(|seat| seat.have.saturating_add(seat.rows))
+            .max()
+            .unwrap_or(0);
+        time.split(rows, lanes, keys, bound)
     }
 
     /// The most dispatches one walked fire's frame encoded, and the most
@@ -4311,7 +4432,7 @@ impl<B: Serve> Shell<B> {
         })
     }
 
-    fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
+    fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: Option<u32>) -> Result<Walked<B>> {
         let place = At::new();
         self.walk_with(p, keep, split, &place, &mut Cursor::new(&place))
     }
@@ -4322,7 +4443,7 @@ impl<B: Serve> Shell<B> {
         &self,
         p: &Prepared<'_, B>,
         keep: bool,
-        split: bool,
+        split: Option<u32>,
         place: &At,
         cursor: &mut S,
     ) -> Result<Walked<B>> {
@@ -4363,8 +4484,8 @@ impl<B: Serve> Shell<B> {
                 }),
                 self.pools.segments(&self.handles)?,
             );
-            if split {
-                run.flush_between_layers();
+            if let Some(layers) = split {
+                run.flush_between_layers(layers);
             }
             walk(
                 &self.trace,
@@ -4410,8 +4531,8 @@ impl<B: Serve> Shell<B> {
 struct Walked<B: Serve> {
     frame: Option<B::Frame>,
 
-    /// The host step of each segment the walk's expert stages cut.
-    cuts: Vec<crate::store::experts::Cut<B>>,
+    /// What follows each segment the walk's flushes cut.
+    cuts: Vec<Option<crate::store::experts::Cut<B>>>,
 
     launches: u32,
 }
@@ -4739,8 +4860,8 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         }
         let plan = if self.walk_only {
             Plan::Walk {
-                keep: None,
-                split: false,
+                keep: Err("the check walks every fire eagerly"),
+                split: None,
             }
         } else {
             B::plan(self, &mut prepared)?
@@ -4767,8 +4888,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             }
             Plan::Walk { keep, split } => (keep, split),
         };
-        self.recorded += u64::from(keep.is_some());
-        self.unkept += u64::from(keep.is_none());
+        self.recorded += u64::from(keep.is_ok());
+        self.unkept += u64::from(keep.is_err());
+        self.split += u64::from(split.is_some());
+        if let Err(reason) = keep {
+            self.name_unkept(&prepared, reason);
+        }
+        let keep = keep.ok();
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
@@ -5572,7 +5698,7 @@ impl<B: Serve> Shell<Named<B>> {
             began: 0,
             made: Vec::with_capacity(whole.len()),
         };
-        match self.walk_with(&prepared, false, false, &place, &mut sink) {
+        match self.walk_with(&prepared, false, None, &place, &mut sink) {
             Ok(_) => {}
             Err(Fault::Fire(poem_exec::Error::Kernel(refusal))) => {
                 self.pipelines.0.abandon();

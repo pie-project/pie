@@ -473,8 +473,8 @@ impl<B: Serve> Serve for Named<B> {
         _prepared: &mut Prepared<'_, Named<B>>,
     ) -> Result<Plan<Named<B>>> {
         Ok(Plan::Walk {
-            keep: None,
-            split: false,
+            keep: Err("the load names its fires, keeping none"),
+            split: None,
         })
     }
 

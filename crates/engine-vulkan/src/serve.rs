@@ -84,10 +84,19 @@ impl Serve for Api {
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
         // A device whose profile lacks the roofline's constants measures
-        // them here, before ready, and keeps them in the user's profile.
-        // No bound on one submission is stated on Vulkan yet.
-        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
+        // them here, before ready, and keeps them in the user's profile,
+        // no timed frame past the platform's bound on one submission.
+        let tuning = crate::rates::at_load(
+            &device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::chip::max_submit(&measured),
+        )?;
         Ok((device, tuning))
+    }
+
+    fn max_submit(device: &Context) -> Option<std::time::Duration> {
+        crate::chip::max_submit(&device.chip())
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
@@ -167,15 +176,32 @@ impl Serve for Api {
     }
 
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
+        // A step estimated past the device's bound on one submission is
+        // submitted in segments within it, each kept to replay as its own
+        // submit. Whole, a 512x512 VAE decode outlasts one Adreno
+        // submission and loses the device: a decode's clips are submitted a
+        // layer and a convolution at a time.
+        let split = if prepared.bindings.voxels.is_some() {
+            Some(1)
+        } else {
+            shell.submit_split(prepared)?
+        };
         // The custom-mask buffer grows: a recording would keep the one it outgrew.
         // A fire landing snapshots binds a table of its own: not recorded.
-        let key = (shell.shelf.recorder.records()
-            && prepared.bindings.group_masks.is_empty()
-            && prepared.bindings.rs_snaps.is_none()
-            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole()))
-        .then(|| record_key(shell, prepared));
+        let key = if let Some(why) = shell.shelf.recorder.refused() {
+            Err(why)
+        } else if !prepared.bindings.group_masks.is_empty() {
+            Err("its group masks lie in a buffer that grows, which a recording would keep")
+        } else if prepared.bindings.rs_snaps.is_some() {
+            Err("it lands snapshots, through a table of its own")
+        } else if prepared.bindings.row_ring.is_none() && !shell.row_caches.whole() {
+            Err("its row tables' misses are handed from the host, not staged in a ring")
+        } else {
+            Ok(record_key(shell, prepared, split))
+        };
 
         let replayable = key
+            .ok()
             .and_then(|key| shell.shelf.recorder.get(key))
             .map(|replay| (replay.layout.clone(), replay.launches));
         if let Some((rows, launches)) = replayable {
@@ -192,8 +218,8 @@ impl Serve for Api {
                 .get(key)
                 .expect("the recording was there a line ago");
             // The segments an expert stage cut, each landed before its stage.
-            let staged = if recording.cuts.is_empty() {
-                Ok(())
+            let staged = if recording.cuts.iter().all(Option::is_none) {
+                (0..recording.cuts.len()).try_for_each(|at| recording.kept.replay_cut(at))
             } else {
                 match shell.weights.host() {
                     None => Err(Fault::Unbound {
@@ -205,7 +231,10 @@ impl Serve for Api {
                         });
                         recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
                             recording.kept.replay_cut(at)?;
-                            shell.expert_caches.stage_cut(host, &planes, cut)
+                            match cut {
+                                Some(cut) => shell.expert_caches.stage_cut(host, &planes, cut),
+                                None => Ok(()),
+                            }
                         })
                     }
                 }
@@ -244,18 +273,7 @@ impl Serve for Api {
             });
         }
 
-        // A split step is not recorded: a recording replays as one submit.
-        let split_rows = shell
-            .tuning
-            .profile()
-            .get::<crate::chip::SubmitSplitRows>()
-            .0;
-        // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = (split_rows > 0
-            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
-            || prepared.bindings.voxels.is_some();
-        let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
-        Ok(Plan::Walk { keep, split })
+        Ok(Plan::Walk { keep: key, split })
     }
 
     fn submit(
@@ -372,8 +390,11 @@ impl Serve for Api {
     }
 }
 
-fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
+fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>, split: Option<u32>) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
+    // The segments a split step is submitted in: a recording replays its
+    // own, each within the bound it was cut for.
+    key.shown(&split);
     key.bytes(&p.descriptor.pack());
     key.shown(&p.arm);
     key.shown(&shell.readout[p.arm].bytes());

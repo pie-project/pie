@@ -95,6 +95,81 @@ pub fn choose(
     })
 }
 
+/// A step's submit time as the roofline estimates it (the load's
+/// [`FireEstimate`], the one every rung is weighed by), and how a step
+/// past the device's bound on one submission is cut into segments of
+/// layers, each its own submit, each within the bound.
+#[derive(Debug, Clone)]
+pub struct SubmitTime {
+    estimate: FireEstimate,
+    /// The kernels a fire launches: the compiled plan's.
+    launches: u32,
+    /// The most lanes one fire carries.
+    fire_lanes: u32,
+    /// The layers the trace states its nodes in.
+    layers: u32,
+}
+
+impl SubmitTime {
+    #[must_use]
+    pub fn new(estimate: FireEstimate, launches: u32, fire_lanes: u32, layers: u32) -> Self {
+        SubmitTime {
+            estimate,
+            launches,
+            fire_lanes,
+            layers: layers.max(1),
+        }
+    }
+
+    /// The estimated time of a step of `rows` rows over `lanes` lanes, its
+    /// widest lane attending `keys` keys, in ns.
+    #[must_use]
+    pub fn ns(&self, rows: u32, lanes: u32, keys: u32) -> f64 {
+        self.estimate.ns(&RungFacts {
+            tokens: rows.max(1),
+            lanes: lanes.max(1),
+            keys: keys.max(1),
+            launches: self.launches,
+            padded_rows: rows.max(1),
+            span_bytes: 0,
+            infeasible: None,
+            fire_lanes: self.fire_lanes,
+        })
+    }
+
+    /// The layers one submit of such a step carries under `bound`, each
+    /// layer its share of the step's estimate: `None` where the whole step
+    /// lies within the bound and is submitted whole, else the most layers
+    /// whose share does. A step one layer of which passes the bound alone
+    /// is refused by name: no cut submits it within the bound.
+    pub fn split(
+        &self,
+        rows: u32,
+        lanes: u32,
+        keys: u32,
+        bound: std::time::Duration,
+    ) -> Result<Option<u32>> {
+        let step = self.ns(rows, lanes, keys);
+        let bound_ns = bound.as_nanos() as f64;
+        if step <= bound_ns {
+            return Ok(None);
+        }
+        let layer = step / f64::from(self.layers);
+        if layer > bound_ns {
+            return Err(Fault::Ceiling {
+                what: "ns one layer of a step is estimated to take, against the device's bound \
+                       on one submission",
+                need: layer as u64,
+                have: bound_ns as u64,
+            });
+        }
+        // At least one layer, by the check above; fewer than all, as the
+        // whole step passes the bound.
+        let layers = (bound_ns / layer).floor() as u32;
+        Ok(Some(layers.clamp(1, self.layers - 1)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +256,42 @@ mod tests {
                  200 MiB"
             ),
             "{err}"
+        );
+    }
+
+    /// The estimate at 1 TFLOP/s and 1 GB/s over 28 layers of one 4096
+    /// square plane each, the load's: a step's submit time scales with its
+    /// rows; one within the bound is submitted whole, one past it in
+    /// segments of the most layers whose share lies within it, and one a
+    /// layer of which passes it is refused.
+    #[test]
+    fn a_step_past_the_bound_on_one_submission_is_cut_into_layers_within_it() {
+        let rated = profile(
+            "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[1, 1.0]]]]\nattn_tflops_by_keys = \
+                 [[1, 1.0]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
+        );
+        let estimate = estimate(&counts(), &rated.rates()).expect("the estimate");
+        let time = SubmitTime::new(estimate, 100, 256, 28);
+        let one = time.ns(1, 1, 1);
+        let wide = time.ns(4096, 1, 4096);
+        assert!(wide > one, "{wide} ns at 4096 rows, {one} at one");
+        let bound = |ns: f64| std::time::Duration::from_nanos(ns as u64);
+
+        assert_eq!(time.split(4096, 1, 4096, bound(wide * 2.0)).unwrap(), None);
+        // A third of the step a submit: 28 layers at ~9.33 each, 9 a segment.
+        assert_eq!(
+            time.split(4096, 1, 4096, bound(wide / 3.0)).unwrap(),
+            Some(9)
+        );
+        // Just under the whole step: every layer but one in the first.
+        assert_eq!(
+            time.split(4096, 1, 4096, bound(wide * 0.99)).unwrap(),
+            Some(27)
+        );
+        let refused = time.split(4096, 1, 4096, bound(wide / 56.0)).unwrap_err();
+        assert!(
+            refused.to_string().contains("one layer of a step"),
+            "{refused}"
         );
     }
 }

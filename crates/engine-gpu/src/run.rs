@@ -232,6 +232,16 @@ pub struct FireBindings {
     pub capture: Option<Tensor>,
 }
 
+/// A split step's segment as the walk lays it: `layers` layers a submit,
+/// the layer the frame holds work of, and the layers before it the segment
+/// already holds.
+#[derive(Debug, Clone, Copy)]
+struct Segment {
+    layers: u32,
+    layer: Option<u32>,
+    held: u32,
+}
+
 pub struct Run<'c, B: Backend> {
     pub ctx: &'c Ctx<'c>,
 
@@ -279,9 +289,9 @@ pub struct Run<'c, B: Backend> {
 
     tuning: &'c B::Tuning,
 
-    /// The layer whose work the frame holds unsubmitted, when the step is
-    /// submitted a layer at a time.
-    split: Option<Option<u32>>,
+    /// The segment the frame holds unsubmitted, when the step is submitted
+    /// in segments of layers.
+    split: Option<Segment>,
 
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
@@ -347,33 +357,54 @@ impl<'c, B: Backend> Run<'c, B> {
         self.tier
     }
 
-    /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self) {
-        self.split = Some(None);
+    /// Submits the frame each time `layers` layers' nodes have run: a
+    /// split step's segments, each its own submit.
+    pub fn flush_between_layers(&mut self, layers: u32) {
+        self.split = Some(Segment {
+            layers: layers.max(1),
+            layer: None,
+            held: 0,
+        });
     }
 
-    /// After `node` runs: submits what the frame holds once a new layer
-    /// starts. A failed submit faults the frame, which its commit reports.
+    /// After `node` runs: submits what the frame holds once a layer past
+    /// the segment's starts (and after each 3-d convolution, which no
+    /// layer holds). Each submit ends a segment of a kept frame, which a
+    /// replay submits on its own, nothing between ([`Self::take_cuts`]). A
+    /// failed submit faults the frame, which its commit reports.
     pub fn split_at(&mut self, node: &Node) {
-        let Some(held) = self.split.as_mut() else {
+        let Some(segment) = self.split.as_mut() else {
             return;
         };
         let Some(layer) = node.layer else {
             if matches!(
                 node.op,
                 poem_ir::Operation::Conv(poem_ir::Conv::Conv3d { .. })
-            ) && let Err(fault) = B::flush_recording()
-            {
-                tracing::warn!(%fault, "submitting a convolution of a split step");
+            ) {
+                match B::flush_recording() {
+                    Ok(()) => self.staged_layer.borrow_mut().cuts.push(None),
+                    Err(fault) => {
+                        tracing::warn!(%fault, "submitting a convolution of a split step");
+                    }
+                }
             }
             return;
         };
-        if held.is_some_and(|held| held != layer)
-            && let Err(fault) = B::flush_recording()
-        {
-            tracing::warn!(%fault, "submitting a layer of a split step");
+        if segment.layer == Some(layer) {
+            return;
         }
-        *held = Some(layer);
+        if segment.layer.is_some() {
+            segment.held += 1;
+        }
+        segment.layer = Some(layer);
+        if segment.held < segment.layers {
+            return;
+        }
+        segment.held = 0;
+        match B::flush_recording() {
+            Ok(()) => self.staged_layer.borrow_mut().cuts.push(None),
+            Err(fault) => tracing::warn!(%fault, "submitting a segment of a split step"),
+        }
     }
 
     pub fn window(&self) -> &'c Window {
@@ -968,9 +999,9 @@ impl<'c, B: Backend> Run<'c, B> {
             })
     }
 
-    /// The host steps of the expert stages this walk made, in order: one
-    /// for each segment a kept frame's flushes cut.
-    pub fn take_cuts(&self) -> Vec<crate::store::experts::Cut<B>> {
+    /// What follows each segment a kept frame's flushes cut, in order: an
+    /// expert stage's host step, or nothing past a split step's segment.
+    pub fn take_cuts(&self) -> Vec<Option<crate::store::experts::Cut<B>>> {
         std::mem::take(&mut self.staged_layer.borrow_mut().cuts)
     }
 

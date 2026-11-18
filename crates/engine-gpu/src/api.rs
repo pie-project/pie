@@ -280,7 +280,7 @@ impl<B: Host> Gpu<B> {
     /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
     /// And the steps walked and kept by no recording: each ran eagerly. On a
     /// backend that keeps recordings that is a fire it should have replayed
-    /// (a split step, bindings a recording cannot hold:
+    /// (bindings a recording cannot hold, each named once at warn:
     /// [`engine::live::Tally::Unrecorded`]); on one that keeps none it is
     /// every fire, as the backend states ([`engine::live::Tally::Eager`]).
     fn count_built(&mut self) {

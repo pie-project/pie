@@ -1716,3 +1716,83 @@ fn two_trimmed_window_lists_read_as_the_whole_ones() {
     );
     trimmed_window_of(&fixture, MODEL, 32, 1024, 700);
 }
+
+/// A step estimated past the device's bound on one submission is submitted
+/// in segments of layers, each within it, and kept: every segment replays
+/// from the recording as its own submit, and no fire walks unkept. A step
+/// within the bound is submitted whole. Split or whole, a step's logits are
+/// the same bits.
+#[test]
+fn a_step_past_the_bound_on_one_submission_is_split_and_every_segment_replays() {
+    use engine_gpu::serve::Serve as _;
+    if !backend::Api::RECORDS {
+        return;
+    }
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    const ROWS: u32 = 128;
+    let tokens: Vec<u32> = (0..ROWS).map(|at| (at * 37 + 11) % 256).collect();
+    let prompt = |slot: u32| Seated {
+        held: Some(0),
+        ..Seated::of(Lane {
+            slot,
+            word: word(&fixture.trace, ROWS),
+            tokens: &tokens,
+        })
+    };
+    let decode = Seated {
+        held: Some(ROWS),
+        ..Seated::of(Lane {
+            slot: 0,
+            word: word(&fixture.trace, 1),
+            tokens: &tokens[..1],
+        })
+    };
+    let counts = |shell: &mut Shell| {
+        (
+            shell.split_serving(),
+            shell.recorded_serving(),
+            shell.unkept_serving(),
+        )
+    };
+
+    // No bound stated: the prompt is submitted whole.
+    let whole = shell.fire_seated(&[prompt(0)]).expect("the prompt fires");
+    let (split, _, unkept) = counts(&mut shell);
+    assert_eq!((split, unkept), (0, 0), "with no bound the prompt walked split or unkept");
+
+    // A bound the prompt passes whole, each of its layers lies within (the
+    // miniature has two), and the decode below lies within.
+    let time = shell
+        .submit_time()
+        .expect("the device's profile states the rates a step is weighed by");
+    let (prompt_ns, decode_ns) = (time.ns(ROWS, 1, ROWS), time.ns(1, 1, ROWS + 1));
+    let floor = (prompt_ns / 2.0).max(decode_ns);
+    assert!(
+        floor < prompt_ns,
+        "the prompt's estimate ({prompt_ns} ns) passes neither its half nor the decode's ({decode_ns} ns)"
+    );
+    shell.bound_submits(std::time::Duration::from_nanos(((floor + prompt_ns) / 2.0) as u64));
+    let walked = shell.fire_seated(&[prompt(1)]).expect("the split prompt fires");
+    assert_eq!(
+        counts(&mut shell),
+        (1, 1, 0),
+        "the prompt past the bound walked split and kept: (split, recorded, unkept)"
+    );
+    let replayed = shell.fire_seated(&[prompt(1)]).expect("the split prompt replays");
+    assert_eq!(
+        counts(&mut shell),
+        (0, 0, 0),
+        "the prompt past the bound replayed its segments: (split, recorded, unkept)"
+    );
+    assert_eq!(walked, whole, "the split prompt's logits are the whole one's");
+    assert_eq!(replayed, whole, "the replayed segments' logits are the whole prompt's");
+
+    // A decode lies well within the bound: submitted whole.
+    let row = shell.fire_seated(&[decode]).expect("the decode fires");
+    assert!(row.iter().flatten().all(|v| v.is_finite()));
+    let (split, _, unkept) = counts(&mut shell);
+    assert_eq!((split, unkept), (0, 0), "the decode within the bound walked split or unkept");
+}

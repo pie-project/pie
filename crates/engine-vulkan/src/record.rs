@@ -11,8 +11,9 @@ pub(crate) struct Recording {
     pub(crate) layout: Vec<engine_gpu::serve::ReadSpan>,
     pub(crate) launches: u32,
 
-    /// The host step after each segment but the last, in order.
-    pub(crate) cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
+    /// What follows each segment but the last, in order: an expert stage's
+    /// host step, or nothing past a split step's segment.
+    pub(crate) cuts: Vec<Option<engine_gpu::store::experts::Cut<crate::device::Api>>>,
 }
 
 impl Recording {
@@ -20,7 +21,7 @@ impl Recording {
         kept: Kept,
         layout: Vec<engine_gpu::serve::ReadSpan>,
         launches: u32,
-        cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
+        cuts: Vec<Option<engine_gpu::store::experts::Cut<crate::device::Api>>>,
     ) -> Recording {
         Recording {
             kept,
@@ -126,12 +127,9 @@ impl Recorder {
         next
     }
 
-    pub(crate) fn records(&self) -> bool {
-        self.refused.is_none()
-    }
-
-    pub(crate) fn has_room(&self) -> bool {
-        self.refused.is_none()
+    /// Why this load keeps no recording, where it keeps none.
+    pub(crate) fn refused(&self) -> Option<&'static str> {
+        self.refused
     }
 
     /// Drops every recording: each names the slabs it was recorded over, and

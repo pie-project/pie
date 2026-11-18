@@ -290,12 +290,13 @@ impl<B: Backend> Cache<B> {
 pub type StageKey = (u32, u32, u32, usize, usize, u32, u32);
 
 /// A walk's expert stages: the layer staged last (once a layer of a fire),
-/// and, in order, each stage's host step, which a recorded fire's replay
-/// repeats between the segments its flushes cut.
+/// and, in order, what follows each segment a kept frame's flushes cut: a
+/// stage's host step, which a recorded fire's replay repeats there, or
+/// nothing where a split step's segment ended ([`crate::run::Run::split_at`]).
 #[derive(Default)]
 pub struct Staged<B: Backend> {
     pub last: Option<StageKey>,
-    pub cuts: Vec<Cut<B>>,
+    pub cuts: Vec<Option<Cut<B>>>,
 }
 
 /// One stage's host step: the routes of layer `layer` of cache `cache`,
@@ -749,7 +750,7 @@ impl<B: Backend> ExpertCaches<B> {
                 let cut = self.stage(handles, host, host_planes, (c, l), routes)?;
                 let mut read = read.borrow_mut();
                 read.last = Some(key);
-                read.cuts.push(cut);
+                read.cuts.push(Some(cut));
             }
         }
         let bind = |buffer: &B::Buffer, len: u64| -> Result<Tensor> {

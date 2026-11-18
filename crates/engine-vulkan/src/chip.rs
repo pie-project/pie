@@ -6,19 +6,27 @@ use std::sync::LazyLock;
 use crate::tuning::{AXES, FACTS};
 use profile::{Facts, Profile, Registry, Report, Shelf};
 
-/// Rows from which a step is submitted a layer at a time rather than in one
-/// submit: in one, a long prefill on a slow GPU outlasts the driver's
-/// watchdog (about 2 s on Adreno, which a 64-row prefill reaches) and loses
-/// the device. A split step is not recorded, so a desktop GPU, with no such
-/// watchdog, says 0, never (the derived profile).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
-#[decision(id = "engine.submit.split_rows", constant(range(0..=1_048_576)), default = 32, tune = engine)]
-pub struct SubmitSplitRows(pub u32);
+/// The longest one submission may run on `device`, where its platform
+/// states a bound: a step estimated past it is submitted in segments within
+/// it (`engine_gpu::serve::Shell::submit_split`).
+///
+/// Android's Adreno driver, KGSL, faults a context whose command batch runs
+/// past `adreno_drawobj_timeout`, 2000 ms (msm-kgsl `adreno_dispatch.c`,
+/// "command batch timeout in msecs"); with long-IB detection on, the fault
+/// takes the device. No other platform this engine runs on states a bound:
+/// a desktop driver's watchdog, where it has one, is not a bound it states.
+#[must_use]
+pub fn max_submit(device: &Device) -> Option<std::time::Duration> {
+    (cfg!(target_os = "android") && device.vendor == "qualcomm")
+        .then_some(std::time::Duration::from_millis(KGSL_DRAWOBJ_TIMEOUT_MS))
+}
+
+/// KGSL's `adreno_drawobj_timeout`: msm-kgsl `adreno_dispatch.c`.
+const KGSL_DRAWOBJ_TIMEOUT_MS: u64 = 2000;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
     crate::tuning::register(&mut r);
-    r.add::<SubmitSplitRows>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // One queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
