@@ -239,13 +239,10 @@ pub fn prepare(
         positions: max_model_len,
     };
     let cache = Cache::open(cfg)?;
-    // One plan: the first the search (or the preset) gives, each of which the plans' memory
-    // model already holds within its PEs (`cost::memory::room`, the static check's model for
-    // a decode program); a link past it is an error, not a cue to try the next.
-    let planned = target::plans(trace, &ask)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{}: no plan", trace.name))?;
+    // One plan: the search's (or the preset's), which the plans' memory model already holds
+    // within its PEs (`cost::memory::room`, the static check's model for a decode program); a
+    // link past it is an error.
+    let planned = target::plan(trace, &ask).map_err(|e| format!("{}: {e}", trace.name))?;
     let plan = planned.plan;
     tracing::info!(
         kernels = kernels_cerebras::kernels::KernelSet::of_shape(&plan.shape).name(),

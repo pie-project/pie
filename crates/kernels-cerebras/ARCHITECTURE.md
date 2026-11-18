@@ -10,10 +10,10 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 
 ```
 .poem trace ─target::shape─▶ Shape ─KernelSet::of_shape─▶ KernelSet
- (or a shape file)               │                       │ pins (a named one, or the one made for the shape; else the search)
+ (or a shape file)               │                       │ the search (or a named plan: pins, a debug override)
                                  └──────────┬────────────┘
-                                            ▼ floorplan::plan (the set's constructor)   (poem_compiler::spatial::plan:
-                                          Plan ─Floorplan::of─▶ Floorplan                 the first of them that builds)
+                                            ▼ floorplan::plan (the set's constructor)
+                                          Plan ─Floorplan::of─▶ Floorplan
                                             │  (the elements each feature asks for: units, segments, aux, head)
                                             │ ─compose::blocks─▶ [Block]
                                             │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
@@ -35,7 +35,7 @@ Modules are under `src/`.
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
 | Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors, the stacked arrangement), `Contract` (positions, CAP, LOOP, WL, the logits' prescale); `Preset` (a partition's named keys, levers and arrangement: a measured program's or the search's); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
-| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (the search's plan; a named plan, a debug override, where one is asked), `plan` / `plan_shape` | the trace's ops, the kernel sets |
+| Target | `target.rs` | `shape` (a trace's `Shape`), `plan` / `plan_shape` (the search's plan; a named plan, a debug override, where one is asked) | the trace's ops, the kernel sets |
 | Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the wafer program architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
 | Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
 | Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
@@ -271,8 +271,8 @@ a set's own is in the head and PLE kernels: the token loop's winner merge and th
 ## The plan seam (poem)
 
 `Program::build(plan)` is the whole physical compiler; its only input is a `Plan`. The plan
-comes from poem's spatial pass (`poem_compiler::spatial::plan` over `target::Wafer`): the trace
-gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
+comes from `target::plan`: the trace (its every running node given a phase by
+`poem_compiler::spatial::layer::lower`) gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
 shape picks the kernel set, and the search (`search`, below) picks the partition: nothing is pinned.
 The chip's measured programs (`cost/measured/*.json`: each shipping model's keys, levers and
 arrangement as the chip ran them, and its measured step) are the cost model's data: a measured

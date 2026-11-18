@@ -2893,7 +2893,7 @@ cut, the router's first experts), f32.
 
 ### G1.7 Compile on load
 
-A model the decode templates refuse (`target::plans` / its presets) loads its decode step as stream
+A model the decode templates refuse (`target::plan`) loads its decode step as stream
 units with no flag: `prepare::unit_program` lowers it (`stream::compile_decode`) and links it into
 the engine's cache, at the config's context or, unstated, at the most positions its K / V columns
 hold (bisected over 64 .. 8192: the 0.6B -l2 links at 8192); `Wafer` runs the template's model or

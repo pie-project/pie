@@ -1,12 +1,10 @@
-//! The wafer as a target of poem's spatial pass ([`poem_compiler::spatial`]): the model's
-//! [`Shape`] read off its trace ([`shape`]), the role kernels its layers take
-//! ([`super::kernels::KernelSet`]), the pinned plan named or made for the shape ([`super::pins`]) as
-//! the partition to try, a plan that builds ([`Program::build`]) as the fit; a model with no
-//! pinned plan that builds plans by the search ([`super::search`]). [`plan`] runs the pass over a
-//! trace; [`plan_shape`] does the same for a shape stated outright (a checkpoint with no catalog
-//! deployment, such as the tiny test checkpoints).
+//! The wafer's decode target: the model's [`Shape`] read off its trace ([`shape`], every running
+//! node given a phase by [`poem_compiler::spatial::layer::lower`] or refused by name), the role
+//! kernels its layers take ([`super::kernels::KernelSet`]), and its plan ([`plan`]): the search's
+//! fastest partition that builds ([`super::search`]), or a named plan asked for as a debug
+//! override ([`super::pins`]). [`plan_shape`] does the same for a shape stated outright (a
+//! checkpoint with no catalog deployment, such as the tiny test checkpoints).
 
-use poem_compiler::spatial::{BlockKind, SpatialGraph, SpatialTarget};
 use poem_ir::{
     Attn, Def, Elemwise, Gather, GluAct, Guard, Linear, NormAxis, NormWeight, Operation, RopeFreqs,
     RouteScore, Ssm, Trace, Turn, ValueId,
@@ -402,64 +400,49 @@ pub fn shape(trace: &Trace) -> R<Shape> {
     })
 }
 
-/// The plan the pass chose, with the preset (overrides set) it came from.
+/// The plan chosen, with the preset (overrides set) it came from.
 #[derive(Clone, Debug)]
 pub struct Planned {
     pub plan: Plan,
     pub preset: Preset,
 }
 
-/// A partition to try: a pinned plan's preset (the `order`-th tried), with the overrides set.
-#[derive(Clone, Debug)]
-pub struct Candidate {
-    pub kernels: KernelSet,
-    pub preset: Preset,
-    pub order: usize,
-}
-
-/// The wafer target for one shape: the pinned plan asked for (else the one made for it) and the
-/// overrides set over it.
-pub struct Wafer {
-    pub shape: Shape,
-    pub preset: Option<String>,
-    pub set: String,
+/// The wafer target for one shape: the named plan asked for (a debug override), the overrides
+/// set over it and the positions it must serve.
+struct Wafer {
+    shape: Shape,
+    preset: Option<String>,
+    set: String,
     /// The positions the program must serve (the serving context); `None`: as many as the
     /// preset holds.
-    pub positions: Option<u32>,
+    positions: Option<u32>,
 }
 
 impl Wafer {
-    /// The partitions to try: the named plan asked for (a debug override: it must be of the
-    /// shape's kernel set, [`crate::pins`]); none where none is named (the search plans it).
-    pub fn candidates(&self) -> Vec<Candidate> {
+    /// The named plan asked for, with the overrides set and the positions asked for: it must be
+    /// of the shape's kernel set ([`crate::pins`]).
+    fn named(&self) -> Option<Preset> {
+        let name = self.preset.as_ref()?;
         let kernels = KernelSet::of_shape(&self.shape);
-        crate::pins::of(kernels)
+        let p = crate::pins::of(kernels)
             .into_iter()
-            .filter(|p| self.preset.as_ref().is_some_and(|n| *n == p.name))
-            .enumerate()
-            .filter_map(|(order, p)| {
-                let mut preset = p.set(&self.set).ok()?;
-                if let Some(n) = self.positions {
-                    preset.keys.insert("CTX".into(), f64::from(n));
-                }
-                Some(Candidate {
-                    kernels,
-                    preset,
-                    order,
-                })
-            })
-            .collect()
+            .find(|p| p.name == *name)?;
+        let mut preset = p.set(&self.set).ok()?;
+        if let Some(n) = self.positions {
+            preset.keys.insert("CTX".into(), f64::from(n));
+        }
+        Some(preset)
     }
 
-    /// The plan `c` makes of the shape, serving exactly the positions asked for (if any).
-    pub fn plan_of(&self, c: &Candidate) -> R<Plan> {
-        let mut plan = super::floorplan::plan(&self.shape, &c.preset)?;
+    /// The plan `preset` makes of the shape, serving exactly the positions asked for (if any).
+    fn plan_of(&self, preset: &Preset) -> R<Plan> {
+        let mut plan = super::floorplan::plan(&self.shape, preset)?;
         if let Some(n) = self.positions {
             let held = plan.contract.positions;
             if n > held {
                 return Err(format!(
                     "preset {}: {n} positions, of at most {held}",
-                    c.preset.name
+                    preset.name
                 ));
             }
             plan.contract.positions = n;
@@ -471,7 +454,7 @@ impl Wafer {
         if held < u64::from(self.shape.vocab) {
             return Err(format!(
                 "preset {}: the head's {} rows of {} vocabulary rows hold {held} of {} tokens",
-                c.preset.name,
+                preset.name,
                 h.rows.max(h.cols),
                 h.vocab_rows,
                 self.shape.vocab
@@ -482,139 +465,50 @@ impl Wafer {
         if room < f64::from(super::build::STACK_ROOM) {
             return Err(format!(
                 "preset {}: the images leave {room:.0} B of stack room, under {} B",
-                c.preset.name,
+                preset.name,
                 super::build::STACK_ROOM
             ));
         }
         Ok(plan)
     }
 
-    /// `c` with the plan it makes.
-    fn planned(&self, c: Candidate) -> R<Planned> {
-        Ok(Planned {
-            plan: self.plan_of(&c)?,
-            preset: c.preset,
-        })
-    }
-
-    /// Whether `c`'s plan builds, or why not.
-    pub fn fit(&self, c: &Candidate) -> R<()> {
-        let plan = self.plan_of(c)?;
-        Program::build(plan)
-            .map(|_| ())
-            .map_err(|e| format!("preset {}: {e}", c.preset.name))
-    }
-
     /// The named plan asked for, if it builds; with none named, the search's fastest partition
     /// ([`crate::search`]).
-    pub fn choose(&self) -> R<Planned> {
-        let mut why = Vec::new();
-        for c in self.candidates() {
-            match self.fit(&c) {
-                Ok(()) => return self.planned(c),
-                Err(e) => why.push(e),
-            }
-        }
-        self.searched(why)
-    }
-
-    /// With no preset named, the search's fastest partition ([`crate::search`]); else (or if the
-    /// search finds none) the refusal of `why`.
-    fn searched(&self, mut why: Vec<String>) -> R<Planned> {
-        if self.preset.is_none() {
+    fn choose(&self) -> R<Planned> {
+        let Some(name) = &self.preset else {
             let ask = crate::search::Asked {
                 positions: self.positions,
                 set: self.set.clone(),
                 cold: false,
             };
-            match crate::search::search(&self.shape, &ask, 1) {
-                Ok(mut found) => return Ok(found.remove(0).planned),
-                Err(e) => why.push(e),
-            }
-        }
-        Err(self.refused(why))
-    }
-
-    fn refused(&self, why: Vec<String>) -> String {
-        match (&self.preset, why.is_empty()) {
-            (Some(p), true) => match crate::pins::named(p) {
+            return crate::search::search(&self.shape, &ask, 1).map(|mut f| f.remove(0).planned);
+        };
+        let Some(preset) = self.named() else {
+            return Err(match crate::pins::named(name) {
                 Some((l, _)) => format!(
-                    "the pinned plan {p} is a plan for the {} kernels; this model's layers take the {} kernels",
+                    "the pinned plan {name} is a plan for the {} kernels; this model's layers take the {} kernels",
                     l.name(),
                     KernelSet::of_shape(&self.shape).name()
                 ),
-                None => format!("no pinned plan {p}"),
-            },
-            (_, true) => "no pinned plan to try".into(),
-            _ => format!("no pinned plan builds: {}", why.join("; ")),
-        }
-    }
-}
-
-impl SpatialTarget for Wafer {
-    type Partition = Candidate;
-
-    /// Every node is the wafer's: the program lays out the whole model (its blocks are the
-    /// floorplan's elements, asked for by the shape's layers).
-    fn classify(&self, _trace: &Trace, _node: u32) -> Option<BlockKind> {
-        Some(BlockKind("wafer"))
-    }
-
-    fn candidates(&self, _trace: &Trace, _graph: &SpatialGraph) -> Vec<Candidate> {
-        Wafer::candidates(self)
-    }
-
-    fn fit(&self, _graph: &SpatialGraph, c: &Candidate) -> R<()> {
-        Wafer::fit(self, c)
-    }
-
-    fn cost(&self, _graph: &SpatialGraph, c: &Candidate) -> f64 {
-        c.order as f64
-    }
-}
-
-/// The plan of `trace` through poem's spatial pass: its shape, then the pinned plan `ask` names
-/// (else the one made for its shape, else the search's) with its overrides and positions.
-pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
-    let wafer = ask.target(shape(trace)?)?;
-    match poem_compiler::spatial::plan(trace, &wafer) {
-        Ok(p) => wafer.planned(p.partition),
-        Err(poem_compiler::spatial::SpatialError::Unfit(why)) => wafer.searched(why),
-        Err(poem_compiler::spatial::SpatialError::NoCandidate) => wafer.searched(Vec::new()),
-        Err(e) => Err(format!("{}: {e}", trace.name)),
-    }
-}
-
-/// The plans a load may fall back on past the search's choice.
-pub const FALLBACKS: usize = 3;
-
-/// Every plan of `trace` that builds, in the order [`plan`] prefers them (its choice first): a
-/// load takes the first (each held within its PEs' memory by the memory model already).
-pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
-    let wafer = ask.target(shape(trace)?)?;
-    if ask.preset.is_none() {
-        // the search's few fastest, its choice first
-        let asked = crate::search::Asked {
-            positions: ask.positions,
-            set: ask.set.clone(),
-            cold: false,
+                None => format!("no pinned plan {name}"),
+            });
         };
-        return crate::search::search(&wafer.shape, &asked, FALLBACKS)
-            .map(|v| v.into_iter().map(|s| s.planned).collect())
-            .map_err(|e| format!("{}: {e}", trace.name));
-    }
-    let mut why = Vec::new();
-    let mut fit = Vec::new();
-    for c in wafer.candidates() {
-        match wafer.fit(&c) {
-            Ok(()) => fit.push(wafer.planned(c)?),
-            Err(e) => why.push(e),
+        let built = self.plan_of(&preset).and_then(|plan| {
+            Program::build(plan.clone())
+                .map(|_| plan)
+                .map_err(|e| format!("preset {}: {e}", preset.name))
+        });
+        match built {
+            Ok(plan) => Ok(Planned { plan, preset }),
+            Err(e) => Err(format!("no pinned plan builds: {e}")),
         }
     }
-    if fit.is_empty() {
-        return wafer.searched(why).map(|p| vec![p]);
-    }
-    Ok(fit)
+}
+
+/// The plan of `trace`: its shape, then the named plan `ask` names (a debug override), else the
+/// search's, with its overrides and positions.
+pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
+    plan_shape(shape(trace)?, ask)
 }
 
 /// The plan of a shape stated outright, chosen as [`plan`] chooses.
@@ -850,14 +744,14 @@ mod tests {
         assert!(e.contains("is a plan for the shared kernels"), "{e}");
     }
 
-    /// The plans a load may fall back on start with the one `plan` chooses: a shipping model's
-    /// measured program.
+    /// With no plan named, a shipping model plans its measured program.
     #[test]
-    fn the_fallback_plans_start_with_the_choice() {
+    fn the_search_chooses_the_measured_program() {
         let t = trace("llama31-8b-bf16-kv-bf16");
-        let all = plans(&t, &Ask::default()).unwrap();
-        assert_eq!(all[0].plan, plan(&t, &Ask::preset("l3-8b")).unwrap().plan);
-        assert_eq!(all[0].plan, plan(&t, &Ask::default()).unwrap().plan);
+        assert_eq!(
+            plan(&t, &Ask::default()).unwrap().plan,
+            plan(&t, &Ask::preset("l3-8b")).unwrap().plan
+        );
     }
 
     /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
@@ -908,7 +802,7 @@ mod tests {
     #[test]
     fn a_model_no_preset_fits_is_planned_by_the_search() {
         let t = trace("qwen3-30b-a3b-mini-bf16-kv-bf16");
-        assert!(plans(&t, &Ask::preset("full")).is_err());
+        assert!(plan(&t, &Ask::preset("full")).is_err());
         let p = plan(&t, &Ask::default()).unwrap();
         assert!(p.preset.name.starts_with("search("), "{}", p.preset.name);
         let shapes = |n: &str| {
