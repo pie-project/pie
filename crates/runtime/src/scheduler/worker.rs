@@ -3973,6 +3973,101 @@ mod tests {
         let _ = lane.shutdown();
     }
 
+    /// An engine whose copies land when the test says: it keeps each
+    /// copy's landing end.
+    struct LateCopyEngine {
+        landings: Arc<std::sync::Mutex<Vec<::engine::CopyLanding>>>,
+    }
+
+    impl engine::Engine for LateCopyEngine {
+        fn kind(&self) -> &'static str {
+            "late-copy"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn submit(
+            &mut self,
+            _frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn copy_slots(
+            &mut self,
+            _copy: &::engine::chunk::SlotCopy,
+        ) -> engine::Result<::engine::CopyCompletion> {
+            let (landing, landed) = ::engine::completion::copy_in_flight();
+            self.landings.lock().unwrap().push(landing);
+            Ok(landed)
+        }
+    }
+
+    /// The lane answers a copy with its landing, not its enqueue: what
+    /// waits on a tracked copy (a park, a restore, a spill) goes on only
+    /// once the engine says the bytes are in place.
+    #[test]
+    fn a_tracked_copy_settles_when_it_lands_not_when_it_is_enqueued() {
+        let landings = Arc::default();
+        let mut lane = Lane::spawn(
+            9311,
+            Some(Box::new(LateCopyEngine {
+                landings: Arc::clone(&landings),
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let tracked = ControlCompletion::new();
+        let commit = within(
+            "the lane takes the copy",
+            lane.control(QueuedItem::CopyTracked {
+                plan: PreLaunchCopy::Slots(::engine::chunk::SlotCopy {
+                    shape: ::engine::chunk::ShapeId(0),
+                    src: ::engine::transfer::MemoryDomain::HostPinned,
+                    dst: ::engine::transfer::MemoryDomain::CudaDevice(0),
+                    slots: vec![(1, 2)],
+                    runs: Vec::new(),
+                }),
+                completion: tracked.clone(),
+            }),
+        )
+        .expect("the lane answers");
+        let LaneCommit::AsyncControl {
+            result: Ok(settles),
+        } = commit
+        else {
+            panic!("the engine took the copy");
+        };
+        assert!(
+            !settles.is_settled(),
+            "a copy the engine only enqueued is not settled"
+        );
+        let landing = landings.lock().unwrap().pop().expect("the engine kept it");
+        landing.landed();
+        assert!(settles.is_settled(), "settled once it landed");
+        within("the copy's completion", settles).expect("landed");
+        let _ = lane.shutdown();
+    }
+
     /// What [`HoldingEngine`] answers it holds back once it took a resident
     /// set.
     const HELD: u64 = 96 << 20;

@@ -1660,6 +1660,47 @@ impl SlotPool {
         }
     }
 
+    /// [`Self::touch`] of slot refs `refs` of `shape` (ref `r` is slot
+    /// `r % per_chunk` of chunk `r / per_chunk`), each where it is handed
+    /// out for that shape; a ref naming nothing handed out (a stale one, or
+    /// the null chunk's) is passed over. One pass a ref: a fire touches
+    /// every slot its lanes name.
+    pub fn touch_held(&mut self, shape: ShapeId, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+        let Some(state) = self.shapes.get_mut(shape as usize) else {
+            return;
+        };
+        let spc = state.spc();
+        // A table's refs run through a chunk in turn: its frame is looked up
+        // once a chunk, not once a slot.
+        let mut at: Option<(u32, Option<u32>)> = None;
+        for slot_ref in refs {
+            let (chunk, index) = (slot_ref / spc, slot_ref % spc);
+            let frame = match at {
+                Some((last, frame)) if last == chunk => frame,
+                _ => {
+                    let frame = self
+                        .chunks
+                        .get(chunk as usize)
+                        .filter(|meta| meta.shape == shape)
+                        .map(|meta| meta.frame);
+                    at = Some((chunk, frame));
+                    frame
+                }
+            };
+            let Some(frame) = frame else {
+                continue;
+            };
+            let word = frame as usize * state.words + (index / WORD) as usize;
+            if state.free[word] & (1 << (index % WORD)) != 0 {
+                continue;
+            }
+            let refs = &mut state.refs[(frame * spc + index) as usize];
+            if refs.touched < epoch {
+                refs.touched = epoch;
+            }
+        }
+    }
+
     /// Drops `holder`'s reference on each of `slots`. A slot no one holds
     /// any more is handed out again once the later of `epoch` and the last
     /// fire that touched it retires.
@@ -1753,6 +1794,16 @@ impl SlotPool {
     /// Slots let go and waiting on a fire.
     pub fn pending_slots(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
+    }
+
+    /// Slots of `shape` let go and waiting on a fire: arriving, each as the
+    /// fire it waits on lands.
+    pub fn pending_of(&self, shape: ShapeId) -> u64 {
+        self.pending
+            .values()
+            .flatten()
+            .filter(|slot| self.chunks[slot.chunk as usize].shape == shape)
+            .count() as u64
     }
 
     fn locate(&mut self, slot: Slot) -> (&mut ShapeState, usize) {

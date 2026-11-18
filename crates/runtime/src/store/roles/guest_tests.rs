@@ -1669,3 +1669,45 @@ fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
     );
     assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(200), holder(300)]);
 }
+
+/// A bind reusing a pair's state another process's instance holds (taken
+/// by `take_bind`, the roles' lock let go for the engine's bind) while that
+/// process parks: the bind attaches to the pair, so it stays on the device
+/// and is not parked or freed under the bind ([`super::Item::pending`],
+/// counted from the take, let go at `bound` or `untake`); the bind lands
+/// on it. Parked, it would have been refused at `bound` as moved off the
+/// device.
+#[test]
+fn a_pair_a_bind_reuses_does_not_park_under_it() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let pair = super::FireKey {
+        program: PROGRAM,
+        extents: BindExtents::default(),
+    };
+    let was = roles.lock().unwrap().slots(Owner::Pair(pair));
+    assert!(!was.is_empty());
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        ..InstanceBinding::default()
+    };
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, None).unwrap();
+    // The pair's only holder parks while the bind is under way.
+    let parked = roles.lock().unwrap().prepare_park(holder(1));
+    if let Some(park) = parked {
+        roles.lock().unwrap().commit(park);
+    }
+    assert_eq!(
+        roles.lock().unwrap().slots(Owner::Pair(pair)),
+        was,
+        "the pair a bind reuses moved under it"
+    );
+    let second = bind_taken(Some(&roles), &mut engine, &binding, Some(holder(2)), taken)
+        .expect("the bind lands on the pair it took")
+        .id;
+    assert_eq!(engine.bindings[1].pair, engine.bindings[0].pair);
+    roles.lock().unwrap().close_instance(second);
+    roles.lock().unwrap().close_instance(first);
+    let _ = held(&device);
+}

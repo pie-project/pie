@@ -182,6 +182,13 @@ pub struct KvStore {
     log_seq: u64,
     seq: u64,
     outstanding: BTreeSet<u64>,
+    /// The engine's shared pool and its host tier, whose slots wait on
+    /// these epochs: a slot let go is handed out again only once the last
+    /// fire or copy that touched it retires ([`SlotPool::touch`]), so each
+    /// retires through the epochs this store retires.
+    ///
+    /// [`SlotPool::touch`]: crate::store::slots::SlotPool::touch
+    fenced: Vec<crate::store::shared::Shared>,
     moved: Arc<tokio::sync::Notify>,
     /// Told when pages may have joined the cache: a fire's pages settle, or
     /// a working set is released and keeps its sealed prefix.
@@ -430,6 +437,7 @@ impl KvStore {
             log_seq: 0,
             seq: 0,
             outstanding: BTreeSet::new(),
+            fenced: Vec::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
             cached: Arc::new(tokio::sync::Notify::new()),
             changed: Arc::new(tokio::sync::Notify::new()),
@@ -629,8 +637,32 @@ impl KvStore {
         self.seq
     }
 
+    /// Opens the epoch of a copy about to be handed to the engine: as a
+    /// fire's, closed by [`Self::settle`], once the copy has landed (not
+    /// once it is enqueued). The slots it names are touched at it, so a
+    /// slot let go while the copy runs waits for it.
+    pub fn begin_copy(&mut self) -> u64 {
+        self.begin_fire()
+    }
+
+    /// The pools whose slots wait on this store's epochs: an engine's
+    /// shared pool, and its host tier.
+    pub fn fence_pools(&mut self, pools: Vec<crate::store::shared::Shared>) {
+        self.fenced = pools;
+    }
+
     pub fn retire_idle(&mut self) {
-        self.pool.retire_through(self.retired_through());
+        let retired = self.retired_through();
+        self.pool.retire_through(retired);
+        for pool in &self.fenced {
+            pool.lock().unwrap().pool_mut().retire_through(retired);
+        }
+    }
+
+    /// The fires' and copies' epochs still open, and the oldest of them:
+    /// what everything let go behind it waits on.
+    pub fn open_epochs(&self) -> (usize, Option<u64>) {
+        (self.outstanding.len(), self.outstanding.first().copied())
     }
 
     /// The last epoch every fire through which has retired.
@@ -3070,6 +3102,12 @@ impl KvStore {
 
     pub fn free_committed(&self) -> usize {
         self.pool.available()
+    }
+
+    /// Device pages let go that wait only on a fire or copy in flight: they
+    /// come back, each as the work naming it lands.
+    pub fn arriving_pages(&self) -> usize {
+        self.pool.arriving()
     }
 
     pub fn note_short(&mut self, pages: u32) {

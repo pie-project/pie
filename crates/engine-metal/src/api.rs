@@ -778,7 +778,7 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
@@ -1161,7 +1161,7 @@ impl Engine for Metal {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {

@@ -331,6 +331,20 @@ impl<I: PoolId> ShapePool<I> {
             .map_or(0, |segment| segment + 1)
     }
 
+    /// Ids let go and waiting on a fire still in flight, here or (a shared
+    /// pool's shape) in the pool: free as each lands.
+    pub fn arriving(&self) -> usize {
+        let here: usize = self.pending.iter().map(|(_, ids)| ids.len()).sum();
+        let pooled = match &self.slots {
+            Backing::Own(pool) => pool.pending_of(0) as usize,
+            Backing::Records(_) => 0,
+            Backing::Shape(shared, shape) => {
+                shared.lock().unwrap().pool().pending_of(*shape) as usize
+            }
+        };
+        here + pooled
+    }
+
     /// Free ids.
     pub fn available(&self) -> usize {
         match &self.slots {

@@ -1978,10 +1978,30 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`.
-    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+    /// Commits `frame`, a copy, as the grafted buffer the next fire queues
+    /// behind, and answers the runtime's end of it ([`Frame::commit_copy`]):
+    /// the copy's slots are handed on only once it landed (CONTRACT-BC 23);
+    /// a drain waits the buffer out on the host as before.
+    ///
+    /// [`Frame::commit_copy`]: crate::device::ctx::Frame::commit_copy
+    fn graft_copy(&mut self, frame: crate::device::ctx::Frame) -> Result<engine::CopyCompletion> {
+        let (pending, completion) = frame.commit_copy()?;
+        self.grafted = Some(pending);
+        Ok(completion)
+    }
+
+    /// A copy that names no slot: nothing is enqueued, so it has landed.
+    fn nothing_copied() -> engine::CopyCompletion {
+        let (landing, completion) = engine::completion::copy_in_flight();
+        landing.landed();
+        completion
+    }
+
+    /// See `Engine::copy_slots`: the copy's completion resolves when its
+    /// buffer retires.
+    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<engine::CopyCompletion> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(Self::nothing_copied());
         }
         self.drain()?;
         // Every fold has landed and been told once drained: a record moved
@@ -1996,8 +2016,7 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
+        self.graft_copy(frame)
     }
 
     /// See `Engine::read_tier_slots`: every frame and copy lands first.
@@ -2319,14 +2338,15 @@ impl Shell {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
+    /// Copies kv token runs on the device; the completion resolves when
+    /// the copy's buffer retires.
+    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<engine::CopyCompletion> {
         if moves.is_empty() {
-            return Ok(());
+            return Ok(Self::nothing_copied());
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_kv(&mut frame, moves)?;
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
+        self.graft_copy(frame)
     }
 
     /// Unstated `budget`: `seats` sequences at `context` and at least the pool,

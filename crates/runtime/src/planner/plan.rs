@@ -55,6 +55,8 @@ enum Step {
         key: EntryKey,
         run: u32,
         pieces: u32,
+        /// The kv pages that, moved out whole, free its runs.
+        pages: u32,
     },
     Release(DevicePageReservation),
     Done,
@@ -133,7 +135,12 @@ impl ResidencyPlanner {
                     return Step::Done;
                 };
                 if let WaitKind::BindRoom { run, pieces, .. } = waiter.kind {
-                    return Step::BindRoom { key, run, pieces };
+                    return Step::BindRoom {
+                        key,
+                        run,
+                        pieces,
+                        pages: inner.room_pages(waiter),
+                    };
                 }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
@@ -180,11 +187,22 @@ impl ResidencyPlanner {
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
-                Step::BindRoom { key, run, pieces } => {
+                Step::BindRoom {
+                    key,
+                    run,
+                    pieces,
+                    pages,
+                } => {
                     // Its runs stand free: the bind takes them.
                     if self.port.guest_room_free(run, pieces) {
                         self.serve_bind_room(key);
                         continue;
+                    }
+                    // Pages arriving as the work in flight lands may free
+                    // its chunks: it waits for that landing (which plans
+                    // again) before any cache is dropped or anyone moved.
+                    if self.arrivals_cover(pages) {
+                        return false;
                     }
                     // As a restore short of room for its roles: idle cache
                     // first, one set or a sweep, and it looks again in what
@@ -206,6 +224,9 @@ impl ResidencyPlanner {
                     if self.port.guest_room_free(need.run, need.pieces) {
                         room_stood = Some(key);
                         continue;
+                    }
+                    if self.arrivals_cover(need.pages) {
+                        return false;
                     }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
@@ -244,6 +265,12 @@ impl ResidencyPlanner {
                         },
                     ) {
                         return true;
+                    }
+                    // Pages let go under device work in flight come back
+                    // as it lands, and its settling plans again: a head
+                    // they cover waits for them rather than moving anyone.
+                    if self.arrivals_cover(count) {
+                        return false;
                     }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
