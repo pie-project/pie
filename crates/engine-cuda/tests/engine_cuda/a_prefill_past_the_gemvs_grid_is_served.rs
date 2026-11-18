@@ -193,6 +193,10 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            // The fire this proves is one of the ceiling's rows: the load
+            // lays its rungs to them, not to the top the estimate would
+            // choose for serving (which chunks a prompt below it).
+            every_rung: Some(engine_cuda::EveryRung::To(fixture.text.ceiling)),
             pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
