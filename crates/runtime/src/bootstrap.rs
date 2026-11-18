@@ -632,12 +632,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 interval.tick().await;
                 let d = planner.diagnostics();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
+                let (model, engine) = planner.locus();
+                let (epochs_open, epoch_behind) = crate::store::registry::try_get(model, engine)
+                    .map(|stores| {
+                        crate::store::registry::with_kv_lock(&stores.kv, "trace", |kv| {
+                            let (open, oldest) = kv.open_epochs();
+                            (open, oldest.map_or(0, |oldest| kv.current_epoch() - oldest))
+                        })
+                    })
+                    .unwrap_or_default();
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }
                 println!(
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
-                     free={}/{} arriving={} arrival_waits={} host_free={}/{} head_rs={} rs_free={}/{} \
+                     free={}/{} arriving={} arrival_waits={} epochs_open={} epoch_behind={} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
@@ -658,6 +667,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.device_pages_total,
                     d.device_pages_arriving,
                     d.arrival_waits_total,
+                    epochs_open,
+                    epoch_behind,
                     d.host_slots_free,
                     d.host_slots_total,
                     d.queue.first().map_or(0, |w| w.rs.slots),

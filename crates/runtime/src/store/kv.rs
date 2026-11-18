@@ -648,6 +648,12 @@ impl KvStore {
         }
     }
 
+    /// The fires' and copies' epochs still open, and the oldest of them:
+    /// what everything let go behind it waits on.
+    pub fn open_epochs(&self) -> (usize, Option<u64>) {
+        (self.outstanding.len(), self.outstanding.first().copied())
+    }
+
     /// The last epoch every fire through which has retired.
     pub fn retired_through(&self) -> u64 {
         self.outstanding
