@@ -193,10 +193,7 @@ impl Model {
             .and_then(|p| p.shape.first().copied())
             .map_or(1000, |v| u32::try_from(v).unwrap_or(1000));
         let facts = trace.facts.clone();
-        // `PREWARM` 1: the warm ladder runs at load (the speed probe: serving
-        // fires then run only programs it prepared)
         let boot = DeviceBoot {
-            prewarm: knob("PREWARM", 0) == 1,
             pool_extra_chunks: extra,
             ..DeviceBoot::default()
         };

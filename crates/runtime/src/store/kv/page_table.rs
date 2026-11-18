@@ -1669,6 +1669,18 @@ impl KvPageTable {
         })
     }
 
+    /// How many pages only the cache reads of `roots` sit below the device,
+    /// `(on the host, on disk)`: room a demand can take by dropping them.
+    pub fn cache_only_below_device(&self, roots: &[NodeId]) -> (u32, u32) {
+        let pages = self.cache_only(roots, &[], |backing| match backing {
+            KvPageBacking::Swapped(_) => Some(true),
+            KvPageBacking::OnDisk(_) => Some(false),
+            KvPageBacking::Resident(_) => None,
+        });
+        let host = pages.iter().filter(|&&(_, on_host)| on_host).count() as u32;
+        (host, pages.len() as u32 - host)
+    }
+
     /// The pages of `roots` no working set, pin, move or root of `above`
     /// reads, as `pick` takes their backings.
     fn cache_only<T>(

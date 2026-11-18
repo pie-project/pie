@@ -958,33 +958,31 @@ impl FireCtx<'_> {
         // eagerly: nothing launches, and a capture would record nothing. It
         // walks across the side streams where the capture would, so each
         // scratch slab is asked for under the stream and lane the body's
-        // regions take it on.
+        // regions take it on. A composition no body carries is walked as
+        // serving walks it, on the one stream: it captures nothing, but its
+        // fire takes its slabs eagerly, and only a walk lays them.
         #[cfg(feature = "rocm")]
         let (rocm_before, compiled_before) = (
             kernels_rocm::tally::counts(),
             self.live.tallied(engine::live::Tally::Compiled),
         );
         let walked = if records && crate::sizing::active() {
-            if self.arming && !p.bodied {
-                Ok(())
-            } else {
-                let lanes = forked.filter(|_| {
-                    p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.islands)
-                });
-                let mut cursor = match lanes {
-                    Some(lanes) => Cursor::across(&place, lanes),
-                    None => Cursor::new(&place),
-                };
-                walk(
-                    self.trace,
-                    self.compiled,
-                    &p.descriptor,
-                    &mut run,
-                    &mut cursor,
-                    Filter::default(),
-                )
-                .map_err(Fault::from)
-            }
+            let lanes = forked.filter(|_| {
+                p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.islands)
+            });
+            let mut cursor = match lanes {
+                Some(lanes) => Cursor::across(&place, lanes),
+                None => Cursor::new(&place),
+            };
+            walk(
+                self.trace,
+                self.compiled,
+                &p.descriptor,
+                &mut run,
+                &mut cursor,
+                Filter::default(),
+            )
+            .map_err(Fault::from)
         } else if records {
             if self.arming && !p.bodied {
                 Ok(())

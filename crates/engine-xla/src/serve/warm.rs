@@ -1,5 +1,5 @@
-//! Warm fires at load (`[engine] prewarm = true`): the fire shapes a server meets
-//! first are traced, compiled (or loaded from the disk cache, where a warm
+//! Warm fires at load, every load, before it answers ready: the fire shapes a
+//! server meets are traced, compiled (or loaded from the disk cache, where a warm
 //! machine finds them) and run once before the first request, as engine-cuda
 //! arms its bodies (`serve/arming.rs`), so no request waits on a compile.
 //!
@@ -47,6 +47,14 @@ impl Shell {
                 !shell.masked.contains(class)
                     && !shell.wide.contains(class)
                     && !shell.corrected.contains(class)
+                    // a class reading a guest input fires only with its
+                    // channel's cell, which a synthetic lane has none of
+                    && !shell
+                        .dit
+                        .feeds()
+                        .inputs
+                        .iter()
+                        .any(|(_, readers)| readers.contains(class))
             })
         };
         if !plain(self, decode) || !plain(self, prefill) || self.patch_seat.is_some() {
