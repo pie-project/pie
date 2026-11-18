@@ -361,57 +361,21 @@ pub(crate) fn release_pages(plane: &[u8]) {
     }
 }
 
+/// What the host can give ([`engine::host::HostMemory::free`]: the smaller
+/// of `MemAvailable` and what the memory cgroup leaves, net of its page
+/// cache). A host with no `/proc/meminfo` (Windows) leaves the device's own
+/// limits to decide, as it always has here.
 pub(crate) fn available_memory() -> u64 {
-    let read = |path: &str| std::fs::read_to_string(path).ok();
-    // cgroup v2 names the limit `memory.max`; a v1 hierarchy (many docker
-    // hosts still) names it `memory.limit_in_bytes`, its usage
-    // `memory.usage_in_bytes`, and keeps its own counters under `memory/`.
-    let (max, current, stat) = match read("/sys/fs/cgroup/memory.max") {
-        Some(max) => (
-            Some(max),
-            read("/sys/fs/cgroup/memory.current"),
-            read("/sys/fs/cgroup/memory.stat"),
-        ),
-        None => (
-            read("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-            read("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
-            read("/sys/fs/cgroup/memory/memory.stat"),
-        ),
-    };
-    headroom(
-        read("/proc/meminfo").as_deref(),
-        max.as_deref(),
-        current.as_deref(),
-        stat.as_deref(),
-    )
+    host_memory().free()
 }
 
-/// `memory.current` counts the page cache the group's reads left behind, which
-/// reclaim hands back on demand, so it is netted out as `MemAvailable` does.
-fn headroom(
-    meminfo: Option<&str>,
-    max: Option<&str>,
-    current: Option<&str>,
-    stat: Option<&str>,
-) -> u64 {
-    let field = |text: Option<&str>, key: &str| -> Option<u64> {
-        text?.lines().find_map(|line| {
-            let rest = line.strip_prefix(key)?;
-            rest.trim().trim_end_matches("kB").trim().parse().ok()
-        })
-    };
-    let number = |text: Option<&str>| -> Option<u64> { text?.trim().parse().ok() };
-    let host = field(meminfo, "MemAvailable:").map(|kb| kb * 1024);
-    let cgroup = number(max).zip(number(current)).map(|(max, current)| {
-        let cached =
-            field(stat, "inactive_file ").unwrap_or(0) + field(stat, "active_file ").unwrap_or(0);
-        max.saturating_sub(current.saturating_sub(cached))
-    });
-    match (host, cgroup) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) => u64::MAX,
-    }
+/// The host's memory ([`engine::host::HostMemory::read`]); a host with no
+/// `/proc/meminfo` reads as unbounded ([`available_memory`]).
+pub(crate) fn host_memory() -> engine::host::HostMemory {
+    engine::host::HostMemory::read().unwrap_or(engine::host::HostMemory {
+        available: u64::MAX,
+        cgroup: None,
+    })
 }
 
 struct Volume {
@@ -2366,58 +2330,5 @@ mod tests {
         assert_eq!(places[0].rows, 248_320);
         assert_eq!(places[0].width, 1024);
         assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
-    }
-
-    #[test]
-    fn the_headroom_nets_the_cgroups_page_cache_out_of_its_usage() {
-        let meminfo = "MemAvailable:   743437580 kB\n";
-        let stat = "anon 758157312\ninactive_file 23216467968\nactive_file 66810552320\n";
-        let pod = headroom(
-            Some(meminfo),
-            Some("93999996928\n"),
-            Some("93473275904\n"),
-            Some(stat),
-        );
-        assert_eq!(
-            pod,
-            93_999_996_928 - (93_473_275_904 - 23_216_467_968 - 66_810_552_320)
-        );
-        assert_eq!(
-            headroom(
-                None,
-                Some("100\n"),
-                Some("100\n"),
-                Some("inactive_file 500\n")
-            ),
-            100
-        );
-    }
-
-    #[test]
-    fn a_v1_cgroup_limit_caps_the_headroom_below_the_hosts() {
-        // A docker container on a v1 hierarchy: 1.3 TB free on the host,
-        // 377 GB the container may hold, 1.4 GB of it used. `memory.stat`
-        // there also carries `total_*` lines, which are not the group's own.
-        let meminfo = "MemAvailable:   1383000000 kB\n";
-        let stat = "cache 0\ninactive_file 0\nactive_file 0\ntotal_inactive_file 99\n";
-        assert_eq!(
-            headroom(
-                Some(meminfo),
-                Some("376999997440\n"),
-                Some("1476259840\n"),
-                Some(stat)
-            ),
-            376_999_997_440 - 1_476_259_840
-        );
-        // v1 says "unlimited" with a number near 2^63: the host decides.
-        assert_eq!(
-            headroom(
-                Some(meminfo),
-                Some("9223372036854771712\n"),
-                Some("1476259840\n"),
-                Some(stat)
-            ),
-            1_383_000_000 * 1024
-        );
     }
 }

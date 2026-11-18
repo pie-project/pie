@@ -543,6 +543,17 @@ impl Context {
         &self.core.name
     }
 
+    /// Whether the device's memory is the host's: an integrated or CPU
+    /// adapter, or any on Android, as the adapter states its type.
+    #[must_use]
+    pub fn shares_host_memory(&self) -> bool {
+        cfg!(target_os = "android")
+            || matches!(
+                self.core.info.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+            )
+    }
+
     #[must_use]
     pub fn backend(&self) -> &'static str {
         self.core.info.backend.to_str()

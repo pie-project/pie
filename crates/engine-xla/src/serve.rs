@@ -1311,8 +1311,9 @@ impl Shell {
     }
 
     /// Seats the host tier, `host` bytes of whole chunks (`None`: as many as
-    /// the device pool holds), and the slot file `disk` names
-    /// (`(dir, bytes, persistent)`), kv list slots.
+    /// the device pool holds, within what the host can give by the shared
+    /// rule, [`engine::host::default_host_kv`]), and the slot file `disk`
+    /// names (`(dir, bytes, persistent)`), kv list slots.
     pub fn seat_tiers(
         &mut self,
         host: Option<u64>,
@@ -1321,7 +1322,26 @@ impl Shell {
         let chunk = self.pools.layout().chunk_bytes;
         let chunks = match host {
             Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
-            None => self.pools.chunks().saturating_sub(2),
+            None => {
+                let pool = u64::from(self.pools.chunks().saturating_sub(2)) * chunk;
+                let host = engine::host::HostMemory::read().map_err(|why| Fault::Device {
+                    call: "reading the host's memory for the host kv tier",
+                    why,
+                })?;
+                let kv = engine::host::default_host_kv(&host, pool, pool, 1);
+                tracing::info!(
+                    available = host.available,
+                    cgroup_max = host.cgroup.map(|group| group.max),
+                    cgroup_current = host.cgroup.map(|group| group.current),
+                    cgroup_reclaimable = host.cgroup.map(|group| group.reclaimable),
+                    free = kv.free,
+                    held_back = kv.held_back,
+                    pool,
+                    budget = kv.budget,
+                    "the host kv tier is the device pool's worth within what the host can give"
+                );
+                u32::try_from(kv.budget / chunk.max(1)).unwrap_or(u32::MAX)
+            }
         };
         self.host = crate::store::tier::Host::new(chunks, chunk);
         self.disk = match (disk, self.pools.layout().kv()) {

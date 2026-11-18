@@ -610,6 +610,12 @@ impl Engine for Metal {
         // move kv and rs slots within the same DRAM: one is seated only
         // where its budget is stated (it frees room in the pool's heap, not
         // memory), and suspended slots otherwise go straight to disk.
+        if residency.host_kv_budget.is_none() {
+            tracing::info!(
+                "no host kv tier: the device pool is the host's unified memory, so a tier would \
+                 only move kv within the same DRAM (budget_host states one)"
+            );
+        }
         shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
         shell
             .seat_disk_kv(

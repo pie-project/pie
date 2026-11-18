@@ -1660,8 +1660,15 @@ impl<B: Serve> Shell<B> {
             slots,
             ..asked
         };
-        let host_chunks =
-            host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
+        let host_chunks = u32::try_from(
+            host_kv_bytes::<B>(
+                &device,
+                host_kv_budget,
+                u64::from(total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c))) * chunk,
+                u64::from(layout.seat_chunks()) * chunk,
+            )? / chunk,
+        )
+        .unwrap_or(u32::MAX);
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
         let row_caches = crate::store::rows::RowCaches::new(
@@ -5767,9 +5774,191 @@ impl<B: Serve> Shell<Named<B>> {
     }
 }
 
+
+/// How a load's host kv tier is sized ([`host_tier`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostTier {
+    /// The operator's `budget_host`.
+    Stated(u64),
+    /// None: the device's memory is the host's, so a tier would only move
+    /// kv within the same RAM.
+    Shared,
+    /// None: this host's memory has no reader here (off Linux), why named.
+    Unread(String),
+    /// The shared rule over what the host can give.
+    Derived(engine::host::HostMemory, engine::host::HostKv),
+}
+
+impl HostTier {
+    fn bytes(&self) -> u64 {
+        match self {
+            HostTier::Stated(bytes) => *bytes,
+            HostTier::Shared | HostTier::Unread(_) => 0,
+            HostTier::Derived(_, kv) => kv.budget,
+        }
+    }
+}
+
+/// The host kv tier: the operator's `budget_host` where stated; none where
+/// the device's memory is the host's (`shares_host`); else the shared rule
+/// over what `reading` says the host can give
+/// ([`engine::host::default_host_kv`]: a device pool's worth, `pool` bytes,
+/// up to the load's seats at full context, `seated` bytes, at most
+/// [`engine::host::HOST_POOLS`] pools, within half of what the host has
+/// past the floor). A reading that cannot be taken is refused by name on
+/// Linux, and named with no tier where no reader is built.
+fn host_tier(
+    stated: Option<u64>,
+    shares_host: bool,
+    reading: impl FnOnce() -> std::result::Result<engine::host::HostMemory, String>,
+    pool: u64,
+    seated: u64,
+) -> Result<HostTier> {
+    if let Some(bytes) = stated {
+        return Ok(HostTier::Stated(bytes));
+    }
+    if shares_host {
+        return Ok(HostTier::Shared);
+    }
+    match reading() {
+        Ok(host) => Ok(HostTier::Derived(
+            host,
+            engine::host::default_host_kv(&host, pool, seated, 1),
+        )),
+        Err(why) if !cfg!(any(target_os = "linux", target_os = "android")) => {
+            Ok(HostTier::Unread(why))
+        }
+        Err(why) => Err(Fault::Device {
+            call: "reading the host's memory for the host kv tier",
+            why,
+        }),
+    }
+}
+
+/// The host kv tier's bytes for this load ([`host_tier`]), its inputs
+/// logged.
+fn host_kv_bytes<B: Serve>(
+    device: &B::Context,
+    stated: Option<u64>,
+    pool: u64,
+    seated: u64,
+) -> Result<u64> {
+    let tier = host_tier(
+        stated,
+        device.shares_host_memory(),
+        engine::host::HostMemory::read,
+        pool,
+        seated,
+    )?;
+    match &tier {
+        HostTier::Stated(bytes) => {
+            tracing::info!(budget = bytes, "the host kv tier is the stated budget_host");
+        }
+        HostTier::Shared => tracing::info!(
+            device = device.name(),
+            "no host kv tier: the device's memory is the host's, so a tier would only move kv \
+             within the same RAM (budget_host states one)"
+        ),
+        HostTier::Unread(why) => tracing::warn!(
+            why,
+            "no host kv tier: this host's memory has no reader here, so none is derived \
+             (budget_host states one)"
+        ),
+        HostTier::Derived(host, kv) => tracing::info!(
+            available = host.available,
+            cgroup_max = host.cgroup.map(|group| group.max),
+            cgroup_current = host.cgroup.map(|group| group.current),
+            cgroup_reclaimable = host.cgroup.map(|group| group.reclaimable),
+            free = kv.free,
+            held_back = kv.held_back,
+            pool,
+            seated,
+            budget = kv.budget,
+            "the host kv tier is derived from what the host can give: the smaller of \
+             MemAvailable and the cgroup's room net of its page cache, less the floor; half \
+             held back for other loads; a device pool's worth up to the seats"
+        ),
+    }
+    Ok(tier.bytes())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReadSpan, SpanCopy, span_copies};
+    use super::{HostTier, ReadSpan, SpanCopy, host_tier, span_copies};
+    use engine::host::HostMemory;
+
+    const GIB: u64 = 1 << 30;
+
+    /// No cgroup: the host's `MemAvailable` decides, less the floor, half
+    /// held back; a 20 GiB pool with 60 GiB of seats seats the seats.
+    #[test]
+    fn with_no_cgroup_the_tier_is_derived_from_mem_available() {
+        let tier = host_tier(
+            None,
+            false,
+            || HostMemory::of("MemAvailable:   209715200 kB\n", Some("max\n"), None, None),
+            20 * GIB,
+            60 * GIB,
+        )
+        .unwrap();
+        let HostTier::Derived(host, kv) = tier.clone() else {
+            panic!("{tier:?}");
+        };
+        assert_eq!(host.free(), 200 * GIB);
+        assert_eq!(kv.free, 200 * GIB - engine::SAFETY_FLOOR_BYTES);
+        assert_eq!(tier.bytes(), 60 * GIB);
+    }
+
+    /// This box: 251 GB of RAM with 230 GB available, a 62 GB cgroup
+    /// holding 40 GB of which 30 GB is page cache. The cgroup's room, net
+    /// of its page cache, decides: half of 52 GB past the floor.
+    #[test]
+    fn a_cgroup_under_mem_available_decides_net_of_its_page_cache() {
+        let stat = "anon 9000000000\ninactive_file 20000000000\nactive_file 10000000000\n";
+        let tier = host_tier(
+            None,
+            false,
+            || {
+                HostMemory::of(
+                    "MemAvailable:   230000000 kB\n",
+                    Some("62000000000\n"),
+                    Some("40000000000\n"),
+                    Some(stat),
+                )
+            },
+            20 * GIB,
+            60 * GIB,
+        )
+        .unwrap();
+        let free = 52_000_000_000 - engine::SAFETY_FLOOR_BYTES;
+        assert_eq!(tier.bytes(), free / 2);
+        assert!(tier.bytes() > 0);
+    }
+
+    /// A stated budget wins, read or not; a device whose memory is the
+    /// host's seats none unstated; a reading that cannot be taken on Linux
+    /// is refused by name, never a silent 0.
+    #[test]
+    fn a_stated_budget_wins_and_an_unread_host_is_refused_by_name() {
+        let unread = || Err("the host has no /proc/meminfo".to_string());
+        assert_eq!(
+            host_tier(Some(3 * GIB), false, unread, 20 * GIB, 60 * GIB).unwrap(),
+            HostTier::Stated(3 * GIB)
+        );
+        assert_eq!(
+            host_tier(Some(3 * GIB), true, unread, 20 * GIB, 60 * GIB).unwrap(),
+            HostTier::Stated(3 * GIB)
+        );
+        assert_eq!(
+            host_tier(None, true, unread, 20 * GIB, 60 * GIB).unwrap(),
+            HostTier::Shared
+        );
+        let refused = host_tier(None, false, unread, 20 * GIB, 60 * GIB);
+        if cfg!(target_os = "linux") {
+            let why = format!("{:?}", refused.expect_err("refused"));
+            assert!(why.contains("host kv tier") && why.contains("meminfo"), "{why}");
+        }
+    }
     use poem_ir::Dtype;
 
     const SENTINEL: u8 = 0xAA;

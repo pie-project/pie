@@ -18,6 +18,7 @@ pub mod error;
 pub mod fire;
 pub mod fit;
 pub mod frame;
+pub mod host;
 pub mod live;
 pub mod load;
 pub mod memory;

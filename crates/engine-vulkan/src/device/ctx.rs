@@ -189,6 +189,10 @@ pub(crate) struct Core {
     /// it has, the most the load may hold in all, read when the device
     /// bound ([`host_ceiling`]).
     ceiling: Option<u64>,
+    /// Whether the device's memory is the host's: every Android device; an
+    /// integrated or CPU device; one whose largest device-local heap the
+    /// host maps, where the driver states no other type.
+    shares_host: bool,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
@@ -778,7 +782,7 @@ impl Context {
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
         // Read before the device is made, so a refusal leaves nothing to free.
-        let ceiling = {
+        let (ceiling, shares_host) = {
             // SAFETY: `physical` was enumerated from the live `instance`.
             let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
             let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
@@ -802,7 +806,10 @@ impl Context {
                 vk::PhysicalDeviceType::DISCRETE_GPU => false,
                 _ => mapped,
             };
-            host_ceiling(&name, shares_host, memory_budget)?
+            (
+                host_ceiling(&name, shares_host, memory_budget)?,
+                cfg!(target_os = "android") || shares_host,
+            )
         };
         let coopmat_ext = has_extension(&device_exts, ash::khr::cooperative_matrix::NAME);
 
@@ -1033,6 +1040,7 @@ impl Context {
             cores,
             device_local,
             ceiling,
+            shares_host,
             heap,
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -1089,6 +1097,12 @@ impl Context {
     pub fn host_room(&self) -> Option<engine::HostRoom> {
         self.core.ceiling?;
         Some(host_room_reader())
+    }
+
+    /// Whether the device's memory is the host's ([`Core::shares_host`]).
+    #[must_use]
+    pub fn shares_host_memory(&self) -> bool {
+        self.core.shares_host
     }
 
     #[must_use]
