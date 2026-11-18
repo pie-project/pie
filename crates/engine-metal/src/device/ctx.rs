@@ -111,6 +111,13 @@ pub struct Context {
     /// What [`Frame::barrier`] signals and waits on, and the value it last set.
     #[cfg(target_vendor = "apple")]
     barrier: (Retained<ProtocolObject<dyn MTLEvent>>, std::cell::Cell<u64>),
+    /// Orders every pass after the one before it, across frames on the
+    /// queue: each compute or blit pass waits on it at its start and
+    /// updates it at its end. The pool's heap is untracked, so Metal
+    /// orders nothing between two passes that reach it through it; without
+    /// this a pass could start while the one before still writes there.
+    #[cfg(target_vendor = "apple")]
+    order: Retained<ProtocolObject<dyn objc2_metal::MTLFence>>,
     /// Buffers kernels reach through an address in another (the pool's
     /// buffers past the first): every compute pass declares them
     /// (`useResource`), so Metal orders their writes and reads as it does a
@@ -180,7 +187,12 @@ impl Context {
                 call: "newEvent",
                 why: "the device would not open an event".to_string(),
             })?;
+            let order = device.newFence().ok_or(Fault::Device {
+                call: "newFence",
+                why: "the device would not open a fence".to_string(),
+            })?;
             Ok(Context {
+                order,
                 device,
                 queue,
                 name,
@@ -442,7 +454,9 @@ impl Context {
             })?;
             let indirect = self.indirect.borrow().clone();
             declare(&encoder, &indirect);
+            encoder.waitForFence(&self.order);
             Ok(Frame {
+                order: self.order.clone(),
                 indirect,
                 buffer: RefCell::new(buffer),
                 encoder: RefCell::new(Some(encoder)),
@@ -463,6 +477,9 @@ impl Context {
 /// the buffer, and opens the next pass. The cells let a fence happen
 /// through a shared `&Frame`, which is all a live encode holds.
 pub struct Frame {
+    /// [`Context`]'s pass fence ([`Context::order`]).
+    #[cfg(target_vendor = "apple")]
+    order: Retained<ProtocolObject<dyn objc2_metal::MTLFence>>,
     /// [`Context`]'s indirect buffers, declared in every compute pass.
     #[cfg(target_vendor = "apple")]
     indirect: Vec<super::alloc::Slab>,
@@ -527,6 +544,7 @@ impl Frame {
             why: "the queue would not open the buffer a flushed frame goes on in".to_string(),
         })?;
         if let Some(encoder) = self.encoder.borrow_mut().take() {
+            encoder.updateFence(&self.order);
             encoder.endEncoding();
         }
         let encoder = tail.computeCommandEncoder().ok_or(Fault::Device {
@@ -534,6 +552,7 @@ impl Frame {
             why: "the command buffer would not open a compute pass".to_string(),
         })?;
         declare(&encoder, &self.indirect);
+        encoder.waitForFence(&self.order);
         head.commit();
         for then in self.committed.borrow_mut().drain(..) {
             then();
@@ -558,9 +577,11 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     fn end_pass(&mut self) {
         if let Some(encoder) = self.encoder.get_mut().take() {
+            encoder.updateFence(&self.order);
             encoder.endEncoding();
         }
         if let Some(blit) = self.blit.take() {
+            blit.updateFence(&self.order);
             blit.endEncoding();
         }
     }
@@ -584,6 +605,7 @@ impl Frame {
                 why: "the command buffer would not open a second compute pass".to_string(),
             })?;
         declare(&encoder, &self.indirect);
+        encoder.waitForFence(&self.order);
         *self.encoder.get_mut() = Some(encoder);
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
     }
@@ -603,6 +625,7 @@ impl Frame {
                 why: "the command buffer would not open a concurrent compute pass".to_string(),
             })?;
         declare(&encoder, &self.indirect);
+        encoder.waitForFence(&self.order);
         *self.encoder.get_mut() = Some(encoder);
         Ok(())
     }
@@ -632,6 +655,7 @@ impl Frame {
             why: "the command buffer would not open a compute pass after a barrier".to_string(),
         })?;
         declare(&encoder, &self.indirect);
+        encoder.waitForFence(&self.order);
         *self.encoder.get_mut() = Some(encoder);
         Ok(())
     }
@@ -660,6 +684,7 @@ impl Frame {
             });
         }
         if let Some(encoder) = self.encoder.borrow_mut().take() {
+            encoder.updateFence(&self.order);
             encoder.endEncoding();
         }
         let current = self.buffer.borrow().clone();
@@ -677,6 +702,7 @@ impl Frame {
                 why: "the command buffer would not reopen a compute pass after a fence".to_string(),
             })?;
         declare(&reopened, &self.indirect);
+        reopened.waitForFence(&self.order);
         *self.encoder.borrow_mut() = Some(reopened);
         Ok(())
     }
@@ -700,7 +726,8 @@ impl Frame {
             }
             if self.blit.is_none() {
                 if let Some(encoder) = self.encoder.get_mut().take() {
-                    encoder.endEncoding();
+                    encoder.updateFence(&self.order);
+            encoder.endEncoding();
                 }
                 self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
                     Fault::Device {
@@ -708,6 +735,9 @@ impl Frame {
                         why: "the command buffer would not open a blit pass".to_string(),
                     },
                 )?);
+                if let Some(blit) = self.blit.as_deref() {
+                    blit.waitForFence(&self.order);
+                }
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -740,7 +770,8 @@ impl Frame {
             }
             if self.blit.is_none() {
                 if let Some(encoder) = self.encoder.get_mut().take() {
-                    encoder.endEncoding();
+                    encoder.updateFence(&self.order);
+            encoder.endEncoding();
                 }
                 self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
                     Fault::Device {
@@ -748,6 +779,9 @@ impl Frame {
                         why: "the command buffer would not open a blit pass".to_string(),
                     },
                 )?);
+                if let Some(blit) = self.blit.as_deref() {
+                    blit.waitForFence(&self.order);
+                }
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -794,7 +828,8 @@ impl Frame {
             }
             if self.blit.is_none() {
                 if let Some(encoder) = self.encoder.get_mut().take() {
-                    encoder.endEncoding();
+                    encoder.updateFence(&self.order);
+            encoder.endEncoding();
                 }
                 self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
                     Fault::Device {
@@ -802,6 +837,9 @@ impl Frame {
                         why: "the command buffer would not open a blit pass".to_string(),
                     },
                 )?);
+                if let Some(blit) = self.blit.as_deref() {
+                    blit.waitForFence(&self.order);
+                }
             }
             let blit = self.blit.as_deref().expect("just opened");
             // SAFETY: both spans were bounds-checked by `Buffer::span`, and

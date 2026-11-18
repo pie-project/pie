@@ -80,6 +80,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLHeap",
     "MTLResidencySet",
     "MTLEvent",
+    "MTLFence",
     "MTL4CommandQueue",
     "MTLResourceStateCommandEncoder",
 ] }
