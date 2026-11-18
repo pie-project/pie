@@ -519,6 +519,85 @@ mod tests {
         assert_eq!(pool.segments(), 500);
     }
 
+    /// One episode end to end: the host's room drops below what the pool
+    /// holds, the governor raises tier pressure for exactly the shortfall,
+    /// PLEX's default responder sheds lowest retention key first (a pinned
+    /// set never), the shrink lands with no retarget failing, and once the
+    /// room recovers the pool grows back to its limit with nothing raised.
+    #[test]
+    fn a_room_under_the_pool_sheds_in_plex_order_and_recovers() {
+        use crate::governor::steered::short_bytes;
+        use crate::policy::pressure::{Candidate, PINNED, choose};
+
+        let set = |id: &str, key: i64, last_use_ms: u64, mib: u64| Candidate {
+            id: id.into(),
+            key,
+            last_use_ms,
+            bytes: Some(mib * MIB),
+        };
+        let sets = vec![
+            set("kept", 5, 10, 200),
+            set("droppable", -1, 30, 150),
+            set("older", 2, 10, 100),
+            set("newer", 2, 20, 100),
+            set("pinned", PINNED, 0, 300),
+        ];
+        let live: u64 = 850;
+
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        pool.pinned = live;
+        let mut steer =
+            Steer::new(&pool, BALANCED, 512 * MIB).with_room(&pool, Some(host.reader()));
+        assert!(tick(&mut steer, &mut pool).is_empty());
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+
+        // Another app takes 500 MiB: the ceiling falls to 500, under the
+        // 850 the live sets hold, so the pool evacuates to them and asks.
+        host.others.store(500, Ordering::Relaxed);
+        let signals = tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), Some(500 * MIB));
+        assert_eq!(
+            signals,
+            vec![Signal::TierPressure {
+                held_bytes: live * MIB,
+                target_bytes: 500 * MIB,
+            }]
+        );
+        assert_eq!(pool.segments(), live, "nothing live was dropped");
+        let short = short_bytes(signals[0]);
+        assert_eq!(short, 350 * MIB);
+
+        // The same reading again raises nothing new while it waits.
+        assert!(tick(&mut steer, &mut pool).is_empty());
+
+        // PLEX order: the droppable key first, then key 2 least recently
+        // used first, stopping once the shortfall is covered; key 5 and the
+        // pinned set stay.
+        let chosen = choose(sets.clone(), short);
+        assert_eq!(chosen, ["droppable", "older", "newer"]);
+        let freed: u64 = sets
+            .iter()
+            .filter(|c| chosen.contains(&c.id))
+            .map(|c| c.bytes.unwrap() / MIB)
+            .sum();
+        assert!(freed * MIB >= short);
+
+        // The stores discard them; the shrink lands and the pressure eases.
+        pool.pinned = live - freed;
+        assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
+        assert_eq!(pool.segments(), 500);
+
+        // The app goes: the room comes back and the pool grows into it,
+        // raising nothing on the way.
+        host.others.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            assert!(tick(&mut steer, &mut pool).is_empty());
+        }
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+        assert_eq!(pool.segments(), 1000);
+    }
+
     #[test]
     fn a_dedicated_pool_is_held_within_the_room_too() {
         let host = Host::new(1000);
