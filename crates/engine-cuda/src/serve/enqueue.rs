@@ -643,14 +643,18 @@ impl FireCtx<'_> {
             forked,
             poem_compiler::FireRows {
                 tokens: carve_rows,
-                lanes: carve_lanes,
+                // A value a lane holds a row for each lane the fire can
+                // carry, which is what the arena laid it for: the body's
+                // lane capacity sizes its lane tables, never a lane value's
+                // slot, so a padded lane row lands in no neighbour's.
+                lanes: carve_lanes.min(u64::from(self.budget.max_lanes)),
                 patches: carve_patches,
                 images: u64::from(p.composition.images()),
                 voxels: u64::from(p.composition.voxel_widest()),
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-        );
+        )?;
         // The fire's guests' programs lay their tables and scratch under
         // this carve.
         let span = super::program_span(
