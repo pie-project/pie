@@ -55,28 +55,55 @@ impl Exports {
     }
 }
 
+/// The attention `op` is, where it reads the fire's masks (a fused sink's
+/// attention included).
+fn mask_reader(op: &poem_ir::Operation) -> Option<&poem_ir::Attn> {
+    let attn = match op {
+        poem_ir::Operation::Attn(attn) => attn,
+        poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) => &**attn,
+        _ => return None,
+    };
+    matches!(
+        attn,
+        poem_ir::Attn::Prefill { mask: Some(_), .. } | poem_ir::Attn::Decode { mask: Some(_), .. }
+    )
+    .then_some(attn)
+}
+
+/// Whether this backend's kernel for `attn` (which reads the masks) applies
+/// each lane's: a selection's and a relative bias's arms read none.
+fn applies_mask(attn: &poem_ir::Attn) -> bool {
+    match attn {
+        poem_ir::Attn::Prefill {
+            selection: None,
+            bias: None,
+            ..
+        }
+        | poem_ir::Attn::Decode {
+            selection: None,
+            bias: None,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// The classes whose fires stage every lane's mask entry, a mask or the
+/// word stating none: an attention of theirs applies the fire's masks.
+#[must_use]
+pub(crate) fn mask_reading_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    classes_running(trace, compiled, |op| mask_reader(op).is_some_and(applies_mask))
+}
+
+/// The classes a lane may state a mask on: some attention of theirs applies
+/// the fire's masks and none that reads them passes a lane's by (a
+/// selection's arm, a biased one, or a kernel here that reads no mask).
 #[must_use]
 pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
-        matches!(
-            op,
-            poem_ir::Operation::Attn(
-                poem_ir::Attn::Prefill {
-                    mask: Some(_),
-                    selection: None,
-                    bias: None,
-                    lse: None,
-                    ..
-                } | poem_ir::Attn::Prefill {
-                    mask: Some(_),
-                    selection: None,
-                    bias: None,
-                    lse: Some(_),
-                    ..
-                }
-            )
-        )
-    })
+    let reading = mask_reading_classes(trace, compiled);
+    let passing =
+        classes_running(trace, compiled, |op| mask_reader(op).is_some_and(|attn| !applies_mask(attn)));
+    poem_ir::ClassSet::of(reading.iter().filter(|&class| !passing.contains(class)))
 }
 
 /// The classes a lane's stated mask reaches over its group's rows: a

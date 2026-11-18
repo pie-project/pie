@@ -33,6 +33,7 @@ mod guest;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
+mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
@@ -70,6 +71,7 @@ mod a_missing_or_misshapen_input_feed_is_refused_by_name;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_padded_row_writes_nothing;
 mod a_prefill_past_the_gemvs_grid_is_served;
+mod a_closed_channel_is_kept_until_its_last_instance_closes;
 mod a_prologue_put_input_is_the_cell_the_forward_reads;
 mod a_prologue_put_port_is_the_cell_the_fire_resolves;
 mod a_regions_own_values_outlive_its_last_pass;

@@ -210,6 +210,25 @@ impl Context {
         self.working_set
     }
 
+    /// The GPU memory every other process holds now: the system memory the
+    /// GPU driver has allocated for all of them together (IORegistry,
+    /// `Alloc system memory`) less what this process holds
+    /// ([`Self::allocated`]). The working set Metal recommends is shared
+    /// with it: a load that takes the whole of it beside them is refused for
+    /// memory at the edge. 0 where the registry does not say.
+    #[must_use]
+    pub fn others_allocated(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            super::iokit::gpu_system_allocated()
+                .map_or(0, |system| system.saturating_sub(self.allocated()))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// The bytes this device holds for the process now
     /// (`currentAllocatedSize`): every buffer, heap and the driver's own
     /// allocations on our behalf.

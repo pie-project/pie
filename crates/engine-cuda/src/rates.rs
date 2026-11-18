@@ -120,16 +120,10 @@ fn ensure_by(
     room: u64,
     measure: impl FnOnce(&profile::Profile) -> Result<Rates, String>,
 ) -> Result<profile::Profile, String> {
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, device),
         provenance: provenance(device),
-        check: &check,
+        registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
     engine::rates::rates_at_load(chip, &KEYS, save, Some(room), None, |_max_submit| {

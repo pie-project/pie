@@ -336,7 +336,10 @@ impl Device {
             && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
         {
             // Serving fires run programs the warm ladder prepared: one built
-            // now is a fire the ladder missed.
+            // now is a fire the ladder missed, built on the fire's path.
+            if let Some(live) = self.live.get() {
+                live.tally(engine::live::Tally::BuiltInFire, 1);
+            }
             let n = self
                 .misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -411,6 +414,14 @@ impl Device {
                     what: "compile",
                     why: e.to_string(),
                 })?;
+                // A registration's program (prepared after the seal) built
+                // rather than loaded: allowed, counted.
+                if serving.is_none()
+                    && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(live) = self.live.get()
+                {
+                    live.tally(engine::live::Tally::BuiltAtRegister, 1);
+                }
                 tracing::info!(
                     bytes = text.len(),
                     ms = started.elapsed().as_millis() as u64,
