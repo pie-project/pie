@@ -2832,3 +2832,116 @@ async fn a_bind_short_of_room_picks_victims_by_victim_order() {
         "the policy's key leads"
     );
 }
+
+/// A6000's E5 (Qwen3-8B, 500 at once, every process ranked): execution
+/// had 194 free permits and 194 waiters and granted none, as a higher key
+/// among the bind holders on their way to execution barred them all,
+/// though it was parked on the planner for pages and could not fire. A
+/// holder parked on the planner claims nothing at the gate after it; once
+/// it can fire again it bars as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_holder_parked_on_the_planner_bars_no_execution_waiter() {
+    use crate::inferlet::process::ordered::OrderedSemaphore;
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let (low, high, later) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    install(Some(Table::new(
+        std::collections::HashMap::from([(low, 1), (high, 9), (later, 1)]),
+        None,
+    )));
+    crate::planner::init_planner(
+        0,
+        7_001,
+        ResidencyPlanner::new(Arc::new(BindRoomPool::new(8, 0..0, 0))),
+    );
+    let planner = crate::planner::planner_for(0, 7_001).expect("registered");
+    planner.register(high);
+    planner.note_admitted(high);
+    let bind = OrderedSemaphore::new("bind", 1, false);
+    let execution = OrderedSemaphore::after("execution", 2, false, vec![bind.clone()]);
+    // The higher one holds bind, on its way to execution.
+    let _on_its_way = bind.clone().acquire_owned(high).await;
+    let settle = || async {
+        for _ in 0..20 {
+            crate::rt::yield_now().await;
+        }
+    };
+    // Control: able to fire, it bars a lower waiter.
+    let first = crate::rt::spawn({
+        let execution = execution.clone();
+        async move { execution.acquire_owned(low).await }
+    });
+    settle().await;
+    assert!(!first.is_finished(), "the higher one on its way bars it");
+    // Parked on the planner for pages: it claims nothing, and the free
+    // permit is taken.
+    planner.with_inner(|inner| inner.procs.get_mut(&high).unwrap().state = Residency::Evicted);
+    execution.regrant();
+    settle().await;
+    assert!(first.is_finished(), "parked, it bars no one");
+    // Back on the device, it bars again.
+    planner.with_inner(|inner| inner.procs.get_mut(&high).unwrap().state = Residency::Resident);
+    let second = crate::rt::spawn({
+        let execution = execution.clone();
+        async move { execution.acquire_owned(later).await }
+    });
+    settle().await;
+    assert!(!second.is_finished(), "resident again, it bars");
+    second.abort();
+    drop(first);
+    planner.unregister(high);
+    install(None);
+}
+
+/// A process registered before its policy row lands is re-keyed when the
+/// row is installed: its planner rank, and its place in the queue, follow
+/// the row, not the key 0 it was registered with.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_is_re_keyed_when_its_row_lands() {
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    install(None);
+    crate::planner::init_planner(
+        0,
+        7_002,
+        ResidencyPlanner::new(Arc::new(BindRoomPool::new(8, 0..0, 0))),
+    );
+    let planner = crate::planner::planner_for(0, 7_002).expect("registered");
+    let (early, late) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [early, late] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let key = |pid| planner.with_inner(|inner| inner.procs[&pid].key);
+    assert_eq!((key(early), key(late)), (0, 0), "no row yet");
+    let waits: Vec<_> = [early, late]
+        .into_iter()
+        .map(|pid| {
+            let planner = planner.clone();
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 3, 1).await })
+        })
+        .collect();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    let head = || planner.with_inner(|inner| inner.unmet_head().map(|(_, w)| w.pid));
+    assert_eq!(head(), Some(early), "arrival order");
+    // The late one's row lands, ranking it first.
+    install(Some(Table::new(
+        std::collections::HashMap::from([(late, 7)]),
+        None,
+    )));
+    assert_eq!(key(late), 7, "re-keyed as its row lands");
+    assert_eq!(head(), Some(late), "and first in the queue");
+    for wait in waits {
+        wait.abort();
+    }
+    for pid in [early, late] {
+        planner.unregister(pid);
+    }
+    install(None);
+}

@@ -2102,6 +2102,26 @@ impl KvPageTable {
         Ok(())
     }
 
+    /// The pages `working_sets` take together: each page they map once,
+    /// however many of them map it, and the pages each has reserved past
+    /// those it maps. A working set the table no longer knows takes none.
+    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
+        let mut locations = FxHashSet::default();
+        let mut unmapped = 0u64;
+        for &ws in working_sets {
+            let Ok(entry) = self.entry(ws) else {
+                continue;
+            };
+            unmapped += entry.page_len.saturating_sub(entry.mapped_len);
+            let _ = self.visit_working_set_locations(ws, |location| {
+                locations.insert(location);
+            });
+        }
+        locations
+            .len()
+            .saturating_add(usize::try_from(unmapped).unwrap_or(usize::MAX))
+    }
+
     fn locations(
         &self,
         working_sets: &HashSet<WorkingSetId>,

@@ -9,6 +9,16 @@ pub trait FireContext {
     /// in rather than computed them.
     fn note_cached(&mut self, _rows: u64) {}
 
+    /// This process has yet to be admitted to run: its first fire is.
+    fn awaits_admission(&self) -> bool {
+        false
+    }
+
+    /// Admits this process to run, its first fire growing its working sets
+    /// by `next_step` pages past what it reserved: it waits, in the
+    /// policy's order, until that fits the device beside the running.
+    async fn admit_execution(&mut self, _next_step: u64) {}
+
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

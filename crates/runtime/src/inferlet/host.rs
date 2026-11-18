@@ -32,6 +32,14 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         self.add_cached_tokens(rows);
     }
 
+    fn awaits_admission(&self) -> bool {
+        !self.execution_admitted()
+    }
+
+    async fn admit_execution(&mut self, next_step: u64) {
+        crate::inferlet::process::ensure_execution_admitted(self, next_step).await;
+    }
+
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::gate::drain_pending_fires(self).await
     }

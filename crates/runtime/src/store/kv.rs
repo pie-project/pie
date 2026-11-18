@@ -2972,6 +2972,12 @@ impl KvStore {
         Ok(self.table.swapped_pages(working_sets)?.len())
     }
 
+    /// The pages `working_sets` take together, shared ones once
+    /// ([`KvPageTable::working_set_pages`]).
+    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
+        self.table.working_set_pages(working_sets)
+    }
+
     pub fn held_page_count(
         &self,
         working_sets: &HashSet<WorkingSetId>,

@@ -36,6 +36,10 @@ pub struct ResidencyPlanner {
     pub(super) pause_due: AtomicBool,
     pub(super) waiters: AtomicUsize,
     pub(super) nonresident: AtomicUsize,
+    /// [`Inner::parked_digest`] as the last `with_inner` left it: a change
+    /// re-runs the admission gates' grants, which claim nothing for a
+    /// parked process.
+    parked: std::sync::atomic::AtomicU64,
     drain: OnceLock<Arc<Notify>>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
@@ -96,6 +100,7 @@ impl ResidencyPlanner {
             pause_due: AtomicBool::new(false),
             waiters: AtomicUsize::new(0),
             nonresident: AtomicUsize::new(0),
+            parked: std::sync::atomic::AtomicU64::new(0),
             drain: OnceLock::new(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
@@ -531,7 +536,18 @@ impl ResidencyPlanner {
         self.nonresident
             .store(inner.nonresident_count(), Ordering::Release);
         inner.admit_unpreempted();
+        let parked = inner.parked_digest();
+        drop(inner);
+        // A process parked or un-parked: the gates' bars move with it.
+        if self.parked.swap(parked, Ordering::AcqRel) != parked {
+            crate::inferlet::process::regrant_admission_soon();
+        }
         result
+    }
+
+    /// The processes that cannot fire now ([`Inner::parked`]).
+    pub fn parked_pids(&self) -> HashSet<ProcessId> {
+        self.lock_inner().parked().collect()
     }
 
     /// [`Self::with_inner`] for `f` that touches no process's residency,
@@ -905,6 +921,11 @@ impl ResidencyPlanner {
             if self.seat_to_end {
                 self.to_end_notify.notify_waiters();
             }
+            // Waiting on its client, it asks for no room: admission weighs
+            // the others again.
+            if idle && proc.admitted {
+                crate::inferlet::process::regrant_admission_soon();
+            }
             let parked = if idle || proc.held || proc.seatless {
                 None
             } else {
@@ -1139,8 +1160,56 @@ impl ResidencyPlanner {
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.admitted = true;
                 proc.respawn = false;
+                proc.next_step = 0;
             }
         });
+    }
+
+    /// `pid`, waiting to be admitted, grows its working sets by `pages`
+    /// with its first fire, past what it reserved.
+    pub fn note_next_step(&self, pid: ProcessId, pages: u64) {
+        self.with_counts(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.next_step = pages;
+            }
+        });
+    }
+
+    /// Whether `pid` is admitted beside `admitted` (the processes holding
+    /// execution seats; those of other devices are not weighed here): the
+    /// working sets of those running, `pid`'s own with its next step, fit
+    /// the device room the kv budget states. A process waiting on its
+    /// client, or a handle's stand-in, asks for no room until it runs
+    /// again. With none running, it is admitted: one runs, whatever it
+    /// asks (a set that can never fit is refused by name where it asks).
+    pub fn admits(&self, pid: ProcessId, admitted: &[ProcessId]) -> bool {
+        let (mut running, next_step) = self.with_counts(|inner| {
+            let running: Vec<ProcessId> = admitted
+                .iter()
+                .copied()
+                .filter(|other| *other != pid)
+                .filter(|other| {
+                    inner
+                        .procs
+                        .get(other)
+                        .is_some_and(|proc| !proc.holder && !proc.idle)
+                })
+                .collect();
+            (
+                running,
+                inner.procs.get(&pid).map_or(0, |proc| proc.next_step),
+            )
+        });
+        if running.is_empty() {
+            return true;
+        }
+        running.push(pid);
+        // Read off the planner's lock: the working sets take the stores'.
+        let need = self
+            .port
+            .working_set_pages(&running)
+            .saturating_add(next_step);
+        need <= u64::from(self.port.device_stats().1)
     }
 
     /// The hold `pid` keeps on its place here past its exit (see
