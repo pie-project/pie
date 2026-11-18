@@ -271,6 +271,7 @@ impl Plane {
         &mut self,
         binding: &InstanceBinding,
         place: Option<&Place<'_, crate::device::Api>>,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
@@ -319,8 +320,10 @@ impl Plane {
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
+        #[cfg(not(feature = "vulkan"))]
+        let _ = layout;
         #[cfg(feature = "vulkan")]
-        let session = self.build_session(place, binding, &plan).map_err(|why| {
+        let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
         // The device cells of the channels this instance holds itself.
@@ -501,13 +504,17 @@ impl Plane {
                     id,
                     instance,
                     rings,
+                    scratch,
+                    pair,
                     ..
                 } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",
                         id: id.0,
                     })?;
-                    seat.session.retarget(pools, instance).map_err(program)?;
+                    seat.session
+                        .retarget(pools, instance, scratch, pair)
+                        .map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
                         let channel = seat.ids.get(ring.channel as usize).ok_or_else(|| {
@@ -1142,6 +1149,7 @@ impl Plane {
         place: Option<&Place<'_, crate::device::Api>>,
         binding: &InstanceBinding,
         plan: &ExecPlan,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<crate::guest::session::Session, String> {
         let place = place.ok_or_else(|| {
             "this engine bound no device, so a guest pass has nowhere to run".to_owned()
@@ -1170,13 +1178,14 @@ impl Plane {
             .library
             .clone()
             .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
-        let extents = eta_exec::Extents {
-            row_count: binding.extents.row_count,
-            token_count: binding.extents.token_count,
-            sampled_rows: binding.extents.sampled_rows,
-            query_len: binding.extents.query_len,
-            key_len: binding.extents.key_len,
-        };
+        let extents = engine_gpu::guest::state::extents_of(&binding.extents);
+        // The instance's state and its pair's, at the places the runtime
+        // took for them.
+        let instance =
+            engine_gpu::guest::state::Placed::at(place.pools, &binding.scratch, layout.instance)
+                .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
+        let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
+            .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
         let args = match self.step_args.get(&binding.program) {
             Some(args) => args.clone(),
             None => {
@@ -1204,6 +1213,8 @@ impl Plane {
                 slots: &binding.instance_slots,
                 align: place.align,
             },
+            [instance, pair],
+            layout,
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -1320,8 +1331,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         &mut self,
         binding: &InstanceBinding,
         place: Option<&Place<'_, crate::device::Api>>,
+        layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal> {
-        Plane::bind(self, binding, place)
+        Plane::bind(self, binding, place, layout)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn scores(
+        &self,
+        instance: InstanceId,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        self.instances.get(&instance)?.session.scores()
     }
 
     fn moved_ends(&self, instance: InstanceId) -> Vec<(ChannelId, bool)> {

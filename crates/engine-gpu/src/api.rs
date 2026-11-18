@@ -362,6 +362,35 @@ impl<B: Host> Gpu<B> {
         self.shell.as_ref().ok_or_else(unloaded::<B>)
     }
 
+    /// Where an instance of `program` bound at `extents` and its pair lay
+    /// their state ([`crate::guest::state::GuestLayout`]): its stages'
+    /// heaps, and the pair's score room where a read of it switches score
+    /// capture on. `None`
+    /// before a load or for a program the plane does not hold.
+    pub fn pair_layout(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> EngineResult<Option<crate::guest::state::GuestLayout>> {
+        let (Some(shell), Some(package)) = (self.shell.as_ref(), self.programs.package(program))
+        else {
+            return Ok(None);
+        };
+        let scores = shell.score_room(
+            package
+                .values
+                .iter()
+                .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
+        );
+        crate::guest::state::GuestLayout::of_plans(
+            &package.plans,
+            &crate::guest::state::extents_of(extents),
+            scores,
+        )
+        .map(Some)
+        .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
+    }
+
     pub fn loaded_mut(&mut self) -> EngineResult<&mut Shell<B>> {
         self.shell.as_mut().ok_or_else(unloaded::<B>)
     }
@@ -616,6 +645,10 @@ where
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        crate::backend::Context::host_room(self.shell.as_ref()?.device())
+    }
+
     fn live(&self) -> engine::live::Live {
         self.live.clone()
     }
@@ -819,23 +852,34 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
-    /// A program reading captured attention scores lays its lanes' score
-    /// rows in a fire's guest region: its per-member term.
-    fn fire_facts(
+    /// What an instance of `program` bound at `extents` and its pair keep
+    /// as their state ([`crate::guest::state`]): its stages' heaps, the
+    /// instance's own, and, where it reads captured attention scores, the
+    /// pair's lane-indexed room a fire lays its capturing lanes' rows in.
+    /// Nothing of a guest lies in a fire's span: this engine states no
+    /// fire term.
+    fn guest_state(
         &self,
         program: ProgramId,
-        _extents: &engine::BindExtents,
-    ) -> EngineResult<engine::FireFacts> {
-        let (Some(shell), Some(package)) = (self.shell.as_ref(), self.programs.package(program))
-        else {
-            return Ok(engine::FireFacts::default());
+        extents: &engine::BindExtents,
+    ) -> EngineResult<engine::GuestState> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(engine::GuestState::default());
         };
-        Ok(shell.capture_term(
-            package
-                .values
-                .iter()
-                .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
-        ))
+        let Some(layout) = self.pair_layout(program, extents)? else {
+            return Ok(engine::GuestState::default());
+        };
+        let facts = crate::guest::state::Facts::of(shell.pools()).map_err(fault)?;
+        layout
+            .state(&facts)
+            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
+    }
+
+    /// Every registration: a ring the device keeps in its `Channel` slots
+    /// or on the host.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
     }
 
     fn ring_facts(
@@ -1012,8 +1056,14 @@ where
             )));
         }
 
+        let layout = self
+            .pair_layout(binding.program, &binding.extents)?
+            .unwrap_or_default();
         let place = self.shell.as_ref().map(place);
-        let bound = self.programs.bind(binding, place.as_ref()).map_err(refusal);
+        let bound = self
+            .programs
+            .bind(binding, place.as_ref(), &layout)
+            .map_err(refusal);
         // What the bind built, counted where it lands, before its first fire.
         self.count_built();
         let bound = bound?;
@@ -1372,7 +1422,21 @@ impl<B: Host> Gpu<B> {
         let guests = B::guests(self, submission)?;
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        // Each lane's score room: its first attachment's pair's, where that
+        // program reads scores.
+        let mut scores: Vec<Option<crate::serve::DeviceCell<B>>> =
+            (0..submission.lanes.len()).map(|_| None).collect();
         for attachment in program_attachments(submission) {
+            if let Some(room) = self.programs.scores(attachment.instance) {
+                let end = attachment.lane + attachment.lanes.max(1);
+                for at in attachment.lane..end {
+                    if let Some(lane) = scores.get_mut(at as usize)
+                        && lane.is_none()
+                    {
+                        *lane = Some(room.clone());
+                    }
+                }
+            }
             // A root read at lane `k` may span rows: row `r` is lane
             // `k + r`'s readout, so every lane of the attachment from `k`
             // on reads the output out.
@@ -1525,7 +1589,7 @@ impl<B: Host> Gpu<B> {
                 // channels: the host reads back the lanes no program reads.
                 hosts: !matches!(lane.readout, Readout::None) && !attached[at],
                 reads: &reads[at],
-
+                scores: scores[at].as_ref(),
 
                 rs: &lane.rs,
                 rs_reset: lane.rs_reset,

@@ -400,6 +400,8 @@ impl<B: Serve> Serve for Named<B> {
 
     const READS_SPAN: bool = B::READS_SPAN;
 
+    const NAMES: bool = true;
+
     const TARGET: kernels_slang::Target = B::TARGET;
 
     fn table_align(device: &Facts) -> u64 {

@@ -34,6 +34,7 @@ const Q_HEADS: u32 = 4;
 const KV_HEADS: u32 = 2;
 const LAYERS: usize = 2;
 const LANES: u32 = 256;
+const ROWS: u32 = 512;
 const CONTEXT: u32 = 64;
 const PAGE: u32 = 16;
 /// The capturing lane: not the fire's first.
@@ -110,7 +111,7 @@ fn shell(trace: Trace, path: &Path) -> Shell {
         trace,
         contract: &contract,
         checkpoint: path,
-        budget: Budget::new(LANES, 512),
+        budget: Budget::new(LANES, ROWS),
         patches: None,
         page_size: PAGE,
         context: CONTEXT,
@@ -120,6 +121,10 @@ fn shell(trace: Trace, path: &Path) -> Shell {
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
+            // Every lane fires in one fire: the load lays its rungs to the
+            // rows its budget states, not to the top the estimate would
+            // choose for serving (which fires a wider wave as several).
+            every_rung: Some(engine_cuda::EveryRung::To(ROWS)),
             pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
@@ -199,22 +204,30 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
     shell
         .commit_segments(segments)
         .expect("the first segment commits");
-    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let slots = guest.slots(
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
+    );
+    let extents = Extents {
+        row_count: rows,
+        token_count: rows,
+        sampled_rows: 1,
+        query_len: rows,
+        ..Extents::default()
+    };
+    let (scratch, pair) = guest.places(
+        (program, extents),
+        &shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
     );
     let backed = shell.footprint().1;
     let instance = shell
         .bind_program(
             program,
             &[],
-            Extents {
-                row_count: rows,
-                token_count: rows,
-                sampled_rows: 1,
-                query_len: rows,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::Host,
             PortMask::default(),
             &[None],
@@ -222,6 +235,8 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
+                scratch,
+                pair,
             },
         )
         .expect("the reader binds");

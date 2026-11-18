@@ -166,16 +166,23 @@ fn bind(
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
     );
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let (scratch, pair) = guest.places(
+        (program, extents),
+        &shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
+    );
     shell
         .bind_program(
             program,
             &[],
-            Extents {
-                row_count: 1,
-                sampled_rows: 1,
-                query_len: 1,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::Host,
             PortMask::NONE,
             &vec![None; count],
@@ -183,6 +190,8 @@ fn bind(
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
+                scratch,
+                pair,
             },
         )
         .expect("the instance binds")

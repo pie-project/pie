@@ -189,32 +189,6 @@ impl Chunks {
         }
     }
 
-    /// Where the chunks the runtime counts as state end: under it lie the
-    /// last of them, in order.
-    #[must_use]
-    pub fn state_end(&self) -> u64 {
-        self.range.base() + u64::from(self.under_state().0) * self.layout.chunk_bytes
-    }
-
-    /// Backs the last `bytes` under the state's end, and keeps them
-    /// backed: where a fire lays its guests' programs once the activation's
-    /// own span has no room under its carve. No further down than the
-    /// state's last chunks lie in one run ([`Chunks::state_fitted`]).
-    pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
-        let (end, run) = self.under_state();
-        let end = u64::from(end) * self.layout.chunk_bytes;
-        let run = u64::from(run) * self.layout.chunk_bytes;
-        if self.skip.0 < self.stated() && bytes > run {
-            return Err(Fault::Ceiling {
-                what: "bytes of the state pool in one run under the activation's span",
-                need: bytes,
-                have: run,
-            });
-        }
-        let bytes = bytes.min(run);
-        self.range.hold(pool, end - bytes, bytes, false)
-    }
-
     /// Where a fire's activation starts: the range's end less its chunks.
     #[must_use]
     pub fn activation_base(&self) -> u64 {
@@ -868,6 +842,32 @@ impl Chunks {
             ));
         }
         self.span(kind, refs[0], 0, bytes)
+    }
+
+    /// The address of a guest item of `bytes` in `run` adjacent chunks from
+    /// logical chunk `first` (`engine::ScratchPlace::Chunks`): the pool
+    /// keeps a run's chunks at adjacent physical chunks inside one segment.
+    pub fn guest_chunks(&self, first: u32, run: u32, bytes: u64) -> Result<u64> {
+        let chunk = self.layout.chunk_bytes;
+        let room = u64::from(run).saturating_mul(chunk);
+        let physical = self.table.physical(first).ok_or(Fault::Ceiling {
+            what: "chunks of the state pool",
+            need: u64::from(first) + 1,
+            have: u64::from(self.total),
+        })?;
+        let at = self.at(physical);
+        let last = physical.saturating_add(run.max(1) - 1);
+        if bytes > room || self.at(last) != at + (last - physical) {
+            return Err(Fault::program(
+                "store::chunks",
+                format!(
+                    "a guest item of {bytes} bytes lies in a run of {run} chunk(s) of {chunk} \
+                     bytes from logical chunk {first}, which lies at range chunk {at} and \
+                     ends past a gap or its bytes"
+                ),
+            ));
+        }
+        self.range.span(u64::from(at) * chunk, room)
     }
 
     /// The id a paged kernel reads page `id`'s slot by.

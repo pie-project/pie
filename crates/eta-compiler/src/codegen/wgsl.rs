@@ -18,6 +18,15 @@ pub const WORKGROUP: u32 = 256;
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
 pub const SELECT_WORDS: u32 = 10320;
 
+/// What WGSL's kernels take of a lane's temporary area past the
+/// whole-value rule (`eta_exec::stage_temporaries`): nothing, by statement.
+/// Its sorts, reduction levels and pivots run over the whole value in
+/// place, in at most four words an element of it (`sort_cell`, `tmp_v`,
+/// `pivot_*` in the runtime: two buffers of two words), the rule's figure,
+/// and its one-row select keeps its state in the [`SELECT_WORDS`] reserved
+/// below the area, not in it.
+pub const TEMPORARY_NEEDS: &[crate::codegen::temporary::TemporaryNeed] = &[];
+
 const BARRIER: &str = "  storageBarrier();\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -999,6 +1008,29 @@ mod stepwise_tests {
                 .contains("storageBarrier()"),
             "the one-workgroup shape still orders its steps in the shader"
         );
+    }
+
+    /// The runtime's temporaries are what [`TEMPORARY_NEEDS`] states of
+    /// them: two buffers of two words an element of the value a step runs
+    /// over (four words, the whole-value rule's figure), and the select's
+    /// state below the area.
+    #[test]
+    fn the_runtimes_temporaries_lie_within_the_whole_value_rule() {
+        assert!(super::TEMPORARY_NEEDS.is_empty());
+        for cell in [
+            "return cfg.temporary + ((buf * n) + c) * 2u;",
+            "return cfg.temporary + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }",
+        ] {
+            assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
+        }
+        let named = RUNTIME.matches("cfg.temporary").count();
+        assert_eq!(named, 7, "a temporary cell this statement has not read");
+        assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
     }
 
     fn a_stepwise_entry_point_strides_by_the_whole_grid() {

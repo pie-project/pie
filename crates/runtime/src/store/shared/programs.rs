@@ -715,12 +715,7 @@ pub async fn take_raise(
                 super::ask_walk(mover.engine());
                 None
             }
-            Some(at)
-                if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.copying().is_some() =>
-            {
-                None
-            }
+            Some(at) if !pool.raise_owed(at) || pool.copying().is_some() => None,
             Some(at) => {
                 let stood = pool.stands_at(at);
                 pool.plan_raise(at).ok().and_then(|evacuation| {

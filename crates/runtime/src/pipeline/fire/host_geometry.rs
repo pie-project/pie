@@ -47,7 +47,10 @@ use eta_ir::registry::{GeometryClass, Port, PortMask};
 pub enum HostGeometry {
     /// The engine's port mask lacks `lacks`, ports the program's device
     /// class needs: a stated engine limit.
-    EngineLacks { engine: &'static str, lacks: PortMask },
+    EngineLacks {
+        engine: &'static str,
+        lacks: PortMask,
+    },
     /// The program alone decides it: host-evaluated is its class.
     Program { why: String },
 }
@@ -121,7 +124,8 @@ pub fn classify(program: ProgramGeometry, device: PortMask, engine: &'static str
     } else {
         PortMask::DEVICE_GEOMETRY
     };
-    let envelope_covered = matches!(program.envelope, Ok(Some(required)) if device.covers(required));
+    let envelope_covered =
+        matches!(program.envelope, Ok(Some(required)) if device.covers(required));
     match program.pooled {
         // A program the decode envelope covers runs ahead: its pages and
         // write slots are the host's, so the next fire is staged while this
@@ -199,7 +203,9 @@ mod tests {
     }
 
     const VULKAN: PortMask = PortMask::DECODE_ENVELOPE.with(Port::Fold);
-    const CUDA: PortMask = PortMask::DEVICE_GEOMETRY.with(Port::AttnMask).with(Port::Fold);
+    const CUDA: PortMask = PortMask::DEVICE_GEOMETRY
+        .with(Port::AttnMask)
+        .with(Port::Fold);
 
     #[test]
     fn host_geometry_every_case() {
@@ -215,11 +221,20 @@ mod tests {
         let Some(host @ HostGeometry::EngineLacks { lacks, .. }) = bound.host.clone() else {
             panic!("an engine limit: {bound:?}");
         };
-        assert_eq!(lacks, PortMask::of(&[Port::Positions, Port::KvLen, Port::Slots]));
+        assert_eq!(
+            lacks,
+            PortMask::of(&[Port::Positions, Port::KvLen, Port::Slots])
+        );
         let message = host.bind_message(0xabc);
-        assert!(message.contains("engine vulkan lacks geometry port(s)"), "{message}");
+        assert!(
+            message.contains("engine vulkan lacks geometry port(s)"),
+            "{message}"
+        );
         assert!(message.contains("positions"), "{message}");
-        assert!(message.contains("program 0000000000000abc needs"), "{message}");
+        assert!(
+            message.contains("program 0000000000000abc needs"),
+            "{message}"
+        );
         assert!(message.contains("its fires serialize"), "{message}");
         assert!(!message.contains("falling back"), "{message}");
 
@@ -240,7 +255,10 @@ mod tests {
     }
 
     fn a_program_only_host_class_is_named_and_counted() {
-        for envelope in [Ok(None), Err("its slots follow a sampled token".to_string())] {
+        for envelope in [
+            Ok(None),
+            Err("its slots follow a sampled token".to_string()),
+        ] {
             // On any engine, one with device geometry among them.
             let bound = classify(program(None, envelope), CUDA, "cuda");
             assert_eq!(bound.class, GeometryClass::Host);

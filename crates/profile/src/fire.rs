@@ -21,7 +21,17 @@
 //! hbm_gbps = 650.0         # a streaming copy, read + write
 //! elementwise_gbps = 450.0 # the per-row ops (rmsnorm, swiglu) as served
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
+//! few_row_tflops = 4.2     # bf16 matmul TFLOP/s at 4-256 rows, as served
+//! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
 //! ```
+//!
+//! Every key is a measurement of the device as serving runs it, but one:
+//! `workgroups_per_core` is derived where the device states its occupancy
+//! (CUDA, ROCm) and measured only where its API hides it (Vulkan, wgpu,
+//! Metal). A key stated at or below zero, or not finite, is no rate: the
+//! profile refuses it by name, a rates step that settles at it is refused
+//! by name before anything is saved (`engine::rates::unmeasured`), and the
+//! roofline divides by none of it (`engine::roofline::Constants::of`).
 
 use std::fmt::Write as _;
 
@@ -46,7 +56,42 @@ pub struct Rates {
     /// Gated-delta scan state elements a nanosecond (G a second), the conv
     /// before it folded in.
     pub scan_gelems: Option<f64>,
+    /// Dense bf16 matmul TFLOP/s (two flops a multiply-add) at decode-shaped
+    /// rows, 4 to 256 (below the first row count `gemm_tflops_by_rows`
+    /// times), on the kernel serving picks at those rows (on the slang
+    /// backends the plain tiled `linear_gemm_tiled_bf16`): the rate its
+    /// compute runs at once its weight reads no longer bound it, its flops
+    /// counted over the rows its kernel's tile pads to. A matmul of that few
+    /// rows costs `launch_ns + max(bytes / hbm_gbps, padded flops /
+    /// few_row_tflops)`. Measured, on every backend.
+    pub few_row_tflops: Option<f64>,
+    /// The workgroups (CUDA's blocks, Metal's threadgroups) each compute
+    /// unit (an SM, a CU, an execution core) must hold at once for a
+    /// kernel to run at its full rate: a device fact every wave-fill choice
+    /// reads, not a kernel's knob. A dispatch of `W` workgroups over `cores`
+    /// units of `S = workgroups_per_core · cores` runs at `min(1, W / S)` of
+    /// its rate, so a kernel of `work` at rate `r` costs `work / r · max(1,
+    /// S / W)`. Derived where the device states its occupancy (CUDA, ROCm:
+    /// the resident blocks a multiprocessor holds); measured where its API
+    /// hides it (Vulkan, wgpu, Metal), once, at the first load: one
+    /// workgroup a head of a kernel at its compute-bound shape timed at `t`
+    /// against `t_full`, the same work at the rate its full curve states,
+    /// `S = W · t / t_full`, over the cores. A real number of workgroups a
+    /// unit.
+    pub workgroups_per_core: Option<f64>,
 }
+
+/// Every key `[rates]` holds, in the order a profile writes them.
+pub const KEYS: [&str; 8] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+    "few_row_tflops",
+    "workgroups_per_core",
+];
 
 impl Rates {
     /// `self` laid over `below`: each key `self` states replaces `below`'s.
@@ -59,6 +104,8 @@ impl Rates {
             hbm_gbps: self.hbm_gbps.or(below.hbm_gbps),
             elementwise_gbps: self.elementwise_gbps.or(below.elementwise_gbps),
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
+            few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
+            workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
         }
     }
 
@@ -84,32 +131,36 @@ impl Rates {
             hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
             elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
             scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
+            few_row_tflops: self.few_row_tflops.filter(|_| has("few_row_tflops")),
+            workgroups_per_core: self
+                .workgroups_per_core
+                .filter(|_| has("workgroups_per_core")),
         }
     }
 
-    /// The keys of `[rates]` the roofline weighs a fire by that this states
-    /// none of: what a load measures before it is ready
-    /// (`engine::rates::rates_at_load`). The one list of them.
+    /// The keys of `keys` (a backend's estimate's: those its roofline weighs
+    /// a fire by, of [`KEYS`]) this states none of: what a load measures
+    /// before it is ready (`engine::rates::rates_at_load`).
     #[must_use]
-    pub fn missing(&self) -> Vec<&'static str> {
-        [
-            ("launch_ns", self.launch_ns.is_none()),
-            ("gemm_tflops_by_rows", self.gemm_tflops_by_rows.is_none()),
-            ("attn_tflops_by_keys", self.attn_tflops_by_keys.is_none()),
-            ("hbm_gbps", self.hbm_gbps.is_none()),
-            ("elementwise_gbps", self.elementwise_gbps.is_none()),
-            ("scan_gelems", self.scan_gelems.is_none()),
-        ]
-        .into_iter()
-        .filter(|&(_, unstated)| unstated)
-        .map(|(key, _)| key)
-        .collect()
+    pub fn missing(&self, keys: &[&'static str]) -> Vec<&'static str> {
+        let unstated = |key: &str| match key {
+            "launch_ns" => self.launch_ns.is_none(),
+            "gemm_tflops_by_rows" => self.gemm_tflops_by_rows.is_none(),
+            "attn_tflops_by_keys" => self.attn_tflops_by_keys.is_none(),
+            "hbm_gbps" => self.hbm_gbps.is_none(),
+            "elementwise_gbps" => self.elementwise_gbps.is_none(),
+            "scan_gelems" => self.scan_gelems.is_none(),
+            "few_row_tflops" => self.few_row_tflops.is_none(),
+            "workgroups_per_core" => self.workgroups_per_core.is_none(),
+            _ => true,
+        };
+        keys.iter().copied().filter(|key| unstated(key)).collect()
     }
 
-    /// Whether every key is stated.
+    /// Whether every key of `keys` is stated.
     #[must_use]
-    pub fn complete(&self) -> bool {
-        self.missing().is_empty()
+    pub fn complete(&self, keys: &[&'static str]) -> bool {
+        self.missing(keys).is_empty()
     }
 
     /// `[rates]` as profile TOML.
@@ -148,6 +199,8 @@ impl Rates {
         float("hbm_gbps", self.hbm_gbps);
         float("elementwise_gbps", self.elementwise_gbps);
         float("scan_gelems", self.scan_gelems);
+        float("few_row_tflops", self.few_row_tflops);
+        float("workgroups_per_core", self.workgroups_per_core);
         out
     }
 }
@@ -167,6 +220,34 @@ pub fn interpolate(curve: &[(u32, f64)], x: f64) -> Option<f64> {
     let ((lo, a), (hi, b)) = (curve[at - 1], curve[at]);
     let t = (x.ln() - f64::from(lo).ln()) / (f64::from(hi).ln() - f64::from(lo).ln());
     Some(a + (b - a) * t)
+}
+
+/// A matmul's rate at `m` rows of an `n x k` plane, read off `by_rows` (rows
+/// curves at each square width, ascending in width, in any unit of rate):
+/// each width's curve at the timed rows at or below `m` (its first below
+/// that), in `log width` at `sqrt(n k)` between the widths. Past the widest
+/// width its last span's slope in log width carries on (a wider plane fills
+/// more tiles), never below the widest's rate; below the narrowest, its rate.
+/// Infinite for no curves.
+#[must_use]
+pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
+    let at = |curve: &[(u32, f64)]| -> f64 {
+        curve
+            .iter()
+            .rev()
+            .find(|&&(rows, _)| rows <= m)
+            .or(curve.first())
+            .map_or(f64::INFINITY, |&(_, r)| r)
+    };
+    let width: Vec<(u32, f64)> = by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
+    let square = (f64::from(n) * f64::from(k)).sqrt();
+    if let [.., (w0, r0), (w1, r1)] = width[..]
+        && square > f64::from(w1)
+    {
+        let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
+        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
+    }
+    interpolate(&width, square).unwrap_or(f64::INFINITY)
 }
 
 /// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a
@@ -246,7 +327,7 @@ mod tests {
                 ..Rates::default()
             }
         );
-        assert!(!low.rates.complete());
+        assert!(!low.rates.complete(&KEYS));
     }
 
     #[test]
@@ -261,14 +342,21 @@ mod tests {
             hbm_gbps: Some(654.4),
             elementwise_gbps: Some(450.0),
             scan_gelems: Some(2684.3),
+            few_row_tflops: Some(4.2),
+            workgroups_per_core: Some(3.3),
         };
-        assert!(rates.complete());
+        assert!(rates.complete(&KEYS));
+        assert_eq!(
+            rates.only(&KEYS[..6]).missing(&KEYS),
+            ["few_row_tflops", "workgroups_per_core"]
+        );
         assert_eq!(
             rates.toml(),
             "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
-             elementwise_gbps = 450.0\nscan_gelems = 2684.3\n"
+             elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
+             workgroups_per_core = 3.3\n"
         );
     }
 

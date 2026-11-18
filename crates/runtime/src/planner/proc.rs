@@ -56,6 +56,27 @@ pub(super) struct Proc {
     /// Its fires stood unsettled past `FIRE_PROGRESS`, and the planner was
     /// told.
     pub(super) fire_lapsed: bool,
+    /// Its last restore found no device room for its parked role slots
+    /// (instance tables, rings, guest state): it waits, queued, for a
+    /// completion or an eviction to free some, never failed for it.
+    pub(super) roles_short: bool,
+    /// Suspended by a bind of its short of guest-state room
+    /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
+    /// asks. Its restore is served only once that room stands free beside
+    /// its kv pages, as a bind short of room is
+    /// ([`super::wait::WaitKind::BindRoom`]), so it never comes back to be
+    /// short again.
+    pub(super) bind_room: Option<PendingBind>,
+}
+
+/// The guest-state room a suspended process's pending bind asks:
+/// `pieces` free runs of `run` adjacent chunks, `pages` the kv pages that,
+/// moved out whole, free them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingBind {
+    pub(super) run: u32,
+    pub(super) pieces: u32,
+    pub(super) pages: u32,
 }
 
 impl Proc {
@@ -102,6 +123,8 @@ impl Proc {
             fires: 0,
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
+            roles_short: false,
+            bind_room: None,
         }
     }
 }

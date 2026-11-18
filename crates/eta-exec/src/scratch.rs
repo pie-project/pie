@@ -1,10 +1,11 @@
 use super::extent::ValueDesc;
+pub use eta_compiler::codegen::temporary::TemporaryNeed;
 
 mod lifetime;
 
 pub use lifetime::{
-    Launch, Launches, describe_launched, lay_out, read_only_unlaunched, region_rows,
-    value_lifetimes,
+    Launch, Launches, describe_launched, lay_out, lay_out_chunked, read_only_unlaunched,
+    region_rows, value_lifetimes,
 };
 
 pub const ALIGN: u64 = 256;
@@ -31,9 +32,65 @@ pub const SELECT_RESERVE: u64 = eta_compiler::codegen::wgsl::SELECT_WORDS as u64
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TooLarge {
-    Bound { bytes: u64, limit: u64 },
+    Bound {
+        bytes: u64,
+        limit: u64,
+    },
 
     Overflow,
+
+    /// An item larger than a segment's chunks: a piece is a run of
+    /// adjacent chunks inside one segment, no run is longer than a segment,
+    /// and no item crosses a piece ([`layout_chunked`]).
+    PastSegment {
+        item: Item,
+        bytes: u64,
+        chunk: u64,
+        segment: u32,
+    },
+}
+
+/// What a scratch layout places: a value of the stage, or the temporary
+/// area with the reserve below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Item {
+    Value(u32),
+    Temporary,
+}
+
+impl core::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Bound { bytes, limit } => {
+                write!(
+                    f,
+                    "a scratch of {bytes} bytes, past the {limit} a lane addresses"
+                )
+            }
+            Self::Overflow => write!(f, "a scratch past a u64"),
+            Self::PastSegment {
+                item: Item::Value(value),
+                bytes,
+                chunk,
+                segment,
+            } => write!(
+                f,
+                "value {value} takes {bytes} bytes, past a segment of {segment} {chunk}-byte \
+                 chunks, and a value lies whole in one run of a segment's chunks"
+            ),
+            Self::PastSegment {
+                item: Item::Temporary,
+                bytes,
+                chunk,
+                segment,
+            } => write!(
+                f,
+                "the temporary area and the reserve below it take {bytes} bytes, past a \
+                 segment of {segment} {chunk}-byte chunks, and they lie whole in one run of \
+                 a segment's chunks"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +157,59 @@ pub fn whole_value_temporaries(descriptors: &[ValueDesc]) -> Option<u64> {
         .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
 }
 
+/// A stage's temporary area: the widest of the whole-value rule
+/// ([`whole_value_temporaries`]) and what each region's emitter publishes
+/// it takes (`needs`, [`TemporaryNeed`]), evaluated against `descriptors`.
+/// An emitter that publishes none passes none. Refused by name where a
+/// need names a value the stage does not hold, or the bytes pass a `u64`.
+pub fn stage_temporaries(
+    descriptors: &[ValueDesc],
+    needs: &[TemporaryNeed],
+) -> Result<u64, TemporaryRefused> {
+    let whole = whole_value_temporaries(descriptors).ok_or(TemporaryRefused::Overflow)?;
+    needs.iter().try_fold(whole, |widest, need| {
+        let rows = match need.per_row {
+            Some((value, bytes)) => u64::from(
+                descriptors
+                    .get(value as usize)
+                    .ok_or(TemporaryRefused::NoValue { value })?
+                    .rows,
+            )
+            .checked_mul(bytes)
+            .ok_or(TemporaryRefused::Overflow)?,
+            None => 0,
+        };
+        let below = if need.above_whole { whole } else { 0 };
+        let bytes = need
+            .fixed
+            .checked_add(rows)
+            .and_then(|bytes| bytes.checked_add(below))
+            .ok_or(TemporaryRefused::Overflow)?;
+        Ok(widest.max(bytes))
+    })
+}
+
+/// Why [`stage_temporaries`] refuses a stage's temporary area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryRefused {
+    /// A region's need is a row count of a value the stage does not hold.
+    NoValue { value: u32 },
+    /// The bytes pass a `u64`.
+    Overflow,
+}
+
+impl core::fmt::Display for TemporaryRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoValue { value } => write!(
+                f,
+                "a region's temporary need counts the rows of value {value}, which the stage does not hold"
+            ),
+            Self::Overflow => write!(f, "a stage's temporary area passes a u64"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lifetime {
     pub def: u32,
@@ -116,8 +226,96 @@ impl Lifetime {
     pub const SEQUENTIAL: u64 = u64::MAX;
 }
 
+/// Where an item lies in a chunked scratch: byte `offset` of piece
+/// `piece`. An engine addresses it as the piece's base (its run's first
+/// chunk's first byte, from the instance's base table) plus `offset`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Placed {
+    pub piece: u32,
+    pub offset: u64,
+}
+
+/// What a chunked scratch is laid in ([`layout_chunked`]): chunks of
+/// `chunk` bytes, which lie at adjacent addresses only inside one segment
+/// of `segment` chunks, and the least chunks a piece takes, `run` (1: a
+/// chunk; more where a program lays all its stages in one piece size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pieces {
+    pub chunk: u64,
+    pub segment: u32,
+    pub run: u32,
+}
+
+impl Pieces {
+    /// Pieces of at least one chunk of `chunk` bytes, in segments of
+    /// `segment` chunks.
+    #[must_use]
+    pub const fn new(chunk: u64, segment: u32) -> Self {
+        Self {
+            chunk,
+            segment,
+            run: 1,
+        }
+    }
+
+    /// The same, each piece at least `run` chunks.
+    #[must_use]
+    pub const fn at_least(self, run: u32) -> Self {
+        Self { run, ..self }
+    }
+}
+
+/// A stage's scratch cut into pieces of `run` adjacent chunks each
+/// ([`lay_out_chunked`]): no item crosses a piece, and two values whose
+/// lifetimes overlap share no bytes. Piece 0 opens with the
+/// [`DUMMY_BYTES`] a value that takes no bytes is stated to lie at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkLayout {
+    /// The chunks a piece takes: a run of adjacent chunks inside one
+    /// segment, what the largest item asks ([`Pieces::run`] at least).
+    pub run: u32,
+    /// A chunk's bytes.
+    pub chunk: u64,
+    /// Each value's place; a dead value's is piece 0, byte 0.
+    pub values: Vec<Placed>,
+    /// The temporary area's first byte: the reserve lies right below it,
+    /// in the same piece.
+    pub temporary: Placed,
+    /// The bytes the temporary area holds.
+    pub temporary_bytes: u64,
+    /// Each piece's bytes in use, from its first: none past
+    /// [`Self::piece_bytes`].
+    pub ends: Vec<u64>,
+}
+
+impl ChunkLayout {
+    /// The pieces the scratch takes: chunks, or one run where it fits one.
+    #[must_use]
+    pub fn pieces(&self) -> u32 {
+        u32::try_from(self.ends.len()).unwrap_or(u32::MAX)
+    }
+
+    /// A piece's bytes: its run of chunks.
+    #[must_use]
+    pub fn piece_bytes(&self) -> u64 {
+        u64::from(self.run).saturating_mul(self.chunk)
+    }
+
+    /// The bytes an instance holds for it: the one piece's bytes where it
+    /// takes one inside a chunk (a run of slots), else whole runs of
+    /// chunks, one a piece.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        match self.ends[..] {
+            [only] if only <= self.chunk => only,
+            _ => u64::from(self.pieces()).saturating_mul(self.piece_bytes()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vacant {
+    piece: u32,
     offset: u64,
     span: u64,
     launch: u32,
@@ -133,7 +331,7 @@ struct Vacant {
 /// so a value takes there only a dead one's own bytes, at its offset: any
 /// other place would lay a block's row over another block's, which may
 /// still be reading it.
-fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u64> {
+fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<Placed> {
     let best = free
         .iter()
         .enumerate()
@@ -147,6 +345,7 @@ fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u6
         .min_by_key(|(_, block)| block.span)
         .map(|(index, _)| index)?;
     let Vacant {
+        piece,
         offset,
         span: width,
         ..
@@ -158,44 +357,119 @@ fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u6
         free[best].span = width - span;
         free[best].whole = false;
     }
-    Some(offset)
+    Some(Placed { piece, offset })
 }
 
 fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
-    let at = free.partition_point(|block| block.offset < vacant.offset);
+    let at =
+        free.partition_point(|block| (block.piece, block.offset) < (vacant.piece, vacant.offset));
     free.insert(at, vacant);
-    let same = |a: &Vacant, b: &Vacant| a.launch == b.launch && a.class == b.class;
-    if at + 1 < free.len()
-        && free[at].offset + free[at].span == free[at + 1].offset
-        && same(&free[at], &free[at + 1])
-    {
+    let joins = |a: &Vacant, b: &Vacant| {
+        a.piece == b.piece
+            && a.offset + a.span == b.offset
+            && a.launch == b.launch
+            && a.class == b.class
+    };
+    if at + 1 < free.len() && joins(&free[at], &free[at + 1]) {
         free[at].span += free[at + 1].span;
         free[at].whole = false;
         free.remove(at + 1);
     }
-    if at > 0
-        && free[at - 1].offset + free[at - 1].span == free[at].offset
-        && same(&free[at - 1], &free[at])
-    {
+    if at > 0 && joins(&free[at - 1], &free[at]) {
         free[at - 1].span += free[at].span;
         free[at - 1].whole = false;
         free.remove(at);
     }
 }
 
-/// `descriptors` laid by `lifetimes`: a value takes the bytes of one whose
-/// last reader ran before it is written. `reserve` bytes lie clear below
-/// the temporary area, which holds `temporary` bytes: what the kernels keep
-/// there, as the engine that runs them states it.
-pub fn layout_reusing(
+/// The first piece whose free tail holds `span` bytes from an aligned
+/// byte `lead` bytes past its end, opening a new one where none does:
+/// `Some(None)` where a fresh piece holds no such span either, `None` past
+/// a `u64`.
+fn bump(ends: &mut Vec<u64>, lead: u64, span: u64, limit: u64) -> Option<Option<(u32, u64)>> {
+    let place = |end: u64| -> Option<Option<u64>> {
+        let at = align_up(end.checked_add(lead)?)?;
+        Some(
+            at.checked_add(span)
+                .filter(|&stop| stop <= limit)
+                .map(|_| at),
+        )
+    };
+    for (piece, end) in ends.iter_mut().enumerate() {
+        if let Some(at) = place(*end)? {
+            *end = at + span;
+            return Some(Some((u32::try_from(piece).ok()?, at)));
+        }
+    }
+    let Some(at) = place(0)? else {
+        return Some(None);
+    };
+    ends.push(at + span);
+    Some(Some((u32::try_from(ends.len() - 1).ok()?, at)))
+}
+
+/// The chunks of `chunk` bytes a piece of `descriptors`' scratch takes:
+/// enough for the largest value alive in it, and for the temporary area
+/// of `temporary` bytes with `reserve` bytes below it, at least `least`.
+/// Past `segment` chunks, the item that asks it is refused by name
+/// ([`TooLarge::PastSegment`]).
+fn run_for(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
     reserve: u64,
     temporary: u64,
-) -> Result<Layout, TooLarge> {
-    if lifetimes.len() != descriptors.len() {
-        return layout(descriptors);
+    pieces: Pieces,
+) -> Result<u32, TooLarge> {
+    let chunk = pieces.chunk.clamp(1, MAX_BYTES);
+    let past = |item, bytes| TooLarge::PastSegment {
+        item,
+        bytes,
+        chunk,
+        segment: pieces.segment,
+    };
+    let runs = |span: u64| span.div_ceil(chunk);
+    let mut run = u64::from(pieces.run.max(1));
+    for (i, descriptor) in descriptors.iter().enumerate() {
+        if lifetimes[i].dead {
+            continue;
+        }
+        let bytes = descriptor.device_bytes();
+        let span = runs(align_up(bytes).ok_or(TooLarge::Overflow)?);
+        if span > u64::from(pieces.segment) {
+            return Err(past(
+                Item::Value(u32::try_from(i).unwrap_or(u32::MAX)),
+                bytes,
+            ));
+        }
+        run = run.max(span);
     }
+    let area = align_up(reserve)
+        .zip(align_up(temporary))
+        .and_then(|(reserve, temporary)| reserve.checked_add(temporary))
+        .ok_or(TooLarge::Overflow)?;
+    let span = runs(area);
+    if span > u64::from(pieces.segment) {
+        return Err(past(
+            Item::Temporary,
+            reserve.saturating_add(align_up(temporary).unwrap_or(u64::MAX)),
+        ));
+    }
+    u32::try_from(run.max(span)).map_err(|_| TooLarge::Overflow)
+}
+
+/// `descriptors` laid by `lifetimes` in pieces of at most `limit` bytes: a
+/// value takes the bytes of one whose last reader ran before it is
+/// written, in that one's piece, else a free tail of the first piece with
+/// room, else a new piece. `reserve` bytes lie right below the temporary
+/// area, which holds `temporary` bytes, both in one piece. The caller has
+/// sized `limit` for every item ([`run_for`]).
+fn place(
+    descriptors: &[ValueDesc],
+    lifetimes: &[Lifetime],
+    reserve: u64,
+    temporary: u64,
+    limit: u64,
+) -> Result<ChunkLayout, TooLarge> {
     let count = descriptors.len();
     let mut by_def: Vec<usize> = (0..count).collect();
     by_def.sort_by_key(|&i| {
@@ -210,9 +484,9 @@ pub fn layout_reusing(
     let mut expired = 0usize;
 
     let mut free: Vec<Vacant> = Vec::new();
-    let mut values = vec![0u64; count];
+    let mut values = vec![Placed::default(); count];
     let mut spans = vec![0u64; count];
-    let mut at = DUMMY_BYTES;
+    let mut ends = vec![DUMMY_BYTES];
     let mut step: Option<u32> = None;
 
     for &i in &by_def {
@@ -225,7 +499,8 @@ pub fn layout_reusing(
                     release(
                         &mut free,
                         Vacant {
-                            offset: values[dead],
+                            piece: values[dead].piece,
+                            offset: values[dead].offset,
                             span: spans[dead],
                             launch: lifetimes[dead].launch_last,
                             class: lifetimes[dead].class_last,
@@ -237,36 +512,115 @@ pub fn layout_reusing(
             step = Some(life.def);
         }
         if life.dead {
-            values[i] = 0;
-            spans[i] = 0;
             continue;
         }
-        let span = align_up(descriptors[i].device_bytes()).ok_or(TooLarge::Overflow)?;
+        let bytes = descriptors[i].device_bytes();
+        let span = align_up(bytes).ok_or(TooLarge::Overflow)?;
         let taken = if life.reusable {
             take(&mut free, span, life.launch_def, life.class_def)
         } else {
             None
         };
-        let offset = match taken {
-            Some(offset) => offset,
+        values[i] = match taken {
+            Some(placed) => placed,
             None => {
-                at = align_up(at).ok_or(TooLarge::Overflow)?;
-                let offset = at;
-                at = at.checked_add(span).ok_or(TooLarge::Overflow)?;
-                offset
+                let (piece, offset) = bump(&mut ends, 0, span, limit)
+                    .ok_or(TooLarge::Overflow)?
+                    .ok_or(TooLarge::Bound { bytes, limit })?;
+                Placed { piece, offset }
             }
         };
-        values[i] = offset;
         spans[i] = span;
     }
 
     let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
-    let temporary = at
-        .checked_add(reserve)
-        .and_then(align_up)
-        .ok_or(TooLarge::Overflow)?;
-    let total = temporary
-        .checked_add(temporary_bytes)
+    let (piece, offset) = bump(&mut ends, reserve, temporary_bytes, limit)
+        .ok_or(TooLarge::Overflow)?
+        .ok_or(TooLarge::Bound {
+            bytes: reserve.saturating_add(temporary_bytes),
+            limit,
+        })?;
+    Ok(ChunkLayout {
+        run: 1,
+        chunk: limit,
+        values,
+        temporary: Placed { piece, offset },
+        temporary_bytes,
+        ends,
+    })
+}
+
+/// Every value live from the first launch to the last, none taking
+/// another's bytes: what a layout falls back to where its lifetimes are
+/// not stated.
+fn each_its_own(count: usize) -> Vec<Lifetime> {
+    vec![
+        Lifetime {
+            def: 0,
+            last: u32::MAX,
+            dead: false,
+            reusable: false,
+            launch_def: 0,
+            launch_last: u32::MAX,
+            class_def: Lifetime::SEQUENTIAL,
+            class_last: Lifetime::SEQUENTIAL,
+        };
+        count
+    ]
+}
+
+/// `descriptors` laid by `lifetimes` in `pieces`, the layout every
+/// backend's guest scratch takes ([`ChunkLayout`]): a piece is a run of
+/// `run` adjacent chunks inside one segment, `run` the least that holds
+/// the largest value alive, and the temporary area with the reserve below
+/// it, whole ([`Pieces::run`] at least); no item crosses a piece, values
+/// packed into pieces, each addressed as its piece's base plus its offset.
+/// An item past a segment's chunks is refused by name
+/// ([`TooLarge::PastSegment`]). Where `lifetimes` are not the values',
+/// each value holds its own bytes.
+pub fn layout_chunked(
+    descriptors: &[ValueDesc],
+    lifetimes: &[Lifetime],
+    reserve: u64,
+    temporary: u64,
+    pieces: Pieces,
+) -> Result<ChunkLayout, TooLarge> {
+    let own;
+    let lifetimes = if lifetimes.len() == descriptors.len() {
+        lifetimes
+    } else {
+        own = each_its_own(descriptors.len());
+        &own
+    };
+    let run = run_for(descriptors, lifetimes, reserve, temporary, pieces)?;
+    let chunk = pieces.chunk.clamp(1, MAX_BYTES);
+    let limit = u64::from(run)
+        .checked_mul(chunk)
+        .ok_or(TooLarge::Overflow)?
+        .min(MAX_BYTES);
+    let laid = place(descriptors, lifetimes, reserve, temporary, limit)?;
+    Ok(ChunkLayout { run, chunk, ..laid })
+}
+
+/// `descriptors` laid by `lifetimes`: a value takes the bytes of one whose
+/// last reader ran before it is written. `reserve` bytes lie clear below
+/// the temporary area, which holds `temporary` bytes: what the kernels keep
+/// there, as the engine that runs them states it. One piece, unbounded but
+/// for [`MAX_BYTES`]: [`layout_chunked`] with no chunk.
+pub fn layout_reusing(
+    descriptors: &[ValueDesc],
+    lifetimes: &[Lifetime],
+    reserve: u64,
+    temporary: u64,
+) -> Result<Layout, TooLarge> {
+    if lifetimes.len() != descriptors.len() {
+        return layout(descriptors);
+    }
+    let laid = place(descriptors, lifetimes, reserve, temporary, u64::MAX)?;
+    let total = laid
+        .temporary
+        .offset
+        .checked_add(laid.temporary_bytes)
         .ok_or(TooLarge::Overflow)?;
     if total > MAX_BYTES {
         return Err(TooLarge::Bound {
@@ -275,9 +629,9 @@ pub fn layout_reusing(
         });
     }
     Ok(Layout {
-        values,
-        temporary,
-        temporary_bytes,
+        values: laid.values.iter().map(|placed| placed.offset).collect(),
+        temporary: laid.temporary.offset,
+        temporary_bytes: laid.temporary_bytes,
         total,
     })
 }
@@ -296,6 +650,59 @@ mod tests {
             dtype: 0,
             dims: [0; MAX_RANK],
         }
+    }
+
+    /// The stage's temporary area is the widest of the whole-value rule and
+    /// what each region's emitter publishes: a short vector's select keeps
+    /// its fixed state below the rule's bytes, a top-k takes so much a row
+    /// of its input, an emitter that publishes none takes the rule alone,
+    /// and a need naming a value the stage lacks, or past a u64, is refused
+    /// by name.
+    #[test]
+    fn a_stage_s_temporaries_take_the_widest_published_need() {
+        let short = [desc(16)];
+        let whole = whole_value_temporaries(&short).unwrap();
+        assert_eq!(whole, 16 * 16);
+        assert_eq!(stage_temporaries(&short, &[]), Ok(whole), "none published: the rule");
+        let select = TemporaryNeed {
+            fixed: 51_200,
+            per_row: None,
+            above_whole: true,
+        };
+        assert_eq!(stage_temporaries(&short, &[select]), Ok(51_200 + whole));
+        let mut rows = desc(16);
+        rows.rows = 4;
+        let topk = TemporaryNeed {
+            fixed: 15,
+            per_row: Some((0, 14_360)),
+            above_whole: false,
+        };
+        assert_eq!(stage_temporaries(&[rows], &[topk]), Ok(15 + 4 * 14_360));
+        assert_eq!(
+            stage_temporaries(&short, &[select, topk]),
+            Ok((51_200 + whole).max(15 + 14_360)),
+            "the widest region's"
+        );
+        // A wide value's rule covers a small need.
+        let wide = [desc(1 << 20)];
+        assert_eq!(
+            stage_temporaries(&wide, &[topk]),
+            Ok(whole_value_temporaries(&wide).unwrap())
+        );
+        let stray = TemporaryNeed {
+            per_row: Some((3, 8)),
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(
+            stage_temporaries(&short, &[stray]),
+            Err(TemporaryRefused::NoValue { value: 3 })
+        );
+        let past = TemporaryNeed {
+            fixed: u64::MAX,
+            above_whole: true,
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(stage_temporaries(&short, &[past]), Err(TemporaryRefused::Overflow));
     }
 
     fn life(def: u32, last: u32) -> Lifetime {
@@ -335,14 +742,20 @@ mod tests {
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
-        rows_of_one_class_share_only_at_one_offset();
+        rows_of_one_class_share_only_at_one_offset(None);
+        // In pieces of a chunk, a few values a piece: the same rule within
+        // each piece, and none past it.
+        rows_of_one_class_share_only_at_one_offset(Some(2048));
+        rows_of_one_class_share_only_at_one_offset(Some(4096));
     }
 
     /// Within a launch across blocks, block `b` owns row `b` of every value
     /// of a row class: a value that takes another's bytes there lies at the
     /// other's offset, so no block's row lands on another block's. Values
-    /// that share across launches may lie anywhere over each other.
-    fn rows_of_one_class_share_only_at_one_offset() {
+    /// that share across launches may lie anywhere over each other. With
+    /// `chunk`, laid in pieces of it ([`layout_chunked`]): two values share
+    /// bytes only in one piece, and the rule holds there.
+    fn rows_of_one_class_share_only_at_one_offset(chunk: Option<u64>) {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |bound: u64| {
             state ^= state << 13;
@@ -369,7 +782,11 @@ mod tests {
                 let last = def + next(4) as u32;
                 // Steps 0..3 one launch across blocks, 4.. another.
                 let launch = |step: u32| u32::from(step >= 4);
-                let class = if next(5) == 0 { 0 } else { (1u64 << 40) | u64::from(width) * 4 };
+                let class = if next(5) == 0 {
+                    0
+                } else {
+                    (1u64 << 40) | u64::from(width) * 4
+                };
                 lifetimes.push(Lifetime {
                     dead: false,
                     def,
@@ -381,17 +798,35 @@ mod tests {
                     class_last: class,
                 });
             }
-            let laid = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
+            let places: Vec<Placed> = match chunk {
+                None => layout_reusing(&descriptors, &lifetimes, 0, 0)
+                    .unwrap()
+                    .values
+                    .into_iter()
+                    .map(|offset| Placed { piece: 0, offset })
+                    .collect(),
+                Some(chunk) => {
+                    let laid =
+                        layout_chunked(&descriptors, &lifetimes, 0, 0, Pieces::new(chunk, 1))
+                            .unwrap();
+                    holds(&laid, &descriptors, &lifetimes, 0);
+                    laid.values
+                }
+            };
             let span = |i: usize| align_up(descriptors[i].device_bytes()).unwrap();
             for i in 0..count {
                 for j in 0..count {
                     let (a, b) = (lifetimes[i], lifetimes[j]);
-                    let (oi, oj) = (laid.values[i], laid.values[j]);
-                    let overlap = oi < oj + span(j) && oj < oi + span(i);
+                    let (pi, pj) = (places[i], places[j]);
+                    let (oi, oj) = (pi.offset, pj.offset);
+                    let overlap = pi.piece == pj.piece && oi < oj + span(j) && oj < oi + span(i);
                     if i == j || !overlap {
                         continue;
                     }
-                    assert!(a.last < b.def || b.last < a.def, "{i} and {j} live together");
+                    assert!(
+                        a.last < b.def || b.last < a.def,
+                        "{i} and {j} live together"
+                    );
                     let (early, late) = if a.last < b.def { (a, b) } else { (b, a) };
                     if early.launch_last >= late.launch_def {
                         assert_eq!(oi, oj, "{i} and {j} share a launch's rows at two offsets");
@@ -399,6 +834,475 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A chunk of 64 KiB: a few [`desc`]`(4096)` values a piece.
+    const CHUNK: u64 = 64 << 10;
+
+    /// Chunks of [`CHUNK`] in segments of 8.
+    const PIECES: Pieces = Pieces::new(CHUNK, 8);
+
+    /// Chunks of [`CHUNK`] in segments of one: a piece is one chunk.
+    const ONE: Pieces = Pieces::new(CHUNK, 1);
+
+    /// Every piece holds its items whole within its run of chunks, none in
+    /// piece 0's dummy bytes, and two values share a byte only where one is
+    /// last read before the other is written; the temporary area and the
+    /// reserve below it share none with a value.
+    fn holds(laid: &ChunkLayout, descriptors: &[ValueDesc], lifetimes: &[Lifetime], reserve: u64) {
+        assert_eq!(laid.values.len(), descriptors.len());
+        assert!(!laid.ends.is_empty());
+        let piece = laid.piece_bytes();
+        assert!(laid.ends.iter().all(|&end| end <= piece), "{:?}", laid.ends);
+        let span = |i: usize| {
+            let at = laid.values[i];
+            (
+                at.piece,
+                at.offset,
+                at.offset + descriptors[i].device_bytes(),
+            )
+        };
+        let live: Vec<usize> = (0..descriptors.len())
+            .filter(|&i| !lifetimes[i].dead)
+            .collect();
+        for &i in &live {
+            let (piece, start, end) = span(i);
+            assert_eq!(start % ALIGN, 0);
+            let top = laid.ends[piece as usize];
+            assert!(
+                end <= top,
+                "value {i} ends at {end}, past its piece's {top}"
+            );
+            if piece == 0 {
+                assert!(start >= DUMMY_BYTES, "value {i} in the dummy bytes");
+            }
+        }
+        for (x, &a) in live.iter().enumerate() {
+            for &b in &live[x + 1..] {
+                let (pa, sa, ea) = span(a);
+                let (pb, sb, eb) = span(b);
+                if pa != pb || ea <= sb || eb <= sa {
+                    continue;
+                }
+                let (la, lb) = (lifetimes[a], lifetimes[b]);
+                assert!(
+                    la.last < lb.def || lb.last < la.def,
+                    "values {a} {la:?} and {b} {lb:?} share bytes and their lifetimes overlap"
+                );
+            }
+        }
+        let temporary = laid.temporary;
+        assert!(temporary.offset >= reserve);
+        let (low, high) = (
+            temporary.offset - reserve,
+            temporary.offset + laid.temporary_bytes,
+        );
+        assert!(high <= laid.ends[temporary.piece as usize]);
+        if temporary.piece == 0 {
+            assert!(low >= DUMMY_BYTES);
+        }
+        for &i in &live {
+            let (piece, start, end) = span(i);
+            assert!(
+                piece != temporary.piece || end <= low || high <= start,
+                "value {i} lies in the temporary area"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_every_case() {
+        no_value_crosses_a_piece();
+        overlapping_lifetimes_take_disjoint_bytes();
+        a_value_past_a_chunk_is_refused_by_name();
+        the_temporary_area_past_a_chunk_is_refused_by_name();
+        one_unbounded_piece_is_the_reusing_layout();
+        an_instance_holds_one_run_or_whole_chunks();
+        a_freed_slot_is_taken_in_its_own_piece();
+    }
+
+    #[test]
+    fn runs_every_case() {
+        a_value_past_a_chunk_lies_in_a_run_of_chunks();
+        the_temporary_area_past_a_chunk_lies_in_a_run_of_chunks();
+        a_value_past_a_segment_is_refused_by_name();
+        a_stated_run_lays_every_piece_that_long();
+        run_one_is_the_chunked_layout();
+    }
+
+    fn no_value_crosses_a_piece() {
+        // Eight values of 16 KiB alive together: three in the first 64 KiB
+        // piece beside the dummy bytes, four in the next, which has none,
+        // and one in a third.
+        let descriptors = [desc(4096); 8];
+        let lifetimes = [life(0, 7); 8];
+        let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES).expect("fits");
+        holds(&laid, &descriptors, &lifetimes, 0);
+        assert_eq!(laid.pieces(), 3);
+        let pieces: Vec<u32> = laid.values.iter().map(|placed| placed.piece).collect();
+        assert_eq!(pieces, [0, 0, 0, 1, 1, 1, 1, 2], "{laid:?}");
+        assert_eq!(
+            laid.values[3].offset, 0,
+            "a piece past the first has no dummy bytes"
+        );
+        assert_eq!(laid.ends, [DUMMY_BYTES + 3 * 16384, CHUNK, 16384]);
+    }
+
+    fn overlapping_lifetimes_take_disjoint_bytes() {
+        let descriptors = [desc(4096), desc(4096), desc(4096), desc(8192)];
+        let lifetimes = [life(0, 1), life(1, 2), life(2, 3), life(3, 3)];
+        let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES).expect("fits");
+        holds(&laid, &descriptors, &lifetimes, 0);
+        assert_eq!(
+            laid.values[2], laid.values[0],
+            "the first was read last a step before"
+        );
+        assert_ne!(laid.values[1], laid.values[0]);
+    }
+
+    /// A segment of one chunk: a value past a chunk is past the segment.
+    fn a_value_past_a_chunk_is_refused_by_name() {
+        let descriptors = [desc(1024), desc(16385)];
+        assert_eq!(
+            layout_chunked(&descriptors, &[life(0, 1), life(1, 1)], 0, 0, ONE),
+            Err(TooLarge::PastSegment {
+                item: Item::Value(1),
+                bytes: 16385 * 4,
+                chunk: CHUNK,
+                segment: 1,
+            })
+        );
+        let refused = layout_chunked(&descriptors, &[], 0, 0, ONE).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .starts_with("value 1 takes 65540 bytes, past a segment of 1 65536-byte chunks"),
+            "{refused}"
+        );
+        // Exactly a chunk fits a piece of its own.
+        let whole = [desc(1024), desc(16384)];
+        let laid = layout_chunked(&whole, &[life(0, 1), life(1, 1)], 0, 0, ONE).expect("fits");
+        assert_eq!(laid.run, 1);
+        assert_eq!(
+            laid.values[1],
+            Placed {
+                piece: 1,
+                offset: 0
+            }
+        );
+        assert_eq!(laid.ends[1], CHUNK);
+    }
+
+    fn the_temporary_area_past_a_chunk_is_refused_by_name() {
+        let descriptors = [desc(1024)];
+        assert_eq!(
+            layout_chunked(&descriptors, &[life(0, 0)], 4096, CHUNK - 4096 + 1, ONE),
+            Err(TooLarge::PastSegment {
+                item: Item::Temporary,
+                bytes: 4096 + align_up(CHUNK - 4096 + 1).unwrap(),
+                chunk: CHUNK,
+                segment: 1,
+            })
+        );
+        let laid = layout_chunked(&descriptors, &[life(0, 0)], 4096, CHUNK - 4096, ONE)
+            .expect("the reserve and the area fill a piece of their own");
+        assert_eq!(laid.run, 1);
+        assert_eq!(
+            laid.temporary,
+            Placed {
+                piece: 1,
+                offset: 4096
+            }
+        );
+        holds(&laid, &descriptors, &[life(0, 0)], 4096);
+    }
+
+    fn one_unbounded_piece_is_the_reusing_layout() {
+        let descriptors = [desc(1024), desc(1024), desc(2048), desc(512)];
+        let lifetimes = [life(0, 0), life(0, 0), life(1, 2), life(2, 2)];
+        let laid = layout_chunked(
+            &descriptors,
+            &lifetimes,
+            SELECT_RESERVE,
+            777,
+            Pieces::new(MAX_BYTES, 1),
+        )
+        .expect("fits");
+        let reused = layout_reusing(&descriptors, &lifetimes, SELECT_RESERVE, 777).expect("fits");
+        assert_eq!(laid.pieces(), 1);
+        assert_eq!(
+            laid.values
+                .iter()
+                .map(|placed| placed.offset)
+                .collect::<Vec<_>>(),
+            reused.values
+        );
+        assert_eq!(laid.temporary.offset, reused.temporary);
+        assert_eq!(laid.ends[0], reused.total);
+        assert_eq!(laid.held_bytes(), reused.total);
+    }
+
+    fn an_instance_holds_one_run_or_whole_chunks() {
+        let one = layout_chunked(&[desc(1024)], &[life(0, 0)], 0, 0, PIECES).expect("fits");
+        assert_eq!(one.held_bytes(), DUMMY_BYTES + 4096, "the tighter run");
+        let three = layout_chunked(&[desc(4096); 8], &[life(0, 0); 8], 0, 0, PIECES).expect("fits");
+        assert_eq!(three.held_bytes(), 3 * CHUNK, "whole chunks, one a piece");
+    }
+
+    fn a_freed_slot_is_taken_in_its_own_piece() {
+        // Piece 0 full of values alive to the end but the first; piece 1
+        // opened; the first's bytes freed and taken back in piece 0.
+        let descriptors = [desc(4096), desc(4096), desc(4096), desc(4096), desc(4096)];
+        let lifetimes = [life(0, 0), life(0, 3), life(0, 3), life(0, 3), life(1, 3)];
+        let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES).expect("fits");
+        holds(&laid, &descriptors, &lifetimes, 0);
+        assert_eq!(laid.values[3].piece, 1);
+        assert_eq!(laid.values[4], laid.values[0]);
+        assert_eq!(laid.pieces(), 2);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// The chunks of `chunk` bytes the largest live value of
+    /// `descriptors`, or the temporary area with its reserve, takes.
+    fn widest(
+        descriptors: &[ValueDesc],
+        lifetimes: &[Lifetime],
+        reserve: u64,
+        temporary: u64,
+        chunk: u64,
+    ) -> u64 {
+        descriptors
+            .iter()
+            .zip(lifetimes)
+            .filter(|(_, life)| !life.dead)
+            .map(|(descriptor, _)| align_up(descriptor.device_bytes()).unwrap())
+            .chain([align_up(reserve).unwrap() + align_up(temporary).unwrap()])
+            .map(|bytes| bytes.div_ceil(chunk))
+            .fold(1, u64::max)
+    }
+
+    /// Random stages: widths across and past a chunk, lifetimes over a few
+    /// launches of one or many blocks, results that may go unwritten, dead
+    /// values, reserves and temporary areas, segments of one to three
+    /// chunks. Each laid one holds ([`holds`]) in pieces of the least run
+    /// that holds its widest item, or is refused naming an item that is
+    /// past the segment.
+    #[test]
+    fn chunked_adversarial_random_stages() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let (mut laid_count, mut refused_count, mut many, mut runs) = (0, 0, 0, 0);
+        for _ in 0..4000 {
+            let chunk = (1 + rng.below(64)) * 1024;
+            let segment = 1 + rng.below(3) as u32;
+            let count = 1 + rng.below(24) as usize;
+            let steps = 1 + rng.below(12) as u32;
+            let per_launch = 1 + rng.below(3) as u32;
+            let classes = [Lifetime::SEQUENTIAL, 0, 7, 9];
+            let descriptors: Vec<ValueDesc> = (0..count)
+                .map(|_| {
+                    let words = match rng.below(8) {
+                        0 => (chunk / 4).saturating_sub(rng.below(80)),
+                        1 => chunk / 4 + 1 + rng.below(64),
+                        _ => 1 + rng.below(chunk / 16),
+                    };
+                    desc(u32::try_from(words).expect("small"))
+                })
+                .collect();
+            let lifetimes: Vec<Lifetime> = (0..count)
+                .map(|_| {
+                    let def = rng.below(u64::from(steps)) as u32;
+                    let last = def + rng.below(u64::from(steps - def)) as u32;
+                    Lifetime {
+                        def,
+                        last,
+                        dead: rng.below(10) == 0,
+                        reusable: rng.below(5) != 0,
+                        launch_def: def / per_launch,
+                        launch_last: last / per_launch,
+                        class_def: classes[rng.below(4) as usize],
+                        class_last: classes[rng.below(4) as usize],
+                    }
+                })
+                .collect();
+            let reserve = rng.below(4) * 256;
+            let temporary = rng.below(chunk / 2);
+            let pieces = Pieces::new(chunk, segment);
+            let wide = widest(&descriptors, &lifetimes, reserve, temporary, chunk);
+            let room = u64::from(segment) * chunk;
+            match layout_chunked(&descriptors, &lifetimes, reserve, temporary, pieces) {
+                Ok(laid) => {
+                    holds(&laid, &descriptors, &lifetimes, reserve);
+                    assert_eq!(u64::from(laid.run), wide, "the least run that holds it");
+                    assert_eq!(laid.chunk, chunk);
+                    laid_count += 1;
+                    many += usize::from(laid.pieces() > 1);
+                    runs += usize::from(laid.run > 1);
+                }
+                Err(TooLarge::PastSegment {
+                    item: Item::Value(value),
+                    bytes,
+                    chunk: named,
+                    segment: of,
+                }) => {
+                    let value = value as usize;
+                    assert_eq!((named, of), (chunk, segment));
+                    assert_eq!(bytes, descriptors[value].device_bytes());
+                    assert!(
+                        align_up(bytes).unwrap() > room,
+                        "value {value} fits a segment"
+                    );
+                    assert!(!lifetimes[value].dead);
+                    refused_count += 1;
+                }
+                Err(TooLarge::PastSegment {
+                    item: Item::Temporary,
+                    bytes,
+                    ..
+                }) => {
+                    assert!(align_up(reserve).unwrap() + align_up(temporary).unwrap() > room);
+                    assert_eq!(bytes, reserve + align_up(temporary).unwrap());
+                    refused_count += 1;
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            laid_count > 1000 && refused_count > 100 && many > 500 && runs > 200,
+            "{laid_count} {refused_count} {many} {runs}"
+        );
+    }
+
+    /// A value of 2.5 chunks lies whole in a piece of a run of 3 adjacent
+    /// chunks, at its piece's base plus its offset; the smaller values pack
+    /// beside it in the same run.
+    fn a_value_past_a_chunk_lies_in_a_run_of_chunks() {
+        let big = u32::try_from(5 * CHUNK / 2 / 4).unwrap();
+        let descriptors = [desc(1024), desc(big), desc(4096)];
+        let lifetimes = [life(0, 2), life(1, 2), life(2, 2)];
+        let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES).expect("fits");
+        holds(&laid, &descriptors, &lifetimes, 0);
+        assert_eq!(laid.run, 3, "ceil(2.5 chunks)");
+        assert_eq!(laid.piece_bytes(), 3 * CHUNK);
+        assert_eq!(laid.pieces(), 1, "all three fit one run: {laid:?}");
+        assert_eq!(laid.held_bytes(), 3 * CHUNK, "a whole run of chunks");
+        // Exactly two chunks: a run of two.
+        let two = [desc(u32::try_from(2 * CHUNK / 4).unwrap())];
+        let laid = layout_chunked(&two, &[life(0, 0)], 0, 0, PIECES).expect("fits");
+        assert_eq!(laid.run, 2);
+        assert_eq!(
+            laid.values[0],
+            Placed {
+                piece: 1,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            laid.held_bytes(),
+            2 * 2 * CHUNK,
+            "two runs, piece 0 the dummy's"
+        );
+    }
+
+    /// The temporary area with the reserve below it lies whole in one run.
+    fn the_temporary_area_past_a_chunk_lies_in_a_run_of_chunks() {
+        let descriptors = [desc(1024)];
+        let laid = layout_chunked(&descriptors, &[life(0, 0)], 4096, CHUNK, PIECES).expect("fits");
+        holds(&laid, &descriptors, &[life(0, 0)], 4096);
+        assert_eq!(laid.run, 2);
+        assert_eq!(
+            laid.temporary,
+            Placed {
+                piece: 0,
+                offset: align_up(DUMMY_BYTES + 4096 + 4096).unwrap(),
+            },
+            "beside the value, in piece 0's run"
+        );
+    }
+
+    /// A value past a segment's chunks is refused by name; one segment
+    /// long, it lies in a run of all of them.
+    fn a_value_past_a_segment_is_refused_by_name() {
+        let past = u32::try_from(8 * CHUNK / 4 + 1).unwrap();
+        let descriptors = [desc(1024), desc(past)];
+        let refused =
+            layout_chunked(&descriptors, &[life(0, 1), life(1, 1)], 0, 0, PIECES).unwrap_err();
+        assert_eq!(
+            refused,
+            TooLarge::PastSegment {
+                item: Item::Value(1),
+                bytes: u64::from(past) * 4,
+                chunk: CHUNK,
+                segment: 8,
+            }
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("past a segment of 8 65536-byte chunks"),
+            "{refused}"
+        );
+        let whole = [desc(1024), desc(past - 1)];
+        let laid = layout_chunked(&whole, &[life(0, 1), life(1, 1)], 0, 0, PIECES).expect("fits");
+        assert_eq!(laid.run, 8);
+        assert_eq!(
+            laid.values[1],
+            Placed {
+                piece: 1,
+                offset: 0
+            }
+        );
+        assert!(matches!(
+            layout_chunked(&[desc(1024)], &[life(0, 0)], 0, 8 * CHUNK + 1, PIECES),
+            Err(TooLarge::PastSegment {
+                item: Item::Temporary,
+                ..
+            })
+        ));
+    }
+
+    /// A program lays all its stages in one piece size: a stated run is
+    /// kept where its items need less.
+    fn a_stated_run_lays_every_piece_that_long() {
+        let descriptors = [desc(4096); 8];
+        let lifetimes = [life(0, 7); 8];
+        let laid =
+            layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES.at_least(3)).expect("fits");
+        holds(&laid, &descriptors, &lifetimes, 0);
+        assert_eq!(laid.run, 3);
+        assert_eq!(
+            laid.pieces(),
+            1,
+            "8 x 16 KiB and the dummy in one 192 KiB run"
+        );
+        let big = u32::try_from(5 * CHUNK / 2 / 4).unwrap();
+        let laid =
+            layout_chunked(&[desc(big)], &[life(0, 0)], 0, 0, PIECES.at_least(2)).expect("fits");
+        assert_eq!(laid.run, 3, "a stated run is a least, not a most");
+    }
+
+    /// Where every item fits a chunk, the run is 1 and the layout is the
+    /// one pieces of a chunk give: a segment's length changes nothing.
+    fn run_one_is_the_chunked_layout() {
+        let descriptors = [desc(4096), desc(1024), desc(4096), desc(8192), desc(16384)];
+        let lifetimes = [life(0, 1), life(0, 3), life(2, 3), life(3, 4), life(4, 4)];
+        let one = layout_chunked(&descriptors, &lifetimes, 1024, 4096, ONE).expect("fits");
+        let eight = layout_chunked(&descriptors, &lifetimes, 1024, 4096, PIECES).expect("fits");
+        assert_eq!(one.run, 1);
+        assert_eq!(one, eight);
     }
 
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {

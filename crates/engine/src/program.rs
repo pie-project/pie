@@ -90,6 +90,67 @@ pub struct InstanceBinding {
     /// program binds none.
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
+    /// Where this instance's lanes' scratch lies
+    /// ([`GuestState::per_instance`]).
+    #[serde(default)]
+    pub scratch: ScratchPlace,
+    /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
+    /// instance of the pair, taken at the pair's first bind and given back
+    /// at its last close.
+    #[serde(default)]
+    pub pair: ScratchPlace,
+}
+
+/// What a guest program bound at given extents holds in the pool, as state
+/// (REDESIGN §6): the scratch each bound instance keeps for its lanes, and
+/// what the (program, extents) pair keeps once while any instance of it is
+/// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
+/// taken at the bind and held while bound ([`InstanceBinding::scratch`],
+/// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
+/// between fires: a park gives them back and an unpark takes fresh room,
+/// nothing copied, the engine told where ([`Rebind::Instance`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestState {
+    /// Bytes each bound instance holds for its lanes' scratch.
+    #[serde(default)]
+    pub per_instance: u64,
+    /// Bytes the pair holds once while any instance of it is bound.
+    #[serde(default)]
+    pub per_pair: u64,
+    /// The chunks a piece of either takes where it lies in whole chunks: a
+    /// run of `run` adjacent chunks inside one segment, the least that
+    /// holds the program's widest value (or its temporary area) whole, so
+    /// each piece is addressed from its first chunk (0 or 1: a chunk). Its
+    /// bytes past a chunk's are whole runs, `per_instance` and `per_pair`
+    /// a multiple of `run` chunks.
+    #[serde(default)]
+    pub run: u32,
+}
+
+impl GuestState {
+    /// The chunks a piece takes: [`Self::run`], at least one.
+    #[must_use]
+    pub fn chunks_a_piece(&self) -> u32 {
+        self.run.max(1)
+    }
+}
+
+/// Where a guest's scratch lies in the pool ([`GuestState`]): bytes that fit
+/// in a chunk's `Instance` slots (its slots times their bytes) as one run of
+/// adjacent slots in one chunk, else whole runs of adjacent chunks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScratchPlace {
+    /// None held.
+    #[default]
+    None,
+    /// `slots` adjacent `Instance` slots from slot ref `first`, in its chunk.
+    Run { first: u32, slots: u32 },
+    /// Pieces of `run` adjacent chunks inside one segment each
+    /// ([`GuestState::run`]): each piece's first chunk, by logical chunk
+    /// id. A piece is addressed from its first chunk's first byte; the
+    /// chunks after it lie at the next physical chunks, which the pool
+    /// keeps so (an evacuation moves a run whole).
+    Chunks { run: u32, pieces: Vec<u32> },
 }
 
 /// What an instance of a registered program holds in the pool, beside the
@@ -320,6 +381,12 @@ pub enum Rebind {
         /// [`InstanceBinding::adapter_slots`].
         #[serde(default)]
         adapter: Vec<u32>,
+        /// Its scratch, as [`InstanceBinding::scratch`].
+        #[serde(default)]
+        scratch: ScratchPlace,
+        /// Its pair's, as [`InstanceBinding::pair`].
+        #[serde(default)]
+        pair: ScratchPlace,
     },
     /// A registered channel's ring (`Channel` slots, as
     /// [`crate::channel::ChannelRegistration::slots`]).

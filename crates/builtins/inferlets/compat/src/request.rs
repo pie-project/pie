@@ -153,6 +153,9 @@ pub struct Request {
     /// model's prefix, with no chat template, and `messages` and `tools`
     /// are ignored. The legacy completions API.
     pub raw_prompt: Option<String>,
+    /// A completion prompt given as token ids: used as they are, as vLLM
+    /// and SGLang do, with no prefix added.
+    pub prompt_tokens: Option<Vec<u32>>,
     /// Tool definitions as JSON documents in the OpenAI function shape
     /// (`{"type":"function","function":{"name":…,"parameters":…}}`), which
     /// is what the chat templates embed verbatim.
@@ -188,6 +191,7 @@ impl Request {
         Self {
             messages,
             raw_prompt: None,
+            prompt_tokens: None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             response_format: ResponseFormat::Text,

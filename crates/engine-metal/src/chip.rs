@@ -139,8 +139,10 @@ seeded!(
     "apple7.toml",
     "apple8.toml",
     "apple9.toml",
+    "apple7/apple-m1-max.toml",
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
+    "apple10/apple-m5-pro.toml",
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -341,6 +343,8 @@ mod tests {
         );
     }
 
+    /// The M4 Pro's file runs over its family's, its values held; its
+    /// provenance names no check model, so none is called measured.
     #[test]
     fn the_m4_pro_runs_its_family_and_what_it_measured() {
         let (profile, report) = resolve("Apple M4 Pro", &facts(9, Some(20), 10, true), None);
@@ -351,15 +355,7 @@ mod tests {
                 profile::Source::Seeded("apple9/apple-m4-pro.toml".into())
             ]
         );
-        assert_eq!(
-            report.measured,
-            [
-                "kernel.ane.mlp",
-                "kernel.moe.tile_rows",
-                "kernel.qmm_splitk"
-            ]
-        );
-        assert!(!report.untuned());
+        assert!(report.measured.is_empty(), "{:?}", report.measured);
         assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 74 });
         assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);
         assert_eq!(profile.get::<AneMinRows>().0, 512);
