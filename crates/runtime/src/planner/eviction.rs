@@ -295,7 +295,6 @@ impl ResidencyPlanner {
             // moves down a tier for the head whatever its key; running work
             // never does.
             let head_key = crate::policy::schedule::current()
-                .filter(|table| table.names(waiter.pid))
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
             let stalled = inner.fleet_stalled();
@@ -519,7 +518,6 @@ impl ResidencyPlanner {
                     }
                     let head_rank = head.0;
                     let head_key = crate::policy::schedule::current()
-                .filter(|table| table.names(waiter.pid))
                 .and(inner.procs.get(&waiter.pid))
                 .map_or(i64::MAX, |proc| proc.key);
                     let stalled = inner.fleet_stalled();

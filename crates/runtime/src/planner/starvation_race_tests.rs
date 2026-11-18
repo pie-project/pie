@@ -3100,3 +3100,35 @@ async fn a_stalled_fleet_lets_a_lower_demand_move_higher_resting_sets_down() {
     }
     install(None);
 }
+
+/// A fresh arrival no row keys yet carries the installed table's default
+/// key as its bound, not none: it may not discard a kept higher-keyed set.
+/// With no table installed, every key is alike and nothing bounds it.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unkeyed_demand_is_bounded_by_the_table_s_default_key() {
+    use crate::policy::schedule::{Table, install};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::with_swap(4, 64)) as Arc<dyn PoolPort>
+    ));
+    let (fresh, kept) = (ProcessId::new_v4(), ProcessId::new_v4());
+    install(None);
+    planner.register(fresh);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            fresh,
+            allocation(Demand {
+                kv_pages: 100,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    assert_eq!(planner.head_key(), None, "no table: nothing bounds it");
+    install(Some(Table::new(
+        std::collections::HashMap::from([(kept, 20)]),
+        None,
+    )));
+    assert_eq!(planner.head_key(), Some(0), "the table's default key");
+    planner.unregister(fresh);
+    install(None);
+}

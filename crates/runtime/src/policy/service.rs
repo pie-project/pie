@@ -1669,7 +1669,19 @@ mod tests {
         assert_eq!(
             round(None, false, false).len(),
             3,
-            "a demand no key bounds takes as before"
+            "a demand no key bounds (no table installed) takes as before"
+        );
+        // A fresh arrival no row keys yet carries the table's default key
+        // (0): with the device full and nothing running, the kept sets move
+        // down a tier for it; none is discarded.
+        assert_eq!(
+            round(Some(0), true, true),
+            vec![(low, "moved down"), (mid, "moved down"), (high, "moved down")],
+            "a kept key-20 set moves down for a fresh arrival"
+        );
+        assert!(
+            round(Some(0), true, false).is_empty(),
+            "and is never discarded for it"
         );
         BOUND_SETS.lock().unwrap().clear();
     }
