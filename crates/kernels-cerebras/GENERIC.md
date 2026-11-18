@@ -3771,3 +3771,18 @@ over a head of 256) at 49,056 B linked alone: 96 B of stack.
   its first step**: a d2h of every PE's stamps returns 82 of 3,696 words, and the simulator
   stops idle at 3.73M cycles. This is not bisected yet. gemma4-sim cannot build without the
   pool, so the earlier binaries cannot run it; qwen3-sim with the pooled row inputs runs right.
+
+## A1: the audit's cleanup
+
+- **The decode plan is not a `SpatialTarget`.** `target::Wafer` implemented poem's
+  `poem_compiler::spatial::SpatialTarget` only as a pass-through: every node one `wafer` block,
+  the candidates the named plan asked for, a candidate's cost its order, and the trace analysed
+  a second time after `target::shape`. The plan comes from `target::plan` now: `shape`, then the
+  search (`search::search`), or a named plan as a debug override. The search is not a
+  `SpatialTarget` yet: its partitions are the kernel sets' keys walked by price
+  (`cold`, `search`), not blocks of the trait's graph, and its fit is a built program, not a
+  check over blocks and flows. Making it one (the blocks the floorplan's elements, the walk the
+  trait's candidates and cost) is a later design question; the trait stays as Pie's
+  cross-target design.
+- **No fallback list.** `target::plans` built the search's best three (`FALLBACKS`); the load took
+  the first. One plan is built.
