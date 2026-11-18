@@ -277,6 +277,73 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     None
 }
 
+/// How a rates step admits its frames under the device's bound on one
+/// submission (`max_submit`, where it states one), every engine's rule:
+/// a frame is estimated from its fire's last measured time, and admitted
+/// where that estimate times [`Admission::worst`] fits the bound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub bound: Option<std::time::Duration>,
+    /// Whether the device's clock has settled: the warm-up's rotations
+    /// agreed ([`warm_up`], by [`settle`]'s rule). Frames before it measure
+    /// the clock's ramp, not an estimate's error.
+    pub settled: bool,
+    /// The largest ratio of a settled frame's time to its estimate seen,
+    /// never below 1: a measurement, over every settled frame carrying its
+    /// estimate up, no decay and no window.
+    pub worst: f64,
+}
+
+impl Admission {
+    #[must_use]
+    pub fn new(bound: Option<std::time::Duration>) -> Admission {
+        Admission {
+            bound,
+            settled: false,
+            worst: 1.0,
+        }
+    }
+
+    /// Whether a frame estimated at `estimate_ns` fits the bound at the
+    /// worst ratio seen (always, with no bound or no estimate).
+    #[must_use]
+    pub fn fits(&self, estimate_ns: Option<f64>) -> bool {
+        match (self.bound, estimate_ns) {
+            (Some(cap), Some(e)) => e * self.worst <= cap.as_nanos() as f64,
+            _ => true,
+        }
+    }
+
+    /// The fires a frame of `count` holds at `per_fire_ns` a fire: `count`
+    /// halved until the frame fits; `None` where not even one fire does
+    /// (the shape is past the bound, refused by name).
+    #[must_use]
+    pub fn fires(&self, count: u32, per_fire_ns: Option<f64>) -> Option<u32> {
+        let mut n = count.max(1);
+        loop {
+            if self.fits(per_fire_ns.map(|p| p * f64::from(n))) {
+                return Some(n);
+            }
+            if n == 1 {
+                return None;
+            }
+            n /= 2;
+        }
+    }
+
+    /// A frame landed: `took_ns` against its `estimate_ns`, carried up
+    /// from a frame of no more fires (`upward`). Only a settled device's
+    /// frames move the worst ratio.
+    pub fn landed(&mut self, estimate_ns: Option<f64>, took_ns: f64, upward: bool) {
+        if let Some(e) = estimate_ns.filter(|&e| e > 0.0)
+            && self.settled
+            && upward
+        {
+            self.worst = self.worst.max(took_ns / e);
+        }
+    }
+}
+
 /// The side of the cube the warm-up's size walk ([`warm_side`]) times
 /// first, and the one after it: the walk's first growth is theirs.
 pub const WARM_PROBE: u32 = 1024;
@@ -1171,6 +1238,44 @@ mod tests {
         };
         assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cold frame before the clock settles moves nothing: the 840's walk
+    /// at 2048^3 took 23.4 ms against 12.3 ms estimated while its clock
+    /// ramped, and held every admission after it 1.9x high.
+    #[test]
+    fn a_cold_frame_does_not_inflate_later_admissions() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.landed(Some(12.33e6), 23.43e6, true);
+        assert_eq!(a.worst, 1.0);
+        // The attention's frame of 4 at 274 ms each fits at 1096 ms.
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(4));
+        // Settled: its frames count, the largest ratio kept.
+        a.settled = true;
+        a.landed(Some(100e6), 104e6, true);
+        a.landed(Some(100e6), 101e6, true);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+        // A frame carried down (from more fires to fewer) holds its own
+        // submit: it moves nothing.
+        a.landed(Some(1e6), 3e6, false);
+        assert!((a.worst - 1.04).abs() < 1e-12);
+    }
+
+    /// A frame that does not fit halves its fires until it does; only a
+    /// single fire past the bound is refused.
+    #[test]
+    fn a_frame_that_does_not_fit_halves_its_fires() {
+        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
+        a.settled = true;
+        a.worst = 1.9;
+        // 4 fires of 274 ms: 2083 ms at 1.9x; 2 fit (1042 ms).
+        assert_eq!(a.fires(4, Some(274.1e6)), Some(2));
+        assert_eq!(a.fires(16, Some(100e6)), Some(8));
+        // One fire past the bound: refused.
+        assert_eq!(a.fires(4, Some(1.2e9)), None);
+        // No estimate yet, or no bound: the frame as asked.
+        assert_eq!(a.fires(4, None), Some(4));
+        assert_eq!(Admission::new(None).fires(4, Some(1e12)), Some(4));
     }
 
     /// The warm-up's cube walks up while its next fire, estimated from the
