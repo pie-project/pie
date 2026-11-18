@@ -61,6 +61,46 @@ fn planner_every_case() {
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    an_owed_raise_is_served_ahead_of_every_bind_funding_its_span();
+}
+
+/// Binds funding their fire spans fill the queue, older and keyed above
+/// the lane, when a lane's fire past a lowered cap asks the room its raise
+/// lacks: the raise is the head (only it lets fires run, which free room
+/// for the rest), no bind is granted past it, and a reschedule (the
+/// policy's keys moving) keeps it there.
+fn an_owed_raise_is_served_ahead_of_every_bind_funding_its_span() {
+    let mut spec: Vec<(u64, Residency, bool)> =
+        (1..=53).map(|seq| (seq, Residency::Resident, true)).collect();
+    spec.push((54, Residency::Resident, true));
+    let (mut inner, pids) = fleet(&spec);
+    let (binders, lane) = (&pids[..53], pids[53]);
+    for &binder in binders {
+        park_allocation(&mut inner, binder, 8);
+    }
+    let raise = inner.enqueue_ahead(
+        lane,
+        WaitKind::Allocation {
+            demand: Demand {
+                kv_pages: 16,
+                rs: RsUnits::default(),
+            },
+            notify: Arc::new(Notify::new()),
+            outcome: None,
+            yielded: false,
+        },
+    );
+    let (head, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(head, raise, "the owed raise is the head");
+    assert_eq!(waiter.pid, lane);
+    assert!(
+        binders.iter().all(|&binder| !inner.growth_first(binder)),
+        "no bind is granted past it"
+    );
+    // The policy keys a binder above every process: the raise stays first.
+    inner.reschedule(|pid| (if *pid == binders[0] { 1_000 } else { 0 }, false));
+    let (head, _) = inner.unmet_head().expect("a head");
+    assert_eq!(head.1, raise.1, "rescheduled, still the head");
 }
 
 /// A restore whose role slots found no room is queued again, a waiter: it

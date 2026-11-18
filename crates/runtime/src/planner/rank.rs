@@ -16,6 +16,17 @@ impl Rank {
         }
     }
 
+    /// Ahead of every process's rank, `self`'s age kept among such: an
+    /// owed raise of the activation rung
+    /// ([`super::ResidencyPlanner::acquire_raise`]).
+    pub(super) fn ahead(self) -> Self {
+        Self {
+            key: std::cmp::Reverse(i64::MAX),
+            kept: std::cmp::Reverse(i64::MAX),
+            ..self
+        }
+    }
+
     pub(super) fn kept(self, kept: i64) -> Self {
         Self {
             kept: std::cmp::Reverse(kept),

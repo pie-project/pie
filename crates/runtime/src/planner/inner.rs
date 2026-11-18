@@ -35,6 +35,9 @@ pub(super) struct Inner {
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
+    /// The entries of owed raises of the activation rung: ranked ahead of
+    /// every process's ([`Rank::ahead`]) through every reschedule.
+    ahead: HashSet<u64>,
 }
 
 impl Inner {
@@ -181,6 +184,17 @@ impl Inner {
         key
     }
 
+    /// [`Self::enqueue`] for an owed raise of the activation rung: served
+    /// ahead of every other waiter (a bind's span among them), since only
+    /// the raise lets the fires run that free room for the rest.
+    pub(super) fn enqueue_ahead(&mut self, pid: ProcessId, kind: WaitKind) -> EntryKey {
+        let key = (self.procs[&pid].rank().ahead(), self.next_id);
+        self.ahead.insert(key.1);
+        self.next_id += 1;
+        self.queue.insert(key, Waiter { pid, kind });
+        key
+    }
+
     /// Wherever a reschedule has since moved it.
     pub(super) fn locate(&self, key: EntryKey) -> Option<EntryKey> {
         if self.queue.contains_key(&key) {
@@ -221,9 +235,16 @@ impl Inner {
         }
         let procs = &self.procs;
         let rank = |pid: &ProcessId, was: Rank| procs.get(pid).map_or(was, Proc::rank);
+        let queue = &self.queue;
+        self.ahead.retain(|id| queue.keys().any(|(_, at)| at == id));
+        let ahead = &self.ahead;
         self.queue = std::mem::take(&mut self.queue)
             .into_iter()
-            .map(|((was, id), waiter)| ((rank(&waiter.pid, was), id), waiter))
+            .map(|((was, id), waiter)| {
+                let now = rank(&waiter.pid, was);
+                let now = if ahead.contains(&id) { now.ahead() } else { now };
+                ((now, id), waiter)
+            })
             .collect();
         self.admitting = std::mem::take(&mut self.admitting)
             .into_iter()

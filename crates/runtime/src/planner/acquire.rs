@@ -106,11 +106,26 @@ impl ResidencyPlanner {
         quorum_id: ProcessId,
         demand: Demand,
     ) -> Result<Acquired, PlannerError> {
-        let acquired = self.acquire_inner(pid, quorum_id, demand).await;
+        let acquired = self.acquire_inner(pid, quorum_id, demand, false).await;
         if matches!(acquired, Ok(Acquired::Granted(_))) {
             self.note_peak(pid, demand);
         }
         acquired
+    }
+
+    /// [`Self::acquire`] for the room an owed raise of the activation rung
+    /// lacks: a pass's fire past the cap waits on it, and its frame with
+    /// it, so it waits ahead of every other waiter, a bind's span among
+    /// them (only the raise lets the fires run that free room for the
+    /// rest), funded as the head is: idle cache first, then a resident
+    /// parked by the victim choice.
+    pub async fn acquire_raise(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        quorum_id: ProcessId,
+        demand: Demand,
+    ) -> Result<Acquired, PlannerError> {
+        self.acquire_inner(pid, quorum_id, demand, true).await
     }
 
     async fn acquire_inner(
@@ -118,6 +133,7 @@ impl ResidencyPlanner {
         pid: ProcessId,
         quorum_id: ProcessId,
         demand: Demand,
+        ahead: bool,
     ) -> Result<Acquired, PlannerError> {
         if let Some(grant) = self.grant_now(pid, demand) {
             return Ok(Acquired::Granted(grant));
@@ -179,15 +195,17 @@ impl ResidencyPlanner {
                 return Parked::NotResident;
             }
             let notify = Arc::new(Notify::new());
-            let key = inner.enqueue(
-                pid,
-                WaitKind::Allocation {
-                    demand,
-                    notify: notify.clone(),
-                    outcome: None,
-                    yielded: false,
-                },
-            );
+            let kind = WaitKind::Allocation {
+                demand,
+                notify: notify.clone(),
+                outcome: None,
+                yielded: false,
+            };
+            let key = if ahead {
+                inner.enqueue_ahead(pid, kind)
+            } else {
+                inner.enqueue(pid, kind)
+            };
             Parked::Entry(key, notify)
         });
         match parked {
