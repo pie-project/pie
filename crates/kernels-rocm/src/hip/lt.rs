@@ -310,10 +310,12 @@ impl Plan {
 /// hipBLASLt 1.4 states no `wavesCount` itself.
 ///
 /// A solution that leaves its split of K to the launch (`globalSplitU` -1)
-/// splits only a problem of less than a wave (rocprofv3 on gfx942: 96 tiles
-/// launched three slices each; 256 to 1728 tiles launched one), so from a
-/// wave its split is one and below it the waves are not stated: `Ok(None)`,
-/// as where hipBLASLt offers no algorithm. `Err` where the solution could
+/// states no split, and hipBLASLt answers none: its split from a wave is
+/// taken as one by inference, not stated. Of 24 launches traced with
+/// rocprofv3 on gfx942, 23 launched exactly their tiles (256 to 1728) and
+/// the one under a wave (96 tiles) three slices each. Below a wave the
+/// waves are therefore not stated: `Ok(None)`, as where hipBLASLt offers no
+/// algorithm. `Err` where the solution could
 /// not be read, and why ([`super::lt_kernel::pricing`] states it).
 pub fn waves(s: Shape) -> Result<Option<f64>, String> {
     const CALL: &str = "hipblasLtMatmulAlgoGetHeuristic";

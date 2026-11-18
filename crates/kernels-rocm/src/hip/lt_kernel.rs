@@ -211,8 +211,10 @@ fn known() -> &'static Mutex<HashMap<String, Known>> {
 }
 
 /// The disk record of `arch`'s stated solutions: named by hipBLASLt's
-/// version and a digest of its dense bf16 logic files' names and sizes, so
-/// another library reads its own.
+/// version and a digest of its dense bf16 logic files' names and sizes. A
+/// record of another version or logic is never opened (its name differs),
+/// so a changed library is read again rather than trusted; where the
+/// version cannot be read there is no record at all.
 fn record_of(arch: &str) -> Option<PathBuf> {
     let root = crate::disk::dir("lt-solutions")?;
     let version = super::lt_grouped::version().ok()?;
@@ -474,8 +476,9 @@ pub fn unread(why: String) {
 #[must_use]
 pub fn pricing() -> String {
     match UNREAD.lock().expect("lock poisoned").as_ref() {
-        None => "waves from hipBLASLt's solutions (tile, split and occupancy of the kernel each \
-                 algorithm indexes)"
+        None => "waves from hipBLASLt's solutions (tile and occupancy of the kernel each \
+                 algorithm indexes; a split left to the launch taken as one from a wave, \
+                 inferred from traced launches, not stated)"
             .to_string(),
         Some(why) => format!("the measured curve as timed: hipBLASLt's solutions unread ({why})"),
     }
