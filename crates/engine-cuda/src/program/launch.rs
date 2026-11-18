@@ -34,17 +34,28 @@ pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
 /// fire runs as many as the device holds at once with its lanes, from one.
 pub const LANE_SAMPLER_BLOCKS: u32 = 16;
-/// A sampler block's arena: a barrier word's line, two exchange buffers and
-/// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
-const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
+/// A sampler block's arena: a barrier word's line and two exchange buffers.
+const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576;
+
+/// A sampler lane's gather buffers, after its blocks' arenas: two of 512
+/// gathered elements (`M1_FAST_GATHER`) for each of the
+/// [`LANE_SAMPLER_BLOCKS`] homes a lane's gathers spread over, however few
+/// blocks the lane runs on (`M1_LANE_GATHERS`).
+const LANE_SAMPLER_GATHERS: u64 = LANE_SAMPLER_BLOCKS as u64 * 2 * 512 * 8;
 
 /// What a sampler block's arena takes of the lane arenas, a block to the next.
 fn lane_arena_stride() -> u64 {
     LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN)
 }
 
+/// What a sampler lane on `blocks` blocks takes of the lane arenas, a lane to
+/// the next (`M1_LANE_SPAN`).
+fn lane_span(blocks: u32) -> u64 {
+    u64::from(blocks) * lane_arena_stride() + LANE_SAMPLER_GATHERS
+}
+
 /// The engine's lane arenas: where a sampler's blocks meet, laid once at
-/// load for the most blocks a fire's sampler launch runs (lanes run their
+/// load for the most lanes' spans a fire's sampler launch lays (lanes run their
 /// launches one after another on the fire's main stream, `fan::Fan::fork`).
 /// They are no lane's: a lane's scratch holds none of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,19 +67,14 @@ pub struct Arenas {
 
 impl Arenas {
     /// The bytes they take for flights of up to `flight` lanes on a device
-    /// of `units` multiprocessors: the most blocks one launch runs, its
-    /// lanes times the blocks each is given (`launch_region`).
+    /// of `units` multiprocessors: the most one launch lays, its lanes'
+    /// spans on the blocks each is given (`launch_region`).
     #[must_use]
     pub fn bytes_for(flight: u32, units: u32) -> u64 {
-        // Past the units a lane takes one block, so the widest flight runs
-        // the most; under them a lane's blocks share the units.
-        let flight = flight.max(1);
-        let under = (1..=flight.min(units.max(1)))
-            .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
+        (1..=flight.max(1))
+            .map(|filled| u64::from(filled) * lane_span(lane_blocks(units, filled)))
             .max()
-            .unwrap_or(0);
-        let past = if flight > units { u64::from(flight) } else { 0 };
-        under.max(past) * lane_arena_stride()
+            .unwrap_or(0)
     }
 }
 
@@ -1393,12 +1399,12 @@ impl Prepared {
             .copied()
             .unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
-        // with the fire's lanes (its blocks wait on one another), each over
-        // its own arena of the engine's; the lanes' barrier words start at
-        // zero.
+        // with the fire's lanes (its blocks wait on one another), in its own
+        // span of the engine's lane arenas: its blocks' arenas and its
+        // gather buffers; the lanes' barrier words start at zero.
         let rows = if sampler {
             let rows = lane_blocks(device_units(), self.filled).min(rows);
-            let need = u64::from(self.filled) * u64::from(rows) * lane_arena_stride();
+            let need = u64::from(self.filled) * lane_span(rows);
             if need > arenas.bytes {
                 return Err(Fault::Ceiling {
                     what: "bytes of the engine's lane arenas a fire's samplers meet in",
@@ -1406,7 +1412,7 @@ impl Prepared {
                     have: arenas.bytes,
                 });
             }
-            self.zero_barriers(arenas, u64::from(rows) * lane_arena_stride(), stream)?;
+            self.zero_barriers(arenas, lane_span(rows), stream)?;
             rows
         } else {
             rows
@@ -2229,10 +2235,11 @@ mod tests {
         );
     }
 
-    /// The kernel steps a block's arena as the launcher lays the lane
-    /// arenas, and they hold the most blocks a launch runs.
+    /// The kernel steps a block's arena and a lane's span as the launcher
+    /// lays the lane arenas, and they hold every lane a launch runs, its
+    /// gather buffers with it however few blocks it runs on.
     #[test]
-    fn the_lane_arenas_hold_every_launch_s_blocks() {
+    fn the_lane_arenas_hold_every_launch_s_lanes() {
         let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
         let stage = &stage[0];
         let region = stage
@@ -2244,18 +2251,24 @@ mod tests {
         let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
             .expect("the sampler emits");
         assert!(source.contains("g.stride = M1_LANE_ARENA_STRIDE;"));
+        assert!(source.contains("M1_LANE_SPAN(lane_blocks)"));
         assert_eq!(
             lane_arena_stride(),
-            (64 + 2 * 24_576 + 2 * 512 * 8 + 255) & !255,
+            (64 + 2 * 24_576 + 255) & !255,
             "the kernel's M1_LANE_ARENA_STRIDE"
         );
+        assert_eq!(
+            LANE_SAMPLER_GATHERS,
+            16 * 2 * 512 * 8,
+            "the kernel's M1_LANE_GATHERS"
+        );
         for (units, flight) in [(142, 128), (304, 256), (1, 1), (8, 4), (20, 32)] {
-            let most = (1..=flight)
-                .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
-                .max()
-                .unwrap();
-            assert_eq!(Arenas::bytes_for(flight, units), most * lane_arena_stride());
-            assert!(most <= u64::from(units.max(flight)));
+            for filled in 1..=flight {
+                assert!(
+                    u64::from(filled) * lane_span(lane_blocks(units, filled))
+                        <= Arenas::bytes_for(flight, units)
+                );
+            }
         }
     }
 

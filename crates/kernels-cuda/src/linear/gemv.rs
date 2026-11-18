@@ -98,46 +98,28 @@ fn rows_split(k: i32) -> i32 {
 /// The threads a block of the few-rows kernel runs.
 const ROWS_THREADS: u32 = 256;
 
-/// The weight rows a warp of the few-rows kernel takes (its `kR`): four
-/// where there are four activation rows or more and the grid at four still
-/// fills a wave of the device (its multiprocessors, each holding as many of
-/// the kernel's blocks as its threads seat), so each activation load a lane
-/// makes serves twice the weight rows and a weight row's product rereads
-/// half the activations from L2; else two, the grid's blocks being what the
-/// device lacks. A device it cannot read takes two.
-fn rows_per_warp(m: i32, n: i32, k: i32) -> u32 {
-    let groups = (8 / rows_split(k)).unsigned_abs();
-    let device =
-        crate::jit::device::multiprocessors().zip(crate::jit::device::max_threads_per_sm());
-    match device {
-        Some((sms, threads)) if m >= 4 => {
-            let wave = sms * (threads / ROWS_THREADS);
-            if n.unsigned_abs().div_ceil(groups * 4) >= wave {
-                4
-            } else {
-                2
-            }
-        }
-        _ => 2,
-    }
-}
-
 /// The weight rows a block of the few-rows kernel takes: its eight warps in
-/// groups of `split` over K, each group [`rows_per_warp`] rows.
-fn rows_per_block(m: i32, n: i32, k: i32) -> u32 {
-    (8 / rows_split(k)).unsigned_abs() * rows_per_warp(m, n, k)
+/// groups of `split` over K, two weight rows a warp. A warp of four weight
+/// rows (each activation load reused over twice the rows) is no candidate:
+/// it runs the same flops over the same bytes in half the blocks, so under
+/// the device's wave rule (`engine::roofline::Constants::wave_ns`) it never
+/// costs less, and on the L40S it measured slower at every product of
+/// eight decode rows of Qwen3-0.6B (qkv 14.8 against 13.0 us, gate | up
+/// 21.4 / 19.2, o 9.0 / 8.1, down 12.7 / 11.9, the head 413 / 395).
+fn rows_per_block(k: i32) -> u32 {
+    (8 / rows_split(k)).unsigned_abs() * 2
 }
 
 /// The blocks a cluster of the few-rows kernel splits a row's K over besides:
 /// four for a product of a few columns (a router's), whose few blocks alone
 /// keep too few loads in flight; else, or below sm_90 (no clusters), 1.
-pub(crate) fn rows_cluster(m: i32, n: i32, k: i32) -> u32 {
+pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
     // Thread block clusters arrive with sm_90.
     if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
         return 1;
     }
     let split = rows_split(k);
-    let blocks = n.unsigned_abs().div_ceil(rows_per_block(m, n, k));
+    let blocks = n.unsigned_abs().div_ceil(rows_per_block(k));
     if blocks <= 32 && (k / 8) % (split * 4) == 0 {
         4
     } else {
@@ -145,17 +127,33 @@ pub(crate) fn rows_cluster(m: i32, n: i32, k: i32) -> u32 {
     }
 }
 
+/// The blocks the few-rows kernel's grid takes over `n` columns of K `k`
+/// (each of its cluster's blocks besides).
+pub(crate) fn rows_blocks(n: i32, k: i32) -> u32 {
+    n.unsigned_abs().div_ceil(rows_per_block(k))
+}
+
 /// The few-rows skeleton's kernel for `epi` at `m x n x k`, its blocks and its
 /// cluster.
 pub(crate) fn rows_kernel(epi: &Epilogue, m: i32, n: i32, k: i32) -> (&'static Kernel, u32, u32) {
     let split = rows_split(k);
-    let rows = rows_per_warp(m, n, k);
-    let cl = rows_cluster(m, n, k);
+    let cl = rows_cluster(n, k);
     (
-        epi.kernel("rows_skeleton", &format!("{m}, {split}, {rows}, {cl}")),
-        n.unsigned_abs().div_ceil(rows_per_block(m, n, k)),
+        epi.kernel("rows_skeleton", &format!("{m}, {split}, {cl}")),
+        rows_blocks(n, k),
         cl,
     )
+}
+
+/// The blocks of the few-rows kernel's plain product at `m x n x k` one
+/// multiprocessor of the current device holds at once, at its launch's
+/// [`ROWS_THREADS`] and no dynamic shared memory: the driver's occupancy
+/// calculator over the kernel's registers and shared memory
+/// ([`Kernel::resident_blocks`]).
+pub(crate) fn rows_resident_blocks(m: i32, n: i32, k: i32) -> Result<u32, Error> {
+    rows_kernel(Epilogue::store(), m, n, k)
+        .0
+        .resident_blocks(ROWS_THREADS, 0)
 }
 
 /// `out[m][n] = act[m] . weight[n]` for a few rows: the few-rows skeleton with

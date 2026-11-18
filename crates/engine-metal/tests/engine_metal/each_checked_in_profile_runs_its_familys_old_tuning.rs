@@ -235,7 +235,7 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
 }
 
 #[test]
-fn the_m4_pro_runs_its_family_and_the_three_values_it_measured() {
+fn the_m4_pro_runs_its_family_and_names_no_measured_decision() {
     assert_old_tuning(
         "Apple M4 Pro",
         9,
@@ -246,14 +246,9 @@ fn the_m4_pro_runs_its_family_and_the_three_values_it_measured() {
         m4_pro_tile,
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
-    assert_eq!(
-        report.measured,
-        [
-            "kernel.ane.mlp",
-            "kernel.moe.tile_rows",
-            "kernel.qmm_splitk"
-        ]
-    );
+    // Its file states the three values its tune picked, and names none
+    // measured: no check model it was tuned with reads them (94e0116a2).
+    assert!(report.measured.is_empty(), "{:?}", report.measured);
 }
 
 #[test]

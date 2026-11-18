@@ -38,7 +38,7 @@
 //! way: one submit each, so neither the clock nor the adapter's span start
 //! biases it.
 
-use engine::rates::{SCAN_SHAPE, attn_flops, gemm_flops, scan_elements, weights_at};
+use engine::rates::{SCAN_SHAPE, Touched, attn_flops, gemm_flops, scan_elements, weights_at};
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -53,6 +53,19 @@ use crate::serve::Serve;
 /// memory, and it takes long enough to dwarf a dispatch. Bounded by the
 /// largest buffer the device allocates.
 pub const COPY_BYTES: u64 = 256 << 20;
+
+/// The `[rates]` keys the slang backends' estimate weighs a fire by (of
+/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
+/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
+/// choice on these backends reads them, so a load measures neither.
+pub const KEYS: [&str; 6] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+];
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -178,33 +191,15 @@ impl<'a, B: Serve> Rig<'a, B> {
     }
 
     /// One `fire`'s time inside a frame: a frame of `n` of it against one,
-    /// `n` doubled until a fire's time settles (`engine::rates::timed_frames`,
-    /// every engine's rule; the device's `max_submit` the only cap), the
-    /// host's clock around each frame's one submit.
+    /// `n` doubled until a fire's time settles, then such frames until their
+    /// rate stops moving (`engine::rates::warmed_frames`, every engine's
+    /// rule; the device's `max_submit` the only cap), the host's clock around
+    /// each frame's one submit.
     fn each(
         &self,
         timer: Timer<'_, B>,
-        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
-    ) -> Result<u64> {
-        self.each_of(timer, false, fire)
-    }
-
-    /// [`Rig::each`] for a memory-bound op: before it is timed, its own
-    /// frames warm the device until their rate stops moving
-    /// (`engine::rates::warm_up`'s rule): the DVFS level sustained serving
-    /// sees, not the one an idle device starts at.
-    fn each_warmed(
-        &self,
-        timer: Timer<'_, B>,
-        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
-    ) -> Result<u64> {
-        self.each_of(timer, true, fire)
-    }
-
-    fn each_of(
-        &self,
-        timer: Timer<'_, B>,
-        warm: bool,
+        touched: &Touched,
+        sets: usize,
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
     ) -> Result<u64> {
         let nothing = |_: &mut B::Frame| Ok(());
@@ -214,8 +209,15 @@ impl<'a, B: Serve> Rig<'a, B> {
                 .collect::<Result<Vec<u64>>>()?;
             Ok(median(walls))
         };
+        // Its sets touched once, by the first point over them.
+        engine::rates::touch_once(
+            touched,
+            self.max_submit,
+            u32::try_from(sets).unwrap_or(u32::MAX),
+            &mut |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
+        )?;
         self.frame(timer, 1, fire, &nothing)?;
-        let frames = engine::rates::timed_frames(
+        let frames = engine::rates::warmed_frames(
             self.max_submit,
             None,
             |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
@@ -225,12 +227,6 @@ impl<'a, B: Serve> Rig<'a, B> {
             self.unsettled.set(true);
         }
         let count = frames.fires;
-        if warm {
-            engine::rates::warm_up(|| {
-                self.frame(timer, count, fire, &nothing)
-                    .map(|(_, w)| f64::from(count) / (w as f64).max(1.0))
-            })?;
-        }
         let one = wall(1)?;
         if count < 2 {
             return Ok(one);
@@ -396,6 +392,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         hbm_gbps: Some(bytes_per_ns),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
+        few_row_tflops: None,
+        workgroups_per_core: None,
     };
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
@@ -429,7 +427,7 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         })
         .collect::<Result<Vec<(Tensor, Tensor, Tensor, Tensor)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each_warmed(timer, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (x, normed, packed, y) = sets[next.get() % sets.len()];
         next.set(next.get() + 1);
         kernels_slang::elemwise::norm::rmsnorm(sink, x, weight, 1e-6, normed)
@@ -527,7 +525,7 @@ fn matmul<B: Serve>(
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each(timer, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), weights.len(), &|sink| {
         let w = weights[next.get() % weights.len()];
         next.set(next.get() + 1);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
@@ -596,7 +594,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         mask_stride: MASK_STRIDE,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
-    let ns = rig.each(timer, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (q, pool) = &sets[next.get() % sets.len()];
         let (q, pool) = (*q, pool);
         next.set(next.get() + 1);
@@ -653,7 +651,7 @@ fn scan<B: Serve>(
         })
         .collect::<Result<Vec<_>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each_warmed(timer, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (raw, conv_state, scan_state) = &sets[next.get() % sets.len()];
         let raw = *raw;
         next.set(next.get() + 1);
@@ -828,7 +826,7 @@ pub fn gemm_rate<B: Serve>(
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
-    let ns = rig.each(timer, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), 1, &|sink| {
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)

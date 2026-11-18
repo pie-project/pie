@@ -400,13 +400,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             |rows| rows,
         );
         let counts = crate::top::counts(&boot.trace)?;
-        let row_tile = crate::top::row_tile(&chip);
-        let top = crate::top::choose(
+        let (top, estimate) = crate::top::choose(
             &rungs,
             after_weights,
             prompt_rows,
             &chip.rates(),
-            Some(row_tile.clone()),
+            crate::top::shape(&chip)?,
             device.name(),
             &counts,
         )?;
@@ -420,18 +419,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        weighed = engine::load::estimate(&counts, &chip.rates())
-            .ok()
-            .map(|mut estimate| {
-                estimate.rates = estimate.rates.with_row_tile(row_tile);
-                estimate
-            })
-            .map(|estimate| crate::top::Weighed {
-                rungs: rungs.clone(),
-                estimate,
-                live: after_weights,
-                fire_top: top.tokens,
-            });
+        weighed = Some(crate::top::Weighed {
+            rungs: rungs.clone(),
+            estimate,
+            live: after_weights,
+            fire_top: top.tokens,
+        });
         let widest = crate::top::widest(&rungs).unwrap_or(top.tokens);
         match boot.knobs.every_rung {
             None => top.tokens,
@@ -1843,8 +1836,8 @@ impl Shell {
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
 
-    /// Where a guest's sampler meets across its blocks: the most blocks one
-    /// of its launches runs, at the plane's flight on this device.
+    /// Where a guest's sampler meets across its blocks: the most lanes'
+    /// spans one of its launches lays, at the plane's flight on this device.
     fn lane_arenas_bytes(&self) -> u64 {
         crate::program::launch::Arenas::bytes_for(
             self.programs.flight(),

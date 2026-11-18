@@ -388,7 +388,7 @@ __global__ void gemv_splitk_skeleton(
 // columns, too few blocks to keep the loads in flight), each block takes a
 // slice of K and the first adds the blocks' sums in rank order. Each
 // product goes to the body alone: one dense bank.
-template <class Body, int kM, int kSplit, int kR, int kCl, int P, int IN, int OUT, bool ROUND>
+template <class Body, int kM, int kSplit, int kCl, int P, int IN, int OUT, bool ROUND>
 __global__ void __launch_bounds__(256) rows_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
@@ -403,10 +403,7 @@ __global__ void __launch_bounds__(256) rows_skeleton(
     pdl_wait();
     pdl_launch();
     static_assert(8 % kSplit == 0, "a block's warps split evenly over its rows");
-    // `kR` weight rows a warp (`kernels_cuda::linear::gemv::rows_per_warp`):
-    // each activation load a lane makes is reused over them. Each product's
-    // sum runs in the same order whatever the count.
-    static_assert(kR == 2 || kR == 4, "two or four weight rows a warp");
+    constexpr int kR = 2;                     // weight rows a warp
     constexpr int kRows = 8 / kSplit * kR;    // weight rows a block
     __shared__ float red[8][kR][kM];
     __shared__ float sum[kRows * kM];

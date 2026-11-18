@@ -64,6 +64,12 @@ attn_tflops_by_keys = [[512, 95.1], [1024, 167.7], [2048, 235.3], [4096, 297.4],
 hbm_gbps = 651.4
 elementwise_gbps = 648.0
 scan_gelems = 2723.6
+# The few-rows kernel (the rows skeleton) at 16 x 4096 x 4096 over one
+# cached plane, the median of 5 `pie tune cuda --rates` steps (11.2 to
+# 12.4); the blocks of it a multiprocessor holds, by the occupancy
+# calculator (derived, not timed).
+few_row_tflops = 12.0
+workgroups_per_core = 2.0
 
 [provenance]
 measured = [

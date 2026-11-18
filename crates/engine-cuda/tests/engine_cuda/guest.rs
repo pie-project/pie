@@ -236,6 +236,12 @@ pub fn alone_span(_: engine_cuda::program::Item<'_>, bytes: u64) -> engine_cuda:
 /// A plane with no pool: each pair's state lies in a buffer of its own
 /// ([`alone_span`]), the test process's until it ends.
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
+    alone_plane_fenced().0
+}
+
+/// [`alone_plane`], and the fence past its lane arenas: a zeroed run as long
+/// as they are, right after them, that no launch of the plane's writes.
+pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
     // The flight and the lane arenas a load lays: the widest flight a
     // power of two of the device's units, its samplers' arenas beside.
@@ -243,8 +249,34 @@ pub fn alone_plane() -> engine_cuda::ProgramPlane {
     let units = device_units().max(1);
     plane.set_flight(1 << units.ilog2());
     let bytes = Arenas::bytes_for(plane.flight(), units);
-    let arenas = engine_cuda::device::Buffer::zeroed(bytes as usize).expect("the lane arenas");
-    let at = Box::leak(Box::new(arenas)).ptr();
-    plane.set_arenas(Arenas { at, bytes });
-    plane
+    let arenas = engine_cuda::device::Buffer::zeroed(2 * bytes as usize).expect("the lane arenas");
+    let arenas: &'static engine_cuda::device::Buffer = Box::leak(Box::new(arenas));
+    plane.set_arenas(Arenas {
+        at: arenas.ptr(),
+        bytes,
+    });
+    (
+        plane,
+        Fence {
+            buffer: arenas,
+            at: bytes,
+        },
+    )
+}
+
+/// The run past a plane's lane arenas ([`alone_plane_fenced`]).
+pub struct Fence {
+    buffer: &'static engine_cuda::device::Buffer,
+    at: u64,
+}
+
+impl Fence {
+    /// Whether every byte of the run is still zero.
+    pub fn intact(&self) -> bool {
+        let mut run = vec![0u8; self.at as usize];
+        self.buffer
+            .read(self.at, &mut run)
+            .expect("the fence reads");
+        run.iter().all(|&byte| byte == 0)
+    }
 }
