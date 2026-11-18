@@ -2939,7 +2939,7 @@ impl<B: Serve> Shell<B> {
                 frame.fill_zero(&into, into_at, bytes)?;
                 continue;
             }
-            let (store, at) =
+            let (store, at, _) =
                 self.inputs[p.arm]
                     .seat(land.seat.id)
                     .ok_or_else(|| Fault::Unbound {
@@ -3008,12 +3008,22 @@ impl<B: Serve> Shell<B> {
                 } else {
                     self.inputs[arm].seat(seat.id)
                 };
-                let (_, base) = seated_at.ok_or_else(|| {
+                let (_, base, region) = seated_at.ok_or_else(|| {
                     program(
                         "serve::feed_inputs",
                         format!("this load carved no seat for guest input {}", seat.id),
                     )
                 })?;
+                // A lane's cells past its seat's region would land in the
+                // next region of the input store.
+                let end = offset * seat.row_bytes() + bytes;
+                if end > region {
+                    return Err(Fault::Ceiling {
+                        what: "bytes of a guest input's cells, against its seat's region",
+                        need: end,
+                        have: region,
+                    });
+                }
                 let at = base + offset * seat.row_bytes();
                 match cell {
                     InputCell::Refused => {
@@ -4118,7 +4128,7 @@ impl<B: Serve> Shell<B> {
         };
         // The narrowest rung that holds the fire: its carve at its fixed
         // place under the span's end.
-        let rung = self.span.rung_of(fire_rows);
+        let rung = self.span.rung_of(fire_rows)?;
         let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
         self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(

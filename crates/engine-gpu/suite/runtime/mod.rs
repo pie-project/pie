@@ -11,4 +11,5 @@ mod scores;
 mod shared;
 mod slots;
 mod rs_layout;
+mod rung_guard;
 mod buffered_fold;

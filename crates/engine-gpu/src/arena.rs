@@ -300,15 +300,20 @@ impl<B: Backend> Span<B> {
 
     /// The carve a fire of `rows` takes: the widest whose bytes lie in the
     /// chunks stated for the narrowest rung that holds it
-    /// ([`Span::widen`]).
-    #[must_use]
-    pub fn rung_of(&self, rows: FireRows) -> usize {
-        let narrowest = self
-            .rungs
-            .iter()
-            .position(|rung| rung.holds(rows))
-            .unwrap_or(self.rungs.len().saturating_sub(1));
-        self.widest.get(narrowest).copied().unwrap_or(narrowest)
+    /// ([`Span::widen`]). A fire no rung holds is refused by name: laid at
+    /// the top rung, its rows would run past that carve's rectangles into
+    /// their neighbours.
+    pub fn rung_of(&self, rows: FireRows) -> Result<usize> {
+        let Some(narrowest) = self.rungs.iter().position(|rung| rung.holds(rows)) else {
+            let top = self.rungs.last().map_or(0, |rung| u64::from(rung.tokens));
+            return Err(Fault::Ceiling {
+                what: "token rows, lanes or readouts of a fire against the widest activation \
+                       rung's carve",
+                need: rows.tokens.max(rows.lanes).max(rows.readouts),
+                have: top,
+            });
+        };
+        Ok(self.widest.get(narrowest).copied().unwrap_or(narrowest))
     }
 
     /// Takes the rungs the pool states, `(tokens, chunks)` of `chunk_bytes`
@@ -505,7 +510,10 @@ mod tests {
     /// covers it at every count.
     #[test]
     fn a_guest_region_lays_a_key_row_a_capturing_lane_and_a_page_row_a_reader() {
-        let rows = CaptureRows { keys: 2048, pages: 128 };
+        let rows = CaptureRows {
+            keys: 2048,
+            pages: 128,
+        };
         assert_eq!((rows.key_bytes(), rows.page_bytes()), (8192, 512));
         assert_eq!(rows.region(0, 0), (0, 0), "no capturing lane, no region");
         assert_eq!(rows.region(3, 0), (3 * 8192, 3 * 8192));
