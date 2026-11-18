@@ -258,6 +258,7 @@ impl ResidencyPlanner {
 
     pub(super) fn victim_set(&self) -> Option<VictimSet> {
         let (free, _) = self.port.device_stats();
+        let arriving = self.port.device_arriving();
         let (rs_free, rs_total) = self.port.rs_stats();
         let rs_growth = self.rs_growth();
         let (mut victims, spare) = self.with_inner(|inner| {
@@ -272,8 +273,11 @@ impl ResidencyPlanner {
             // In-flight moves past what the head's own kv takes free chunks
             // for its state too.
             let spare = expected.pages.saturating_sub(missing);
+            // Pages arriving come back as the work in flight lands: the
+            // head is short only past them (of a fleet still running).
+            let arriving = if inner.fleet_stalled() { 0 } else { arriving };
             let deficit = Reclaim {
-                pages: missing.saturating_sub(expected.pages.saturating_add(free)),
+                pages: missing.saturating_sub(expected.pages.saturating_add(free + arriving)),
                 rs: waiter
                     .rs_need()
                     .add(inner.seating_reserve(waiter.pid, rs_growth, waiter.rs_need(), rs_total))
