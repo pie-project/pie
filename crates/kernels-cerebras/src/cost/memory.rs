@@ -10,8 +10,8 @@
 use crate::kernels::KernelSet;
 use crate::plan::{LayerKind, Plan, Shape};
 
-/// A PE's memory below the stack (`0xC000`).
-pub const PE_BYTES: f64 = 49152.0;
+/// A PE's memory ([`crate::check::PE_BYTES`]; the stack grows down from `0xC000`).
+pub const PE_BYTES: f64 = crate::check::PE_BYTES as f64;
 
 /// The bytes of a plan that move with the partition: the weight PE's tiles and KV cache, the head
 /// PE's tiles and embeddings.

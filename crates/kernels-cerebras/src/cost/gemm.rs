@@ -43,8 +43,8 @@ pub const CALL: f64 = 8.0;
 pub const EXP: f64 = 30.0;
 /// An op's fixed cycles: the interpreter, the array's step between ops.
 pub const OP: f64 = 200.0;
-/// A PE's 32-bit words.
-pub const PE_WORDS: u32 = 12_288;
+/// A PE's 32-bit words ([`crate::check::PE_BYTES`]).
+pub const PE_WORDS: u32 = (crate::check::PE_BYTES / 4) as u32;
 /// The code's words a PE (the interpreter, the line streams, the all-reduces; the regions
 /// counted apart), fitted to the linked ELFs so that the model holds them (klein-4B's compute
 /// PE at 1024²: 46,962 bytes linked, 47,008 modelled; flux2-mini's at 16 + 16 rows below its
