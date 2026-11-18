@@ -38,8 +38,6 @@ moe.mxfp4_mma_per_from = 4
 
 [engine]
 seated_first = true
-bodies_mb = 1024
-forward_tokens = 2304
 prefill_lattice_steps = 8
 
 # Independent chains on side streams, as the RTX 4090, H100, sm100 and the RTX PRO 6000 run them:
@@ -49,6 +47,23 @@ prefill_lattice_steps = 8
 [compiler]
 dag_streams = true
 dag_streams_until = 256
+
+[rates]
+# `pie tune cuda --rates` on this L40S, the median of 5 bursts of each kernel
+# back to back, its launches taken off. The matmul by rows at n = k of 1024,
+# 2048 and 4096; the attention, one sequence attending itself, d 128, by keys
+# (at 8192 keys d 64 323.7, d 256 297.3); the per-row ops an rmsnorm and a
+# swiglu at 2048 x 4096.
+launch_ns = 904
+gemm_tflops_by_rows = [
+  [1024, [[256, 76.3], [512, 118.9], [1024, 156.3], [2048, 177.3], [4096, 174.0], [8192, 199.9]]],
+  [2048, [[256, 126.7], [512, 153.5], [1024, 186.4], [2048, 198.9], [4096, 205.7], [8192, 216.4]]],
+  [4096, [[256, 136.8], [512, 177.8], [1024, 204.9], [2048, 214.8], [4096, 210.8], [8192, 192.3]]],
+]
+attn_tflops_by_keys = [[512, 95.1], [1024, 167.7], [2048, 235.3], [4096, 297.4], [8192, 359.8]]
+hbm_gbps = 651.4
+elementwise_gbps = 648.0
+scan_gelems = 2723.6
 
 [provenance]
 measured = [
@@ -83,10 +98,8 @@ measured = [
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.prefill_lattice_steps",
   "engine.lattice_steps",
-  "engine.bodies_mb",
   "engine.working_set_percent",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",
@@ -103,3 +116,4 @@ measured = [
   "compiler.launch_us",
   "compiler.side_streams",
 ]
+rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): NVIDIA L40S; the matmul through cuBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at commit 9bc8af76e-wip; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

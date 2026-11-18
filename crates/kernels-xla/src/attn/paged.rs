@@ -26,7 +26,7 @@ use dtype::Dtype;
 use super::{DecodePlan, PrefillPlan};
 use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Ty, Val};
+use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
 use crate::tensor::{KvPool, Landing, Operand, PageMap, RaggedTensor, Stored};
 use crate::tuning::Chunks;
 use crate::tuning::Tuning;
@@ -2259,7 +2259,9 @@ pub fn attend_fresh(
             // The flash read keeps the table's pages (the fresh rows are
             // told by them) and reads each plane's older pages by its map.
             let narrow = tuning.chunks.flash_narrow_rows;
-            match fresh.filter(|a| plain && super::flash::fits(f, a, r, &heads, cap_v, narrow)) {
+            match fresh.filter(|a| {
+                plain && super::flash::fits(f, a, r, &heads, cap_v, narrow, (keys, values), geom.ps)
+            }) {
                 Some(a) => super::flash::attend(
                     f,
                     &a,
@@ -2272,13 +2274,11 @@ pub fn attend_fresh(
                     qpos,
                     lo,
                     hi,
-                    window,
                     cap,
-                    enabled,
+                    enabled.zip(mask).map(|(en, m)| (en, m, rule.bound)),
                     scale,
                     cap_v,
                     narrow,
-                    Box::new(walk),
                     [pool.keys_map, pool.values_map],
                 )?,
                 None => walk(f)?,
@@ -2293,6 +2293,7 @@ pub fn attend_fresh(
                 && heads.kvh * heads.d >= 1024
                 && rule.rel.is_none()
                 && rule.rbias.is_none()
+                && rule.bits.is_none()
                 && !matches!(planes, Planes::Paged { latent: true, .. })
                 && f.elem(keys) == Elem::Bf16
                 && f.elem(values) == Elem::Bf16
@@ -2305,47 +2306,17 @@ pub fn attend_fresh(
                         && f.view_order(keys) == f.view_order(values))
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
-            // A decode's rows copy their own pages; a fire whose rows carry
-            // a custom mask walks them as before.
+            // A decode's rows copy their own pages; a row under a custom
+            // mask copies its mask's columns beside them (no run-time
+            // choice).
             let vmem = tuning.vmem_cap();
             // each plane's pages by its own map, in the kernel's copies
             let maps = [pool.keys_map, pool.values_map];
-            let copied = move |f: &mut Func| -> Built<Flashed> {
-                super::pages::attend(
-                    f, rs.q, keys, values, geom.pt, lane, rs.lo, rs.hi, geom.pages, geom.ps,
-                    &heads, scale, vmem, maps,
-                )
-            };
-            match rs.enabled {
-                None => copied(f)?,
-                Some(en) => {
-                    let on = cmp_i(f, Cmp::Ne, en, 0)?;
-                    let any = f.reduce(on, &[0], Fold::Or)?;
-                    let at = f.convert(any, Elem::I32);
-                    let o = f.dims(rs.q).to_vec();
-                    let stat = Ty::new(Elem::F32, &o[..3]);
-                    let outs = [
-                        Ty::new(Elem::F32, &[o[0], o[1], o[2], heads.dv]),
-                        stat.clone(),
-                        stat,
-                    ];
-                    let plain: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-                        let fl = copied(f)?;
-                        Ok(vec![fl.o, fl.m, fl.l])
-                    });
-                    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-                        let fl =
-                            per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?;
-                        Ok(vec![fl.o, fl.m, fl.l])
-                    });
-                    let out = f.case(at, &outs, vec![plain, walked])?;
-                    Flashed {
-                        o: out[0],
-                        m: out[1],
-                        l: out[2],
-                    }
-                }
-            }
+            let mask = rs.enabled.zip(rs.mask).map(|(en, m)| (en, m, rule.bound));
+            super::pages::attend(
+                f, rs.q, keys, values, geom.pt, lane, rs.lo, rs.hi, geom.pages, geom.ps, &heads,
+                scale, vmem, maps, mask,
+            )?
         }
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
@@ -2358,13 +2329,12 @@ pub fn attend_fresh(
 
 /// A decode over a fire's readout rows (`call.q`'s rows, at the fire rows
 /// `rows` names), each attending as the token it reads out, its position
-/// and lane in `call.tables`. Where every readout's lane holds no keys from
-/// before the fire, its keys are the rows the fire appended (`fresh`, one a
-/// fire row: `cache_rows` and `request_of_token` are the fire's), its
-/// lane's run up to itself: one blocked walk over that rectangle reads them,
-/// not a gather of every row's pages (a prompt's 32 padded lanes read 1024
-/// pages a layer). The fire decides at run time; the paged walk is the
-/// other branch, and the only one without `fresh`.
+/// and lane in `call.tables`. Its keys from this fire are the rows the fire
+/// appended (`fresh`, one a fire row: `cache_rows` and `request_of_token`
+/// are the fire's), its lane's run up to itself, read by one blocked walk
+/// over that rectangle; its lane's older keys each row copies page by page
+/// (`flash::readouts`), not a gather of every row's pages (a prompt's 32
+/// padded lanes read 1024 pages a layer). A fire without `fresh` walks.
 #[allow(clippy::too_many_arguments)]
 pub fn attend_readouts(
     f: &mut Func,
@@ -2414,12 +2384,22 @@ pub fn attend_readouts(
     let req = read_rows_i32(f, OP, request_of_token, request_of_token.rows)?;
     let lane = geom.lane_of(f, req)?;
     let q4 = f.reshape(call.q.val, &[i64::from(r), heads.kvh, heads.g, heads.d])?;
-    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        Ok(vec![walk(f).map_err(|e| crate::hlo::Malformed {
-            op: OP,
-            detail: e.to_string(),
-        })?])
-    });
+    // each readout row's custom mask, where the call carries one
+    let mask = if call.masked {
+        let t = call.tables;
+        if !matches!(t.mask.dtype, Dtype::U8 | Dtype::Bool)
+            || t.mask.rows < r
+            || t.mask_stride > t.mask.width
+        {
+            // the walk refuses it by name
+            return walk(f);
+        }
+        let en = read_rows_i32(f, OP, t.mask_enabled, r)?;
+        let plane = f.slice_axis(t.mask.val, 0, 0, i64::from(r))?;
+        Some((en, plane, i64::from(t.mask_stride)))
+    } else {
+        None
+    };
     Ok(super::flash::readouts(
         f,
         &ap,
@@ -2434,8 +2414,9 @@ pub fn attend_readouts(
         window,
         f64::from(call.sm_scale),
         tuning.chunks,
-        walked,
+        tuning.vmem_cap(),
         [pool.keys_map, pool.values_map],
+        mask,
     )?)
 }
 
@@ -3766,8 +3747,8 @@ mod tests {
     #[test]
     fn a_fire_past_two_to_the_31_key_places_is_refused() {
         let mut f = Func::new("geometry");
-        let indptr = f.param(Ty::new(Elem::I32, &[257]), None);
-        let indices = f.param(Ty::new(Elem::I32, &[1 << 20]), None);
+        let indptr = f.param(crate::hlo::Ty::new(Elem::I32, &[257]), None);
+        let indices = f.param(crate::hlo::Ty::new(Elem::I32, &[1 << 20]), None);
         let fits = geometry(&mut f, indptr, indices, 16, (1 << 19) / 16);
         assert!(fits.is_ok(), "256 lanes of 512K keys fit: {fits:?}");
         let wide = geometry(&mut f, indptr, indices, 16, (8 << 20) / 16);

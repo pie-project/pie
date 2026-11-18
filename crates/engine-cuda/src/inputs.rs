@@ -436,6 +436,30 @@ pub struct MaskInject {
 /// each is copied on its own.
 const GATHERED_INJECTS: usize = 4;
 
+/// Refuses by name, before anything is staged, a fire whose token rows (or
+/// any table laid a row each: kv write pages and offsets, readout rows,
+/// adapter routes) pass the `regions` rows the slab laid them for: a table
+/// longer than its region would run on into the next one.
+fn rows_fit(regions: u32, rows: u32, fire: &Fire<'_>) -> Result<()> {
+    let tables = fire
+        .page_tables
+        .iter()
+        .flat_map(|geometry| [geometry.write_page.len(), geometry.write_offset.len()])
+        .chain([fire.readout_rows.len()])
+        .chain(fire.adapter_routes.map(<[i32]>::len));
+    let widest = tables.fold(rows as usize, usize::max);
+    if widest > regions as usize {
+        return Err(crate::error::Fault::program(
+            "inputs::write_host",
+            format!(
+                "token rows a fire stages exceed its rung's regions: {widest} rows (the fire's \
+                 {rows}) against the {regions} its regions were laid for"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Lands each lane's device-carried tokens at its rows of `tokens`: past a few
 /// lanes in one gather launch; one copy each inside a stream capture.
 fn inject_tokens(
@@ -898,13 +922,7 @@ impl Inputs {
         let lanes = fire.slot_ids.len() as u32;
         let host = &self.staging[slot.at() as usize];
 
-        if rows > self.max_rows {
-            return Err(crate::error::Fault::Ceiling {
-                what: "staged token rows",
-                need: u64::from(rows),
-                have: u64::from(self.max_rows),
-            });
-        }
+        rows_fit(self.max_rows, rows, fire)?;
 
         if fire.windows.len() as u64 > self.window_ints {
             return Err(crate::error::Fault::Ceiling {
@@ -1682,6 +1700,57 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `u32` is `Copy`, no padding or niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(test)]
+mod rows_fit_tests {
+    use super::{Fire, Geometry, rows_fit};
+
+    fn fire<'a>(tokens: &'a [i32], tables: &'a [Geometry]) -> Fire<'a> {
+        Fire {
+            tokens,
+            positions: &[],
+            windows: &[],
+            qo_absolute: &[],
+            live: &[],
+            slot_ids: &[],
+            state_ids: &[],
+            adapter_routes: None,
+            readout_rows: &[],
+            readout_live: 0,
+            page_tables: tables,
+            mask: None,
+            live_rows: 0,
+            lane_of_row: &[],
+            lane_reach: 0,
+            group_of_lane: &[],
+            packings: &[],
+            rs: None,
+        }
+    }
+
+    /// A fire past its regions' rows, in its tokens or in a kv write table,
+    /// is refused by name; one within them passes.
+    #[test]
+    fn token_rows_past_the_regions_are_refused_by_name() {
+        let tables = [Geometry {
+            write_page: vec![0; 4],
+            write_offset: vec![0; 4],
+            ..Geometry::default()
+        }];
+        assert!(rows_fit(4, 4, &fire(&[0; 4], &tables)).is_ok());
+        let wide = rows_fit(4, 5, &fire(&[0; 5], &tables)).unwrap_err();
+        assert!(
+            wide.to_string()
+                .contains("token rows a fire stages exceed its rung's regions"),
+            "{wide}"
+        );
+        let long = [Geometry {
+            write_page: vec![0; 5],
+            ..Geometry::default()
+        }];
+        assert!(rows_fit(4, 4, &fire(&[0; 4], &long)).is_err());
     }
 }
 

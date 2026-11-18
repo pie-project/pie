@@ -55,9 +55,6 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
     pub profiles: Option<PathBuf>,
 
-    /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
-    pub prewarm: bool,
-
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
     pub headroom: Option<u64>,
@@ -87,7 +84,6 @@ impl Default for DeviceBoot {
             plugin: None,
             ordinal: 0,
             profiles: None,
-            prewarm: false,
             headroom: None,
             seat_tokens: None,
             stream_weights: false,
@@ -421,6 +417,13 @@ impl Xla {
     }
 }
 
+/// What a program's compile made off the engine's thread
+/// (`Xla::prepare_program`).
+struct Compiled {
+    pending: crate::program::Pending,
+    staged: std::result::Result<Vec<std::sync::Arc<crate::guest::run::Staged>>, String>,
+}
+
 impl Engine for Xla {
     fn kind(&self) -> &'static str {
         "xla"
@@ -492,14 +495,15 @@ impl Engine for Xla {
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
         shell.warm_maintenance().map_err(fault)?;
-        if boot.prewarm {
-            shell.prewarm().map_err(fault)?;
-            // The program a bind or a host pass lands guest cells with.
-            let (rows, _) = shell.pool_geometry();
-            crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
-            // from here a program built is a fire the ladder missed
-            shell.device().seal();
-        }
+        // The warm ladder, every fire shape the load serves, built before
+        // ready: none is built after it (a fire outside it is a ladder miss,
+        // named with its shape).
+        shell.prewarm().map_err(fault)?;
+        // The program a bind or a host pass lands guest cells with.
+        let (rows, _) = shell.pool_geometry();
+        crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
+        // from here a program built is a fire the ladder missed
+        shell.device().seal();
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
@@ -646,6 +650,42 @@ impl Engine for Xla {
         self.refused(registered)
     }
 
+    /// The program checked and its stage shapes named here; its stages
+    /// compile in the returned compile, off the engine's thread, while
+    /// fires go on (`Plane::prepare`).
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let pending = self.programs.prepare(registration).map_err(refusal);
+        let pending = self.refused(pending)?;
+        let device = self.shell.as_ref().map(Shell::device_shared);
+        Ok(Box::new(move || {
+            let staged = match &device {
+                Some(device) => pending.compile(device),
+                None => Ok(Vec::new()),
+            };
+            engine::Prepared(Box::new(Compiled { pending, staged }))
+        }))
+    }
+
+    /// The stages a prepared program's compile made held, and the program
+    /// registered (`Plane::finish`).
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(compiled) = prepared.0.downcast::<Compiled>() else {
+            return Err(Error::Program(
+                "a prepared program XLA did not prepare".to_string(),
+            ));
+        };
+        let Compiled { pending, staged } = *compiled;
+        let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
     /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
     /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
     /// bytes the load reserved, so no term beside the rungs; a sequence
@@ -715,6 +755,13 @@ impl Engine for Xla {
     /// A registered channel an instance may carry or feed on the device
     /// keeps its ring in the pool's `Channel` slots, the rows every instance
     /// bound to it reads; one only the host reads or writes takes none.
+    /// Every registration: its ring on the host, mirrored where the host
+    /// reads or writes it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

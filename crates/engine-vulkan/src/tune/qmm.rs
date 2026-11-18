@@ -360,7 +360,11 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     }
     Ok((
         vec![(spec.id.to_string(), ladder)],
-        vec![Line { id: spec.id, text }],
+        vec![Line {
+            id: spec.id,
+            text,
+            measured: true,
+        }],
     ))
 }
 

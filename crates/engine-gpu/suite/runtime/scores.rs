@@ -232,6 +232,36 @@ fn a_fire_lays_rows_for_its_capturing_lanes_alone() {
     served(256, &[Nothing, Nothing, Nothing]);
 }
 
+/// A load whose trace captures names every kernel a capture fires, all at
+/// the baseline tier (no subgroup, fp16 or cooperative-matrix form: a device
+/// at its baseline runs them), and holds no lane class unservable for want
+/// of one: the normaliser, the mass at the form the device's workgroup
+/// memory takes, and the page sums.
+#[test]
+fn a_capturing_load_names_its_capture_kernels_at_the_baseline_tier() {
+    let fixture = fixture(MODEL, None);
+    let Some(shell) = load(&fixture, 256) else {
+        return;
+    };
+    let named = shell.named();
+    let unservable: Vec<_> = named.unservable.iter().map(|held| held.class).collect();
+    assert!(unservable.is_empty(), "classes held unservable: {unservable:?}");
+    for prefix in ["attn_score_norm_", "attn_score_mass_", "attn_score_pages"] {
+        let kernel = named
+            .kernels
+            .iter()
+            .find(|kernel| kernel.key.starts_with(prefix))
+            .unwrap_or_else(|| panic!("the load names no `{prefix}` kernel"));
+        assert_eq!(kernel.unit, "attn/score.slang");
+        assert_eq!(
+            kernels_slang::key(kernel.key, kernels_slang::Tier::Baseline),
+            Some(kernel.key),
+            "`{}` is the baseline tier's",
+            kernel.key
+        );
+    }
+}
+
 /// The span lays no byte for a capturing lane's rows: a load that captures
 /// lays every rung's carve as the compiler's arena, which places them
 /// nowhere.

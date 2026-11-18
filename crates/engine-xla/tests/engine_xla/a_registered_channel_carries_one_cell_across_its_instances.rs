@@ -89,6 +89,8 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
             extents: BindExtents::default(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         })
         .expect("an instance bound to the registered counter binds")
         .id
@@ -291,6 +293,8 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
                 ring_slots: Vec::new(),
                 adapter_slots: Vec::new(),
                 extents: BindExtents::default(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
             })
             .expect("the instance binds")
             .id

@@ -77,7 +77,7 @@ pub(super) fn select_bf16_wgmma(
 /// `routes` routes: `kernel.moe.bf16_mma_from ..= kernel.moe.bf16_mma_until`.
 pub(super) fn bf16_mma_spans(ctx: &Ctx, routes: u32) -> bool {
     let t = ctx.tuning();
-    t.bf16_mma_until > 0 && t.bf16_mma_from <= routes && routes <= t.bf16_mma_until
+    t.bf16_mma_until() > 0 && t.bf16_mma_from() <= routes && routes <= t.bf16_mma_until()
 }
 
 /// `y[route] = x[route or its token] . W[routes[route]]^T` on the grouped
@@ -280,7 +280,7 @@ pub fn select_bf16_held(
     }
     // A prefill's experts averaging the wide tile's routes lay their order in
     // its 128-route slices once, kept for the down select.
-    let wide = fan.route_count.div_ceil(experts) >= ctx.tuning().bf16_wide_from.max(128);
+    let wide = fan.route_count.div_ceil(experts) >= ctx.tuning().bf16_wide_from().max(128);
     let SelectPlan {
         nb,
         tiled,
@@ -307,7 +307,7 @@ pub fn select_bf16_held(
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
         // CTA each 32 routes by 64 rows: two CTAs an SM.
-        let stages = ctx.tuning().bf16_gemm_stages.clamp(2, 4);
+        let stages = ctx.tuning().bf16_gemm_stages().clamp(2, 4);
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
         let bm: u32 = if wide { 128 } else { 64 };
@@ -393,7 +393,7 @@ pub fn select_bf16_copy(
         || y.dtype != Dtype::Bf16
         || !x.width.is_multiple_of(64)
         || !bank.is_multiple_of(16)
-        || fan.route_count < ctx.tuning().mxfp4_bf16_from.max(1)
+        || fan.route_count < ctx.tuning().mxfp4_bf16_from().max(1)
         || bias.is_some_and(|b| b.dtype != Dtype::Bf16)
         || matches!(glu, Some(crate::linear::gemm_sm100::Glu::Relu2))
     {

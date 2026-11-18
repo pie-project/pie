@@ -63,6 +63,14 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
 }
 
+/// `pid` waits on something the frame's firing would free: no frame on
+/// `engine` waits on its lanes until its next submit.
+pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::OwnerWaits(pid));
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -229,8 +237,12 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
-    RegisterProgram {
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     FireFacts {
@@ -279,6 +291,10 @@ enum SchedulerItem {
     AdmissionQueued(ProcessId),
     AdmissionDequeued(ProcessId),
     ProcessResume(ProcessId),
+    /// The process waits on something the frame's firing would free (a
+    /// raise of the activation rung): its lanes go out of the frame
+    /// ([`super::frame::FramePolicy::on_owner_waits`]).
+    OwnerWaits(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -467,10 +483,18 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
-    /// Registers a program with the engine, and learns what an instance
-    /// of it holds in the pool and what its fires take.
-    RegisterProgram {
+    /// A program's registration, first step: the engine checks it and
+    /// hands back its compile (`Engine::prepare_program`), which runs off
+    /// the lane while the lane fires on.
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    /// A program's registration, last step: the engine takes what its
+    /// compile made (`Engine::finish_program`), and the lane learns what an
+    /// instance of it holds in the pool.
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     /// Asks the engine what fires of a program bound at given extents take
@@ -861,18 +885,74 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<
-        HashMap<
-            u64,
-            (
-                ::engine::ProgramId,
-                ::eta_compiler::codegen::launch::LaunchPackage,
-            ),
-        >,
-    >,
+    /// Each program registered or registering, by its content hash, with
+    /// its launch package (a hash collision is refused by name): one
+    /// registration a program, however many binds ask for it at once.
+    program_ids: Mutex<HashMap<u64, (Known, ::eta_compiler::codegen::launch::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     device_domain: ::engine::MemoryDomain,
+    /// The backend a registration's host codegen emits for, off the
+    /// engine's thread (`EngineSpec::codegen_backend`).
+    codegen_backend: Option<String>,
+}
+
+/// What a bind finds of a program by its content hash.
+enum Known {
+    /// Registered: its id.
+    Ready(::engine::ProgramId),
+    /// Its registration under way: the answer every bind of it waits for.
+    Registering(tokio::sync::watch::Receiver<Option<Answer>>),
+}
+
+/// A registration's answer, as each bind waiting on it takes it.
+type Answer = std::result::Result<::engine::ProgramId, String>;
+
+/// Answers a registration's waiters when it is dropped unanswered (its
+/// task cancelled or panicking): the in-flight entry goes, and each waiter
+/// is refused by the program's hash, so a later bind registers it afresh.
+struct Unanswered {
+    handle: SchedulerHandle,
+    hash: u64,
+    answer: Option<tokio::sync::watch::Sender<Option<Answer>>>,
+}
+
+impl Unanswered {
+    fn answer(mut self, answer: Answer) {
+        {
+            let mut ids = self.handle.inner.program_ids.lock().unwrap();
+            match answer {
+                Ok(id) => {
+                    if let Some(entry) = ids.get_mut(&self.hash) {
+                        entry.0 = Known::Ready(id);
+                    }
+                }
+                Err(_) => {
+                    ids.remove(&self.hash);
+                }
+            }
+        }
+        if let Some(sender) = self.answer.take() {
+            let _ = sender.send(Some(answer));
+        }
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(sender) = self.answer.take() {
+            self.handle
+                .inner
+                .program_ids
+                .lock()
+                .unwrap()
+                .remove(&self.hash);
+            let _ = sender.send(Some(Err(format!(
+                "program 0x{:016x}: its registration ended unanswered",
+                self.hash
+            ))));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -934,6 +1014,115 @@ impl SchedulerHandle {
             .map_err(|_| anyhow!("scheduler channel closed"))
     }
 
+    /// Registers `program`: its host codegen on a blocking thread, then
+    /// the lane hands back its compile, which runs on a blocking thread
+    /// while the lane fires on, and the lane then makes it the program. Its
+    /// instances bind once this answers. Every failure names the program's
+    /// hash; an engine's prepare holds nothing its finish must undo, so a
+    /// compile that panics leaves nothing behind.
+    async fn register(&self, program: ProgramRegistration) -> Result<::engine::ProgramId> {
+        let hash = program.program_hash;
+        let program = match self.inner.codegen_backend.clone() {
+            Some(backend) => crate::rt::spawn_blocking(move || {
+                let coded = match crate::pipeline::program::with_host_codegen(
+                    &program,
+                    Some(backend.as_str()),
+                ) {
+                    std::borrow::Cow::Owned(coded) => Some(coded),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                coded.unwrap_or(program)
+            })
+            .await
+            .map_err(|e| anyhow!("program 0x{hash:016x}: its host codegen did not finish: {e}"))?,
+            None => program,
+        };
+        let compile = self
+            .request(|response| SchedulerItem::PrepareProgram {
+                program: Box::new(program),
+                response,
+            })
+            .await?
+            .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))?;
+        let prepared = crate::rt::spawn_blocking(compile)
+            .await
+            .map_err(|e| anyhow!("program 0x{hash:016x}: its compile did not finish: {e}"))?;
+        self.request(|response| SchedulerItem::FinishProgram { prepared, response })
+            .await?
+            .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))
+    }
+
+    /// The id of `program`, registered once however many binds ask at
+    /// once: the first registers it in a task of its own, which a bind's
+    /// cancellation does not stop (its finish is always reached, so no
+    /// compile is lost and no prepared program is left behind), and every
+    /// bind waits on its answer.
+    async fn program_id(
+        &self,
+        pid: ProcessId,
+        program: ProgramRegistration,
+    ) -> Result<::engine::ProgramId> {
+        self.program_id_with(pid, program, |this, program| async move {
+            this.register(program).await
+        })
+        .await
+    }
+
+    /// [`SchedulerHandle::program_id`], registering by `register`.
+    async fn program_id_with<F, Fut>(
+        &self,
+        pid: ProcessId,
+        program: ProgramRegistration,
+        register: F,
+    ) -> Result<::engine::ProgramId>
+    where
+        F: FnOnce(SchedulerHandle, ProgramRegistration) -> Fut,
+        Fut: std::future::Future<Output = Result<::engine::ProgramId>> + Send + 'static,
+    {
+        let hash = program.program_hash;
+        let mut answer = {
+            let mut ids = self.inner.program_ids.lock().unwrap();
+            match ids.get(&hash) {
+                Some((_, launch)) if launch != &program.launch => {
+                    return Err(anyhow!("program hash collision for 0x{hash:016x}"));
+                }
+                Some((Known::Ready(id), _)) => return Ok(*id),
+                Some((Known::Registering(answer), _)) => answer.clone(),
+                None => {
+                    let (sender, answer) = tokio::sync::watch::channel(None);
+                    ids.insert(
+                        hash,
+                        (Known::Registering(answer.clone()), program.launch.clone()),
+                    );
+                    let this = self.clone();
+                    let unanswered = Unanswered {
+                        handle: self.clone(),
+                        hash,
+                        answer: Some(sender),
+                    };
+                    let registering = register(this, program);
+                    crate::rt::spawn(async move {
+                        let registered = registering.await;
+                        unanswered.answer(registered.map_err(|e| format!("{e:#}")));
+                    });
+                    answer
+                }
+            }
+        };
+        let answered = crate::inferlet::process::said(
+            "bind: register the program",
+            pid,
+            answer.wait_for(Option::is_some),
+        )
+        .await
+        .map_err(|_| anyhow!("program 0x{hash:016x}: its registration ended unanswered"))?;
+        match &*answered {
+            Some(Ok(id)) => Ok(*id),
+            Some(Err(why)) => Err(anyhow!("{why}")),
+            None => Err(anyhow!("program 0x{hash:016x}: its registration ended unanswered")),
+        }
+    }
+
     pub(crate) fn stats(&self) -> Arc<SchedulerStats> {
         Arc::clone(&self.inner.stats)
     }
@@ -985,40 +1174,9 @@ impl SchedulerHandle {
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
     ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
-        let program_hash = program.program_hash;
-        let cached = {
-            let program_ids = self.inner.program_ids.lock().unwrap();
-            match program_ids.get(&program_hash) {
-                Some((program_id, launch)) => {
-                    if launch != &program.launch {
-                        return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
-                    }
-                    Some(*program_id)
-                }
-                None => None,
-            }
-        };
-        let program_id = match cached {
-            Some(program_id) => program_id,
-            None => {
-                let launch = program.launch.clone();
-                let program_id = crate::inferlet::process::said(
-                    "bind: register the program",
-                    pipeline_id.unwrap_or_default(),
-                    self.request(|response| SchedulerItem::RegisterProgram {
-                        program: Box::new(program),
-                        response,
-                    }),
-                )
-                .await??;
-                self.inner
-                    .program_ids
-                    .lock()
-                    .unwrap()
-                    .insert(program_hash, (program_id, launch));
-                program_id
-            }
-        };
+        let program_id = self
+            .program_id(pipeline_id.unwrap_or_default(), program)
+            .await?;
         bind.binding.program = program_id;
         // The fire term of the program at these extents counts while the
         // bind is under way, and the activation the fires may take holds it
@@ -1107,8 +1265,63 @@ impl SchedulerHandle {
                 None => Err(crate::planner::PlannerError::Cancelled),
             }
         };
-        let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident).await?;
+        // Short of a free run for its guest state, it waits on the walk to
+        // commit a segment, as a kv admission does, never refused while a
+        // segment is left to commit within the budget.
+        let engine = bind.engine_id;
+        let grown = |prefix: u32, run: u32| async move {
+            let shared = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.shared)
+                .ok_or_else(|| format!("engine {engine} has no shared pool to grow"))?;
+            crate::inferlet::process::said(
+                "bind: a segment for its guest state",
+                pid,
+                crate::store::roles::grow_for_guest(&shared, engine, prefix, run),
+            )
+            .await
+        };
+        // Short of room the budget holds, with no segment left to commit,
+        // it waits for room given back (a process completing, or parked),
+        // as an admission waits on pages, never refused for it.
+        let room = || {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .map(|roles| roles.lock().unwrap().room_watch())
+        };
+        // Whether `pieces` runs of `run` chunks stand free for its state.
+        let fits = |run: u32, pieces: u32| {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+        };
+        // Holding guest state of its own, it is suspended instead: waiting,
+        // it would hold room its own bind lacks.
+        let suspend = |run: u32, pieces: u32| {
+            let holds = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+            holds
+                && crate::planner::planner_of(pid)
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
+        };
+        // Waiting, it is a waiter in the planner's queue: idle cache goes
+        // first, then a resident is parked for it, as for a restore short
+        // of room for its roles.
+        let planned = |run: u32, pieces: u32| async move {
+            let planner = crate::planner::planner_of(pid)
+                .ok_or_else(|| "its process has no planner".to_string())?;
+            crate::inferlet::process::said(
+                "bind: room for its guest state",
+                pid,
+                planner.wait_bind_room(pid, run, pieces),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let (registered, _, bound) = crate::store::roles::bind_when_resident(
+            pid, lane_bind, resident, grown, room, fits, suspend, planned,
+        )
+        .await?;
         Ok((registered, bound))
     }
 
@@ -1185,6 +1398,9 @@ impl BatchScheduler {
                 accepting: AtomicBool::new(true),
                 stats: Arc::clone(&stats),
                 device_domain: crate::scheduler::device_domain(engine_idx),
+                codegen_backend: crate::engine::get_spec(engine_idx)
+                    .ok()
+                    .and_then(|spec| spec.codegen_backend),
             }),
         };
         crate::scheduler::install_scheduler_handle(engine_id, handle.clone());
@@ -1319,12 +1535,15 @@ impl BatchScheduler {
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
-            // No launch past the cap is submitted from here (`post_frame`
-            // holds it): once none in flight is either, the pool may lower
-            // its rung.
+            // No frame past the cap is sealed from here, and no unframed
+            // launch past it posted (`post_frame` holds it): once none in
+            // flight is either, nor a frame sealed before still to go, the
+            // pool may lower its rung.
+            frame_policy.cap_fires(stepped.max_forward_tokens);
             if in_flight_launches
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
+                && frame_policy.sealed_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -1626,7 +1845,8 @@ impl BatchScheduler {
                 QueuedItem::PreLaunchCopy {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
-                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
+                QueuedItem::PrepareProgram { .. } => "PrepareProgram".to_string(),
+                QueuedItem::FinishProgram { .. } => "FinishProgram".to_string(),
                 QueuedItem::FireFacts { key, .. } => format!("FireFacts({key})"),
                 QueuedItem::StandingAfter { binding, .. } => {
                     format!("StandingAfter(program {})", binding.program)
@@ -1802,6 +2022,7 @@ impl BatchScheduler {
                             launch.request.tokens(),
                             launch.wire_row_count(),
                             launch.request.sequence_readouts(),
+                            launch.request.rung_rows(),
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -1810,6 +2031,9 @@ impl BatchScheduler {
 
             SchedulerItem::ProcessResume(pid) => {
                 frame_policy.on_process_resume(pid);
+            }
+            SchedulerItem::OwnerWaits(pid) => {
+                frame_policy.on_owner_waits(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,
@@ -1826,8 +2050,11 @@ impl BatchScheduler {
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
             }
-            SchedulerItem::RegisterProgram { program, response } => {
-                pending.push_back(QueuedItem::RegisterProgram { program, response });
+            SchedulerItem::PrepareProgram { program, response } => {
+                pending.push_back(QueuedItem::PrepareProgram { program, response });
+            }
+            SchedulerItem::FinishProgram { prepared, response } => {
+                pending.push_back(QueuedItem::FinishProgram { prepared, response });
             }
             SchedulerItem::FireFacts { key, response } => {
                 pending.push_back(QueuedItem::FireFacts { key, response });
@@ -1969,7 +2196,8 @@ impl BatchScheduler {
             QueuedItem::CopyTracked { .. }
                 | QueuedItem::HostKv { .. }
                 | QueuedItem::Pool { .. }
-                | QueuedItem::RegisterProgram { .. }
+                | QueuedItem::PrepareProgram { .. }
+                | QueuedItem::FinishProgram { .. }
                 | QueuedItem::FireFacts { .. }
                 | QueuedItem::StandingAfter { .. }
         )
@@ -2424,6 +2652,17 @@ impl BatchScheduler {
                 }
                 continue;
             }
+            // What the frame posted owes its output from here, and only that.
+            if let Some(batch) = in_flight_launches.back() {
+                frame_policy.on_frame_posted(
+                    batch
+                        .requests
+                        .iter()
+                        .filter(|request| request.frame.is_some())
+                        .filter_map(|request| request.pipeline_id),
+                    now,
+                );
+            }
             if rider_batch {
                 frame_policy.record_rider_wave();
             }
@@ -2492,10 +2731,13 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back.
+                // An unframed launch past the pool's activation rung (SPEC
+                // decision 6) waits until the rung is back. A framed one was
+                // sealed under the cap, and its frame goes whole: the rung is
+                // not lowered under a sealed frame (`FramePolicy::cap_fires`).
                 QueuedItem::Launch(launch)
-                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
+                    if !launch.framed
+                        && launch.request.request.rung_rows() > limits.max_forward_tokens =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
@@ -2746,8 +2988,14 @@ impl BatchScheduler {
     ) {
         match commit {
             LaneCommit::None => {}
-            LaneCommit::BindFinished { pipeline_id } => {
+            LaneCommit::BindFinished { pipeline_id, waits } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Waiting for room, its process submits nothing until the
+                // bind lands: its lanes go out of the frame, as a
+                // suspension's do, and come back with its next submit.
+                if waits && let Some(pid) = pipeline_id {
+                    frame_policy.on_owner_waits(pid);
+                }
             }
             LaneCommit::BindInstance {
                 pipeline_id,
@@ -2917,6 +3165,24 @@ mod tests {
             "panicking"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3047,6 +3313,56 @@ mod tests {
         a_launch_waits_for_the_copy_queued_ahead_of_it();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
+        a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
+    }
+
+    /// The lane refuses by name a step whose token rows (or lanes) pass the
+    /// rung the engine holds, before the engine sees it (this engine panics
+    /// on any submit); one within it goes on to the engine.
+    fn a_step_wider_than_the_rung_the_engine_holds_never_reaches_it() {
+        const ENGINE: usize = 9207;
+        crate::store::shared::set_engine_rows_for_test(ENGINE, 2);
+        let mut lane = Lane::spawn(
+            ENGINE,
+            Some(Box::new(PanickingEngine)),
+            Arc::new(SchedulerStats::default()),
+        );
+        let frame = |lanes: u32| crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: (0..lanes)
+                        .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
+                        .collect(),
+                    attachments: Vec::new(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: Vec::new(),
+                completions: Vec::new(),
+                member_lanes: Vec::new(),
+                instances: vec![::engine::InstanceId(0); lanes as usize],
+            }],
+        };
+        let answer = |lanes: u32| {
+            let reply = lane.fire(frame(lanes), false);
+            crate::rt::block_on(async {
+                crate::rt::time::timeout(Duration::from_secs(10), reply).await
+            })
+            .expect("answered")
+            .expect("answered")
+        };
+        let Err(wide) = answer(3) else {
+            panic!("past the rung: refused");
+        };
+        assert!(
+            wide.contains("3 token rows") && wide.contains("the rung the engine was told"),
+            "refused by name: {wide}"
+        );
+        let Err(narrow) = answer(2) else {
+            panic!("the engine panics on what reaches it");
+        };
+        assert!(narrow.contains("panic"), "it reached the engine: {narrow}");
+        let _ = lane.shutdown();
     }
 
     /// A browser's single thread lands the batch a close waits on only after
@@ -3194,6 +3510,24 @@ mod tests {
             "exhausted"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3272,6 +3606,24 @@ mod tests {
     impl engine::Engine for InlineEngine {
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -3381,6 +3733,24 @@ mod tests {
     impl engine::Engine for LaneFaultEngine {
         fn kind(&self) -> &'static str {
             "lane-fault"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -3585,6 +3955,24 @@ mod tests {
             "holding"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3638,5 +4026,143 @@ mod tests {
         );
         assert!(port.idle(), "asked nothing more");
         let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// A handle on no scheduler: what a program's registration by content
+    /// hash keeps, driven by a registration of the test's own.
+    fn bare_handle() -> SchedulerHandle {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SchedulerHandle {
+            inner: Arc::new(SchedulerControl {
+                tx,
+                active_senders: AtomicUsize::new(0),
+                shutdown_wait: Condvar::new(),
+                shutdown_gate: Mutex::new(()),
+                program_ids: Mutex::new(HashMap::new()),
+                accepting: AtomicBool::new(true),
+                stats: Arc::new(SchedulerStats::default()),
+                device_domain: ::engine::MemoryDomain::HostPinned,
+                codegen_backend: None,
+            }),
+        }
+    }
+
+    async fn never_registers() -> Result<::engine::ProgramId> {
+        panic!("a program found by its hash registers again")
+    }
+
+    async fn panics_registering() -> Result<::engine::ProgramId> {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        panic!("the compile panics")
+    }
+
+    fn registration(hash: u64) -> ProgramRegistration {
+        ProgramRegistration {
+            program_hash: hash,
+            ..ProgramRegistration::default()
+        }
+    }
+
+    /// Binds asking at once for one program they find unregistered wait on
+    /// one registration: one compile, one id, and a later bind finds it.
+    #[test]
+    fn concurrent_binds_of_one_new_program_register_it_once() {
+        let handle = bare_handle();
+        let registered = Arc::new(AtomicUsize::new(0));
+        let ids = crate::rt::block_on(async {
+            let binds = (0..8).map(|_| {
+                let registered = Arc::clone(&registered);
+                handle.program_id_with(ProcessId::default(), registration(0xd0d0), |_, _| {
+                    async move {
+                        registered.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(::engine::ProgramId(7))
+                    }
+                })
+            });
+            futures::future::join_all(binds).await
+        });
+        for id in ids {
+            assert_eq!(id.expect("each bind gets the id"), ::engine::ProgramId(7));
+        }
+        assert_eq!(registered.load(Ordering::SeqCst), 1, "one registration");
+        let again = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xd0d0),
+            |_, _| never_registers(),
+        ));
+        assert_eq!(again.expect("found"), ::engine::ProgramId(7));
+        let mut colliding = registration(0xd0d0);
+        colliding.launch.plans.push(Default::default());
+        let collided = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            colliding,
+            |_, _| never_registers(),
+        ));
+        assert!(
+            collided.expect_err("refused").to_string().contains("collision"),
+            "a hash collision is refused by name"
+        );
+    }
+
+    /// A bind dropped while its program compiles does not stop the
+    /// registration: it reaches its end, and the next bind finds the id.
+    #[test]
+    fn a_registration_outlives_the_bind_that_started_it() {
+        let handle = bare_handle();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        crate::rt::block_on(async {
+            let bind = handle.program_id_with(ProcessId::default(), registration(0xc0c0), |_, _| {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    done.store(true, Ordering::SeqCst);
+                    Ok(::engine::ProgramId(9))
+                }
+            });
+            assert!(
+                crate::rt::time::timeout(Duration::from_millis(10), bind)
+                    .await
+                    .is_err(),
+                "the bind is dropped mid-compile"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        assert!(finished.load(Ordering::SeqCst), "the registration finished");
+        let found = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xc0c0),
+            |_, _| never_registers(),
+        ));
+        assert_eq!(found.expect("found"), ::engine::ProgramId(9));
+    }
+
+    /// A registration that panics refuses each bind waiting on it by the
+    /// program's hash, and leaves no entry: the next bind registers afresh.
+    #[test]
+    fn a_registration_that_panics_is_refused_by_name_and_forgotten() {
+        let handle = bare_handle();
+        let refused = crate::rt::block_on(async {
+            let binds = (0..3).map(|_| {
+                handle.program_id_with(ProcessId::default(), registration(0xbad1), |_, _| {
+                    panics_registering()
+                })
+            });
+            futures::future::join_all(binds).await
+        });
+        for bind in refused {
+            let why = bind.expect_err("refused").to_string();
+            assert!(why.contains("0x000000000000bad1"), "by name: {why}");
+        }
+        assert!(
+            !handle.inner.program_ids.lock().unwrap().contains_key(&0xbad1),
+            "no entry is left"
+        );
+        let retried = crate::rt::block_on(handle.program_id_with(
+            ProcessId::default(),
+            registration(0xbad1),
+            |_, _| async { Ok(::engine::ProgramId(3)) },
+        ));
+        assert_eq!(retried.expect("registers afresh"), ::engine::ProgramId(3));
     }
 }

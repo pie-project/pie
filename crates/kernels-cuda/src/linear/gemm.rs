@@ -1,6 +1,6 @@
-//! Host-only: the dense products on the vendor's libraries. `cublas` runs
-//! the cuBLAS and cuBLASLt tactics a profile's table names for a bf16
-//! product (`pie tune` times those it lacks); `cublas_lt_fp8` is
+//! Host-only: the dense products on the vendor's libraries. `cublas` runs a
+//! bf16 product on a streaming skeleton where one covers its few rows, else
+//! on cuBLASLt's first heuristic algorithm for its shape; `cublas_lt_fp8` is
 //! cuBLASLt's fp8 product over `act_quant`'s scales.
 
 use crate::error::Error;
@@ -14,7 +14,7 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::{Tactics, install_tactics, time_tactics, timed, untuned};
+pub use cublas::tile_rows;
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
@@ -190,11 +190,11 @@ pub fn epilogue(
 }
 
 /// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone (a bias, a ReLU,
-/// or a bias then a ReLU: [`Epilogue::lt`]), at the first
-/// heuristic that takes it: one of the candidates [`anchored`] times, as it
-/// runs. `ins` is the bias, where the epilogue reads one. False, landing
-/// nothing, where no cuBLASLt epilogue lands `epi`'s or no algorithm takes
-/// it.
+/// or a bias then a ReLU: [`Epilogue::lt`]), at cuBLASLt's first heuristic
+/// algorithm for the product with it, as [`anchored`] runs a region no
+/// streaming skeleton covers. `ins` is the bias, where the epilogue reads
+/// one. False, landing nothing, where no cuBLASLt epilogue lands `epi`'s or
+/// cuBLASLt offers no algorithm for it.
 pub fn anchored_on_lt(
     ctx: &Ctx,
     op: &'static str,

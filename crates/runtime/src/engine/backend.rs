@@ -53,6 +53,11 @@ pub struct EngineSpec {
     pub device_domain: MemoryDomain,
     /// The engine's kind ([`::engine::Engine::kind`]), as bind names it.
     pub kind: &'static str,
+    /// The backend the host emits a guest program's kernels for
+    /// ([`::engine::caps::DeviceFacts::codegen_backend`]), where the engine
+    /// takes host-emitted kernels: a registration's codegen runs off the
+    /// engine's thread with it.
+    pub codegen_backend: Option<String>,
 }
 
 impl EngineSpec {
@@ -190,6 +195,7 @@ pub fn register_engine_backend(
         .device_facts()
         .map_or(MemoryDomain::HostPinned, |facts| facts.domain);
     spec.kind = backend.kind();
+    spec.codegen_backend = crate::engine::verbs::codegen_backend(&backend).map(str::to_owned);
     let live = backend.live();
     engines.push(Some(EngineRegistration {
         spec,

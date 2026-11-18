@@ -127,7 +127,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     // Under `rows_vec` (B200) a row of 16-byte words a lane (64-, 128- and
     // 256-wide heads) lands in shared memory whole, by one bulk copy (sm_90's).
     let stage = (word || head_dim == 256)
-        && ctx.tuning().rows_vec
+        && ctx.tuning().rows_vec()
         && crate::jit::compute_capability_major().is_some_and(|major| major >= 9)
         && packed.width * 2 + 16 <= 48 * 1024;
     let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
@@ -147,7 +147,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     } else {
         ROW_BLOCK
     };
-    if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
+    if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from()) {
         return ctx.fire(
             OP,
             Fire::at(kernel(FILE, &instantiation))
@@ -194,7 +194,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             OP,
             Fire::at(kernel(FILE, &instantiation)).apply(
                 Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1])
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
             ),
             &[
                 packed.arg(),

@@ -16,14 +16,6 @@ fn set(name: &str, v: u32) {
     crate::common_llm::set_knob(name, v);
 }
 
-/// Loads with the warm ladder run (as a server with `prewarm` does), unless
-/// `PIE_XLA_SPEED_WARM=0`; with `PIE_XLA_WARM_STRICT=1` a fire outside the
-/// ladder fails the probe.
-fn warm() {
-    let on = std::env::var("PIE_XLA_SPEED_WARM").as_deref() != Ok("0");
-    set("PREWARM", u32::from(on));
-}
-
 fn quiet(lane: &mut engine::fire::Lane) {
     lane.readout = Readout::None;
 }
@@ -32,7 +24,6 @@ fn quiet(lane: &mut engine::fire::Lane) {
 fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
     // a lane holds `held` + 103 rows at most
     let context = 512;
-    warm();
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
     set("TOKENS", (2 * lanes).max(held).max(128));
@@ -88,7 +79,6 @@ fn median(xs: &mut [f64]) -> f64 {
 /// Prefill tok/s of one `len`-token prompt.
 fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     let context = (len + 64).next_power_of_two();
-    warm();
     set("SLOTS", runs + 3);
     // `runs` prompts after two warm ones, each a working set of its own
     set("LANES", 8);
@@ -151,7 +141,7 @@ fn speed() {
 }
 
 /// `PIE_XLA_SERVE_PROBE=<model>`: what a server meets with the shipped
-/// config (no prewarm unless `PIE_XLA_SPEED_WARM=1`), the disk cache
+/// config (the warm ladder built at load), the disk cache
 /// wherever `PIE_XLA_CACHE` names. Chat traffic in order (c1 twice, c8,
 /// c64; prompts of mixed lengths, greedy decode with a readout a step,
 /// one lane asking prompt logprobs), each fire's wall time reported where
@@ -161,8 +151,6 @@ fn serve_probe() {
     let Ok(name) = std::env::var("PIE_XLA_SERVE_PROBE") else {
         return;
     };
-    let on = std::env::var("PIE_XLA_SPEED_WARM").as_deref() == Ok("1");
-    set("PREWARM", u32::from(on));
     set("SLOTS", 160);
     set("LANES", 64);
     set("TOKENS", 512);
