@@ -623,11 +623,14 @@ impl FramePolicy {
         self.park_owner(owner);
     }
 
-    /// `owner`'s bind waits for room for its guest state: until it lands
-    /// the process submits nothing, so a frame does not wait on its lanes.
-    /// They are parked as a suspension's are, and come back with its next
+    /// `owner` waits on something only the frame's firing frees: its bind
+    /// waits for room for its guest state, or its pass waits for a raise of
+    /// the activation rung (the room a raise is funded with is freed by the
+    /// planner, never by the frame it waits behind). Until it is through
+    /// the process submits nothing, so a frame does not wait on its lanes:
+    /// they are parked as a suspension's are, and come back with its next
     /// submit ([`Self::record_arrival`]).
-    pub fn on_bind_waits(&mut self, owner: ProcessId) {
+    pub fn on_owner_waits(&mut self, owner: ProcessId) {
         self.park_owner(owner);
     }
 
@@ -1375,15 +1378,16 @@ mod tests {
         a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
-        a_frame_goes_without_a_lane_whose_process_waits_to_bind();
+        a_frame_goes_without_a_lane_whose_process_waits();
     }
 
-    /// A process whose bind found no room for its guest state submits
-    /// nothing until the bind lands: the frame its lane was awaited in
+    /// A process whose bind found no room for its guest state (or whose
+    /// pass waits for a raise of the activation rung) submits nothing
+    /// until it is through: the frame its lane was awaited in
     /// goes without it (the soak's 56-lane frame held 6 minutes on one
     /// process stuck at bind, its bind re-asked so often the leash never
     /// ran out). Its next submit brings the lane back.
-    fn a_frame_goes_without_a_lane_whose_process_waits_to_bind() {
+    fn a_frame_goes_without_a_lane_whose_process_waits() {
         let mut policy =
             FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
         let (runner, binder) = (pid(), pid());
@@ -1404,7 +1408,7 @@ mod tests {
             "control: the binder's lane is awaited"
         );
         // The bind is short of guest-state room and waits for it.
-        policy.on_bind_waits(binder);
+        policy.on_owner_waits(binder);
         assert_eq!(
             fires(&plan(&mut policy, &queued, t0)),
             vec![3],
@@ -1419,6 +1423,18 @@ mod tests {
         let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
         both.sort_unstable();
         assert_eq!(both, vec![4, 5], "it rides the next frame");
+        policy.on_frame_retired([runner, binder]);
+
+        // Mid-prompt, its pass waits for a raise of the activation rung:
+        // the frame goes with the runner alone, as for the bind.
+        policy.on_fire_enqueued(stamp(runner, 3, 0, 1), Some(runner), 6, 1, 1);
+        let queued: QueuedFireIds = [6].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, t0), FramePlan::Hold(_)),
+            "control: the prompting lane is awaited"
+        );
+        policy.on_owner_waits(binder);
+        assert_eq!(fires(&plan(&mut policy, &queued, t0)), vec![6]);
     }
 
     /// Prompts past half a fire's tokens take a frame each, the lane's
