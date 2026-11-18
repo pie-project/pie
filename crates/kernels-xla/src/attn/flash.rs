@@ -149,12 +149,16 @@ impl Src {
 }
 
 /// A fire's older pages as the kernel reads them: `np` virtual pages of
-/// `ps` rows, the values' pages a list of their own where `split`.
+/// `ps` rows, a list of the lanes' table pages (`-1` past the ones read)
+/// every layer shares; each plane's page of a table page is its map's
+/// (`page · stride + offset`), the sink for `-1`, found in the kernel.
 #[derive(Clone, Copy, Debug)]
 struct OldPages {
     np: i64,
     ps: i64,
-    split: bool,
+    maps: [PageMap; 2],
+    /// The plane page an unread virtual page copies (the planes' last).
+    sink: i64,
     /// The custom mask's column plane, where the fire carries one: `i32
     /// [r, w]`, position `k` at column `k + BK`; prefetched each row's flag,
     /// its lane's shift (`Older::shift`) and each row block's flag (any
@@ -329,9 +333,6 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
     };
     let any = |array: Vec<i64>| any_of(array, Elem::Bf16);
     let mut prefetch = vec![vec![nb], vec![nb], vec![nb], vec![nb], vec![old.np]];
-    if old.split {
-        prefetch.push(vec![old.np]);
-    }
     let mask_at = prefetch.len();
     if old.mask.is_some() {
         prefetch.extend([vec![r], vec![r], vec![nb]]);
@@ -411,7 +412,6 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             Src::Pooled { .. } => (blk.ins[7], blk.ins[7]),
         };
         let opk = blk.grid.prefetch[4];
-        let opv = if old.split { blk.grid.prefetch[5] } else { opk };
         let packed = match src {
             Src::Pooled { .. } => Some((blk.scratch[7], blk.scratch[8])),
             Src::Plain { .. } => None,
@@ -512,8 +512,19 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
                 for p in 0..per_blk {
                     let pv = b.i32(p);
                     let vp = b.addi(v0, pv)?;
-                    let pk = b.load(opk, &[vp])?;
-                    let pvv = if old.split { b.load(opv, &[vp])? } else { pk };
+                    let raw = b.load(opk, &[vp])?;
+                    // each plane's page of the table page, by its map
+                    let unread = b.cmpi(ICmp::Slt, raw, z)?;
+                    let sink = b.i32(old.sink);
+                    let mut planes_pages = [raw; 2];
+                    for (at, map) in old.maps.iter().enumerate() {
+                        let by = b.i32(map.stride);
+                        let off = b.i32(map.offset);
+                        let page = b.muli(raw, by)?;
+                        let page = b.addi(page, off)?;
+                        planes_pages[at] = b.select(unread, sink, page)?;
+                    }
+                    let [pk, pvv] = planes_pages;
                     for (page, plane, sidx, which) in
                         [(pk, old_k, slot, 0usize), (pvv, old_v, vslot, 1)]
                     {
@@ -1137,11 +1148,10 @@ pub(crate) fn readouts(
 /// so a block's mask columns come in one aligned copy.
 #[derive(Clone, Copy)]
 struct Older {
-    /// Each virtual page's keys plane page, `[np]` (the sink past the ones
-    /// read).
-    keys: Val,
-    /// The values plane's, where its map differs from the keys'.
-    values: Option<Val>,
+    /// Each virtual page's table page, `[np]` (`-1` past the ones read):
+    /// what every layer of the fire reads, each plane's page of it its
+    /// map's, in the kernel.
+    pages: Val,
     klo: Val,
     khi: Val,
     /// Each row's lane's virtual row less its position (`[r]`, a multiple
@@ -1149,6 +1159,9 @@ struct Older {
     shift: Val,
     np: i64,
     ps: i64,
+    /// Where each plane's pages lie, and the planes' sink page.
+    maps: [PageMap; 2],
+    sink: i64,
 }
 
 /// Each row's older keys: positions `[lo, p0)` of its lane (`p0` its
@@ -1250,41 +1263,31 @@ fn older(
     let idx = f.select(valid, v, past)?;
     let m = lanes * pages;
     let idx = f.reshape(idx, &[m, 1])?;
-    let sink = slots / ps - 1;
-    let lay = |f: &mut Func, map: PageMap| -> Built<Val> {
-        let page = map.apply(f, raw)?;
-        let page = super::paged::clamp_i(f, page, 0, sink)?;
-        let page = f.reshape(page, &[m])?;
-        let list = f.const_i(Elem::I32, sink, &[np]);
-        f.scatter_hinted(
-            list,
-            idx,
-            page,
-            &crate::hlo::ScatterDims {
-                update_window_dims: vec![],
-                inserted_window_dims: vec![0],
-                scatter_dims_to_operand_dims: vec![0],
-                index_vector_dim: 1,
-                ..crate::hlo::ScatterDims::default()
-            },
-            crate::hlo::Combine::Set,
-            true,
-        )
-    };
-    let keys = lay(f, maps[0])?;
-    let values = if maps[1] == maps[0] {
-        None
-    } else {
-        Some(lay(f, maps[1])?)
-    };
+    let page = f.reshape(raw, &[m])?;
+    let list = f.const_i(Elem::I32, -1, &[np]);
+    let pages = f.scatter_hinted(
+        list,
+        idx,
+        page,
+        &crate::hlo::ScatterDims {
+            update_window_dims: vec![],
+            inserted_window_dims: vec![0],
+            scatter_dims_to_operand_dims: vec![0],
+            index_vector_dim: 1,
+            ..crate::hlo::ScatterDims::default()
+        },
+        crate::hlo::Combine::Set,
+        true,
+    )?;
     Ok(Older {
-        keys,
-        values,
+        pages,
         klo,
         khi,
         shift,
         np,
         ps,
+        maps,
+        sink: slots / ps - 1,
     })
 }
 
@@ -1361,12 +1364,12 @@ fn run(
     let pages = OldPages {
         np: old.np,
         ps: old.ps,
-        split: old.values.is_some(),
+        maps: old.maps,
+        sink: old.sink,
         mask: mask.map(|(_, cols)| f.dims(cols)[1]),
     };
     let kern = kernel(s, vmem_cap, &pages)?;
-    let mut operands = vec![lo_blk, hi_blk, olo, ohi, old.keys];
-    operands.extend(old.values);
+    let mut operands = vec![lo_blk, hi_blk, olo, ohi, old.pages];
     if let Some((en, _)) = mask {
         // each row block's flag: any flagged row
         let on = cmp_i(f, Cmp::Ne, en, 0)?;
@@ -1416,7 +1419,8 @@ mod tests {
         let old = OldPages {
             np: 256,
             ps: 16,
-            split: false,
+            maps: [PageMap::IDENTITY; 2],
+            sink: 255,
             mask: None,
         };
         let c = kernel(&s, 110 << 20, &old).unwrap();
@@ -1472,7 +1476,14 @@ mod tests {
         let old = OldPages {
             np: 64 * 256,
             ps: 16,
-            split: true,
+            maps: [
+                PageMap::IDENTITY,
+                PageMap {
+                    stride: 2,
+                    offset: 1,
+                },
+            ],
+            sink: 255,
             mask: None,
         };
         let c = kernel(&s, 110 << 20, &old).unwrap();
@@ -1481,7 +1492,8 @@ mod tests {
             c.module.contains("memref<2x16x64x128xi32")
                 || c.module.contains("memref<2x16x64x128xui32")
         );
-        // five prefetched (the values' list too), seven blocks and the pool
-        assert_eq!(c.operands.len(), 6 + 8);
+        // five prefetched (one page list, each plane's page by its map in
+        // the kernel), seven blocks and the pool
+        assert_eq!(c.operands.len(), 5 + 8);
     }
 }
