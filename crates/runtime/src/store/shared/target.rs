@@ -41,7 +41,16 @@ pub struct SharedGrow {
     /// planner's `no_grow`, whose plan then goes on to demote, sweep and
     /// evict.
     no_grow: Arc<dyn Fn() + Send + Sync>,
+    /// The engine's lane the walk's moves go through: its scheduler's.
+    lane: Lane,
 }
+
+/// The engine's lane a segment move goes through, ordered with its fires.
+type Lane = Arc<
+    dyn Fn(usize, PoolOp) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl SharedGrow {
     /// Steers `shared`, engine `engine`'s, from the segments mapped at load.
@@ -83,7 +92,20 @@ impl SharedGrow {
                     planner.no_grow();
                 }
             }),
+            lane: Arc::new(|engine, op| Box::pin(crate::scheduler::pool(engine, op))),
         }
+    }
+
+    /// The lane the walk's moves go through, for a test that plays the
+    /// engine.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_lane(
+        mut self,
+        lane: impl Fn(PoolOp) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.lane = Arc::new(move |_, op| Box::pin(std::future::ready(lane(op))));
+        self
     }
 
     /// What the walk tells when a promised grow does not come; for a test.
@@ -538,7 +560,16 @@ impl SharedGrow {
                 pool.next_move(goal, current.saturating_add(1))
             };
             let op = match step {
-                None | Some(SegmentMove::Wait) => return,
+                Some(SegmentMove::Wait) => return,
+                // There, or past it with nothing of the prefix left to
+                // give back: what stands is the rung's span, which comes
+                // down only with no room, as the last of the shed.
+                None => {
+                    if self.shared.lock().unwrap().mapped_segments() > goal {
+                        self.no_room.store(true, Ordering::Release);
+                    }
+                    return;
+                }
                 Some(SegmentMove::NoRoom) => {
                     self.no_room.store(true, Ordering::Release);
                     return;
@@ -560,7 +591,7 @@ impl SharedGrow {
                 _ => None,
             };
             let evacuating = matches!(op, PoolOp::Evacuate(_));
-            match crate::scheduler::pool(self.engine, op).await {
+            match (self.lane)(self.engine, op).await {
                 Ok(()) => {
                     // A segment mapped: what was promised a waiter is
                     // kept, and `pages_freed` wakes the planner.
@@ -599,11 +630,11 @@ impl SharedGrow {
                 }
             }
             if evacuating {
-                // The segment drains until the first fire handed out after
-                // the engine took the copy retires.
+                // The engine took the copy and waits it out before it
+                // gives the segment back: the segment drains once the
+                // fires handed out by now retire, at once on an idle pool.
                 let (current, _) = self.epochs();
                 self.shared.lock().unwrap().evacuated(current);
-                return;
             }
         }
     }
@@ -650,24 +681,24 @@ impl PoolTarget for SharedGrow {
     }
 
     /// Judged on what the pool maps, the measure the governor's target is
-    /// in: whatever keeps a segment past the target (state with no room to
-    /// evacuate into, idle cache among it, or a drained segment whose fire
-    /// has not retired, as on an idle pool) answers
-    /// [`Retarget::NoRoom`], so the policy's tier pressure sheds idle cache
-    /// for the difference.
+    /// in. Past the target, the walk's last word decides: while it
+    /// evacuates and releases on its own (or has yet to look),
+    /// [`Retarget::Moving`]; once it found what is left with no room to
+    /// move into, [`Retarget::NoRoom`], so the policy's tier pressure sheds
+    /// idle cache for the difference.
     fn retarget(&mut self, segments: u64) -> Retarget {
         self.target.store(
             u32::try_from(segments).unwrap_or(u32::MAX),
             Ordering::Release,
         );
         self.wake.notify_one();
-        let mapped = self.shared.lock().unwrap().mapped_segments();
-        if u64::from(mapped) <= segments {
+        let held = u64::from(self.shared.lock().unwrap().mapped_segments());
+        if held <= segments {
             Retarget::Reached
+        } else if self.no_room.load(Ordering::Acquire) {
+            Retarget::NoRoom { held }
         } else {
-            Retarget::NoRoom {
-                held: u64::from(mapped),
-            }
+            Retarget::Moving { held }
         }
     }
 
@@ -909,14 +940,16 @@ mod tests {
     }
 
     /// Mac, yield 1, after a burst, every prompt finished: a pool full of
-    /// idle cache, the system's pressure bringing the target under what
-    /// it maps. The walk evacuates the top segment and then waits on the
-    /// fire that carries the copy, which an idle pool never runs. Each
-    /// turn's answer is judged on what the pool maps: never reached past
-    /// the target, short of it tier pressure, so the policy sheds the idle
-    /// cache; once it has and a fire retired, the pool is at its target.
+    /// idle cache, the system's pressure bringing the target under what it
+    /// maps, and no fire at all. The walk evacuates the top segment into
+    /// the room below; the engine takes the copy and waits it out itself,
+    /// so the segment goes with no fire to retire, and while it does the
+    /// pool answers Moving, asking nothing of the policy. The next segment
+    /// has no room to evacuate into: NoRoom, tier pressure, and once the
+    /// policy shed the idle cache the pool stands at its target. No answer
+    /// is ever Reached past the target.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_target_under_what_idle_cache_holds_is_never_reached_above_it() {
+    async fn a_target_under_what_idle_cache_holds_is_given_back_with_no_fire() {
         use crate::governor::run::Steer;
         use crate::governor::{Signal, Source, Yield};
 
@@ -936,7 +969,13 @@ mod tests {
         pool.give_records(gone);
         assert_eq!(pool.mapped_segments(), 8);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(model, ENGINE, shared.clone());
+        // The engine takes every move it is told.
+        let moves = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let told = moves.clone();
+        let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |op| {
+            told.lock().unwrap().push(format!("{op:?}"));
+            Ok(())
+        });
 
         let dir = std::env::temp_dir().join(format!("pie-govr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -962,42 +1001,43 @@ mod tests {
         assert_eq!(first.answer, Retarget::Reached);
 
         // An app takes memory: 272 + 752 * 0.65 MiB comes to 6 segments of
-        // the 8 mapped.
+        // the 8 mapped. The walk has yet to look: Moving, nothing raised.
         std::fs::write(&path, "0.35").unwrap();
         let (pressed, signals) = turn(&mut steer, &mut grow);
         assert_eq!(pressed.segments, 6);
-        assert_eq!(pressed.answer, Retarget::NoRoom { held: 8 });
-        assert!(matches!(signals[..], [Signal::TierPressure { .. }]), "{signals:?}");
-        // The walk evacuates segment 5 into the room below, and waits on
-        // its fire, which the idle engine never runs.
-        for _ in 0..4 {
-            grow.walk().await;
-        }
-        assert_eq!(shared.lock().unwrap().draining_segments(), 1);
-        for _ in 0..4 {
-            let (waiting, _) = turn(&mut steer, &mut grow);
-            assert_eq!(waiting.answer, Retarget::NoRoom { held: 8 });
-            assert_eq!(waiting.mapped.draining, 1);
-            grow.walk().await;
-        }
+        assert_eq!(pressed.answer, Retarget::Moving { held: 8 });
+        assert!(signals.is_empty(), "{signals:?}");
+        // The walk evacuates segment 5 into the room below; the engine took
+        // the copy, and with no fire handed out the segment goes at once.
+        // Segment 4 has no room left to evacuate into.
+        grow.walk().await;
+        let told: Vec<String> = moves.lock().unwrap().clone();
+        assert!(told[0].starts_with("Evacuate"), "{told:?}");
+        assert_eq!(told[1], "ReleaseSegments(5)", "{told:?}");
+        assert_eq!(shared.lock().unwrap().draining_segments(), 0);
+        let (short, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(short.answer, Retarget::NoRoom { held: 7 });
+        assert_eq!(
+            signals,
+            vec![Signal::TierPressure {
+                held_bytes: 7 * segment,
+                target_bytes: 6 * segment,
+            }]
+        );
 
-        // The policy sheds the idle cache for the tier pressure, and a fire
-        // retires: the drained segment goes, the next empties, and the pool
-        // stands at its target.
+        // The policy sheds the idle cache for the tier pressure: the walk
+        // gives segment 4 back, and the pool stands at its target.
         shared.lock().unwrap().give_records(idle);
-        {
-            let stores = registry::get(model, ENGINE);
-            let mut kv = stores.kv.lock();
-            let fire = kv.begin_fire();
-            kv.settle(fire);
-        }
-        for _ in 0..4 {
-            grow.walk().await;
-        }
+        grow.walk().await;
         let (eased, signals) = turn(&mut steer, &mut grow);
         assert_eq!(eased.answer, Retarget::Reached);
         assert_eq!(eased.mapped.segments, 6);
         assert_eq!(signals, vec![Signal::Eased]);
+        assert_eq!(
+            registry::get(model, ENGINE).kv.lock().current_epoch(),
+            0,
+            "no fire at all"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

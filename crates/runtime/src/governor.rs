@@ -180,11 +180,14 @@ pub enum Retarget {
     /// It maps no more than the segments asked (a grow may still be on its
     /// way).
     Reached,
-    /// It maps `held` segments, more than asked, and could not give the
-    /// rest back yet: state no evacuation has room for, idle cache among
-    /// it, or a drained segment its fire has not retired. Nothing it holds
-    /// was dropped; the policy's tier pressure sheds idle cache for the
-    /// difference.
+    /// It maps `held` segments, more than asked, and gives the rest back
+    /// on its own: an evacuation or a release under way, or a walk yet to
+    /// take its next step. Nothing is asked of the policy.
+    Moving { held: u64 },
+    /// It maps `held` segments, more than asked, and cannot give the rest
+    /// back unless the policy sheds: live state, or idle cache, that no
+    /// evacuation has room for. Nothing it holds was dropped; the policy's
+    /// tier pressure sheds idle cache for the difference.
     NoRoom { held: u64 },
 }
 
@@ -194,7 +197,8 @@ pub struct Mapped {
     /// Segments with memory under them.
     pub segments: u64,
     /// Of those, the ones an evacuation drained, waiting on the fire that
-    /// carries its copy to retire before they go.
+    /// moved their chunks to land and the fires that read them there to
+    /// retire before they go.
     pub draining: u64,
 }
 
@@ -223,7 +227,8 @@ pub trait PoolTarget {
     /// Moves the pool toward `segments`. A shrink evacuates the emptiest
     /// segment and then releases it, and stops where there is no room.
     /// [`Retarget::Reached`] only where it maps no more than `segments`
-    /// ([`Self::mapped`]); short of that, [`Retarget::NoRoom`].
+    /// ([`Self::mapped`]); short of that, [`Retarget::Moving`] while it
+    /// gives the rest back on its own, [`Retarget::NoRoom`] once it cannot.
     fn retarget(&mut self, segments: u64) -> Retarget;
     /// Whether the system refused memory since this last asked: the system
     /// saying it can give no more, read as pressure 1.
@@ -242,7 +247,8 @@ pub enum Signal {
     /// The pool holds `held_bytes` against a target of `target_bytes` and
     /// has no room to give the difference back.
     TierPressure { held_bytes: u64, target_bytes: u64 },
-    /// The pool reached its target again.
+    /// Nothing is asked of the policy any more: the pool reached its
+    /// target, or gives the rest back on its own ([`Retarget::Moving`]).
     Eased,
 }
 

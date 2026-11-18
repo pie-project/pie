@@ -139,7 +139,9 @@ pub fn turn(governor: &mut Governor, tier: &mut impl PoolTarget, pressure: f64) 
     let target = governor.tick(pressure);
     let segments = governor.limits().segments(target);
     match tier.retarget(segments) {
-        Retarget::Reached => Signal::Eased,
+        // Moving toward it on its own: no pressure for the policy, and an
+        // earlier one eases (the device governor's rule).
+        Retarget::Reached | Retarget::Moving { .. } => Signal::Eased,
         Retarget::NoRoom { held } => Signal::TierPressure {
             held_bytes: held * governor.limits().segment_bytes,
             target_bytes: target,

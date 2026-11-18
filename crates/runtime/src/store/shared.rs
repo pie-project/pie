@@ -2219,11 +2219,14 @@ impl SharedPool {
 
     /// The engine took the evacuation [`Self::next_move`] planned, with
     /// fires through `current` (the kv store's per-fire epoch, CONTRACT-BC
-    /// 17) handed out by then. Any of those may run ahead of the copy and
-    /// read the old location; the first fire after them runs after it. The
-    /// segment drains until that one, `current + 1`, retires.
+    /// 17) handed out by then. Any of those may still read the old
+    /// location; every fire after reads the new one. The copy itself the
+    /// engine waits out before it gives the segment back
+    /// (`Engine::release_segments`), so the segment drains once the fires
+    /// through `current` retire, with no fire to wait for after them: on
+    /// an idle pool, at once.
     pub fn evacuated(&mut self, current: u64) {
-        self.pool.fence_drains(current.saturating_add(1));
+        self.pool.drains_through(current);
     }
 
     fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {
