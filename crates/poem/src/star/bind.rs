@@ -749,6 +749,13 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         Ok(Whole(Held::Mask(RaggedMask::GroupBlockDiagonal)))
     }
 
+    /// A ragged attention's mask that lets each row attend rows of its own
+    /// group, narrowed by the mask its lane states: the one attention a
+    /// lane's stated mask reaches (a lane stating none attends its group).
+    fn stated_group_mask() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Mask(RaggedMask::Stated)))
+    }
+
     fn multiple_of(#[starlark(require = pos)] n: u32) -> anyhow::Result<Whole> {
         anyhow::ensure!(n > 0, "rows are a multiple of a positive count, not 0");
         Ok(Whole(Held::Rows(poem_ir::RowCount::Multiple(n))))

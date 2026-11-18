@@ -995,23 +995,25 @@ fn the_gdn_prep_derives_decay_and_beta() {
 
 // ------------------------------------------------------------ delta rules
 
-/// One token of the delta rule over a head's state `s` (`dv × dk`): decay
-/// by `a` (per key channel), then the delta update; returns `S q`.
+/// One token of the delta rule over a head's state `s` (`dk × dv`, a key
+/// channel's row of values: the kernels' `[H, dk, dv]`, as a model's
+/// `delta_state` declares it): decay by `a` (per key channel), then the
+/// delta update; returns `Sᵀ q`.
 fn delta_token(s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], a: &[f32], beta: f32) -> Vec<f32> {
     let (dk, dv) = (k.len(), v.len());
+    let at = |i: usize, c: usize| i * dv + c;
     let mut y = vec![0.0; dv];
     for c in 0..dv {
-        let row = &mut s[c * dk..(c + 1) * dk];
         let mut mem = 0.0;
         for i in 0..dk {
-            row[i] *= a[i];
-            mem += row[i] * k[i];
+            s[at(i, c)] *= a[i];
+            mem += s[at(i, c)] * k[i];
         }
         let delta = (v[c] - mem) * beta;
         let mut acc = 0.0;
         for i in 0..dk {
-            row[i] += k[i] * delta;
-            acc += row[i] * q[i];
+            s[at(i, c)] += k[i] * delta;
+            acc += s[at(i, c)] * q[i];
         }
         y[c] = acc;
     }
@@ -2190,8 +2192,9 @@ impl M2 {
                 .collect(),
         }
     }
-    /// Row `t` through `state` (`[heads, p, n]`): `(C S + D x) * silu(z)`,
-    /// rounded to bf16, then the group norm.
+    /// Row `t` through `state` (`[heads, n, p]`, the kernels' `[H, dk, dv]`
+    /// with `n` the key side): `(C S + D x) * silu(z)`, rounded to bf16,
+    /// then the group norm.
     fn token(&self, i: &M2In, t: usize, state: &mut [f32]) -> Vec<f32> {
         let (h, g, p, n) = (self.heads, self.groups, self.p, self.n);
         let inner = self.inner();
@@ -2206,11 +2209,11 @@ impl M2 {
             let decay = (-i.a_log[hd].exp() * step).exp();
             for pp in 0..p {
                 let x = row[hd * p + pp];
-                let s = &mut state[(hd * p + pp) * n..(hd * p + pp + 1) * n];
+                let at = |k: usize| (hd * n + k) * p + pp;
                 let mut acc = 0.0;
                 for k in 0..n {
-                    s[k] = s[k] * decay + step * x * b[k];
-                    acc += s[k] * c[k];
+                    state[at(k)] = state[at(k)] * decay + step * x * b[k];
+                    acc += state[at(k)] * c[k];
                 }
                 let o = hd * p + pp;
                 y[o] = round_bf16((acc + i.d[hd] * x) * silu(i.z[t * inner + o]));

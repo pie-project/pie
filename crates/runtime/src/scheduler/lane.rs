@@ -94,6 +94,10 @@ pub(super) enum LaneCommit {
     },
     BindFinished {
         pipeline_id: Option<ProcessId>,
+        /// The bind found no room for its guest state and registered
+        /// nothing: its process waits for room
+        /// ([`crate::store::roles::bind_when_resident`]), off the frame.
+        waits: bool,
     },
     CloseInstance {
         id: ::engine::InstanceId,
@@ -128,6 +132,25 @@ fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
 /// engine's shared pool that is not handed out (its chunk not open for the
 /// shape, or the slot free in it) is refused, saying which: a page table
 /// entry the engine would read or write through unassigned memory.
+/// A step of `frame` wider than the rung the engine holds, `held` rows
+/// ([`crate::store::shared::engine_rows`]): its token rows or its lanes
+/// past them. The engine lays a fire's inputs for the rung it was told, so
+/// such a step would run its tables past their regions; it is refused by
+/// name before the engine stages anything.
+fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
+    frame.steps.iter().enumerate().find_map(|(at, step)| {
+        let rows = step.submission.rows();
+        let lanes = u32::try_from(step.submission.lanes.len()).unwrap_or(u32::MAX);
+        (rows > held || lanes > held).then(|| {
+            format!(
+                "step {at} of a fire takes {rows} token rows over {lanes} lanes, past the \
+                 {held} rows of the activation rung the engine holds: no step wider than the \
+                 rung the engine was told reaches it"
+            )
+        })
+    })
+}
+
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()) {
@@ -186,7 +209,10 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::Pool { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
-                QueuedItem::RegisterProgram { response, .. } => {
+                QueuedItem::PrepareProgram { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
+                QueuedItem::FinishProgram { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
                 QueuedItem::FireFacts { response, .. } => {
@@ -457,10 +483,15 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let fault = unassigned_ref(engine_idx, &frame);
+                        let fault = past_rung(
+                            crate::store::shared::engine_rows(engine_idx),
+                            &frame,
+                        )
+                        .or_else(|| unassigned_ref(engine_idx, &frame));
                         let result = match engine.as_mut() {
-                            // A fire naming a slot nobody was handed is
-                            // refused before the engine reads it.
+                            // A fire wider than the rung the engine holds,
+                            // or naming a slot nobody was handed, is refused
+                            // before the engine reads it.
                             _ if fault.is_some() => Err(fault.unwrap_or_default()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
@@ -564,6 +595,7 @@ impl Lane {
             QueuedItem::Launch(_) => unreachable!(),
             QueuedItem::RegisterChannelsBind { pipeline_id, .. } => LaneCommit::BindFinished {
                 pipeline_id: *pipeline_id,
+                waits: false,
             },
             QueuedItem::PreLaunchCopy { .. } | QueuedItem::CopyTracked { .. } => {
                 LaneCommit::AsyncControl {
@@ -574,7 +606,8 @@ impl Lane {
             | QueuedItem::CloseChannels { .. }
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
-            | QueuedItem::RegisterProgram { .. }
+            | QueuedItem::PrepareProgram { .. }
+            | QueuedItem::FinishProgram { .. }
             | QueuedItem::FireFacts { .. }
             | QueuedItem::StandingAfter { .. } => LaneCommit::None,
         }
@@ -783,15 +816,30 @@ impl Lane {
                     }
                 }
             }
-            QueuedItem::RegisterProgram { program, response } => {
+            QueuedItem::PrepareProgram { program, response } => {
+                // Its host codegen ran off this thread before it was sent.
+                let prepared =
+                    backend(engine).and_then(|engine| Ok(engine.prepare_program(&program)?));
+                let _ = response.send(prepared);
+                LaneCommit::None
+            }
+            QueuedItem::FinishProgram { prepared, response } => {
                 let registered = backend(engine).and_then(|engine| {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
-                    let program_id = engine.register_program(plan)?;
+                    let program_id = engine.finish_program(prepared)?;
                     // What an instance of it holds in the pool, asked once
-                    // at registration.
-                    if let Some(roles) = roles_of(engine_idx) {
-                        crate::store::roles::learn_program(&roles, &**engine, program_id)?;
+                    // at registration. A program whose facts are not
+                    // learned is released: the registration fails whole.
+                    if let Some(roles) = roles_of(engine_idx)
+                        && let Err(error) =
+                            crate::store::roles::learn_program(&roles, &**engine, program_id)
+                    {
+                        let released = engine.close_program(program_id);
+                        return Err(match released {
+                            Ok(()) => anyhow!("its facts: {error}; released"),
+                            Err(also) => anyhow!(
+                                "its facts: {error}; and releasing program {program_id}: {also}"
+                            ),
+                        });
                     }
                     Ok(program_id)
                 });
@@ -836,7 +884,10 @@ impl Lane {
                         program_id = bind.program_id().0,
                         "scheduler RPC cancelled before resource creation"
                     );
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
                 let engine = match backend(engine) {
                     Ok(engine) => engine,
@@ -844,26 +895,72 @@ impl Lane {
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 let roles = roles_of(engine_idx);
+                let held = crate::store::roles::held_by(&**engine, &plans);
+                // Everything it takes of the pool first, its rings, its
+                // guest state, its tables: a bind short of room is answered
+                // so before it registers anything, and waits for room
+                // (`bind_when_resident`) with nothing rolled back.
+                let taken = crate::store::roles::take_bind(
+                    roles.as_ref(),
+                    &mut **engine,
+                    &bind.binding,
+                    |id| channels.engine_registered(id) || held.contains(&id),
+                )
+                .and_then(|taken| {
+                    match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {
+                        Ok(rings) => Ok((taken, rings)),
+                        Err(error) => {
+                            if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                                roles.lock().unwrap().untake(taken);
+                            }
+                            Err(error)
+                        }
+                    }
+                });
+                let (taken, rings) = match taken {
+                    Ok(taken) => taken,
+                    Err(error) => {
+                        let waits = crate::store::roles::waits_for_room(&error);
+                        if response.send(Err(error)).is_err() {
+                            Self::release_wait_slots([bind.pacing_wait_id]);
+                        }
+                        return LaneCommit::BindFinished { pipeline_id, waits };
+                    }
+                };
+                let untake = |taken: Option<crate::store::roles::Taken>| {
+                    if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                        roles.lock().unwrap().untake(taken);
+                    }
+                };
                 let registered = match Self::register_channel_set(
                     engine,
                     engine_idx,
                     channels,
                     &plans,
+                    rings,
                     pipeline_id,
                 ) {
                     Ok(registered) => registered,
                     Err(error) => {
+                        untake(taken);
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 if response.is_closed() {
+                    untake(taken);
                     Self::rollback_channel_set(
                         engine,
                         channels,
@@ -873,9 +970,19 @@ impl Lane {
                     );
                     Lane::release_registered_channel_wait_slots(&registered);
                     Self::release_wait_slots([bind.pacing_wait_id]);
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
-                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
+                match Self::bind(
+                    engine,
+                    channels,
+                    &bind,
+                    roles.as_ref(),
+                    pipeline_id,
+                    taken,
+                ) {
                     Ok((bound, standing)) => {
                         // Its program can be in a fire until it closes, and
                         // the engine's standing guest bytes are its total.
@@ -914,7 +1021,10 @@ impl Lane {
                             Self::release_registered_channel_wait_slots(&registered);
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        LaneCommit::BindFinished { pipeline_id }
+                        LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        }
                     }
                 }
             }
@@ -1055,14 +1165,10 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
         roles: Option<&crate::store::roles::RolesHandle>,
         holder: Option<ProcessId>,
+        taken: Option<crate::store::roles::Taken>,
     ) -> Result<(BoundInstance, u64)> {
-        let bound = crate::store::roles::bind_instance(
-            roles,
-            &mut **engine,
-            &plan.binding,
-            holder,
-            |id| channels.engine_registered(id),
-        )?;
+        let bound =
+            crate::store::roles::bind_taken(roles, &mut **engine, &plan.binding, holder, taken)?;
         let standing = bound.standing_guest_bytes;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
@@ -1081,9 +1187,12 @@ impl Lane {
         engine_idx: usize,
         channels: &mut ChannelJoin,
         plans: &[ChannelRegistration],
+        rings: Vec<Option<crate::store::roles::TakenRing>>,
         holder: Option<ProcessId>,
     ) -> Result<Vec<RegisteredChannel>> {
         let roles = roles_of(engine_idx);
+        // Each plan's ring, taken before anything was registered.
+        let mut rings = rings.into_iter();
         let mut registered = Vec::with_capacity(plans.len());
         let mut registered_ids = Vec::with_capacity(plans.len());
         let undo =
@@ -1097,15 +1206,21 @@ impl Lane {
                 }
             };
         for plan in plans {
+            let ring = rings.next().flatten();
             if channels.contains(plan.id) {
                 undo(engine, channels, &registered_ids);
+                crate::store::roles::untake_rings(
+                    roles.as_ref(),
+                    std::iter::once(ring).chain(rings).collect(),
+                );
                 return Err(anyhow!("channel {} is already registered", plan.id));
             }
-            match crate::store::roles::register_channel(
+            match crate::store::roles::register_taken(
                 roles.as_ref(),
                 &mut **engine,
                 plan,
                 holder,
+                ring,
                 |engine, plan| crate::engine::verbs::register_channel(engine, engine_idx, plan),
             ) {
                 Ok(channel) => {
@@ -1115,6 +1230,7 @@ impl Lane {
                 }
                 Err(cause) => {
                     undo(engine, channels, &registered_ids);
+                    crate::store::roles::untake_rings(roles.as_ref(), rings.collect());
                     return Err(cause);
                 }
             }

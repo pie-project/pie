@@ -39,7 +39,8 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, KvWrites, LaneFault, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
+    CompletionSink, Engine, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone, StepOutcome,
+    TapGroups, TapSink, Tapped,
 };
 pub use error::{Error, Result};
 pub use fire::{
@@ -49,9 +50,9 @@ pub use fire::{
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{
-    BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestTerm, InstanceBinding,
-    InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration, ReadoutFacts,
-    ReadoutLanding, Rebind, RingFacts, RingSlots,
+    BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,
+    InstanceBinding, InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration,
+    ReadoutFacts, ReadoutLanding, Rebind, RingFacts, RingSlots, ScratchPlace,
 };
 pub use transfer::{
     KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,

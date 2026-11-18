@@ -57,6 +57,15 @@ pub enum Fault {
         have: u64,
     },
 
+    /// A fire's carve that asks a value more bytes than the arena map laid
+    /// its slot: the value's rows would land in a neighbour's.
+    Overcarved {
+        value: u32,
+        rows: u32,
+        need: u64,
+        laid: u64,
+    },
+
     Mask {
         lane: u32,
         stated: u64,
@@ -206,6 +215,17 @@ impl fmt::Display for Fault {
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"
             ),
+            Self::Overcarved {
+                value,
+                rows,
+                need,
+                laid,
+            } => write!(
+                f,
+                "this fire carves value {value} at {rows} rows, {need} bytes, and the arena \
+                 laid its slot for {laid}: its rows past the slot would land in another \
+                 value's"
+            ),
             Self::Mask {
                 lane,
                 stated,
@@ -228,7 +248,8 @@ impl fmt::Display for Fault {
                 "lane {lane} carries an explicit attention mask and this load's \
                  artifact bakes no masked class: `masked` is a fact the MODEL declares \
                  and this plan has no `attention.masked` arm for the bits \
-                 to reach"
+                 to reach, nor a ragged attention whose text states a lane's mask \
+                 (`stated_group_mask()`)"
             ),
             Self::MaskWord {
                 lane,

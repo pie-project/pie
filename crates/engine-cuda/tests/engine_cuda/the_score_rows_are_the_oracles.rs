@@ -34,6 +34,7 @@ const Q_HEADS: u32 = 4;
 const KV_HEADS: u32 = 2;
 const LAYERS: usize = 2;
 const LANES: u32 = 256;
+const ROWS: u32 = 512;
 const CONTEXT: u32 = 64;
 const PAGE: u32 = 16;
 /// The capturing lane: not the fire's first.
@@ -110,7 +111,7 @@ fn shell(trace: Trace, path: &Path) -> Shell {
         trace,
         contract: &contract,
         checkpoint: path,
-        budget: Budget::new(LANES, 512),
+        budget: Budget::new(LANES, ROWS),
         patches: None,
         page_size: PAGE,
         context: CONTEXT,
@@ -120,6 +121,10 @@ fn shell(trace: Trace, path: &Path) -> Shell {
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
+            // Every lane fires in one fire: the load lays its rungs to the
+            // rows its budget states, not to the top the estimate would
+            // choose for serving (which fires a wider wave as several).
+            every_rung: Some(engine_cuda::EveryRung::To(ROWS)),
             pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },

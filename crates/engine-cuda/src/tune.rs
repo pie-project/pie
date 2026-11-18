@@ -91,16 +91,16 @@ pub fn rates(
 
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
 /// its pages and context.
-pub(crate) struct Shape {
-    pub(crate) slots: u32,
-    pub(crate) budget: poem_compiler::Budget,
-    pub(crate) patches: Option<poem_compiler::PatchLadder>,
-    pub(crate) page_size: u32,
-    pub(crate) context: u32,
+pub struct Shape {
+    pub slots: u32,
+    pub budget: poem_compiler::Budget,
+    pub patches: Option<poem_compiler::PatchLadder>,
+    pub page_size: u32,
+    pub context: u32,
 }
 
 /// Load `artifact` under `knobs` shaped by `shape` (from the trace).
-pub(crate) fn load(
+pub fn load(
     artifact: &Path,
     deployment: &str,
     knobs: crate::Knobs,
@@ -283,7 +283,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     Some(h.finish())
 }
 
-pub(crate) fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
+pub fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
     crate::api::patch_ladder(
         trace,
         &engine::load::Budgets {

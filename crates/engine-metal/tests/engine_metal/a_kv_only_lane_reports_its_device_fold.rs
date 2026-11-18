@@ -115,9 +115,12 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
     let channel = layout.channel.expect("a channel shape");
-    let base = (1 + slot) * instance.per_chunk;
+    // From the first chunk no slot holds: past the engine's tables run,
+    // which no slot names, and the seats' runs.
+    let free = layout.free_chunk();
+    let base = (free + slot) * instance.per_chunk;
     let slots: Vec<u32> = (base..base + facts.instance.slots).collect();
-    let mut next = (3 + slot) * channel.per_chunk;
+    let mut next = (free + 2 + slot) * channel.per_chunk;
     let rings: Vec<engine::RingSlots> = facts
         .rings
         .iter()

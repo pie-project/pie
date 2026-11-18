@@ -314,6 +314,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
+        Fault::Overcarved { .. } => Error::Invalid(fault.to_string()),
         Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
@@ -945,6 +946,13 @@ impl Engine for Cuda {
         }
     }
 
+    /// Every registration: a device channel's ring in its `Channel` slots,
+    /// a host one's in the mirror it publishes.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,
@@ -1086,6 +1094,40 @@ impl Engine for Cuda {
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()
             .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
+    }
+
+    /// The program adopted and its build planned here; its regions compile
+    /// (NVRTC, or the kernel cache's files) in the returned compile, off
+    /// the engine's thread, while fires go on. Their modules load into the
+    /// context at [`Engine::finish_program`].
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let prepared = self
+            .loaded_mut()
+            .and_then(|shell| shell.prepare_program(registration).map_err(fault));
+        let mut pending = self.refused(prepared)?;
+        Ok(Box::new(move || {
+            pending.build();
+            engine::Prepared(Box::new(pending))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(pending) = prepared.0.downcast::<crate::program::Pending>() else {
+            return Err(Error::Program(
+                "a prepared program CUDA did not prepare".to_string(),
+            ));
+        };
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.finish_program(*pending).map_err(fault));
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
     }
 
     fn settles_asynchronously(&self) -> bool {

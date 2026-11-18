@@ -68,8 +68,27 @@ pub mod verbs {
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel> {
         let table = waker::WakerTable::global();
+        // What the engine stated it holds is what the bind took rings by
+        // (`Engine::holds_channel`): an answer past it would leave a ring
+        // with no slots, or slots taken twice.
+        let holds = engine.holds_channel(registration);
         let answered = match engine.register_channel(registration) {
+            Ok(answer) if !holds => {
+                let _ = engine.close_channel(registration.id);
+                return Err(anyhow::anyhow!(
+                    "channel {}: the engine states it leaves the registration to the runtime \
+                     and took it",
+                    answer.id
+                ));
+            }
             Ok(answer) => Some(answer),
+            Err(engine::Error::Unsupported { .. }) if holds => {
+                return Err(anyhow::anyhow!(
+                    "channel {}: the engine states it holds the registration and answered it \
+                     unsupported",
+                    registration.id
+                ));
+            }
             Err(engine::Error::Unsupported { .. }) => None,
             Err(error) => return Err(anyhow::Error::from(error)),
         };

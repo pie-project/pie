@@ -198,9 +198,9 @@ pub struct KvStore {
     /// The last count of reclaimable cache pages, when it was taken and what
     /// the walk took: see [`Self::reclaimable_cache_pages`].
     reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
-    /// The same for idle cache parked on the host: see
-    /// [`Self::host_cache_pages`].
-    host_cached: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
+    /// The same for idle cache below the device: see
+    /// [`Self::below_device_cache_pages`].
+    below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -431,7 +431,7 @@ impl KvStore {
             persisted: None,
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
-            host_cached: std::cell::Cell::new(None),
+            below_cached: std::cell::Cell::new(None),
         }
     }
 
@@ -1164,7 +1164,7 @@ impl KvStore {
             pages.extend(group);
             records.extend(kept);
         }
-        self.host_cached.set(None);
+        self.below_cached.set(None);
         if pages.is_empty() {
             return None;
         }
@@ -1271,7 +1271,7 @@ impl KvStore {
         let count = txn.pages.len();
         self.host_pool
             .release_reserved(txn.pages.into_iter().map(|(_, host, _)| host).collect());
-        self.host_cached.set(None);
+        self.below_cached.set(None);
         self.end_move(freed);
         tracing::debug!(target: "pie::kv", pages = count, "spilled host to disk");
         count
@@ -1288,21 +1288,27 @@ impl KvStore {
     }
 
     /// Idle cache pages parked on the host that only the cache reads: what
-    /// a host short of room can move on down to disk. A count stands as
-    /// [`Self::reclaimable_cache_pages`]' does.
+    /// a host short of room can move on down to disk.
     pub fn host_cache_pages(&self) -> u32 {
-        if self.host_pool.capacity() == 0 {
-            return 0;
+        self.below_device_cache_pages().0
+    }
+
+    /// Idle cache pages below the device that only the cache reads,
+    /// `(on the host, on disk)`: dropping them frees their slots for any
+    /// demand. A count stands as [`Self::reclaimable_cache_pages`]' does.
+    pub fn below_device_cache_pages(&self) -> (u32, u32) {
+        if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
+            return (0, 0);
         }
-        if let Some((at, took, pages)) = self.host_cached.get()
+        if let Some((at, took, pages)) = self.below_cached.get()
             && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
         {
             return pages;
         }
         let began = Instant::now();
         let roots = self.table.unused_cache_roots();
-        let pages = self.table.cache_only_host_slots(&roots, &[]).len() as u32;
-        self.host_cached.set(Some((began, began.elapsed(), pages)));
+        let pages = self.table.cache_only_below_device(&roots);
+        self.below_cached.set(Some((began, began.elapsed(), pages)));
         pages
     }
 

@@ -245,6 +245,9 @@ impl PoolPort for GrowingPool {
     fn reclaimable_idle(&self) -> u32 {
         0
     }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
     fn suspend_capable(&self) -> bool {
         false
     }
