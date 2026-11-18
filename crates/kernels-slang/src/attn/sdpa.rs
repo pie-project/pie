@@ -337,14 +337,11 @@ pub fn decode(
     }
     if let Some(planes) = split {
         let ceiling = split_ceiling(&planes, &shape, head_dim);
-        // Every page the fire's tables name: the walker splits no row past
-        // the keys it holds.
-        let keys = pool
-            .page_indices
-            .rows
-            .saturating_mul(pool.page_indices.width)
-            .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
-        let slices = splits_for(&tactic, &shape, ceiling, window, keys);
+        // The splits are the shape's alone, never the keys the fire holds:
+        // each row's walker splits its own keys (no split under the fewest,
+        // and one split lands the row whole for the fold to pass), so a
+        // fire's dispatches are the same as its keys grow.
+        let slices = splits_for(&tactic, &shape, ceiling);
         if slices > 1 {
             return decode_split(
                 ctx, tactic, q, tables, pool, &shape, head_dim, sm_scale, o, lse, planes, slices,
@@ -367,19 +364,18 @@ pub fn decode(
 }
 
 /// The splits a decode of this shape takes: enough (heads x rows x splits)
-/// workgroups to reach the device's want, no split under its fewest keys,
-/// and no more than the partial planes hold.
-fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32, window: Option<u32>, keys: u32) -> u32 {
+/// workgroups to reach the device's want, and no more than the partial
+/// planes hold. Its rows' keys play no part: each row's walker takes as many
+/// of these as its own keys fill (`split_min_keys` each), the rest landing
+/// nothing.
+fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32) -> u32 {
     let groups = shape.q_heads.saturating_mul(shape.rows).max(1);
     if ceiling <= 1 || groups >= tactic.split_groups {
         return 1;
     }
-    let min_keys = tactic.split_min_keys.max(1);
-    let bound = window.map_or(keys, |w| w.min(keys));
     tactic
         .split_groups
         .div_ceil(groups)
-        .min(bound.div_ceil(min_keys))
         .clamp(1, ceiling.max(1))
 }
 
