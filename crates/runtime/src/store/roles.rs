@@ -1676,15 +1676,16 @@ impl Roles {
             .sum()
     }
 
-    /// Bytes of the slots `holder`'s own items take on the device, or will
-    /// once unparked: its instances' tables, rings and guest state, and the
-    /// channels it registered. What its instances share with others' (an
-    /// adapter, a guest pair's state) is no one's own.
+    /// Bytes of the slots `holder`'s own items take on the device now: its
+    /// instances' tables, rings and guest state, and the channels it
+    /// registered; parked ones take none until they come back. What its
+    /// instances share with others' (an adapter, a guest pair's state) is
+    /// no one's own.
     #[must_use]
     pub fn bytes_held_by(&self, holder: Holder) -> u64 {
         self.items
             .values()
-            .filter(|item| item.holder == Some(holder))
+            .filter(|item| item.holder == Some(holder) && item.tier != Tier::Host)
             .flat_map(|item| &item.parts)
             .map(|part| self.part_bytes(part))
             .sum()
