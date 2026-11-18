@@ -26,6 +26,12 @@ attn_tflops_by_keys = [[512, 4.4], [1024, 3.9], [2048, 4.3], [4096, 4.8], [8192,
 hbm_gbps = 379.4
 elementwise_gbps = 261.6
 scan_gelems = 90.0
+# The two keys added on 2026-11-18, each the median of five runs, every run
+# within 0.3% (few rows) and 0.7% (workgroups) of it:
+#   few_row_tflops: 5.084 / 5.079 / 5.073 / 5.085 / 5.084 TFLOP/s
+#   workgroups_per_core: 3.820 / 3.819 / 3.846 / 3.822 / 3.835
+few_row_tflops = 5.08
+workgroups_per_core = 3.82
 
 [provenance]
-rates = "Metal's rates step (pie tune metal --rates) on 2026-11-17, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; operands: engine::rates' pattern"
+rates = "Metal's rates step (pie tune metal --rates) on 2026-11-17, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; the few-row matmul at m = 4 to 256 over n = k = 4096, its most flops over time; workgroups a core from the matmul's first curve rows over as few columns as launch one workgroup a core or fewer, against the curve's rate there; operands: engine::rates' pattern"
