@@ -89,6 +89,7 @@ fn tests_every_case() {
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
+    a_pin_waits_out_a_move_and_lands_where_the_page_settled();
     floor_keyed_idle_cache_is_dropped_not_demoted();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1216,6 +1217,52 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     );
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
+}
+
+/// An offload reader's pin of pages a residency move holds: refused as
+/// mid-move (the caller waits for the move to end), never handed the ids
+/// the move's commit frees at once. After the commit the pages lie on the
+/// host, so the pin finds them not on the device, and no freed id is
+/// pinned; a pin before the move takes them whole.
+fn a_pin_waits_out_a_move_and_lands_where_the_page_settled() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(36));
+    store.set_page_size(16);
+    let a = ProcessId::from_u128(44);
+    let tokens = prompt(18, 2);
+    sealed_and_gone(&mut store, &tokens, a);
+    let probe = store.create_working_set();
+    let keys = keys_ahead(&store, probe, 0, &tokens);
+    store.release_working_set(probe, store.current_epoch());
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(run.len(), 2);
+    let keys_above = Steps {
+        entries: vec![(a, None, 10)],
+    };
+    let txn = store
+        .prepare_demote(8, keys_above)
+        .unwrap()
+        .expect("the pages go to the host");
+    assert!(
+        matches!(
+            store.pin_resident(&run),
+            Err(super::KvStoreError::MoveInFlight)
+        ),
+        "mid-move: waited for, not pinned"
+    );
+    let ended = store.moves_ended();
+    let notified = ended.notified();
+    let mut notified = std::pin::pin!(notified);
+    notified.as_mut().enable();
+    store.commit_suspend(txn).unwrap();
+    assert!(
+        futures::FutureExt::now_or_never(notified).is_some(),
+        "the move's end wakes the waiter"
+    );
+    let run = store.cached_run_any_tier(&keys);
+    assert!(
+        matches!(store.pin_resident(&run), Ok(None)),
+        "settled on the host: not on the device, and no freed id pinned"
+    );
 }
 
 /// Idle cache no policy keys above the floor is not copied down a tier

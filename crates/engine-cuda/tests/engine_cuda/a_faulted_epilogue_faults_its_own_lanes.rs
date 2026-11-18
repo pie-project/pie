@@ -192,6 +192,7 @@ fn bind(
                 rings: slots.1,
                 scratch,
                 pair,
+                pair_generation: 0,
             },
         )
         .expect("the instance binds")

@@ -704,15 +704,47 @@ pub(super) fn expire_leases() {
     }
 }
 
+/// Pins `keys[from..]` where they stand (`tag` names the lock's use), each
+/// page's device id with it, and `then`'s read of the run under the same
+/// hold; `None` when they are not all one run, or not all on the device. A
+/// page a residency move holds is waited for, the move's end the event, and
+/// pinned where it settled: never an id the move is about to free.
+async fn pin_settled<T>(
+    stores: &Stores,
+    tag: &'static str,
+    keys: &[Hash256],
+    from: usize,
+    then: impl Fn(&crate::store::kv::KvStore, &[crate::store::kv::page_table::TriePageLocation]) -> T,
+) -> Option<(
+    crate::store::kv::ReaderPin,
+    Vec<crate::store::kv::page_table::PhysicalKvPageId>,
+    T,
+)> {
+    loop {
+        let ended = with_kv_lock(&stores.kv, tag, |kv| kv.moves_ended());
+        let notified = ended.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let pinned = with_kv_lock(&stores.kv, tag, |kv| {
+            let run = kv.cached_run_any_tier(keys);
+            if run.len() != keys.len() || from >= run.len() {
+                return Ok(None);
+            }
+            let read = then(kv, &run[from..]);
+            kv.pin_resident(&run[from..])
+                .map(|pinned| pinned.map(|(pin, pages)| (pin, pages, read)))
+        });
+        match pinned {
+            Ok(pinned) => return pinned,
+            Err(_) => notified.await,
+        }
+    }
+}
+
 /// Holds `keys[from..]`, device-resident, for an asker to read in place;
 /// `None` when some of them are not on the device.
-fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
-    let (pin, pages) = with_kv_lock(&stores.kv, "offload-hold", |kv| {
-        let run = kv.cached_run_any_tier(keys);
-        (run.len() == keys.len() && from < run.len())
-            .then(|| kv.pin_resident(&run[from..]))
-            .flatten()
-    })?;
+async fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
+    let (pin, pages, ()) = pin_settled(stores, "offload-hold", keys, from, |_, _| ()).await?;
     let lease = NEXT_LEASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     LEASES.lock().unwrap().insert(
         lease,
@@ -859,12 +891,12 @@ pub async fn serve(
         run_ms = (t_run - t_fetch).as_millis() as u64,
         "served a prefill"
     );
-    Ok(RemotePages {
-        held: (delivery == Delivery::InPlace)
-            .then(|| hold(&stores, &keys, from as usize))
-            .flatten(),
-        ..answer
-    })
+    let held = if delivery == Delivery::InPlace {
+        hold(&stores, &keys, from as usize).await
+    } else {
+        None
+    };
+    Ok(RemotePages { held, ..answer })
 }
 
 /// The bytes of this worker's sealed pages `keys[from..]`, for a peer that
@@ -889,15 +921,10 @@ async fn export(
     keys: &[Hash256],
     from: usize,
 ) -> Result<PageStream> {
-    let held = with_kv_lock(&stores.kv, "offload-export", |kv| {
-        let run = kv.cached_run_any_tier(keys);
-        if run.len() != keys.len() || from >= run.len() {
-            return None;
-        }
-        let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
-        kv.pin_resident(&run[from..])
-            .map(|(pin, device)| (pin, device, hashes))
-    });
+    let held = pin_settled(stores, "offload-export", keys, from, |kv, run| {
+        kv.run_slots(run).unwrap_or_default()
+    })
+    .await;
     let (pin, device, hashes) =
         held.ok_or_else(|| anyhow!("those pages are not all cached on the device here"))?;
     let release = |stores: &Stores, pin| {

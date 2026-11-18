@@ -1106,6 +1106,7 @@ impl Engine for Metal {
                 &binding.ring_slots,
                 &binding.scratch,
                 &binding.pair,
+                binding.pair_generation,
             )
             .map_err(fault)?;
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);

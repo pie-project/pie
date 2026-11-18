@@ -1565,27 +1565,39 @@ impl KvStore {
     }
 
     /// A run of sealed pages, held so it is neither moved nor reclaimed while
-    /// its bytes are read out, with each page's device id; `None` unless all
-    /// of it is on the device.
+    /// its bytes are read out, with each page's device id; `Ok(None)` unless
+    /// all of it is on the device. A page a move holds is the move's until it
+    /// settles ([`KvStoreError::MoveInFlight`]): pinned mid-move, its id is
+    /// one the move's commit frees at once, read out while another owner
+    /// writes it. The caller waits for the move to end
+    /// ([`Self::moves_ended`]) and pins where the page settled.
     pub fn pin_resident(
         &mut self,
         run: &[TriePageLocation],
-    ) -> Option<(ReaderPin, Vec<PhysicalKvPageId>)> {
-        let last = run.last()?;
+    ) -> Result<Option<(ReaderPin, Vec<PhysicalKvPageId>)>, KvStoreError> {
+        let Some(last) = run.last() else {
+            return Ok(None);
+        };
+        if run
+            .iter()
+            .any(|location| self.table.page_location_pinned(*location))
+        {
+            return Err(KvStoreError::MoveInFlight);
+        }
         let mut ids = Vec::with_capacity(run.len());
         for location in run {
-            match self.table.backing_at(location).ok()? {
-                KvPageBacking::Resident(id) => ids.push(id),
-                _ => return None,
+            match self.table.backing_at(location) {
+                Ok(KvPageBacking::Resident(id)) => ids.push(id),
+                _ => return Ok(None),
             }
         }
         self.table.pin(last.node);
-        Some((
+        Ok(Some((
             ReaderPin {
                 nodes: vec![last.node],
             },
             ids,
-        ))
+        )))
     }
 
     /// `ws` as a snapshot reads it, pinned where it stands until the pin is

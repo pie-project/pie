@@ -324,6 +324,7 @@ fn four_ranks_land_what_one_rank_lands() {
                     adapter_slots: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .id;

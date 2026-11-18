@@ -2726,6 +2726,7 @@ impl Shell {
         ring_slots: &[engine::RingSlots],
         scratch: &engine::ScratchPlace,
         pair: &engine::ScratchPlace,
+        pair_generation: u64,
     ) -> Result<engine::InstanceId> {
         let pooled = crate::program::session::Pooled {
             pools: &self.pools,
@@ -2746,6 +2747,7 @@ impl Shell {
             pooled,
             scratch,
             pair,
+            pair_generation,
         )?;
         if crate::diag::on().tier_trace {
             eprintln!(
