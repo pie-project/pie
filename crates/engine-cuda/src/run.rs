@@ -2757,7 +2757,12 @@ impl<'c> Run<'c> {
                     p.total_tokens,
                     p.causal,
                     p.graph_capturable,
-                    (p.mask_indptr, p.mask_origin)
+                    // Where the mask tables lie, not how many lanes this fire
+                    // staged in them: a body reads each fire's entries.
+                    (
+                        p.mask_indptr.map(|table| table.ptr),
+                        p.mask_origin.map(|table| table.ptr)
+                    )
                 ),
                 StructSlot::Mla(p) => write!(
                     sink,

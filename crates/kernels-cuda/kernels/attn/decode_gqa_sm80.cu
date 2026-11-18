@@ -151,7 +151,7 @@ __device__ __forceinline__ void decode_body(
     const unsigned char* bits = nullptr;
     if (mask_origin != nullptr) {
         origin = static_cast<int>(mask_origin[batch] & 0x7fffffffu);
-        bits = mask + mask_indptr[batch];
+        if (origin < kv_len) bits = mask + mask_indptr[batch];
     }
     const int chunk = partition_kv ? *kv_chunk_size_ptr : kv_len - window_start;
     int chunk_start = window_start + (partition_kv ? kv_tile * chunk : 0);

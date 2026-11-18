@@ -279,7 +279,9 @@ fn fa2_decode_with(
         }
         None => {
             let arm = match mask {
-                Some(_) => fa2::decode_custom_arm(NO_SOFT_CAP),
+                Some(_) => {
+                    fa2::decode_masked_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP)
+                }
                 None => fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP),
             };
             fa2::decode(ctx, op, point(arm), &params)?;
