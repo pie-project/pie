@@ -372,6 +372,14 @@ impl PoolPort for RegistryPool {
         };
         let sets =
             crate::inferlet::process::residency::kv_working_sets_for(pids, self.model, self.engine);
+        // The guest state they hold in Instance chunks (dead between fires,
+        // given back at their park), read before the pools' locks: the
+        // roles take the device pool's lock themselves.
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_chunk_slots(pids))
+            .unwrap_or_default();
         // The kv lock first, then the shared pool's: the order kv takes.
         crate::store::registry::with_kv_lock(&stores.kv, "planner-chunks", |kv| {
             let pool = shared.lock().unwrap();
@@ -395,6 +403,17 @@ impl PoolPort for RegistryPool {
                 }
                 for (physical, pages) in counts {
                     by.get_mut(&physical).expect("entered").1.push((pid, pages));
+                }
+            }
+            for (logical, pid, slots) in guest {
+                if let Some(physical) = pool.pool().physical(logical) {
+                    let entry = by
+                        .entry(physical)
+                        .or_insert_with(|| (pool.pool().chunk_used(logical), Vec::new()));
+                    match entry.1.iter_mut().find(|(held, _)| *held == pid) {
+                        Some((_, count)) => *count += slots,
+                        None => entry.1.push((pid, slots)),
+                    }
                 }
             }
             ChunkMap {
