@@ -3855,3 +3855,69 @@ linked images (as G4.2 did for weight PEs), not a budget.
 byte-identical (decode ident; flux identity); every program that moves is linked by cslc (its
 fullest PE's ELF against the model's estimate), and qwen3-sim, qwen3-sim4 and minimax-sim run
 token-exact on the simulator, flux2-mini's checks where a flux program moves.
+
+## G5: gemma4-sim's stall and NaN, gpt-oss's experts, a lane's rotation
+
+### G5.1 gemma4-sim: the attention's redo passes, a reciprocal past its domain
+
+**The stall** (G4.4), read off a core dump: every PE ends but the second layer's K / V column
+(`kp_0.csl` at x 8 .. 11, y 82 .. 87), each waiting on its root's multicast; the root (`kr_0`)
+ended after 8 passes (its `passes` word), the PEs' `mref` at -696 (8 x -87).
+
+- **The protocol's two bounds**: a query's passes are the root's (`ops/cy_satt.csl`): q out,
+  `[o | l]` back, `[redo, ln l]` out, and q again while any head's `l` is outside the 16-bit
+  window. Both sides bounded the loop at 8 passes; at the 8th the root sent `redo` and stopped,
+  the PEs (`ops/satt.csl`) took the redo and waited for a q that never came.
+- **Built: the root alone ends a query**, the PEs passing until its word says done (`while
+  (true)`, no bound of their own), and its passes are exact, not capped (derived in
+  `cy_satt.csl`): a pass steps the reference by the log of its sum, by at least `min(D, ln PMAX)`
+  (69 a bf16 build, 11 an IEEE one) toward the largest score `D` off it and never past the
+  scores' log-sum-exp from above, by `ln1(0) = -88` from below (past it by at most `ln n`), so a
+  query ends converged within `|D| / ln PMAX + 2` passes. `PASSES` (1,024: `|D|` to ~70,000 in
+  bf16) is a hang guard only: a query reaching it is never returned unconverged, its output NaN
+  and the root's `passes` word's top bit set (a stamp's third word).
+- **Open: the guard's report.** A NaN does not surely reach the host: later regions' exp clamps
+  (`vexp`'s against -87 / 87) turn it finite (as they turned the NaN below into -30). Next: each
+  op module that declares a status word has it counted onto the sends it already makes (the K /
+  V root's output to its head root, summed onto the row stream by a matvec of ones, carried to
+  the exit) and delivered with the argmax / logits words the host already reads (no read of its
+  own), the step refused by name. Until then the host refuses NaN logits (`units.rs`) and a row
+  no logit of which passed the PEs' floor (`reading.rs`'s wafer argmax), which a laundered NaN
+  passes.
+- **Open: the template kernels' same hang.** `att.csl` / `cy_att.csl`, `kv.csl` / `cy_kv.csl`
+  and `swa.csl` / `cy_swa.csl` bound their redo loops at 8 passes on both sides, the root
+  sending `redo` at its 8th and stopping: a query whose largest score sits more than about
+  `8 x ln PMAX - ln HI` off the reference it carries (~540 bf16, ~80 IEEE; scale-1 scores over
+  normed heads, as gemma's, reach that) hangs its K / V PEs. Left as they are (the shipping
+  programs byte-identical; the shipping models ran on the chip); the fix is this one.
+
+**The -30 logits.** With the hang gone, step 0's logits were all -30 (the softcap's floor). The
+core dump of the step (each PE's arrays read at its ELF's addresses: `scratch/cleanup/g5/rd*.py`,
+a debug root logging each pass) has layer 0's MLP GELU region (`rg_1_16`, at `cy_1_2` / `cy_1_3`
+and their helpers) making NaN where its tanh's `exp(2 y)` reached the exp's ceiling:
+`math.vexp` clamped its argument to 88, `e^88` (1.65e38) is past `2^126`, and the regions'
+bit-trick reciprocal (`vrecip`, a first guess from the exponent's complement) wraps to a
+negative guess there and gives NaN. A GELU input past ~9.6 does it (this random slice reaches
+125). The NaN reached every later value (layer 1's scores NaN, so its query never converged: the
+exp clamps them to the floor, the sum never moves), and the softcap's exp clamped the logits to
+-30. Every region's tanh, sigmoid and GELU takes `1 / (1 + e^x)`, so the class is any such
+argument past 87.
+
+- **Built**: `math.vexp`'s ceiling is 87 whatever its caller asks (`e^87`, 6.1e37, leaves the
+  reciprocal a normal 1.6e-38). Every value at or below 87 is computed as before, bit for bit;
+  above it, an exp the attention kernels clamp to their probabilities' PMAX anyway (unchanged),
+  or one a reciprocal took to NaN (now its right limit). The emitted programs, the templates'
+  kernels' included, are byte-identical (the ops are linked in).
+
+**The golden's layers.** transformers' Gemma 4 config forces its last layer global, so G4's
+golden (`hf_sim.py`) was of a sliding and a global layer while the poem's slice (E2B's first
+two) is two sliding ones. `hf_sim.py` now keeps the release's first layers' kinds (set past the
+config's check) and takes the golden from the model as built (not reloaded, which would force it
+again): `scratch/cleanup/g5/gs/` (G4's weights; the tokens from step 4 on differ). A slice of
+gemma's global layers (`full_every = 2`) does not build: a head of 512 at a head root is 13,568
+words with its region arrays (at any K / V replica count): the memory model's (A1's) to take.
+
+**On the simulator** (20 steps: the prompt's 4 and the golden's 16, teacher-forced): the first
+checked steps token-exact, logits within bf16 of HF's f32 (step 4: 416 at 17.625 against
+17.643; step 5: 168 at 16.5 against 16.42; step 6: 320 at 19.0 against 18.90), 144-179k cycles a
+step (the scale-1 scores' redo passes). The whole run's count is G5's next section's.

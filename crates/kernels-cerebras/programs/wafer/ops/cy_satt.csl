@@ -3,7 +3,20 @@
 // head, 2 Dc f32) multicast up the column. Attend phase, a query a call: q (Qh heads of Dc)
 // multicast; from the column chain [o | l] a head; o / l; [redo, ln l a head] multicast (the PEs'
 // reference steps), and q again while any l is outside [LO, HI): the 16-bit probabilities'
-// window (f16: [2^-8, 2^15), as ops/cy_att.csl's).
+// window (f16: [2^-8, 2^15), as ops/cy_att.csl's). The root alone ends a query (the PEs pass
+// until its word says done), so the two sides cannot disagree on a query's passes.
+//
+// The passes a query takes, its largest score s off the reference m by D = s - m: a pass's sum l
+// is of the 16-bit probabilities, each at most exp(D) and at least 2^-133 or none, so with n
+// entries attended exp(D) <= l <= n exp(D) where nothing clamps. Out of the window it steps
+// m += ln l: from above (D > ln HI) by at least min(D, ln PMAX) (69 a bf16 build, 11 an IEEE
+// one) and at most the sum's log, so never past the scores' log-sum-exp; from below (l = 0, D
+// under ~-88) by ln1(0) = -88, past it by at most ln n (n below 2^15: the next sum in the window
+// or one step back). A query so ends within |D| / ln PMAX + 2 passes, exactly converged. PASSES
+// (1024: |D| up to ~70,000 bf16, ~11,000 IEEE) is a hang guard, not a bound the numerics lean
+// on: a query that reaches it is never returned unconverged: its output is NaN and `passes`' top
+// bit set (a stamp's third word). (That a NaN reaches the host is not assured: later regions'
+// exp clamps turn it finite. GENERIC.md G5.1: the host's every-step report is next.)
 //
 // SINK (attention sinks, gpt-oss's): each head's sink logit `sk` joins its softmax's sum, o =
 // sum(p v) / (l + exp(sk - mref)), the root keeping the PEs' reference `mr` (their mref: ln l a
@@ -50,9 +63,10 @@ fn query_q(o: mem1d_dsd) void {
 fn store(kv: mem1d_dsd) void { @fmovs(fab.fout(YO, 2 * Dc), kv); }
 
 // One query: q (QD f32) in, o (QD f32) out.
+const PASSES: u16 = 1024;
 fn query(q: mem1d_dsd, o: mem1d_dsd) void {
   var pass: u16 = 0;
-  while (pass < 8) : (pass += 1) {
+  while (pass < PASSES) : (pass += 1) {
     passes += 1;
     @fmovs(fab.fout(YO, QD), q);
     @fmovs(t_d, fab.fin(IN, TW));
@@ -68,8 +82,14 @@ fn query(q: mem1d_dsd, o: mem1d_dsd) void {
       u[1 + h] = math.ln1(l);
       if (SINK) { mr[h] += u[1 + h]; }
     }
+    // (the hang guard: refused, not returned)
+    if (pass + 1 == PASSES and bad != 0.0) {
+      @fmovs(@set_dsd_length(o, QD), @bitcast(f32, @as(u32, 0x7fc00000)));
+      passes |= 0x80000000;
+      bad = 0.0;
+    }
     u[0] = bad;
     @fmovs(fab.fout(YO, 1 + Qh), u_d);
-    if (bad == 0.0) { pass = 8; }
+    if (bad == 0.0) { pass = PASSES; }
   }
 }

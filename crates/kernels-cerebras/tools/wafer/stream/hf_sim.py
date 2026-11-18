@@ -40,6 +40,11 @@ if getattr(cfg, "per_layer_config", None) is not None:
     d = cfg.to_dict()
     d["per_layer_config"] = {k: v for k, v in (d.get("per_layer_config") or {}).items() if int(k) < cfg.num_hidden_layers}
     cfg = type(cfg).from_dict(d)
+# (the release's first layers' kinds, as the slice the poem cuts reads them: a config's own
+# checks may force its last layer's kind otherwise, as Gemma 4's forces a global one)
+if hasattr(cfg, "layer_types") and cfg.layer_types:
+    kinds = list(getattr(top if text is None else top.text_config, "layer_types"))[:cfg.num_hidden_layers]
+    object.__setattr__(cfg, "layer_types", kinds)
 torch.manual_seed(0)
 cfg.initializer_range = 0.1
 m = AutoModelForCausalLM.from_config(cfg)
@@ -50,7 +55,9 @@ if vectors > 0:
                 p.add_(torch.randn_like(p) * vectors)
 m = m.to(torch.bfloat16)
 m.save_pretrained(out, safe_serialization=True)
-m = AutoModelForCausalLM.from_pretrained(out, torch_dtype=torch.float32).eval()
+# (the saved bf16 weights in f32: the model as built, not reloaded, whose config's checks
+# could change its layers' kinds again)
+m = m.float().eval()
 if text is not None:
     from safetensors.torch import load_file, save_file
     f = os.path.join(out, "model.safetensors")

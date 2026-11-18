@@ -153,6 +153,12 @@ impl UnitModel {
             let w = logits.width;
             for (t, r) in chunk.iter().enumerate() {
                 let l = &v[t * w..(t + 1) * w];
+                // (NaN logits: a step whose attention refused a query; refused here too)
+                if l.iter().any(|x| x.is_nan()) {
+                    return Err(format!(
+                        "units: row {t}'s logits are NaN (a refused attention query?)"
+                    ));
+                }
                 out.push((argmax_of(l), r.logits.then(|| l.to_vec())));
             }
         }

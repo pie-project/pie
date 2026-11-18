@@ -1546,6 +1546,13 @@ impl Fabric for Runtime {
                 }
             }
         }
+        // (a row no logit of which passed the PEs' floor: its logits NaN, as a step whose
+        // attention refused a query leaves them; refused, not taken as column 0)
+        if let Some(t) = best.iter().position(|&(m, _)| m.is_nan() || m <= -3.0e38) {
+            return Err(format!(
+                "row {t}: no finite logit (a refused attention query?)"
+            ));
+        }
         Ok(Some(best.into_iter().map(|(_, k)| k).collect()))
     }
 }

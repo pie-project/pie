@@ -270,8 +270,8 @@ fn mask() void {
 fn query() void {
   const QD: u16 = Qh * Dc;
   @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
-  var pass: u16 = 0;
-  while (pass < 8) : (pass += 1) {
+  // (until the root's word says done: ops/cy_satt.csl's PASSES its own bound)
+  while (true) {
     var h: u16 = 0;
     while (h < Qh) : (h += 1) {
       matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NE), kc_d,
@@ -299,8 +299,7 @@ fn query() void {
     @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(YM, 1 + Qh));
     h = 0;
     while (h < Qh) : (h += 1) { mref[h] += sx[1 + h]; }
-    if (sx[0] == 0.0) { pass = 8; } else {
-      @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
-    }
+    if (sx[0] == 0.0) { return; }
+    @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
   }
 }
