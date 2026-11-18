@@ -28,8 +28,9 @@ mod victim;
 mod wait;
 
 #[cfg(test)]
-mod pressure_tests;
 mod admission_tests;
+#[cfg(test)]
+mod pressure_tests;
 #[cfg(test)]
 mod seat_tests;
 #[cfg(test)]

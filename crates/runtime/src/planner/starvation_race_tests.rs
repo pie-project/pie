@@ -2448,9 +2448,6 @@ impl PoolPort for BindRoomPool {
     fn reclaimable_idle(&self) -> u32 {
         self.cache.lock().len() as u32
     }
-    fn idle_below_device(&self) -> (u32, u32) {
-        (0, 0)
-    }
     fn suspend_capable(&self) -> bool {
         self.host > 0
     }
@@ -2873,6 +2870,8 @@ async fn a_holder_parked_on_the_planner_bars_no_execution_waiter() {
     install(Some(Table::new(
         std::collections::HashMap::from([(low, 1), (high, 9), (later, 1)]),
         None,
+        std::collections::HashMap::new(),
+        None,
     )));
     crate::planner::init_planner(
         0,
@@ -2954,6 +2953,8 @@ async fn a_process_is_re_keyed_when_its_row_lands() {
     // The late one's row lands, ranking it first.
     install(Some(Table::new(
         std::collections::HashMap::from([(late, 7)]),
+        None,
+        std::collections::HashMap::new(),
         None,
     )));
     assert_eq!(key(late), 7, "re-keyed as its row lands");

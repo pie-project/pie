@@ -19,6 +19,15 @@ struct SizedPool {
 }
 
 impl PoolPort for SizedPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: (self.total, self.total),
@@ -164,6 +173,8 @@ async fn the_policy_s_order_decides_who_is_admitted() {
             .map(|(i, pid)| (*pid, i as i64))
             .collect(),
         None,
+        std::collections::HashMap::new(),
+        None,
     )));
     // Three sets of 3 pages fit a device of 10; a fourth does not.
     let sized: Vec<(ProcessId, u64)> = pids.iter().map(|pid| (*pid, 3)).collect();
@@ -186,6 +197,8 @@ async fn the_policy_s_order_decides_who_is_admitted() {
             .enumerate()
             .map(|(i, pid)| (*pid, if i == 0 { 9 } else { i as i64 }))
             .collect(),
+        None,
+        std::collections::HashMap::new(),
         None,
     )));
     gate.regrant();
@@ -278,7 +291,12 @@ async fn at_four_seats_all_six_lower_finish_after_the_higher_one() {
     let high = ProcessId::new_v4();
     let mut keys: HashMap<ProcessId, i64> = lower.iter().map(|pid| (*pid, 1)).collect();
     keys.insert(high, 9);
-    schedule::install(Some(Table::new(keys, None)));
+    schedule::install(Some(Table::new(
+        keys,
+        None,
+        std::collections::HashMap::new(),
+        None,
+    )));
     let prewarm = OrderedSemaphore::new("prewarm", SEATS, true);
     let bind = OrderedSemaphore::after("bind", 2 * SEATS, false, vec![prewarm.clone()]);
     let execution = OrderedSemaphore::after("execution", SEATS, true, vec![bind.clone()]);
@@ -342,7 +360,10 @@ async fn saturated_is_the_admission_rule_idle_cache_is_room() {
     for pid in [a, b] {
         planner.set_idle(pid, true);
     }
-    assert!(!gate.saturated(), "sets of processes waiting on clients are room");
+    assert!(
+        !gate.saturated(),
+        "sets of processes waiting on clients are room"
+    );
     planner.set_idle(a, false);
     planner.set_idle(b, false);
     assert!(gate.saturated());

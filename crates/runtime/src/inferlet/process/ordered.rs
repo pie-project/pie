@@ -233,7 +233,10 @@ impl OrderedSemaphore {
                 .waiters
                 .iter()
                 .any(|w| !state.holds || !schedule.as_ref().is_some_and(|s| s.held(w.pid)))
-            || self.room.as_ref().is_some_and(|room| room.full(&state.holders))
+            || self
+                .room
+                .as_ref()
+                .is_some_and(|room| room.full(&state.holders))
     }
 
     pub(crate) fn available_permits(&self) -> usize {

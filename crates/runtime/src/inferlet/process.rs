@@ -353,7 +353,6 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
         true,
     ));
-    const STAGED_COHORTS: usize = 1;
     let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
         gates
             .iter()
@@ -376,10 +375,6 @@ pub fn init_admission(max_concurrent: Option<usize>) {
             Some(Box::new(PlannerRoom)),
         )
     });
-    BIND_STAGED_RESERVE.store(
-        limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
-        Relaxed,
-    );
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");

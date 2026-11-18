@@ -497,9 +497,9 @@ impl ResidencyPlanner {
                     // of room asks, as the victim set counts them.
                     let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                     let expected = inner.expected_reclaim().pages;
-                    let deficit = missing.saturating_sub(expected).saturating_add(
-                        inner.room_pages(waiter).saturating_sub(expected),
-                    );
+                    let deficit = missing
+                        .saturating_sub(expected)
+                        .saturating_add(inner.room_pages(waiter).saturating_sub(expected));
                     if deficit == 0 {
                         return (None, Vec::new());
                     }
