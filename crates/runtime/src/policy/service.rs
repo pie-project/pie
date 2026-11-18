@@ -425,21 +425,81 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
             continue;
         }
         let below = tier == Tier::Device && (registry.cache.swap)().1 > 0;
-        let candidates = registry
+        let mut candidates: Vec<pressure::Candidate> = registry
             .snapshot()
             .candidates_for(tier, keys)
             .into_iter()
             .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
-            .filter(|c| {
-                if below && !registry.handles.contains_key(&ProcessId::from_str(&c.id).unwrap()) {
-                    demand.may_demote(c.key)
-                } else {
-                    demand.may_discard(c.key)
-                }
-            })
+            .filter(|c| c.bytes != Some(0) && c.key != pressure::PINNED)
             .collect();
-        let chosen = pressure::choose(candidates, short);
-        if chosen.is_empty() {
+        candidates.sort_by(|a, b| (a.key, a.last_use_ms, &a.id).cmp(&(b.key, b.last_use_ms, &b.id)));
+        // Lowest key first, until what was freed covers the shortfall. Each
+        // candidate is judged where it stands: moved down a tier where one
+        // below has room and the demand may move it; else discarded where
+        // the demand may discard it; else kept, and not counted.
+        let mut freed: u64 = 0;
+        let mut took = false;
+        for candidate in candidates {
+            if freed >= short {
+                break;
+            }
+            let Ok(owner) = ProcessId::from_str(&candidate.id) else {
+                continue;
+            };
+            let key = candidate.key;
+            let handle = registry.handles.contains_key(&owner);
+            let moved = below && !handle && demand.may_demote(key) && (registry.cache.demote)(owner);
+            if moved {
+                tracing::info!(
+                    tier = tier.name(),
+                    short,
+                    working_set = %owner,
+                    key,
+                    up_to = ?demand.up_to,
+                    "tier pressure: the default responder moves a working set down a tier"
+                );
+            } else if demand.may_discard(key) {
+                tracing::info!(
+                    tier = tier.name(),
+                    short,
+                    working_set = %owner,
+                    key,
+                    up_to = ?demand.up_to,
+                    "tier pressure: the default responder discards a working set"
+                );
+                discard(registry, owner, || {
+                    "no worker policy answers tier pressure: the default responder discarded it"
+                        .to_string()
+                });
+                discarded.push(owner);
+            } else {
+                let why = if !below || handle {
+                    "keyed above the demand, and no tier below takes it"
+                } else if !demand.may_demote(key) {
+                    "keyed above the demand, which running work will serve"
+                } else {
+                    "keyed above the demand, and it could not move down"
+                };
+                // Said once an episode at INFO, its repeats at DEBUG.
+                if KEPT.lock().unwrap()[tier.index()].seen() {
+                    tracing::info!(tier = tier.name(), working_set = %owner, key, up_to = ?demand.up_to, why, "tier pressure: the default responder keeps a working set");
+                } else {
+                    tracing::debug!(tier = tier.name(), working_set = %owner, key, up_to = ?demand.up_to, why, "tier pressure: the default responder keeps a working set");
+                }
+                continue;
+            }
+            took = true;
+            match candidate.bytes {
+                Some(bytes) => freed = freed.saturating_add(bytes),
+                // Its size unknown: the waiter's next report says whether
+                // that was enough.
+                None => break,
+            }
+        }
+        if took {
+            nothing_left_ends(tier, "a working set is moved down or discarded");
+            let _ = KEPT.lock().unwrap()[tier.index()].end();
+        } else {
             // Said once an episode, as it starts; its repeats at DEBUG.
             if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
                 tracing::info!(
@@ -455,47 +515,15 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
                 );
             }
             pressure::answered_nothing(tier);
-        } else {
-            nothing_left_ends(tier, "a working set is discarded");
-        }
-        for id in chosen {
-            let Ok(owner) = ProcessId::from_str(&id) else {
-                continue;
-            };
-            let key = keys.key_at(Some(owner), 0);
-            // Cache moves down where a tier below has room: kept, not lost.
-            if below && !registry.handles.contains_key(&owner) && (registry.cache.demote)(owner) {
-                tracing::info!(
-                    tier = tier.name(),
-                    short,
-                    working_set = %owner,
-                    key,
-                    up_to = ?demand.up_to,
-                    "tier pressure: the default responder moves a working set down a tier"
-                );
-                continue;
-            }
-            // What cannot move down is discarded only within the demand's key.
-            if !demand.may_discard(key) {
-                continue;
-            }
-            tracing::info!(
-                tier = tier.name(),
-                short,
-                working_set = %owner,
-                key,
-                up_to = ?demand.up_to,
-                "tier pressure: the default responder discards a working set"
-            );
-            discard(registry, owner, || {
-                "no worker policy answers tier pressure: the default responder discarded it"
-                    .to_string()
-            });
-            discarded.push(owner);
         }
     }
     discarded
 }
+
+/// Per tier, the episode in which the default responder keeps a set the
+/// demand may not take: said once at INFO as it starts.
+static KEPT: std::sync::Mutex<[process::WaitEpisode; 2]> =
+    std::sync::Mutex::new([process::WaitEpisode::new(), process::WaitEpisode::new()]);
 
 #[derive(Clone, Copy)]
 struct Cache {
@@ -1567,6 +1595,8 @@ mod tests {
     static BOUND_GONE: std::sync::Mutex<Vec<(ProcessId, &'static str)>> =
         std::sync::Mutex::new(Vec::new());
     static BOUND_BELOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    /// An owner whose set cannot move down (its cache in use, say).
+    static BOUND_STUCK: std::sync::Mutex<Option<ProcessId>> = std::sync::Mutex::new(None);
 
     /// Idle sets of one page each that say whether they were moved down or
     /// discarded, and a tier below with room or none.
@@ -1592,7 +1622,8 @@ mod tests {
             BOUND_GONE.lock().unwrap().push((owner, "discarded"));
         },
         demote: |owner| {
-            let below = BOUND_BELOW.load(std::sync::atomic::Ordering::SeqCst);
+            let below = BOUND_BELOW.load(std::sync::atomic::Ordering::SeqCst)
+                && *BOUND_STUCK.lock().unwrap() != Some(owner);
             if below {
                 BOUND_SETS.lock().unwrap().retain(|(o, _)| *o != owner);
                 BOUND_GONE.lock().unwrap().push((owner, "moved down"));
@@ -1633,6 +1664,7 @@ mod tests {
         };
         let round = |up_to: Option<i64>, stalled: bool, below: bool| {
             *BOUND_SETS.lock().unwrap() = vec![(low, 1), (mid, 1), (high, 1)];
+            *BOUND_STUCK.lock().unwrap() = None;
             BOUND_GONE.lock().unwrap().clear();
             BOUND_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
             let mut registry = Registry::new(BOUND_CACHE);
@@ -1682,6 +1714,36 @@ mod tests {
         assert!(
             round(Some(0), true, false).is_empty(),
             "and is never discarded for it"
+        );
+        // A6000's conform: a set chosen to move down that cannot is judged
+        // again at once: discarded where the key lets the demand, else kept
+        // and not counted toward the shortfall, so the next one is taken.
+        let stuck = |owner, up_to| {
+            *BOUND_SETS.lock().unwrap() = vec![(low, 1), (mid, 1), (high, 1)];
+            BOUND_GONE.lock().unwrap().clear();
+            BOUND_BELOW.store(true, std::sync::atomic::Ordering::SeqCst);
+            *BOUND_STUCK.lock().unwrap() = Some(owner);
+            let mut registry = Registry::new(BOUND_CACHE);
+            registry.pressure[Tier::Device.index()] = Reading {
+                short: 2,
+                demand: pressure::Demand { up_to, stalled: true },
+                ..Reading::default()
+            };
+            respond(&registry, &[Tier::Device], &keys);
+            let mut gone = BOUND_GONE.lock().unwrap().clone();
+            gone.sort_by_key(|(o, _)| keys(Some(*o)));
+            *BOUND_STUCK.lock().unwrap() = None;
+            gone
+        };
+        assert_eq!(
+            stuck(low, Some(15)),
+            vec![(low, "discarded"), (mid, "moved down")],
+            "within the key, a set that cannot move is discarded"
+        );
+        assert_eq!(
+            stuck(low, Some(0)),
+            vec![(mid, "moved down"), (high, "moved down")],
+            "above it, it is kept, uncounted, and the next ones move"
         );
         BOUND_SETS.lock().unwrap().clear();
     }
