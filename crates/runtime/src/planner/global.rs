@@ -147,6 +147,16 @@ pub fn planner_of(pid: ProcessId) -> Option<Arc<ResidencyPlanner>> {
     planner_for(0, engine_of(pid))
 }
 
+/// The processes no planner lets fire now: off the device, or waiting
+/// for pages, room for a bind or their restore
+/// ([`ResidencyPlanner::parked_pids`]).
+pub fn parked_pids() -> std::collections::HashSet<ProcessId> {
+    planners()
+        .iter()
+        .flat_map(|planner| planner.parked_pids())
+        .collect()
+}
+
 pub fn rekey_holders() {
     for planner in planners() {
         planner.rekey_holders();

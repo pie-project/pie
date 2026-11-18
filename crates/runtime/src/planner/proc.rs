@@ -72,6 +72,9 @@ pub(super) struct Proc {
     /// ([`super::wait::WaitKind::BindRoom`]), so it never comes back to be
     /// short again.
     pub(super) bind_room: Option<PendingBind>,
+    /// Waiting to be admitted: the pages its first fire grows its working
+    /// sets by, past those it reserved ([`super::ResidencyPlanner::admits`]).
+    pub(super) next_step: u64,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
@@ -138,6 +141,7 @@ impl Proc {
             landed: 0,
             roles_short: false,
             bind_room: None,
+            next_step: 0,
         }
     }
 }

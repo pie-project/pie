@@ -3466,10 +3466,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
     {
+        // A geometry the device resolves grows nothing past what the
+        // process reserved for it.
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
+            ctx.admit_execution(0).await;
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
         if ctx.resources().get(&fwd)?.float.is_some() {
+            ctx.admit_execution(0).await;
             return float::fire_float_lane(ctx, this, fwd, frame).await;
         }
         let began = crate::scheduler::probe::ProbeClock::start();
@@ -3632,6 +3636,28 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|(_, lanes)| pass_lanes.kv[lanes[0]].clone())
             .collect();
+        if ctx.awaits_admission() {
+            // Admitted before it takes anything for its fire: its lane
+            // seats, its pages.
+            let page = u64::from(page_size.max(1));
+            let next_step = crate::store::registry::with_kv_lock(&stores.kv, "admission", |kv| {
+                groups
+                    .iter()
+                    .zip(&group_sets)
+                    .map(|((_, lanes), set)| {
+                        let end = lanes
+                            .iter()
+                            .map(|&lane| landings[lane].end())
+                            .max()
+                            .unwrap_or(0);
+                        u64::from(end)
+                            .div_ceil(page)
+                            .saturating_sub(kv.page_len(set.id).unwrap_or(0))
+                    })
+                    .sum::<u64>()
+            });
+            ctx.admit_execution(next_step).await;
+        }
         if let Err(refusal) = crate::inferlet::process::said(
             "seat the lanes",
             ctx.process_id(),

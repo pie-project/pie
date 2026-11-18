@@ -164,16 +164,6 @@ pub struct EngineConfig {
     pub engine_backend: crate::engine::EngineBox,
 }
 
-/// The admission cap: `cap`, held to the `seats` a seated-first kv pool
-/// seats where the model holds no recurrent state (whose processes its
-/// planner admits against the state pool instead).
-fn seat_cap(cap: usize, has_state: bool, seats: Option<usize>) -> usize {
-    match seats {
-        Some(seats) if !has_state && cap > seats.max(1) => seats.max(1),
-        _ => cap,
-    }
-}
-
 /// A disk tier kept across runs: where its journal is, and whether the
 /// engine found its slot files as the last run left them.
 #[derive(Debug, Clone)]
@@ -282,47 +272,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    // A model with fixed recurrent state is admitted by its planner, which
-    // charges each process the fixed set its working set holds against the
-    // state pool, beside a copy-on-write set per lane a fire runs
-    // (`ResidencyPlanner::admit`): no cap here.
-    let has_state = engine_configs.iter().any(|d| d.chunks.record_bytes > 0);
-    let admission_cap = config
-        .max_concurrent_processes
-        .or_else(|| {
-            engine_configs
-                .iter()
-                .map(|d| d.limits.max_forward_requests)
-                .min()
-                .filter(|&r| r > 0)
-        })
-        .map(|cap| {
-            // A seated-first pool of kv pages alone seats no more than five
-            // sequences a sequence at the declared context holds: past that,
-            // admitted prompts seat lanes the pool then suspends for each
-            // other's growth (Gemma-4-26B on an A100, c512: 2.9k tok/s
-            // admitting all 512, 4.7k at 224; its 5791 pages seat 45 at 2048).
-            // A pool that spreads its starts holds them to what it seats itself.
-            let seats = engine_configs
-                .iter()
-                .filter(|d| d.seated_first && !d.seat_spread && d.limits.max_context > 0)
-                .map(|d| {
-                    5 * usize::try_from(d.chunks.kv_device_pages()).unwrap_or(usize::MAX)
-                        * kv_page_size
-                        / d.limits.max_context
-                })
-                .min();
-            let capped = seat_cap(cap, has_state, seats);
-            if capped < cap {
-                tracing::info!(
-                    requested = cap,
-                    seated = capped,
-                    "admission: capped at five sequences a sequence at the declared context \
-                     holds in the kv pool"
-                );
-            }
-            capped
-        });
+    // Past the seats, a process is admitted while its working set fits the
+    // device beside the running ones' (`ResidencyPlanner::admits`); a model
+    // with fixed recurrent state is admitted against its state pool as well
+    // (`ResidencyPlanner::admit`).
+    let admission_cap = config.max_concurrent_processes.or_else(|| {
+        engine_configs
+            .iter()
+            .map(|d| d.limits.max_forward_requests)
+            .min()
+            .filter(|&r| r > 0)
+    });
     process::init_admission(admission_cap);
 
     let rs_caps = {
@@ -997,7 +957,6 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::seat_cap;
     use crate::model::RsCaps;
 
     /// What bootstrap reads of a load's chunk facts for the model's
@@ -1015,9 +974,9 @@ mod tests {
 
     /// A pool that lays a state shape for a dense model (records of some
     /// size beside its kv) still says the model holds no state: its RsCaps
-    /// state nothing (no rs working set, no rs count a fire is held to) and
-    /// it keeps the seat cap. A hybrid's record bytes are its RsCaps' state
-    /// size, a record's and not a slot's, and it skips the cap.
+    /// state nothing (no rs working set, no rs count a fire is held to). A
+    /// hybrid's record bytes are its RsCaps' state size, a record's and not
+    /// a slot's.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
         let mut facts = ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
@@ -1031,16 +990,10 @@ mod tests {
         facts.record_bytes = 0;
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
-        assert_eq!(seat_cap(512, dense, Some(45)), 45, "dense: the seat cap");
 
         facts.record_bytes = 3000;
         let (hybrid, caps) = read(&facts);
         assert!(hybrid && caps.has_state());
         assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
-        assert_eq!(seat_cap(512, hybrid, Some(45)), 512, "hybrid: admitted by its planner");
-
-        assert_eq!(seat_cap(512, false, None), 512, "no seated-first pool, no cap");
-        assert_eq!(seat_cap(16, false, Some(45)), 16, "a cap under the seats stands");
-        assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
     }
 }

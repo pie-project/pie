@@ -376,7 +376,9 @@ impl ProcessCtx {
             let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
             let _ = self.ctx().table.get(&fwd)?;
         }
-        crate::inferlet::process::ensure_execution_admitted(self).await;
+        // Its seat is taken at its first fire, which knows what that grows
+        // its working sets by (`FireContext::admit_execution`).
+        crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
         let pipeline = self.ctx().table.get(&on)?;
         if !pipeline.scope.is_closed() {

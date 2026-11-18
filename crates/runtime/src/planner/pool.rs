@@ -89,6 +89,16 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = chunks;
         0
     }
+    /// The device pages the working sets of `pids` take together, or will
+    /// once on the device: their kv pages, each page they share once, with
+    /// the pages they reserved past those they map; their state; their
+    /// instances' slots (tables, rings, guest state). Pages are the room's
+    /// unit: what is not kv counts as the pages it keeps out of the pool.
+    /// What admission weighs ([`super::ResidencyPlanner::admits`]).
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+        let _ = pids;
+        0
+    }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
     /// state. `None` where the kv pages are a pool of their own.
@@ -275,6 +285,42 @@ impl PoolPort for RegistryPool {
         };
         let slots = shared.lock().unwrap().list_slots_for(rs);
         u32::try_from(slots).unwrap_or(u32::MAX)
+    }
+
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        let kv_sets: HashSet<_> = pids
+            .iter()
+            .flat_map(|&pid| {
+                crate::inferlet::process::residency::kv_working_set_ids(
+                    pid,
+                    self.model,
+                    self.engine,
+                )
+            })
+            .collect();
+        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-working-sets", |kv| {
+            kv.working_set_pages(&kv_sets)
+        });
+        let rs = pids.iter().fold(RsUnits::default(), |sum, &pid| {
+            sum.add(super::holdings::held_rs_units(pid, self.model, self.engine))
+        });
+        let roles = stores.roles.as_ref().map_or(0, |roles| {
+            let roles = roles.lock().unwrap();
+            pids.iter()
+                .map(|&pid| roles.bytes_held_by(pid))
+                .sum::<u64>()
+        });
+        let roles = self.room().map_or(0, |room| {
+            let chunks = roles.div_ceil(room.chunk_bytes.max(1));
+            self.chunks_as_pages(u32::try_from(chunks).unwrap_or(u32::MAX))
+        });
+        u64::try_from(kv)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(self.rs_as_pages(rs)))
+            .saturating_add(u64::from(roles))
     }
 
     fn reclaim_idle(&self) -> u32 {

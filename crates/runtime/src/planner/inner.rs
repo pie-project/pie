@@ -84,6 +84,42 @@ impl Inner {
             .fold(Reclaim::default(), |sum, &mark| sum.add(mark))
     }
 
+    /// The processes that cannot fire now: off the device (a handle at
+    /// rest aside), or waiting in the queue for pages, room for a bind, or
+    /// their restore. What an admission gate claims nothing for
+    /// (`inferlet::process::ordered`): they claim again once un-parked.
+    pub(super) fn parked(&self) -> impl Iterator<Item = ProcessId> + '_ {
+        let off = self
+            .procs
+            .iter()
+            .filter(|(_, proc)| off_device(proc))
+            .map(|(pid, _)| *pid);
+        off.chain(self.queued_on_device())
+    }
+
+    /// The processes waiting in the queue that are not off the device,
+    /// each once.
+    fn queued_on_device(&self) -> Vec<ProcessId> {
+        let mut waiting: Vec<ProcessId> = self
+            .queue
+            .values()
+            .filter(|waiter| waiter.is_unmet())
+            .map(|waiter| waiter.pid)
+            .filter(|pid| self.procs.get(pid).is_none_or(|proc| !off_device(proc)))
+            .collect();
+        waiting.sort_unstable();
+        waiting.dedup();
+        waiting
+    }
+
+    /// A digest of [`Self::parked`]: it changes when the set does.
+    pub(super) fn parked_digest(&self) -> u64 {
+        self.parked().fold(0u64, |digest, pid| {
+            let bits = pid.as_u128();
+            digest ^ (bits as u64) ^ ((bits >> 64) as u64)
+        })
+    }
+
     pub(super) fn nonresident_count(&self) -> usize {
         let mut n = 0;
         for proc in self.procs.values() {
@@ -452,4 +488,9 @@ pub(super) enum RestoreGate {
     /// Its role slots wait on room nothing else will free: a resident
     /// process is evicted for it.
     Evict,
+}
+
+/// Off the device, a handle at rest aside: it cannot fire until restored.
+fn off_device(proc: &Proc) -> bool {
+    proc.state != Residency::Resident && !proc.holder
 }
