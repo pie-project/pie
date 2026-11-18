@@ -32,7 +32,45 @@ pub struct Tables<'a> {
     pub align: u64,
 }
 
-const READ_ONLY: [bool; BINDINGS as usize] = [false, true, true, true, false, false];
+/// What the runtime declares read-only (the tables, storage) or a uniform
+/// (the config), and the same binding declared read_write storage. An
+/// instance's tables and config lie in its pool slots, in the segment buffer
+/// its heap binds read_write, and a WebGPU usage scope takes one buffer one
+/// way only: a stage's module declares them read_write, and its layout binds
+/// every binding read_write storage.
+const WIDENED: [(&str, &str); 4] = [
+    (
+        "@binding(1) var<storage, read>       descs",
+        "@binding(1) var<storage, read_write> descs",
+    ),
+    (
+        "@binding(2) var<storage, read>       params",
+        "@binding(2) var<storage, read_write> params",
+    ),
+    (
+        "@binding(3) var<storage, read>       offs",
+        "@binding(3) var<storage, read_write> offs",
+    ),
+    (
+        "@binding(5) var<uniform>             cfg",
+        "@binding(5) var<storage, read_write> cfg",
+    ),
+];
+
+/// `source` with every binding [`WIDENED`] names declared read_write;
+/// refused by name where the runtime declares one otherwise.
+fn widened(call: usize, source: String) -> std::result::Result<String, String> {
+    WIDENED.iter().try_fold(source, |source, (read, written)| {
+        if source.contains(read) {
+            Ok(source.replace(read, written))
+        } else {
+            Err(format!(
+                "guest step call {call}'s module declares no `{read}`, which this backend \
+                 binds read_write storage beside the heap in the pool's segments"
+            ))
+        }
+    })
+}
 
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
@@ -607,14 +645,9 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         .map(|at| wgpu::BindGroupLayoutEntry {
             binding: at,
             visibility: wgpu::ShaderStages::COMPUTE,
+            // Read_write storage, every one ([`WIDENED`]).
             ty: wgpu::BindingType::Buffer {
-                ty: if at == CFG_BINDING {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage {
-                        read_only: READ_ONLY[at as usize],
-                    }
-                },
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
@@ -637,6 +670,7 @@ fn build_call(
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
     let source =
         engine_gpu::guest::step_module(call).ok_or_else(|| format!("no step call {call}"))?;
+    let source = widened(call, source)?;
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
     crate::guest::validated(core, "create_compute_pipeline", || {
