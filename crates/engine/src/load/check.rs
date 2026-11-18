@@ -104,6 +104,16 @@ pub struct Shell {
 }
 
 /// An engine's loads of one model, for the check.
+///
+/// A check fire is exactly the fire serving makes at its shape: it reads
+/// back what a serving fire reads and no more. Where serving samples on the
+/// device and reads back its tokens (or its programs' readouts), the check
+/// reads those; where serving reads each lane's rows to the host, the check
+/// reads those rows. A check that reads back more (every lane's full logits
+/// row where serving reads tokens) times a fire serving never makes.
+/// `replayed` ([`Fired`]) is likewise the fire as serving runs it: a
+/// recorded body replayed where the engine records, a walk where it
+/// records nothing and serving walks.
 pub trait Bench {
     /// A load of the model run as `run`: on `shell` ([`shell_for`] the fires
     /// it runs: the prompts on one slot of the widest prompt, the decode

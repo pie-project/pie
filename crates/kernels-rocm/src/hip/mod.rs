@@ -8,6 +8,7 @@ pub mod code_object;
 pub mod kfd;
 pub mod lt;
 pub mod lt_grouped;
+pub mod lt_kernel;
 mod msgpack;
 pub mod rt;
 pub mod sys;
@@ -228,6 +229,7 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(api) = sys::api() {
+            kfd::forget(self.0);
             // SAFETY: the stream came from `hipStreamCreate` and is destroyed once.
             unsafe { (api.hip.hipStreamDestroy)(self.0) };
         }

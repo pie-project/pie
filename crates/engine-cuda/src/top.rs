@@ -140,21 +140,73 @@ pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
     }
 }
 
+/// `chip`'s kernels laid on the estimate's constants: each matmul padded to
+/// [`row_tile`] and priced by the waves the vendor library's algorithm
+/// fills at its shape (cuBLASLt's / hipBLASLt's `wavesCount`,
+/// `engine::roofline::Constants::with_gemm_waves`), and on CUDA the few rows the rows skeleton serves (2 to
+/// its 16, `linear::gemm::few_rows_grid`) weighed at `few_row_tflops` under
+/// the wave rule over its grid and the device's multiprocessors
+/// (`engine::roofline::Constants::with_few_rows`). The key it lacks where
+/// the profile states none.
+pub fn shape(
+    chip: &profile::Profile,
+) -> Result<
+    impl Fn(engine::roofline::Constants) -> std::result::Result<engine::roofline::Constants, &'static str>
+    + use<>,
+> {
+    let tile = row_tile(chip);
+    #[cfg(feature = "cuda")]
+    let tuning = kernels_cuda::tuning::Tuning::of(chip);
+    #[cfg(feature = "cuda")]
+    let cores = kernels_cuda::linear::gemm::multiprocessors().ok_or_else(|| {
+        Fault::Card(
+            "the device did not answer its multiprocessor count, which the few-rows kernel's \
+             wave rule reads"
+                .to_owned(),
+        )
+    })?;
+    Ok(move |constants: engine::roofline::Constants| {
+        let constants = constants.with_row_tile(tile.clone());
+        #[cfg(feature = "cuda")]
+        {
+            constants
+                .with_gemm_waves(std::sync::Arc::new(move |m, n, k| {
+                    kernels_cuda::linear::gemm::waves(&tuning, m, n, k)
+                }))
+                .with_few_rows(
+                    std::sync::Arc::new(kernels_cuda::linear::gemm::few_rows_grid),
+                    cores,
+                )
+        }
+        #[cfg(feature = "rocm")]
+        {
+            Ok(constants
+                .with_gemm_waves(std::sync::Arc::new(kernels_cuda::linear::gemm::waves)))
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            Ok(constants)
+        }
+    })
+}
+
 /// The fire top of `rungs` (every rung of the lattice a load offers) a
 /// prompt of `context` holds, on `device`, whose profile states `rates`,
-/// over a live range of `live` bytes, each matmul padded to `row_tile`
-/// ([`engine::load::choose_tiled`], [`engine::load::fire_top`]).
+/// over a live range of `live` bytes, the backend's kernels laid on the
+/// estimate by `shape` ([`engine::load::choose_shaped`],
+/// [`engine::load::fire_top`]), and the estimate it weighed them by.
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
     rates: &profile::fire::Rates,
-    row_tile: Option<engine::roofline::RowTile>,
+    shape: impl FnOnce(
+        engine::roofline::Constants,
+    ) -> std::result::Result<engine::roofline::Constants, &'static str>,
     device: &str,
     counts: &Counts,
-) -> Result<TopRung> {
-    engine::load::choose_tiled(rungs, live, context, rates, row_tile, device, counts)
-        .map(|(top, _)| top)
+) -> Result<(TopRung, engine::load::FireEstimate)> {
+    engine::load::choose_shaped(rungs, live, context, rates, device, counts, shape)
         .map_err(|refused| Fault::Card(refused.to_string()))
 }
 
@@ -223,7 +275,7 @@ mod tests {
             8 << 30,
             u32::MAX,
             &profile::fire::Rates::default(),
-            None,
+            Ok,
             "NVIDIA L40S",
             &counts(),
         )
@@ -261,12 +313,12 @@ mod tests {
             Some("its plan does not compile at this budget: the arena does not fit")
         );
         assert_eq!(rungs[4].span_bytes, 0);
-        let top = choose(
+        let (top, _) = choose(
             &rungs,
             live,
             u32::MAX,
             &l40s(),
-            None,
+            Ok,
             "NVIDIA L40S",
             &counts(),
         )
@@ -289,7 +341,7 @@ mod tests {
             live,
             u32::MAX,
             &l40s(),
-            None,
+            Ok,
             "NVIDIA L40S",
             &counts(),
         )

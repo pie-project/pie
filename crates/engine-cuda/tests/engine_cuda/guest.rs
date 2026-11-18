@@ -160,6 +160,12 @@ pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64
 /// A plane with no pool: its fires lay their programs' tables and scratch
 /// in a buffer of its own, the test process's until it ends.
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
+    alone_plane_fenced().0
+}
+
+/// [`alone_plane`], and the fence past its lane arenas: a zeroed run as long
+/// as they are, right after them, that no launch of the plane's writes.
+pub fn alone_plane_fenced() -> (engine_cuda::ProgramPlane, Fence) {
     const SPAN: usize = 256 << 20;
     let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
     let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
@@ -171,8 +177,48 @@ pub fn alone_plane() -> engine_cuda::ProgramPlane {
     let units = device_units().max(1);
     plane.set_flight(1 << units.ilog2());
     let bytes = Arenas::bytes_for(plane.flight(), units);
-    let arenas = engine_cuda::device::Buffer::zeroed(bytes as usize).expect("the lane arenas");
-    let at = Box::leak(Box::new(arenas)).ptr();
-    plane.set_arenas(Arenas { at, bytes });
-    plane
+    let arenas = engine_cuda::device::Buffer::zeroed(2 * bytes as usize).expect("the lane arenas");
+    let arenas: &'static engine_cuda::device::Buffer = Box::leak(Box::new(arenas));
+    plane.set_arenas(Arenas {
+        at: arenas.ptr(),
+        bytes,
+    });
+    (
+        plane,
+        Fence {
+            buffer: arenas,
+            at: bytes,
+        },
+    )
+}
+
+/// Backs `plane`'s staged fire with a span of its own as long as the fire
+/// states it lays ([`engine_cuda::ProgramPlane::staged_bytes`], the figure
+/// a short span refuses it by), where the span it has is shorter: a fire of
+/// one lane a unit lays more on a device of more units.
+pub fn fit_span(plane: &mut engine_cuda::ProgramPlane) {
+    let need = plane.staged_bytes().expect("the staged fire's bytes");
+    if need <= plane.span().1 {
+        return;
+    }
+    let buffer = engine_cuda::device::Buffer::zeroed(need as usize).expect("the span's buffer");
+    let end = Box::leak(Box::new(buffer)).ptr() + need;
+    plane.set_span((end, need));
+}
+
+/// The run past a plane's lane arenas ([`alone_plane_fenced`]).
+pub struct Fence {
+    buffer: &'static engine_cuda::device::Buffer,
+    at: u64,
+}
+
+impl Fence {
+    /// Whether every byte of the run is still zero.
+    pub fn intact(&self) -> bool {
+        let mut run = vec![0u8; self.at as usize];
+        self.buffer
+            .read(self.at, &mut run)
+            .expect("the fence reads");
+        run.iter().all(|&byte| byte == 0)
+    }
 }
