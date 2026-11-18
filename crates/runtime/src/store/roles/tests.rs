@@ -681,7 +681,19 @@ fn a_ring_past_a_slot_registers_parks_and_unparks_as_one_run() {
         .find(|copy| copy.shape == CHANNEL)
         .unwrap()
         .clone();
-    assert!(adjacent(&ring.host, PER_CHUNK), "a run on the host too");
+    // The copy carries every channel item of the process; the ring's own
+    // run (where its device run lies in the copy) is a run on the host too.
+    // Its single-slot items lie in a chunk of their own, never beside it.
+    let at = ring
+        .device
+        .iter()
+        .position(|&slot| slot == slots[0])
+        .expect("the ring's run in the copy");
+    assert_eq!(&ring.device[at..at + slots.len()], &slots[..]);
+    assert!(
+        adjacent(&ring.host[at..at + slots.len()], PER_CHUNK),
+        "a run on the host too"
+    );
     roles.lock().unwrap().commit(park);
     let unpark = roles
         .lock()

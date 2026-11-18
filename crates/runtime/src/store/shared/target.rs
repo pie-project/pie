@@ -53,11 +53,17 @@ impl SharedGrow {
     /// Steers `shared`, engine `engine`'s, from the segments mapped at load.
     #[must_use]
     pub fn new(model: usize, engine: usize, shared: Shared) -> Self {
-        let (mapped, start_cap) = {
+        let (mapped, start_cap, target) = {
             let mut pool = shared.lock().unwrap();
             pool.steers(engine);
-            (pool.mapped_segments(), pool.start_cap())
+            let mapped = pool.mapped_segments();
+            // The pool reads the same target: a bind short of room waits on
+            // a commit only where the walk would make one.
+            let target = Arc::new(AtomicU32::new(mapped));
+            pool.walked_to(Arc::clone(&target));
+            (mapped, pool.start_cap(), target)
         };
+        let _ = mapped;
         // Fires start cut to the rung the pool starts at: on a span backed
         // on demand, the smallest, until a raise reaches the engine.
         super::set_fire_cap(engine, start_cap);
@@ -65,7 +71,7 @@ impl SharedGrow {
             model,
             engine,
             shared,
-            target: Arc::new(AtomicU32::new(mapped)),
+            target,
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
@@ -626,7 +632,7 @@ impl SharedGrow {
 /// A test hook: while the file `PIE_SHARED_SEGMENTS_FILE` names holds a
 /// number, that many mapped segments stand in for the governor's target, so
 /// a test can force a grow or a shrink (and its evacuation) mid-run.
-fn pinned_segments() -> Option<u32> {
+pub(crate) fn pinned_segments() -> Option<u32> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     let path = PATH
         .get_or_init(|| std::env::var_os("PIE_SHARED_SEGMENTS_FILE").map(Into::into))

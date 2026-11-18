@@ -495,7 +495,28 @@ impl ResidencyPlanner {
             match served {
                 None => return Err(PlannerError::Cancelled),
                 Some(true) => return Ok(()),
-                Some(false) => notified.await,
+                Some(false) => {
+                    // Room that comes free or moves (the rung lowered or
+                    // raised, a segment committed, guest state given back)
+                    // has the planner quote the waiting head again, not only
+                    // its own serve: it never waits on room that is there.
+                    let (model, engine) = self.port.locus();
+                    let rung = crate::store::shared::rung_watch(engine);
+                    let given = crate::store::registry::try_get(model, engine)
+                        .and_then(|stores| stores.roles)
+                        .map(|roles| roles.lock().unwrap().room_watch());
+                    let given = async move {
+                        match given {
+                            Some(watch) => watch.freed().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        () = notified => {}
+                        () = rung => self.poke(),
+                        () = given => self.poke(),
+                    }
+                }
             }
         }
     }

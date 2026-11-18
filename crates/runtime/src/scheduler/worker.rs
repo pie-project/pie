@@ -1338,8 +1338,15 @@ impl SchedulerHandle {
                 crate::store::roles::guest_turn(&roles, pid).await;
             }
         };
+        // Waiting at the bind for room, the process is a victim the
+        // planner may park for an older head, as an idle one is.
+        let waiting = move |waits: bool| {
+            if let Some(planner) = crate::planner::planner_of(pid) {
+                planner.set_bind_waiting(pid, waits);
+            }
+        };
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned, turn, leave,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned, turn, leave, waiting,
         )
         .await?;
         Ok((registered, bound))
