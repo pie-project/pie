@@ -396,8 +396,12 @@ impl ResidencyPlanner {
         }
         let (disk_free, _) = self.port.disk_stats();
         let room = (host_free.saturating_sub(reserve) + disk_free).min(wanted.max(1));
+        // The demand is the head's: it takes cache keyed at or below its own
+        // key, never above (PLEX's keys say which survives; equal keys take
+        // from each other, so a run with no policy demotes as it did).
+        let up_to = self.head_key();
         let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize))
+            .then(|| self.port.prepare_demote(room as usize, up_to))
             .flatten();
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
@@ -488,6 +492,15 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// The policy key of the process whose demand heads the queue: what it
+    /// may take from others is keyed at or below it.
+    pub(super) fn head_key(&self) -> Option<i64> {
+        self.with_counts(|inner| {
+            let (_, waiter) = inner.unmet_head()?;
+            inner.procs.get(&waiter.pid).map(|proc| proc.key)
+        })
+    }
+
     pub(super) fn re_arm_idle_reclaim(&self) {
         self.idle_reclaim_exhausted.store(false, Ordering::Release);
         self.sweep_exhausted.store(false, Ordering::Release);
@@ -507,6 +520,10 @@ impl ResidencyPlanner {
         let (swap_free, swap_total) = self.swap_stats();
         let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
         let (model, engine) = self.port.locus();
+        // A set at rest keyed above the head's demand stays for it, as idle
+        // cache keyed so does ([`Self::demote_idle`]).
+        let up_to = self.head_key();
+        let mut above: Vec<ProcessId> = Vec::new();
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set
         // they keep going last.
@@ -516,6 +533,13 @@ impl ResidencyPlanner {
                     .procs
                     .iter()
                     .filter(|(_, proc)| proc.holder)
+                    .filter(|(pid, proc)| {
+                        let under = up_to.is_none_or(|up_to| proc.kept <= up_to);
+                        if !under {
+                            above.push(**pid);
+                        }
+                        under
+                    })
                     .map(|(pid, proc)| (proc.victim_order(), *pid))
                     .collect();
                 holders.sort_unstable();
@@ -555,6 +579,9 @@ impl ResidencyPlanner {
             })
             .collect();
         keep.extend(whole.into_iter().map(|(ws, _)| ws));
+        keep.extend(above.into_iter().flat_map(|pid| {
+            crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+        }));
         let txn = (room > 0)
             .then(|| {
                 if tails_only {
@@ -1276,7 +1303,8 @@ impl ResidencyPlanner {
                 .collect()
         });
         !running.is_empty()
-            && self.port.working_set_pages(&running) >= u64::from(self.port.device_stats().1)
+            && self.port.working_set_pages(&running).total()
+                >= u64::from(self.port.device_stats().1)
     }
 
     pub fn admits(&self, pid: ProcessId, admitted: &[ProcessId]) -> bool {
@@ -1302,11 +1330,32 @@ impl ResidencyPlanner {
         }
         running.push(pid);
         // Read off the planner's lock: the working sets take the stores'.
-        let need = self
-            .port
-            .working_set_pages(&running)
-            .saturating_add(next_step);
-        need <= u64::from(self.port.device_stats().1)
+        let parts = self.port.working_set_pages(&running);
+        let need = parts.total().saturating_add(next_step);
+        let (free, total) = self.port.device_stats();
+        let fits = need <= u64::from(total);
+        if !fits && tracing::enabled!(target: "pie::admission", tracing::Level::DEBUG) {
+            let own = self.port.working_set_pages(&[pid]);
+            tracing::debug!(
+                target: "pie::admission",
+                %pid,
+                running = running.len() - 1,
+                total,
+                need,
+                resident = parts.resident,
+                reserved = parts.reserved,
+                state = parts.state,
+                roles = parts.roles,
+                next_step,
+                own_resident = own.resident,
+                own_reserved = own.reserved,
+                own_roles = own.roles,
+                free,
+                idle = self.port.reclaimable_idle(),
+                "refused for room"
+            );
+        }
+        fits
     }
 
     /// The hold `pid` keeps on its place here past its exit (see

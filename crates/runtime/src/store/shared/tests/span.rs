@@ -784,7 +784,10 @@ async fn no_fire_wider_than_the_rung_the_engine_was_told_reaches_it() {
             if rows > cap {
                 return true;
             }
-            assert!(rows <= engine_rows(ENGINE), "{rows} rows past the lane's rung");
+            assert!(
+                rows <= engine_rows(ENGINE),
+                "{rows} rows past the lane's rung"
+            );
             assert!(rows <= held(&engine), "{rows} rows past the engine's rung");
             reached.push(rows);
             false
@@ -814,9 +817,15 @@ async fn no_fire_wider_than_the_rung_the_engine_was_told_reaches_it() {
     // A pass of 297 rows asks: 512 is of the class set aside, yet the
     // engine holds 256, so the cap stays until the engine hears 512.
     raise_now(&shared, ENGINE, 297);
-    assert_eq!(fire_cap(ENGINE), 256, "no fire past the rung the engine holds");
+    assert_eq!(
+        fire_cap(ENGINE),
+        256,
+        "no fire past the rung the engine holds"
+    );
     turn(&mut queued, &mut reached);
-    let step = walk.step(&shared.lock().unwrap(), 512, 256, 256, 6, 6).unwrap();
+    let step = walk
+        .step(&shared.lock().unwrap(), 512, 256, 256, 6, 6)
+        .unwrap();
     let RungStep::Raise { rung, evacuation } = step else {
         panic!("a rung of the class set aside is a raise: {step:?}");
     };

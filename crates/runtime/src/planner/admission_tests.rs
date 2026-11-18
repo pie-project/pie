@@ -31,11 +31,15 @@ impl PoolPort for SizedPool {
             rs: Default::default(),
         }
     }
-    fn working_set_pages(&self, pids: &[ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[ProcessId]) -> super::pool::WorkingSetPages {
         let sizes = self.sizes.lock();
-        pids.iter()
-            .map(|pid| sizes.get(pid).copied().unwrap_or(0))
-            .sum()
+        super::pool::WorkingSetPages {
+            resident: pids
+                .iter()
+                .map(|pid| sizes.get(pid).copied().unwrap_or(0))
+                .sum(),
+            ..Default::default()
+        }
     }
     fn host_stats(&self) -> (u32, u32) {
         (0, 0)
@@ -84,7 +88,11 @@ impl PoolPort for SizedPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }

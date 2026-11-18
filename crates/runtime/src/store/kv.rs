@@ -997,12 +997,15 @@ impl KvStore {
     /// what lands on disk as its copies, journaled. Only cache keyed above
     /// the retention floor ([`retention::above_floor`]) moves: the rest is
     /// dropped when its room is wanted, never copied down.
+    /// With `up_to`, only groups keyed at or below it go: what a demand
+    /// keyed so may take. A higher-keyed group stays for it.
     pub fn prepare_demote(
         &mut self,
         room: usize,
         keys: impl Keys,
+        up_to: Option<i64>,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_demote_where(room, keys, false)
+        self.prepare_demote_where(room, keys, false, up_to)
     }
 
     /// The tiers entry `id`'s KV may sit on.
@@ -1019,7 +1022,7 @@ impl KvStore {
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         let room = self.host_pool.available() + self.disk_pool.available();
-        self.prepare_demote_where(room, keys, true)
+        self.prepare_demote_where(room, keys, true, None)
     }
 
     /// Idle cache whose row lets it sit nowhere, or not where it is (on
@@ -1053,6 +1056,7 @@ impl KvStore {
         room: usize,
         keys: impl Keys,
         now: bool,
+        up_to: Option<i64>,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // Free slots only: a demote gives up no copy for idle cache.
         let room = room.min(self.host_pool.available() + self.disk_pool.available());
@@ -1076,6 +1080,7 @@ impl KvStore {
             })
             .filter(|(_, ids)| !ids.is_empty())
             .collect();
+        groups.retain(|(key, _)| up_to.is_none_or(|up_to| *key <= up_to));
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
@@ -1096,7 +1101,12 @@ impl KvStore {
                     continue;
                 }
                 pages.truncate(room);
-                tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
+                let owners: Vec<String> = ids
+                    .iter()
+                    .filter_map(|id| self.cache.get(id).and_then(|entry| entry.owner))
+                    .map(|owner| owner.to_string())
+                    .collect();
+                tracing::debug!(target: "pie::kv", pages = pages.len(), key, ?up_to, last, ?owners, "demote");
                 let records = self.demote_records(&ids, pages.iter().map(|&(at, _)| at), key);
                 // A run split over the tiers would leave its disk tail
                 // following on from pages a restart loses: a persistent
@@ -3050,7 +3060,7 @@ impl KvStore {
 
     /// The pages `working_sets` take together, shared ones once
     /// ([`KvPageTable::working_set_pages`]).
-    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
+    pub fn working_set_pages(&self, working_sets: &HashSet<WorkingSetId>) -> (usize, usize) {
         self.table.working_set_pages(working_sets)
     }
 

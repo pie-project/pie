@@ -527,6 +527,38 @@ const MAX_SPLIT_REDUCTIONS: usize = 64;
 /// runtime's `M4_SEL_BYTES` (16 rows of 3200 bytes).
 const SELECT_BYTES: usize = 16 * 3200;
 
+/// A pivot threshold the streamed form runs as a select: one that keeps
+/// so many ranks or so much mass ([`emit_streamed_region`]'s `Plan::Select`).
+#[must_use]
+pub const fn is_streamed_select(tag: u8, pred_tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD
+        && matches!(pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE)
+}
+
+/// What the streamed form of `plan`'s region `region` takes of a lane's
+/// temporary area: each select's [`SELECT_BYTES`] at its bottom, and above
+/// them the split reductions' planes in what the whole-value rule leaves
+/// (`m4_plane_bytes`).
+#[must_use]
+pub fn streamed_temporary_need(
+    plan: &crate::codegen::launch::LaunchStagePlan,
+    region: usize,
+) -> crate::codegen::temporary::TemporaryNeed {
+    let selects = plan.fused.get(region).map_or(0, |region| {
+        region
+            .nodes
+            .iter()
+            .filter_map(|&node| plan.ops.get(node as usize))
+            .filter(|op| is_streamed_select(op.tag, op.pred_tag))
+            .count()
+    });
+    crate::codegen::temporary::TemporaryNeed {
+        fixed: (selects * SELECT_BYTES) as u64,
+        per_row: None,
+        above_whole: true,
+    }
+}
+
 enum Plan {
     Direct {
         base: u32,
@@ -1070,13 +1102,7 @@ pub fn emit_streamed_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         let plan = match kind {
-            StepKind::Single
-                if op.tag == tags::PIVOT_THRESHOLD
-                    && matches!(
-                        op.pred_tag,
-                        predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE
-                    ) =>
-            {
+            StepKind::Single if is_streamed_select(op.tag, op.pred_tag) => {
                 Plan::Select {
                     node: node_u32,
                     mode: u32::from(op.pred_tag == predicate_tags::CUMMASS_LE),

@@ -923,8 +923,15 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_lowers_within() {
         panic!("past the rung told: a raise");
     };
     assert_eq!(rung, 16);
-    assert!(evacuation.moves.is_empty(), "nothing moves within the class");
-    assert_eq!(pool.raise_applied(&evacuation).unwrap(), None, "no lane trip");
+    assert!(
+        evacuation.moves.is_empty(),
+        "nothing moves within the class"
+    );
+    assert_eq!(
+        pool.raise_applied(&evacuation).unwrap(),
+        None,
+        "no lane trip"
+    );
     assert_eq!(pool.told(), 16);
     assert_eq!(
         walk.step(&pool, 16, 1, 1, 40, 40).unwrap(),
@@ -1361,8 +1368,16 @@ fn a_lane_s_list_kind_is_stated_beside_its_table() {
         panic!("three lanes");
     };
     assert_eq!(placed.list, ::engine::ListKind::Translation);
-    assert_eq!(list(placed), Some(vec![7, 8]), "the translation, not the pages");
-    assert_eq!(unattached.list, ::engine::ListKind::Pages, "beside it, pages");
+    assert_eq!(
+        list(placed),
+        Some(vec![7, 8]),
+        "the translation, not the pages"
+    );
+    assert_eq!(
+        unattached.list,
+        ::engine::ListKind::Pages,
+        "beside it, pages"
+    );
     assert_eq!(list(unattached), Some(vec![9]));
     assert_eq!((bare.list, list(bare)), (::engine::ListKind::Pages, None));
 }
@@ -1399,7 +1414,11 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
         "{:?}",
         lanes[0].record
     );
-    assert_eq!(lanes[1].record, ::engine::LaneRecord::Null, "stated: no state");
+    assert_eq!(
+        lanes[1].record,
+        ::engine::LaneRecord::Null,
+        "stated: no state"
+    );
     settle(&mut rs, out.txn);
 
     // The negative control: a pool that lays no record states none.

@@ -219,7 +219,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
         pages.into_iter().map(KvPageBacking::Resident).collect(),
     ));
     // The device wants room: it goes to the host, not journaled.
-    let txn = kv.prepare_demote(64, |_| 1).unwrap().expect("a demote");
+    let txn = kv.prepare_demote(64, |_| 1, None).unwrap().expect("a demote");
     for (tier, copy) in kv_copies(&txn, true) {
         assert_eq!(tier, MemoryDomain::HostPinned);
         bytes.copy(&copy);

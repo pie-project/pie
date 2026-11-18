@@ -286,7 +286,11 @@ impl PoolPort for GrowingPool {
         self.sweeps.fetch_add(1, Ordering::SeqCst);
         0
     }
-    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        _room: usize,
+        _up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
 }

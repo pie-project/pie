@@ -289,6 +289,8 @@ impl ResidencyPlanner {
                 return None;
             }
             let head_rank = head.0;
+            // Never a set keyed above the head's demand, idle or not.
+            let head_key = inner.procs.get(&waiter.pid).map_or(i64::MAX, |proc| proc.key);
             // A prompt not yet seated waits for a lane to finish rather than
             // suspending one mid-decode: only an idle or held process yields
             // to it.
@@ -305,6 +307,9 @@ impl ResidencyPlanner {
                     proc.admitted
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
+                        && proc.key <= head_key
+                        // A set at rest is keyed by what keeps it.
+                        && !(proc.holder && proc.kept > head_key)
                         && if seating {
                             proc.idle || proc.held
                         } else {
@@ -504,6 +509,7 @@ impl ResidencyPlanner {
                         return (None, Vec::new());
                     }
                     let head_rank = head.0;
+                    let head_key = inner.procs.get(&waiter.pid).map_or(i64::MAX, |proc| proc.key);
                     let quotes = crate::inferlet::process::residency::quote_locked(
                         kv,
                         working_sets,
@@ -516,6 +522,8 @@ impl ResidencyPlanner {
                         .filter_map(|((pid, quote), &rs)| {
                             let proc = inner.procs.get(pid)?;
                             if (proc.rank() <= head_rank && !proc.idle && !proc.held)
+                                || proc.key > head_key
+                                || (proc.holder && proc.kept > head_key)
                                 || (proc.holder && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)

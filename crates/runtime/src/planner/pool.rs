@@ -18,6 +18,28 @@ pub struct ChunkStats {
     pub rs: (RsUnits, RsUnits),
 }
 
+/// The device pages working sets take, by part ([`PoolPort::working_set_pages`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkingSetPages {
+    /// Their kv pages on the device, each shared page once.
+    pub resident: u64,
+    /// Their kv pages reserved past those mapped: their next step.
+    pub reserved: u64,
+    /// Their state.
+    pub state: u64,
+    /// Their instances' slots (tables, rings, guest state).
+    pub roles: u64,
+}
+
+impl WorkingSetPages {
+    pub fn total(&self) -> u64 {
+        self.resident
+            .saturating_add(self.reserved)
+            .saturating_add(self.state)
+            .saturating_add(self.roles)
+    }
+}
+
 pub trait PoolPort: Send + Sync + 'static {
     /// The device's chunks by shape.
     fn chunk_stats(&self) -> ChunkStats;
@@ -102,9 +124,9 @@ pub trait PoolPort: Send + Sync + 'static {
     /// set parked below the device takes none until it comes back. Pages are the room's
     /// unit: what is not kv counts as the pages it keeps out of the pool.
     /// What admission weighs ([`super::ResidencyPlanner::admits`]).
-    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> WorkingSetPages {
         let _ = pids;
-        0
+        WorkingSetPages::default()
     }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
@@ -134,7 +156,14 @@ pub trait PoolPort: Send + Sync + 'static {
         order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
-    fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache keyed above the floor down a tier, lowest key first;
+    /// with `up_to`, only cache keyed at or below it (what a demand keyed
+    /// so may take: a higher-keyed set stays for it).
+    fn prepare_demote(
+        &self,
+        room: usize,
+        up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn>;
     /// Idle cache a `retention/tiers` row keeps off the device, to move
     /// down now.
     fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn>;
@@ -299,9 +328,9 @@ impl PoolPort for RegistryPool {
         u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
-    fn working_set_pages(&self, pids: &[super::ProcessId]) -> u64 {
+    fn working_set_pages(&self, pids: &[super::ProcessId]) -> WorkingSetPages {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
-            return 0;
+            return WorkingSetPages::default();
         };
         let kv_sets: HashSet<_> = pids
             .iter()
@@ -313,7 +342,8 @@ impl PoolPort for RegistryPool {
                 )
             })
             .collect();
-        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-working-sets", |kv| {
+        let (resident, reserved) =
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-working-sets", |kv| {
             kv.working_set_pages(&kv_sets)
         });
         let rs = pids.iter().fold(RsUnits::default(), |sum, &pid| {
@@ -329,10 +359,12 @@ impl PoolPort for RegistryPool {
             let chunks = roles.div_ceil(room.chunk_bytes.max(1));
             self.chunks_as_pages(u32::try_from(chunks).unwrap_or(u32::MAX))
         });
-        u64::try_from(kv)
-            .unwrap_or(u64::MAX)
-            .saturating_add(u64::from(self.rs_as_pages(rs)))
-            .saturating_add(u64::from(roles))
+        WorkingSetPages {
+            resident: resident as u64,
+            reserved: reserved as u64,
+            state: u64::from(self.rs_as_pages(rs)),
+            roles: u64::from(roles),
+        }
     }
 
     fn reclaim_idle(&self) -> u32 {
@@ -494,12 +526,16 @@ impl PoolPort for RegistryPool {
         .flatten()
     }
 
-    fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+    fn prepare_demote(
+        &self,
+        room: usize,
+        up_to: Option<i64>,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
         if !self.suspend_capable {
             return None;
         }
         self.with_kv_tagged("planner-demote", |kv| {
-            kv.prepare_demote(room, crate::policy::retention::Installed)
+            kv.prepare_demote(room, crate::policy::retention::Installed, up_to)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()

@@ -251,7 +251,11 @@ impl FramePolicy {
     /// waits. The rung is not lowered under it until it has gone.
     #[must_use]
     pub fn sealed_widest(&self) -> usize {
-        self.sealed.iter().map(|frame| frame.widest).max().unwrap_or(0)
+        self.sealed
+            .iter()
+            .map(|frame| frame.widest)
+            .max()
+            .unwrap_or(0)
     }
 
     /// A frame was posted to the engine with fires of `lanes`: they owe its
@@ -860,7 +864,11 @@ impl FramePolicy {
                 };
                 // Cut under a cap since lowered: kept whole, out of this
                 // frame, until the cap is back (the queued rows ask it).
-                if front.fires.iter().any(|fire| fire.rung_rows > self.fire_cap) {
+                if front
+                    .fires
+                    .iter()
+                    .any(|fire| fire.rung_rows > self.fire_cap)
+                {
                     continue;
                 }
                 let mut live: Vec<PlacedFire> = front

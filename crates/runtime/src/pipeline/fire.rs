@@ -2709,9 +2709,7 @@ fn lane_requests(
             let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
                 .adapted(lane.adapter.is_some())
                 .drafting(on.contains(&poem_ir::Builtin::Drafts))
-                .capturing_scores(
-                    req.boundary_program && on.contains(&poem_ir::Builtin::Scores),
-                )
+                .capturing_scores(req.boundary_program && on.contains(&poem_ir::Builtin::Scores))
                 .with_media(media.contains(&(at as u32)))
                 .starting(starts(lane));
             let switches = of
@@ -2810,11 +2808,10 @@ pub(crate) fn map_lane_pages(
     groups: &LaneGroups,
 ) -> Result<(), String> {
     for (ws, lanes) in groups {
-        if lanes.iter().all(|&lane| {
-            req.lanes
-                .get(lane)
-                .is_none_or(|lane| lane.pages.is_empty())
-        }) {
+        if lanes
+            .iter()
+            .all(|&lane| req.lanes.get(lane).is_none_or(|lane| lane.pages.is_empty()))
+        {
             continue;
         }
         let table = working_set_flat_table(stores, *ws)?;
@@ -6951,7 +6948,9 @@ pub(crate) mod fold_tests {
 
     fn request(lanes: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: (0..lanes).map(|_| crate::engine::FireLane::default()).collect(),
+            lanes: (0..lanes)
+                .map(|_| crate::engine::FireLane::default())
+                .collect(),
             ..crate::engine::FireRequest::default()
         }
     }
@@ -7317,7 +7316,10 @@ pub(crate) mod fold_tests {
         let pass = lanes_on(&stores, ws, &[&cell, &cell]);
         // Three rows and four, from slot 4.
         let mut req = crate::engine::FireRequest {
-            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows).into()).collect(),
+            lanes: [3, 4]
+                .into_iter()
+                .map(|rows| rows_of(4, rows).into())
+                .collect(),
             ..crate::engine::FireRequest::default()
         };
         let landings = [landing(4, 3), landing(4, 4)];
@@ -7521,9 +7523,7 @@ pub(crate) mod fold_tests {
         let found = stores.kv.lock().folded(ws).unwrap();
         let state = rs.map(|rs| stores.rs.lock().unwrap().frozen(rs).unwrap());
         let mut req = crate::engine::FireRequest {
-            lanes: vec![
-                rows_of(slots.start as u32, (slots.end - slots.start) as usize).into(),
-            ],
+            lanes: vec![rows_of(slots.start as u32, (slots.end - slots.start) as usize).into()],
             ..crate::engine::FireRequest::default()
         };
         if let Some(rs) = rs {

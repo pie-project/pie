@@ -458,8 +458,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
             adapter: Vec::new(),
-            scratch: engine::ScratchPlace::None,
-            pair: engine::ScratchPlace::None,
+            scratch: binding.scratch.clone(),
+            pair: binding.pair.clone(),
         })
         .expect("the slots rebind");
     // The stale pass kept its ids where the cell no longer is: `seen` reads
@@ -544,8 +544,10 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 })
                 .collect(),
             adapter: Vec::new(),
-            scratch: engine::ScratchPlace::None,
-            pair: engine::ScratchPlace::None,
+            // The guest's state comes back where it lay: room the test's
+            // chunks hold for it (`guest_state` moves it to fresh room).
+            scratch: binding.scratch.clone(),
+            pair: binding.pair.clone(),
         })
         .expect("the unparked slots rebind");
     last = before;
