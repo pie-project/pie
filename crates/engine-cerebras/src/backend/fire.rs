@@ -555,15 +555,13 @@ impl CerebrasEngine {
             let mut outputs: Vec<(String, u32, Value)> = Vec::new();
             for (out_name, k) in self.programs.outputs_of(attachment.instance) {
                 let lane = attachment.lane as usize + k as usize;
-                if out_name != name && out_name.starts_with("attn.") {
+                // the model answers its readout alone: any other output is refused by name,
+                // not left unanswered
+                if out_name != name {
                     return Err(Error::Invalid(format!(
                         "the program reads model output `{out_name}`; the spatial engine's \
-                         model answers `{name}` (the logits) alone — attention scores are not \
-                         served yet"
+                         model answers `{name}` (its readout) alone"
                     )));
-                }
-                if out_name != name {
-                    continue;
                 }
                 // A pass over several lanes reads its rows as one output: the
                 // lane's, then the pass's later lanes'.
