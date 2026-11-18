@@ -656,6 +656,8 @@ mod tests {
             bytes_per_ns,
             elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
+            few_row_flops_per_ns: None,
+            workgroups_per_core: None,
             row_tile: std::sync::Arc::new(|_, _, _| 1),
         }
     }

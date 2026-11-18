@@ -25,6 +25,21 @@
 //!   ([`elementwise_bytes`]) over their time together.
 //! - `scan_gelems`: the prefill gated-delta scan and the causal conv before
 //!   it at [`SCAN_SHAPE`], [`scan_elements`] over the two together's time.
+//! - `few_row_tflops`: a bf16 matmul at decode-shaped rows, 4 to 256, on
+//!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
+//!   the curve never weighs it), its flops over its time once its weight
+//!   reads no longer bind it. Measured on every backend.
+//! - `workgroups_per_core`: the workgroups a compute unit holds at once
+//!   for a kernel's full rate. Derived where the device states its
+//!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
+//!   measured where its API hides it (Vulkan, wgpu, Metal): one workgroup
+//!   a head of a kernel at its compute-bound shape, its time against the
+//!   same work at the rate its full curve states ([`workgroups_per_core`]).
+//!
+//! Each backend's estimate weighs a fire by the keys it names
+//! ([`rates_at_load`]'s `keys`, of `profile::fire::KEYS`); a rate measured
+//! or stated at or below zero, or not finite, is refused by its key
+//! ([`unmeasured`]), never saved or divided by.
 
 /// The bytes the rates step lays on the device at once, at most: the
 /// largest of a matmul's rotation and operands, the attention's cold sets,
@@ -77,6 +92,18 @@ pub const GEMM_ROWS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
 
 /// The keys (and rows) the attention curve is timed at.
 pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
+
+/// `workgroups_per_core` from one timed dispatch: `workgroups` of a kernel
+/// over `cores` compute units took `ns`, and the same work at the kernel's
+/// full rate (its work over the rate its full curve states there) takes
+/// `full_ns`. The dispatch ran at `workgroups / S` of its rate, so the
+/// device fills at `S = workgroups · ns / full_ns`, over `cores`. `None`
+/// where a time or the cores are nothing: no rate is made of them.
+#[must_use]
+pub fn workgroups_per_core(workgroups: u32, cores: u32, ns: f64, full_ns: f64) -> Option<f64> {
+    let per = f64::from(workgroups) * ns / full_ns / f64::from(cores);
+    (per.is_finite() && per > 0.0).then_some(per)
+}
 
 /// The per-row ops' shape: `(rows, width)`, a 2048-token fire of a
 /// 4096-wide model; the norm reads and writes rows of `width`, the gated
@@ -234,6 +261,49 @@ pub const LAUNCH_CHAINS: [u32; 2] = [64, 1024];
 #[must_use]
 pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
     ((chain_ns - one_ns) / f64::from(n.max(1))).max(0.0)
+}
+
+/// The first rate of `rates` stated with no measurement behind it: a value
+/// at or below zero, or not finite (a timing that settled at nothing), by
+/// its key and where. A launch of 0 ns is a measurement (a launch the work
+/// hides); nothing divides by it. Such a rate is refused by name wherever
+/// rates are read ([`rates_at_load`], `crate::roofline::Constants::of`):
+/// nothing divides by it.
+#[must_use]
+pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)> {
+    let bad = |v: f64| !(v.is_finite() && v > 0.0);
+    let point = |key: &'static str, unit: &str, curve: &[(u32, f64)]| {
+        curve
+            .iter()
+            .find(|&&(_, v)| bad(v))
+            .map(|&(at, v)| (key, format!("at {at} {unit} as {v}")))
+    };
+    if let Some(widths) = &rates.gemm_tflops_by_rows {
+        for (w, curve) in widths {
+            if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(found) = rates
+        .attn_tflops_by_keys
+        .as_deref()
+        .and_then(|curve| point("attn_tflops_by_keys", "keys", curve))
+    {
+        return Some(found);
+    }
+    for (key, v) in [
+        ("hbm_gbps", rates.hbm_gbps),
+        ("elementwise_gbps", rates.elementwise_gbps),
+        ("scan_gelems", rates.scan_gelems),
+        ("few_row_tflops", rates.few_row_tflops),
+        ("workgroups_per_core", rates.workgroups_per_core),
+    ] {
+        if let Some(v) = v.filter(|&v| bad(v)) {
+            return Some((key, format!("as {v}")));
+        }
+    }
+    None
 }
 
 /// The matmul every backend's rates step warms the device with before it
@@ -724,7 +794,8 @@ pub fn saved_text(
 }
 
 /// The roofline a load weighs its fires by, one rule for every engine: the
-/// rates `chip`'s layers state where they state every one (a checked-in
+/// rates `chip`'s layers state where they state every one of `keys` (those
+/// the backend's estimate weighs a fire by, of `profile::fire::KEYS`) (a checked-in
 /// profile's over a saved one, `profile::Registry::resolve`); else, before
 /// the load is ready, the device's own, measured by `measure` (the backend's
 /// `pie tune --rates` step, seconds long, its frames sized by
@@ -736,19 +807,22 @@ pub fn saved_text(
 /// bound unsettled, and the load line says so (`engine::load::line_of`).
 /// The step runs at the start of the load, its buffers of `room` (what the
 /// load's budget leaves the device, where the engine can say): where that
-/// holds less than it lays at most ([`step_bytes`]) the load is refused.
+/// holds less than it lays at most ([`step_bytes`]) the load is refused,
+/// as is a rate the step settled at nothing ([`unmeasured`]), before
+/// anything is saved.
 pub fn rates_at_load(
     chip: profile::Profile,
+    keys: &[&'static str],
     save: Option<SaveTo<'_>>,
     room: Option<u64>,
     max_submit: Option<std::time::Duration>,
     measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     let stated = chip.rates();
-    if stated.missing().is_empty() {
+    if stated.complete(keys) {
         return Ok(chip);
     }
-    let lacked = stated.missing();
+    let lacked = stated.missing(keys);
     // The step lays its buffers before any of the load's: where the load's
     // budget leaves the device less than it lays at most, the load is
     // refused by name, never left to wait for memory.
@@ -767,11 +841,17 @@ pub fn rates_at_load(
         rates: measured,
         unsettled,
     } = measure(max_submit)?;
+    if let Some((key, why)) = unmeasured(&measured) {
+        return Err(format!(
+            "the device's rates step measured `[rates] {key}` {why}: nothing weighs a fire by \
+             it, and no rate is divided by"
+        ));
+    }
     let rates = stated.over(measured);
-    if !rates.missing().is_empty() {
+    if !rates.complete(keys) {
         return Err(format!(
             "the device's rates step measured no {:?}: nothing weighs a fire by them",
-            rates.missing()
+            rates.missing(keys)
         ));
     }
     // The user's file gains what this load measured, the keys no layer
@@ -857,6 +937,8 @@ mod tests {
             hbm_gbps: Some(700.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
+            few_row_tflops: Some(4.0),
+            workgroups_per_core: Some(3.3),
         }
     }
 
@@ -874,6 +956,7 @@ mod tests {
         let mut asked = None;
         let p = rates_at_load(
             chip(stated),
+            &profile::fire::KEYS,
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
@@ -933,7 +1016,7 @@ mod tests {
         let facts = profile::Facts::of(&registry);
         let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
         let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert!(!first.rates().missing().is_empty());
+        assert!(!first.rates().complete(&profile::fire::KEYS));
         let check = |text: &str| {
             registry
                 .parse(text, "saved", profile::Strict::User)
@@ -942,6 +1025,7 @@ mod tests {
         };
         let measured = rates_at_load(
             first,
+            &profile::fire::KEYS,
             Some(SaveTo {
                 path: SHELF.user_path(&dir, "Card X"),
                 provenance: provenance("toy", "a test"),
@@ -963,9 +1047,14 @@ mod tests {
         let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(second.rates(), all());
-        let second = rates_at_load(second, None, None, None, |_| -> Result<_, String> {
-            panic!("measured what the first load saved")
-        })
+        let second = rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured what the first load saved") },
+        )
         .unwrap();
         assert!(!second.tuned().measured_this_load);
     }
@@ -1003,6 +1092,7 @@ mod tests {
         let short = step_bytes() - 1;
         let err = rates_at_load(
             chip(profile::fire::Rates::default()),
+            &profile::fire::KEYS,
             None,
             Some(short),
             None,
@@ -1014,13 +1104,119 @@ mod tests {
 
     #[test]
     fn a_load_whose_layers_state_every_constant_measures_nothing() {
-        let p = rates_at_load(chip(all()), None, None, None, |_| -> Result<_, String> {
-            panic!("measured a profile stating every constant")
-        })
+        let p = rates_at_load(
+            chip(all()),
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured a profile stating every constant") },
+        )
         .unwrap();
         assert_eq!(p.rates(), all());
         assert!(!p.tuned().measured_this_load);
         assert_eq!(crate::load::measured_line(p.tuned()), None);
+    }
+
+    /// A backend whose estimate weighs fewer keys measures nothing for the
+    /// rest: a profile stating its six is complete for it, not for one
+    /// weighing all eight.
+    #[test]
+    fn a_load_measures_the_keys_its_backend_weighs_and_no_others() {
+        let six = all().only(&profile::fire::KEYS[..6]);
+        let p = rates_at_load(
+            chip(six.clone()),
+            &profile::fire::KEYS[..6],
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured keys the backend does not weigh") },
+        )
+        .unwrap();
+        assert_eq!(p.rates(), six);
+        let err = rates_at_load(
+            chip(six.clone()),
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: six.clone(),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("measured no [\"few_row_tflops\", \"workgroups_per_core\"]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
+        let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
+        let path = dir.join("vulkan/user/card-x.toml");
+        let check = |_: &str| Ok(());
+        for (zero, says) in [
+            (
+                profile::fire::Rates {
+                    workgroups_per_core: Some(0.0),
+                    ..all()
+                },
+                "`[rates] workgroups_per_core` as 0",
+            ),
+            (
+                profile::fire::Rates {
+                    few_row_tflops: Some(f64::NAN),
+                    ..all()
+                },
+                "`[rates] few_row_tflops` as NaN",
+            ),
+            (
+                profile::fire::Rates {
+                    attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 150.0)]),
+                    ..all()
+                },
+                "`[rates] attn_tflops_by_keys` at 512 keys as 0",
+            ),
+        ] {
+            let save = SaveTo {
+                path: path.clone(),
+                provenance: ("rates", "\"measured at load\"".to_string()),
+                check: &check,
+            };
+            let err = rates_at_load(
+                chip(profile::fire::Rates::default()),
+                &profile::fire::KEYS,
+                Some(save),
+                None,
+                None,
+                |_| {
+                    Ok(Measured {
+                        rates: zero,
+                        unsettled: false,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(err.contains(says), "{err}");
+            assert!(!path.exists(), "a refused rate was saved");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The RTX PRO 4500's tiled attention at one workgroup a head: 264
+    /// workgroups fill its 80 units, 3.3 a unit; a dispatch of 32 ran 8.25x
+    /// the time the full curve states.
+    #[test]
+    fn the_workgroups_a_core_holds_come_from_one_dispatch_against_the_full_rate() {
+        let per = workgroups_per_core(32, 80, 8.25e6, 1e6).unwrap();
+        assert!((per - 3.3).abs() < 1e-9, "{per}");
+        assert_eq!(workgroups_per_core(32, 80, 0.0, 1e6), None);
+        assert_eq!(workgroups_per_core(32, 80, 1e6, 0.0), None);
+        assert_eq!(workgroups_per_core(32, 0, 1e6, 1e6), None);
     }
 
     #[test]
@@ -1262,6 +1458,8 @@ mod tests {
             hbm_gbps: Some(800.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
+            few_row_tflops: Some(4.5),
+            workgroups_per_core: Some(3.3),
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

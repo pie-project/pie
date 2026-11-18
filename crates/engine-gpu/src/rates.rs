@@ -54,6 +54,19 @@ use crate::serve::Serve;
 /// largest buffer the device allocates.
 pub const COPY_BYTES: u64 = 256 << 20;
 
+/// The `[rates]` keys the slang backends' estimate weighs a fire by (of
+/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
+/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
+/// choice on these backends reads them, so a load measures neither.
+pub const KEYS: [&str; 6] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+];
+
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
@@ -393,6 +406,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             hbm_gbps: Some(bytes_per_ns),
             elementwise_gbps: Some(elementwise),
             scan_gelems: Some(scan),
+            few_row_tflops: None,
+            workgroups_per_core: None,
         },
         unsettled: rig.unsettled.get(),
     })
