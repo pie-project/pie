@@ -394,6 +394,11 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     for lane in p.lanes {
         key.shown(&lane.readout);
         key.shown(&lane.reads);
+        // A score room is its pair's place in the pool, which an unpark
+        // or an evacuation moves: a recording binds the one it was taken at.
+        key.hashed(&lane.scores.map(|room| {
+            (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)
+        }));
     }
 
     key.finish()

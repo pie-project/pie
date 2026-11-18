@@ -741,6 +741,24 @@ impl<B: Backend> Pools<B> {
         self.pool.locate(at)
     }
 
+    /// Logical chunk `chunk`'s first byte as a guest's state lies there
+    /// (`guest::state`): the segment buffer its physical chunk sits in now
+    /// and its offset there, its segment committed. A run of chunks from it
+    /// lies at the next physical chunks of the same segment.
+    pub fn chunk_place(&self, chunk: u32) -> Result<(&B::Buffer, u64)> {
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a guest's state may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        self.pool
+            .locate(u64::from(physical) * self.layout.chunk_bytes)
+    }
+
     /// The bytes one slot of shape `id` holds.
     pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
         Ok(self.shape(id)?.slot_bytes)

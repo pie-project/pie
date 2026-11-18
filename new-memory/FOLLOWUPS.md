@@ -97,3 +97,11 @@ The guest-state line (0da550eb6) states guest scratch as Instance-slot state
 through `Engine::guest_state`, but keeps `Engine::fire_facts` and the fire's
 guest term as they were: each engine moves its scratch from the term into
 `guest_state` when its half ports. The term goes once no engine states it.
+
+engine-gpu (Vulkan, wgpu) states none: a guest pass there is one
+instance's dispatches over its own stage heaps (no grouped launch, so no
+lane-base table), per_instance; a score reader's pair keeps a lane-indexed
+room of `max_lanes` key and page rows that a fire lays its capturing lanes'
+rows in, per_pair (`engine_gpu::guest::state`). Score rows in each
+instance's own room (the capture kernels launched once per pool segment
+over per-lane bases) are a later step.
