@@ -1787,9 +1787,21 @@ impl Shell {
         // the classes do (a mixed bucket-256 fire's two classes rung 256
         // each), and the carve a fire of the bucket takes (the forked arena,
         // an activation rung) holds no more readout rows than its tokens.
+        // An unlisted ladder (a class no plain request lands, as a DiT's) is
+        // the whole-bucket body: every class present at the bucket.
+        let whole: Vec<(u32, u32)>;
+        let rungs = if ladder.rungs().is_empty() {
+            whole = token_axis
+                .classes
+                .present_in_order()
+                .map(|class| (class, token_axis.bucket))
+                .collect();
+            whole.as_slice()
+        } else {
+            ladder.rungs()
+        };
         let (last_rows, every_row) =
-            ladder
-                .rungs()
+            rungs
                 .iter()
                 .fold((0, 0), |(last, every), &(class, rung)| {
                     match self.exports.readback(class as usize) {
