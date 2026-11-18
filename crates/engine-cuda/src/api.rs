@@ -1007,7 +1007,10 @@ impl Engine for Cuda {
         }
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> EngineResult<engine::CopyCompletion> {
         use crate::store::Tier;
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let tier = |domain| match domain {
@@ -1045,7 +1048,7 @@ impl Engine for Cuda {
             for &(src, dst) in &copy.slots {
                 shell.fork_state(src, dst).map_err(fault)?;
             }
-            return Ok(());
+            return shell.landed_on_stream().map_err(fault);
         }
         if copy.shape != LIST && copy.shape != WINDOW {
             // Any other shape this load states (the rs list): whole slots.
@@ -1056,7 +1059,8 @@ impl Engine for Cuda {
                 )));
             }
             let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
-            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
+            shell.copy_whole_slots(copy.shape, &pairs).map_err(fault)?;
+            return shell.landed_on_stream().map_err(fault);
         }
         let page = shell.paging().page_size;
         let runs: Vec<engine::transfer::KvRun> = copy
@@ -1079,7 +1083,8 @@ impl Engine for Cuda {
             .collect();
         shell
             .copy_token_slots(copy.shape == WINDOW, &runs)
-            .map_err(fault)
+            .map_err(fault)?;
+        shell.landed_on_stream().map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1370,7 +1375,7 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         // The host and disk tiers move through `copy_slots` (CONTRACT-BC
         // 22): a kv copy is within the device.
@@ -1396,9 +1401,11 @@ impl Engine for Cuda {
                 tokens: page_size,
             })
             .collect();
-        self.loaded_mut()?
+        let shell = self.loaded_mut()?;
+        shell
             .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
-            .map_err(fault)
+            .map_err(fault)?;
+        shell.landed_on_stream().map_err(fault)
     }
 }
 

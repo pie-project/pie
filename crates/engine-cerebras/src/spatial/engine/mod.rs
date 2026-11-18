@@ -221,7 +221,9 @@ impl Engine for Spatial {
         self.kv.ref_from = chunks
             .shape(engine::chunk::DEGENERATE_KV)
             .and_then(|shape| Some((shape.pinned?, shape.slots_per_chunk)))
-            .map_or(0, |(pinned, per)| pinned.device.first * per - pinned.ids_from);
+            .map_or(0, |(pinned, per)| {
+                pinned.device.first * per - pinned.ids_from
+            });
         let pools = PoolFacts::default();
         let caps = Capabilities {
             device: DeviceFacts {
@@ -286,7 +288,10 @@ impl Engine for Spatial {
 
     /// Recurrent states replay from their tokens (the program holds one
     /// sequence's): a copy is not a device move here.
-    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
+    fn copy_state(
+        &mut self,
+        copy: &engine::transfer::StateCopy,
+    ) -> EngineResult<engine::CopyCompletion> {
         let _ = copy;
         Err(Error::Unsupported {
             verb: "`copy_state` on the wafer program (its state replays from tokens)",
@@ -297,7 +302,10 @@ impl Engine for Spatial {
     /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
     /// runtime moves its kv through `copy_kv`; there is no shared pool and
     /// no host or disk tier to move slots between.
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> EngineResult<engine::CopyCompletion> {
         let _ = copy;
         Err(Error::Unsupported {
             verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
@@ -329,7 +337,7 @@ impl Engine for Spatial {
         })
     }
 
-    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         let t0 = std::time::Instant::now();
         self.drain();
@@ -348,30 +356,7 @@ impl Engine for Spatial {
                 engine: "cerebras-spatial",
             });
         }
-        let size = self.kv.page_size.max(1);
-        for run in copy.runs(size)? {
-            let src: Vec<Option<u32>> = self
-                .kv
-                .pages
-                .get(&run.src_page)
-                .cloned()
-                .unwrap_or_else(|| vec![None; size as usize]);
-            let dst = self
-                .kv
-                .pages
-                .entry(run.dst_page)
-                .or_insert_with(|| vec![None; size as usize]);
-            self.kv.copied.insert(run.dst_page);
-            for k in 0..run.tokens as usize {
-                if let (Some(&cell), Some(slot)) = (
-                    src.get(run.src_token as usize + k),
-                    dst.get_mut(run.dst_token as usize + k),
-                ) {
-                    *slot = cell;
-                }
-            }
-        }
-        Ok(())
+        self.copy_host_pages(copy)
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
@@ -560,6 +545,51 @@ impl Spatial {
     }
 }
 
+impl Spatial {
+    /// `copy_kv` within this load's device, once the posted steps ran: a
+    /// kv page here is its tokens on the host (the wafer's cache replays
+    /// from them; no posted step or wafer launch writes them), so the copy
+    /// is whole when the cells are, and its completion lands here.
+    fn copy_host_pages(
+        &mut self,
+        copy: &engine::transfer::KvCopy,
+    ) -> EngineResult<engine::CopyCompletion> {
+        let (landing, completion) = engine::completion::copy_in_flight();
+        let size = self.kv.page_size.max(1);
+        let runs = match copy.runs(size) {
+            Ok(runs) => runs,
+            Err(refused) => {
+                landing.failed(&refused);
+                return Err(refused);
+            }
+        };
+        for run in runs {
+            let src: Vec<Option<u32>> = self
+                .kv
+                .pages
+                .get(&run.src_page)
+                .cloned()
+                .unwrap_or_else(|| vec![None; size as usize]);
+            let dst = self
+                .kv
+                .pages
+                .entry(run.dst_page)
+                .or_insert_with(|| vec![None; size as usize]);
+            self.kv.copied.insert(run.dst_page);
+            for k in 0..run.tokens as usize {
+                if let (Some(&cell), Some(slot)) = (
+                    src.get(run.src_token as usize + k),
+                    dst.get_mut(run.dst_token as usize + k),
+                ) {
+                    *slot = cell;
+                }
+            }
+        }
+        landing.landed();
+        Ok(completion)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use engine::Engine;
@@ -652,5 +682,51 @@ mod tests {
             })
             .expect_err("the load is refused");
         assert!(refused.to_string().contains("no float output"), "{refused}");
+    }
+
+    /// A kv copy within the load's device moves the lane's host tokens and
+    /// answers a completion already landed: nothing of it is in flight once
+    /// the call returns.
+    #[test]
+    fn a_kv_copy_has_landed_when_it_returns() {
+        let mut spatial = Spatial::new(crate::spatial::Config::default(), no_model);
+        spatial.kv.page_size = 4;
+        spatial
+            .kv
+            .pages
+            .insert(1, vec![Some(7), Some(8), Some(9), None]);
+        let device = engine::transfer::MemoryDomain::CerebrasDevice(0);
+        let copy = engine::transfer::KvCopy {
+            src: device,
+            dst: device,
+            src_page_ids: vec![1],
+            dst_page_ids: vec![2],
+            ..engine::transfer::KvCopy::default()
+        };
+        let completion = spatial.copy_host_pages(&copy).expect("the copy runs");
+        assert!(completion.is_resolved(), "nothing of the copy is in flight");
+        assert!(matches!(completion.check(), Some(Ok(()))), "{completion:?}");
+        assert_eq!(spatial.kv.pages[&2], [Some(7), Some(8), Some(9), None]);
+    }
+
+    /// Copies the engine does not make stay refused by name: a recurrent
+    /// state copy, and a kv copy off this load's device (here: before any
+    /// load).
+    #[test]
+    fn copies_it_does_not_make_are_refused() {
+        let mut spatial = Spatial::new(crate::spatial::Config::default(), no_model);
+        let state = spatial
+            .copy_state(&engine::transfer::StateCopy::default())
+            .expect_err("a state copy is refused");
+        assert!(state.to_string().contains("copy_state"), "{state}");
+        let device = engine::transfer::MemoryDomain::CerebrasDevice(0);
+        let kv = spatial
+            .copy_kv(&engine::transfer::KvCopy {
+                src: device,
+                dst: device,
+                ..engine::transfer::KvCopy::default()
+            })
+            .expect_err("no load, so no device to copy on");
+        assert!(kv.to_string().contains("copy_kv"), "{kv}");
     }
 }

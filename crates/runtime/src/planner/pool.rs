@@ -123,6 +123,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let (free, total) = self.device_stats();
         total.saturating_sub(free)
     }
+    /// Device pages let go that wait only on device work in flight (a fire
+    /// or a copy naming them): arriving, each free as that work lands, whose
+    /// settling wakes the planner ([`super::ResidencyPlanner::pages_freed`]).
+    fn device_arriving(&self) -> u32 {
+        0
+    }
     fn host_stats(&self) -> (u32, u32);
     fn disk_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (RsUnits, RsUnits) {
@@ -324,6 +330,10 @@ impl PoolPort for RegistryPool {
 
     fn device_out(&self) -> u32 {
         self.with_kv_tagged("planner-device-out", |kv| kv.pages_out())
+    }
+
+    fn device_arriving(&self) -> u32 {
+        self.with_kv_tagged("planner-device-arriving", |kv| kv.arriving_pages() as u32)
     }
 
     fn host_stats(&self) -> (u32, u32) {

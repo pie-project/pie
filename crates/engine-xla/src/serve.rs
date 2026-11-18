@@ -1256,6 +1256,29 @@ impl Shell {
         Ok(())
     }
 
+    /// The copies run so far, as one completion: it resolves once the
+    /// pool's newest buffer is ready (every copy program has run and landed
+    /// its rows; a tier move's host and disk sides are done when its call
+    /// returns), and fails with the device's error. A callback the plugin
+    /// refuses drops the landing, which resolves it failed.
+    pub fn copies_landed(&self) -> engine::CopyCompletion {
+        let (landing, completion) = engine::completion::copy_in_flight();
+        match self.pools.landing() {
+            Ok(Some(event)) => {
+                let registered = event.on_ready(move |done| match done {
+                    Ok(()) => landing.landed(),
+                    Err(why) => landing.failed(why),
+                });
+                if let Err(why) = registered {
+                    tracing::warn!("xla: a copy's landing callback was refused: {why}");
+                }
+            }
+            Ok(None) => landing.landed(),
+            Err(why) => landing.failed(why),
+        }
+        completion
+    }
+
     /// Copies kv runs between slot refs of the kv list.
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
         self.pools.copy_kv(&self.device, &self.handles, moves)

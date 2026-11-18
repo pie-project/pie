@@ -6,6 +6,13 @@ pub struct KvTxn {
     seq: u64,
 }
 
+impl KvTxn {
+    /// The epoch this transaction holds.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 pub type PageCopies = (Vec<u32>, Vec<u32>);
 
 pub type CopiedBeforeWrite = (PageCopies, Option<KvTxn>);

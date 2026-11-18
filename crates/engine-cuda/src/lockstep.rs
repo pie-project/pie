@@ -876,7 +876,7 @@ impl Engine for Rank {
         self.group.steps.announce(self.rank);
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         self.with(|cuda| cuda.copy_kv(copy))
     }
 
@@ -893,7 +893,7 @@ impl Engine for Rank {
         self.with(|cuda| cuda.evacuate(evacuation))
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         self.with(|cuda| cuda.copy_slots(copy))
     }
 

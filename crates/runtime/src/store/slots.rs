@@ -497,6 +497,24 @@ impl ShapeState {
     }
 }
 
+/// Room a pool gives back: a count of the gives and their event. Told by
+/// the pool itself wherever room actually comes free (a slot given back,
+/// at once or as the fire it waited on retires; a fenced chunk reopened),
+/// so no caller can free room and forget to tell; read by whatever waits
+/// for room (`crate::store::roles::RoomWatch`).
+#[derive(Debug, Default)]
+pub struct RoomGiven {
+    pub gives: std::sync::atomic::AtomicU64,
+    pub notify: tokio::sync::Notify,
+}
+
+impl RoomGiven {
+    pub fn tell(&self) {
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
 /// See the module docs.
 #[derive(Clone, Debug)]
 pub struct SlotPool {
@@ -560,23 +578,10 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
-    /// Told each time a chunk comes free for state ([`Self::room_watch`]).
+    /// Told whenever room actually comes free ([`RoomGiven`]): a slot given
+    /// back, at once or as the fire it waited on retires, and a fenced
+    /// chunk reopened. The one source a wait for room reads.
     given: std::sync::Arc<RoomGiven>,
-}
-
-/// Room given back: a chunk opened for state, by a slot's release, a fence
-/// retired, a lower or a commit. A count of the gives, and their event.
-#[derive(Debug, Default)]
-pub struct RoomGiven {
-    gives: std::sync::atomic::AtomicU64,
-    notify: tokio::sync::Notify,
-}
-
-impl RoomGiven {
-    fn give(&self) {
-        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.notify.notify_waiters();
-    }
 }
 
 /// A watch on room given back from when it was taken ([`SlotPool::room_watch`]).
@@ -656,6 +661,7 @@ impl SlotPool {
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
             fenced: Bits::new(total, false),
+            given: std::sync::Arc::default(),
             ceiling: total,
             segments,
             held: 0,
@@ -664,7 +670,6 @@ impl SlotPool {
             holders: HashMap::new(),
             waiters: HashMap::new(),
             runs: HashMap::new(),
-            given: std::sync::Arc::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -717,7 +722,7 @@ impl SlotPool {
         if self.openable(chunk) {
             if !self.open.get(chunk) {
                 self.open.set(chunk);
-                self.given.give();
+                self.given.tell();
             }
         } else {
             self.open.clear(chunk);
@@ -1784,6 +1789,47 @@ impl SlotPool {
         }
     }
 
+    /// [`Self::touch`] of slot refs `refs` of `shape` (ref `r` is slot
+    /// `r % per_chunk` of chunk `r / per_chunk`), each where it is handed
+    /// out for that shape; a ref naming nothing handed out (a stale one, or
+    /// the null chunk's) is passed over. One pass a ref: a fire touches
+    /// every slot its lanes name.
+    pub fn touch_held(&mut self, shape: ShapeId, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+        let Some(state) = self.shapes.get_mut(shape as usize) else {
+            return;
+        };
+        let spc = state.spc();
+        // A table's refs run through a chunk in turn: its frame is looked up
+        // once a chunk, not once a slot.
+        let mut at: Option<(u32, Option<u32>)> = None;
+        for slot_ref in refs {
+            let (chunk, index) = (slot_ref / spc, slot_ref % spc);
+            let frame = match at {
+                Some((last, frame)) if last == chunk => frame,
+                _ => {
+                    let frame = self
+                        .chunks
+                        .get(chunk as usize)
+                        .filter(|meta| meta.shape == shape)
+                        .map(|meta| meta.frame);
+                    at = Some((chunk, frame));
+                    frame
+                }
+            };
+            let Some(frame) = frame else {
+                continue;
+            };
+            let word = frame as usize * state.words + (index / WORD) as usize;
+            if state.free[word] & (1 << (index % WORD)) != 0 {
+                continue;
+            }
+            let refs = &mut state.refs[(frame * spc + index) as usize];
+            if refs.touched < epoch {
+                refs.touched = epoch;
+            }
+        }
+    }
+
     /// Drops `holder`'s reference on each of `slots`. A slot no one holds
     /// any more is handed out again once the later of `epoch` and the last
     /// fire that touched it retires.
@@ -1856,9 +1902,14 @@ impl SlotPool {
         if epoch == u64::MAX {
             due.append(&mut self.fences);
         }
+        let mut reopened = false;
         for chunk in due.into_values().flatten() {
             self.fenced.clear(chunk);
             self.reopen(chunk);
+            reopened = true;
+        }
+        if reopened {
+            self.given.tell();
         }
         let later = self.pending.split_off(&(epoch.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
@@ -1890,9 +1941,25 @@ impl SlotPool {
             .collect()
     }
 
+    /// What the pool tells as room comes free ([`RoomGiven`]).
+    #[must_use]
+    pub fn room_given(&self) -> std::sync::Arc<RoomGiven> {
+        std::sync::Arc::clone(&self.given)
+    }
+
     /// Slots let go and waiting on a fire.
     pub fn pending_slots(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
+    }
+
+    /// Slots of `shape` let go and waiting on a fire: arriving, each as the
+    /// fire it waits on lands.
+    pub fn pending_of(&self, shape: ShapeId) -> u64 {
+        self.pending
+            .values()
+            .flatten()
+            .filter(|slot| self.chunks[slot.chunk as usize].shape == shape)
+            .count() as u64
     }
 
     fn locate(&mut self, slot: Slot) -> (&mut ShapeState, usize) {
@@ -2005,6 +2072,7 @@ impl SlotPool {
             state.spare.push(meta.frame);
             self.close_chunk(slot.chunk, physical);
         }
+        self.given.tell();
     }
 
     fn close_chunk(&mut self, logical: u32, physical: u32) {

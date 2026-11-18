@@ -40,6 +40,8 @@ struct RacePool {
     /// `RegistryPool`'s does: the waiter registered short, then promised a
     /// grow only where the walk's next step maps a segment.
     grow: Option<crate::store::shared::SharedGrow>,
+    /// Pages let go under device work in flight (`device_arriving`).
+    arriving: AtomicU32,
 }
 
 impl RacePool {
@@ -53,6 +55,7 @@ impl RacePool {
             host_total: 0,
             rs_model: None,
             grow: None,
+            arriving: AtomicU32::new(0),
         }
     }
 
@@ -80,6 +83,9 @@ impl RacePool {
 }
 
 impl PoolPort for RacePool {
+    fn device_arriving(&self) -> u32 {
+        self.arriving.load(Ordering::SeqCst)
+    }
     fn grow(&self, need: Demand) -> bool {
         let Some(grow) = &self.grow else {
             return false;
@@ -2361,6 +2367,75 @@ async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
     assert!(reached_eviction(&planner, key), "it went on to eviction");
 }
 
+/// A page let go under a fire or copy in flight is arriving: a head whose
+/// need it covers waits for that landing, woken by it, rather than moving
+/// another process out. (On MI300X the fence alone had slots come back
+/// later, and the planner evicted for pages about to land: ~1.9x evictions
+/// and restores.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_covered_by_arriving_pages_waits_for_them_instead_of_evicting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::with_swap(4, 64));
+    pool.arriving.store(1, Ordering::SeqCst);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, running) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let key = planner.with_inner(|inner| {
+        for pid in [head, running] {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+        }
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    planner.plan();
+    assert!(
+        !reached_eviction(&planner, key),
+        "a head the arriving page covers went on to an eviction plan"
+    );
+    assert_eq!(planner.stats.arrival_waits.load(Ordering::Relaxed), 1);
+
+    // The work lands: its page is free, and its settling wakes the plan.
+    pool.arriving.store(0, Ordering::SeqCst);
+    pool.refill_after_stall(1, 0);
+    planner.pages_freed();
+    assert_eq!(planner.stats.serves.load(Ordering::Relaxed), 1, "served on the landing");
+    assert!(!reached_eviction(&planner, key));
+}
+
+/// With nothing of the fleet in flight, what is let go under an epoch has
+/// nothing that lands it: the head does not wait on it.
+#[tokio::test(flavor = "current_thread")]
+async fn arriving_pages_do_not_hold_a_stalled_fleet() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::with_swap(4, 64));
+    pool.arriving.store(1, Ordering::SeqCst);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.with_inner(|inner| {
+        let mut proc = Proc::new(inner.next_seq);
+        inner.next_seq += 1;
+        proc.admitted = true;
+        inner.procs.insert(head, proc);
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    planner.plan();
+    assert_eq!(planner.stats.arrival_waits.load(Ordering::Relaxed), 0);
+}
+
 /// A shared pool's chunks for a bind short of room: free, held by idle
 /// cache (dropped by `reclaim_idle`), or held by a resident's guest state.
 /// Chunk ids stand for kv pages one a chunk.
@@ -2374,6 +2449,8 @@ struct BindRoomPool {
     /// The process whose state holds the chunks, if one does
     /// ([`PoolPort::chunk_occupants`]): each chunk of the pool, whole.
     occupant: parking_lot::Mutex<Option<ProcessId>>,
+    /// Chunks let go under device work in flight (`device_arriving`).
+    arriving: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2385,6 +2462,7 @@ impl BindRoomPool {
             host,
             model: 0,
             occupant: parking_lot::Mutex::new(None),
+            arriving: AtomicU32::new(0),
         }
     }
 
@@ -2409,6 +2487,9 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn device_arriving(&self) -> u32 {
+        self.arriving.load(Ordering::SeqCst)
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: (self.free.lock().len() as u32, self.total),
@@ -2574,6 +2655,42 @@ async fn a_bind_short_of_room_lands_once_a_resident_is_parked() {
         planner.wait_bind_room(gone, 3, 1).await,
         Err(PlannerError::Cancelled)
     ));
+}
+
+/// A bind short of a run of 3 chunks while 3 chunks are on their way back
+/// (let go under device work in flight, a fleet still running): it waits
+/// for that landing, which plans again, and is served then; the idle
+/// cache filling the rest of the pool is not dropped for it, and no one
+/// is parked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_waits_for_arriving_chunks_before_dropping_cache() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(11, 0..8, 0));
+    pool.arriving.store(3, Ordering::SeqCst);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, running) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, running] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.arrival_waits.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(planner.stats.arrival_waits.load(Ordering::Relaxed) > 0, "it waits on them");
+    assert!(!waited.is_finished());
+    assert_eq!(pool.cache.lock().len(), 8, "no cache dropped for chunks on their way");
+    // The work lands: its chunks are free, and its settling plans again.
+    pool.arriving.store(0, Ordering::SeqCst);
+    pool.free.lock().extend(8..11);
+    planner.pages_freed();
+    waited.await.expect("the wait ends").expect("served");
+    assert_eq!(pool.cache.lock().len(), 8, "served on the landing alone");
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
 }
 
 impl BindRoomPool {

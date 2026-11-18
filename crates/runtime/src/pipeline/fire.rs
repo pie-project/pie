@@ -251,6 +251,15 @@ impl FireEpoch {
     fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
         completion.on_settled(move || drop(self));
     }
+
+    /// Stamps `completion` with this fire's epoch before it is submitted:
+    /// the lane stamps the slots the fire's frame names with it, so they
+    /// wait for this frame's fires, not for every fire opened since.
+    fn stamp(&self, completion: &crate::engine::WorkItemCompletion) {
+        if let Some(txn) = &self._txn.txn {
+            completion.stamp_kv_epoch(txn.seq());
+        }
+    }
 }
 
 struct RsTxnsGuard {
@@ -4309,6 +4318,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .get_mut(&fwd)?
                 .bound_instance
                 .reserve_completion();
+            epoch.stamp(&completion);
 
             // Only the last fire runs the program, so only it takes channel values.
             let ticket_reservation = last.then(|| TicketReservation::new(&cells, &accesses));
@@ -5387,6 +5397,7 @@ async fn fire_device_geometry<C: FireContext>(
     let (completion, instance_id, scheduler, cells, fwd_rep, accesses) = {
         let p = ctx.resources().get_mut(&fwd)?;
         let completion = p.bound_instance.reserve_completion();
+        epoch.stamp(&completion);
         let accesses = p.instance.program.channel_accesses.clone();
         (
             completion,
@@ -9398,6 +9409,11 @@ mod unfolded_tests {
     /// That pool with activation rungs `act_chunks` (tokens, chunks), its
     /// span backed from the load: it starts at the largest.
     pub(super) fn pool_with_rungs(act_chunks: Vec<(u32, u32)>) -> crate::store::registry::Stores {
+        crate::store::registry::get(model_with_rungs(act_chunks), 0)
+    }
+
+    /// The model registered over that pool.
+    pub(super) fn model_with_rungs(act_chunks: Vec<(u32, u32)>) -> usize {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -9441,7 +9457,7 @@ mod unfolded_tests {
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
-        let model = crate::store::registry::register_model_with_chunks(
+        crate::store::registry::register_model_with_chunks(
             16,
             &[crate::store::registry::EngineStores {
                 pools: crate::store::chunks::StorePools::of(&facts).unwrap(),
@@ -9449,8 +9465,7 @@ mod unfolded_tests {
                 shared: Some(Arc::new(Mutex::new(pool))),
                 tiers: crate::store::shared::Tiers::default(),
             }],
-        );
-        crate::store::registry::get(model, 0)
+        )
     }
 
     fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
@@ -9740,5 +9755,93 @@ mod mask_cut_tests {
         // One behind what the lane states moves nothing.
         restate_boundary(&mut lane, 3);
         assert_eq!(lane.kv.folded, 14);
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+    use crate::planner::{Acquired, Demand, RegistryPool, ResidencyPlanner};
+
+    /// A fire's landing frees what it fenced, by itself: its last fire
+    /// lands with no further fire queued, and the head waiting on the page
+    /// it named gets it then (the landing's settle retires the epoch and
+    /// wakes the planner), with no later fire to drive the retirement.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_last_fire_s_landing_hands_its_fenced_page_to_the_waiting_head() {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let model = super::unfolded_tests::model_with_rungs(Vec::new());
+        let stores = crate::store::registry::get(model, 0);
+        crate::planner::init_planner(
+            model,
+            0,
+            ResidencyPlanner::new(Arc::new(RegistryPool::new(model, 0, false))),
+        );
+        let planner = crate::planner::planner_for(model, 0).expect("registered");
+        let (owner, head) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        for pid in [owner, head] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        // Every page is out; the owner's is named by its fire.
+        let mut taken = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let free = kv.available_pages();
+            kv.reserve_device_pages(free).expect("all of them")
+        });
+        let named = taken.pop().expect("a page");
+        let epoch = FireEpoch::begin(model, 0, &stores, owner);
+        let seq = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.current_epoch());
+        let list = stores.shared.as_ref().unwrap().lock().unwrap().list().unwrap().id;
+        stores
+            .shared
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .touch(list, [named.0], seq);
+        let fire = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        epoch.retire_on(&fire);
+        // The owner lets the page go while the fire still runs.
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            kv.release_device_reservation(vec![named]);
+            assert_eq!(kv.available_pages(), 0, "fenced while the fire runs");
+            assert_eq!(kv.arriving_pages(), 1);
+        });
+
+        let asked = {
+            let planner = planner.clone();
+            crate::rt::spawn(async move {
+                planner
+                    .acquire(
+                        head,
+                        head,
+                        Demand {
+                            kv_pages: 1,
+                            ..Demand::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!asked.is_finished(), "served a page the fire still names");
+
+        // The fire lands; nothing else is queued.
+        crate::engine::completion::settle(
+            &[fire.terminal_cell_ptr()],
+            crate::engine::completion::TERMINAL_OUTCOME_SUCCESS,
+        );
+        fire.resolve_landed("test");
+        // A guard against a hang, as the other tests here keep: nothing
+        // but the landing can serve the head.
+        let granted = crate::rt::time::timeout(std::time::Duration::from_secs(5), asked)
+            .await
+            .expect("the landing serves the waiting head")
+            .expect("the task ran");
+        let Ok(Acquired::Granted(grant)) = granted else {
+            panic!("the head was not granted its page");
+        };
+        drop(grant);
+        drop(taken);
     }
 }
