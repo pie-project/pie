@@ -3708,3 +3708,32 @@ bound let it through.
 - **qwen3-30b-a3b-mini -l1** takes 115 x 554 (the exit over more columns); it links, its fullest
   image 47,440 B (`w_1_0`, 1,712 B of stack), the check's estimate 47,647 B. The other decode
   programs and flux's text and denoise are byte-identical (their weight PEs are far from a PE).
+
+### G4.3 A root's scratch pool
+
+The regions at a root run one after another, and nothing a region keeps in its scratch rows
+(its row buffers `b<k>`, the halving sum's `sumt`, exp's `ep` / `ek`, recip's `ra` / `ry` /
+`rsg`, the 16-bit rounding's `h16`) lives past its `row()`. Each printed its own.
+
+- **Built**: `emit::region::pooled` takes a printed module's scratch rows in as pointer
+  parameters (`param b0: [*]f32;`, an address of one its pointer); every stream root (and a
+  helper) declares one pool, a row a name as wide as its widest module's chunk (`pl_b0`, ...),
+  and passes its rows to each region it imports. A pointer parameter's DSD is still a const
+  DSD (its address comptime: cslc builds `tensor_access = |i|{C} -> b0[i]` over it). The
+  fewest-roots search counts a root's arrays the same way (`place::root_words`: each region's
+  own arrays, its scratch rows once a root by name, `region_halves` now `Arrays`).
+- **Data**: qwen3-sim's fullest root 22,662 to 18,310 B; minimax-sim's 25,046 to 20,694 B;
+  minimax-m25-mini -l1's 32,980 to 28,628 B. No layout moved (every decode program's PEs and
+  price the same); every program with a stream root region changes (its root and region files
+  only: layout.csl, host.json and the arrays the host fills unchanged), klein's text and denoise
+  among them (93 files, `cx` / `cy` / `hp` / `rg` only); flux2-mini's text, denoise and the tiled
+  VAEs are byte-identical.
+- **On the simulator** (20 steps, the prompt's 4 and the golden's 16): minimax-sim 16 of 16 token-exact (step 7's 0.027
+  and step 12's 0.009 ties included), 81.1-81.2k cycles a step; qwen3-sim 16 of 16 and
+  qwen3-sim4 15 of 16 (step 3 the known HF bf16 tie), argmax and logit bf16-identical to G3's
+  runs of the same programs unpooled (3ceaac77f), 4 and 1-3 cycles a step more (75.2k, 55.0k).
+- **gemma4-e2b -l2 plans** (663 x 408 at py 384; G3: none of 462 within 755 x 1170). It does not
+  run yet: its unit 1 head root (`cy_1_0.csl`, s0l0's four head regions over one pool) links
+  alone at 49,056 B, 96 B of stack (the estimate 49,267 B: inside the check's `OVER`, and its
+  code, ~13.6 KB, past the search's `CODE_RESERVE` of 7,680 B). Next: a root's code in the
+  search by its regions' (the kind refit G4.2 did for weight PEs), so the plan keeps the stack.

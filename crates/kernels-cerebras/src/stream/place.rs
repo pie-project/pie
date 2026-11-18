@@ -771,17 +771,19 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, widen: u32)
 
 /// Words column root `col` holds as emitted: its held rows ([`held_words`]), the values it
 /// holds (each received into a row buffer and rounded in a 16-bit one) and, for each column
-/// region it runs, the printed module's chunk-wide arrays (its rows in, results,
-/// scratch rows and per-column tables: `[C]` arrays, a 16-bit one half a word), its chunk's
-/// each. `printed` caches a region's arrays a column by (step, chunk).
+/// region it runs, the printed module's chunk-wide arrays (its rows in, results and
+/// per-column tables: `[C]` arrays, a 16-bit one half a word), its chunk's each, and its
+/// scratch rows once a root (the root's pool: a row a name as wide as its widest region's).
+/// `printed` caches a region's arrays a column by (step, chunk).
 fn root_words(
     r: &Reader,
     u: &Unit,
     l: &Layout,
     col: u32,
-    printed: &mut BTreeMap<(usize, u32, u32), u32>,
+    printed: &mut BTreeMap<(usize, u32, u32), Arrays>,
 ) -> u32 {
     // the values it holds, each received into a row buffer and rounded in a 16-bit one
+    let mut pool: BTreeMap<String, u32> = BTreeMap::new();
     let mut w = held_words(u, l, col)
         + l.cols
             .get(col as usize)
@@ -798,12 +800,17 @@ fn root_words(
         if at.roots == 0 || col < at.first || col >= at.first + at.roots {
             continue;
         }
-        let halves = *printed
+        let (halves, rows) = printed
             .entry((i, at.chunk, at.roots))
             .or_insert_with(|| region_halves(chain, &at));
-        w += at.chunk * halves / 2;
+        w += at.chunk * *halves / 2;
+        for (name, h) in rows.iter() {
+            let e = pool.entry(name.clone()).or_insert(0);
+            *e = (*e).max(at.chunk * h);
+        }
     }
-    w
+    // the scratch rows one pool a root, a row a name as wide as its widest region's
+    w + pool.values().map(|h| h.div_ceil(2)).sum::<u32>()
 }
 
 /// A weight PE's bytes past its matvecs' arrays, refitted on 34 linked weight PEs (each linked
@@ -846,7 +853,7 @@ fn root_over(
     u: &Unit,
     l: &Layout,
     col: u32,
-    printed: &mut BTreeMap<(usize, u32, u32), u32>,
+    printed: &mut BTreeMap<(usize, u32, u32), Arrays>,
 ) -> bool {
     crate::check::PeBytes {
         data: 4 * i64::from(root_words(r, u, l, col, printed)),
@@ -855,9 +862,13 @@ fn root_over(
     .overflows()
 }
 
-/// A column region's chunk-wide arrays printed at `chunk` columns, in 16-bit halves a column
-/// (0 where it does not print alone: its program's check counts it).
-fn region_halves(chain: &poem_compiler::fuse::chain::Chain, at: &RegionAt) -> u32 {
+/// A printed region's own chunk-wide arrays (16-bit halves a column) and its scratch rows (a
+/// name and its halves a column: the root's pool's, [`crate::emit::region::pooled`]).
+type Arrays = (u32, Vec<(String, u32)>);
+
+/// A column region's chunk-wide arrays printed at `chunk` columns ([`Arrays`]; none where it
+/// does not print alone: its program's check counts it).
+fn region_halves(chain: &poem_compiler::fuse::chain::Chain, at: &RegionAt) -> Arrays {
     let params = chain
         .region
         .params
@@ -887,17 +898,22 @@ fn region_halves(chain: &poem_compiler::fuse::chain::Chain, at: &RegionAt) -> u3
         dup: at.per.max(1),
     };
     let Ok(p) = crate::emit::region::print(&chain.region, &place) else {
-        return 0;
+        return (0, Vec::new());
     };
+    let (csl, rows, _) = crate::emit::region::pooled(&p.csl);
     let mut halves = 0;
-    for line in p.csl.lines().filter(|l| l.starts_with("var ")) {
+    for line in csl.lines().filter(|l| l.starts_with("var ")) {
         for (pat, h) in [("[C]f32", 2), ("[C]u16", 1), ("[C]@fp16()", 1)] {
             if line.contains(&format!("@zeros({pat})")) {
                 halves += h;
             }
         }
     }
-    halves
+    let rows = rows
+        .into_iter()
+        .map(|(n, ty)| (n, if ty == "f32" { 2 } else { 1 }))
+        .collect();
+    (halves, rows)
 }
 
 /// A layout's worst tile past the budget: (rest roots, the root, its words, its matvecs' (step,
@@ -935,7 +951,7 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
     let mut unstored = false;
     // the column regions' arrays a column, by (step, chunk); the last layout a root of which
     // overflows: (rest roots, the root, its words)
-    let mut printed: BTreeMap<(usize, u32, u32), u32> = BTreeMap::new();
+    let mut printed: BTreeMap<(usize, u32, u32), Arrays> = BTreeMap::new();
     let mut over_root: Option<(u32, u32, u32)> = None;
     // the most rest roots' worst tile: its root, its words, its matvecs' (step: words)
     let mut over_tile: Option<OverTile> = None;

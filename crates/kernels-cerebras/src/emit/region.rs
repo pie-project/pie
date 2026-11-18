@@ -1604,11 +1604,104 @@ fn lit(x: f32) -> String {
     }
 }
 
+/// A printed module's scratch rows (its row buffers `b<k>`, the sum's, exp's and recip's rows,
+/// the 16-bit rounding's): nothing it holds from one `row()` to the next, so the regions a root
+/// runs one after another can share them ([`pooled`]).
+fn scratch_name(n: &str) -> bool {
+    matches!(n, "sumt" | "ep" | "ek" | "ra" | "ry" | "rsg" | "h16")
+        || n.strip_prefix('b')
+            .is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// A scratch row as `pooled` takes it in: its name and element type.
+pub type ScratchRow = (String, &'static str);
+
+/// `csl` (a printed module) with its scratch rows taken in as pointer parameters (`param b0:
+/// [*]f32;`, ...) in place of its own arrays: the root that imports it passes rows of its pool,
+/// one a name, as wide as the widest module's (a root's regions run one after another). Each
+/// row's name and element type, and the module's chunk (`C`).
+#[must_use]
+pub fn pooled(csl: &str) -> (String, Vec<ScratchRow>, u32) {
+    let mut out = String::with_capacity(csl.len());
+    let mut rows: Vec<ScratchRow> = Vec::new();
+    let mut c = 0;
+    for line in csl.split_inclusive('\n') {
+        if let Some(v) = line.strip_prefix("const C: u16 = ") {
+            c = v.trim_end().trim_end_matches(';').parse().unwrap_or(0);
+        }
+        let decl = line.strip_prefix("var ").and_then(|r| {
+            let name = r.split([':', ' ']).next()?;
+            let ty = if r.contains("@zeros([C]f32)") {
+                "f32"
+            } else if r.contains("@zeros([C]u16)") {
+                "u16"
+            } else if r.contains("@zeros([C]@fp16())") {
+                "@fp16()"
+            } else {
+                return None;
+            };
+            scratch_name(name).then(|| (name.to_string(), ty))
+        });
+        match decl {
+            Some((name, ty)) => {
+                out.push_str(&format!("param {name}: [*]{ty};\n"));
+                rows.push((name, ty));
+            }
+            None => out.push_str(line),
+        }
+    }
+    // a pointer parameter is its row's address already
+    let mut text = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find('&') {
+        text.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let n = after
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .unwrap_or(after.len());
+        if !rows.iter().any(|(r, _)| r == &after[..n]) {
+            text.push('&');
+        }
+        rest = after;
+    }
+    text.push_str(rest);
+    (text, rows, c)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ParamAt, Place, print};
+    use super::{ParamAt, Place, pooled, print};
     use kernels_ir::Shape;
     use poem_ir::{Operands, Platform};
+
+    /// A pooled module takes its scratch rows in as pointers (its own arrays gone, an address of
+    /// one its pointer), keeps its other arrays, and names each row's type and its chunk.
+    #[test]
+    fn a_pooled_module_takes_its_scratch_rows_in() {
+        let csl = "const C: u16 = 64;\n\
+                   var in0: [C]f32 align(16) = @zeros([C]f32);   // a row's\n\
+                   var b0: [C]f32 align(16) = @zeros([C]f32);\n\
+                   var b12: [C]f32 align(16) = @zeros([C]f32);\n\
+                   var ek = @zeros([C]u16);\n\
+                   var h16 = @zeros([C]@fp16());\n\
+                   var b0x = @zeros([C]u16);\n\
+                   fn f() void { g(&b12, &in0, &b0x); h(@ptrcast([*]u16, &ek)); }\n";
+        let (text, rows, c) = pooled(csl);
+        assert_eq!(c, 64);
+        let names: Vec<(&str, &str)> = rows.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        assert_eq!(
+            names,
+            [
+                ("b0", "f32"),
+                ("b12", "f32"),
+                ("ek", "u16"),
+                ("h16", "@fp16()")
+            ]
+        );
+        assert!(text.contains("param b12: [*]f32;\n") && text.contains("param h16: [*]@fp16();\n"));
+        assert!(text.contains("var in0: [C]f32") && text.contains("var b0x = @zeros([C]u16);"));
+        assert!(text.contains("g(b12, &in0, &b0x); h(@ptrcast([*]u16, ek));"));
+    }
 
     /// srope's STEP in f32 as the PE runs it (a DIRECT anchor at each multiple of the period, one
     /// rotation a position between) stays within the budget less the anchor's own error, against

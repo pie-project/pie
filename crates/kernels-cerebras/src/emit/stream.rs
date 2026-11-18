@@ -18,7 +18,7 @@ use poem_ir::ValueId;
 use serde::Serialize;
 
 use crate::emit::placed::{At, Placed, Route, Tile as PlacedTile};
-use crate::emit::region::ParamAt;
+use crate::emit::region::{self, ParamAt};
 use crate::fabric::{Endpoint, RouteWord};
 use crate::floor::{Coord, Dir};
 use crate::floorplan::stream::{
@@ -1236,6 +1236,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let mut g = Gen::default();
     let mut arrays: Vec<HostArray> = Vec::new();
     let mut regions: Vec<(String, String)> = Vec::new();
+    // the root's scratch pool: a row a name, its element type and the widest chunk
+    let mut pool: BTreeMap<String, (&'static str, u32)> = BTreeMap::new();
     let rows = u.rows;
     let held = |v: ValueId| u.held.contains(&v);
     // a row-side value's chunk at this root
@@ -1448,11 +1450,17 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 };
                 let q = help.map_or(c, |h| c / (h.1 + 1));
                 let rname = format!("rg_{ui}_{si}.csl");
+                // its scratch rows the root's pool's (the regions at a root run one after
+                // another)
+                let (text, rows, cc) = region::pooled(help.map_or(&printed.csl, |h| &h.2.csl));
                 if !later && !regions.iter().any(|(n, _)| *n == rname) {
-                    regions.push((
-                        rname.clone(),
-                        help.map_or(&printed.csl, |h| &h.2.csl).clone(),
-                    ));
+                    regions.push((rname.clone(), text));
+                }
+                let mut ptrs = String::new();
+                for (name, ty) in &rows {
+                    let e = pool.entry(name.clone()).or_insert((*ty, 0));
+                    e.1 = e.1.max(cc);
+                    let _ = write!(ptrs, ", .{name} = &pl_{name}");
                 }
                 let mut nrow = 0u32;
                 let mut hsc: Vec<String> = Vec::new();
@@ -1471,7 +1479,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 if !later {
                     let _ = writeln!(
                         g.imports,
-                        "const rg{k} = @import_module(\"{rname}\", .{{ .math = math, .seg = {seg} }});"
+                        "const rg{k} = @import_module(\"{rname}\", .{{ .math = math, .seg = {seg}{ptrs} }});"
                     );
                 }
                 let mut nsc = 0;
@@ -2052,6 +2060,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         t.push_str("const seg = @import_module(\"ops/seg.csl\", .{ .fab = fab, .rcfg = &rcfg, .RQ = 0, .XM = @get_input_queue(6), .YM = @get_input_queue(7), .AO = @get_output_queue(4), .UT = @get_ut_id(5) });\n");
         inits.push_str("  @initialize_queue(@get_input_queue(6), .{ .color = @get_color(C_SM) });\n  @initialize_queue(@get_input_queue(7), .{ .color = @get_color(C_SA) });\n  @initialize_queue(@get_output_queue(4), .{ .color = @get_color(C_SS) });\n");
     }
+    t.push_str(&pool_decls(&pool));
     t.push_str(&g.imports);
     if hin_w > 0 {
         let _ = writeln!(t, "const HINW: u16 = {hin_w};");
@@ -2291,9 +2300,17 @@ fn helper_file(ui: usize, b: &Built, r: &Reader) -> R<(String, String)> {
     t.push_str(COMMON);
     t.push_str("const q_hm = @get_input_queue(2);\nconst q_hr = @get_input_queue(3);\nconst q_hs = @get_output_queue(2);\n");
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_hr, .OUT = q_hs });\n");
+    let (_, rows, cc) = region::pooled(&printed.csl);
+    let pool: BTreeMap<String, (&'static str, u32)> =
+        rows.iter().map(|(n, ty)| (n.clone(), (*ty, cc))).collect();
+    t.push_str(&pool_decls(&pool));
+    let ptrs: String = rows
+        .iter()
+        .map(|(n, _)| format!(", .{n} = &pl_{n}"))
+        .collect();
     let _ = writeln!(
         t,
-        "const rg = @import_module(\"rg_{ui}_{si}.csl\", .{{ .math = math, .seg = math }});"
+        "const rg = @import_module(\"rg_{ui}_{si}.csl\", .{{ .math = math, .seg = math{ptrs} }});"
     );
     t.push_str(&cfg_decl(&[0, 0]));
     t.push_str(&buf("drn", 64));
@@ -2348,6 +2365,15 @@ fn helper_file(ui: usize, b: &Built, r: &Reader) -> R<(String, String)> {
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_hm, .{ .color = @get_color(C_HM) });\n  @initialize_queue(q_hr, .{ .color = @get_color(C_HR) });\n  @initialize_queue(q_hs, .{ .color = @get_color(C_HS) });\n}\n");
     let _ = printed;
     Ok((name, t))
+}
+
+/// A root's scratch pool ([`region::pooled`]): a row a name, as wide as its widest module's.
+fn pool_decls(pool: &BTreeMap<String, (&'static str, u32)>) -> String {
+    let mut t = String::new();
+    for (name, (ty, n)) in pool {
+        let _ = writeln!(t, "var pl_{name}: [{n}]{ty} align(16) = @zeros([{n}]{ty});");
+    }
+    t
 }
 
 /// Whether root `idx` of unit `ui`'s `side` all-reduces over its side's segment.
