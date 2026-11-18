@@ -709,6 +709,13 @@ impl FramePolicy {
         self.maybe_reset_episode();
     }
 
+    /// Whether `owner` is suspended: its lanes ride no frame until it
+    /// resumes.
+    #[must_use]
+    pub fn is_suspended(&self, owner: ProcessId) -> bool {
+        self.suspended.contains(&owner)
+    }
+
     pub fn on_process_resume(&mut self, owner: ProcessId) {
         self.suspended.remove(&owner);
     }
