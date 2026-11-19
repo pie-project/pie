@@ -124,6 +124,11 @@ impl LaneCommit {
 
 /// The instance and channel slots of engine `engine_idx`'s pool, where it
 /// states their shapes (the serving model's stores, model 0).
+/// A step on its way through the engine: the instances it attaches, and
+/// what they name in the roles, read until it lands
+/// ([`crate::store::roles::Roles::reading`]).
+type LandingReads = (Vec<::engine::InstanceId>, Vec<crate::store::roles::Owner>);
+
 fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
 }
@@ -575,7 +580,7 @@ impl Lane {
         // The pool's instance and channel slots, looked up at the first
         // fire (the stores are registered before any process runs).
         let roles = std::cell::OnceCell::new();
-        let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>> =
+        let mut landed_instances: HashMap<::engine::FrameId, Vec<LandingReads>> =
             HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
@@ -720,7 +725,7 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let instances = landed_instances
+                    let (instances, reads) = landed_instances
                         .get(&frame)
                         .and_then(|steps| steps.get(step as usize))
                         .cloned()
@@ -739,6 +744,11 @@ impl Lane {
                                 tracing::error!(frame = frame.0, step, %error, "channel take after landing");
                             }
                         }
+                    }
+                    // What the step named is read no more: let go under it,
+                    // it goes back now.
+                    if let Some(roles) = roles.get_or_init(|| roles_of(engine_idx)).as_ref() {
+                        roles.lock().unwrap().landed(&reads);
                     }
                     tracing::debug!(frame = frame.0, step, "channels pumped out after landing");
                     settlements.settled(frame, step as usize, &outcome, &broker);
@@ -824,7 +834,7 @@ impl Lane {
         broker: &crate::engine::CompletionBroker,
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
         inline_faults: &InlineFaults,
-        landed: &mut HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>>,
+        landed: &mut HashMap<::engine::FrameId, Vec<LandingReads>>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
@@ -868,6 +878,30 @@ impl Lane {
         let mut at = 0usize;
         while !pending.is_empty() {
             let submitted = ::engine::FrameSubmission { steps: pending };
+            // What each step's attachments name (their instances, and the
+            // pair, channels and adapter each shares) is read until the step
+            // lands: let go meanwhile (a last close, a park), it waits for
+            // that. A step the engine did not fire is read no more.
+            let mut reads: Vec<Vec<crate::store::roles::Owner>> = submitted
+                .steps
+                .iter()
+                .map(|step| {
+                    roles.map_or_else(Vec::new, |roles| {
+                        roles
+                            .lock()
+                            .unwrap()
+                            .reading(step.attachments.iter().map(|a| a.instance))
+                    })
+                })
+                .collect();
+            let let_go = |reads: &[Vec<crate::store::roles::Owner>]| {
+                if let Some(roles) = roles {
+                    let mut roles = roles.lock().unwrap();
+                    for reads in reads {
+                        roles.landed(reads);
+                    }
+                }
+            };
             tracing::debug!(
                 steps = submitted.steps.len(),
                 "submitting a frame to the engine"
@@ -881,12 +915,14 @@ impl Lane {
                 }
                 Err(::engine::Error::Lanes(refused)) => (None, refused),
                 Err(error) if error.is_retryable() => {
+                    let_go(&reads);
                     return Err(format!(
                         "frame admission answered a retryable refusal past static \
                          admission, which the frame contract forbids: {error}"
                     ));
                 }
                 Err(error) => {
+                    let_go(&reads);
                     if matches!(error, ::engine::Error::Impossible(_)) {
                         crate::store::shared::programs::impossible_submission(engine_idx, &error);
                     }
@@ -897,17 +933,24 @@ impl Lane {
             let mut rest = submitted.steps;
             let ran: Vec<::engine::Step> = rest.drain(..fired.min(rest.len())).collect();
             let ran_at = at..at + ran.len();
+            let unfired = reads.split_off(ran.len().min(reads.len()));
+            let_go(&unfired);
 
-            if let Some(ticket) = &ticket
-                && asynchronous
-                && !ran.is_empty()
-            {
-                landed.insert(
-                    ticket.id,
-                    ran.iter()
-                        .map(|step| step.attachments.iter().map(|a| a.instance).collect())
-                        .collect(),
-                );
+            match &ticket {
+                Some(ticket) if asynchronous && !ran.is_empty() => {
+                    landed.insert(
+                        ticket.id,
+                        ran.iter()
+                            .zip(reads)
+                            .map(|(step, reads)| {
+                                (step.attachments.iter().map(|a| a.instance).collect(), reads)
+                            })
+                            .collect(),
+                    );
+                }
+                // Settled inside `submit` (or nothing fired): the device is
+                // done with what it named.
+                _ => let_go(&reads),
             }
             let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); ran.len()];
             for (step, woken) in ran.iter().zip(&mut wakes) {

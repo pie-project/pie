@@ -11,6 +11,11 @@ pub enum DecodeArm {
     Full,
     Softcap,
     Window,
+    /// The plain arms, each request's mask read from its word's boundary on
+    /// (a request stating none reads no bit), as data (`fa2.cu`'s `MaskData`).
+    MaskedFull,
+    MaskedSoftcap,
+    MaskedWindow,
     RelBiasFull,
     RelBiasWindow,
 }
@@ -52,6 +57,9 @@ pub(crate) fn decode_symbol(
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
         DecodeArm::Softcap => ("VariantWindowSoftcap", "DecodeParams"),
         DecodeArm::Window => ("VariantWindow", "DecodeParams"),
+        DecodeArm::MaskedFull => ("MaskedFull", "DecodeParams"),
+        DecodeArm::MaskedSoftcap => ("MaskedWindowSoftcap", "DecodeParams"),
+        DecodeArm::MaskedWindow => ("MaskedWindow", "DecodeParams"),
         DecodeArm::RelBiasFull => ("VariantRelBiasFull", "DecodeRelParams"),
         DecodeArm::RelBiasWindow => ("VariantRelBiasWindow", "DecodeRelParams"),
     };
@@ -267,6 +275,20 @@ pub fn decode_arm(
         return DecodeArm::Softcap;
     }
     DecodeArm::Window
+}
+
+/// [`decode_arm`] reading the fire's masks.
+#[must_use]
+pub fn decode_masked_arm(
+    full_attention_variant: bool,
+    window_left: i32,
+    logits_soft_cap: f32,
+) -> DecodeArm {
+    match decode_arm(full_attention_variant, window_left, logits_soft_cap) {
+        DecodeArm::Full => DecodeArm::MaskedFull,
+        DecodeArm::Softcap => DecodeArm::MaskedSoftcap,
+        _ => DecodeArm::MaskedWindow,
+    }
 }
 
 #[must_use]

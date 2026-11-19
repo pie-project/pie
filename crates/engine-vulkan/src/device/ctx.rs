@@ -765,6 +765,8 @@ impl Context {
             maintenance3.max_memory_allocation_size,
             sized.then_some(maintenance4.max_buffer_size),
         );
+        #[cfg(feature = "test-limits")]
+        let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         // The narrowest subgroup a pipeline may be compiled at: a driver
         // that varies the width (Intel: 8 to 32) reports its default as
         // `subgroupSize`, which a kernel folding 32 lanes cannot rely on.

@@ -7,6 +7,7 @@ mod lane_refusal;
 mod outputs;
 mod port;
 mod readout_rows;
+mod readout_seat;
 mod register;
 mod roles;
 mod scores;

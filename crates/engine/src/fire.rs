@@ -280,6 +280,14 @@ pub struct Lane {
     /// `Masking::Extent`: one mask for every row. `Masking::Rows`: one per
     /// row, as many as the lane's rows. A kv-less lane's mask is over its
     /// attention group's rows, as before.
+    ///
+    /// The mask is the lane's data, never its class: a lane stating one
+    /// lands on the class it would land on stating none (`attn.attend`
+    /// reads no `fact.Mask`), and shares a fire, and a body, with lanes
+    /// stating none; each reads its own entry of the fire's masks
+    /// (`RuntimeInput::Mask`). An engine whose kernels do not read a lane's
+    /// mask where its class attends refuses the lane by name, never serves
+    /// it unmasked.
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
     #[serde(default)]

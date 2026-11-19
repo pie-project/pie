@@ -255,7 +255,7 @@ pub(crate) fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. }
         | Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }

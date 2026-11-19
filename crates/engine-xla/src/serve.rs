@@ -610,6 +610,11 @@ impl Shell {
                         bias: None,
                         lse: Some(_),
                         ..
+                    } | poem_ir::Attn::Decode {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        ..
                     }
                 )
             )
@@ -1705,12 +1710,12 @@ impl Shell {
     /// present reads more than tokens (a mask, an adapter, media),
     /// or the padding does not fit the rows or the lanes.
     /// The class of a lane the warm ladder lays fires of: one that reads
-    /// only tokens (no mask, adapter, media or guest input) and its last row
+    /// only tokens and its mask (no adapter, media or guest input) and its last row
     /// or every row, in a class that reads no more. `None` for any other.
     fn ladder_class(&self, seated: &Seated<'_>) -> Option<usize> {
         let classes = &self.compiled.classes;
+        // (a lane's mask is data: it stages the load's mask plane)
         if seated.media.is_some()
-            || seated.mask.is_some()
             || seated.adapter.is_some()
             || seated.kv_less
             // a lane reads its last row, or every row (a drafting lane's
@@ -1725,8 +1730,7 @@ impl Shell {
         let class = classes.class_of(seated.lane.word & classes.mask)?;
         let reads_input =
             (self.dit.feeds().inputs.iter()).any(|(_, readers)| readers.contains(class));
-        (!self.masked.contains(class)
-            && !self.wide.contains(class)
+        (!self.wide.contains(class)
             && !self.corrected.contains(class)
             && !reads_input)
             .then_some(class)
@@ -2181,11 +2185,12 @@ impl Shell {
             if kv_mask.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if kv_mask.is_some() != runs_masked_arm {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is refused.
+            if kv_mask.is_some() && !runs_masked_arm {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
             masks.push(crate::mask::LaneMask {
@@ -2387,7 +2392,13 @@ impl Shell {
         let mut inputs = Inputs::new();
         windows.bind(handles, &mut inputs)?;
 
-        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        // The mask plane's columns are the load's: every key a lane can hold,
+        // at a power of two, so a masked fire's program is keyed by its shape
+        // and not by how far its lanes have read.
+        let mask_width = (paging.pages_per_slot.max(1) * paging.page_size.max(1))
+            .max(256)
+            .next_power_of_two();
+        let staged = crate::mask::stage(&masks, mask_width).map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {

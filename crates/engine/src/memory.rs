@@ -280,9 +280,63 @@ impl fmt::Display for Ledger {
     }
 }
 
+/// The one rule every tier's target takes from the system's memory
+/// pressure (user ruling, 2026-11-15):
+/// `floor + (ceiling - floor) * (1 - yield * pressure)`, saturating.
+/// `yield` is the deployment's `[engine.memory] yield`, validated at config
+/// parse ([`crate::pressure::Yield::new`]); `pressure` the OS's reading
+/// ([`crate::pressure::host`]). Both are taken within `0..=1` here (`NaN`
+/// as `0`), and a floor over the ceiling is the ceiling.
+#[must_use]
+pub fn target(floor: u64, ceiling: u64, yield_: f64, pressure: f64) -> u64 {
+    let within = |x: f64| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+    let floor = floor.min(ceiling);
+    let above = ceiling - floor;
+    let kept = 1.0 - within(yield_) * within(pressure);
+    // `kept` is in [0, 1]: the product stays within `above`.
+    floor + ((above as f64 * kept) as u64).min(above)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FLOOR: u64 = 100 * MIB;
+    const CEILING: u64 = 1000 * MIB;
+
+    #[test]
+    fn a_yield_of_zero_holds_the_ceiling_whatever_the_pressure() {
+        for pressure in [0.0, 0.3, 1.0] {
+            assert_eq!(target(FLOOR, CEILING, 0.0, pressure), CEILING);
+        }
+    }
+
+    #[test]
+    fn a_full_yield_at_full_pressure_holds_the_floor() {
+        assert_eq!(target(FLOOR, CEILING, 1.0, 1.0), FLOOR);
+        assert_eq!(target(FLOOR, CEILING, 1.0, 0.0), CEILING);
+    }
+
+    #[test]
+    fn in_between_the_target_falls_with_yield_times_pressure() {
+        // 900 MiB above the floor, kept at 1 - 0.5 * 0.5 = 0.75.
+        assert_eq!(target(FLOOR, CEILING, 0.5, 0.5), FLOOR + 675 * MIB);
+        assert_eq!(target(FLOOR, CEILING, 1.0, 0.25), FLOOR + 675 * MIB);
+        assert_eq!(target(FLOOR, CEILING, 0.5, 1.0), FLOOR + 450 * MIB);
+    }
+
+    #[test]
+    fn readings_out_of_range_are_taken_within_it() {
+        assert_eq!(target(FLOOR, CEILING, 1.0, 2.0), FLOOR);
+        assert_eq!(target(FLOOR, CEILING, 1.0, -1.0), CEILING);
+        assert_eq!(target(FLOOR, CEILING, 1.0, f64::NAN), CEILING);
+        assert_eq!(target(FLOOR, CEILING, f64::NAN, 1.0), CEILING);
+    }
+
+    #[test]
+    fn a_floor_over_the_ceiling_is_the_ceiling() {
+        assert_eq!(target(2 * CEILING, CEILING, 1.0, 1.0), CEILING);
+    }
 
     const MIB: u64 = 1 << 20;
 

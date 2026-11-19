@@ -40,6 +40,12 @@ pub struct DeviceBoot {
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,
+
+    /// A test's device that binds less (as a phone's GPU does): the
+    /// largest buffer the load lays, below the device's own. Test builds
+    /// only (`test-limits`): no config or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub max_buffer: Option<u64>,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;

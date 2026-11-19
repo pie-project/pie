@@ -346,7 +346,7 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
+        | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
@@ -1003,6 +1003,7 @@ impl Engine for Cuda {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => self
                 .loaded_mut()?
@@ -1013,6 +1014,7 @@ impl Engine for Cuda {
                         rings,
                         scratch,
                         pair,
+                        pair_generation,
                     },
                 )
                 .map_err(fault),
@@ -1313,6 +1315,7 @@ impl Engine for Cuda {
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
                     pair: binding.pair.clone(),
+                    pair_generation: binding.pair_generation,
                 },
             )
             .map_err(fault)?;
