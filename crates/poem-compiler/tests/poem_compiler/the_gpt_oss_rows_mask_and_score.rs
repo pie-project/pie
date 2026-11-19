@@ -11,11 +11,14 @@ fn count(trace: &poem::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
     trace.nodes.iter().filter(|node| wanted(&node.op)).count()
 }
 
-// A gpt-oss attention layer folds its sink into every arm, so the masked arm
-// needs the log-sum-exp the plain `attn.masked` never returns; this is
-// why the family went without one. Each layer now reads `attn.masked_lse`
-// once, and the full-attention layers export their prefill scores for the
-// eviction programs (`attn_score`).
+// A gpt-oss attention layer folds its sink into every arm, so each arm
+// writes the log-sum-exp the sink reads. A lane's mask is data its arm
+// reads, never a kind of lane (`Attn::Decode`'s and `Attn::Prefill`'s
+// `mask`): every layer has two sunk arms, decode and prefill, and both read
+// the fire's masks, a lane stating none reading every key in the same body.
+// The full-attention layers (the odd ones) capture their prefill scores for
+// the eviction programs, each adding into the row the layer before filled,
+// and the trace reads that row out once (`attn.scores`, `attn.scores.pages`).
 #[test]
 fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
     let rows: Vec<_> = poem_compiler::catalog::deployments()
@@ -28,7 +31,19 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
             let sinks = count(&trace, |op| {
                 matches!(op, Operation::Attn(Attn::Sink { .. }))
             });
-            let masked = count(&trace, |op| {
+            let decode = count(&trace, |op| {
+                matches!(
+                    op,
+                    Operation::Attn(Attn::Decode {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: Some(_),
+                        ..
+                    })
+                )
+            });
+            let prefill = count(&trace, |op| {
                 matches!(
                     op,
                     Operation::Attn(Attn::Prefill {
@@ -41,24 +56,30 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
                 )
             });
             assert!(
-                masked > 0 && sinks == 3 * masked,
-                "{} on {platform:?}: {masked} causal `attn.masked_lse` arm(s) against \
-                 {sinks} sink(s); every layer has three sunk arms (masked, decode, \
-                 prefill)",
+                prefill > 0 && decode == prefill && sinks == 2 * prefill,
+                "{} on {platform:?}: {decode} decode and {prefill} prefill arm(s) reading \
+                 the masks with their log-sum-exp, against {sinks} sink(s); every layer \
+                 has two sunk arms (decode, prefill), both masked",
                 row.name
             );
-            let scores = trace
-                .outputs
-                .iter()
-                .filter(|s| s.name == "attn.scores")
-                .count();
+            let captures = count(&trace, |op| {
+                matches!(op, Operation::Attn(Attn::ScoreCapture { .. }))
+            });
             assert_eq!(
-                scores,
-                masked / 2,
-                "{} on {platform:?}: {scores} score output(s) for {masked} layer(s); every \
-                 full-attention layer (the odd ones) reads one out",
+                captures,
+                prefill / 2,
+                "{} on {platform:?}: {captures} score capture(s) for {prefill} layer(s); \
+                 every full-attention layer (the odd ones) adds its scores to the row",
                 row.name
             );
+            for name in ["attn.scores", "attn.scores.pages"] {
+                let read = trace.outputs.iter().filter(|s| s.name == name).count();
+                assert_eq!(
+                    read, 1,
+                    "{} on {platform:?}: the summed row is read out once as `{name}`",
+                    row.name
+                );
+            }
         }
     }
 }

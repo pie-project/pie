@@ -1315,26 +1315,40 @@ pub fn attend(
         Value::merge(arms)
     };
     if scores {
-        const OBSERVE: u32 = 32;
-        // Each layer adds into the row the layers before it filled; the
-        // recorder reads the last one out when the trace is done
-        // (`attn.scores` and `attn.scores.pages`).
-        let rec = inputs.recorder();
-        let into = rec.carried(SCORE_ROW);
-        let captured = score_capture(
-            q,
-            inputs,
-            kv,
-            q_heads,
-            kv_heads,
-            head_dim,
-            sm_scale,
-            OBSERVE,
-            into.as_ref(),
-        );
-        rec.carry(SCORE_ROW, &captured);
+        capture_scores(q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, 32);
     }
     o
+}
+
+/// This layer's [`score_capture`] of `q` over `kv`, added into the row the
+/// layers before it filled. The recorder reads the last one out when the
+/// trace is done (`attn.scores` and `attn.scores.pages`), so a trace has one
+/// key row however many layers capture.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_scores(
+    q: &Value,
+    inputs: &Input,
+    kv: &str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    observe: u32,
+) {
+    let rec = inputs.recorder();
+    let into = rec.carried(SCORE_ROW);
+    let captured = score_capture(
+        q,
+        inputs,
+        kv,
+        q_heads,
+        kv_heads,
+        head_dim,
+        sm_scale,
+        observe,
+        into.as_ref(),
+    );
+    rec.carry(SCORE_ROW, &captured);
 }
 
 /// The row a trace's score captures add into, layer after layer.
