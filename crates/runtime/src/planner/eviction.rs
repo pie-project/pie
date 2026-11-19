@@ -737,6 +737,8 @@ mod chunk_picks_tests {
         let map = ChunkMap {
             held: vec![held(1, 5, &[(1, 5)]), held(2, 4, &[(2, 2)]), held(3, 3, &[(3, 3)])],
             free: vec![],
+            headroom: None,
+            segment_chunks: 0,
         };
         assert_eq!(map.cheapest_runs(1, 1), Some(vec![pid(3)]));
         // Two chunks: C's and A's, B's never.
@@ -753,6 +755,8 @@ mod chunk_picks_tests {
         let map = ChunkMap {
             held: vec![held(4, 6, &[(1, 6)]), held(7, 2, &[(2, 1), (3, 1)])],
             free: vec![5, 8],
+            headroom: None,
+            segment_chunks: 0,
         };
         let mut pids = map.cheapest_runs(2, 1).unwrap();
         pids.sort_unstable();
@@ -779,6 +783,8 @@ mod chunk_picks_tests {
         let map = ChunkMap {
             held: vec![held(1, 5, &[(1, 5)]), held(3, 3, &[(3, 3)])],
             free: vec![],
+            headroom: None,
+            segment_chunks: 0,
         };
         let (picked, wanted, occupants) =
             chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
@@ -791,5 +797,42 @@ mod chunk_picks_tests {
         let none = ChunkMap::default();
         let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
         assert_eq!((kept.len(), same), (3, deficit), "no chunk empties: as before");
+    }
+
+    /// Mac Pro's M5 shape B: the cheapest runs stood free, yet the head
+    /// waited with no one moved. Free chunks the budget cannot open (no
+    /// headroom) are no room: each needs a chunk emptied elsewhere, the
+    /// cheapest, whose budget comes back.
+    #[test]
+    fn a_free_run_past_the_budgets_headroom_empties_a_chunk_elsewhere() {
+        let mut map = ChunkMap {
+            held: vec![held(10, 4, &[(1, 4)]), held(20, 2, &[(2, 2)])],
+            free: vec![3, 4, 5],
+            headroom: Some(3),
+            segment_chunks: 0,
+        };
+        assert_eq!(map.cheapest_runs(3, 1), Some(vec![]), "room for the run: no one moves");
+        map.headroom = Some(1);
+        assert_eq!(
+            map.cheapest_runs(3, 1),
+            Some(vec![pid(1), pid(2)]),
+            "two chunks short of the budget: the two cheapest elsewhere are emptied"
+        );
+        map.headroom = Some(0);
+        assert_eq!(map.cheapest_runs(3, 1), None, "three short and two to empty: no runs stand");
+    }
+
+    /// A run lies inside one segment: free chunks either side of a
+    /// segment's edge are no run.
+    #[test]
+    fn a_run_across_a_segments_edge_is_no_run() {
+        let map = ChunkMap {
+            held: Vec::new(),
+            free: vec![6, 7, 8, 9],
+            headroom: None,
+            segment_chunks: 8,
+        };
+        assert_eq!(map.cheapest_runs(4, 1), None, "6..10 crosses chunk 8's segment edge");
+        assert_eq!(map.cheapest_runs(2, 2), Some(vec![]), "6..8 and 8..10 each lie in one");
     }
 }

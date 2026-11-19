@@ -2516,6 +2516,8 @@ impl PoolPort for BindRoomPool {
                 })
                 .collect(),
             free: Vec::new(),
+            headroom: None,
+            segment_chunks: 0,
         }
     }
     fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {

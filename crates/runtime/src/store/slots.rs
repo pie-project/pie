@@ -1203,6 +1203,13 @@ impl SlotPool {
         self.open.iter_in(0, self.total).collect()
     }
 
+    /// The open chunks a guest's state may take ([`Self::chunk_runs_for`]'s):
+    /// below the activation the rung lends and the ceiling.
+    #[must_use]
+    pub fn state_open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.state_limit().min(self.ceiling)).collect()
+    }
+
     /// The logical -> physical table the engine keeps: a permutation, free
     /// logical ids included.
     pub fn chunk_table(&self) -> &[u32] {

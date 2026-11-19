@@ -27,8 +27,15 @@ pub struct ChunkMap {
     /// all, and each candidate's pages there that would leave the device
     /// with it.
     pub held: Vec<ChunkHeld>,
-    /// The chunks free now.
+    /// The chunks free now that state may take: open, below the activation
+    /// the rung lends and the ceiling.
     pub free: Vec<u32>,
+    /// How many chunks state may open now within the budget
+    /// ([`crate::store::slots::SlotPool::headroom`]); `None`: no bound.
+    /// A free chunk opened takes one; a chunk emptied gives one back.
+    pub headroom: Option<u32>,
+    /// The chunks a segment holds; a run lies inside one. `0`: no bound.
+    pub segment_chunks: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,6 +66,10 @@ impl ChunkMap {
     #[must_use]
     pub fn cheapest_runs(&self, run: u32, pieces: u32) -> Option<Vec<ProcessId>> {
         let run = run.max(1);
+        let one_segment = |first: u32| {
+            self.segment_chunks == 0
+                || first / self.segment_chunks == (first + run - 1) / self.segment_chunks
+        };
         let free: std::collections::BTreeSet<u32> = self.free.iter().copied().collect();
         let held: std::collections::BTreeMap<u32, &ChunkHeld> = self
             .held
@@ -79,6 +90,7 @@ impl ChunkMap {
             free.iter().chain(held.keys()).copied().collect();
         let mut windows: Vec<(u32, u32)> = starts
             .iter()
+            .filter(|&&first| one_segment(first))
             .filter_map(|&first| {
                 (first..first + run)
                     .map(cost)
@@ -99,10 +111,29 @@ impl ChunkMap {
         if (taken.len() as u32) < pieces {
             return None;
         }
-        let mut pids: Vec<ProcessId> = taken
+        let in_runs: std::collections::BTreeSet<u32> = taken
             .iter()
             .flat_map(|&(_, first)| first..first + run)
-            .filter_map(|chunk| held.get(&chunk))
+            .collect();
+        // The free chunks the runs open take the budget's headroom; past
+        // it, each needs a chunk emptied elsewhere (its slots leave, and
+        // the budget it held comes back). Counted as costless, a free run
+        // the budget could not open was waited on with no one moved.
+        let opened = in_runs.iter().filter(|chunk| free.contains(chunk)).count() as u32;
+        let short = opened.saturating_sub(self.headroom.unwrap_or(u32::MAX));
+        let mut elsewhere: Vec<&ChunkHeld> = held
+            .values()
+            .filter(|chunk| !in_runs.contains(&chunk.chunk))
+            .copied()
+            .collect();
+        elsewhere.sort_unstable_by_key(|chunk| (chunk.pages(), chunk.chunk));
+        if (elsewhere.len() as u32) < short {
+            return None;
+        }
+        let mut pids: Vec<ProcessId> = in_runs
+            .iter()
+            .filter_map(|chunk| held.get(chunk).copied())
+            .chain(elsewhere.into_iter().take(short as usize))
             .flat_map(|held| held.by.iter().map(|&(pid, _)| pid))
             .collect();
         pids.sort_unstable();
@@ -433,7 +464,9 @@ impl PoolPort for RegistryPool {
                     .into_iter()
                     .map(|(chunk, (used, by))| ChunkHeld { chunk, used, by })
                     .collect(),
-                free: pool.pool().open_chunks(),
+                free: pool.pool().state_open_chunks(),
+                headroom: Some(pool.pool().headroom()),
+                segment_chunks: pool.pool().segments().segment_chunks(),
             }
         })
     }
