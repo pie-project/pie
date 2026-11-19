@@ -388,7 +388,9 @@ pub struct Stepwise {
 /// 3: a node keeps its temporaries in an area of its own, at its op's word
 /// past the values' in the offsets table (`node_area`), in place of the
 /// stage's one area at `cfg.temporary`.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 3;
+/// 4: a reshape that covers its source is read as its source whatever the
+/// stage's channel slots number, and launches nothing.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 4;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
