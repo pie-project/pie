@@ -43,10 +43,11 @@ impl Dense {
 
 /// The name a kernel is said by.
 fn name(tactic: &Tactic) -> &'static str {
-    match (tactic.vector > 0, tactic.wide) {
-        (true, _) => "gemv",
-        (false, false) => "tiled",
-        (false, true) => "wide tiled",
+    match (tactic.vector > 0, tactic.tier, tactic.wide) {
+        (true, ..) => "gemv",
+        (false, kernels_slang::Tier::Coopmat, _) => "coopmat",
+        (false, _, false) => "tiled",
+        (false, _, true) => "wide tiled",
     }
 }
 
