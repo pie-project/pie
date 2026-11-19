@@ -181,7 +181,9 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                per_instance,
+                resident: per_instance,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair,
                 run: 1,
             },
@@ -231,6 +233,7 @@ impl Engine for GuestEngine {
         &self,
         _program: ProgramId,
         _extents: &BindExtents,
+        _class: eta_ir::registry::GeometryClass,
     ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }

@@ -201,7 +201,7 @@ impl Plane {
     /// The value scratch an instance's state holds: its widest launching
     /// stage's, a frame in flight each, in which it fires every stage,
     /// alone or as a lane of its pair's batch
-    /// (`engine::GuestState::per_instance`).
+    /// (`engine::GuestState::resident`).
     fn instance_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<u64>> {
         let scratch = Session::scratch_for(&program.compiled, extents)?;
         Ok(if scratch == 0 { Vec::new() } else { vec![scratch; self.arms] })
@@ -460,7 +460,7 @@ impl Plane {
             Some(held) => held.place.clone(),
             None => take(state.per_pair),
         };
-        let scratch = take(state.per_instance);
+        let scratch = take(state.resident);
         self.bind(
             context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )
@@ -1402,7 +1402,7 @@ struct Bound {
     /// The pair whose batch sets its grouped stages fire with.
     pair: u64,
     /// Where its value scratch lies, one a frame in flight, for the stages
-    /// it fires alone (`engine::GuestState::per_instance`).
+    /// it fires alone (`engine::GuestState::resident`).
     scratch_place: engine::ScratchPlace,
     scratch: Vec<launch::ScratchAt>,
     program_id: ProgramId,

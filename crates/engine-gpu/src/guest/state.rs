@@ -10,7 +10,7 @@
 //!
 //! - each stage's heap, the values its launches lay over their lifetimes
 //!   ([`eta_exec::tables::StageTables::scratch`]): the instance's own
-//!   (`per_instance`), in its own `Instance` slots or run of chunks, so the
+//!   (`resident`), in its own `Instance` slots or run of chunks, so the
 //!   pool holds a heap for every bound instance and none more. Its stages
 //!   share one region as wide as the widest: a stage runs whole (staged
 //!   in, dispatched, read back, its kept puts copied to their channels'
@@ -152,7 +152,11 @@ impl GuestLayout {
             )));
         }
         Ok(GuestState {
-            per_instance: self.instance,
+            // Today's arms are folded into the instance's bytes: one arm, no
+            // scratch apart.
+            resident: self.instance,
+            scratch: 0,
+            scratch_arms: 1,
             per_pair: self.pair,
             run: u32::try_from(run).unwrap_or(u32::MAX),
         })
@@ -337,7 +341,9 @@ mod tests {
         assert_eq!(
             small.state(&FACTS).expect("fits"),
             GuestState {
-                per_instance: 100_000,
+                resident: 100_000,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair: 0,
                 run: 0
             }
@@ -346,7 +352,9 @@ mod tests {
         assert_eq!(
             top_p.state(&FACTS).expect("fits"),
             GuestState {
-                per_instance: 5_056_768,
+                resident: 5_056_768,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair: 0,
                 run: 2
             }

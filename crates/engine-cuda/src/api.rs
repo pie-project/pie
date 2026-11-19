@@ -960,6 +960,8 @@ impl Engine for Cuda {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.shell.as_ref() {
             Some(shell) => shell

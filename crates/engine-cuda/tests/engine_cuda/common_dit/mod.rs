@@ -663,6 +663,7 @@ pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
         lanes: 1,
         instance: handles.instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

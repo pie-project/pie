@@ -1,3 +1,4 @@
+use crate::ports::GeometryClass;
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::AdapterRegistration;
@@ -268,8 +269,16 @@ pub trait Engine: Send {
     /// at every bind, on the lane, before it is sent. The default states
     /// none: an engine that lays its guests' scratch in the fire's span
     /// ([`Self::fire_facts`]) states it there until it moves it here.
-    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
-        let _ = (program, extents);
+    /// `class` is the geometry class the instance is bound at
+    /// ([`InstanceBinding::geometry`]): the engine states its scratch arms
+    /// per class ([`GuestState::scratch_arms`]).
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &BindExtents,
+        class: GeometryClass,
+    ) -> Result<GuestState> {
+        let _ = (program, extents, class);
         Ok(GuestState::default())
     }
 
