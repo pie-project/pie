@@ -116,9 +116,9 @@ pub struct RuntimeConfig {
 }
 
 pub struct ModelConfig {
-    /// How this process yields memory to the system around it
-    /// (`[engine.memory] governor_*`).
-    pub memory_tolerance: crate::governor::Tolerance,
+    /// How much of the device budget this load gives back to the system's
+    /// memory pressure (`[engine.memory] yield`).
+    pub memory_yield: crate::governor::Yield,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -255,7 +255,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let bound_port = config.port;
 
     let ModelConfig {
-        memory_tolerance,
+        memory_yield,
         name,
         model_id,
         kv_page_size,
@@ -793,9 +793,26 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
+    // A yield that moves some pool needs the system's memory pressure: with
+    // none to read, the load is refused by name rather than yielding
+    // nothing. At yield 0, or where every pool is laid whole, nothing is
+    // read.
+    let moves = governed.iter().any(crate::governor::run::yield_applies);
+    let source = if moves {
+        crate::governor::source_for(memory_yield, ::engine::pressure::Source::of_this_system)
+    } else {
+        Ok(None)
+    };
+    let source = match source {
+        Ok(source) => source,
+        Err(why) => {
+            scheduler_shutdown.shutdown().await.ok();
+            return Err(anyhow::anyhow!(why));
+        }
+    };
     for (engine, steered) in governed.into_iter().enumerate() {
         let room = rooms.get_mut(engine).and_then(Option::take);
-        crate::governor::run::start(steered, memory_tolerance, room);
+        crate::governor::run::start(steered, memory_yield, room, source.clone());
     }
     active_guard.disarm();
     Ok(BootstrapHandle {

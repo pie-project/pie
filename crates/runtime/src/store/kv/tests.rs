@@ -90,6 +90,7 @@ fn tests_every_case() {
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
     floor_keyed_idle_cache_is_dropped_not_demoted();
+    a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
@@ -1676,6 +1677,39 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
         s.flat_table(b).unwrap().to_vec(),
         s.table.flatten(b).unwrap()
     );
+}
+
+/// How long idle cache is kept is the policy's (KEEP_CACHE moved to PLEX):
+/// a key above the floor keeps it from a reclaim the runtime runs unasked,
+/// and once the policy lowers the key (its keep over, on its alarm) the next
+/// demand reclaims it. With no policy, idle cache has no expiry: it stays
+/// whatever time passes, and only a demand for its room (the planner's
+/// reclaim) takes it, lowest key then least recently used first.
+fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new(8, h(43));
+    let (kept, unkept) = (ProcessId::from_u128(47), ProcessId::from_u128(48));
+    let kept_tokens = kept_and_gone(&mut store, 22, 3, kept);
+    let unkept_tokens = kept_and_gone(&mut store, 23, 3, unkept);
+    // No demand: nothing is reclaimed, however long the cache sits.
+    for _ in 0..1000 {
+        store.retire_idle();
+    }
+    assert_eq!(on_device(&mut store, &kept_tokens), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 3);
+    // The policy keeps one: a demand reclaims only the other.
+    let keep = move |owner: Option<ProcessId>| {
+        if owner == Some(kept) { FLOOR + 1 } else { FLOOR }
+    };
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "unkept: reclaimed");
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the keep is honoured");
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
+    // The keep is over: the policy lowers the key, and the next demand
+    // reclaims it.
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), |_| FLOOR), 3);
+    assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
 /// Idle cache dropped while fires are in flight goes back once the fires

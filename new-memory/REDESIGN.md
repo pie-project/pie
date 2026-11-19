@@ -153,7 +153,7 @@ SPEC decision 7 stands: the governor decides how much, PLEX decides what stays, 
 
 | Role | Interface today | What it reads after the redesign |
 |---|---|---|
-| Governor (`runtime/src/governor.rs`) | `PoolTarget`: `floor`, `hard_limit`, `held`, `demand {wanted, live}`, `growth`, `retarget(segments)` | `hard_limit` = measured capacity − `outside` − model floor (2.2), no longer a share of the card. `floor` = one working set + the smallest rung's `fire` (as its doc already says). `held` and `demand` are ledger sums. `growth` is `Fixed` on a span that cannot be unbacked (ROCm, Vulkan, wgpu, XLA) and `Elastic` on CUDA and Metal, as today. |
+| Governor (`runtime/src/governor.rs`) | `PoolTarget`: `floor`, `hard_limit`, `held`, `growth`, `retarget(segments)` (`demand` went with the demand-following loop, 2026-11-15) | `hard_limit` = measured capacity − `outside` − model floor (2.2), no longer a share of the card. `floor` = one working set + the smallest rung's `fire` (as its doc already says). `held` and `demand` are ledger sums. `growth` is `Fixed` on a span that cannot be unbacked (ROCm, Vulkan, wgpu, XLA) and `Elastic` on CUDA and Metal, as today. |
 | Ledger | — | `total` at any moment is `min(capacity, governor target)`. The invariant `model + state + fire(rung) <= total` is checked against that. |
 | PLEX (`plex:policy`, `runtime/src/policy/pressure.rs`) | one `tier-pressure` edge a band crossing; worker attrs `{device,host}-{total,state,live,wanted,act,short}-bytes`; answers with `discard` and retention keys | The same attrs, now exact because every byte is in the ledger (`act` is `fire(rung)` whole, not the arena alone). Two attrs added, `model` (cache bytes) and `outside`; attrs are not verbs. |
 | Pool | segments, evacuation, `copy_slots` | unchanged |
@@ -166,7 +166,7 @@ What PLEX may be asked to give up:
 
 So the redesign defines no valuation of its own. An earlier draft proposed a common unit ("expected time lost"); that is a policy's business and is dropped.
 
-Not addressed here: the governor's own loop constants (`FIRST_HOLD`, `IDLE_AFTER`, `KEEP_CACHE`, `CUT_SHARE`, and the tolerance table), which its header says were measured on one 16 GB machine. They act only when the process is not dedicated, and they size nothing; FOLLOWUPS F2 turns the tolerance into `governor_*` keys.
+The governor (user ruling, 2026-11-15): no loop constants and no tolerance table. Its device target is one rule, `target = floor + (budget_device − floor) × (1 − yield × pressure)`, with `floor` the pool's floor, the load's own promise (one lane at the full declared `max_context`, the reserved chunks, the activation span and the dense weights; Leader's ruling: yield never presses below it, so a long `max_context` raises the floor and lowers how far yield can press; the load line states each part). Leader's rulings: once pressure goes the pool grows back only on demand up to the target (nothing allocates for nobody); at `yield = 1` it trims under moderate pressure, by design; `yield = 0`, the default, never trims. Live state over the target stays: the pool answers `NoRoom`, the governor raises tier pressure, and the load log says so on that edge, `budget_device` the pool's hard limit and `pressure` the OS's own reading in 0..1: Linux / Android PSI `/proc/pressure/memory` `some avg10` / 100, read once per the kernel's 2 s averaging period (`PSI_FREQ`, kernel/sched/psi.c); macOS `1 − kern.memorystatus_level / 100` (percent available, unprivileged). A `yield` above 0 on a system whose pressure cannot be read (no PSI, Windows, iOS, a browser, an unreadable sysctl) refuses the load by name; at `yield = 0` nothing is read. An engine refusing a commit reads as pressure 1. `yield = 0` (the default) holds the budget and reads nothing. A pool the engine states is `Growth::Fixed` takes no yield, and the load logs it once: XLA's one PJRT buffer, and wgpu's pool (user ruling: laid whole at load, never resized; engine-gpu's `Backend::RESIZES_POOL = false`). The rule and the OS readers live in the engine crate (`engine::memory::target`, `engine::pressure::{Source, host, Yield}`), shared with the host kv tier. Shedding toward a lower target keeps PLEX order: segment evacuation, then the weight cache, then `tier-pressure` for idle prefixes; the activation rung's lower is the last step, taken only when a waiter is parked short of a slot or the target is under what is mapped with no room to evacuate into (no tick count: `PATIENCE` is gone). Idle cache is never timed out by the runtime (`KEEP_CACHE` is gone): with no policy it stays until a demand needs its room and goes in key, then LRU, order; a policy states a longer or shorter keep with its retention keys (a key above the floor keeps it, and `set-alarm` lowers it when the keep is over).
 
 ### 2.9 Metal: ANE
 
@@ -193,9 +193,9 @@ Memory sizing reads **no key by default**. Everything below is optional; an empt
 | `budget_host` | what the governor allows | same, for host memory |
 | `budget_disk` | none without `disk_path` | same, for disk |
 | `disk_path`, `disk_persistent` | no disk tier | where files go is the operator's |
-| `governor_backoff`, `governor_release_idle` | dedicated: `1.0`, `false` | how much to yield when the system is congested, and whether idle memory goes back |
+| `yield` | `0`: hold the whole budget | how much of the budget a shared machine gives back to the OS's memory pressure (2.8) |
 
-Seven keys, none required. `governor_patience` (F2) goes (user decision, 2026-11-13): in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value ( today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
+Six keys, none required. `governor_patience`, `governor_backoff` and `governor_release_idle` went (user rulings 2026-11-13, 2026-11-15) for the one `yield`; a file that states one fails as serde's unknown field. Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
 
 Removed (user ruling, 2026-11-16: no rename table or per-key message; a file that still states one fails as serde's unknown field):
 
@@ -204,7 +204,7 @@ Removed (user ruling, 2026-11-16: no rename table or per-key message; a file tha
 | `device_memory_share`, `[wgpu] device_memory` | measured capacity; `budget_device` to cap |
 | `device_kv_budget`, `host_kv_budget`, `disk_kv_budget` | the ledger; `budget_*` to cap a tier |
 | `disk_kv_dir`, `disk_kv_persistent` | `disk_path`, `disk_persistent` |
-| `memory_tolerance` | `governor_*` |
+| `memory_tolerance`, `governor_backoff`, `governor_release_idle` | `yield` |
 | `weight_streaming` | weights are holders (2.7, F1) |
 | `snapshot_budget` | snapshots are disk-tier holders (F1) |
 | `max_forward_tokens`, `max_forward_requests` | the derived largest rung (2.5) |

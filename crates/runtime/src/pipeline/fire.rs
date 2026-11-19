@@ -6398,10 +6398,10 @@ mod rung_wait_tests {
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
         ask.until_settled(&fire);
 
-        // The pool idles past the walker's patience with the fire queued:
-        // fires are cut to what is asked, never under the staged fire.
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        // A waiter is short of a slot with the fire queued: fires are cut
+        // to what is asked, never under the staged fire.
+        shared.lock().unwrap().pool_mut().wait(1, 0, 1);
+        for _ in 0..6 {
             grow.walk_rung().await;
             assert!(
                 crate::store::shared::fire_cap(ENGINE) >= 2,
@@ -6422,8 +6422,7 @@ mod rung_wait_tests {
         tokio::task::yield_now().await;
         assert!(fire.is_settled());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        for _ in 0..6 {
             grow.walk_rung().await;
         }
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
