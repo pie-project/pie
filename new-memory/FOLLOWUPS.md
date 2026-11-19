@@ -382,3 +382,27 @@ Each turns depth into depth 1 or adds host work per step; CUDA does the same in 
 - kernels-metal has the VECTOR_MAX_ROWS = 4 GEMM cliff (linear/gemm.rs:33), and the qmv fold only folds
   divisors <= 8, so 11 rows take ~11 weight passes (linear/qmv/rows.rs:60).
 - Metal never counts the Refused tally.
+
+## F33. Metal's few-row dense matmul on the M1: 4 rows ≈ 1.38× one row
+The user's rule is that a beam-4 step costs about what a single greedy step costs. On the M1 Max
+(Qwen3-0.6B, home-carve), after `sc/mac-gemv-rows` (0bc7019c8, few-row forms that read each weight row
+once), a step costs: greedy ×1 5.96 ms, 4 parallel greedy 8.21 ms, beam-4 8.31 ms. The device profile of
+a 4-row decode fire is 8.1 ms (projections 5.7 ms, against 3.9 ms at 1 row); the rest is flat.
+Tried and dropped (each passed the few-row matmul test; device time of the wide projections at 4 rows,
+against 3.9 ms for 0bc7019c8):
+- weights converted once for all rows: 3.9 ms (conversion is not the bottleneck);
+- activation rows staged per threadgroup as floats, 8 columns, 64-group tiles: 4.5 ms; resized to 32 KiB
+  (16 columns, 1024/R groups): 4.7 ms (barriers, and one threadgroup a core);
+- 4 columns a simdgroup, an activation load shared by 4 weight rows: 4.2 ms (fewer simdgroups, register
+  pressure);
+- the 8×8 simdgroup matrix multiply, rows padded to 8, D^T = W x A^T with each lane's weight operand a
+  contiguous bf16 pair (patch kept in the Metal session's scratchpad): projections 7.5 / 7.8 / 8.4 ms at
+  2 / 4 / 8 rows, against 4.4 / 5.7 / 9.2 ms. Flat in the rows, as a weight-read-bound form should be,
+  but bound by its 4-byte weight loads: it beats 0bc7019c8 only at 8 rows (fire 12.1 -> 11.3 ms).
+What could still close it: the matrix form with wider weight loads (weights pre-packed so a lane's
+operand pairs come from one 16-byte load, or several 8×8 blocks a load), which needs a packed weight
+layout; or a kernel that is load-issue-bound at the M1's rate rather than per-lane. Measure on the M5
+(tensor ops) before choosing: the M1 is not where Apple's decode will be judged. Measured on the M5 at
+a34acca57 (Mac Pro, same method): greedy ×1 5.08 ms, 4 parallel 5.52 ms (1.09×), beam-4 6.09 ms (1.20×);
+the 4-row projections take the few-row vector forms there too (3.4 + 1.3 ms against 3.2 + 1.1 at one row),
+so the M5 meets the rule within ~20% and the gap is the M1's.
