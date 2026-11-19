@@ -1050,7 +1050,10 @@ impl KvStore {
     }
 
     /// Idle cache a `retention/tiers` row keeps off the device, moved down
-    /// now, whatever its key and whether or not its room is wanted.
+    /// now, whatever its key and whether or not its room is wanted. The
+    /// floor gates the demotes pressure chooses (the runtime picks those
+    /// sets); this one the policy chose by its row, and floor-keyed cache
+    /// left on the device would sit where its row says it may not.
     pub fn prepare_demote_now(
         &mut self,
         keys: impl Keys,

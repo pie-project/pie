@@ -1021,6 +1021,7 @@ impl Port {
             // and not counted.
             let mut freed: u64 = 0;
             let mut took = false;
+            let mut kept = false;
             for candidate in candidates {
                 if freed >= short {
                     break;
@@ -1067,6 +1068,7 @@ impl Port {
                         } else {
                             tracing::debug!(tier = tier.name(), working_set = %owner, key, up_to = ?demand.up_to, why, "tier pressure: the default responder keeps a working set");
                         }
+                        kept = true;
                         continue;
                     }
                 }
@@ -1081,6 +1083,10 @@ impl Port {
             if took {
                 nothing_left_ends(tier, "a working set is moved down or discarded");
                 let _ = KEPT.lock().unwrap()[tier.index()].end();
+            } else if kept {
+                // What it kept is keyed above the demand: running work or
+                // new keys may still let it go, so this is no answer of
+                // nothing, and no short waiter fails on it.
             } else {
                 // Said once an episode, as it starts; its repeats at DEBUG.
                 if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
@@ -1351,6 +1357,56 @@ mod responder_tests {
             "the default responder discarded a live process's state"
         );
         IDLE.lock().unwrap().clear();
+        SHED.lock().unwrap().clear();
+    }
+
+    /// Cache the responder keeps (keyed above the demand, no tier below)
+    /// is not an answer of nothing: a short waiter that could fit alone
+    /// does not fail on it, since running work or new keys may still let
+    /// that cache go. With nothing left at all, the answer is nothing.
+    #[test]
+    fn keeping_cache_keyed_above_the_demand_is_no_answer_of_nothing() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _schedule = crate::policy::schedule::TEST_LOCK.blocking_write();
+        let mut port = idle_port();
+        let kept = ProcessId::new_v4();
+        IDLE.lock().unwrap().clear();
+        IDLE.lock().unwrap().push((kept, 4, 10));
+        SHED.lock().unwrap().clear();
+        let bounded = pressure::Demand {
+            up_to: Some(0),
+            ..pressure::Demand::default()
+        };
+        let press_bounded = |port: &mut Port| {
+            port.apply(Event::TierPressure(
+                Tier::Device,
+                Reading {
+                    band: Band::of(Band::Clear, 1 << 30, 1 << 31),
+                    short: 1 << 30,
+                    demand: bounded,
+                },
+            ));
+        };
+        press_bounded(&mut port);
+        let above = |_: Option<ProcessId>| 10;
+        let before = pressure::nothing_freed(Tier::Device);
+        assert!(
+            port.pressure_round(&above).is_empty(),
+            "kept, not discarded"
+        );
+        assert_eq!(
+            pressure::nothing_freed(Tier::Device),
+            before,
+            "keeping something is no answer of nothing"
+        );
+        IDLE.lock().unwrap().clear();
+        press_bounded(&mut port);
+        assert!(port.pressure_round(&above).is_empty());
+        assert_eq!(
+            pressure::nothing_freed(Tier::Device),
+            before + 1,
+            "with nothing left, the answer is nothing"
+        );
         SHED.lock().unwrap().clear();
     }
 
