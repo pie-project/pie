@@ -205,7 +205,7 @@ impl Refs {
 struct Rig {
     engine: backend::Engine,
     asynchronous: bool,
-    heard: mpsc::Receiver<engine::StepDone>,
+    heard: mpsc::Receiver<(engine::StepDone, engine::StepOutcome)>,
 }
 
 impl Rig {
@@ -312,8 +312,8 @@ fn answers_the_host_path(frames: u8) {
     let asynchronous = engine.settles_asynchronously();
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
-    engine.on_complete(Arc::new(move |at, _| {
-        let _ = tx.lock().expect("the sink's sender").send(at);
+    engine.on_complete(Arc::new(move |at, outcome| {
+        let _ = tx.lock().expect("the sink's sender").send((at, outcome));
     }));
 
     // Chunks of the test's own above the committed ones: the guest's two,
@@ -325,7 +325,7 @@ fn answers_the_host_path(frames: u8) {
     engine.commit_segments(commit).expect("the segments commit");
     let mut slots = Slots::of(&facts, first, first + 1);
     let mut refs = Refs::of(&facts, LIST, first + 2);
-    assert!(refs.per >= 4, "a chunk holds the test's pages");
+    assert!(refs.per >= 5, "a chunk holds the test's pages");
 
     let masked = fixture.trace.facts.word(&Request::new(1, true));
     let plain = fixture.trace.facts.word(&Request::new(PROMPT, false));
@@ -342,8 +342,9 @@ fn answers_the_host_path(frames: u8) {
         vec![refs.take(), refs.take()],
         vec![refs.take(), refs.take()],
     ];
+    let mut alone = Vec::new();
     for (slot, set) in sets.iter().enumerate() {
-        rig.fire(
+        alone = rig.fire(
             vec![Lane {
                 slot: slot as u32,
                 word: plain,
@@ -539,6 +540,103 @@ fn answers_the_host_path(frames: u8) {
         }
         eprintln!("{frames} frame(s), step {step}: every beam the host path's");
     }
+
+    // Ports describing more lanes than the attachment owns: the constant
+    // `embed_indptr` describes both beams and the attachment owns one. Its
+    // lane is refused by name before any of its geometry applies, and the
+    // neighbour lane, another request's prompt on a set of its own, answers
+    // as it does alone.
+    for (channel, cell) in [(0u32, words(&TOKENS[0])), (3, bits(&masks[0].concat()))] {
+        assert!(
+            rig.engine
+                .publish_channel(instance, channel, &cell)
+                .expect("the cell publishes"),
+            "the ring had room"
+        );
+    }
+    let neighbour = Lane {
+        slot: 0,
+        word: plain,
+        tokens: prompt.clone(),
+        readout: Readout::Last,
+        tables: vec![(LIST, vec![refs.take()])],
+        ..Lane::default()
+    };
+    let _ = rig.heard.try_iter().count();
+    let mut ticket = rig
+        .engine
+        .submit(&FrameSubmission::of(Step {
+            attachments: vec![Attachment {
+                lane: 0,
+                lanes: 1,
+                instance,
+                adapter_only: false,
+                scratch: engine::ScratchPlace::None,
+            }],
+            lanes: vec![device_lanes().remove(0), neighbour],
+            media: Vec::new(),
+            voxels: Vec::new(),
+        }))
+        .expect("the frame fires");
+    rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+    let outcome = (0..600)
+        .find_map(|_| {
+            rig.heard
+                .recv_timeout(Duration::from_millis(100))
+                .ok()
+                .filter(|(at, _)| at.frame == ticket.id)
+                .map(|(_, outcome)| outcome)
+        })
+        .expect("the step that refused a lane tells its outcome");
+    let lanes: Vec<u32> = outcome.faulted.iter().map(|fault| fault.lane).collect();
+    assert_eq!(lanes, vec![0], "the attachment's lane alone faults: {:?}", outcome.faulted);
+    let why = format!("{:?}", outcome.faulted[0]);
+    assert!(why.contains("describes 2"), "{why}");
+    let got = &ticket.steps[0]
+        .readouts
+        .last()
+        .expect("the neighbour reads its logits")
+        .values;
+    let apart = got
+        .iter()
+        .zip(&alone[0])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        got.len() == alone[0].len() && apart <= 1e-3,
+        "the neighbour's logits are {apart} apart from its prompt's alone"
+    );
+    eprintln!("{frames} frame(s): an overreaching embed_indptr refused: {why}");
+    // The refused lane wrote nothing its working set holds: the device
+    // path's set still answers beam 0's first step as the host path did.
+    let again = rig.fire(
+        vec![Lane {
+            slot: 0,
+            word: masked,
+            tokens: vec![TOKENS[0][0]],
+            positions: vec![PROMPT],
+            readout: Readout::Last,
+            tables: vec![(LIST, sets[1].clone())],
+            kv: KvDelta {
+                held: PROMPT,
+                folded: PROMPT,
+                ..KvDelta::default()
+            },
+            mask: Some(Masking::Extent(runs(&masks[0][0]))),
+            ..Lane::default()
+        }],
+        None,
+    );
+    let apart = again[0]
+        .iter()
+        .zip(&want[0][0])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        apart <= 1e-3,
+        "after the refused lane, the device path's set answers {apart} apart: it wrote there"
+    );
+
     rig.engine
         .close_instance(instance)
         .expect("the instance closes");

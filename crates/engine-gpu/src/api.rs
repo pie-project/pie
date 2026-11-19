@@ -1715,6 +1715,18 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        // A refused lane still fires (token 0) to keep the composition; one
+        // whose program places its rows has no run of its own the host may
+        // append to, so its rows land in the null chunk, never its table.
+        let sunk: Vec<bool> = submission
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(at, lane)| {
+                lane.list == engine::fire::ListKind::Translation
+                    && faulted.faulted.iter().any(|fault| fault.lane as usize == at)
+            })
+            .collect();
         let seated: Vec<Seated<'_, B>> = submission
             .lanes
             .iter()
@@ -1728,13 +1740,19 @@ impl<B: Host> Gpu<B> {
                 },
                 pages: pages_of[at].as_deref().unwrap_or(&[]),
                 held: match device[at].as_ref().and_then(|placed| placed.have) {
+                    _ if sunk[at] => Some(0),
                     Some(have) => Some(have),
                     None => pages_of[at].is_some().then_some(lane.kv.held),
                 },
+                sunk: sunk[at],
                 folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
-                mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
+                mask: if sunk[at] {
+                    None
+                } else {
+                    resolved_masks[at].as_ref().or(lane.mask.as_ref())
+                },
 
                 adapter: lane_adapters[at].or(lane.adapter),
                 positions: device[at]
