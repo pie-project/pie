@@ -4,24 +4,31 @@
 //! the device is lost (an Adreno 840 on wgpu lost it on a 3843-token
 //! prompt's prefill steps of ~480 rows at ~3 to 3.8k keys, each 1 to 2 s).
 //!
-//! Every step is its own submission on both slang backends, so a frame's
-//! steps never share one: each is admitted alone. A step is estimated by the
-//! load's own estimate ([`engine::load::FireEstimate`], the device's
-//! measured `[rates]` over the model's counts) at its rows and the keys its
-//! longest lane attends, times the worst ratio of a frame's time to its
-//! estimate the device's rates step measured (its clock's swing among them,
-//! [`crate::rates::measured_worst`]; 1 where this process measured none):
+//! Every step is its own submission on both slang backends (its own command
+//! buffer and fence), so a frame's steps never share one: each is admitted
+//! alone. A step is estimated by the load's own estimate
+//! ([`engine::load::FireEstimate`], the device's measured `[rates]` over the
+//! model's counts) at its rows and the keys its longest lane attends, times
+//! the worst ratio of a frame's time to its estimate the device's rates step
+//! measured, its clock's swing at least (`[rates] submit_worst_ratio`, saved
+//! with the other rates), and as a split step its widest submission, a
+//! layer's share of the dispatches with the readout's on the last:
 //!
-//! - estimated within the bound: one submission, as without a bound;
-//! - past it whole, its layers each within it: submitted a layer at a time
-//!   (`Run::flush_between_layers`), each submission a layer's share of the
-//!   step's dispatches and the readout's with the last;
-//! - past it even a layer at a time: refused by name, naming the bound and
+//! - a prompt step (a lane of more than one row) is kept whole only where its
+//!   whole estimate is under the bound by at least one layer's: the layer is
+//!   the split's own granularity, and a device warmer than any boot measured
+//!   (an Adreno 840 ran ~1.25x slower warm) eats into a margin measured
+//!   cool; else it is submitted a layer at a time
+//!   (`Run::flush_between_layers`), which costs a native Vulkan step nothing
+//!   measurable;
+//! - a decode step (one row a lane, tiny) is kept whole where its estimate
+//!   fits the bound;
+//! - a step no layer of which fits is refused by name, naming the bound and
 //!   the estimate. The load lowers the rows a prefill fire takes
-//!   (`FireLimits::prefill_rows`) to the widest laid rung whose prompt step
-//!   at the load's context is admitted ([`SubmitBound::prefill_rows`]), so a
-//!   prompt is cut to steps that fit; a step refused past that is one no
-//!   rung fits.
+//!   (`FireLimits::prefill_rows`) to the widest laid rung whose prompt step at
+//!   the load's context is admitted ([`SubmitBound::prefill_rows`]), so a
+//!   prompt is cut to steps that fit; a step refused past that is one no rung
+//!   fits.
 //!
 //! No margin is chosen here: the bound is the platform's, the estimate and
 //! the worst ratio are measurements. Where no bound is stated nothing is
@@ -31,12 +38,14 @@ use engine::load::{FireEstimate, RungFacts};
 
 /// What a step asks of the device, as the estimate weighs it: `rows` new
 /// tokens over `lanes` lanes, the longest lane attending `keys` keys (the
-/// slots it holds and its own rows).
+/// slots it holds and its own rows); a prompt step where a lane carries more
+/// than one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepRows {
     pub rows: u32,
     pub lanes: u32,
     pub keys: u32,
+    pub prompt: bool,
 }
 
 impl StepRows {
@@ -52,6 +61,7 @@ impl StepRows {
                 .map(|lane| lane.kv.held.saturating_add(lane.rows()))
                 .max()
                 .unwrap_or(0),
+            prompt: step.lanes.iter().any(|lane| lane.rows() > 1),
         }
     }
 }
@@ -89,11 +99,14 @@ impl Admitted {
 }
 
 /// The rule, over estimates already at the worst ratio: a step of `whole`
-/// ns in one submission where it fits `bound_ns`; else in `layers`
-/// submissions where the widest, `per_layer` ns, fits; else refused.
+/// ns, `per_layer` its widest submission a layer at a time over `layers`.
+/// A prompt step is whole only where `whole` is under `bound_ns` by at least
+/// `per_layer` (the split's granularity), a decode step where `whole` fits;
+/// else in layers where `per_layer` fits; else refused.
 #[must_use]
-pub fn admit_ns(whole: f64, per_layer: f64, layers: u32, bound_ns: f64) -> Admitted {
-    if whole <= bound_ns {
+pub fn admit_ns(whole: f64, per_layer: f64, layers: u32, bound_ns: f64, prompt: bool) -> Admitted {
+    let headroom = if prompt && layers > 1 { per_layer } else { 0.0 };
+    if whole + headroom <= bound_ns {
         Admitted::Whole { ns: whole }
     } else if layers > 1 && per_layer <= bound_ns {
         Admitted::Layers {
@@ -109,18 +122,18 @@ pub fn admit_ns(whole: f64, per_layer: f64, layers: u32, bound_ns: f64) -> Admit
     }
 }
 
-/// The submissions a frame of `steps` (each `(whole, per_layer)` ns at the
-/// worst ratio) is cut into: each step its own submission, or its layers'
-/// where it is past the bound whole; each entry the step's index and its
+/// The submissions a frame of `steps` (each `(whole, per_layer, prompt)`,
+/// ns at the worst ratio) is cut into: each step its own submission, or its
+/// layers' where [`admit_ns`] splits it; each entry the step's index and its
 /// estimate. `Err` names the first step no submission of which fits.
 pub fn frame_submissions(
-    steps: &[(f64, f64)],
+    steps: &[(f64, f64, bool)],
     layers: u32,
     bound_ns: f64,
 ) -> Result<Vec<(usize, f64)>, (usize, Admitted)> {
     let mut out = Vec::new();
-    for (at, &(whole, per_layer)) in steps.iter().enumerate() {
-        match admit_ns(whole, per_layer, layers, bound_ns) {
+    for (at, &(whole, per_layer, prompt)) in steps.iter().enumerate() {
+        match admit_ns(whole, per_layer, layers, bound_ns, prompt) {
             Admitted::Whole { ns } => out.push((at, ns)),
             Admitted::Layers {
                 per_submission,
@@ -139,7 +152,7 @@ pub struct SubmitBound {
     /// The platform's bound, ns.
     pub bound_ns: f64,
     /// The worst ratio of a frame's time to its estimate the device's rates
-    /// step measured, at least 1.
+    /// step measured, at least 1 (`[rates] submit_worst_ratio`).
     pub worst: f64,
     /// The load's estimate (its rates with the backend's row tile laid).
     pub estimate: FireEstimate,
@@ -181,7 +194,7 @@ impl SubmitBound {
     #[must_use]
     pub fn admit(&self, step: StepRows) -> Admitted {
         let (whole, per_layer) = self.step_ns(step);
-        admit_ns(whole, per_layer, self.layers, self.bound_ns)
+        admit_ns(whole, per_layer, self.layers, self.bound_ns, step.prompt)
     }
 
     /// The laid rung a step of `rows` runs under: the narrowest at or past
@@ -208,6 +221,7 @@ impl SubmitBound {
                     rows: rung,
                     lanes: 1,
                     keys: context.max(rung),
+                    prompt: rung > 1,
                 }),
                 Admitted::Refused { .. }
             )
@@ -239,7 +253,8 @@ impl SubmitBound {
         format!(
             "a step of {} rows over {} lanes at {} keys is estimated at {:.0} ms whole and {:.0} \
              ms a layer at a time ({} layers, at the worst ratio {:.3} of a frame's time to its \
-             estimate the rates step measured), past the platform's stated bound of {:.0} ms on \
+             estimate the rates step measured, `[rates] submit_worst_ratio`), past the platform's \
+             stated bound of {:.0} ms on \
              one GPU submission (engine_gpu::rates::STATED_SUBMIT_BOUND); the widest prefill \
              rung this load lays is {} rows",
             step.rows,
@@ -320,21 +335,33 @@ mod tests {
     }
 
     fn prompt(rows: u32, keys: u32) -> StepRows {
-        StepRows { rows, lanes: 1, keys }
+        StepRows {
+            rows,
+            lanes: 1,
+            keys,
+            prompt: true,
+        }
     }
 
-    /// Two prompt steps of a frame, together past the bound and each within
-    /// it: two submissions, each within the bound.
+    /// `b`'s estimate of `step` as [`frame_submissions`] takes it.
+    fn shaped(b: &SubmitBound, step: StepRows) -> (f64, f64, bool) {
+        let (whole, per_layer) = b.step_ns(step);
+        (whole, per_layer, step.prompt)
+    }
+
+    /// Two prompt steps of a frame, together past the bound and each under
+    /// it by a layer: two submissions, each within the bound. A step past
+    /// it whole goes a layer at a time.
     #[test]
     fn a_frame_past_the_bound_together_splits_into_submissions_within_it() {
         let b = bound(1.0);
-        let steps = [b.step_ns(prompt(256, 1024)), b.step_ns(prompt(256, 1280))];
+        let steps = [shaped(&b, prompt(256, 1024)), shaped(&b, prompt(256, 1280))];
         assert!(steps[0].0 + steps[1].0 > BOUND, "{steps:?}");
+        assert!(steps.iter().all(|s| s.0 + s.1 <= BOUND), "{steps:?}");
         let subs = frame_submissions(&steps, b.layers, BOUND).unwrap();
         assert_eq!(subs.len(), 2);
         assert!(subs.iter().all(|&(_, ns)| ns <= BOUND));
-        // A step past the bound whole goes a layer at a time.
-        let long = b.step_ns(prompt(512, 3800));
+        let long = shaped(&b, prompt(512, 3800));
         assert!(long.0 > BOUND, "{long:?}");
         let subs = frame_submissions(&[steps[0], long], b.layers, BOUND).unwrap();
         assert_eq!(subs.len(), 1 + 28);
@@ -342,16 +369,53 @@ mod tests {
         assert!(b.admit(prompt(512, 3800)).split());
     }
 
-    /// The worst ratio the rates step measured moves a step past the bound
-    /// that fits at a ratio of 1.
+    /// A prompt step whose whole estimate fits the bound but not by one
+    /// layer's estimate is split; a decode step of the same estimate stays
+    /// whole.
+    #[test]
+    fn a_prompt_step_stays_whole_only_a_layer_under_the_bound() {
+        let b = bound(1.0);
+        let step = prompt(256, 1024);
+        let (whole, per_layer) = b.step_ns(step);
+        // A bound the step fits, by less than a layer.
+        let near = whole + per_layer / 2.0;
+        let held = SubmitBound {
+            bound_ns: near,
+            ..b.clone()
+        };
+        assert!(held.admit(step).split(), "{:?}", held.admit(step));
+        assert!(matches!(
+            admit_ns(whole, per_layer, b.layers, near, false),
+            Admitted::Whole { .. }
+        ));
+        // A layer under it: whole.
+        let roomy = SubmitBound {
+            bound_ns: whole + per_layer,
+            ..b.clone()
+        };
+        assert!(matches!(roomy.admit(step), Admitted::Whole { .. }));
+    }
+
+    /// The margin saved with the rates moves a step past the bound that
+    /// fits at a ratio of 1: Android's lost step, 1024 rows estimated at 83%
+    /// of the bound at a ratio of 1 (it ran 1.25x that warm), is split at
+    /// the 1.7 its rates step measured.
     #[test]
     fn the_measured_worst_ratio_is_the_margin() {
         let at_one = bound(1.0);
         let step = prompt(256, 1024);
-        let (whole, _) = at_one.step_ns(step);
-        assert!(matches!(at_one.admit(step), Admitted::Whole { .. }));
-        let swung = bound(BOUND / whole * 1.01);
-        assert!(swung.admit(step).split());
+        let (whole, per_layer) = at_one.step_ns(step);
+        let scaled = SubmitBound {
+            bound_ns: whole / 0.83,
+            ..at_one.clone()
+        };
+        assert!(whole + per_layer <= scaled.bound_ns);
+        assert!(matches!(scaled.admit(step), Admitted::Whole { .. }));
+        let measured = SubmitBound {
+            worst: 1.7,
+            ..scaled
+        };
+        assert!(measured.admit(step).split());
     }
 
     /// A prompt step past the bound even a layer at a time takes a
@@ -384,7 +448,7 @@ mod tests {
         assert!(why.contains("past the platform's stated bound of 2000 ms"), "{why}");
         assert!(why.contains("is estimated at"), "{why}");
         assert_eq!(
-            frame_submissions(&[b.step_ns(step)], b.layers, BOUND).map_err(|(at, _)| at),
+            frame_submissions(&[shaped(&b, step)], b.layers, BOUND).map_err(|(at, _)| at),
             Err(0)
         );
     }

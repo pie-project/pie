@@ -272,6 +272,7 @@ impl<B: Host> Gpu<B> {
             rows = rows.rows,
             lanes = rows.lanes,
             keys = rows.keys,
+            prompt = rows.prompt,
             rung = held.rung_of(rows.rows),
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
