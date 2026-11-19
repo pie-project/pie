@@ -382,6 +382,19 @@ Each turns depth into depth 1 or adds host work per step; CUDA does the same in 
 - kernels-metal has the VECTOR_MAX_ROWS = 4 GEMM cliff (linear/gemm.rs:33), and the qmv fold only folds
   divisors <= 8, so 11 rows take ~11 weight passes (linear/qmv/rows.rs:60).
 - Metal never counts the Refused tally.
+- Measured on the M1 (Qwen3-0.6B, 2026-11-19): no guest binds as device geometry today (a beam mix bound 2080
+  Host-class instances and 32 DecodeEnvelope, beam included, and none DeviceGeometry), so the port read above
+  does not run for them. But `fence_instances` (serve.rs ~3684) holds every attached instance, whatever its
+  class, to its last fire's landing before its next is staged (a session's one status word, the host reading
+  its cells between fires): every guest lane runs at depth 1. The GPU idles between frames 7.3% of its time at
+  1 lane, 9.5% at c16 and 15.1% at c64 (each frame's command-buffer start / end), the host's take, settle
+  and next stage+encode not overlapped. Two status words a session (the host's take deferred one step, as
+  CUDA's decode envelope does) is worth scoping after the scratch-in-flight split.
+- An instance's value scratch is held once, not a frame in flight each (no two of its fires overlap); its
+  pair's batch tables must stay a set a frame in flight: consecutive frames fire different instances of one
+  pair. Cutting both to one set broke beam --verify (62 / 57 / 38 of 64, "read another beam's cells");
+  cutting only the instance scratch kept 64 / 64 and halved it (11.4 -> 5.7 MB an instance, 45.6 -> 22.8 MB
+  a beam instance).
 
 ## F33. Metal's few-row dense matmul on the M1: 4 rows ≈ 1.38× one row
 The user's rule is that a beam-4 step costs about what a single greedy step costs. On the M1 Max
