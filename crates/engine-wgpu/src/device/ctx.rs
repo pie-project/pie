@@ -158,7 +158,10 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<Held>>,
+    /// The uniform buffer frames write their dispatches' scalars to, made
+    /// at load, a region of it each frame in flight; and the regions free.
+    pub(crate) uniform_buffer: std::sync::OnceLock<Held>,
+    pub(crate) uniforms: Mutex<Vec<u64>>,
     pub(crate) scratch: Mutex<Vec<Held>>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
@@ -245,18 +248,20 @@ impl Core {
     /// flight, at load: a frame takes at most one of each, and gives it back
     /// when it is dropped.
     pub(crate) fn stock_rings(&self, frames: usize) {
-        let uniforms = (0..frames).map(|_| {
-            self.held(
-                &wgpu::BufferDescriptor {
-                    label: Some("pie uniforms"),
-                    size: UNIFORM_CHUNK,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-                engine_gpu::books::owners::UNIFORMS,
-            )
-        });
-        self.return_uniforms(uniforms.collect());
+        // One buffer of a region a frame, so a bind group made once binds
+        // every frame's scalars, at a dynamic offset into its region.
+        let buffer = self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie uniforms"),
+                size: UNIFORM_CHUNK * frames as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::UNIFORMS,
+        );
+        if self.uniform_buffer.set(buffer).is_ok() {
+            self.return_uniforms((0..frames as u64).map(|at| at * UNIFORM_CHUNK).collect());
+        }
         let scratch = (0..frames).map(|_| {
             self.held(
                 &wgpu::BufferDescriptor {
@@ -273,7 +278,8 @@ impl Core {
         self.return_scratch(scratch.collect());
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Result<Held> {
+    /// The uniform buffer's region a frame takes, its first byte.
+    pub(crate) fn uniform_chunk(&self) -> Result<u64> {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
@@ -285,7 +291,7 @@ impl Core {
             })
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
+    pub(crate) fn return_uniforms(&self, chunks: Vec<u64>) {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
@@ -569,6 +575,7 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
             last_error,
@@ -724,7 +731,7 @@ impl Context {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
                 encoder: Mutex::new(Some(encoder)),
-                uniforms: Mutex::new(UniformRing::default()),
+                uniforms: Mutex::new(UniformRegion::default()),
                 scratch: Mutex::new(UniformRing::default()),
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
@@ -737,6 +744,13 @@ impl Context {
     }
 }
 
+/// The uniform buffer's region a frame holds, and the bytes of it written.
+#[derive(Default)]
+pub(crate) struct UniformRegion {
+    region: Option<u64>,
+    used: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
@@ -746,7 +760,7 @@ pub(crate) struct UniformRing {
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
     encoder: Mutex<Option<wgpu::CommandEncoder>>,
-    uniforms: Mutex<UniformRing>,
+    uniforms: Mutex<UniformRegion>,
     scratch: Mutex<UniformRing>,
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
@@ -767,7 +781,7 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
-        self.core.return_uniforms(ring.chunks);
+        self.core.return_uniforms(ring.region.into_iter().collect());
         let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
         self.core.return_scratch(scratch.chunks);
     }
@@ -784,17 +798,7 @@ impl Frame {
         self.inner.pass.lock().expect("pass lock poisoned").take();
     }
 
-    pub(crate) fn dispatch(
-        &self,
-        label: &'static str,
-        pipeline: &wgpu::ComputePipeline,
-        group: &wgpu::BindGroup,
-        groups: [u32; 3],
-    ) -> Result<()> {
-        self.dispatch_at(label, pipeline, group, &[], groups)
-    }
-
-    /// [`Frame::dispatch`] with `group`'s dynamic offsets.
+    /// Dispatches `pipeline` over `group`, read at its dynamic `offsets`.
     pub(crate) fn dispatch_at(
         &self,
         label: &'static str,
@@ -841,25 +845,36 @@ impl Frame {
         Ok(f(encoder))
     }
 
+    /// `bytes` of this frame's region of the uniform buffer: the buffer and
+    /// the slot's first byte in it.
     pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
+        let buffer = core.uniform_buffer.get().ok_or(Fault::Ceiling {
+            what: "frames in flight holding a uniform region (stocked at load)",
+            need: 1,
+            have: 0,
+        })?;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = match ring.region {
+            Some(region) => region,
+            None => {
+                let region = core.uniform_chunk()?;
+                ring.region = Some(region);
+                ring.used = 0;
+                region
+            }
+        };
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() {
-            ring.chunks.push(core.uniform_chunk()?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
-        }
         if at + bytes > UNIFORM_CHUNK {
             return Err(Fault::Ceiling {
-                what: "bytes of uniforms one frame writes (its chunk)",
+                what: "bytes of uniforms one frame writes (its region)",
                 need: at + bytes,
                 have: UNIFORM_CHUNK,
             });
         }
         ring.used = at + bytes;
-        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
+        Ok(((**buffer).clone(), region + at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
