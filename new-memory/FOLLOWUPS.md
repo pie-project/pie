@@ -597,7 +597,92 @@ Draft of the upstream request (text only; filing it is the user's call):
 >   reload into HBM), a way to share or page it rather than hold a private copy per
 >   executable.
 
-## F38. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
+## F38. ROCm 1-lane greedy moves +0.6% when gemv.hip's code object changes, its 1-row kernels unchanged
+
+The turned norm fold (the norm prologue in `skinnyt_bf16`) leaves every 1-row kernel
+untouched, yet 1-lane greedy on MI300X (qwen3-0.6b) is 0.6% slower. Over 10 ABAB runs of
+1,536 tokens the wall is 2.122 vs 2.107 s, and the step cost (32 → 544 tokens) is 1.345 vs
+1.338 ms. c64, 4-parallel, beam-4 and prefill are flat or faster.
+
+Bisect:
+
+| build | g1 ms/step, 32 → 544 |
+|---|---|
+| tip before the fold | 1.334 – 1.338 |
+| the fold's kernels with the old routing (the fold never taken) | 1.343 – 1.344 |
+| the same, the skinny kernel's prologue the tip's verbatim | 1.344 – 1.345 |
+| the fold | 1.343 – 1.348 |
+
+The 1-row decode runs only `skinny_bf16` instantiations. Their summed device time per step
+is equal within 2 µs (rocprofv3, 1,024 tokens), and their registers, LDS and occupancy
+match (no scratch). What moved is the module the kernels share, so the suspicion is code
+placement (instruction-cache or alignment), not the kernels' work.
+
+Next:
+- dump the code object's kernel offsets on both builds; place or align the hot skinny entry
+  points and see whether the 7 µs follows;
+- if it does, a stable placement for the decode kernels, rather than chasing each module
+  edit.
+
+## F39. ROCm `kernel.gemm.turn_min_n` (2048) stands in for the turned kernel's narrow-bank idle
+
+The turned kernel (`skinnyt_bf16`) walks one 16-row tile a block, so a bank of n rows is
+n / 16 blocks. Below 2048 rows the route keeps the skinny kernel, and that constant is
+the narrow-bank idle, not a measured choice.
+
+Removing it costs MI300X 4-parallel decode +28 µs a step (qwen3-0.6b: 1.475 → 1.510 ms;
+beam-4 2.155 → 2.188). o-proj (1024 x 2048) moves to the turned kernel: 64 blocks on 304
+compute units, two serial 256-element slices a wavefront. It takes 7.2 µs a call against the
+skinny kernel's 6.2 (rocprofv3 device durations).
+
+Stream-timed microbenchmarks said the opposite: turn ahead from 128 columns up, cold weights
+too. Their back-to-back launches were capped by the dispatch rate (about 5 µs) and hid kernel
+duration. Kernel choices are compared on device durations.
+
+What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
+that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
+slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
+
+## F40. ROCm 4-row decode: where the 4-parallel step's ~170 µs over 1 greedy goes (MI300X, qwen3-0.6b)
+
+At short context 1 greedy is 1.31 ms a step and 4 parallel 1.48 (after the turned norm
+fold). The attach kernel trace attributed the gap mostly to o-proj + down (+78 µs). That
+was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts after a
+~290 µs idle gap, so its durations describe a cold, down-clocked device, not graph replay.
+The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
+are 0.
+
+The instrument that measures in context is ablation by duplication. Launch one product
+twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
+median of 5, two rounds):
+
+| product (per call) | m = 1 | m = 4 | 4-row extra a step |
+|---|---|---|---|
+| o-proj 1024 x 2048, skinny | 3.7 µs | 3.7 µs | 0 |
+| down 1024 x 3072, skinny | 4.6 µs | 4.8 µs | +6 |
+| qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
+| gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
+
+About 100 µs is the folded products on the turned kernel. The other ~70 µs is not yet
+ablated: attention, the qkv/rope kernel, the m = 4 lm head, and the host side (four lanes'
+sampling and channel work).
+
+Tried, none kept (4-parallel ms a step, against 1.475–1.484):
+- skinny at m = 4: staging the activation four loads at a time (worse); reading it from
+  global, not LDS (no change); 16-wave blocks over 64 (worse); a grid trimmed to the blocks
+  with rows (noise); the quad kernel on narrow banks (much worse, 402 vs 306 µs traced);
+- turn_min_n removed (o-proj on turn): 1.510 (F39);
+- the turned kernel's tiles spread evenly (192 two-tile blocks for gate-up's 384 tiles over
+  304 CUs): 1.498–1.505.
+
+Next:
+- gated turned product at m = 4 (9.0 vs 6.6 µs at m = 1 on skinny): an exact device-duration
+  breakdown (the norm stage per block × 384 blocks, the gated epilogue, residency);
+- ablate the remaining ~70 µs the same way;
+- the duplication switch is a scratch patch: a profile probe that times a kernel in place
+  (in a captured body) would make it a standing instrument.
+
+## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
 
 `runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
 (Windows on Arm, NVIDIA driver) in about half its runs, on wgpu-Vulkan and on native Vulkan,

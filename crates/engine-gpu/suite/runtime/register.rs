@@ -112,7 +112,7 @@ fn heavier_epilogue(rounds: u32) -> eta_ir::container::TraceContainer {
 ///
 /// Known to fail on the RTX Spark (Windows NVIDIA driver): a one-time submit stall early in
 /// the engine's life lands inside the compile window in about half the runs, with no pie lock
-/// involved (`new-memory/FOLLOWUPS.md` F38). The measurement stays strict.
+/// involved (`new-memory/FOLLOWUPS.md` F41). The measurement stays strict.
 #[test]
 fn a_cold_registration_compiles_while_a_lane_fires() {
     use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
