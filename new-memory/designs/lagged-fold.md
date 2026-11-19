@@ -73,12 +73,24 @@ row and no state is touched.
 
 ## Windows
 
-Window retirement (`RsStore::window_advance`, `store/rs.rs:1543`) retires
-below `committed − window`, and `committed` moves with the fold. Under the
-lag `committed` never passes an unaccepted row, so every row a cut needs,
-`[cut − window, cut)`, is still held: a window cut is a truncate with no
-extra slots. (Retiring below `committed − (window + W)` is only needed if
-`committed` could pass unaccepted rows, which this rule excludes.)
+The trim is the runtime's: `RsStore::window_advance` (`store/rs.rs:1543`)
+retires each list's slots whose last row lies below `reach − window`.
+
+- Host-positioned fires (the envelope decode) use `reach = committed`, which
+  moves with the fold; with `fold = accepted − folded` it never retires a
+  slot that unaccepted rows or a stop's rewind still need.
+- Device-positioned fires (`positioned = false`) use the fire's first
+  writable token as `reach`, which under the lag lies past `committed`, so
+  a stop rewinding to `committed` could find its slots retired. **Every
+  fire retires below `min(committed, its reach) − window`.**
+- At a retract the window head rewinds to `committed`; slots past it that
+  hold stray rows are released, or copied before the next write into them
+  (the tail rule `checkpoint_at` / `prepare_window` keep: a write into a
+  shared slot copies first). A fork or checkpoint at the accepted length
+  takes that tail copy and never shares a slot with rows past it.
+
+No extra retirement lag (`committed − (window + W)`) is needed: `committed`
+never passes an unaccepted row.
 
 ## Reservation
 
@@ -151,8 +163,13 @@ One pass a recurrent layer, inside the ordinary decode body:
 - **Metal.** `LanePlan::of` with `RsVerb::Buffer` staged per fire
   (`engine-metal/src/serve.rs` ~4488–4680); carried rows bounded by the
   current rung (`serve.rs:4908`). Mamba-2 and biased buffered conv refused
-  (`dispatch/ssm.rs:23–31`). Window trim guarantees and the M1 replay cost:
-  from Mac (pending).
+  (`dispatch/ssm.rs:23–31`). M1 replay proxy (Qwen3.5-0.8B, single-lane
+  fires of 1 / 2 / 3 rows, as W = 0 / 1 / 2): the recurrent kernels cost
+  0.730 / 0.986 / 1.052 ms a fire. Metal switches from the step kernels
+  (`causal_conv1d`, `gated_delta_scan_step`) to the chunked prefill kernels
+  at ≥ 2 rows: a fixed +0.26 ms a fire at a lag of 1 (+35% of the recurrent
+  layers, ~+3.8% of the 6.7 ms c1 decode fire), then ~+0.07 ms a row. Metal
+  needs the one-pass decode replay kernel too.
 - **engine-gpu.** `LaneFold::of` wraps `LanePlan::of`
   (`store/frozen.rs:34`); replay in `dispatch/rs.rs`, committed kernels in
   `dispatch/ssm.rs:92`. Vulkan / wgpu share the kernel via Slang / WGSL.
