@@ -775,15 +775,16 @@ impl WorkItemCompletion {
         hook();
     }
 
-    /// [`Self::on_settled`], `hook` told whether the work item succeeded:
-    /// one never resolved, or resolved failed, did not.
-    pub fn on_settled_ok(&self, hook: impl FnOnce(bool) + Send + 'static) {
+    /// [`Self::on_settled`], told whether it landed: never where no handle
+    /// on it is left by the time the hook runs, which holds none of its own.
+    pub fn on_settled_landed(&self, hook: impl FnOnce(bool) + Send + 'static) {
         let state = Arc::downgrade(&self.state);
         self.on_settled(move || {
-            let ok = state
-                .upgrade()
-                .is_some_and(|state| matches!(state.result(), Some(Ok(()))));
-            hook(ok);
+            hook(
+                state
+                    .upgrade()
+                    .is_some_and(|state| matches!(state.result(), Some(Ok(())))),
+            );
         });
     }
 

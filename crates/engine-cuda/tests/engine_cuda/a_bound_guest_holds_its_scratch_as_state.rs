@@ -566,14 +566,14 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     fire(&mut shell, word, &tokens, &attach(a));
     shell.drain().expect("the device drains");
     // Whatever A's launches left, A's bytes are in its scratch as it closes.
-    foreign(&shell, &scratch, state.per_instance);
+    foreign(&shell, &scratch, state.instance_bytes());
     shell.close_program_instance(a).expect("A closes");
     // The pair's slots went back with A's close and another owner wrote them.
     foreign(&shell, &pair, state.per_pair);
 
     let (b, b_slots) = bind(&mut shell, &mut guest, &scratch, &pair, 2);
     assert!(
-        zero(&mut shell, &scratch, state.per_instance),
+        zero(&mut shell, &scratch, state.instance_bytes()),
         "B's scratch holds none of A's bytes"
     );
     assert!(
@@ -585,7 +585,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
 
     // An unpark: fresh room holding garbage reads zero once B is there.
     let (fresh, fresh_pair) = guest.places((program, "unparked"), &state);
-    foreign(&shell, &fresh, state.per_instance);
+    foreign(&shell, &fresh, state.instance_bytes());
     foreign(&shell, &fresh_pair, state.per_pair);
     // Its items stay where they lie; its state moves.
     shell
@@ -601,7 +601,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         )
         .expect("the unpark rebinds");
     assert!(
-        zero(&mut shell, &fresh, state.per_instance),
+        zero(&mut shell, &fresh, state.instance_bytes()),
         "the unparked scratch holds none of the room's last bytes"
     );
     assert!(
