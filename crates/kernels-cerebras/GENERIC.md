@@ -4285,3 +4285,134 @@ words with its region arrays (at any K / V replica count): the memory model's (A
 checked steps token-exact, logits within bf16 of HF's f32 (step 4: 416 at 17.625 against
 17.643; step 5: 168 at 16.5 against 16.42; step 6: 320 at 19.0 against 18.90), 144-179k cycles a
 step (the scale-1 scores' redo passes). The whole run's count is G5's next section's.
+
+## Kernels as modules
+
+**Goal.** A hand-written kernel (a mixer, a routed bank, a tiled conv: anything outside a
+kernels-ir `Region`) is one self-describing module, registered in one place, as a Metal or CUDA
+kernel is (`kernels-metal/src/<group>/<op>.rs` plus a `sources.rs` row, dispatched by
+`engine-metal/src/dispatch/<group>.rs` on the poem-ir op). Elementwise ops keep their own,
+backend-neutral path (poem-ir, `fuse::chain::lower_run`, a kernels-ir `Region`, `emit::region`)
+and are not modules. eta-ir is not in this path.
+
+### Where a kernel is named today (survey, origin ab83b4447)
+
+A mixer reaches the wafer through up to six regimes, each matching it on its own:
+
+| touch point | what is matched | kernels |
+|---|---|---|
+| `poem-compiler spatial::layer::Body::node` | `Attn::Decode`, `Ssm::{GatedDelta, Mamba2, Kda}`, `KvAppend / Sink / CausalConv1d / GdnGates` into `Mixer::{Attn, Gdn}`; else "has no spatial lowering" | decode templates |
+| `poem-compiler spatial::layer::stream::stream_node` | `Attn::{Ragged, Prefill, Decode}` into `Mixer::Joint`, `PackRows`; else refused | units, GEMM |
+| `target::shape` (`LayerSpec`) | `MoeSelect / MoeRoute / MoeCombine / MoeBiasSum`, `KvAppend`, `Attn::Decode` + its plan, `Sink`, `GatedDelta` | templates |
+| `compose::{Needs::of, refuse, Schedule}`; `KernelSet::of`; `kernels::{snake, stacked, runs, split}` (`MIXK` 0-3); `tiles/<set>.rs`; `emit::stamps` (`MIXK` 2, 3) | `Mixer::Attn { window, shared_from }`, `Mixer::Gdn`, experts, `"attn.sink"` | att, gdn, kv, swa, moe (+ `cy_*`) |
+| `stream::unit::lower_through` | `Attn::{Ragged, KvAppend, Prefill, Decode, Sink}` into `Step::{Store, Attend}` + `Joint`; `Ssm::CausalConv1d` + `{GatedDelta, GdnGates, Mamba2, Kda}` into `Joint::state`; `MoeRoute / MoeSelect` (`stream::moe`) into matvecs and regions; `rooted` / `alias` name lists | satt, sst, moe |
+| `stream::shape` (`JointSpec`), `stream::build` (`rep` only where `state` is none; a column's PEs: `PYA x lanes` for a state, `kv_pya_split` else), `stream::place` (a state head's b / a slices) | `Joint::state` | satt / sst |
+| `emit::stream::emit` (K / V columns), `kv_root_file` / `kv_pe_file` / `st_root_file` / `st_pe_file`, root `Step::Store` (b / a parts), `state_root` (`"kv" / "gdn" / "mamba2" / "kda"`), `paging` | `state.is_some()`, `state.{mamba, kda}`, `sink` | satt, cy_satt, sst, cy_sst |
+| `cost::stream` (`Step::Attend`'s term), `cost::gemm` (`GOp::Attend`), `cost::tiled` (`TOp::Attend`) | step / op kind | attention |
+| `stream::gemm` (`Step::{Store, Attend}` into `GOp::Attend`), `emit::gemm` (`gemm_pe.csl`: `fn gemm`, `fn attend`) | step kind | GEMM attention |
+| `stream::tiled` / `emit::tiled` (`tiled_pe.csl`: `conv`, `norm`, `up`, `attend`, op codes 1-8) | `Attn::Voxel`, `Conv::*` | tiled VAE |
+| `check::hazard::{lines, line_queues, attention_orders_row}` (H1-H4) | `GOp::{Gemm, Region, Attend}`, CSL functions `"gemm"`, `"attend"`, `gseg.allred` | GEMM |
+| `check::hazard::hub_loops` | `TOp::{Norm, Attend}`, CSL functions `"allreduce"`, `"attend"` | tiled |
+| `check::CODE_KINDS`, `check::pe_bytes` | file patterns (`w_*.csl` + `ops/smv.csl`, `tpe.csl`, `ttape.csl`) | memory refits |
+| `sources::{OPS, STREAM_OPS}` | file names | every CSL module |
+
+So a new mixer for the unit path today touches poem-compiler's `stream_node`, `unit.rs`,
+`stream::shape`, `build`, `place`, `emit::stream` (four places), `cost::stream`, `sources`,
+and, to run in the GEMM regime, `stream::gemm`, `emit::gemm`, `cost::gemm` and the hazard lines.
+
+### The trait and the registry
+
+`src/kernel/` mirrors kernels-metal's layout: a module per kernel under the poem-ir group it
+implements, one registry list.
+
+```rust
+// src/kernel/mod.rs
+pub trait Kernel: Sync {
+    fn name(&self) -> &'static str;                       // "attn.column", "ssm.state", ...
+    fn ops(&self) -> &'static [&'static str];             // poem-ir op names it implements
+    fn sources(&self) -> &'static [(&'static str, &'static str)];   // its CSL (sources rows)
+    fn unit(&self) -> Option<&dyn UnitKernel> { None }    // the unit regime (stream + decode units)
+    fn column(&self) -> Option<&dyn Column> { None }      // a mixer on a unit's K / V column
+    fn hazards(&self) -> Hazards { Hazards::NONE }        // what the hazard checks need
+    fn code_kinds(&self) -> &'static [CodeKind] { &[] }   // its memory refits (check::CODE_KINDS rows)
+}
+pub static KERNELS: &[&dyn Kernel] = &[&attn::column::COLUMN, &ssm::state::STATE, ...];
+pub fn by_op(op: &str) -> Option<&'static dyn Kernel>;
+```
+
+- **`UnitKernel`**: how a node becomes unit steps. `lower(cx, at, op) -> Option<R<()>>` claims a
+  node (and the nodes its pattern consumes) in `unit::lower_through`; it pushes existing steps
+  (`Store / Attend`, matvecs, regions: MoE's gated sum is only those) or one generic
+  `Step::Kernel { kernel, node, side, ins, outs }` at the roots of a side, which the module
+  prints into its root (`root_decls`, `root_row`, its arrays, its memory). The poem-compiler
+  side asks the same question target-neutrally: `layer::stream::lower_with(.., claims)`, where
+  `claims(op)` is the target's `Root` (runs at the roots its inputs are at, as an elementwise
+  op) or `Tiles(Mixer)`; with no claims it is today's `lower`.
+- **`Column`**: a mixer on a K / V column (P7 / P8): `claims(&Joint)`, the column's PEs
+  (`pya`), whether its heads replicate (`kv_rep`) and page (`paging`), its region kind in the
+  state root, the extra per-head parts a store sends (b / a), its root and PE files and their
+  host arrays. Attention (`satt` / `cy_satt`) and the recurrence (`sst` / `cy_sst`: GDN,
+  Mamba-2, KDA as variants of one module) are the two today.
+- **`Hazards`**: declared, not inferred from names:
+  - `line: Option<&str>`, the CSL function whose input queue rebinds among colours;
+  - `orders: Orders::{Row, Skew, Neither}` (`Row` when its CSL ends in a row-wide ordering point,
+    checked from the text as now);
+  - `alternates`, whether it starts each run on its last run's colour;
+  - `hub: Option<(&str, words fn)>`, the function whose blocking sends precede its broadcast
+    receive, and the words it sends.
+- **Price and memory.** A step's price is the module's (`UnitKernel::price`, the term
+  `cost::stream` now computes for `Attend`). The PE's memory stays the generic CSL read
+  (`check::pe_bytes`); a module only adds its refit rows.
+
+### What each kernel declares
+
+| module | ops | sources | unit | column | hazards |
+|---|---|---|---|---|---|
+| `attn::column` | `attn.ragged`, `attn.prefill`, `attn.decode`, `attn.kv_append`, `attn.sink` | satt, cy_satt, schain | Store / Attend + `Joint` | paged, replicable, kind `kv`, sinks' `snk` / `pos` | GEMM: `line "attend"`, `orders` by `gseg.allred`, alternates; tiled: hub `attend`, a key's words |
+| `ssm::state` | `ssm.causal_conv1d`, `ssm.gated_delta`, `ssm.gdn_gates`, `ssm.mamba2`, `ssm.kda` | sst, cy_sst | Store / Attend + `Joint::state` | `PYA x lanes`, no replicas, no pages, kind `gdn` / `mamba2` / `kda`, `stw` + `rowp`, b / a parts | none (no GEMM / tiled form) |
+| `linear::moe` | `linear.moe_route`, `moe_select`, `moe_combine` | none (matvecs + regions) | `stream::moe`'s pattern | | none |
+| `linear::gemm` | `linear.matmul` (GEMM regime) | gemm_pe.csl `gemm` | | | `line "gemm"`, `orders Row` |
+| `conv::tiled` | `conv.*`, `attn.voxel` (tiled regime) | tiled_pe.csl | | | hub `allreduce` (a norm's groups) |
+| template mixers `att`, `gdn`, `kv`, `swa`, `moe` | via `Mixer::{Attn, Gdn}` | ops/*.csl, cy_*.csl | | | declared only (below) |
+
+### Regimes as placement strategies
+
+- **Units** (stream readings, decode through units) are the reference: a regime places unit
+  steps, and a module states its steps once. Its K / V columns are `Column`s; a `Step::Kernel`
+  is printed by its module at whatever root the placement gives it.
+- **GEMM** reads the same unit steps (`stream::gemm` already folds `Store / Attend` into
+  `GOp::Attend`). A module with a GEMM form gives one; one without is refused by name ("<kernel>
+  has no GEMM form"), so the search drops the regime for that reading. Not yet separable: the GEMM
+  PE is one image (`gemm_pe.csl`) whose functions are the ops', so a GEMM form is a function in it,
+  not a file of its own.
+- **Tiled** is the same for the grid regime (`tiled_pe.csl`'s op table, codes 1-8); its ops come
+  from the grid reading (`Attn::Voxel`, `Conv::*`), not from unit steps, so it stays its own
+  lowering with modules for its ops' declarations (hazards, price).
+- **Decode templates** (`KernelSet` x `MIXK`) are fused images of a family's mixers. They are not
+  a strategy over the module interface and are not made one: G1.3's end state is deleting them
+  once units are as fast. Each template mixer is declared (its sources, the set and `MIXK` that
+  carry it) so the inventory is complete, and a new op goes to the units.
+
+### Hazards as generic checks
+
+H1-H4 and the hub loops stay the same checks, over declared properties instead of op kinds:
+- **H2 (row line).** For each op in order, a module with `line` reached while the last op since a
+  `Row` ordering point is `Skew` is a window. Today `GOp::Gemm` is `line "gemm"` / `Row`,
+  `GOp::Region` with an all-reduce is `Row`, and `GOp::Attend` is `Skew` unless its text orders
+  the row.
+- **H2 (column line).** Two ops of one module with a column `line` and no `alternates`.
+- **H4.** A `Skew` op with ops after it.
+- **Hub loops.** Each op whose module declares `hub`, its words past `HUB_LOOP_WORDS` with a
+  blocking send before the receive.
+- **Overlap / host words / startup** read every CSL file and are already generic.
+
+### Migration order (each step byte-identical: decode identity, flux identity, unit decodes)
+
+1. `kernel/` with the trait and an empty registry; `sources::STREAM_OPS` from the modules.
+2. `attn::column`: the K / V column's root / PE files, host arrays, paging and state-root kind.
+3. `ssm::state`: the state column (GDN, Mamba-2, KDA variants).
+4. `UnitKernel::lower`: `unit::lower_through`'s attention, recurrence and MoE arms move into
+   their modules; the loop asks the registry.
+5. Hazards: `lines` / `hub_loops` over `Hazards`.
+6. The new op: `ssm::short_conv` (inkling's keys and values), `Step::Kernel` and poem-compiler's
+   `claims`.
