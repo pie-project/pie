@@ -211,7 +211,23 @@ impl Host for Api {
                             step.lanes.len()
                         )));
                     };
-                    if lane.mask.is_none() {
+                    #[cfg(feature = "vulkan")]
+                    let mask_feed = (lane.mask.is_none() && lane.tokens.len() == 1)
+                        .then(|| gpu.programs.mask_feed(attachment.instance, lane_at))
+                        .flatten();
+                    #[cfg(not(feature = "vulkan"))]
+                    let mask_feed: Option<engine_gpu::serve::DeviceCell<Api>> = None;
+                    if let Some(cell) = mask_feed {
+                        // A pass still on the queue put this lane's mask row;
+                        // the forward packs it in behind that pass. The
+                        // placeholder states the row's width.
+                        let keys = cell.bytes;
+                        let admitted = u32::try_from(keys).unwrap_or(u32::MAX);
+                        envelope.masks[lane_index] = Some(engine::fire::Masking::Extent(
+                            engine::fire::Mask::new(vec![0, admitted], keys),
+                        ));
+                        envelope.mask_feeds[lane_index] = Some(cell);
+                    } else if lane.mask.is_none() {
                         match gpu.programs.envelope_mask(
                             attachment.instance,
                             lane.tokens.len(),

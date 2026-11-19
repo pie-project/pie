@@ -422,7 +422,8 @@ pub fn decode(
 
 /// The ports the host reads off an instance's rings at a fire, so a pass
 /// recorded to land later lands their puts rather than keeping them on the
-/// device: a `fold` count and an `attn_mask` for every class, and the
+/// device: a `fold` count for every class, an `attn_mask` unless the engine
+/// packs it on the device (`mask_on_device`, [`mask_on_device`]), and the
 /// descriptor ports the engine resolves ([`engine::ports::engine_resolves`])
 /// past a decode envelope's tokens, which stay on the device for the next
 /// forward to copy in.
@@ -430,17 +431,41 @@ pub fn decode(
 pub fn read_at_fire(
     geometry: eta_ir::registry::GeometryClass,
     device: eta_ir::registry::PortMask,
+    mask_on_device: bool,
 ) -> eta_ir::registry::PortMask {
     use eta_ir::registry::{GeometryClass, Port, PortMask};
     Port::ALL
         .iter()
         .copied()
         .filter(|&port| {
-            matches!(port, Port::Fold | Port::AttnMask)
+            port == Port::Fold
+                || (port == Port::AttnMask && !mask_on_device)
                 || (engine::ports::engine_resolves(geometry, device, port)
-                    && !(geometry == GeometryClass::DecodeEnvelope && port == Port::EmbedTokens))
+                    && !(geometry == GeometryClass::DecodeEnvelope
+                        && matches!(port, Port::EmbedTokens | Port::AttnMask)))
         })
         .fold(PortMask::NONE, PortMask::with)
+}
+
+/// Whether a decode envelope's `attn_mask` can stay on the device for the
+/// next forward to pack, as its tokens do: a one-cell channel the host
+/// does not read, bound in the decode envelope (device geometry resolves
+/// its mask with its other descriptor ports).
+#[must_use]
+pub fn mask_on_device(
+    plan: &eta_exec::ExecPlan,
+    geometry: eta_ir::registry::GeometryClass,
+) -> bool {
+    use eta_ir::registry::{GeometryClass, Port};
+    geometry == GeometryClass::DecodeEnvelope
+        && plan.package.ports.iter().any(|binding| {
+            binding.port == Port::AttnMask
+                && !binding.is_const
+                && plan.package.channels.get(binding.channel as usize).is_some_and(|decl| {
+                    decl.capacity == 1
+                        && decl.host_role != eta_ir::container::HostRole::Reader
+                })
+        })
 }
 
 /// The channels of `plan` bound to the ports [`descriptor_ports`] reads for

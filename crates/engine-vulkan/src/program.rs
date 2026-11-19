@@ -1029,6 +1029,41 @@ impl Plane {
         Some(cell)
     }
 
+    /// The device cell holding lane `lane_at`'s one row of `attn_mask`
+    /// bools, where a pass on the queue kept the instance's mask on the
+    /// device ([`engine_gpu::program::mask_on_device`]): the forward packs
+    /// it behind that pass instead of the host waiting for it to land.
+    #[cfg(feature = "vulkan")]
+    #[must_use]
+    pub fn mask_feed(
+        &self,
+        instance: InstanceId,
+        lane_at: usize,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        let seat = self.instances.get(&instance)?;
+        if !engine_gpu::program::mask_on_device(&seat.plan, seat.geometry) {
+            return None;
+        }
+        let binding = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::AttnMask && !binding.is_const)?;
+        let mut cell = seat.session.kept_cell(binding.channel)?;
+        let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+        let rows = u64::from(*indptr.last()?);
+        let start = u64::from(*indptr.get(lane_at)?);
+        let end = u64::from(*indptr.get(lane_at + 1)?);
+        if rows == 0 || end != start + 1 || !cell.bytes.is_multiple_of(rows) {
+            return None;
+        }
+        let keys = cell.bytes / rows;
+        cell.at += start * keys;
+        cell.bytes = keys;
+        Some(cell)
+    }
+
     /// Whether `instance`'s pass can be recorded to land later: one stage,
     /// reading its logits on the device.
     #[cfg(feature = "vulkan")]
@@ -1074,7 +1109,11 @@ impl Plane {
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred(
-                engine_gpu::program::read_at_fire(seat.geometry, seat.device),
+                engine_gpu::program::read_at_fire(
+                    seat.geometry,
+                    seat.device,
+                    engine_gpu::program::mask_on_device(&seat.plan, seat.geometry),
+                ),
             );
         let outcome = eta_exec::step_with(
             &mut seat.inst,

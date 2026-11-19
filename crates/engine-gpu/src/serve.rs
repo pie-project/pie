@@ -526,6 +526,12 @@ pub struct Seated<'a, B: Serve> {
     /// on the queue; the fire copies it in behind that pass.
     pub feed: Option<&'a DeviceCell<B>>,
 
+    /// A device cell holding the lane's one row of attention-mask bools
+    /// (column `c` is key `folded + c`), put by a pass still on the queue:
+    /// the fire packs its columns into the lane's row of the mask plane
+    /// behind that pass, and `mask` is a placeholder of the cell's width.
+    pub mask_feed: Option<&'a DeviceCell<B>>,
+
     pub group: Option<u32>,
     pub inputs: &'a [(engine::fire::InputFeed, InputCell<B>)],
 }
@@ -557,6 +563,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             record: None,
             record_run: None,
             feed: None,
+            mask_feed: None,
             group: None,
             inputs: &[],
         }
@@ -3097,13 +3104,17 @@ impl<B: Serve> Shell<B> {
     }
 
     fn feed(&self, p: &Prepared<'_, B>) -> Result<Option<B::Pending>> {
-        if p.feeds.is_empty() && p.input_copies.is_empty() {
+        if p.feeds.is_empty() && p.mask_feeds.is_empty() && p.input_copies.is_empty() {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
         let mut frame = self.device.frame()?;
         for &(row, cell) in &p.feeds {
             frame.copy(&cell.buffer, cell.at, store, tokens + u64::from(row) * 4, 4)?;
+        }
+        let (_, plane) = self.inputs[p.arm].mask_seat();
+        for &(at, cell, columns) in &p.mask_feeds {
+            frame.copy(&cell.buffer, cell.at, store, plane + at, columns)?;
         }
         for copy in p.input_copies.iter().filter(|copy| !copy.cast) {
             frame.copy(&copy.cell.buffer, copy.cell.at, store, copy.at, copy.bytes)?;
@@ -3698,6 +3709,8 @@ impl<B: Serve> Shell<B> {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut feeds: Vec<(u32, &'a DeviceCell<B>)> = Vec::new();
         let mut fed_lanes: Vec<(u32, u32)> = Vec::new();
+        // `(the lane's row, its cell, the columns its row reads)`.
+        let mut pending_mask_feeds: Vec<(u32, &'a DeviceCell<B>, u64)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -3899,6 +3912,33 @@ impl<B: Serve> Shell<B> {
                 folded: seated.folded.min(have),
                 rows: row.rows,
             });
+            if let Some(cell) = seated.mask_feed.filter(|_| masking.is_some()) {
+                // Its row reads its buffer, then its own key.
+                let columns = u64::from(have - seated.folded.min(have)) + 1;
+                if row.rows != 1 || columns > cell.bytes {
+                    return Err(program(
+                        "serve::stage",
+                        format!(
+                            "lane {source} carries its mask on the device in a {}-byte row \
+                             and runs {} row(s) reading {columns} column(s); a device mask \
+                             is packed into a lane's one row, its columns within the cell",
+                            cell.bytes, row.rows
+                        ),
+                    ));
+                }
+                if [cell.at, columns].iter().any(|n| !n.is_multiple_of(B::COPY_GRAIN)) {
+                    return Err(program(
+                        "serve::stage",
+                        format!(
+                            "lane {source}'s device mask row at byte {} of {columns} column(s) \
+                             is off this device's {}-byte copy grain",
+                            cell.at,
+                            B::COPY_GRAIN
+                        ),
+                    ));
+                }
+                pending_mask_feeds.push((row.row_offset, cell, columns));
+            }
 
             let runs_correction = self.corrected.contains(row.class as usize);
             if seated.adapter.is_some() && self.corrected.is_empty() {
@@ -4167,6 +4207,17 @@ impl<B: Serve> Shell<B> {
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
         let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        // Each device mask row lands at its row's byte in the plane.
+        let mask_feeds: Vec<(u64, &'a DeviceCell<B>, u64)> = match &staged {
+            Some(staged) => pending_mask_feeds
+                .iter()
+                .map(|&(row, cell, columns)| {
+                    let at = staged.words.get(row as usize * 2 + 1).copied().unwrap_or(0);
+                    (u64::from(at), cell, columns)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
@@ -4654,6 +4705,7 @@ impl<B: Serve> Shell<B> {
             wrote,
             left: merged(left),
             feeds,
+            mask_feeds,
             fed_lanes,
             fed_check: None,
             input_copies,
@@ -4829,6 +4881,9 @@ pub struct Prepared<'a, B: Serve> {
     /// ([`crate::store::frozen`]), kept once the fire is on its way.
     left: Vec<(Vec<u32>, Option<u32>)>,
     feeds: Vec<(u32, &'a DeviceCell<B>)>,
+    /// Each device-carried mask row: `(its byte in the mask plane, its
+    /// cell, the columns its row reads)`.
+    mask_feeds: Vec<(u64, &'a DeviceCell<B>, u64)>,
     /// Each device-fed lane: its index among the step's lanes and its row
     /// in the token seat.
     pub fed_lanes: Vec<(u32, u32)>,

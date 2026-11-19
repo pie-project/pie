@@ -595,6 +595,13 @@ impl<B: Backend> Inputs<B> {
         (&self.store, self.laid.tokens)
     }
 
+    /// The mask plane's place in the store: a device-carried mask row is
+    /// copied in at its row's byte.
+    #[must_use]
+    pub fn mask_seat(&self) -> (&B::Buffer, u64) {
+        (&self.store, self.laid.mask_planes)
+    }
+
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes()

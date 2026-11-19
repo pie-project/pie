@@ -110,6 +110,10 @@ pub struct Envelope<B: Serve> {
 
     /// A device cell holding the lane's one token ([`Seated::feed`]).
     pub feeds: Vec<Option<crate::serve::DeviceCell<B>>>,
+
+    /// A device cell holding the lane's one row of mask bools
+    /// ([`Seated::mask_feed`]); its `masks` entry is a placeholder.
+    pub mask_feeds: Vec<Option<crate::serve::DeviceCell<B>>>,
 }
 
 impl<B: Serve> Envelope<B> {
@@ -129,6 +133,7 @@ impl<B: Serve> Envelope<B> {
                 self.tokens[at] = Some(vec![0; stated.tokens.len()]);
                 self.masks[at] = None;
                 self.feeds[at] = None;
+                self.mask_feeds[at] = None;
             }
         }
         tracing::warn!(instance = attachment.instance.0, %why, "a guest envelope refused; its lanes fault");
@@ -1487,6 +1492,7 @@ impl<B: Host> Gpu<B> {
             tokens: vec![None; lanes],
             masks: vec![None; lanes],
             feeds: vec![None; lanes],
+            mask_feeds: vec![None; lanes],
         };
         B::envelope(self, submission, &mut envelope, &mut faulted)?;
         let device = self.device_lanes(submission, &mut envelope, &mut faulted);
@@ -1497,6 +1503,7 @@ impl<B: Host> Gpu<B> {
             tokens: resolved,
             masks: resolved_masks,
             feeds,
+            mask_feeds,
         } = envelope;
 
         // A lane whose fold length is the device's takes the count its
@@ -1780,6 +1787,7 @@ impl<B: Host> Gpu<B> {
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
                 feed: feeds[at].as_ref(),
+                mask_feed: mask_feeds[at].as_ref().filter(|_| !sunk[at]),
                 group: lane.group,
                 inputs: &input_cells[at],
             })
@@ -1923,6 +1931,7 @@ impl<B: Host> Gpu<B> {
                         }
                         if placed.mask.is_some() {
                             envelope.masks[at].clone_from(&placed.mask);
+                            envelope.mask_feeds[at] = None;
                         }
                         out[at] = Some(placed);
                     }
