@@ -2231,6 +2231,13 @@ impl Prepared {
         }
     }
 
+    /// The status word's region, as a completion handler reads it
+    /// ([`super::session::EpilogueCheck`]).
+    #[must_use]
+    pub(crate) fn status_region(&self) -> Held {
+        self.status.clone()
+    }
+
     pub fn status(&self) -> Result<Status> {
         let mut bytes = [0u8; eta_exec::STATUS_BYTES];
         self.status.read(0, &mut bytes)?;

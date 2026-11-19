@@ -519,11 +519,17 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let began = Instant::now();
     let mut fence = FenceGuard::raise(handles, pid, (model, engine));
     crate::scheduler::worker::notify_process_suspend(pid);
+    // Each wait of the prelude said as it begins: an eviction that never
+    // reports done names the wait it sits in (Mac Pro's beam mix: evicting
+    // stuck at 2 after a bind-suspend, nothing said).
+    tracing::debug!(%pid, "planner: an eviction drains its detachable fires");
     drain_detachable(pid).await;
     let drained = began.elapsed();
+    tracing::debug!(%pid, sets = fence.handles.len(), "planner: an eviction waits for its sets' fires");
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
+    tracing::debug!(%pid, "planner: an eviction waits for its state's device folds");
     let stores = crate::store::registry::get(model, engine);
     // A set a fire still folds by a count the device computes keeps its
     // state where the engine holds the record, whose length is the engine's
@@ -774,6 +780,12 @@ async fn restore(
         }
     }
     drop(slots);
+    // Taken before the unpark: a move of its pair that ends meanwhile is
+    // not lost.
+    let pair_watch = stores
+        .roles
+        .as_ref()
+        .map(|roles| roles.lock().unwrap().room_watch());
     // The instance tables and rings parked with it come back into fresh
     // device slots, which the engine is told before the process fires.
     let roles = match stores
@@ -802,8 +814,37 @@ async fn restore(
             }
             // Its pair is on its way back with another process's restore:
             // it goes again once that lands, its instances rebound to it.
-            if matches!(error, crate::store::roles::RolesError::PairParked(_)) {
-                tracing::debug!(%pid, %error, "planner: a restore waits for its pair's move");
+            // It goes again once that move ends (committed or aborted, the
+            // roles say so), never at once: queued again straight away it
+            // was served, short and queued again, round after round, as
+            // long as the move took (Mac Pro's M5: 27702 rounds).
+            // Said once a wait, with what the move carries; woken by the
+            // move's end alone (a commit or an abort tells the roles' watch,
+            // and the pair no longer moves), never re-planned meanwhile.
+            // The move is a park's or a restore's copies of the instances
+            // it names: it waits on no queued fire, so nothing queued
+            // behind this restore (a holder's fire, an eviction) holds it.
+            if let crate::store::roles::RolesError::PairParked(pair) = &error {
+                let pair = *pair;
+                let roles = stores.roles.as_ref().expect("a pair is a roles item");
+                if let Some(moving) = roles.lock().unwrap().pair_moving(pair) {
+                    tracing::debug!(
+                        %pid,
+                        %pair,
+                        ?moving,
+                        "planner: a restore waits for its pair's move: copies of the \
+                         instances it moves with, landing on the engine's lane"
+                    );
+                }
+                let mut watch = pair_watch;
+                while let Some(waiting) = watch.take() {
+                    let next = roles.lock().unwrap().room_watch();
+                    if roles.lock().unwrap().pair_moving(pair).is_none() {
+                        break;
+                    }
+                    waiting.freed().await;
+                    watch = Some(next);
+                }
                 planner.requeue_restore(pid);
                 return;
             }

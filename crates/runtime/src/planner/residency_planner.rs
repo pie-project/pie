@@ -914,14 +914,25 @@ impl ResidencyPlanner {
     /// idle process is, and the planner looks again for a head it may now
     /// fund.
     pub fn set_bind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: bool) {
-        let changed = self.with_inner(|inner| {
-            inner.procs.get_mut(&pid).is_some_and(|proc| {
+        let (changed, released) = self.with_inner(|inner| {
+            let changed = inner.procs.get_mut(&pid).is_some_and(|proc| {
                 let was = proc.bind_waiting;
                 proc.bind_waiting = waiting;
                 was != waiting
-            })
+            });
+            // The suspended bind it was restored for waits for room again:
+            // its restore is over, and the next bind-suspended restore may
+            // go. Held for it, every other one waited on a bind that waits
+            // behind them (Mac Pro's beam mix: a restored process short at
+            // its bind again, the queue's head a bind-suspended restore,
+            // flat with every thread parked).
+            let released = waiting && inner.bind_restoring == Some(pid);
+            if released {
+                inner.bind_restoring = None;
+            }
+            (changed, released)
         });
-        if changed && waiting {
+        if (changed && waiting) || released {
             self.poke();
         }
     }
