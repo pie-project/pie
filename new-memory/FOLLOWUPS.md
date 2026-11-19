@@ -240,3 +240,21 @@ nothing recorded. Depends on device geometry for engine-gpu and the WGSL
 guest bounds checks (per-instance limits) landing first; the bind-group cache
 key including per-step scalars (`pipelines.rs:253`) is in Windows' step 7
 item 5.
+
+## F36. Vulkan at 256 lanes is host-CPU-bound: the inferlet runtime's per-step cost
+
+After the step's guest passes record into one frame (sc/gpu-serial-fixes:
+0/3/5 command-buffer allocations / submits / fence waits a step at any lane
+count), a 256-lane top-p decode on the RTX PRO 4500 (Qwen3-0.6B, ~10 CPUs
+of cgroup quota) steps in ~141 ms, and ~140 ms of it is the engine thread
+recording the step's 256 guest passes (`Plane::fire_deferred`): ~0.55 ms a
+pass, against ~0.08-0.11 ms a pass at 64 lanes (step ~35 ms, recording
+~5-7 ms). The recording is the same work a pass either way, so the
+superlinear cost is the engine thread starved of CPU beside 256 inferlet
+processes (and the clients) on ~10 CPUs; the device sits idle meanwhile.
+Not profiled yet. The next limit at high concurrency is therefore the
+inferlet runtime's per-step CPU cost (guest calls, channel take / put
+handling, the scheduler's per-lane work, F22) and the per-pass host
+recording (eta-exec's interpreter around each stage, one descriptor set and
+widen a readout row); profile c256 (perf on the engine thread and the
+wasmtime workers) before choosing which.
