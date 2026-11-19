@@ -176,9 +176,12 @@ pub trait Serve: Backend {
     /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
     fn bound(pipelines: &Self::Pipelines) -> u64;
 
-    /// The backend's state of a fresh load over its `readout` seats.
+    /// The backend's state of a fresh load over its `readout` seats, with
+    /// whatever device memory it keeps for every fire (made before the pool
+    /// is sized, so the pool is sized past it).
     fn shelf(
         device: &Self::Context,
+        pipelines: &Self::Pipelines,
         readout: &[Self::Buffer],
         weights_stream: bool,
     ) -> Result<Self::Shelf>;
@@ -1697,13 +1700,39 @@ impl<B: Serve> Shell<B> {
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
+        // Every reservation the load makes beside the pool is made before
+        // the pool is sized, so the pool is sized past them: the weight row
+        // and expert caches, and the backend's own state of the load (its
+        // frame rings, where it keeps them).
+        let row_caches = crate::store::rows::RowCaches::new(
+            &device,
+            &boot.trace,
+            row_shapes,
+            boot.budget.max_tokens,
+            chunk,
+            arms,
+        )?;
+        let expert_caches =
+            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
+        let weights_stream = weights.streams() || weights.gathered().is_some();
+        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream)?;
+
+        // The ledger's capacity is what the device has, measured once the
+        // context, the weights and every load-time reservation beside the
+        // pool are up; what the driver holds by then is its own entry.
+        device.books().outside("driver", device.outside());
+        device.books().settle(chunk, device.capacity());
+
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
         // Every pipeline a fire asks for is built by now: what is left is
-        // past what the driver took for them.
-        let left = device.left();
+        // past what the driver took for them. The ledger holds each class in
+        // whole chunks, so what is left is what it leaves: a pool of the
+        // bytes the device leaves would hold up to a chunk a class past what
+        // the device has.
+        let left = device.left().min(device.books().ledger().room());
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1785,11 +1814,6 @@ impl<B: Serve> Shell<B> {
             "the chunk pool is sized to its budget or what the weights and the working set leave; \
              a fire's activation takes its top chunks"
         );
-        // The ledger's capacity is what the device has, measured once the
-        // context, the weights and every load-time reservation are up;
-        // what the driver holds by then is its own entry.
-        device.books().outside("driver", device.outside());
-        device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
             slots,
@@ -1799,16 +1823,6 @@ impl<B: Serve> Shell<B> {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
-        let row_caches = crate::store::rows::RowCaches::new(
-            &device,
-            &boot.trace,
-            row_shapes,
-            boot.budget.max_tokens,
-            chunk,
-            arms,
-        )?;
-        let expert_caches =
-            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment and the span's stand from the load on;
         // a pool laid whole stands whole.
         let segments = pools.load_segments();
@@ -1825,9 +1839,6 @@ impl<B: Serve> Shell<B> {
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
-
-        let weights_stream = weights.streams() || weights.gathered().is_some();
-        let shelf = B::shelf(&device, &readout, weights_stream)?;
 
         let mut shell = Shell {
             preseated: Vec::new(),

@@ -474,7 +474,12 @@ impl<B: Serve> Serve for Named<B> {
         Ok(NoFrame)
     }
 
-    fn shelf(_device: &Facts, _readout: &[NoBuffer], _weights_stream: bool) -> Result<()> {
+    fn shelf(
+        _device: &Facts,
+        _pipelines: &Self::Pipelines,
+        _readout: &[NoBuffer],
+        _weights_stream: bool,
+    ) -> Result<()> {
         Ok(())
     }
 

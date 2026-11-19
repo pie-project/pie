@@ -70,6 +70,14 @@ inline float m1_load_f(const device uchar* data, uint index, uint dtype) {
   return data[index] != 0 ? 1.0f : 0.0f;
 }
 
+// A 32-bit element's bits, already loaded, as m1_load_f reads it.
+inline float m1_bits_f(uint bits, uint dtype) {
+  if (dtype == 0) return as_type<float>(bits);
+  if (dtype == 1) return float(as_type<int>(bits));
+  if (dtype == 2) return float(bits);
+  return bits != 0 ? 1.0f : 0.0f;
+}
+
 inline int m1_load_i(const device uchar* data, uint index, uint dtype) {
   if (dtype == 0) return int(reinterpret_cast<const device float*>(data)[index]);
   if (dtype == 1) return reinterpret_cast<const device int*>(data)[index];
@@ -1345,7 +1353,12 @@ inline void m4_reduce_two_levels(
     uint threads,
     threadgroup M1ArgmaxCandidate* tgbuf,
     uint simd_lane,
-    uint simd_id) {
+    uint simd_id,
+    // Where stated, level 0 reads exp(x - center[row]) for x, both read
+    // through their dtypes: a log-softmax's sum of exponentials from its
+    // row itself.
+    const device uchar* center = nullptr,
+    uint center_dtype = 0u) {
   const uint count = m4_reduce_count(d.last, level);
   const uint chunks = (count + 31u) / 32u;
   const uint pitch = (d.last + 31u) / 32u;
@@ -1362,7 +1375,9 @@ inline void m4_reduce_two_levels(
         result[row] = identity;
       } else {
         result[row] = level == 0u
-            ? reinterpret_cast<const device uint*>(input)[row * d.last]
+            ? (center != nullptr
+                   ? as_type<uint>(precise::exp(m1_load_f(input, row * d.last, d.dtype) - m1_load_f(center, row, center_dtype)))
+                   : reinterpret_cast<const device uint*>(input)[row * d.last])
             : plane[((level - 1u) & 1u) * d.rows * pitch + row * pitch];
       }
     }
@@ -1377,12 +1392,16 @@ inline void m4_reduce_two_levels(
     const device uint* src = level == 0u
         ? reinterpret_cast<const device uint*>(input) + row * d.last
         : plane + ((level - 1u) & 1u) * d.rows * pitch + row * pitch;
+    const float centre = (level == 0u && center != nullptr) ? m1_load_f(center, row, center_dtype) : 0.0f;
 
     uint held[8];
     for (uint k = 0; k < 8u; ++k) {
       const uint chunk = group * span + simd_id + k * simds;
       const uint at = chunk * 32u + simd_lane;
       held[k] = (k < rounds && chunk < chunks && at < count) ? src[at] : identity;
+      if (level == 0u && center != nullptr && k < rounds && chunk < chunks && at < count) {
+        held[k] = as_type<uint>(precise::exp(m1_bits_f(held[k], d.dtype) - centre));
+      }
     }
     for (uint k = 0; k < 8u; ++k) {
       if (k < rounds) {

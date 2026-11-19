@@ -152,7 +152,22 @@ impl Serve for Api {
         pipelines.bound()
     }
 
-    fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
+    fn shelf(
+        device: &Context,
+        pipelines: &Pipelines,
+        readout: &[Buffer],
+        _weights_stream: bool,
+    ) -> Result<Shelf> {
+        // A frame takes a scratch chunk from the ring: stocked for each frame
+        // in flight (an arm a readout seat) and the one a settle or a walk
+        // holds beside them, here at the load, before the pool is sized past
+        // them. A shell fires frames with or without a guest program. Its
+        // uniforms are the device's, made with it.
+        #[cfg(feature = "wgpu")]
+        device.core().stock_rings(readout.len() + 1);
+        #[cfg(not(feature = "wgpu"))]
+        let _ = device;
+        let _ = pipelines;
         Ok(Shelf {
             mirror: readout
                 .iter()

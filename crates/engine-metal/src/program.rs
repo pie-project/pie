@@ -1313,6 +1313,15 @@ impl Plane {
         bound.session.settle_launched(&program.plan)
     }
 
+    /// Instance `id`'s airborne pass as its frame's completion handler
+    /// reads it ([`session::EpilogueCheck`]); `None` with nothing airborne.
+    #[must_use]
+    pub fn epilogue_check(&self, id: InstanceId) -> Option<session::EpilogueCheck> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        bound.session.epilogue_check(&program.plan)
+    }
+
     pub fn abandon_launched(&mut self, id: InstanceId) {
         if let Some(bound) = self.instances.get_mut(&id) {
             bound.session.abandon_launched();
