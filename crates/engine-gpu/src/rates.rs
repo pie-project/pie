@@ -13,8 +13,10 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
-//! - its vector matmul kernels at each of [`FEW_ROWS`] over the widest
-//!   plane, the most flops over time any reaches, for `few_row_tflops`;
+//! - each of its vector matmul kernels (by the rows a workgroup carries) at
+//!   each of [`VECTOR_ROWS_TIMED`] over the widest plane, for
+//!   `vector_tflops_by_rows`, and each tiled kernel at each of [`TILE_ROWS`],
+//!   for `tile_tflops_by_rows`;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
 //!   longest keys, said beside it), through the kernel a served fire selects
@@ -109,11 +111,11 @@ pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-/// `few_row_tflops` is the vector kernels' rate, which the dense matmul's
-/// kernel at each rung is chosen by (`crate::dense`). `workgroups_per_core`
-/// is not weighed here yet: no choice on these backends reads it, so a
-/// load measures none. `tile_tflops_by_rows` is each tiled kernel's rate
-/// below the matmul curve, which that choice weighs them by.
+/// `vector_tflops_by_rows` and `tile_tflops_by_rows` are each vector and
+/// tiled matmul kernel's rate by rows, which the dense matmul's kernel is
+/// chosen by (`crate::dense`). `few_row_tflops` and `workgroups_per_core`
+/// are not weighed here: no choice on these backends reads them, so a load
+/// measures neither.
 pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
@@ -121,17 +123,17 @@ pub const KEYS: [&str; 8] = [
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
-    "few_row_tflops",
     "tile_tflops_by_rows",
+    "vector_tflops_by_rows",
 ];
 
 /// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
 /// decode's few to the matmul curve's first.
 const TILE_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
 
-/// The decode-shaped rows `few_row_tflops` is timed at: 4 to 256, the rows
-/// below the matmul curve's first.
-const FEW_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
+/// The rows each vector kernel is timed at for `vector_tflops_by_rows`: a
+/// decode's one to the matmul curve's first.
+const VECTOR_ROWS_TIMED: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -528,7 +530,7 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
 struct Wanted {
     launch: bool,
     gemm: bool,
-    few_row: bool,
+    vectors: bool,
     tiles: bool,
     attn: bool,
     elementwise: bool,
@@ -542,7 +544,7 @@ impl Wanted {
         Wanted {
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
-            few_row: lacks("few_row_tflops"),
+            vectors: lacks("vector_tflops_by_rows"),
             tiles: lacks("tile_tflops_by_rows"),
             attn: lacks("attn_tflops_by_keys"),
             elementwise: lacks("elementwise_gbps"),
@@ -606,29 +608,38 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
-    // `few_row_tflops`: the vector kernels at decode-shaped rows of the
-    // widest plane, each row count on the workgroup rows a rung of it takes
-    // (`gemm::vector_rows`). Their time is their launch and the longer of
-    // their weight reads and their flops at that rate, so flops over time
-    // reaches the rate where the weights no longer bind them and stays
-    // under it everywhere: the rate is the most any of the rows reaches.
-    let mut few_row = 0f64;
+    // `vector_tflops_by_rows`: each vector kernel, by the rows a workgroup
+    // carries, at `VECTOR_ROWS_TIMED` of the widest plane, each fire reading
+    // the next plane past the last-level cache: its flops over its time,
+    // every weight pass it makes in it.
     let w = engine::rates::GEMM_WIDTH;
-    for m in FEW_ROWS.into_iter().filter(|_| want.few_row) {
+    let mut vector_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    let carried = if want.vectors {
+        kernels_slang::linear::gemm::VECTOR_ROWS.to_vec()
+    } else {
+        Vec::new()
+    };
+    for rows in carried {
         let vector = kernels_slang::linear::gemm::Tactic {
-            vector: kernels_slang::linear::gemm::vector_rows(m),
+            vector: rows,
             ..tactics.gemm(tier, 1)
         };
-        let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
-        rig.release();
-        let Some(rate) = dropped(&rig, rate, say)? else {
-            continue;
-        };
-        say(&format!(
-            "[rates]: vector matmul {m}x{w}x{w}: {:.1} TFLOP/s",
-            rate / 1e3
-        ));
-        few_row = few_row.max(rate);
+        let mut curve = Vec::new();
+        for m in VECTOR_ROWS_TIMED {
+            let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
+            rig.release();
+            let Some(rate) = dropped(&rig, rate, say)? else {
+                continue;
+            };
+            say(&format!(
+                "[rates]: vector matmul ({rows} rows a workgroup) {m}x{w}x{w}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        if !curve.is_empty() {
+            vector_curves.push((rows, curve));
+        }
     }
     // `tile_tflops_by_rows`: each tiled kernel the backend can take, at
     // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
@@ -748,8 +759,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         hbm_gbps: want.launch.then_some(bytes_per_ns),
         elementwise_gbps: elementwise,
         scan_gelems: scan,
-        few_row_tflops: (few_row > 0.0).then_some(few_row / 1e3),
+        few_row_tflops: None,
         tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
+        vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
         workgroups_per_core: None,
     };
     // A rate that settled at nothing is refused by name, never saved or
@@ -1351,14 +1363,15 @@ mod wanted_tests {
             hbm_gbps: Some(650.0),
             elementwise_gbps: Some(700.0),
             scan_gelems: Some(100.0),
-            few_row_tflops: Some(12.0),
+            few_row_tflops: None,
             workgroups_per_core: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
         };
         let none = Wanted {
             launch: false,
             gemm: false,
-            few_row: false,
+            vectors: false,
             tiles: false,
             attn: false,
             elementwise: false,
@@ -1366,13 +1379,13 @@ mod wanted_tests {
         };
         assert_eq!(Wanted::of(&all), none);
         let few = Rates {
-            few_row_tflops: None,
+            vector_tflops_by_rows: None,
             ..all.clone()
         };
         assert_eq!(
             Wanted::of(&few),
             Wanted {
-                few_row: true,
+                vectors: true,
                 ..none
             }
         );
@@ -1391,7 +1404,7 @@ mod wanted_tests {
         assert!(
             every.launch
                 && every.gemm
-                && every.few_row
+                && every.vectors
                 && every.tiles
                 && every.attn
                 && every.elementwise

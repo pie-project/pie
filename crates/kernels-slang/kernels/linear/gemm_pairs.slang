@@ -244,6 +244,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate linear_gemm_pairs_gemv_bf16 PIE_GEMV=1 PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_gemv_bf16 PIE_GEMV=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v1_bf16 PIE_GEMV=1 PIE_VROWS=1u PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v1_bf16 PIE_GEMV=1 PIE_VROWS=1u PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_gemv_v8_bf16 PIE_GEMV=1 PIE_VROWS=8u PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_gemv_v8_bf16 PIE_GEMV=1 PIE_VROWS=8u PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_gemv_v16_bf16 PIE_GEMV=1 PIE_VROWS=16u PIE_TARGET=wgsl

@@ -1129,6 +1129,10 @@ impl<'a> Walk<'a> {
                     rates.tile_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
+                key @ "vector_tflops_by_rows" => {
+                    rates.vector_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
                 key @ "attn_tflops_by_keys" => {
                     rates.attn_tflops_by_keys = self.curve(v, key);
                     continue;
@@ -1160,8 +1164,8 @@ impl<'a> Walk<'a> {
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
-                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core` and \
-                             `tile_tflops_by_rows`, not `{other}`"
+                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
+                             `tile_tflops_by_rows` and `vector_tflops_by_rows`, not `{other}`"
                         ),
                     );
                     continue;

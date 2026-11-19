@@ -25,6 +25,8 @@
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
 //! # each tiled kernel's TFLOP/s by rows below its full fill, keyed by its row tile
 //! tile_tflops_by_rows = [[32, [[8, 1.0], [256, 9.0]]], [256, [[8, 0.2], [256, 12.0]]]]
+//! # each vector kernel's TFLOP/s by rows, keyed by the rows a workgroup carries
+//! vector_tflops_by_rows = [[1, [[1, 0.3], [256, 2.0]]], [16, [[1, 0.1], [256, 6.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -90,10 +92,15 @@ pub struct Rates {
     /// between them and the vector kernels weighs measured costs at partial
     /// fill. Measured.
     pub tile_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    /// Each vector matmul kernel's bf16 TFLOP/s by rows, its flops at the
+    /// rows it lands over its time (its weight passes in it): `(rows a
+    /// workgroup carries, [(rows, TFLOP/s)])`, ascending in the rows a
+    /// workgroup carries (the slang backends' vector kernels). Measured.
+    pub vector_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 10] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -103,6 +110,7 @@ pub const KEYS: [&str; 9] = [
     "few_row_tflops",
     "workgroups_per_core",
     "tile_tflops_by_rows",
+    "vector_tflops_by_rows",
 ];
 
 impl Rates {
@@ -119,6 +127,7 @@ impl Rates {
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
             tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
+            vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
         }
     }
 
@@ -152,6 +161,10 @@ impl Rates {
                 .tile_tflops_by_rows
                 .clone()
                 .filter(|_| has("tile_tflops_by_rows")),
+            vector_tflops_by_rows: self
+                .vector_tflops_by_rows
+                .clone()
+                .filter(|_| has("vector_tflops_by_rows")),
         }
     }
 
@@ -170,6 +183,7 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
+            "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -223,6 +237,11 @@ impl Rates {
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
         keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
+        keyed(
+            &mut out,
+            "vector_tflops_by_rows",
+            &self.vector_tflops_by_rows,
+        );
         out
     }
 }
@@ -374,6 +393,7 @@ mod tests {
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
@@ -381,7 +401,8 @@ mod tests {
             [
                 "few_row_tflops",
                 "workgroups_per_core",
-                "tile_tflops_by_rows"
+                "tile_tflops_by_rows",
+                "vector_tflops_by_rows"
             ]
         );
         assert_eq!(
@@ -390,7 +411,7 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\n"
+             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
         );
     }
 

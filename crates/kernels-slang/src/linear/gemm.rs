@@ -21,7 +21,7 @@ const LANE: &str = "linear/gemm_lane.slang";
 /// The rows one workgroup of the eight-column vector kernel can carry over
 /// one read of the weight (the shader's `PIE_VROWS`, one entry each): its
 /// grid takes a row of workgroups a block of them.
-pub const VECTOR_ROWS: [u32; 3] = [4, 8, 16];
+pub const VECTOR_ROWS: [u32; 4] = [1, 4, 8, 16];
 
 /// The rows a vector workgroup carries for a matmul of `rows`: the fewest
 /// of [`VECTOR_ROWS`] that hold them, the most past them all.
@@ -238,6 +238,7 @@ fn kernel(
         Target::Spirv if tactic.vector > 0 && k.is_multiple_of(8) => {
             let rows = vector_rows(tactic.vector);
             let entry = match rows {
+                1 => "linear_gemm_gemv_v1_bf16",
                 4 => "linear_gemm_gemv_v_bf16",
                 8 => "linear_gemm_gemv_v8_bf16",
                 _ => "linear_gemm_gemv_v16_bf16",
@@ -290,6 +291,7 @@ fn kernel(
             if tactic.vector > 0 {
                 let rows = vector_rows(tactic.vector);
                 let entry = match rows {
+                    1 => "linear_gemm_pairs_gemv_v1_bf16",
                     4 => "linear_gemm_pairs_gemv_bf16",
                     8 => "linear_gemm_pairs_gemv_v8_bf16",
                     _ => "linear_gemm_pairs_gemv_v16_bf16",
@@ -396,7 +398,14 @@ mod tests {
     fn the_kernels_a_projection_names_hold_the_kernel_of_every_row_count() {
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for (vector, wide) in [(0, false), (0, true), (4, false), (8, false), (16, false)] {
+                for (vector, wide) in [
+                    (0, false),
+                    (0, true),
+                    (1, false),
+                    (4, false),
+                    (8, false),
+                    (16, false),
+                ] {
                     let tactic = Tactic { tier, vector, wide };
                     for (n, k) in [(64, 64), (1024, 1024), (1030, 1001), (48, 16), (8, 24)] {
                         let named: Vec<(&str, Tier)> =
@@ -431,7 +440,14 @@ mod tile_tests {
         // `tile_for`'s row tile.
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for (vector, wide) in [(0, false), (0, true), (4, false), (8, false), (16, false)] {
+                for (vector, wide) in [
+                    (0, false),
+                    (0, true),
+                    (1, false),
+                    (4, false),
+                    (8, false),
+                    (16, false),
+                ] {
                     let tactic = Tactic { tier, vector, wide };
                     for m in [1, 4, 8, 16, 47, 48, 64, 255, 256, 1024, 4096] {
                         for (n, k) in [(1024, 1024), (96, 4096), (4096, 1000)] {
