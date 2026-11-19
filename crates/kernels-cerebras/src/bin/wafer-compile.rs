@@ -651,11 +651,16 @@ fn stream(args: &[String]) -> Result<(), String> {
             // (each op's first word of column 0's weight stream: where the tape is during it)
             for o in &c.ops {
                 println!(
-                    "  op {} {}: {:.0} cycles, from stream word {}",
+                    "  op {} {}: {:.0} cycles, from stream word {}, terms {:.0} {:.0} {:.0} {:.0} {:.0}",
                     o.op,
                     o.what,
                     o.cycles,
-                    p.wop.get(o.op).copied().unwrap_or(0)
+                    p.wop.get(o.op).copied().unwrap_or(0),
+                    o.terms[0],
+                    o.terms[1],
+                    o.terms[2],
+                    o.terms[3],
+                    o.terms[4]
                 );
             }
         }

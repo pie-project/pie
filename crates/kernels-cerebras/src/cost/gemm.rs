@@ -5,7 +5,7 @@
 //! - **A GEMM**: a turn of the row's line a piece of the input (the root's two sends, a drain
 //!   each, its four route writes: [`TURN`]), the piece's words, and a weight block a segment
 //!   (its words, three times at its column's root: received, sent north and south), each row's
-//!   `mac32`s ([`MAC_CALL`] + [`MAC_ELEM`] an element: `mv.csl` on the simulator); rows of
+//!   `mac32`s (a row a call, [`MAC_CALL`], and [`MAC_ELEM`] a multiply-accumulate); rows of
 //!   another class drain the blocks.
 //! - **A region**: its printed `row()` ([`RegionFeatures`]) a row, its rows' chunks copied in
 //!   and out, a row's sum an all-reduce along the row ([`HOP`] a PE), a head's along its band.
@@ -27,20 +27,25 @@ pub const TURN: f64 = 150.0;
 /// flux2-mini on the simulator (16 + 16 rows: its entries' 219k cycles, 253 a piece; its step's
 /// 969k before the even cut's division was hoisted, 395, about 100 of it the division).
 pub const PIECE: f64 = 280.0;
-/// A `mac32` instruction's fixed cycles and an element's (16-bit operands, f32 accumulation).
-pub const MAC_CALL: f64 = 1.84;
-pub const MAC_ELEM: f64 = 0.5;
-/// A `mac32`'s loop around it in `mv.csl` (its operands' DSDs stepped, the count), fitted to a
-/// klein-shaped slice on the simulator: flux2-mini at `tb` 8 (32 x 4 PEs, 16 + 16 rows; a GEMM's
-/// piece `8 x 8` of an `8 x 8` block, klein's at 1024²) measured 2,527,668 cycles a step where the
-/// rest of this model prices 1.936M, its 127k `mac32`s the difference (4.65 each).
-pub const MAC_LOOP: f64 = 4.65;
+/// A `mac32` (or `tile32`) call's fixed cycles and a multiply-accumulate's: a call is a row of a
+/// block (its DSRs loaded, its `@map` over the input's elements set up), its MACs the block's
+/// (`kc` `@fmachs` of `p` words, pipelined). Fitted to the chip (1572: klein 1024²'s denoise at
+/// 384 x 520, the tape's stamps over 74 GEMMs of seven shapes, weighted rms 3%): the model had a
+/// call a row an input element (`kc` of them a row, 6.49 cycles each), which priced the k = 9,216
+/// down-projection at 1.29x the chip and the three-segment k = 3,072 GEMMs at 0.90x.
+pub const MAC_CALL: f64 = 61.75;
+pub const MAC_ELEM: f64 = 0.543;
 /// A PE's hop of an all-reduce's chain (an `fadds` from the fabric into the fabric).
 pub const HOP: f64 = 12.0;
 /// A DSD op's fixed cycles.
 pub const CALL: f64 = 8.0;
 /// A scalar exponent (`math.exp1`).
 pub const EXP: f64 = 30.0;
+/// A key block's cycles past its terms here, fitted to the chip and not yet attributed (1572:
+/// klein 1024²'s 25 attentions of 65 key blocks took ~47.2M of the array's 163.4M, the GEMMs'
+/// 112.2M, the regions' and the host's ops' priced, against 28.0M priced: 29.0k a block, 17.2k
+/// priced). The attention reads no stream words, so the tape's stamps do not split it.
+pub const KEY_BLOCK: f64 = 11_770.0;
 /// An op's fixed cycles: the interpreter, the array's step between ops.
 pub const OP: f64 = 200.0;
 /// A PE's 32-bit words ([`crate::check::PE_BYTES`]).
@@ -61,6 +66,10 @@ pub struct OpCost {
     pub op: usize,
     pub what: &'static str,
     pub cycles: f64,
+    /// A GEMM's price by term: its line's turns and pieces, its input pieces' words, its weight
+    /// blocks' words (and their calls), its `mac32`s' calls and their elements (the chip's
+    /// profile is fitted to them).
+    pub terms: [f64; 5],
 }
 
 /// A GEMM program's ops and its cycles.
@@ -82,8 +91,9 @@ impl GemmCost {
     }
 }
 
+/// A `mac32` call of `n` multiply-accumulates.
 fn mac(n: u32) -> f64 {
-    MAC_CALL + MAC_LOOP + MAC_ELEM * f64::from(n)
+    MAC_CALL + MAC_ELEM * f64::from(n)
 }
 
 /// An all-reduce of `n` words over `members` PEs.
@@ -110,6 +120,7 @@ pub fn time(p: &GemmProgram) -> GemmCost {
     let (c, tb) = (p.c, p.tb);
     let mut ops = Vec::new();
     for (i, op) in p.l.ops.iter().enumerate() {
+        let mut terms = [0.0; 5];
         let (what, cy) = match op {
             GOp::In { v, lane, .. } => {
                 let rows = if *lane { 1 } else { tb };
@@ -122,7 +133,6 @@ pub fn time(p: &GemmProgram) -> GemmCost {
             } => {
                 let rows = if *lane { 1 } else { tb };
                 let segs = crate::stream::gemm::local(&p.l.vals[y], c, 0);
-                let mut cy = 0.0;
                 for cp in 0..c {
                     let (a, b) = piece(cp, c, *k);
                     let kc = b - a;
@@ -130,17 +140,20 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                         continue;
                     }
                     let xw = (rows * kc).div_ceil(2) * if *x32 { 2 } else { 1 };
-                    cy += TURN + PIECE + 3.0 * f64::from(xw);
+                    terms[0] += TURN + PIECE;
+                    terms[1] += 3.0 * f64::from(xw);
                     for s in &segs {
                         let p = s.4;
                         let wb = f64::from(kc * p / 2);
                         // the block off the column's tree
-                        cy += wb + CALL;
-                        cy +=
-                            f64::from(rows) * f64::from(kc) * mac(p) * if *x32 { 2.0 } else { 1.0 };
+                        terms[2] += wb + CALL;
+                        // (a call a row and half: its block's MACs)
+                        let calls = f64::from(rows) * if *x32 { 2.0 } else { 1.0 };
+                        terms[3] += calls * MAC_CALL;
+                        terms[4] += calls * MAC_ELEM * f64::from(kc * p);
                     }
                 }
-                ("gemm", cy)
+                ("gemm", terms.iter().sum())
             }
             GOp::Region(ri) => {
                 let g = &p.l.regs[*ri];
@@ -164,13 +177,14 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                 // (a request's key blocks: its rows of PEs')
                 let blocks = p.r / p.l.batch.max(1) / p.kbm;
                 let sl = kb / p.band.max(1);
-                let blk = f64::from(p.kbm)
-                    * (TURN
-                        + 3.0 * f64::from(half)
-                        + f64::from(tb) * (CALL + f64::from(nc))
-                        + CALL
-                        + f64::from(half))
-                    + f64::from(tb) * f64::from(nc) * mac(kb)
+                let blk = KEY_BLOCK
+                    + f64::from(p.kbm)
+                        * (TURN
+                            + 3.0 * f64::from(half)
+                            + f64::from(tb) * (CALL + f64::from(nc))
+                            + CALL
+                            + f64::from(half))
+                    + f64::from(tb) * mac(kb * nc)
                     + 2.0 * allred(tb * kb, p.band)
                     + f64::from(tb * kb) * 1.0
                     + f64::from(tb)
@@ -179,7 +193,7 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                             + 3.0 * EXP
                             + 4.0 * CALL
                             + f64::from(kb)
-                            + f64::from(kb) * mac(nc))
+                            + mac(kb * nc))
                     + if *causal {
                         f64::from(tb * kb) * 4.0
                     } else {
@@ -192,6 +206,7 @@ pub fn time(p: &GemmProgram) -> GemmCost {
             op: i,
             what,
             cycles: cy + OP,
+            terms,
         });
     }
     let cycles = ops.iter().map(|o| o.cycles).sum();

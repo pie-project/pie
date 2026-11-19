@@ -3975,8 +3975,40 @@ refusal of the program where any is open):
   attention (flux2-mini's kbm-16 GEMM: +0.087%, 1564). The emitter ends every attention with
   one. A route restored only once a send's last wavelet is through the router (the switch's
   advance) did not cure it (1563), nor did the column line alone (1559).
-- **Price** (1564): klein 1024²'s whole denoise, priced 151.5M cycles, ran 185.8M a step
-  (+23%): an open item for the cost model.
+- **Price** (1564, 1567, 1572): klein 1024²'s whole denoise, priced 151.5M cycles, read 185.8M a
+  step (1564; Pie's 384 x 520 one 179.5M against 148.1M, 1567). Most of the gap is the launch,
+  not the work. A PE's stamps are its own time since its launch arrived, and the tape's launch
+  arrived ~15.3M cycles before the array's (1572: every array PE starts at 11 and ends at
+  163.08-163.44M on its own clock; the tape's last words read at 178.67M on its own, with no
+  jump between its rows). The span the engine and wafer-bench report runs from the earliest
+  start to the latest end over every PE, so it holds that offset: **the denoise computes in
+  ~163.4M**, +10% over 148.1M.
+  - **The profile** (1572, `wafer-bench --stamps` on the program Pie ran, its tape stamping each
+    PE's own words gone, `GemmProgram::wop` placing each op on the stream): each tape PE's
+    interval is the time the column took to read its 10,832 words. A GEMM's intervals give its
+    time (an op right after a word-less one loses its first interval, which holds that op's
+    time). 74 GEMMs of seven shapes:
+
+    | GEMM (words a column, weight blocks a piece) | ops | priced | chip | priced now |
+    |---|---|---|---|---|
+    | k 9,216, 1 block a piece (36,871) | 30 | 1,089k | 847k | 826k (-2.5%) |
+    | k 3,072, 3 blocks (36,873) | 11 | 966k | 1,071k | 1,074k (+0.3%) |
+    | k 3,072, 2 blocks of 24 (73,736) | 10 | 1,191k | 1,267k | 1,302k (+2.8%) |
+    | k 3,072, 5 blocks (110,603) | 20 | 2,010k | 2,218k | 2,237k (+0.9%) |
+    | the lane GEMMs (x32, one row; 24,584 and 73,740) | 3 | 334k, 653k | 298k, 682k | 353k, 711k |
+    | the 74 | | 97.07M | 95.87M | 96.14M |
+
+    The model had a `mac32` call a row an input element (`kc` of them a block, 6.49 cycles
+    each); the PE makes one a row a block, `kc` `@fmachs` of `p` words under its `@map`. Priced
+    so (`MAC_CALL` 61.75 a call, `MAC_ELEM` 0.543 a multiply-accumulate, the attention's
+    `tile32` and `mac32` counted the same way), all 108 GEMMs price 112.49M, the 74 measured
+    alone 96.14M against the chip's 95.87M (weighted rms 3%).
+  - **The attention** reads no stream words, so the tape does not split it: what the array's
+    163.4M leaves past the GEMMs as measured and the regions and the host's ops at price is
+    ~47.2M, against 28.0M priced (29.0k a key block, 17.2k priced). `KEY_BLOCK` (11,770 a
+    block) holds the difference, unattributed until the attention's own stamps split it.
+  - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
+    (chip 1.858M, 1.71M before); the 576-row one 168.7M.
 
 As emitted today, every GEMM after an attention is an H2 window: flux2-mini's denoise has 8,
 and klein's at c5 and c2 have 50. With v14's barrier or v16's queues, none
