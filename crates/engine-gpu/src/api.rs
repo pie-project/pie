@@ -601,6 +601,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
+        | Fault::DeviceLost { .. }
         | Fault::NoDevice { .. }
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
