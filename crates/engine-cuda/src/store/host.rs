@@ -95,6 +95,8 @@ pub struct HostTier {
     next: u64,
     /// The last batch writing into each chunk: one a move reads waits for.
     writing: Vec<u64>,
+    #[cfg(windows)]
+    committed: Vec<bool>,
     shared: Arc<Shared>,
     send: Option<Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -134,17 +136,15 @@ impl HostTier {
                 0,
             )
         };
-        // SAFETY: a fresh committed reservation no other code knows of;
-        // Windows makes its pages, zeroed, as they are first written.
+        // SAFETY: reserve the address range. check() commits its chunks
+        // before a copy or a slice can access them.
         #[cfg(windows)]
         let base = unsafe {
-            use windows_sys::Win32::System::Memory::{
-                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-            };
+            use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
             VirtualAlloc(
                 core::ptr::null_mut(),
                 len.max(1),
-                MEM_COMMIT | MEM_RESERVE,
+                MEM_RESERVE,
                 PAGE_READWRITE,
             )
         };
@@ -195,6 +195,8 @@ impl HostTier {
             freed: 0,
             next: 0,
             writing: vec![0; chunks as usize],
+            #[cfg(windows)]
+            committed: vec![false; chunks as usize],
             shared,
             send: Some(send),
             thread: Some(thread),
@@ -291,7 +293,7 @@ impl HostTier {
         Ok(())
     }
 
-    fn check(&self, offset: u64, len: usize) -> Result<usize> {
+    fn check(&mut self, offset: u64, len: usize) -> Result<usize> {
         let end = offset.saturating_add(len as u64);
         if end > self.len as u64 {
             return Err(Fault::Ceiling {
@@ -299,6 +301,35 @@ impl HostTier {
                 need: end,
                 have: self.len as u64,
             });
+        }
+        #[cfg(windows)]
+        if len != 0 {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+            let size = self.chunk_bytes;
+            for index in offset / size..end.div_ceil(size) {
+                let committed = &mut self.committed[index as usize];
+                if !*committed {
+                    let start = (index * size) as usize;
+                    // SAFETY: check above bounded the span within the reservation.
+                    // Only the engine thread commits chunks, before handing them to a reader or writer.
+                    let page = unsafe {
+                        VirtualAlloc(
+                            self.base.add(start).cast(),
+                            size as usize,
+                            MEM_COMMIT,
+                            PAGE_READWRITE,
+                        )
+                    };
+                    if page.is_null() {
+                        return Err(Fault::Ceiling {
+                            what: "bytes of host memory to commit for a host-tier chunk",
+                            need: size,
+                            have: 0,
+                        });
+                    }
+                    *committed = true;
+                }
+            }
         }
         Ok(offset as usize)
     }
