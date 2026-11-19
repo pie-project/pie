@@ -657,11 +657,16 @@ impl FireRows {
 /// The own and carried rows of a lane the host places at `start..end`, its
 /// recurrent state folded through `frozen` (`None`: it has none, and
 /// carries nothing): it carries the rows between its state and its first
-/// row.
+/// row. A lane of one row asks the rung for none of them: the engines'
+/// decode step replays them as data, inside its own rows' body.
 fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
+    let own = end.saturating_sub(start);
     FireRows {
-        own: end.saturating_sub(start),
-        carried: frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
+        own,
+        carried: ::engine::fire::lane_carried(
+            own,
+            frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
+        ),
     }
 }
 
@@ -680,7 +685,10 @@ fn device_lane_rows(
 ) -> FireRows {
     FireRows {
         own,
-        carried: frozen.map_or(0, |frozen| cursor.unfolded(frozen)),
+        carried: ::engine::fire::lane_carried(
+            own,
+            frozen.map_or(0, |frozen| cursor.unfolded(frozen)),
+        ),
     }
 }
 
@@ -3296,6 +3304,67 @@ fn unsettle(
     });
 }
 
+/// The fold of a run-ahead fire (its tokens the device's) on sets with a
+/// recurrent state or windows: each group's no further than where the rows
+/// its program has accepted end ([`Cursor::accepted`], bounded by the
+/// run-ahead window), so the rows past them stay buffered and a stop takes
+/// them back. A fold the device counts, or over a folded length the host
+/// does not know, stays as stated.
+///
+/// [`Cursor::accepted`]: crate::inferlet::host::working_set::Cursor::accepted
+fn lagged_fold(
+    fold: &geometry::Fold,
+    lanes: &PassLanes,
+    groups: &LaneGroups,
+    landings: &[geometry::Landing],
+) -> geometry::Fold {
+    let count = landings.len();
+    if (0..count).any(|lane| fold.of(lane).is_none()) {
+        return fold.clone();
+    }
+    let bound = crate::scheduler::run_ahead_window();
+    let mut counts: Vec<u32> = (0..count).map(|lane| fold.of(lane).unwrap_or(0)).collect();
+    for (_, group) in groups {
+        let first = group[0];
+        let place = &lanes.places[first];
+        if !place.folded_exact {
+            continue;
+        }
+        let accepted = lanes.cursors[first]
+            .lock()
+            .unwrap()
+            .accepted(landings[first].start, bound);
+        let room = accepted.saturating_sub(place.folded);
+        for &lane in group {
+            counts[lane] = counts[lane].min(room);
+        }
+    }
+    geometry::Fold::Host(counts)
+}
+
+/// The outputs a fire just reserved its moves for publishes to the host:
+/// the program accepts the fire's rows as it takes them.
+fn host_reads(
+    cells: &BoundCells,
+    accesses: &[(bool, bool)],
+) -> Vec<crate::inferlet::host::working_set::HostRead> {
+    cells
+        .iter()
+        .zip(accesses)
+        .filter(|(_, (_, publish))| *publish)
+        .filter_map(|(cell, _)| {
+            let c = cell.lock().unwrap();
+            if c.role != Some(HostRole::Reader) {
+                return None;
+            }
+            Some(crate::inferlet::host::working_set::HostRead {
+                cell: Arc::downgrade(cell),
+                index: c.last_published()?,
+            })
+        })
+        .collect()
+}
+
 /// What a fire whose rows the host places folds on `group`'s working set.
 /// A count the host knows over a folded length it knows is a slot, frozen
 /// as the fire is prepared; anything else is placed when the pass's last
@@ -3823,6 +3892,22 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(error) => return Ok(Err(error)),
             };
         let windowed = crate::model::model().rs_caps().window_tokens > 0;
+        // On a set with a recurrent state or windows a run-ahead fire folds
+        // no further than the rows the program has accepted, so a stop can
+        // take back the rest; a fire whose tokens the host places is
+        // accepted as it is submitted, and everything before it with it.
+        // A state that buffers no row folds every row as before.
+        let lags = !rs_ws_ids.is_empty() && stores.rs.lock().unwrap().holds_unfolded();
+        let fold = match (!lags, decode_envelope.is_some()) {
+            (true, _) => fold,
+            (false, true) => lagged_fold(&fold, &pass_lanes, &groups, &landings),
+            (false, false) => {
+                for cursor in &pass_lanes.cursors {
+                    cursor.lock().unwrap().accept_all();
+                }
+                fold
+            }
+        };
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
         // none, folds each fire's rows in turn.
@@ -4176,7 +4261,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 kv: set.id,
                 cursor: pass_lanes.cursors[lanes[0]].clone(),
                 start,
-                recurrent: rs_ws_ids.get(lanes[0]).is_some(),
+                rs: rs_ws_ids.get(lanes[0]).copied(),
             }
         };
         let mut at = 0;
@@ -4515,6 +4600,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let Some(reservation) = &ticket_reservation {
                 reservation.apply_to(&mut req);
             }
+            // A run-ahead fire's rows on a set with a recurrent state or
+            // windows wait for the program to take what it publishes.
+            let run_ahead_reads = (last && decode_envelope.is_some() && lags)
+                .then(|| host_reads(&cells, &accesses));
 
             let scheduler_clock = crate::scheduler::probe::ProbeClock::start();
             let submit_error =
@@ -4585,6 +4674,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     )),
                 );
                 host_wrote(cell, &completion, start as u32, slots.end as u32);
+                if let Some(reads) = &run_ahead_reads {
+                    cell.lock()
+                        .unwrap()
+                        .run_ahead(start as u32, slots.end as u32, reads.clone());
+                }
             }
             unqueued.queue(
                 &pipe_fires,
@@ -4933,9 +5027,9 @@ pub(crate) struct SetStart {
     kv: crate::store::kv::page_table::WorkingSetId,
     cursor: CursorCell,
     start: u64,
-    /// The set keeps a recurrent state (or a window) the fire's rows fold
-    /// into.
-    recurrent: bool,
+    /// The set's recurrent state (or windows) the fire's rows land in: its
+    /// buffer or its windows' head, taken back with the rows.
+    rs: Option<crate::store::rs::RsWorkingSetId>,
 }
 
 /// What one fire wrote, set by set: `None` where the device placed its rows.
@@ -4972,13 +5066,6 @@ fn retracted_ends(
             ));
         };
         for set in sets {
-            if set.recurrent {
-                return Err(
-                    "a recurrent state (or a window) folded the rows past the stop, and a fold \
-                     is not taken back"
-                        .to_string(),
-                );
-            }
             match ends.iter_mut().find(|end| end.kv == set.kv) {
                 Some(end) => end.start = end.start.min(set.start),
                 None => ends.push(set.clone()),
@@ -5043,19 +5130,12 @@ pub async fn pipeline_retract<C: FireContext>(
         Err(why) => Some(why),
         Ok(ends) => ends.iter().find_map(|end| {
             let stores = crate::store::registry::get(end.model, end.engine);
-            let cut = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                kv.truncate(end.kv, end.start)
-            });
-            match cut {
+            match take_back(&stores, end) {
                 Ok(()) => {
                     retract_cursor(&end.cursor, end.start);
                     None
                 }
-                // A set released already holds nothing to take back.
-                Err(crate::store::kv::KvStoreError::Table(
-                    crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
-                )) => None,
-                Err(error) => Some(error.to_string()),
+                Err(why) => Some(why),
             }
         }),
     };
@@ -5068,6 +5148,32 @@ pub async fn pipeline_retract<C: FireContext>(
         }
     }
     Ok(Ok(()))
+}
+
+/// Takes `end`'s set back to where the retracted fires began writing it:
+/// its unaccepted run-ahead rows first (refused where the run-ahead bound
+/// accepted rows past the cut), then its recurrent state's buffer or its
+/// windows' head (refused where a fold reached past the cut), then its KV.
+/// Under the lagged fold none of these touches a folded row.
+fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
+    let cut = u32::try_from(end.start).unwrap_or(u32::MAX);
+    end.cursor.lock().unwrap().take_back(cut)?;
+    if let Some(rs) = end.rs {
+        match stores.rs.lock().unwrap().truncate(rs, cut) {
+            // A set released already holds nothing to take back.
+            Ok(()) | Err(crate::store::rs::RsError::UnknownWorkingSet) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+        kv.truncate(end.kv, end.start)
+    }) {
+        Ok(())
+        | Err(crate::store::kv::KvStoreError::Table(
+            crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
+        )) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The host's record of a set's rows ends at `end`.
@@ -5637,9 +5743,12 @@ async fn fire_device_geometry<C: FireContext>(
             device_lane_rows(0, &cursor, frozen[lanes[0]]).carried
         };
         let split = &resolved_qo_indptr;
-        lanes.iter().map(move |&lane| FireRows {
-            own: split[lane + 1] - split[lane],
-            carried,
+        lanes.iter().map(move |&lane| {
+            let own = split[lane + 1] - split[lane];
+            FireRows {
+                own,
+                carried: ::engine::fire::lane_carried(own, carried),
+            }
         })
     }));
     if let Err(refusal) = check_largest_rung(counted, largest_rung(&stores, ws.engine)) {
@@ -6415,9 +6524,28 @@ pub(crate) mod lifecycle_tests {
         completions: Vec<crate::engine::WorkItemCompletion>,
     }
 
-    fn run_ahead(fires: u32, recurrent: bool) -> anyhow::Result<RunAhead> {
-        let model = crate::store::registry::register_model(16, &[64], &[1]);
+    /// `state`: the set keeps a recurrent state frozen through that row,
+    /// and its decodes fold nothing (the lagged fold: the program accepted
+    /// none of them yet).
+    fn run_ahead(fires: u32, state: Option<u32>) -> anyhow::Result<RunAhead> {
+        let model = crate::store::registry::register_model_with_swap(
+            16,
+            &[64],
+            &[0],
+            &[0],
+            &[crate::store::registry::StatePool { slots: 1, pages: 4 }],
+            &[0],
+        );
         let stores = crate::store::registry::get(model, 0);
+        let rs = state.map(|frozen| {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 8,
+                buffer_page_tokens: 4,
+            });
+            rs.fold(ws, frozen);
+            ws
+        });
         let prompt: Vec<u32> = (0..20).map(|t| 3000 + t).collect();
         let id = {
             let mut kv = stores.kv.lock();
@@ -6452,7 +6580,9 @@ pub(crate) mod lifecycle_tests {
             let seq = {
                 let mut kv = stores.kv.lock();
                 let seq = kv.log_begin(id, start).unwrap();
-                kv.freeze(id, start + 1).unwrap();
+                if rs.is_none() {
+                    kv.freeze(id, start + 1).unwrap();
+                }
                 seq
             };
             let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
@@ -6473,7 +6603,7 @@ pub(crate) mod lifecycle_tests {
                             },
                         }),
                         lease: ws.fire_lease().expect("lease the set"),
-                        fold: Some(FoldAt {
+                        fold: rs.is_none().then_some(FoldAt {
                             by: FoldBy::To(start + 1),
                             decoded: true,
                         }),
@@ -6499,7 +6629,7 @@ pub(crate) mod lifecycle_tests {
                     kv: id,
                     cursor: cursor.clone(),
                     start,
-                    recurrent,
+                    rs,
                 }]),
             )?;
             completions.push(completion);
@@ -6549,7 +6679,7 @@ pub(crate) mod lifecycle_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> {
         use std::future::Future;
-        let mut run = run_ahead(6, false)?;
+        let mut run = run_ahead(6, None)?;
         for completion in &run.completions[..2] {
             resolve_test_completion(completion, false);
         }
@@ -6609,7 +6739,7 @@ pub(crate) mod lifecycle_tests {
             kv.release_working_set(child, epoch);
         }
 
-        let mut whole = run_ahead(6, false)?;
+        let mut whole = run_ahead(6, None)?;
         for completion in &whole.completions {
             resolve_test_completion(completion, false);
         }
@@ -6632,12 +6762,33 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
-    /// Rows a recurrent state folded are not taken back: the pipeline fails
-    /// by that name, and its set is refused where it is used next. A
+    /// Under the lagged fold a run-ahead past a stop on a set with a
+    /// recurrent state folded none of its rows: the take-back is a buffer
+    /// truncate, the state untouched, the set usable for the next turn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_on_a_recurrent_set_takes_back_its_buffered_rows() -> anyhow::Result<()> {
+        let mut run = run_ahead(6, Some(20))?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(run.failure(), None);
+        let (folded, logged, _) = run.length();
+        assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
+        assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+        Ok(())
+    }
+
+    /// Rows a recurrent state folded past the cut, or the run-ahead bound
+    /// accepted, are not taken back: the pipeline fails by that name, and
+    /// its set is refused where it is used next. A
     /// retract on an open pipeline, or past what it submitted, is refused.
     #[tokio::test(flavor = "current_thread")]
     async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
-        let mut run = run_ahead(4, true)?;
+        let mut run = run_ahead(4, Some(20))?;
         for completion in &run.completions {
             resolve_test_completion(completion, false);
         }
@@ -6647,7 +6798,7 @@ pub(crate) mod lifecycle_tests {
         // No more than the run-ahead window is kept, however long the
         // pipeline runs.
         let window = crate::scheduler::run_ahead_window();
-        let long = run_ahead(u32::try_from(window).unwrap() + 3, false)?;
+        let long = run_ahead(u32::try_from(window).unwrap() + 3, None)?;
         let borrowed: Resource<Pipeline> = Resource::new_borrow(long.pipeline);
         assert_eq!(
             long.context
@@ -6659,7 +6810,9 @@ pub(crate) mod lifecycle_tests {
                 .len(),
             window
         );
-        let mut run = run_ahead(4, true)?;
+        // A state folded past the cut is not taken back: the pipeline fails
+        // by that name, and its set is refused where it is used next.
+        let mut run = run_ahead(4, Some(23))?;
         for completion in &run.completions {
             resolve_test_completion(completion, false);
         }
@@ -6668,11 +6821,23 @@ pub(crate) mod lifecycle_tests {
             .await?
             .map_err(anyhow::Error::msg)?;
         let failure = run.failure().expect("the pipeline fails");
-        assert!(failure.contains("recurrent state"), "{failure}");
-        assert_eq!(run.length().0, 24, "nothing taken back");
+        assert!(failure.contains("a fold is not taken back"), "{failure}");
+        assert_eq!(run.length().1, 24, "nothing taken back");
         let next = crate::store::PipelineScope::failing_as(Default::default(), || true);
         let refused = run.ws.claim_pipeline_scope(&next).unwrap_err().to_string();
         assert!(refused.contains("could not be taken back"), "{refused}");
+        // Nor are rows the run-ahead bound accepted unread.
+        let mut run = run_ahead(4, Some(20))?;
+        run.cursor.lock().unwrap().bound_accepted = 23;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let failure = run.failure().expect("the pipeline fails");
+        assert!(failure.contains("run-ahead bound"), "{failure}");
 
         let mut context = TestContext {
             id: uuid::Uuid::new_v4(),
@@ -10069,8 +10234,10 @@ mod unfolded_tests {
                         )
                         .unwrap();
                         let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
+                        // A decode lane (one row) states none: its step
+                        // replays them as data, beside its own row.
                         assert!(
-                            carried <= fire.stated,
+                            carried <= fire.stated || fire.own == 1,
                             "replays {carried} rows, stated {}",
                             fire.stated
                         );
