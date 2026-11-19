@@ -501,9 +501,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .fold(0.0, f64::max);
     let mut attn: Vec<(u32, f64)> = Vec::new();
     // A shape's first fire, estimated by its work at the last shape's rate.
-    let at_rate = |shape: engine::rates::AttnShape, rate: Option<f64>| {
-        rate.map(|rate| attn_flops(shape) / rate.max(f64::MIN_POSITIVE) + launch)
-    };
+    let at_rate = |shape: engine::rates::AttnShape, rate: Option<f64>| first_fire_ns(shape, rate, launch);
     for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
         let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
@@ -729,15 +727,7 @@ fn warm_at<B: Serve>(
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
-    let fits = |left: u32| -> u32 {
-        match (rotations.get().bound, per_fire()) {
-            (Some(cap), Some(per)) => {
-                ((cap.as_nanos() as f64 / (per.max(1.0) * rotations.get().worst)).floor() as u32)
-                    .min(left)
-            }
-            _ => left,
-        }
-    };
+    let fits = |left: u32| rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left);
     let shrunk = std::cell::Cell::new(false);
     let warmed = engine::rates::warm_up(|| {
         let mut wall = 0u64;
@@ -1116,4 +1106,82 @@ pub fn gemm_rate<B: Serve>(
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)
+}
+
+/// The fires a warm-up rotation's next frame holds of `left`: as many as fit
+/// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)
+/// times `worst` (at least the walk's measured worst ratio); 0 where not one
+/// fits; all of them where no bound is stated or nothing is measured yet.
+fn rotation_fires(
+    bound: Option<std::time::Duration>,
+    per_fire: Option<f64>,
+    worst: f64,
+    left: u32,
+) -> u32 {
+    match (bound, per_fire) {
+        (Some(cap), Some(per)) => {
+            ((cap.as_nanos() as f64 / (per.max(1.0) * worst.max(1.0))).floor() as u32).min(left)
+        }
+        _ => left,
+    }
+}
+
+/// A new attention shape's first fire, estimated before it is submitted: its
+/// work at the rate the step's last shape measured, plus a launch; none
+/// where no shape has been measured yet.
+fn first_fire_ns(shape: engine::rates::AttnShape, rate: Option<f64>, launch: f64) -> Option<f64> {
+    rate.map(|rate| attn_flops(shape) / rate.max(f64::MIN_POSITIVE) + launch)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const BOUND: std::time::Duration = std::time::Duration::from_millis(2000);
+
+    /// The Adreno 840's trace: a fire swinging 182 → 318 ms. Sized from the
+    /// slowest fire at the walk's worst ratio, a frame stays under the bound
+    /// even when every fire runs at the slowest seen; sized from the last
+    /// (fastest) fire at 1, it would not.
+    #[test]
+    fn a_rotation_frame_sized_from_the_slowest_fire_at_the_worst_ratio_stays_under_the_bound() {
+        let (fast, slow, walk_worst) = (182e6, 318e6, 1.57);
+        let fires = rotation_fires(Some(BOUND), Some(slow), walk_worst, 64);
+        assert!(fires >= 1);
+        assert!(f64::from(fires) * slow * walk_worst <= BOUND.as_nanos() as f64);
+        assert!(f64::from(fires) * slow <= BOUND.as_nanos() as f64);
+        // The old sizing: the last fire's time at a ratio of 1.
+        let old = rotation_fires(Some(BOUND), Some(fast), 1.0, 64);
+        assert!(f64::from(old) * slow > BOUND.as_nanos() as f64, "the old sizing passes the bound at the slowest fire");
+    }
+
+    /// Not one fire fits: the rotation stops (the cube halves), never
+    /// submits a frame past the bound.
+    #[test]
+    fn a_fire_past_the_bound_at_the_worst_ratio_fits_none() {
+        assert_eq!(rotation_fires(Some(BOUND), Some(1500e6), 1.4, 8), 0);
+        // No bound stated: the whole rotation.
+        assert_eq!(rotation_fires(None, Some(1500e6), 1.4, 8), 8);
+        // Nothing measured yet: the whole rotation (the walk admitted it).
+        assert_eq!(rotation_fires(Some(BOUND), None, 1.4, 8), 8);
+    }
+
+    /// A new shape's first fire is estimated from the last shape's rate by
+    /// its work: d256 after d64 at the same keys is estimated at about the
+    /// work ratio, so on a device where d64 took 1.29 s the d256 fire is
+    /// estimated past the 2 s bound and is refused before it is submitted.
+    #[test]
+    fn a_new_attention_shape_is_estimated_by_its_work_before_its_first_fire() {
+        let d64 = engine::rates::ATTN_SHAPE.at(8192).with_dim(64);
+        let d256 = engine::rates::ATTN_SHAPE.at(8192).with_dim(256);
+        assert_eq!(first_fire_ns(d256, None, 0.0), None);
+        let took = 1.29e9;
+        let rate = attn_flops(d64) / took;
+        let estimate = first_fire_ns(d256, Some(rate), 0.0).unwrap();
+        let ratio = attn_flops(d256) / attn_flops(d64);
+        assert!((estimate / took - ratio).abs() < 1e-9);
+        let admission = engine::rates::Admission { settled: true, ..engine::rates::Admission::new(Some(BOUND)) };
+        assert!(!admission.fits(Some(estimate)), "the d256 first fire is refused unsubmitted");
+        assert!(admission.fits(Some(took)), "the d64 fire it was estimated from fits");
+    }
 }
