@@ -224,15 +224,22 @@ pub fn interpolate(curve: &[(u32, f64)], x: f64) -> Option<f64> {
     Some(a + (b - a) * t)
 }
 
-/// A matmul's rate at `m` rows of an `n x k` plane, read off `by_rows` (rows
-/// curves at each square width, ascending in width, in any unit of rate):
-/// each width's curve at the timed rows at or below `m` (its first below
-/// that), in `log width` at `sqrt(n k)` between the widths. Past the widest
-/// width its last span's slope in log width carries on (a wider plane fills
-/// more tiles), never below the widest's rate; below the narrowest, its rate.
-/// Infinite for no curves.
+/// A matmul's rate at `m` rows of an `n x k` plane (`n` the columns it
+/// lands, `k` its depth), read off `by_rows` (rows curves at each square
+/// width, ascending in width, in any unit of rate): each width's curve at
+/// the timed rows at or below `m` (its first below that), in `log width` at
+/// the plane's columns `n` between the widths. The columns set the output
+/// tiles a kernel's waves fill; the depth only lengthens each tile's walk:
+/// on an RTX PRO 4500 (Vulkan) Qwen3.5-0.8B's 1024-column planes ran at the
+/// 1024 curve's rate whatever their depth (2048 or 3584: 14.2, 18.4 TFLOP/s
+/// at 512 and 1024 rows against the curve's 14.2, 18.1), and its 5120- to
+/// 8192-column planes over 1024 at the 4096 curve's carried on (22.6 to
+/// 23.5 at 1024 rows), where their square width (2289 to 2896) read
+/// 18.3 to 19.6. Past the widest width its last span's slope in log width
+/// carries on (more columns fill more tiles), never below the widest's
+/// rate; below the narrowest, its rate. Infinite for no curves.
 #[must_use]
-pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
+pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, _k: u32) -> f64 {
     let at = |curve: &[(u32, f64)]| -> f64 {
         curve
             .iter()
@@ -242,14 +249,14 @@ pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> 
             .map_or(f64::INFINITY, |&(_, r)| r)
     };
     let width: Vec<(u32, f64)> = by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
-    let square = (f64::from(n) * f64::from(k)).sqrt();
+    let columns = f64::from(n);
     if let [.., (w0, r0), (w1, r1)] = width[..]
-        && square > f64::from(w1)
+        && columns > f64::from(w1)
     {
         let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
-        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
+        return (r1 + slope * (columns.ln() - f64::from(w1).ln())).max(r1);
     }
-    interpolate(&width, square).unwrap_or(f64::INFINITY)
+    interpolate(&width, columns).unwrap_or(f64::INFINITY)
 }
 
 /// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a

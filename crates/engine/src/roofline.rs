@@ -6,9 +6,10 @@
 //! over the device's measured rates (the profile's `[rates]`:
 //! `profile::fire::Rates`). The compute rates are measured curves, not
 //! peaks: a matmul's rate by its rows at a few widths (columns and depth;
-//! a plane of `n x k` is read at its square width `sqrt(n k)`, in `log
-//! width` between the widths measured, at the timed rows (half octaves) at or
-//! below its own) and the attention's by its keys, each as the backend's own kernels
+//! a plane of `n x k` is read at its columns `n`, which set the tiles its
+//! waves fill, in `log width` between the widths measured, at the timed rows
+//! (half octaves) at or below its own: `profile::fire::gemm_rate`) and the
+//! attention's by its keys at each head width, each as the backend's own kernels
 //! run it, so a kernel's waves and residency at those points are in the
 //! rate. Between timed rows a matmul pays for the rows its kernel pads to its
 //! tile (`ceil(m / TM) · TM`, `TM` the tile rows of the algorithm the
@@ -449,14 +450,15 @@ mod tests {
         // Past the curve's ends: its first row's, its last's.
         assert_eq!(c.gemm_rate(1, 4096, 4096), 80_000.0);
         assert_eq!(c.gemm_rate(65536, 4096, 4096), 202_000.0);
-        // A 1024-square plane reads the 1024 curve; 2048 square halfway in
-        // log width; a 1024 x 4096 plane is 2048 square.
+        // A plane reads the curve at its columns: 1024 columns the 1024
+        // curve whatever its depth, 2048 halfway in log width.
         assert_eq!(c.gemm_rate(1024, 1024, 1024), 80_000.0);
+        assert_eq!(c.gemm_rate(1024, 1024, 4096), 80_000.0);
         assert!((c.gemm_rate(1024, 2048, 2048) - 120_000.0).abs() < 1e-6);
-        assert!((c.gemm_rate(1024, 1024, 4096) - 120_000.0).abs() < 1e-6);
+        assert!((c.gemm_rate(1024, 2048, 1024) - 120_000.0).abs() < 1e-6);
         // Past the widest width: its last span's slope (1024 to 4096 at 1024
-        // rows, 80 to 160) carries on: 16384 square two more octaves, 240.
-        assert!((c.gemm_rate(1024, 16384, 16384) - 240_000.0).abs() < 1e-6);
+        // rows, 80 to 160) carries on: 16384 columns two more octaves, 240.
+        assert!((c.gemm_rate(1024, 16384, 1024) - 240_000.0).abs() < 1e-6);
         assert!((c.attn_rate(128, 2048) - 225_000.0).abs() < 1e-6);
         // Between the widths measured, linear in log width: 181 is halfway
         // from 128 to 256 (log 2), so halfway in rate.
