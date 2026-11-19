@@ -49,15 +49,13 @@ var<private> sel_group : u32;
 var<private> sel_groups : u32;
 
 
-// The stage's bounds (its cfg's heap words, values and ops), read once at
-// the step's entry: every access below is checked against them. A heap
+// The stage's heap bound, read once at the step's entry: every heap access
+// is checked against it (the tables need no device check; see d_word). A heap
 // index is relative to the stage's own heap binding, which spans exactly its
 // heap: [0, lim_heap). Where that binding spans more (a pool segment at a
 // dynamic offset), the check must become [the instance's base, base +
 // limit), never the binding's size.
 var<private> lim_heap : u32;
-var<private> lim_values : u32;
-var<private> lim_ops : u32;
 
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
@@ -83,12 +81,17 @@ fn hst(w : u32, x : u32) {
   heap[w] = x;
 }
 
-// A value's descriptor word `k`, refused past the stage's values.
+// A value's descriptor word `k`. The descriptors, offsets and op params
+// are read at indices with no device check: every index is host-written (a
+// value id from an op's params, an op from the step's uniform, a constant
+// word), the host refuses a plan whose tables name past themselves at its
+// registration (engine_gpu's plan_tables_valid) and a layout that lays a
+// value past its heap at a bind, and no store of this runtime reaches
+// those tables (it declares them read-only; a backend that must bind them
+// read_write beside the heap in one buffer, wgpu, still stores to them
+// nowhere, as the step modules' test holds). Only the heap, whose indices
+// come from guest data, is checked on the device (hld / hst).
 fn d_word(v : u32, k : u32) -> u32 {
-  if (v >= lim_values || k >= DESC_WORDS) {
-    pie_fault(OUT_OF_BOUNDS, v * DESC_WORDS + k, lim_values * DESC_WORDS);
-    return 0u;
-  }
   return descs[v * DESC_WORDS + k];
 }
 
@@ -98,10 +101,7 @@ fn d_rank(v : u32) -> u32 { return d_word(v, 3u); }
 fn d_dtype(v : u32) -> u32 { return d_word(v, 4u); }
 fn d_dim(v : u32, k : u32) -> u32 { return d_word(v, 5u + k); }
 
-fn base(v : u32) -> u32 {
-  if (v >= lim_values) { pie_fault(OUT_OF_BOUNDS, v, lim_values); return 0u; }
-  return offs[v] >> 2u;
-}
+fn base(v : u32) -> u32 { return offs[v] >> 2u; }
 
 fn rows_of(v : u32) -> u32 {
   let rank = d_rank(v);
@@ -112,13 +112,7 @@ fn rows_of(v : u32) -> u32 {
 }
 
 
-fn p_at(p : u32, k : u32) -> u32 {
-  if (p >= lim_ops || k >= PARAM_WORDS) {
-    pie_fault(OUT_OF_BOUNDS, p * PARAM_WORDS + k, lim_ops * PARAM_WORDS);
-    return 0u;
-  }
-  return params[p * PARAM_WORDS + k];
-}
+fn p_at(p : u32, k : u32) -> u32 { return params[p * PARAM_WORDS + k]; }
 fn p_tag(p : u32) -> u32 { return p_at(p, 0u); }
 fn p_a0(p : u32) -> u32 { return p_at(p, 1u); }
 fn p_a1(p : u32) -> u32 { return p_at(p, 2u); }
