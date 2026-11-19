@@ -103,6 +103,91 @@ pub struct Shape {
     /// A GEMM of fewer input words than PEs gives them to the westmost PEs (none of no words
     /// west of one with), not spread over the row.
     pub packed: bool,
+    /// The column line's rule v17 (as emitted): iq6 rebound to `KF` once the last row's piece
+    /// is read (the last row: after its own send), not left on `KB` to the next attention.
+    pub v17: bool,
+    /// The column line as emitted: the attentions alternate their members' order (forward,
+    /// then from the last row), each starting on the colour the last ended on.
+    pub alt: bool,
+    /// Ramp mode, the tape bounded: a column's weight stream (`C_WT`, a multicast up the
+    /// column, every PE of it taking every word) moves a word on only once every PE of the
+    /// column has room for it (`n` words a PE holds unread) and none's ramp is held; so a
+    /// column's PEs drift at most `n` words of it apart (`None`: the tape always there).
+    pub tape_cap: Option<u64>,
+}
+
+impl Shape {
+    /// A GEMM-regime program's ops as the check sees them, on a `gx x rq` array: its GEMMs'
+    /// input words scaled from the program's row of PEs, its classes' rows split as its rows
+    /// are, its host ins and outs a header off the tape each (ramp mode, as emitted: the row line
+    /// on its own queues, the attentions alternating their members' order, each ending in a row
+    /// all-reduce where the PE code has one).
+    #[must_use]
+    pub fn of(p: &crate::stream::gemm::GemmProgram, gx: u32, rq: u32) -> Shape {
+        use crate::stream::gemm::GOp;
+        // (the classes a check of two tells apart: class 0, then every other)
+        let bits = |m: u16| u8::from(m & 1 != 0) | (u8::from(m & !1 != 0) << 1);
+        let ops =
+            p.l.ops
+                .iter()
+                .map(|o| match o {
+                    GOp::Gemm { k, mask, .. } => Op::Gemm {
+                        k: (k * gx).div_ceil(p.c),
+                        mask: bits(*mask),
+                    },
+                    GOp::Region(r) => {
+                        let g = &p.l.regs[*r];
+                        let (row, head) = g
+                            .printed
+                            .as_ref()
+                            .map_or((0, 0), |x| (x.all_reduces, x.head_reduces));
+                        Op::Region {
+                            mask: bits(g.mask),
+                            row,
+                            head,
+                        }
+                    }
+                    GOp::Attend { .. } => Op::Attend,
+                    GOp::In { .. } | GOp::Out { .. } => Op::Region {
+                        mask: 0,
+                        row: 0,
+                        head: 0,
+                    },
+                })
+                .collect::<Vec<_>>();
+        // (the attention's row-wide ordering point at its end, where the PE code has one)
+        let ops = if crate::check::hazard::attention_orders_row(crate::emit::gemm::GPE_OPS) {
+            ops.into_iter()
+                .flat_map(|o| match o {
+                    Op::Attend => vec![Op::Attend, Op::RowReduce(1)],
+                    o => vec![o],
+                })
+                .collect()
+        } else {
+            ops
+        };
+        let first = p.row_class.iter().take_while(|&&c| c == 0).count() as u32;
+        Shape {
+            gx,
+            rq,
+            band: p.band,
+            kbm: p.kbm,
+            ops,
+            bind_blocks: false,
+            seed: 0,
+            bug: 0,
+            split: (first * rq).div_ceil(p.r.max(1)),
+            hol: true,
+            lag: Vec::new(),
+            drift: None,
+            v13: false,
+            x_queues: true,
+            packed: false,
+            v17: false,
+            alt: true,
+            tape_cap: None,
+        }
+    }
 }
 
 impl Shape {
@@ -196,18 +281,32 @@ impl Shape {
         }
         match self.ops[oi as usize] {
             Op::Attend => {
+                // (`alt`: every other attention's members in reverse, from the last row; its
+                // pieces come on `KB` until a PE's turn, then on `KF`)
+                let rev = self.alt
+                    && self.ops[..oi as usize]
+                        .iter()
+                        .filter(|o| matches!(o, Op::Attend))
+                        .count()
+                        % 2
+                        == 1;
+                let (pre, post) = if rev {
+                    (Colour::Kb, Colour::Kf)
+                } else {
+                    (Colour::Kf, Colour::Kb)
+                };
                 if k == 0 {
-                    v.push(Act::Bind(6, Colour::Kf));
+                    v.push(Act::Bind(6, pre));
                 }
                 let j = k * self.kbm;
                 for i in 0..self.kbm {
-                    let m = j + i;
-                    if m >= self.rq {
+                    if j + i >= self.rq {
                         break;
                     }
+                    let m = if rev { self.rq - 1 - (j + i) } else { j + i };
                     if m == y {
                         if self.bug != 1 {
-                            v.push(Act::Bind(6, Colour::Kb));
+                            v.push(Act::Bind(6, post));
                         }
                         if y > 0 {
                             v.push(Act::Send(Colour::Kb, (oi, m, 0)));
@@ -217,6 +316,9 @@ impl Shape {
                         }
                     } else {
                         v.push(Act::Recv(6, (x, m), (oi, m, 0)));
+                    }
+                    if self.v17 && !self.alt && j + i + 1 == self.rq {
+                        v.push(Act::Bind(6, Colour::Kf));
                     }
                 }
                 for r in 0..2 {
@@ -291,8 +393,16 @@ impl Shape {
                     }
                     v.push(Act::Bind(2, Colour::Xf));
                 } else if self.hol {
-                    // (the op's weights drained)
-                    v.push(Act::Tape);
+                    // (the op's weights drained: as many words as a member takes, where the
+                    // tape is bounded)
+                    let n = if self.tape_cap.is_some() {
+                        (0..self.gx)
+                            .filter(|&cp| self.word0(cp + 1, kw) > self.word0(cp, kw))
+                            .count()
+                    } else {
+                        1
+                    };
+                    v.extend(std::iter::repeat_n(Act::Tape, n));
                 }
             }
             Op::Region { mask, row, head } => {
@@ -440,6 +550,11 @@ impl Shape {
         };
         // PEs waiting for room at a destination: woken when it reads
         let mut waiting_room: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // (a bounded tape: the words a column's stream has moved on, a PE has taken; the PEs
+        // waiting on their column's)
+        let mut tape_moved = vec![0u64; gx];
+        let mut tape_taken = vec![0u64; n];
+        let mut tape_wait: Vec<Vec<usize>> = vec![Vec::new(); gx];
         // (`cap` 0: a sender's messages not yet read)
         let mut unread = vec![0usize; n];
         // (`cap` 0: each multicast's destinations, which have read it, and the first that has
@@ -540,6 +655,11 @@ impl Shape {
                         for w in std::mem::take(&mut waiting_room[p]) {
                             wake!(w);
                         }
+                        if ramp[p].is_empty() {
+                            for w in std::mem::take(&mut tape_wait[x as usize]) {
+                                wake!(w);
+                            }
+                        }
                     }
                     Act::Send(c, tag) => {
                         let ds = self.dests(x, y, c);
@@ -586,6 +706,25 @@ impl Shape {
                     Act::Tape => {
                         if !ramp[p].is_empty() {
                             break;
+                        }
+                        if let Some(room) = self.tape_cap {
+                            let col = x as usize;
+                            if tape_taken[p] >= tape_moved[col] {
+                                // the stream's next word: every PE of the column has room and
+                                // its ramp free
+                                // (woken when a PE of it takes a word or frees its ramp)
+                                if (0..rq as u32).map(|r| id(x, r)).any(|q| {
+                                    tape_moved[col] - tape_taken[q] >= room || !ramp[q].is_empty()
+                                }) {
+                                    tape_wait[col].push(p);
+                                    break;
+                                }
+                                tape_moved[col] += 1;
+                            }
+                            tape_taken[p] += 1;
+                            for w in std::mem::take(&mut tape_wait[col]) {
+                                wake!(w);
+                            }
                         }
                     }
                     Act::Recv(q, from, tag) => {
@@ -659,7 +798,13 @@ impl Shape {
                         }
                         Act::Send(c, tag) => format!("sends {c:?} {tag:?} (no room)"),
                         Act::Bind(q, c) => format!("binds iq{q} {c:?}"),
-                        Act::Tape => "reads the tape (iq3) behind its held ramp".into(),
+                        Act::Tape => {
+                            if ramp[p].is_empty() {
+                                "reads the tape (iq3), its column's stream stopped".into()
+                            } else {
+                                "reads the tape (iq3) behind its held ramp".into()
+                            }
+                        }
                     });
                     found.blocked.push(format!(
                         "({}, {}) {}{}",
@@ -723,6 +868,9 @@ mod tests {
             v13: false,
             x_queues: false,
             packed: false,
+            v17: false,
+            alt: false,
+            tape_cap: None,
             ops: vec![
                 Op::RowReduce(8),
                 Op::HeadReduce(8),
@@ -786,6 +934,9 @@ mod tests {
             v13: false,
             x_queues: false,
             packed: false,
+            v17: false,
+            alt: false,
+            tape_cap: None,
             ops: vec![
                 g(256, 3),
                 g(3072, 3),
@@ -1095,5 +1246,157 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// klein's 1024² denoise as compile on load places it (384 x 576 PEs, key blocks of 8; its
+    /// first `stages` stages, `None` all 27).
+    fn klein_1024(stages: Option<usize>) -> crate::stream::gemm::GemmProgram {
+        let o = crate::stream::Options {
+            reading: "denoise".into(),
+            rows: 16,
+            round16: true,
+            upto: stages,
+            taps: Vec::new(),
+            anneal: Default::default(),
+        };
+        let t = poem_compiler::catalog::repository()
+            .parse("flux2-klein-4b-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let rows = [("context".to_string(), 512), ("latents".to_string(), 4096)];
+        let l = crate::stream::gemm::lower(&t, &o, &rows).unwrap_or_else(|e| panic!("{e}"));
+        crate::stream::gemm::laid(&l, 384, 576, 8).unwrap_or_else(|e| panic!("{}", e.text()))
+    }
+
+    /// The first run of `s` over slow PEs, drifts and seeds that holds a ramp, reads a wrong
+    /// message or does not finish.
+    fn first_unclean(s: &Shape) -> Option<String> {
+        let (gx, rq) = (s.gx, s.rq);
+        let lags: Vec<Vec<(u32, u32)>> = vec![
+            vec![],
+            vec![(1, 5)],
+            vec![(gx - 1, rq - 1)],
+            (0..gx).map(|x| (x, rq / 3)).collect(),
+            (0..rq).map(|y| (gx / 2, y)).collect(),
+            (16..32).map(|x| (x, 3)).collect(),
+        ];
+        for lag in &lags {
+            for drift in [Some(0), Some(1), Some(4), None] {
+                for seed in [0, 7] {
+                    let mut t = s.clone();
+                    t.lag = lag.clone();
+                    t.drift = drift;
+                    t.seed = seed;
+                    let f = t.run(None);
+                    if !(f.done && f.wrong.is_empty() && f.held.is_empty()) {
+                        return Some(format!(
+                            "lag {lag:?} drift {drift:?} seed {seed}: held {:?} wrong {:?} blocked {:?}",
+                            f.held.first(),
+                            f.wrong.first(),
+                            f.blocked.iter().take(4).collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// klein's whole 1024² program (every stage: 25 attentions, the GEMMs and regions between),
+    /// its op list read off the placed program, on a 48 x 64 array in ramp mode: as emitted
+    /// (the row line on its own queues, the attentions alternating their members' order) no
+    /// colour reaches a PE before its queue is bound, whichever PEs are slow and however far
+    /// the others drift. With the order fixed, v17 (`KF` rebound once the last piece is read)
+    /// or not, a row slow in an attention's key blocks is on `KB` (from its turn to the last
+    /// piece) when the next attention's first `KF` comes: it holds the ramp, the row's band
+    /// reductions' words behind it (1557; 1558: s2 ran, s3, its second attention, hung).
+    #[test]
+    fn klein_1024s_whole_program_holds_no_ramp_as_emitted() {
+        let p = klein_1024(None);
+        let s = Shape::of(&p, 48, 64);
+        let attends = s.ops.iter().filter(|o| matches!(o, Op::Attend)).count();
+        assert_eq!(attends, 25, "{:?}", s.ops);
+        assert_eq!(first_unclean(&s), None, "as emitted");
+        for v17 in [false, true] {
+            let mut fixed = s.clone();
+            fixed.alt = false;
+            fixed.v17 = v17;
+            let bad = first_unclean(&fixed).expect("the order fixed holds a ramp");
+            assert!(
+                bad.contains("held Some(") && bad.contains("by Kf"),
+                "v17 {v17}: {bad}"
+            );
+        }
+    }
+
+    /// klein's 1024² program, its first stages and whole, with the tape bounded (a column's PEs
+    /// at most `n` words of it apart) and the colours' buffers bounded: `cargo test --release --
+    /// --ignored klein_1024_bounded --nocapture`. With the members' order fixed (as 1558 ran),
+    /// s3 holds a ramp only with both unbounded (s2 never): the chip's buffers let a column's
+    /// rows drift that far apart, as its hang shows, so the window is shut by the protocol, not
+    /// left to the buffers.
+    #[test]
+    #[ignore = "a sweep: prints"]
+    fn klein_1024_bounded() {
+        for stages in [Some(2), Some(3), None] {
+            let p = klein_1024(stages);
+            for (gx, rq) in [(48, 64)] {
+                let base = Shape::of(&p, gx, rq);
+                for tape in [None, Some(1), Some(2), Some(8)] {
+                    for cap in [None, Some(1), Some(0)] {
+                        let mut s = base.clone();
+                        s.tape_cap = tape;
+                        let t0 = std::time::Instant::now();
+                        let mut s0 = s.clone();
+                        s0.lag.clear();
+                        let f = s0.run(cap);
+                        let rest = if f.done && f.held.is_empty() {
+                            first_unclean_cap(&s, cap)
+                        } else {
+                            None
+                        };
+                        eprintln!(
+                            "stages {stages:?} {gx}x{rq} tape {tape:?} cap {cap:?}: done {} held {:?} blocked {:?}; swept: {} ({:.0} s)",
+                            f.done,
+                            f.held.first(),
+                            f.blocked.iter().rev().take(3).collect::<Vec<_>>(),
+                            rest.as_deref().unwrap_or("clean"),
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`first_unclean`] with the colours' buffers `cap`.
+    fn first_unclean_cap(s: &Shape, cap: Option<usize>) -> Option<String> {
+        let (gx, rq) = (s.gx, s.rq);
+        for lag in [
+            vec![(1, 5)],
+            (0..gx).map(|x| (x, rq / 3)).collect::<Vec<_>>(),
+            (0..rq).map(|y| (gx / 2, y)).collect(),
+            (16..32).map(|x| (x, 3)).collect(),
+        ] {
+            for drift in [Some(1), None] {
+                for seed in [0, 7] {
+                    let mut t = s.clone();
+                    t.lag = lag.clone();
+                    t.drift = drift;
+                    t.seed = seed;
+                    let f = t.run(cap);
+                    if !(f.done && f.wrong.is_empty() && f.held.is_empty()) {
+                        return Some(format!(
+                            "lag {:?}.. drift {drift:?} seed {seed}: held {:?} wrong {:?} blocked {:?}",
+                            lag.first(),
+                            f.held.first(),
+                            f.wrong.first(),
+                            f.blocked.iter().rev().take(4).collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
+        }
+        None
     }
 }
