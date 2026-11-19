@@ -1896,14 +1896,16 @@ impl<B: Serve> Shell<B> {
         Ok(shell)
     }
 
-    /// Opens seat `slot` for a direct fire: its record zeroed, nothing held.
+    /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
+    /// nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
-            self.drain()?;
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
             let units = self.pools.record(None, slot)?;
-            self.pools.clear(&units)?;
+            let mut frame = self.device.frame()?;
+            self.pools.clear(&mut frame, &units)?;
+            self.grafted = Some(frame.commit_async(None)?);
         }
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
@@ -2959,7 +2961,7 @@ impl<B: Serve> Shell<B> {
     }
 
     fn feed(&self, p: &Prepared<'_, B>) -> Result<Option<B::Pending>> {
-        if p.feeds.is_empty() && p.input_copies.is_empty() {
+        if p.feeds.is_empty() && p.input_copies.is_empty() && p.beginning.is_empty() {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
@@ -2983,6 +2985,11 @@ impl<B: Serve> Shell<B> {
                 have: u64::from(u32::MAX),
             })?;
             let whole = self.handles.bind(store, 0, store.bytes())?;
+        // A fresh lane's record is zeroed in queue order: after every frame
+        // in flight that read the slot, before the fire that folds into it.
+        for units in &p.beginning {
+            self.pools.clear(&mut frame, units)?;
+        }
             let into = kernels_slang::Tensor::new(whole, 1, elements, Dtype::Bf16);
             for copy in casts {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
@@ -3942,13 +3949,6 @@ impl<B: Serve> Shell<B> {
         };
         self.pools.admit(demand)?;
 
-        if !beginning.is_empty() && self.pools.has_state() {
-            self.drain()?;
-        }
-        for units in beginning {
-            self.pools.clear(&units)?;
-        }
-
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
@@ -4517,6 +4517,11 @@ impl<B: Serve> Shell<B> {
             seats,
             kv_less,
             tables,
+            beginning: if self.pools.has_state() {
+                beginning
+            } else {
+                Vec::new()
+            },
             windows,
             slots,
             rung,
@@ -4686,6 +4691,9 @@ pub struct Prepared<'a, B: Serve> {
     pub seats: Vec<Seat>,
     kv_less: Vec<bool>,
 
+    /// The record of each lane the fire begins, zeroed on the queue before
+    /// the fire ([`Shell::feed`]).
+    beginning: Vec<Vec<u32>>,
     tables: Vec<std::borrow::Cow<'a, [u32]>>,
     pub windows: Windows,
     pub slots: SlotTable,
