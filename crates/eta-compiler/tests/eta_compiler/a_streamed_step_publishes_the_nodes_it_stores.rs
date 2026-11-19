@@ -117,7 +117,7 @@ fn a_streamed_step_publishes_the_nodes_it_stores() {
                 // A node with no result writes nothing a layout holds; a
                 // folded one (its step computes it in another form) writes
                 // none of its results, and holds only what it reads.
-                if results.is_empty() || published.folded.contains(&node) {
+                if results.is_empty() {
                     continue;
                 }
                 let Some(&first) = steps_of.first() else {
@@ -187,6 +187,14 @@ fn a_streamed_step_publishes_the_nodes_it_stores() {
                 {
                     let at = held.entry(value).or_insert(last);
                     *at = (*at).max(last);
+                }
+            }
+            // A folded node holds what it reads through the step that stands
+            // for it.
+            for &(step, node) in &published.folded {
+                for value in ops[node as usize].reads().map(resolve) {
+                    let at = held.entry(value).or_insert(step as usize);
+                    *at = (*at).max(step as usize);
                 }
             }
             for (step, case) in cases.iter().enumerate() {
