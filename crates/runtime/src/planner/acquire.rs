@@ -295,25 +295,55 @@ impl ResidencyPlanner {
 
     /// Sleeps until what a non-resident process waits on changes: its own
     /// residency (`signal`, told as it is evicted, restored, rolled back or
-    /// gone), or the policy answering pressure with nothing freed, the
-    /// event its short restore gives up on ([`Self::restore_expired`]).
-    /// No clock: a planner poke for another process, or the shortfall
-    /// standing, does not wake it. (On a 100 ms re-report it woke each
-    /// waiter ten times a second while it stayed evicted.)
-    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
+    /// gone), or the policy answering pressure with nothing freed where
+    /// that answer is the event its own short restore gives up on
+    /// (`answered_mine`, [`Self::restore_expired`]). No clock: a planner
+    /// poke for another process, the shortfall standing, or the policy
+    /// answering a shortfall that is not its restore's (any planner's,
+    /// any tier's: the answer is process-wide) does not wake it. (On a
+    /// 100 ms re-report it woke each waiter ten times a second while it
+    /// stayed evicted; on every answer of nothing it woke every evicted
+    /// gate, a restore queued or not.)
+    async fn await_residency_change(
+        signal: &Notify,
+        settled: impl Fn() -> bool,
+        answered_mine: impl Fn() -> bool,
+    ) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let answered = crate::policy::pressure::answered();
-        tokio::pin!(answered);
-        answered.as_mut().enable();
-        if settled() {
-            return;
+        loop {
+            let answered = crate::policy::pressure::answered();
+            tokio::pin!(answered);
+            answered.as_mut().enable();
+            if settled() || answered_mine() {
+                return;
+            }
+            tokio::select! {
+                () = &mut notified => return,
+                () = &mut answered => {}
+            }
         }
-        tokio::select! {
-            () = &mut notified => {}
-            () = &mut answered => {}
-        }
+    }
+
+    /// Whether `pid`'s queued restore is short and the policy has since
+    /// answered a tier it is short on with nothing freed: the answer
+    /// [`Self::restore_expired`] acts on. An answer counted before the
+    /// restore became short is not its (the shortfall reads the count as
+    /// it is noted), so no answer is missed for a restore queued later.
+    fn restore_answered(&self, pid: ProcessId) -> bool {
+        let Some(key) = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .find(|(_, waiter)| {
+                    waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
+                })
+                .map(|(key, _)| *key)
+        }) else {
+            return false;
+        };
+        self.short.lock().answered_nothing(key.1)
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -401,7 +431,12 @@ impl ResidencyPlanner {
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            Self::await_residency_change(&signal, || self.is_resident(pid)).await;
+            Self::await_residency_change(
+                &signal,
+                || self.is_resident(pid),
+                || self.restore_answered(pid),
+            )
+            .await;
             if let Some(error) = self.restore_expired(pid) {
                 tracing::warn!(%pid, %error, "planner: a short restore gives up");
                 return Err(error);
