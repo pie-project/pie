@@ -163,6 +163,9 @@ pub(crate) struct Core {
     pub(crate) uniform_buffer: std::sync::OnceLock<Held>,
     pub(crate) uniforms: Mutex<Vec<u64>>,
     pub(crate) scratch: Mutex<Vec<Held>>,
+    /// The uniform regions and scratch chunks stocked, free or held.
+    uniform_stock: std::sync::atomic::AtomicUsize,
+    scratch_stock: std::sync::atomic::AtomicUsize,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) books: Arc<engine_gpu::Books>,
@@ -261,6 +264,10 @@ impl Core {
             engine_gpu::books::owners::UNIFORMS,
         );
         if self.uniform_buffer.set(buffer).is_ok() {
+            self.uniform_stock.fetch_add(
+                usize::try_from(frames).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
             self.return_uniforms((0..frames).map(|at| at * UNIFORM_CHUNK).collect());
         }
     }
@@ -281,6 +288,7 @@ impl Core {
                 engine_gpu::books::owners::FRAME_SCRATCH,
             )
         });
+        self.scratch_stock.fetch_add(frames, Ordering::Relaxed);
         self.return_scratch(scratch.collect());
     }
 
@@ -290,10 +298,12 @@ impl Core {
             .lock()
             .expect("uniforms lock poisoned")
             .pop()
-            .ok_or(Fault::Ceiling {
-                what: "frames in flight holding a uniform chunk (stocked at load)",
-                need: 1,
-                have: 0,
+            .ok_or_else(|| {
+                let stock = self.uniform_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "uniform region",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
             })
     }
 
@@ -319,10 +329,12 @@ impl Core {
             .lock()
             .expect("scratch lock poisoned")
             .pop()
-            .ok_or(Fault::Ceiling {
-                what: "frames in flight holding a scratch chunk (stocked at load)",
-                need: 1,
-                have: 0,
+            .ok_or_else(|| {
+                let stock = self.scratch_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "scratch chunk",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
             })
     }
 
@@ -584,6 +596,8 @@ impl Context {
             uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
+            uniform_stock: std::sync::atomic::AtomicUsize::new(0),
+            scratch_stock: std::sync::atomic::AtomicUsize::new(0),
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
@@ -800,12 +814,21 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Gives the frame's uniform region and scratch chunk back to the
+    /// load's stock: once it is submitted, or where it is dropped
+    /// unsubmitted.
+    fn release(&self) {
+        let ring = std::mem::take(&mut *self.uniforms.lock().expect("uniforms lock poisoned"));
+        self.core.return_uniforms(ring.region.into_iter().collect());
+        let scratch = std::mem::take(&mut *self.scratch.lock().expect("scratch lock poisoned"));
+        self.core.return_scratch(scratch.chunks);
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
-        let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
-        self.core.return_uniforms(ring.region.into_iter().collect());
-        let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
-        self.core.return_scratch(scratch.chunks);
+        self.release();
     }
 }
 
@@ -875,10 +898,9 @@ impl Frame {
     /// the slot's first byte in it.
     pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
-        let buffer = core.uniform_buffer.get().ok_or(Fault::Ceiling {
-            what: "frames in flight holding a uniform region (stocked at load)",
-            need: 1,
-            have: 0,
+        let buffer = core.uniform_buffer.get().ok_or(Fault::Device {
+            call: "uniform region",
+            why: "the device made no uniform buffer".into(),
         })?;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
@@ -1132,6 +1154,20 @@ impl Frame {
         crate::encode::record_read_phase(0, started.ns());
         let index = core.queue.submit(std::iter::once(finished));
         crate::encode::record_submit(started.ns(), 0);
+        // What the frame staged through goes back to the load's stock now,
+        // submitted, not when its work completes: the queue runs what any
+        // frame writes or dispatches after this one's (WebGPU's queue
+        // timeline), so the next frame to take them cannot reach them before
+        // this one's work is done with them. That holds for these two only
+        // because they are device-only: a scratch chunk (STORAGE and copies)
+        // and a uniform region (UNIFORM, written through the queue), neither
+        // mappable, so the host never reads one back. What the host maps or
+        // reads (the readout mirrors, the guest readback buffers, the read
+        // stagings) stays held until its work is done. The stock then covers
+        // the frames a step encodes at once, however many it has in flight:
+        // a step's copies (a same-buffer copy stages through scratch) and
+        // its walk, each submitted before the next is opened.
+        self.inner.release();
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {
             inner.done.store(true, Ordering::Release);
