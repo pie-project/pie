@@ -123,6 +123,11 @@ struct Rig<'a, B: Serve> {
     /// The step whose fire, at one a frame, was past the bound: refused by
     /// name, and the step drops that shape ([`dropped`]).
     past_bound: std::cell::RefCell<Option<String>>,
+    /// The ratio of the slowest fire to the fastest the warm-up's rotations
+    /// measured at its cube: how far this device's clock swings from fire to
+    /// fire, which a settled frame's admission carries as its least worst
+    /// ratio (the Adreno 840 swung ~10% inside one settled step).
+    swing: std::cell::Cell<f64>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -140,6 +145,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             basis: std::cell::Cell::new(0),
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
             past_bound: std::cell::RefCell::new(None),
+            swing: std::cell::Cell::new(1.0),
         }
     }
 
@@ -493,10 +499,15 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .iter()
         .flat_map(|(_, curve)| curve.iter().map(|&(_, rate)| rate))
         .fold(0.0, f64::max);
-    let mut attn = Vec::new();
+    let mut attn: Vec<(u32, f64)> = Vec::new();
+    // A shape's first fire, estimated by its work at the last shape's rate.
+    let at_rate = |shape: engine::rates::AttnShape, rate: Option<f64>| {
+        rate.map(|rate| attn_flops(shape) / rate.max(f64::MIN_POSITIVE) + launch)
+    };
     for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+        let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
+        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
         rig.release();
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
@@ -512,7 +523,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
     for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+        let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
+        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
         rig.release();
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
@@ -648,6 +660,9 @@ fn warm<B: Serve>(
                 // from here every frame's time against its estimate counts.
                 let mut admission = rig.admission.get();
                 admission.settled = true;
+                // The clock's swing the rotations measured: a settled frame
+                // is never admitted nearer the bound than that.
+                admission.worst = admission.worst.max(rig.swing.get());
                 rig.admission.set(admission);
                 return Ok((side, warmed));
             }
@@ -709,6 +724,7 @@ fn warm_at<B: Serve>(
         ..engine::rates::Admission::new(rig.max_submit)
     });
     let slowest = std::cell::Cell::new(rig.per_fire.get());
+    let fastest = std::cell::Cell::new(None::<f64>);
     let per_fire = || match (slowest.get(), rig.per_fire.get()) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -740,6 +756,11 @@ fn warm_at<B: Serve>(
             let estimate = per_fire().map(|p| p * f64::from(count));
             let took = rig.frame(timer, count, &fire, &nothing)?.1;
             slowest.set(per_fire());
+            let this = took as f64 / f64::from(count.max(1));
+            fastest.set(Some(fastest.get().map_or(this, |f: f64| f.min(this))));
+            if let (Some(fast), Some(slow)) = (fastest.get(), slowest.get()) {
+                rig.swing.set(rig.swing.get().max(slow / fast.max(1.0)));
+            }
             let mut r = rotations.get();
             r.landed(estimate, took as f64, true);
             rotations.set(r);
@@ -797,6 +818,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     s: engine::rates::AttnShape,
     launch: f64,
+    estimate: Option<f64>,
 ) -> Result<f64> {
     let tactic = tactics.sdpa(tier, s.head_dim);
     // Tiled where a request's rows reach the profile's tile rows, as a
@@ -838,9 +860,12 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
+    // A new shape's first fire is estimated before it is submitted (from
+    // the rate the step's last shape measured, by the work), so one past the
+    // device's bound is refused by name unsubmitted, never run to find out.
     rig.step(
         format!("attention {}x{} d {}", s.rows, s.keys, s.head_dim),
-        None,
+        estimate,
     );
     let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (q, pool) = &sets[next.get() % sets.len()];
@@ -1071,7 +1096,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     launch: f64,
 ) -> Result<f64> {
     let mut rig = Rig::<B>::new(device, None);
-    attention(&mut rig, tactics, tier, timer, shape, launch)
+    attention(&mut rig, tactics, tier, timer, shape, launch, None)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)` under `tactic`: a check
