@@ -779,6 +779,8 @@ pub fn rung_rows(own: u32, carried: u32) -> u32 {
     own.max(carried)
 }
 
+pub fn lane_carried(own: u32, carried: u32) -> u32 { if own == 1 { 0 } else { carried } }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {
     Host(u32),

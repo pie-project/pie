@@ -44,6 +44,54 @@ pub struct Cursor {
     pub staged: Vec<Arc<StagedRows>>,
     /// M-RoPE spans `(start_slot, end_slot, lag)`, `lag = token_count - position_span`.
     pub spans: Vec<(u32, u32, u32)>,
+    /// The run-ahead fires on the set whose rows the program has not
+    /// accepted yet, oldest first: a fold never passes their first row, so
+    /// a stop can take them back ([`Cursor::accepted`]).
+    pub unaccepted: std::collections::VecDeque<Unaccepted>,
+    /// The run-ahead bound accepted the rows below this the program had not
+    /// read: they fold, and a retract never reaches them.
+    pub bound_accepted: u32,
+}
+
+/// One run-ahead fire's rows on a set, `start..end`, not yet accepted: the
+/// program accepts them as it takes each of `reads`, the outputs the fire
+/// publishes to the host.
+#[derive(Clone, Debug)]
+pub struct Unaccepted {
+    pub start: u32,
+    pub end: u32,
+    pub reads: Vec<HostRead>,
+}
+
+/// The `index`th cell a ring the host reads holds (counted from its first):
+/// taken once the host has taken more than `index` of its cells.
+#[derive(Clone)]
+pub struct HostRead {
+    pub cell: std::sync::Weak<Mutex<crate::pipeline::channel::ChannelCell>>,
+    pub index: u64,
+}
+
+impl std::fmt::Debug for HostRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRead")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostRead {
+    /// The host has taken the cell, or its ring is gone (nothing will).
+    fn taken(&self) -> bool {
+        self.cell
+            .upgrade()
+            .is_none_or(|cell| cell.lock().unwrap().taken() > self.index)
+    }
+}
+
+impl Unaccepted {
+    fn accepted(&self) -> bool {
+        self.reads.iter().all(HostRead::taken)
+    }
 }
 
 /// The rows of one fire on a working set that land where the device says,
@@ -150,6 +198,54 @@ impl Cursor {
         }
     }
 
+    /// Where the rows the program has accepted end on a set written to
+    /// `end`: the first row of the oldest run-ahead fire whose outputs it
+    /// has not taken, else `end`. No more than `bound` fires stand
+    /// unaccepted: past it the oldest are accepted unread, and
+    /// [`Self::bound_accepted`] marks them.
+    pub fn accepted(&mut self, end: u32, bound: usize) -> u32 {
+        while self.unaccepted.front().is_some_and(Unaccepted::accepted) {
+            self.unaccepted.pop_front();
+        }
+        while self.unaccepted.len() > bound {
+            if let Some(fire) = self.unaccepted.pop_front() {
+                self.bound_accepted = self.bound_accepted.max(fire.end);
+            }
+        }
+        self.unaccepted
+            .front()
+            .map_or(end, |fire| fire.start.min(end))
+    }
+
+    /// The program accepted every row the set holds: it placed the tokens
+    /// that follow them.
+    pub fn accept_all(&mut self) {
+        self.unaccepted.clear();
+    }
+
+    /// A run-ahead fire wrote `start..end`, accepted as `reads` are taken.
+    pub fn run_ahead(&mut self, start: u32, end: u32, reads: Vec<HostRead>) {
+        if start < end {
+            self.unaccepted.push_back(Unaccepted { start, end, reads });
+        }
+    }
+
+    /// The rows from `cut` on are taken back: no fire stands unaccepted
+    /// past it. `Err` where the bound accepted rows past `cut`.
+    pub fn take_back(&mut self, cut: u32) -> Result<(), String> {
+        if cut < self.bound_accepted {
+            return Err(format!(
+                "the run-ahead bound accepted the rows below {} unread, past the cut at {cut}",
+                self.bound_accepted
+            ));
+        }
+        self.unaccepted.retain(|fire| fire.start < cut);
+        if let Some(last) = self.unaccepted.back_mut() {
+            last.end = last.end.min(cut);
+        }
+        Ok(())
+    }
+
     /// The last write wins from `start` on.
     pub fn rewrite(&mut self, start: u32, spans: impl IntoIterator<Item = (u32, u32, u32)>) {
         self.spans.retain(|&(from, _, _)| from < start);
@@ -176,6 +272,8 @@ impl Default for Cursor {
             untold: false,
             staged: Vec::new(),
             spans: Vec::new(),
+            unaccepted: std::collections::VecDeque::new(),
+            bound_accepted: 0,
         }
     }
 }
@@ -432,6 +530,45 @@ pub(crate) fn grow_pages(kv: &KvWorkingSet, end: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run-ahead fire's rows are accepted once the host takes what it
+    /// published, oldest first; no more than the bound stand unaccepted,
+    /// the oldest past it accepted unread and never taken back; a stop
+    /// takes back the fires past its cut.
+    #[test]
+    fn acceptance_every_case() {
+        let ring = Arc::new(Mutex::new(crate::pipeline::channel::ChannelCell::new(
+            vec![1],
+            eta_ir::types::Dtype::I32,
+            8,
+        )));
+        let read = |index| HostRead {
+            cell: Arc::downgrade(&ring),
+            index,
+        };
+        let mut set = Cursor::default();
+        assert_eq!(set.accepted(20, 4), 20, "nothing run ahead: all accepted");
+        for (at, start) in (20..24).enumerate() {
+            set.run_ahead(start, start + 1, vec![read(at as u64)]);
+        }
+        assert_eq!(set.accepted(24, 4), 20);
+        ring.lock().unwrap().set_taken(2);
+        assert_eq!(set.accepted(24, 4), 22, "two taken");
+        // A fifth and sixth past the bound of four: the oldest goes unread.
+        set.run_ahead(24, 25, vec![read(4)]);
+        set.run_ahead(25, 26, vec![read(5)]);
+        assert_eq!(set.accepted(26, 3), 23);
+        assert_eq!(set.bound_accepted, 23);
+        assert!(set.take_back(22).unwrap_err().contains("run-ahead bound"));
+        set.take_back(24).unwrap();
+        assert_eq!(set.accepted(24, 3), 23, "the fires past the cut are gone");
+        ring.lock().unwrap().set_taken(4);
+        assert_eq!(set.accepted(24, 3), 24);
+        // A fire whose tokens the host places accepts everything before it.
+        set.run_ahead(24, 25, vec![read(9)]);
+        set.accept_all();
+        assert_eq!(set.accepted(25, 3), 25);
+    }
 
     #[test]
     fn lag_every_case() {
