@@ -255,7 +255,7 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,

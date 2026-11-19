@@ -290,7 +290,7 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,
