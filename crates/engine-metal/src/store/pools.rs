@@ -2086,24 +2086,25 @@ impl Pools {
     /// Copies whole slots of `id` (slot refs `ids`) and the slot file's
     /// `slots` the way `to_disk` says. The caller has drained every frame.
     fn spill(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
-        // A parked role's slot no larger than a kv page lies in a slot of
-        // the kv file (CONTRACT-BC 22).
-        let (what, bytes) = match id {
-            LIST => ("disk kv pages", self.shape(LIST)?.slot_bytes),
-            FIXED => ("parked rs rows", self.shape(FIXED)?.slot_bytes),
-            other => {
-                let bytes = self.shape(other)?.slot_bytes;
-                if bytes > self.page_bytes()? {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "slot shape {other} to the slot file: its {bytes}-byte slot is \
-                             larger than the file's kv page"
-                        ),
-                    });
-                }
-                ("disk kv pages", bytes)
+        // A parked role's slot lies whole in the kv file, in a run of
+        // adjacent slots its bytes take, named by the run's first
+        // (CONTRACT-BC 22).
+        let (what, bytes, file_bytes) = match id {
+            LIST => {
+                let bytes = self.shape(LIST)?.slot_bytes;
+                ("disk kv pages", bytes, bytes)
             }
+            FIXED => {
+                let bytes = self.shape(FIXED)?.slot_bytes;
+                ("parked rs rows", bytes, bytes)
+            }
+            other => (
+                "disk kv pages",
+                self.shape(other)?.slot_bytes,
+                self.page_bytes()?.max(1),
+            ),
         };
+        let span = bytes.div_ceil(file_bytes).max(1);
         let offsets = ids
             .iter()
             .map(|&slot| self.slot_offset(id, slot))
@@ -2112,18 +2113,34 @@ impl Pools {
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
         }
+        // Each slot's run: its first file slot, then the next `span - 1`.
+        let pieces: Vec<(u64, u32, usize)> = offsets
+            .iter()
+            .zip(slots)
+            .flat_map(|(&at, &first)| {
+                (0..span).map(move |k| {
+                    let done = k * file_bytes;
+                    let len = file_bytes.min(bytes - done);
+                    (
+                        at + done,
+                        first + u32::try_from(k).unwrap_or(u32::MAX),
+                        usize::try_from(len).unwrap_or(0),
+                    )
+                })
+            })
+            .collect();
         let file = match id {
             FIXED => &mut self.parked,
             _ => &mut self.disk,
         };
-        Spill::room(file.as_ref(), what, slots)?;
+        let touched: Vec<u32> = pieces.iter().map(|&(_, slot, _)| slot).collect();
+        Spill::room(file.as_ref(), what, &touched)?;
         let Some(spill) = file.as_mut() else {
             return Ok(());
         };
-        for (&at, &slot) in offsets.iter().zip(slots) {
-            let staged = &mut spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
+        for (at, slot, len) in pieces {
             if to_disk {
-                self.pool.read(at, staged)?;
+                self.pool.read(at, &mut spill.stage.as_mut_slice()[..len])?;
                 spill
                     .file
                     .write(slot, spill.stage.as_mut_slice())
@@ -2133,8 +2150,7 @@ impl Pools {
                     .file
                     .read(slot, spill.stage.as_mut_slice())
                     .map_err(super::slot_file)?;
-                let staged = &spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
-                self.pool.write(at, staged)?;
+                self.pool.write(at, &spill.stage.as_mut_slice()[..len])?;
             }
         }
         Ok(())

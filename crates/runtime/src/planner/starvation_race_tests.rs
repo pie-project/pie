@@ -2493,6 +2493,7 @@ impl PoolPort for BindRoomPool {
                 })
                 .collect(),
             free: self.free.lock().clone(),
+            ..Default::default()
         }
     }
     /// One host slot a chunk of parked state: the host full, host kv goes

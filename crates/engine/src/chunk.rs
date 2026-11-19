@@ -893,8 +893,9 @@ pub struct Evacuation {
 /// Tiers (CONTRACT-BC 22): `src`/`dst` each the engine's device domain,
 /// [`MemoryDomain::HostPinned`] (refs of [`ChunkFacts::host_chunks`]) or
 /// [`MemoryDomain::LocalDisk`] (kv list refs of
-/// [`ChunkFacts::disk_chunks`]; a role shape's slot no larger than a kv
-/// list slot moves between the device and one of them too). Device refs are logical, through the
+/// [`ChunkFacts::disk_chunks`]; a role shape's slot of any size moves
+/// between the device and a run of adjacent kv slots of the file its bytes
+/// take, whole, named by the run's first). Device refs are logical, through the
 /// [`ChunkTable`]; host and disk refs name their place. Token runs are
 /// device to device only. The copy is ordered on the engine's stream after
 /// every fire submitted before it and before every fire after it, and

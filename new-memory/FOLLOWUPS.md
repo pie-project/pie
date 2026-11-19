@@ -336,16 +336,18 @@ before any change, on memory-redesign 5963ceb17 / c1188a53d:
    answers `Ok(false)` (rocBLAS takes the product). No shape declines on c64
    or the beam load.
 
-## F28. A parked role slot takes a whole kv slot of the slot file
+## F29. A parked role slot rounds up to whole kv slots of the slot file
 
 Where the load states no host tier (unified memory), a parked process's
-role slots (Instance, Channel, Adapter) go down to the kv slot file, one
-kv list slot of the file a role slot (`Roles::prepare_park_down`,
-`DiskSlots`, CONTRACT-BC 22 in `Engine::copy_slots`): exact and with no
-file or budget of their own, but a 4 KiB Instance slot holds a whole kv
-page's slot (≈1–2 MiB), so 500 parked processes of 8 role slots take
-4000 of the file's slots. Packing several role slots into one file slot
-(an offset inside it, aligned for the file's direct I/O) or a role slot
-file per shape would cut that; measure the file's room under the M1 / M5
-loads first. A role slot larger than a kv slot is never moved to disk
-(it stays parked on the device and is no movable room).
+role slots (Instance, Channel, Adapter) go down to the kv slot file, each
+whole in a run of `ceil(slot_bytes / kv slot_bytes)` adjacent file slots
+(`Roles::prepare_park_down`, `DiskSlots`, CONTRACT-BC 22 in
+`Engine::copy_slots`), counted against `budget_disk` with kv: exact, no
+file or budget of its own, any size. The cost is rounding: a 4 KiB
+Instance slot holds a whole kv page's slot (≈1–2 MiB), so 500 parked
+processes of 8 small role slots take 4000 of the file's slots, while a
+slot wider than a kv page wastes under one kv slot. Packing several small
+role slots into one file slot (an offset inside it, aligned for the
+file's direct I/O) would cut that; measure the file's room under the M1 /
+M5 loads first. With guest scratch held only while a fire is in flight,
+only the small resident part (tables, rings) parks at all.

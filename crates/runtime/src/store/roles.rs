@@ -621,15 +621,17 @@ pub struct RoleCopy {
 }
 
 /// The disk tier's slot file, for the live parts of parked items no host
-/// tier holds (a load on unified memory states none): one slot of the file
-/// a role slot, as the slots of a shape no larger than a kv list slot lie
-/// there (CONTRACT-BC 22). The kv store's disk slots, taken and given back
-/// through it.
+/// tier holds (a load on unified memory states none): a role slot lies
+/// whole in a run of `span` adjacent slots of the file, `span` the kv list
+/// slots its bytes take (one where it is no wider), named by the run's
+/// first slot (CONTRACT-BC 22). The kv store's disk slots, taken and given
+/// back through it, counted against the disk's budget with kv's.
 pub trait DiskSlots: Send + Sync {
-    /// `n` free slots of the file, all or none.
-    fn take(&self, n: usize) -> Option<Vec<u32>>;
-    /// Slots taken before, free again.
-    fn give(&self, slots: &[u32]);
+    /// `n` runs of `span` adjacent free slots of the file, as each run's
+    /// first slot; all or none.
+    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>>;
+    /// Runs taken before, each from its first slot, free again.
+    fn give(&self, firsts: &[u32], span: u32);
 }
 
 /// The disk tier a [`Roles`] parks on, and the bytes a slot of it holds.
@@ -765,8 +767,9 @@ impl Roles {
     }
 
     /// Parks on `disk` too, the disk tier's slot file whose slots hold a kv
-    /// list slot's bytes: the live parts of a role whose slot is no larger
-    /// lie there where no host tier holds them.
+    /// list slot's bytes: the live parts of every role lie there where no
+    /// host tier holds them, a role slot in a run of the file's slots
+    /// ([`DiskSlots`]).
     pub fn set_disk(&mut self, disk: Arc<dyn DiskSlots>) {
         let slot_bytes = self
             .device
@@ -780,13 +783,17 @@ impl Roles {
         });
     }
 
-    /// Whether a slot of `role` fits a slot of the disk tier's file.
+    /// The run of the disk file's slots a slot of `role` lies in whole,
+    /// where the load keeps a disk tier: its bytes in kv list slots.
+    fn disk_span(&self, role: SlotRole) -> Option<u32> {
+        let disk = self.disk.as_ref()?;
+        let shape = self.shapes.of(role)?;
+        Some(u32::try_from(shape.slot_bytes.div_ceil(disk.slot_bytes).max(1)).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the disk tier holds slots of `role`.
     fn disk_holds(&self, role: SlotRole) -> bool {
-        self.disk.as_ref().is_some_and(|disk| {
-            self.shapes
-                .of(role)
-                .is_some_and(|shape| shape.slot_bytes <= disk.slot_bytes)
-        })
+        self.disk_span(role).is_some()
     }
 
     /// Whether some tier below the device holds every live part of `parts`.
@@ -809,42 +816,39 @@ impl Roles {
         {
             return None;
         }
-        let need: usize = parts
-            .iter()
-            .filter(|part| !part.dead())
-            .map(|part| part.refs.len())
-            .sum();
-        let mut slots = if need == 0 {
-            Vec::new()
-        } else {
-            disk.slots.take(need)?
+        let mut taken: Vec<Part> = Vec::with_capacity(parts.len());
+        for part in parts {
+            let refs = if part.dead() || part.refs.is_empty() {
+                Vec::new()
+            } else {
+                let span = self.disk_span(part.role)?;
+                match disk.slots.take(part.refs.len(), span) {
+                    Some(firsts) => firsts,
+                    None => {
+                        self.give_on(Tier::Disk, &taken);
+                        return None;
+                    }
+                }
+            };
+            taken.push(Part {
+                refs,
+                ..part.clone()
+            });
         }
-        .into_iter();
-        Some(
-            parts
-                .iter()
-                .map(|part| Part {
-                    refs: if part.dead() {
-                        Vec::new()
-                    } else {
-                        slots.by_ref().take(part.refs.len()).collect()
-                    },
-                    ..part.clone()
-                })
-                .collect(),
-        )
+        Some(taken)
     }
 
     /// Gives `parts` back on tier `on` (their refs that tier's).
     fn give_on(&self, on: Tier, parts: &[Part]) {
         match on {
             Tier::Disk => {
-                let slots: Vec<u32> = parts
-                    .iter()
-                    .flat_map(|part| part.refs.iter().copied())
-                    .collect();
-                if let (Some(disk), false) = (&self.disk, slots.is_empty()) {
-                    disk.slots.give(&slots);
+                let Some(disk) = &self.disk else {
+                    return;
+                };
+                for part in parts.iter().filter(|part| !part.refs.is_empty()) {
+                    if let Some(span) = self.disk_span(part.role) {
+                        disk.slots.give(&part.refs, span);
+                    }
                 }
             }
             Tier::Host => {
@@ -1714,7 +1718,11 @@ impl Roles {
                     .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
                     && item.attached.iter().all(|id| {
                         instance(id).is_some_and(|instance| {
-                            instance.holder == Some(holder) || instance.tier != Tier::Device
+                            // Parked already: off the device, or parked
+                            // where it lies (no room below, [`Item::shed`]).
+                            instance.holder == Some(holder)
+                                || instance.tier != Tier::Device
+                                || instance.shed
                         })
                     })
             }

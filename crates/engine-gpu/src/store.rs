@@ -1540,8 +1540,9 @@ impl<B: Backend> Pools<B> {
 
     /// Copies whole slots of `id` (slot refs `ids`) and the slot file's
     /// `slots` the way `to_disk` says: kv list slots, or a parked role's
-    /// slots no larger than one, each in a slot of the file (CONTRACT-BC
-    /// 22). The caller has drained every frame.
+    /// slots, each whole in a run of adjacent file slots its bytes take,
+    /// named by the run's first (CONTRACT-BC 22). The caller has drained
+    /// every frame.
     fn spill(
         &mut self,
         device: &B::Context,
@@ -1551,25 +1552,30 @@ impl<B: Backend> Pools<B> {
         slots: &[u32],
     ) -> Result<()> {
         let bytes = self.shape(id)?.slot_bytes;
-        if id != LIST && bytes > self.page_bytes() {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "slot shape {id} to the slot file: its {bytes}-byte slot is larger than \
-                     the file's kv list slot"
-                ),
-            });
+        let file_bytes = self.page_bytes().max(1);
+        // A slot lies whole in a run of adjacent file slots its bytes take,
+        // named by the run's first.
+        let span = bytes.div_ceil(file_bytes).max(1);
+        let mut pieces: Vec<(u64, u32, u64)> = Vec::new();
+        for (&slot, &first) in ids.iter().zip(slots) {
+            let at = self.slot_offset(id, slot)?;
+            for k in 0..span {
+                let done = k * file_bytes;
+                pieces.push((
+                    at + done,
+                    first + u32::try_from(k).unwrap_or(u32::MAX),
+                    file_bytes.min(bytes - done),
+                ));
+            }
         }
-        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        let places = ids
-            .iter()
-            .map(|&slot| self.slot_offset(id, slot))
-            .collect::<Result<Vec<_>>>()?;
+        let touched: Vec<u32> = pieces.iter().map(|&(_, slot, _)| slot).collect();
+        Spill::room(self.disk.as_ref(), "disk kv pages", &touched)?;
         let Some(mut disk) = self.disk.take() else {
             return Ok(());
         };
-        let copied = places.into_iter().zip(slots).try_for_each(|(at, &slot)| {
+        let copied = pieces.into_iter().try_for_each(|(at, slot, len)| {
             let (buffer, local) = self.pool.locate(at)?;
-            disk.copy(device, buffer, local, bytes, to_disk, slot)
+            disk.copy(device, buffer, local, len, to_disk, slot)
         });
         self.disk = Some(disk);
         copied

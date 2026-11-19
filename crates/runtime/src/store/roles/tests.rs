@@ -54,6 +54,11 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> Sl
 /// 4 KiB `Instance`, a 1 KiB `Channel` and a 64 KiB `Adapter` shape; 8
 /// host chunks.
 fn facts(roles: bool) -> ChunkFacts {
+    facts_with_list(roles, 64 * KIB)
+}
+
+/// [`facts`] with a kv list slot of `list` bytes.
+fn facts_with_list(roles: bool, list: u64) -> ChunkFacts {
     let mut shapes = vec![
         shape(
             LIST,
@@ -62,7 +67,7 @@ fn facts(roles: bool) -> ChunkFacts {
                 rate: 1,
                 window: None,
             },
-            64 * KIB,
+            list,
             SlotRole::State,
         ),
         shape(
@@ -1532,17 +1537,38 @@ impl FakeDisk {
 }
 
 impl super::DiskSlots for FakeDisk {
-    fn take(&self, n: usize) -> Option<Vec<u32>> {
+    /// Runs of `span` from the top of the free list (kept sorted), counted
+    /// in slots.
+    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>> {
         let mut free = self.0.lock().unwrap();
-        let at = free.len().checked_sub(n)?;
-        self.1.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        Some(free.split_off(at))
+        free.sort_unstable();
+        let mut firsts = Vec::new();
+        let mut at = 0usize;
+        while firsts.len() < n && at + span as usize <= free.len() {
+            let first = free[at];
+            if (0..span).all(|k| free.get(at + k as usize) == Some(&(first + k))) {
+                firsts.push(first);
+                at += span as usize;
+            } else {
+                at += 1;
+            }
+        }
+        if firsts.len() < n {
+            return None;
+        }
+        free.retain(|slot| !firsts.iter().any(|&f| (f..f + span).contains(slot)));
+        self.1
+            .fetch_add(n * span as usize, std::sync::atomic::Ordering::Relaxed);
+        Some(firsts)
     }
 
-    fn give(&self, slots: &[u32]) {
+    fn give(&self, firsts: &[u32], span: u32) {
         self.1
-            .fetch_sub(slots.len(), std::sync::atomic::Ordering::Relaxed);
-        self.0.lock().unwrap().extend_from_slice(slots);
+            .fetch_sub(firsts.len() * span as usize, std::sync::atomic::Ordering::Relaxed);
+        let mut free = self.0.lock().unwrap();
+        for &first in firsts {
+            free.extend(first..first + span);
+        }
     }
 }
 
@@ -1683,6 +1709,80 @@ fn with_the_host_full_parked_role_slots_wait_for_host_room_then_go_there() {
         .unwrap();
     roles.lock().unwrap().commit(unpark);
     assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), resident);
+    roles.lock().unwrap().close_instance(instance);
+    assert_eq!(held(&device), before);
+}
+
+/// A load with no host tier whose role slots are wider than a kv slot
+/// (Metal: an instance's state far past a kv page): each still parks to
+/// disk, whole, in a run of adjacent slots of the file its bytes take (a
+/// 4 KiB Instance slot in four 1 KiB kv slots), and restores whole; the
+/// file's slots all come back. Refused only where the file has no such
+/// runs left: it stays parked on the device.
+#[test]
+fn a_role_slot_wider_than_a_kv_slot_parks_to_disk_in_a_run_and_restores_whole() {
+    let facts = facts_with_list(true, KIB);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let resident = held(&device);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+
+    // Too small a file: the move is refused whole, nothing taken.
+    let small = FakeDisk::with(4);
+    roles.lock().unwrap().set_disk(small.clone());
+    assert!(
+        roles.lock().unwrap().prepare_park_down(&[holder(1)], true).txn.is_none(),
+        "no file room for it: it stays"
+    );
+    assert_eq!(small.taken(), 0);
+
+    let disk = FakeDisk::with(64);
+    roles.lock().unwrap().set_disk(disk.clone());
+    let down = roles
+        .lock()
+        .unwrap()
+        .prepare_park_down(&[holder(1)], true)
+        .txn
+        .expect("wider slots go to disk too");
+    let tables = down
+        .copies()
+        .iter()
+        .find(|copy| copy.shape == INSTANCE)
+        .expect("the tables")
+        .clone();
+    assert!(tables.disk);
+    assert_eq!(tables.device.len(), 3, "a disk ref a role slot");
+    assert!(
+        tables.host.iter().all(|first| first % 4 == 0),
+        "each the first of a run of four: {:?}",
+        tables.host
+    );
+    let rings: usize = down
+        .copies()
+        .iter()
+        .filter(|copy| copy.shape == CHANNEL)
+        .map(|copy| copy.host.len())
+        .sum();
+    assert!(rings > 0, "its own rings too");
+    roles.lock().unwrap().commit(down);
+    assert_eq!(held(&device), before);
+    // Three 4 KiB tables slots in four kv slots each, its own rings' 1 KiB
+    // slots in one each.
+    assert_eq!(disk.taken(), 3 * 4 + rings);
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(disk.taken(), 0, "every run back");
     assert_eq!(held(&device), resident);
     roles.lock().unwrap().close_instance(instance);
     assert_eq!(held(&device), before);

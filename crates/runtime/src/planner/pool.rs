@@ -80,6 +80,11 @@ impl ChunkMap {
         self.free.extend(other.free);
         self.free.sort_unstable();
         self.free.dedup();
+        self.headroom = match (self.headroom, other.headroom) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.segment_chunks = self.segment_chunks.max(other.segment_chunks);
     }
 
     /// The processes whose eviction empties the cheapest `pieces` disjoint
@@ -551,7 +556,9 @@ impl PoolPort for RegistryPool {
                 .into_iter()
                 .map(|(chunk, (used, by))| ChunkHeld { chunk, used, by })
                 .collect(),
-            free: pool.pool().open_chunks(),
+            free: pool.pool().state_open_chunks(),
+            headroom: Some(pool.pool().headroom()),
+            segment_chunks: pool.pool().segments().segment_chunks(),
         }
     }
 

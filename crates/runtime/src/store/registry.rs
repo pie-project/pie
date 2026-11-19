@@ -259,14 +259,14 @@ pub fn shared_stores(
 struct KvDiskSlots(std::sync::Weak<parking_lot::Mutex<KvStore>>);
 
 impl super::roles::DiskSlots for KvDiskSlots {
-    fn take(&self, n: usize) -> Option<Vec<u32>> {
+    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>> {
         let kv = self.0.upgrade()?;
-        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_slots(n))
+        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_slots(n, span))
     }
 
-    fn give(&self, slots: &[u32]) {
+    fn give(&self, firsts: &[u32], span: u32) {
         if let Some(kv) = self.0.upgrade() {
-            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_slots(slots));
+            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_slots(firsts, span));
         }
     }
 }
