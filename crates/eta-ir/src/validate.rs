@@ -38,6 +38,34 @@ pub struct BoundTrace {
     pub stage_types: Vec<Vec<ValueType>>,
     pub readiness: Vec<ReadinessEntry>,
     pub classes: Vec<ChannelClass>,
+    /// What the bind held the program to ([`bind_within`]); `None` for a
+    /// [`bind`] that states none (an engine's own rebind of a program the
+    /// runtime already held to it, or a test's), which nothing evaluates on
+    /// the host.
+    pub budget: Option<Budget>,
+}
+
+/// What a bind may take of the device and load serving it
+/// ([`bind_within`]), derived from what they state: nothing here is
+/// picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// The bytes one instance's state room holds on the device serving the
+    /// program: its pool's state chunks less what the engine holds back of
+    /// them. A stage's values are laid in that room on the device, and the
+    /// host's evaluation of a stage (`eta_compiler::eval::pareval`) holds
+    /// every value of it at once: a stage whose values together pass it
+    /// can bind nowhere, and is refused at its registration.
+    pub room_bytes: u64,
+}
+
+/// What one stage of a program takes as it declares itself: the bytes of
+/// every value it defines, as the host's evaluation holds them all at
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageFootprint {
+    pub stage: Stage,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +140,17 @@ pub enum ValidateError {
     },
     ExternDirViolation {
         chan: u32,
+        stage: Stage,
+    },
+    /// A stage's values take more bytes than an instance's state room
+    /// holds ([`Budget::room_bytes`]).
+    StagePastRoom {
+        stage: Stage,
+        bytes: u64,
+        room: u64,
+    },
+    /// A stage's values' bytes pass a u64.
+    StageBytesOverflow {
         stage: Stage,
     },
 }
@@ -202,6 +241,17 @@ impl fmt::Display for ValidateError {
                  (import ⇒ consume-only, export ⇒ produce-only — SPSC across the pair)",
                 stage.name()
             ),
+            StagePastRoom { stage, bytes, room } => write!(
+                f,
+                "stage {}: its values take {bytes} bytes and an instance's state room \
+                 on the device serving this model holds {room}; it can bind nowhere",
+                stage.name()
+            ),
+            StageBytesOverflow { stage } => write!(
+                f,
+                "stage {}: its values' bytes pass a u64",
+                stage.name()
+            ),
         }
     }
 }
@@ -262,7 +312,62 @@ pub fn bind(
         stage_types,
         readiness,
         classes,
+        budget: None,
     })
+}
+
+/// [`bind`], then every stage held to `budget` ([`check_budget`]): what a
+/// registration binds, refused by name past it.
+pub fn bind_within(
+    container: TraceContainer,
+    lanes: Vec<Vec<OutputDecl>>,
+    caps: EngineCaps,
+    budget: Budget,
+) -> Result<BoundTrace, ValidateError> {
+    let mut bound = bind(container, lanes, caps)?;
+    check_budget(&bound, budget)?;
+    bound.budget = Some(budget);
+    Ok(bound)
+}
+
+/// The bytes the values `types` take, each its elements times its
+/// dtype's; `None` past a u64.
+#[must_use]
+pub fn values_bytes(types: &[ValueType]) -> Option<u64> {
+    types.iter().try_fold(0u64, |sum, ty| {
+        let elem = super::container::const_elem_size(ty.dtype) as u64;
+        sum.checked_add(ty.shape.numel().checked_mul(elem)?)
+    })
+}
+
+/// Every stage's footprint ([`StageFootprint`]) as `bound` declares it.
+pub fn footprints(bound: &BoundTrace) -> Result<Vec<StageFootprint>, ValidateError> {
+    bound
+        .container
+        .stages
+        .iter()
+        .zip(&bound.stage_types)
+        .map(|(program, types)| {
+            let stage = program.stage;
+            let bytes = values_bytes(types).ok_or(ValidateError::StageBytesOverflow { stage })?;
+            Ok(StageFootprint { stage, bytes })
+        })
+        .collect()
+}
+
+/// Every stage of `bound` within `budget`: its values within an
+/// instance's state room.
+pub fn check_budget(bound: &BoundTrace, budget: Budget) -> Result<(), ValidateError> {
+    for footprint in footprints(bound)? {
+        if footprint.bytes > budget.room_bytes {
+            return Err(ValidateError::StagePastRoom {
+                stage: footprint.stage,
+                bytes: footprint.bytes,
+                room: budget.room_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn channel_decl(

@@ -11,7 +11,7 @@ use eta_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use eta_ir::container_hash;
 use eta_ir::op::Op;
 use eta_ir::registry::{EngineCaps, OutputDecl, Port};
-use eta_ir::validate::{BoundTrace, ValidateError, bind, check_outputs};
+use eta_ir::validate::{BoundTrace, Budget, ValidateError, bind_within, check_outputs};
 use lru::LruCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,12 +118,15 @@ impl Registry {
         }
     }
 
-    /// A program bound for one pass is checked again against the next's `lanes`.
+    /// A program bound for one pass is checked again against the next's
+    /// `lanes`. It binds within `budget` (`validate::bind_within`): past
+    /// it, refused by name before anything of it is evaluated or laid.
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
         lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
+        budget: Budget,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let mut hash = container_hash(&bytes);
         if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
@@ -143,7 +146,7 @@ impl Registry {
         let pricing = price(&decoded)?;
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads = Self::reads(&decoded);
-        let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
+        let bound = bind_within(decoded, lanes, caps, budget).map_err(RegisterError::Bind)?;
         let compiled_stages = eta_compiler::plan::compile_bound(&bound);
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
@@ -290,7 +293,7 @@ pub fn register(
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    global().register(bytes, lanes, caps)
+    global().register(bytes, lanes, caps, eta.budget)
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -407,5 +410,64 @@ mod pricing_tests {
             matches!(refused, super::RegisterError::Overflow("a port's length")),
             "{refused}"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{RegisterError, Registry};
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::types::{Literal, Shape};
+    use eta_ir::validate::{Budget, ValidateError};
+    use std::num::NonZeroUsize;
+
+    fn broadcast(shape: Shape) -> Vec<u8> {
+        TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![Op::Const(Literal::F32(0.5)), Op::Broadcast { value: 0, shape }],
+            }],
+            ..TraceContainer::default()
+        }
+        .encode()
+    }
+
+    /// A guest declaring a prologue past an instance's state room is refused
+    /// at its registration by name, and nothing of it is held; one within
+    /// it registers.
+    #[test]
+    fn an_oversized_prologue_is_refused_at_registration_by_name() {
+        let mut registry = Registry::new(NonZeroUsize::new(4).unwrap());
+        let budget = Budget {
+            room_bytes: 64 << 20,
+        };
+        let refused = registry
+            .register(
+                broadcast(Shape::matrix(1 << 16, 1 << 16)),
+                vec![],
+                EngineCaps::default(),
+                budget,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                RegisterError::Bind(ValidateError::StagePastRoom {
+                    stage: Stage::Prologue,
+                    room,
+                    ..
+                }) if room == 64 << 20
+            ),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("state room"), "{refused}");
+        assert_eq!(registry.inner.len(), 0, "a refused program is not held");
+
+        let fits = registry
+            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget)
+            .expect("a 16 KiB prologue registers");
+        assert_eq!(fits.bound.budget, Some(budget));
     }
 }

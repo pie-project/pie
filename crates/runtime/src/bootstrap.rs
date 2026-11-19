@@ -164,6 +164,32 @@ pub struct EngineConfig {
     pub engine_backend: crate::engine::EngineBox,
 }
 
+/// The budget a guest program binds within on every engine of the model
+/// ([`model::guest_budget`]): the least room of theirs. A model served by
+/// no engine, or by one stating no state room, binds no guest program, and
+/// is refused by name here rather than refuse each registration.
+fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
+    let budget = engines
+        .iter()
+        .map(|engine| model::guest_budget(&engine.chunks))
+        .min_by_key(|budget| budget.room_bytes)
+        .ok_or_else(|| anyhow::anyhow!("a model served by no engine has no guest budget"))?;
+    if budget.room_bytes == 0 {
+        anyhow::bail!(
+            "an engine of this model states no state room past what it holds back \
+             ({} state chunks of {} bytes, {} held back); no guest program could bind",
+            engines.iter().map(|e| e.chunks.state_chunks()).min().unwrap_or(0),
+            engines.first().map_or(0, |e| e.chunks.chunk_bytes),
+            engines.first().map_or(0, |e| e.chunks.held_bytes),
+        );
+    }
+    tracing::info!(
+        room_bytes = budget.room_bytes,
+        "a guest program's stages bind within an instance's state room"
+    );
+    Ok(budget)
+}
+
 /// The admission cap: `cap`, held to the `seats` a seated-first kv pool
 /// seats where the model holds no recurrent state (whose processes its
 /// planner admits against the state pool instead).
@@ -355,6 +381,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .map(|d| d.rs_snapshots)
             .min()
             .unwrap_or(0),
+        budget: guest_budget(&engine_configs)?,
     };
     let facts = engine_configs
         .first()

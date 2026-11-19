@@ -281,7 +281,14 @@ mod tests {
         let mut registry =
             super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
         let program = registry
-            .register(traced.encode(), vec![outputs()], EngineCaps::default())
+            .register(
+                traced.encode(),
+                vec![outputs()],
+                EngineCaps::default(),
+                eta_ir::validate::Budget {
+                    room_bytes: u64::MAX,
+                },
+            )
             .expect("registers");
         if backend == "wgsl" {
             let calls = wgsl::step_calls();

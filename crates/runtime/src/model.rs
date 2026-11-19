@@ -274,7 +274,7 @@ impl RsCaps {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EtaCaps {
     pub draft_block: u32,
     pub draft_mask_token: u32,
@@ -284,6 +284,22 @@ pub struct EtaCaps {
     pub adapter_attachments: bool,
     /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.
     pub rs_snapshots: u32,
+    /// What a guest program's registration binds within
+    /// ([`eta_ir::validate::bind_within`]): the least of the engines'
+    /// ([`guest_budget`]).
+    pub budget: eta_ir::validate::Budget,
+}
+
+/// The budget a guest program binds within on an engine whose pools
+/// `chunks` states: an instance's state room is its state chunks' bytes
+/// less what the engine holds back of them.
+#[must_use]
+pub fn guest_budget(chunks: &::engine::chunk::ChunkFacts) -> eta_ir::validate::Budget {
+    eta_ir::validate::Budget {
+        room_bytes: u64::from(chunks.state_chunks())
+            .saturating_mul(chunks.chunk_bytes)
+            .saturating_sub(chunks.held_bytes),
+    }
 }
 
 impl std::fmt::Debug for Model {
