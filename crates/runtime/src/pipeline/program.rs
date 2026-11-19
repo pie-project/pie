@@ -84,6 +84,9 @@ pub enum RegisterError {
     Decode(ContainerDecodeError),
     Bind(ValidateError),
     HashCollision(u64),
+    /// A size the program declares does not fit the arithmetic it is
+    /// priced in: `what` names it.
+    Overflow(&'static str),
 }
 
 impl fmt::Display for RegisterError {
@@ -93,6 +96,9 @@ impl fmt::Display for RegisterError {
             RegisterError::Bind(e) => write!(f, "bind failed: {e}"),
             RegisterError::HashCollision(hash) => {
                 write!(f, "program hash collision for 0x{hash:016x}")
+            }
+            RegisterError::Overflow(what) => {
+                write!(f, "{what} overflows the arithmetic it is priced in")
             }
         }
     }
@@ -134,7 +140,7 @@ impl Registry {
             return Ok(hit.clone());
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
-        let pricing = price(&decoded);
+        let pricing = price(&decoded)?;
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads = Self::reads(&decoded);
         let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
@@ -204,27 +210,40 @@ impl Registry {
     }
 }
 
-fn price(c: &TraceContainer) -> Pricing {
-    let channel_bytes = c
-        .channels
-        .iter()
-        .map(|ch| {
-            let elem = container::const_elem_size(ch.dtype.program_dtype()) as u64;
-            let cells = (ch.capacity as u64) + 1;
-            ch.shape.numel() * elem * cells
-        })
-        .sum();
-    let port_len = |port| {
-        c.ports
-            .iter()
-            .find(|p| p.port == port)
-            .and_then(|p| match &p.source {
-                container::PortSource::Const { shape, .. } => Some(shape.numel() as u32),
-                container::PortSource::Channel(channel) => c
-                    .channels
-                    .get(*channel as usize)
-                    .map(|decl| decl.shape.numel() as u32),
-            })
+/// What `c` asks of the host and the device as it declares itself; a
+/// declared size past the arithmetic it is priced in is refused by name.
+fn price(c: &TraceContainer) -> Result<Pricing, RegisterError> {
+    let mut channel_bytes = 0u64;
+    for ch in &c.channels {
+        let elem = container::const_elem_size(ch.dtype.program_dtype()) as u64;
+        let cells = u64::from(ch.capacity)
+            .checked_add(1)
+            .ok_or(RegisterError::Overflow("a channel's cells"))?;
+        let bytes = ch
+            .shape
+            .numel()
+            .checked_mul(elem)
+            .and_then(|bytes| bytes.checked_mul(cells))
+            .ok_or(RegisterError::Overflow("a channel's bytes"))?;
+        channel_bytes = channel_bytes
+            .checked_add(bytes)
+            .ok_or(RegisterError::Overflow("the program's channel bytes"))?;
+    }
+    let numel = |shape: eta_ir::types::Shape| {
+        u32::try_from(shape.numel()).map_err(|_| RegisterError::Overflow("a port's length"))
+    };
+    let port_len = |port| -> Result<Option<u32>, RegisterError> {
+        let Some(binding) = c.ports.iter().find(|p| p.port == port) else {
+            return Ok(None);
+        };
+        match &binding.source {
+            container::PortSource::Const { shape, .. } => numel(*shape).map(Some),
+            container::PortSource::Channel(channel) => c
+                .channels
+                .get(*channel as usize)
+                .map(|decl| numel(decl.shape))
+                .transpose(),
+        }
     };
     let output_rows = || {
         c.stages
@@ -236,19 +255,18 @@ fn price(c: &TraceContainer) -> Pricing {
             })
             .max()
     };
-    let rows = port_len(eta_ir::registry::Port::Readout)
-        .map(|readout| readout.max(1))
-        .or_else(|| {
-            port_len(eta_ir::registry::Port::EmbedIndptr)
-                .map(|indptr| indptr.saturating_sub(1).max(1))
-        })
-        .or_else(output_rows)
-        .unwrap_or(1);
-    Pricing {
+    let rows = match port_len(eta_ir::registry::Port::Readout)? {
+        Some(readout) => readout.max(1),
+        None => match port_len(eta_ir::registry::Port::EmbedIndptr)? {
+            Some(indptr) => indptr.saturating_sub(1).max(1),
+            None => output_rows().unwrap_or(1),
+        },
+    };
+    Ok(Pricing {
         channel_bytes,
         num_channels: c.channels.len(),
         rows,
-    }
+    })
 }
 
 use std::sync::{LazyLock, MutexGuard};
@@ -341,7 +359,53 @@ mod pricing_tests {
             }],
             ..TraceContainer::default()
         };
-        assert_eq!(price(&container).rows, 256);
-        assert_eq!(price(&TraceContainer::default()).rows, 1);
+        assert_eq!(price(&container).unwrap().rows, 256);
+        assert_eq!(price(&TraceContainer::default()).unwrap().rows, 1);
+    }
+
+    #[test]
+    fn a_channel_past_the_pricing_arithmetic_is_refused_by_name() {
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole};
+        let huge = Shape::new(&[u32::MAX, u32::MAX]).unwrap();
+        let container = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: huge,
+                dtype: ChanDType::Concrete(Dtype::F32),
+                capacity: u32::MAX,
+                host_role: HostRole::None,
+                seeded: false,
+            }],
+            ..TraceContainer::default()
+        };
+        let refused = price(&container).unwrap_err();
+        assert!(
+            matches!(refused, super::RegisterError::Overflow("a channel's bytes")),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_port_longer_than_a_u32_is_refused_by_name() {
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
+        use eta_ir::registry::Port;
+        let container = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: Shape::new(&[1 << 20, 1 << 20]).unwrap(),
+                dtype: ChanDType::Concrete(Dtype::Bool),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: false,
+            }],
+            ports: vec![PortBinding {
+                port: Port::Readout,
+                source: PortSource::Channel(0),
+            }],
+            ..TraceContainer::default()
+        };
+        let refused = price(&container).unwrap_err();
+        assert!(
+            matches!(refused, super::RegisterError::Overflow("a port's length")),
+            "{refused}"
+        );
     }
 }
