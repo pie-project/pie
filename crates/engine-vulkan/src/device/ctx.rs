@@ -2578,6 +2578,17 @@ struct Submission {
     landed: std::sync::atomic::AtomicBool,
 }
 
+impl Submission {
+    /// Notes the wait on the fence returned: a lent fence goes back unwaited,
+    /// and a frame's own one is not waited on again when the frame drops.
+    fn landed(&self, ok: bool) {
+        self.landed.store(ok, Ordering::Release);
+        if ok && !self.lent {
+            self.inner.submitted.store(false, Ordering::Release);
+        }
+    }
+}
+
 impl Drop for Submission {
     fn drop(&mut self) {
         if !self.lent {
@@ -2605,9 +2616,7 @@ impl Watch {
     fn run(self) {
         let submission = self.submission;
         let result = submission.inner.block_on_fence(submission.fence);
-        submission
-            .landed
-            .store(result.is_ok(), Ordering::Release);
+        submission.landed(result.is_ok());
         (self.on_done)(
             result
                 .err()
@@ -2695,9 +2704,7 @@ impl Pending {
             Some(landing) => landing.wait(),
             None => {
                 let result = inner.block_on_fence(self.submission.fence);
-                self.submission
-                    .landed
-                    .store(result.is_ok(), Ordering::Release);
+                self.submission.landed(result.is_ok());
                 result
             }
         }
