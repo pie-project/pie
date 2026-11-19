@@ -167,9 +167,15 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
-    /// Command buffers whose frame was dropped off the thread that owns
-    /// their pool, which a pool's own thread frees: a pool is not shared.
-    orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
+    /// Command buffers whose frame is gone, no longer pending, by the pool
+    /// they came from: the next frame opened on that pool's thread resets
+    /// and records into one rather than allocating (a pool is not shared,
+    /// so only its own thread resets them).
+    spare_cmds: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
+
+    /// Descriptor pools whose frame is gone, no longer in use: a frame
+    /// resets one rather than creating a pool.
+    spare_sets: Mutex<Vec<vk::DescriptorPool>>,
 
     pub(crate) family: u32,
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
@@ -351,21 +357,6 @@ impl Core {
     pub(crate) fn thread_pool(&self) -> Result<vk::CommandPool> {
         let mut pools = self.pools.lock().expect("pools lock poisoned");
         if let Some(&pool) = pools.get(&std::thread::current().id()) {
-            let mut orphans = self.orphans.lock().expect("orphans lock poisoned");
-            let mut freed = Vec::new();
-            orphans.retain(|&(owner, cmd)| {
-                let mine = owner == pool;
-                if mine {
-                    freed.push(cmd);
-                }
-                !mine
-            });
-            if !freed.is_empty() {
-                // SAFETY: `pool` is this thread's own pool, so it is not used
-                // concurrently, and each orphan was allocated from it by a
-                // frame whose drop already waited out its submission.
-                unsafe { self.device.free_command_buffers(pool, &freed) };
-            }
             return Ok(pool);
         }
         // SAFETY: `self.device` is live and `family` is the queue family it
@@ -381,6 +372,63 @@ impl Core {
         .map_err(|e| self.fault("vkCreateCommandPool", e))?;
         pools.insert(std::thread::current().id(), pool);
         Ok(pool)
+    }
+
+    /// A command buffer of this thread's `pool` in the initial state: a
+    /// spare one reset, else one allocated.
+    fn command_buffer(&self, pool: vk::CommandPool) -> Result<vk::CommandBuffer> {
+        let spare = {
+            let mut spare = self.spare_cmds.lock().expect("spare commands lock poisoned");
+            spare
+                .iter()
+                .position(|&(owner, _)| owner == pool)
+                .map(|at| spare.swap_remove(at).1)
+        };
+        if let Some(cmd) = spare {
+            // SAFETY: `pool` is this thread's own pool, so its external sync
+            // holds; the buffer's frame is gone and waited out its
+            // submission, so it is not pending, and the pool was made with
+            // `RESET_COMMAND_BUFFER`.
+            unsafe {
+                self.device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+            }
+            .map_err(|e| self.fault("vkResetCommandBuffer", e))?;
+            return Ok(cmd);
+        }
+        // SAFETY: `pool` is this thread's own pool, which no other thread
+        // allocates from or frees into, so its external sync holds.
+        Ok(unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| self.fault("vkAllocateCommandBuffers", e))?[0])
+    }
+
+    /// A descriptor pool no set is allocated from: a spare one reset, or
+    /// `None` for the caller to create.
+    pub(crate) fn spare_descriptor_pool(&self) -> Result<Option<vk::DescriptorPool>> {
+        let Some(pool) = self
+            .spare_sets
+            .lock()
+            .expect("spare sets lock poisoned")
+            .pop()
+        else {
+            return Ok(None);
+        };
+        // SAFETY: the pool left the spare list under its lock, so only this
+        // caller holds it; the frame that used it is gone and waited out its
+        // submission, so none of its sets is in use.
+        unsafe {
+            self.device
+                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+        }
+        .map_err(|e| self.fault("vkResetDescriptorPool", e))?;
+        Ok(Some(pool))
     }
 }
 
@@ -402,6 +450,9 @@ impl Drop for Core {
                     .expect("spare fences lock poisoned"),
             ) {
                 self.device.destroy_fence(fence, None);
+            }
+            for pool in std::mem::take(self.spare_sets.get_mut().expect("spare sets lock poisoned")) {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
@@ -997,7 +1048,8 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
-            orphans: Mutex::new(Vec::new()),
+            spare_cmds: Mutex::new(Vec::new()),
+            spare_sets: Mutex::new(Vec::new()),
             family,
             memory,
             limits: props.limits,
@@ -1238,17 +1290,7 @@ impl Context {
         let core = &self.core;
         let d = &core.device;
         let pool = core.thread_pool()?;
-        // SAFETY: `pool` is this thread's own pool, which no other thread
-        // allocates from or frees into, so its external sync holds.
-        let cmd = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let cmd = core.command_buffer(pool)?;
         let fence = core.lend_fence()?;
         // SAFETY: `cmd` was just allocated on this thread and is in the
         // initial state, so it may be begun; the barrier below records into it
@@ -1391,35 +1433,28 @@ impl Drop for Inner {
         // `cmd` or allocates from its descriptor pools. A submitted frame is
         // waited on first, so the pools, queries and buffer are no longer in
         // use (a wait that times out after two minutes is taken as a lost
-        // device). The command buffer is freed only on the thread whose pool
-        // it came from, and otherwise left to that thread as an orphan.
+        // device). The command buffers and descriptor pools go back to the
+        // device's spares for the next frame; a command buffer is reset
+        // only on the thread whose pool it came from.
         unsafe {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
-            }
+            self.core
+                .spare_sets
+                .lock()
+                .expect("spare sets lock poisoned")
+                .extend(self.pools.get_mut().expect("pools lock poisoned").drain(..));
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
-            let owned = self
-                .core
-                .pools
-                .lock()
-                .expect("pools lock poisoned")
-                .get(&std::thread::current().id())
-                == Some(&self.cmd_pool);
             let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
             buffers.push(self.cmd());
-            if owned {
-                d.free_command_buffers(self.cmd_pool, &buffers);
-            } else {
-                let mut orphans = self.core.orphans.lock().expect("orphans lock poisoned");
-                for cmd in buffers {
-                    orphans.push((self.cmd_pool, cmd));
-                }
-            }
+            self.core
+                .spare_cmds
+                .lock()
+                .expect("spare commands lock poisoned")
+                .extend(buffers.into_iter().map(|cmd| (self.cmd_pool, cmd)));
         }
         self.core.return_fence(self.fence);
     }
@@ -1570,19 +1605,24 @@ impl Frame {
         let mut sets = match got {
             Some(sets) => sets,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+                let pool = match core.spare_descriptor_pool()? {
+                    Some(pool) => pool,
+                    None => {
+                        let sizes = [vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(BUFFERS_PER_POOL)];
+                        // SAFETY: `d` is live and the create info is complete.
+                        unsafe {
+                            d.create_descriptor_pool(
+                                &vk::DescriptorPoolCreateInfo::default()
+                                    .max_sets(SETS_PER_POOL)
+                                    .pool_sizes(&sizes),
+                                None,
+                            )
+                        }
+                        .map_err(|e| core.fault("vkCreateDescriptorPool", e))?
+                    }
+                };
                 pools.push(pool);
                 let info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
