@@ -114,8 +114,10 @@ fn a_streamed_step_publishes_the_nodes_it_stores() {
                     .filter(|(_, listed)| listed.contains(&node))
                     .map(|(step, _)| step)
                     .collect();
-                // A node with no result writes nothing a layout holds.
-                if results.is_empty() {
+                // A node with no result writes nothing a layout holds; a
+                // folded one (its step computes it in another form) writes
+                // none of its results, and holds only what it reads.
+                if results.is_empty() || published.folded.contains(&node) {
                     continue;
                 }
                 let Some(&first) = steps_of.first() else {

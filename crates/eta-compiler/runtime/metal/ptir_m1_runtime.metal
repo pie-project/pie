@@ -1345,7 +1345,10 @@ inline void m4_reduce_two_levels(
     uint threads,
     threadgroup M1ArgmaxCandidate* tgbuf,
     uint simd_lane,
-    uint simd_id) {
+    uint simd_id,
+    // Where stated, level 0 reads exp(x - center[row]) for x (f32): a
+    // log-softmax's sum of exponentials from its row itself.
+    const device float* center = nullptr) {
   const uint count = m4_reduce_count(d.last, level);
   const uint chunks = (count + 31u) / 32u;
   const uint pitch = (d.last + 31u) / 32u;
@@ -1362,7 +1365,9 @@ inline void m4_reduce_two_levels(
         result[row] = identity;
       } else {
         result[row] = level == 0u
-            ? reinterpret_cast<const device uint*>(input)[row * d.last]
+            ? (center != nullptr
+                   ? as_type<uint>(precise::exp(reinterpret_cast<const device float*>(input)[row * d.last] - center[row]))
+                   : reinterpret_cast<const device uint*>(input)[row * d.last])
             : plane[((level - 1u) & 1u) * d.rows * pitch + row * pitch];
       }
     }
@@ -1383,6 +1388,9 @@ inline void m4_reduce_two_levels(
       const uint chunk = group * span + simd_id + k * simds;
       const uint at = chunk * 32u + simd_lane;
       held[k] = (k < rounds && chunk < chunks && at < count) ? src[at] : identity;
+      if (level == 0u && center != nullptr && k < rounds && chunk < chunks && at < count) {
+        held[k] = as_type<uint>(precise::exp(as_type<float>(held[k]) - center[row]));
+      }
     }
     for (uint k = 0; k < 8u; ++k) {
       if (k < rounds) {
