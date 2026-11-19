@@ -141,6 +141,11 @@ impl ResidencyPlanner {
                 }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
+                // Its parked state is on its way down a tier: restored now,
+                // it would miss the items moving. The landing pokes.
+                if is_restore && inner.parked_moving.contains(&pid) {
+                    return Step::Done;
+                }
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
@@ -149,7 +154,7 @@ impl ResidencyPlanner {
                 if missing > 0 {
                     return Step::Absorb {
                         count: missing,
-                        fund_by_eviction: !is_restore || inner.fleet_stalled(),
+                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
                     };
                 }
                 // rs slots are taken whole when the head is served; a short
@@ -160,7 +165,7 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         ask: seated,
-                        fund_by_eviction: !is_restore || inner.fleet_stalled(),
+                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }
@@ -170,6 +175,37 @@ impl ResidencyPlanner {
                         extra: inner.burst_shortfall(),
                     },
                     None => match inner.procs.get(&pid).and_then(|proc| proc.bind_room) {
+                        // Another restored for its bind and not yet fired
+                        // ([`Inner::bind_restoring`]): its bind goes first,
+                        // served or funded as a bind is, and with none
+                        // waiting the planner waits for it to fire. Funding
+                        // this restore instead moved every resident for a
+                        // restore the planner would not serve, and the
+                        // restored one's bind waited behind it for good.
+                        Some(_)
+                            if inner
+                                .bind_restoring
+                                .is_some_and(|restoring| restoring != pid) =>
+                        {
+                            let restoring = inner.bind_restoring;
+                            inner
+                                .queue
+                                .iter()
+                                .find_map(|(key, waiter)| match waiter.kind {
+                                    WaitKind::BindRoom {
+                                        run,
+                                        pieces,
+                                        served: false,
+                                        ..
+                                    } if Some(waiter.pid) == restoring => Some(Step::BindRoom {
+                                        key: *key,
+                                        run,
+                                        pieces,
+                                    }),
+                                    _ => None,
+                                })
+                                .unwrap_or(Step::Done)
+                        }
                         // Its whole need: the room its bind asks too.
                         Some(need) if room_stood != Some(key) => {
                             Step::RestoreBindRoom { key, need }
@@ -212,6 +248,11 @@ impl ResidencyPlanner {
                     if self.wait_on_grow(no_grow, need) {
                         return true;
                     }
+                    // Parked state lying on the device moves down a tier
+                    // before any resident does.
+                    if self.park_down_for(run, pieces) {
+                        return false;
+                    }
                     true
                 }
                 Step::RestoreBindRoom { key, need } => {
@@ -234,18 +275,24 @@ impl ResidencyPlanner {
                             inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid),
                         )
                     });
-                    if !other_restoring
-                        && pid.is_some_and(|pid| {
-                            self.port.room_beside_own(pid, need.run, need.pieces)
-                        })
-                    {
+                    debug_assert!(!other_restoring, "selected only with no other restoring");
+                    if pid.is_some_and(|pid| self.port.room_beside_own(pid, need.run, need.pieces)) {
                         room_stood = Some(key);
                         continue;
                     }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
-                    if !self.with_inner(|inner| inner.fleet_stalled()) {
+                    // Parked state lying on the device moves down a tier for
+                    // it, no one running on it (the M1 stress: every
+                    // Instance chunk held by parked processes' role slots,
+                    // the bind-suspended head's runs never funded).
+                    if self.park_down_for(need.run, need.pieces) {
+                        return false;
+                    }
+                    // Funded once nothing in flight can free room
+                    // ([`Inner::nothing_in_flight`]).
+                    if !self.with_inner(|inner| inner.nothing_in_flight()) {
                         return false;
                     }
                     true
@@ -297,6 +344,14 @@ impl ResidencyPlanner {
                     };
                     if self.wait_on_grow(no_grow, grow) {
                         return true;
+                    }
+                    // Parked state lying on the device (role slots their
+                    // park found no host room for) moves down a tier before
+                    // any resident does: no one runs on it (Mac Pro's M5
+                    // stall: host full, every process evicted, the head's
+                    // runs held by parked role slots, nothing to evict).
+                    if self.park_down_for(run, pieces) {
+                        return false;
                     }
                     // Else the occupants of the chunks it could take move
                     // for it (`plan_eviction`'s chunk branch), under the

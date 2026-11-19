@@ -510,7 +510,20 @@ pub trait Engine: Send {
     /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves kv list slots
     /// between the device (or the host tier) and
     /// [`crate::transfer::MemoryDomain::LocalDisk`], disk ref `r` slot `r`
-    /// of its kv slot file. Token runs are device to device only. Each copy
+    /// of its kv slot file, and between the device and that file the
+    /// slots of a role shape ([`crate::chunk::SlotRole::Instance`],
+    /// [`crate::chunk::SlotRole::Channel`], [`crate::chunk::SlotRole::Adapter`])
+    /// of any size: where no host tier is stated, a parked process's role
+    /// slots lie there. Such a copy names the role's own shape id (the one
+    /// a host park names) and moves whole slots only, `(device ref, disk
+    /// ref)` pairs: a role slot lies whole in a run of
+    /// `ceil(slot_bytes / kv list slot_bytes)` adjacent slots of the kv
+    /// slot file, its bytes in order, the disk ref the run's first slot.
+    /// No room of their own is stated: they take slots of the file's
+    /// [`crate::chunk::ChunkFacts::disk_chunks`] (`budget_disk`), counted
+    /// out of the kv slots' room by the runtime, and the device slots a
+    /// restore copies back into are taken before the copy.
+    /// Token runs are device to device only. Each copy
     /// is ordered after every fire submitted before it and before every one
     /// after (a stream-ordered copy, or a drain), and copies in submission
     /// order: the runtime names a destination again as soon as the call

@@ -2163,3 +2163,55 @@ fn a_close_the_engine_refuses_still_frees_the_instance_and_its_pair() {
     );
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
+
+/// A load with no host tier (unified memory): two processes' instances
+/// share their pair's state. Each park leaves its instance's tables where
+/// they lie (no room below) but gives back its scratch; once both have
+/// parked, the pair's state (dead between fires) goes back too: an
+/// instance parked where it lies counts as parked for what it shares.
+#[test]
+fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    let pair = slots(PAIR) * SLOT;
+    let bound = held(&device);
+    let tables = (bound - before - 2 * 2 * CHUNK - pair) / 2;
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert_eq!(
+        held(&device) - before,
+        2 * tables + 2 * CHUNK + pair,
+        "the first's scratch back, the pair still the second's"
+    );
+    let park = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert_eq!(
+        held(&device) - before,
+        2 * tables,
+        "every scratch and the pair's state back, the tables where they lie"
+    );
+    for (by, id) in [(1, first), (2, second)] {
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .unwrap()
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+        let stale = roles.lock().unwrap().stale(holder(by));
+        for rebind in stale {
+            engine.rebind_slots(rebind).unwrap();
+            roles.lock().unwrap().rebound(Owner::Instance(id));
+        }
+    }
+    assert_eq!(held(&device), bound, "both back, with one pair");
+    roles.lock().unwrap().close_instance(first);
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(held(&device), before);
+}

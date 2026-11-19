@@ -4260,10 +4260,24 @@ impl Pools {
                 )
             })?;
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        if (from == Tier::Disk || to == Tier::Disk) && kind != Kind::List {
+        // The slot file's slots are kv list slots: a parked role's slot lies
+        // whole in a run of adjacent ones its bytes take, named by the run's
+        // first (CONTRACT-BC 22); the host tier's own slots move to disk as
+        // kv list slots only.
+        let list_bytes = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let role = matches!(kind, Kind::Instance | Kind::Channel);
+        if (from == Tier::Disk || to == Tier::Disk)
+            && kind != Kind::List
+            && !(role && list_bytes > 0 && (from == Tier::Device || to == Tier::Device))
+        {
             return Err(Fault::Unbound {
                 what: format!(
-                    "a {} to or from disk: the slot file holds kv list slots only",
+                    "a {} to or from disk: the slot file holds kv list slots, and a parked \
+                     role's slots moved from the device",
                     kind.name()
                 ),
             });
@@ -4337,8 +4351,24 @@ impl Pools {
                     .iter()
                     .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
                     .unzip();
-                self.through_disk(stream, to_disk, &disk, |pools, at| {
-                    pools.chunks.span(kind, device[at], 0, bytes)
+                // Each slot whole in a run of the file's slots, from its
+                // first: pieces of a kv slot's bytes, in order.
+                let file = if kind == Kind::List { bytes } else { list_bytes.max(1) };
+                let span = bytes.div_ceil(file).max(1);
+                let mut pieces: Vec<(u32, usize, u64, u64)> = Vec::new();
+                for (at, &first) in disk.iter().enumerate() {
+                    for k in 0..span {
+                        let done = k * file;
+                        pieces.push((
+                            first + u32::try_from(k).unwrap_or(u32::MAX),
+                            at,
+                            done,
+                            file.min(bytes - done),
+                        ));
+                    }
+                }
+                self.through_disk(stream, to_disk, &pieces, |pools, at, offset, len| {
+                    pools.chunks.span(kind, device[at], offset, len)
                 })
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
@@ -4399,28 +4429,24 @@ impl Pools {
         Ok(())
     }
 
-    /// Moves kv list slots between the slot file's slots `disk` and the
-    /// device addresses `at(i)` through the stage, one slot at a time.
+    /// Moves `pieces` between the slot file and the device through the
+    /// stage, one at a time: each a file slot, and the device address
+    /// `at(slot index, offset, len)` of `len` bytes at `offset` in a slot.
     fn through_disk(
         &mut self,
         stream: *mut core::ffi::c_void,
         to_disk: bool,
-        disk: &[u32],
-        at: impl Fn(&Self, usize) -> Result<u64>,
+        pieces: &[(u32, usize, u64, u64)],
+        at: impl Fn(&Self, usize, u64, u64) -> Result<u64>,
     ) -> Result<()> {
         let have = u64::from(self.disk_pages());
-        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+        if let Some(&(slot, ..)) = pieces.iter().find(|&&(slot, ..)| u64::from(slot) >= have) {
             return Err(Fault::Ceiling {
                 what: "disk kv pages",
                 need: u64::from(slot) + 1,
                 have,
             });
         }
-        let bytes = self
-            .chunks
-            .layout()
-            .shape(Kind::List)
-            .map_or(0, |list| list.slot_bytes);
         let Some(mut spill) = self.disk.take() else {
             return Ok(());
         };
@@ -4430,19 +4456,20 @@ impl Pools {
             // the stream that touches it is waited for before the host reads
             // or writes it.
             let staged = || unsafe { std::slice::from_raw_parts_mut(stage, stride) };
-            for (i, &slot) in disk.iter().enumerate() {
+            for &(slot, i, offset, len) in pieces {
                 if spill.landing {
                     crate::device::ctx::sync(stream)?;
                     spill.landing = false;
                 }
-                let place = at(self, i)?;
+                let place = at(self, i, offset, len)?;
+                let len = usize::try_from(len).unwrap_or(usize::MAX);
                 if to_disk {
-                    crate::device::copy_any(stream, stage as u64, place, bytes as usize)?;
+                    crate::device::copy_any(stream, stage as u64, place, len)?;
                     crate::device::ctx::sync(stream)?;
                     spill.file.write(slot, staged()).map_err(slot_file)?;
                 } else {
                     spill.file.read(slot, staged()).map_err(slot_file)?;
-                    crate::device::copy_any(stream, place, stage as u64, bytes as usize)?;
+                    crate::device::copy_any(stream, place, stage as u64, len)?;
                     spill.landing = true;
                 }
             }

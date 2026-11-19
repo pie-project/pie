@@ -16,7 +16,12 @@
 //! with their process on the host tier, as it parks the process's kv: a
 //! park copies each item to host slots and frees its device slots, an
 //! unpark copies it into fresh device slots, and the engine is told the new
-//! refs ([`Engine::rebind_slots`]) before the next fire reads them.
+//! refs ([`Engine::rebind_slots`]) before the next fire reads them. What
+//! the host has no room for at the park stays on the device, parked, until
+//! the device wants its room ([`Roles::prepare_park_down`]): then it goes
+//! on down to the host, or, where the load states no host tier (unified
+//! memory), to the disk tier's slot file, a slot of it a role slot
+//! ([`DiskSlots`]).
 //!
 //! A ring an instance holds itself is the instance's item. A registered
 //! channel's ring is the channel's, shared by every instance bound to it,
@@ -337,6 +342,10 @@ impl std::fmt::Display for GuestRoom {
 enum Tier {
     Device,
     Host,
+    /// In the disk tier's slot file, where no host tier holds it
+    /// ([`Roles::prepare_park_down`]): its live parts' refs are slots of
+    /// the file ([`DiskSlots`]).
+    Disk,
     /// A park or unpark is copying it: neither side's slots are free.
     Moving,
 }
@@ -418,7 +427,8 @@ struct Item {
     /// Parked with no tier below to hold its live parts: they stayed where
     /// they lie, its dead parts (guest scratch, dead between fires) were
     /// given back, and its restore takes fresh ones in their class
-    /// ([`Roles::prepare_unpark`]).
+    /// ([`Roles::prepare_unpark`]). Its live parts go on down once the
+    /// device wants their room ([`Roles::prepare_park_down`]).
     shed: bool,
     /// Frames on their way through the engine that name it (an instance
     /// they attach, or the pair, channels and adapter one of those shares):
@@ -589,6 +599,9 @@ impl TakenRing {
 pub struct RoleMove {
     out: bool,
     items: Vec<(Owner, Vec<Part>)>,
+    /// Each item's tier off the device, in item order: the one it goes to
+    /// (`out`) or comes from.
+    below: Vec<Tier>,
     copies: Vec<RoleCopy>,
     /// Items whose live parts stay where they lie, each with its parts after
     /// the move: parking, its dead parts given back (no refs); unparking,
@@ -597,12 +610,52 @@ pub struct RoleMove {
 }
 
 /// One role shape's slots a move copies: device slot `device[i]` and host
-/// slot `host[i]`, whichever way the move goes.
+/// slot `host[i]` (`disk`: slot `host[i]` of the disk tier's slot file),
+/// whichever way the move goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleCopy {
     pub shape: EngineShape,
     pub device: Vec<u32>,
     pub host: Vec<u32>,
+    pub disk: bool,
+}
+
+/// The disk tier's slot file, for the live parts of parked items no host
+/// tier holds (a load on unified memory states none): a role slot lies
+/// whole in a run of `span` adjacent slots of the file, `span` the kv list
+/// slots its bytes take (one where it is no wider), named by the run's
+/// first slot (CONTRACT-BC 22). The kv store's disk slots, taken and given
+/// back through it, counted against the disk's budget with kv's.
+pub trait DiskSlots: Send + Sync {
+    /// `n` runs of `span` adjacent free slots of the file, as each run's
+    /// first slot; all or none.
+    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>>;
+    /// Runs taken before, each from its first slot, free again.
+    fn give(&self, firsts: &[u32], span: u32);
+}
+
+/// The disk tier a [`Roles`] parks on, and the bytes a slot of it holds.
+#[derive(Clone)]
+struct Disk {
+    slots: Arc<dyn DiskSlots>,
+    slot_bytes: u64,
+}
+
+impl std::fmt::Debug for Disk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Disk")
+            .field("slot_bytes", &self.slot_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Parked items' live parts moving down from the device
+/// ([`Roles::prepare_park_down`]): the move of those the host has room for,
+/// and the host chunks the rest would take.
+#[derive(Debug, Default)]
+pub struct ParkDown {
+    pub txn: Option<RoleMove>,
+    pub host_chunks: u64,
 }
 
 impl RoleMove {
@@ -618,6 +671,8 @@ impl RoleMove {
 pub struct Roles {
     device: Shared,
     host: Option<Shared>,
+    /// The disk tier, where the load keeps one ([`Self::set_disk`]).
+    disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
     items: HashMap<Owner, Item>,
@@ -700,6 +755,7 @@ impl Roles {
         Some(Self {
             device: Arc::clone(device),
             host: host.cloned(),
+            disk: None,
             shapes,
             programs: HashMap::new(),
             items: HashMap::new(),
@@ -711,6 +767,103 @@ impl Roles {
             generations: 0,
             leaked: 0,
         })
+    }
+
+    /// Parks on `disk` too, the disk tier's slot file whose slots hold a kv
+    /// list slot's bytes: the live parts of every role lie there where no
+    /// host tier holds them, a role slot in a run of the file's slots
+    /// ([`DiskSlots`]).
+    pub fn set_disk(&mut self, disk: Arc<dyn DiskSlots>) {
+        let slot_bytes = self
+            .device
+            .lock()
+            .unwrap()
+            .list()
+            .map_or(0, |list| list.slot_bytes);
+        self.disk = (slot_bytes > 0).then_some(Disk {
+            slots: disk,
+            slot_bytes,
+        });
+    }
+
+    /// The run of the disk file's slots a slot of `role` lies in whole,
+    /// where the load keeps a disk tier: its bytes in kv list slots.
+    fn disk_span(&self, role: SlotRole) -> Option<u32> {
+        let disk = self.disk.as_ref()?;
+        let shape = self.shapes.of(role)?;
+        Some(u32::try_from(shape.slot_bytes.div_ceil(disk.slot_bytes).max(1)).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the disk tier holds slots of `role`.
+    fn disk_holds(&self, role: SlotRole) -> bool {
+        self.disk_span(role).is_some()
+    }
+
+    /// Whether some tier below the device holds every live part of `parts`.
+    fn lies_below(&self, parts: &[Part]) -> bool {
+        self.host.is_some()
+            || parts
+                .iter()
+                .filter(|part| !part.dead())
+                .all(|part| self.disk_holds(part.role))
+    }
+
+    /// Disk slots for the live parts of `parts`, all or none: a dead part
+    /// holds nothing off the device.
+    fn take_disk(&self, parts: &[Part]) -> Option<Vec<Part>> {
+        let disk = self.disk.as_ref()?;
+        if !parts
+            .iter()
+            .filter(|part| !part.dead())
+            .all(|part| self.disk_holds(part.role))
+        {
+            return None;
+        }
+        let mut taken: Vec<Part> = Vec::with_capacity(parts.len());
+        for part in parts {
+            let refs = if part.dead() || part.refs.is_empty() {
+                Vec::new()
+            } else {
+                let span = self.disk_span(part.role)?;
+                match disk.slots.take(part.refs.len(), span) {
+                    Some(firsts) => firsts,
+                    None => {
+                        self.give_on(Tier::Disk, &taken);
+                        return None;
+                    }
+                }
+            };
+            taken.push(Part {
+                refs,
+                ..part.clone()
+            });
+        }
+        Some(taken)
+    }
+
+    /// Gives `parts` back on tier `on` (their refs that tier's).
+    fn give_on(&self, on: Tier, parts: &[Part]) {
+        match on {
+            Tier::Disk => {
+                let Some(disk) = &self.disk else {
+                    return;
+                };
+                for part in parts.iter().filter(|part| !part.refs.is_empty()) {
+                    if let Some(span) = self.disk_span(part.role) {
+                        disk.slots.give(&part.refs, span);
+                    }
+                }
+            }
+            Tier::Host => {
+                if let Some(host) = self.host.clone() {
+                    self.give(&host, parts);
+                }
+            }
+            Tier::Device | Tier::Moving => {
+                let device = Arc::clone(&self.device);
+                self.give_freeing(&device, parts);
+            }
+        }
     }
 
     /// Per logical chunk, the slots each of `holders` holds there in dead
@@ -1006,7 +1159,8 @@ impl Roles {
         };
         let mut own: Vec<OwnPiece> = Vec::new();
         for (owner, item) in &self.items {
-            let parked = item.tier == Tier::Host || (item.tier == Tier::Device && item.shed);
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
+                || (item.tier == Tier::Device && item.shed);
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
@@ -1608,10 +1762,7 @@ impl Roles {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
-        let on = self.tier(item.tier == Tier::Host);
-        if let Some(on) = on {
-            self.give_freeing(&on, &item.parts);
-        }
+        self.give_on(item.tier, &item.parts);
     }
 
     // ---- parking ----
@@ -1636,7 +1787,11 @@ impl Roles {
                     .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
                     && item.attached.iter().all(|id| {
                         instance(id).is_some_and(|instance| {
-                            instance.holder == Some(holder) || instance.tier != Tier::Device
+                            // Parked already: off the device, or parked
+                            // where it lies (no room below, [`Item::shed`]).
+                            instance.holder == Some(holder)
+                                || instance.tier != Tier::Device
+                                || instance.shed
                         })
                     })
             }
@@ -1712,15 +1867,18 @@ impl Roles {
                     self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
                     items.push((owner, to));
                 }
-                None if parts.iter().any(|part| part.dead() && !part.refs.is_empty()) => {
+                // Its live parts stay where they lie, parked all the same:
+                // room a move down a tier makes once the device wants it
+                // ([`Self::prepare_park_down`]).
+                None => {
                     self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
                     shed.push((owner, emptied(&parts)));
                 }
-                None => {}
             }
         }
         (!items.is_empty() || !shed.is_empty()).then(|| {
-            let mut txn = self.moving(true, items);
+            let below = vec![Tier::Host; items.len()];
+            let mut txn = self.moving(true, items, below);
             txn.shed = shed;
             txn
         })
@@ -1733,7 +1891,8 @@ impl Roles {
             .items
             .iter()
             .filter(|(owner, item)| {
-                item.tier == Tier::Host && self.unparks_with(**owner, item, holder)
+                matches!(item.tier, Tier::Host | Tier::Disk)
+                    && self.unparks_with(**owner, item, holder)
             })
             .map(|(owner, _)| *owner)
             .collect();
@@ -1817,14 +1976,136 @@ impl Roles {
                 }
             }
         }
+        let below: Vec<Tier> = items.iter().map(|(owner, _)| self.items[owner].tier).collect();
         for (owner, _) in items.iter().chain(&shed) {
             self.items.get_mut(owner).expect("present").tier = Tier::Moving;
         }
         Ok((!items.is_empty() || !shed.is_empty()).then(|| {
-            let mut txn = self.moving(false, items);
+            let mut txn = self.moving(false, items, below);
             txn.shed = shed;
             txn
         }))
+    }
+
+    /// The process a parked item went with: an instance's or a channel's
+    /// holder, an adapter's (or a pair's) first instance's.
+    fn parked_with(&self, owner: Owner, item: &Item) -> Option<Holder> {
+        match owner {
+            Owner::Instance(_) | Owner::Channel(_) => item.holder,
+            Owner::Adapter(_) | Owner::Pair(_) => item.attached.iter().find_map(|id| {
+                self.items
+                    .get(&Owner::Instance(*id))
+                    .and_then(|instance| instance.holder)
+            }),
+        }
+    }
+
+    /// Parked items whose live parts stayed on the device for want of room
+    /// below ([`Item::shed`]): no fire reads them until their process is
+    /// restored, so they are room a move down a tier makes.
+    fn parked_on_device(&self) -> impl Iterator<Item = (Owner, &Item, Holder)> {
+        self.items.iter().filter_map(|(owner, item)| {
+            (item.tier == Tier::Device && item.shed)
+                .then(|| self.parked_with(*owner, item))
+                .flatten()
+                .map(|holder| (*owner, item, holder))
+        })
+    }
+
+    /// Per logical chunk, the slots parked items' live parts hold on the
+    /// device ([`Item::shed`]), by the process each parked with, `except`'s
+    /// left out (its restore keeps them where they lie): the chunks moving
+    /// them down a tier ([`Self::prepare_park_down`]) empties.
+    #[must_use]
+    pub fn parked_chunk_slots(&self, except: Holder) -> Vec<(u32, Holder, u32)> {
+        let device = self.device.lock().unwrap();
+        let mut counts: BTreeMap<(u32, Holder), u32> = BTreeMap::new();
+        for (_, item, holder) in self.parked_on_device() {
+            if holder == except {
+                continue;
+            }
+            // Room a move makes only where some tier below takes it.
+            if !self.lies_below(&item.parts) {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| !part.dead()) {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
+                for &slot_ref in &part.refs {
+                    let slot = device.slot(shape.pool, slot_ref);
+                    *counts.entry((slot.chunk, holder)).or_default() += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .map(|((chunk, holder), slots)| (chunk, holder, slots))
+            .collect()
+    }
+
+    /// Moves the items `holders` parked with whose live parts stayed on the
+    /// device (no room below at their park, [`Item::shed`]) down a tier, as
+    /// the load's tiers lie: to the host where it has room now, slots taken
+    /// there for each that fits, to copy into, as a park takes them; where
+    /// the load states no host tier (unified memory: its host is the
+    /// device's own memory), or with `disk_too` once the host can make no
+    /// room, to the disk tier's slot file ([`DiskSlots`]) for a role whose
+    /// slot fits one of its slots. Committed, each lies below as if parked
+    /// there, and its restore takes fresh device slots
+    /// ([`Self::prepare_unpark`]). What the host has no room for, short of
+    /// `disk_too`, is counted in host chunks: the room kv on the host
+    /// moving on down to disk makes for it, older below newer.
+    pub fn prepare_park_down(&mut self, holders: &[Holder], disk_too: bool) -> ParkDown {
+        let owners: Vec<Owner> = self
+            .parked_on_device()
+            .filter(|(_, _, holder)| holders.contains(holder))
+            .map(|(owner, ..)| owner)
+            .collect();
+        let mut items = Vec::new();
+        let mut below = Vec::new();
+        let mut host_chunks = 0u64;
+        for owner in owners {
+            let parts = self.items[&owner].parts.clone();
+            let on_host = self
+                .host
+                .clone()
+                .map(|host| (self.take_parts(&host, &parts, false).ok(), host));
+            let to = match on_host {
+                Some((Some(to), _)) => Some((to, Tier::Host)),
+                Some((None, host)) if !disk_too => {
+                    host_chunks += self.chunks_on(&host, &parts);
+                    None
+                }
+                _ => self.take_disk(&parts).map(|to| (to, Tier::Disk)),
+            };
+            if let Some((to, tier)) = to {
+                self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
+                items.push((owner, to));
+                below.push(tier);
+            }
+        }
+        ParkDown {
+            txn: (!items.is_empty()).then(|| self.moving(true, items, below)),
+            host_chunks,
+        }
+    }
+
+    /// The whole chunks of `on` the live parts of `parts` take.
+    fn chunks_on(&self, on: &Shared, parts: &[Part]) -> u64 {
+        let pool = on.lock().unwrap();
+        parts
+            .iter()
+            .filter(|part| !part.dead())
+            .map(|part| {
+                let per_chunk = self
+                    .shapes
+                    .of(part.role)
+                    .and_then(|shape| pool.pool().shape(shape.pool))
+                    .map_or(1, |shape| shape.slots_per_chunk.max(1));
+                (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
+            })
+            .sum()
     }
 
     /// Whether the items of `owners` together fit the device pool's state
@@ -1852,10 +2133,13 @@ impl Roles {
     }
 
     /// The move of `items` (each item's slots to take), with the copies
-    /// from the slots each holds now.
-    fn moving(&self, out: bool, items: Vec<(Owner, Vec<Part>)>) -> RoleMove {
+    /// from the slots each holds now: each item's tier off the device is
+    /// `below`'s, in item order, the one it goes to (`out`), else the one
+    /// it lies on now.
+    fn moving(&self, out: bool, items: Vec<(Owner, Vec<Part>)>, below: Vec<Tier>) -> RoleMove {
         let mut copies: Vec<RoleCopy> = Vec::new();
-        for (owner, to) in &items {
+        for ((owner, to), tier) in items.iter().zip(&below) {
+            let disk = *tier == Tier::Disk;
             let from = &self.items[owner].parts;
             for (from, to) in from.iter().zip(to) {
                 // Scratch: dead between fires, nothing to copy.
@@ -1870,13 +2154,17 @@ impl Roles {
                 } else {
                     (&to.refs, &from.refs)
                 };
-                let copy = match copies.iter_mut().find(|copy| copy.shape == shape.id) {
+                let copy = match copies
+                    .iter_mut()
+                    .find(|copy| copy.shape == shape.id && copy.disk == disk)
+                {
                     Some(copy) => copy,
                     None => {
                         copies.push(RoleCopy {
                             shape: shape.id,
                             device: Vec::new(),
                             host: Vec::new(),
+                            disk,
                         });
                         copies.last_mut().expect("pushed")
                     }
@@ -1889,6 +2177,7 @@ impl Roles {
         RoleMove {
             out,
             items,
+            below,
             copies,
             shed: Vec::new(),
         }
@@ -1918,20 +2207,20 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
-        let left = self.tier(!txn.out);
-        for (owner, parts) in txn.items {
+        for ((owner, parts), below) in txn.items.into_iter().zip(txn.below) {
             let Some(item) = self.items.get_mut(&owner) else {
                 continue;
             };
             let old = std::mem::replace(&mut item.parts, parts);
-            item.tier = if txn.out { Tier::Host } else { Tier::Device };
+            item.tier = if txn.out { below } else { Tier::Device };
+            // Moved whole: nothing of it stayed behind (a parked item whose
+            // live parts went on down later, [`Self::prepare_park_down`]).
+            item.shed = false;
             if !txn.out {
                 item.generation = generation;
             }
             item.stale = !txn.out;
-            if let Some(left) = &left {
-                self.give_freeing(left, &old);
-            }
+            self.give_on(if txn.out { Tier::Device } else { below }, &old);
             self.free_if_done(owner);
         }
         // A bind waiting on a pair's move looks again.
@@ -1955,13 +2244,15 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
-        let taken_on = self.tier(txn.out);
-        for (owner, parts) in txn.items {
-            if let Some(on) = &taken_on {
-                self.give(on, &parts);
+        for ((owner, parts), below) in txn.items.into_iter().zip(txn.below) {
+            if txn.out {
+                self.give_on(below, &parts);
+            } else {
+                let device = Arc::clone(&self.device);
+                self.give(&device, &parts);
             }
             if let Some(item) = self.items.get_mut(&owner) {
-                item.tier = if txn.out { Tier::Device } else { Tier::Host };
+                item.tier = if txn.out { Tier::Device } else { below };
             }
             self.free_if_done(owner);
         }
@@ -1992,10 +2283,10 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
-        for (owner, parts) in txn.items {
+        for ((owner, parts), below) in txn.items.into_iter().zip(txn.below) {
             leaked += parts.iter().map(|part| part.refs.len() as u64).sum::<u64>();
             if let Some(item) = self.items.get_mut(&owner) {
-                item.tier = if txn.out { Tier::Device } else { Tier::Host };
+                item.tier = if txn.out { Tier::Device } else { below };
             }
             self.free_if_done(owner);
         }
@@ -2011,15 +2302,6 @@ impl Roles {
     #[must_use]
     pub fn leaked(&self) -> u64 {
         self.leaked
-    }
-
-    /// The host tier (`host`), else the device.
-    fn tier(&self, host: bool) -> Option<Shared> {
-        if host {
-            self.host.clone()
-        } else {
-            Some(Arc::clone(&self.device))
-        }
     }
 
     /// `holder`'s items whose slots moved since the engine last named them:
@@ -2178,7 +2460,7 @@ impl Roles {
     pub fn device_bytes(&self) -> u64 {
         self.items
             .values()
-            .filter(|item| item.tier != Tier::Host)
+            .filter(|item| !matches!(item.tier, Tier::Host | Tier::Disk))
             .flat_map(|item| &item.parts)
             .map(|part| {
                 part.refs.len() as u64 * self.shapes.of(part.role).map_or(0, |s| s.slot_bytes)

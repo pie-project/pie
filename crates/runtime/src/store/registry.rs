@@ -228,21 +228,46 @@ pub fn shared_stores(
     if let Some(identity) = crate::model::identity() {
         kv.set_domain(identity.domain());
     }
+    let kv = Arc::new(parking_lot::Mutex::new(kv));
     let rs = RsStore::shared(shared, tiers.host.as_ref());
-    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
-    kv.set_page_size(kv_page_size);
+    {
+        let mut kv = kv.lock();
+        kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
+        kv.set_page_size(kv_page_size);
+    }
     Stores {
-        kv: Arc::new(parking_lot::Mutex::new(kv)),
+        kv: Arc::clone(&kv),
         rs: Arc::new(Mutex::new(rs)),
         seats: Arc::new(Mutex::new(Seats::new(records))),
         kv_page_size,
         context_pages: context_pages(max_context, kv_page_size),
         shared: Some(Arc::clone(shared)),
         host: tiers.host.clone(),
-        roles: super::roles::Roles::new(shared, tiers.host.as_ref())
-            .map(|roles| Arc::new(Mutex::new(roles))),
+        roles: super::roles::Roles::new(shared, tiers.host.as_ref()).map(|mut roles| {
+            if tiers.disk_slots > 0 {
+                roles.set_disk(Arc::new(KvDiskSlots(Arc::downgrade(&kv))));
+            }
+            Arc::new(Mutex::new(roles))
+        }),
         pinned_kv: None,
         pinned_state: None,
+    }
+}
+
+/// The disk tier's slot file as the roles park on it: the kv store's disk
+/// slots ([`super::roles::DiskSlots`]).
+struct KvDiskSlots(std::sync::Weak<parking_lot::Mutex<KvStore>>);
+
+impl super::roles::DiskSlots for KvDiskSlots {
+    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>> {
+        let kv = self.0.upgrade()?;
+        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_slots(n, span))
+    }
+
+    fn give(&self, firsts: &[u32], span: u32) {
+        if let Some(kv) = self.0.upgrade() {
+            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_slots(firsts, span));
+        }
     }
 }
 

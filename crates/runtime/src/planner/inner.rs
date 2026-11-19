@@ -42,6 +42,10 @@ pub(super) struct Inner {
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
+    /// The evicted processes whose parked state is on its way down a tier
+    /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
+    /// lands, so no restore misses an item moving under it.
+    pub(super) parked_moving: HashSet<ProcessId>,
 }
 
 impl Inner {
@@ -186,6 +190,14 @@ impl Inner {
     pub(super) fn enqueue(&mut self, pid: ProcessId, kind: WaitKind) -> EntryKey {
         let key = (self.procs[&pid].rank(), self.next_id);
         self.next_id += 1;
+        // The one restored for its bind asks for pages: its bind went
+        // through, and the next suspended bind may come back. Held to its
+        // first fire, the hold outlived a grant it waited on behind the
+        // held restore (the M1 stress: 86 at the planner's grant, the
+        // restore head held, nothing moved).
+        if matches!(kind, WaitKind::Allocation { .. }) && self.bind_restoring == Some(pid) {
+            self.bind_restoring = None;
+        }
         self.queue.insert(key, Waiter { pid, kind });
         key
     }
@@ -395,29 +407,29 @@ impl Inner {
     /// each resident lane's next one: suspended processes come back as
     /// soon as room appears, every one it holds at once, not one a
     /// completion. One whose role slots found no room last time
-    /// ([`super::proc::Proc::roles_short`]) waits while the fleet decodes
-    /// (a completion frees room; funding it then thrashed), and once the
-    /// fleet is stalled (a fleet waiting at binds included) has room made
-    /// for its runs: idle cache, a coming grow, then the occupants of the
-    /// chunks it could take.
+    /// ([`super::proc::Proc::roles_short`]) goes again on the runs that
+    /// stand free, and has room made for its runs (idle cache, a coming
+    /// grow, then the occupants of the chunks it could take) only once
+    /// nothing in flight can free room, a fleet waiting at binds included:
+    /// funding it while the fleet decoded thrashed.
     pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
         let roles_short = self.procs.get(&pid).and_then(|proc| proc.roles_short);
         if self.completion_credit > 0 {
             self.completion_credit -= 1;
             return RestoreGate::Serve;
         }
-        let stalled = self.fleet_stalled();
+        let stalled = self.nothing_in_flight();
         // Short of runs for its roles: it goes again on runs that stand
         // free whatever the fleet does (the plan looks, outside this lock);
-        // room is made for it by moving others only once the fleet is
-        // stalled or waits at binds. Waiting for a completion while its
-        // runs stood free, it waited on an event that need not come (Mac
-        // Pro's beam mix: 2 runs of 4 short, 440 such runs free, flat for
-        // 191 s with every thread parked).
+        // room is made for it by moving others only once nothing in flight
+        // can free room (a fleet waiting at binds included). Waiting for a
+        // completion while its runs stood free, it waited on an event that
+        // need not come (Mac Pro's beam mix: 2 runs of 4 short, 440 such
+        // runs free, flat for 191 s with every thread parked).
         if let Some(need) = roles_short {
             return RestoreGate::Evict {
                 need: (need.run, need.pieces),
-                fund: stalled || self.fleet_waits_at_binds(),
+                fund: stalled,
             };
         }
         if spare < self.growth_reserve() && !stalled {
@@ -438,25 +450,32 @@ impl Inner {
         }
     }
 
-    /// No resident process makes progress save through room: each is
-    /// stalled as [`Self::fleet_stalled`] counts it, or waits at a bind for
-    /// room (AMD's 7-minute stall: 143 processes at a bind, the restore
-    /// head short of role slots never funded). Read only where a restore
-    /// short of role slots asks whether to wait for a completion: a bind
-    /// waiter is no wedge for the starvation verdict, which may still
-    /// move it.
-    pub(super) fn fleet_waits_at_binds(&self) -> bool {
-        self.evicting.is_empty()
-            && self.procs.values().any(|proc| proc.bind_waiting)
-            && self.procs.iter().all(|(pid, proc)| match proc.state {
-                Residency::Resident => {
-                    !proc.admitted
-                        || proc.idle
-                        || proc.bind_waiting
-                        || (self.queue.values().any(|waiter| waiter.pid == *pid) && !proc.firing())
+    /// Whether a process other than `waiter` holds device room the planner
+    /// can still move: resident (a victim), or on its way in or out.
+    pub(super) fn others_hold_room(&self, waiter: Option<ProcessId>) -> bool {
+        self.procs.iter().any(|(pid, proc)| {
+            Some(*pid) != waiter
+                && match proc.state {
+                    Residency::Resident => proc.admitted,
+                    Residency::Evicting | Residency::Restoring => true,
+                    Residency::Evicted => false,
                 }
-                Residency::Evicting | Residency::Restoring => false,
-                Residency::Evicted => true,
+        })
+    }
+
+    /// Nothing in flight can free room: no fire submitted and not landed,
+    /// no eviction, restore or kill under way. What the others wait on
+    /// (grants, binds, gates, anything not yet named) does not matter:
+    /// with nothing moving, only the planner moving a resident makes room.
+    /// Counting waiter kinds instead missed one each time (stalled, then
+    /// waiting at binds, then one resident between steps), and the fleet
+    /// stood still with nothing coming.
+    pub(super) fn nothing_in_flight(&self) -> bool {
+        self.evicting.is_empty()
+            && !self.kill_in_flight()
+            && self.procs.values().all(|proc| {
+                !proc.firing()
+                    && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
             })
     }
 

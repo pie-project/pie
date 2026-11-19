@@ -76,6 +76,63 @@ impl<I: PoolId> Pool<I> {
         Some(taken)
     }
 
+    /// `n` runs of `span` adjacent free ids each, lowest first, as each
+    /// run's first id; all or none.
+    pub fn try_alloc_runs(&mut self, n: usize, span: u32) -> Option<Vec<I>> {
+        if span <= 1 {
+            return self.try_alloc_n(n);
+        }
+        if self.available < n.saturating_mul(span as usize) {
+            return None;
+        }
+        let free = |offset: u32| {
+            let (word, bit) = locate(offset);
+            self.free[word] & bit != 0
+        };
+        let mut firsts: Vec<u32> = Vec::with_capacity(n);
+        let (mut at, mut stretch) = (0u32, 0u32);
+        while firsts.len() < n && at < self.capacity {
+            stretch = if free(at) { stretch + 1 } else { 0 };
+            if stretch == span {
+                firsts.push(at + 1 - span);
+                stretch = 0;
+            }
+            at += 1;
+        }
+        if firsts.len() < n {
+            return None;
+        }
+        for &first in &firsts {
+            for offset in first..first + span {
+                let (word, bit) = locate(offset);
+                self.free[word] &= !bit;
+            }
+        }
+        self.available -= n * span as usize;
+        while self.lowest < self.free.len() && self.free[self.lowest] == 0 {
+            self.lowest += 1;
+        }
+        Some(
+            firsts
+                .into_iter()
+                .map(|first| I::from_index(self.base + first))
+                .collect(),
+        )
+    }
+
+    /// Runs [`Self::try_alloc_runs`] took, each from its first id, free
+    /// again.
+    pub fn release_runs(&mut self, firsts: &[I], span: u32) {
+        let ids = firsts
+            .iter()
+            .flat_map(|first| {
+                let first = first.index();
+                (first..first + span.max(1)).map(I::from_index)
+            })
+            .collect();
+        self.give_back(ids);
+    }
+
     /// Takes `id` out of the free list, as a reservation; false when it is
     /// not free.
     pub fn take(&mut self, id: I) -> bool {
@@ -152,6 +209,20 @@ mod tests {
         assert!(!pool.take(8));
         assert_eq!(pool.available(), 3);
         assert_eq!(pool.try_alloc_n(3), Some(vec![4, 6, 7]));
+    }
+
+    #[test]
+    fn runs_take_adjacent_free_ids_and_go_back_whole() {
+        let mut pool = Pool::<u32>::new(10);
+        assert_eq!(pool.try_alloc_n(1), Some(vec![0]));
+        assert!(pool.take(4));
+        // Free: 1 2 3 . 5 6 7 8 9: runs of three at 1 and 5.
+        assert_eq!(pool.try_alloc_runs(2, 3), Some(vec![1, 5]));
+        assert_eq!(pool.available(), 2);
+        assert_eq!(pool.try_alloc_runs(1, 3), None, "8 9 is no run of three");
+        pool.release_runs(&[1], 3);
+        assert_eq!(pool.available(), 5);
+        assert_eq!(pool.try_alloc_n(2), Some(vec![1, 2]));
     }
 
     #[test]

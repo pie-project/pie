@@ -59,6 +59,34 @@ impl ChunkHeld {
 }
 
 impl ChunkMap {
+    /// `other`'s chunks counted in as well: a chunk both hold has the
+    /// occupants of each, a pid in both its slots summed.
+    pub fn merge(&mut self, other: ChunkMap) {
+        for chunk in other.held {
+            match self.held.iter_mut().find(|held| held.chunk == chunk.chunk) {
+                Some(held) => {
+                    held.used = held.used.max(chunk.used);
+                    for (pid, slots) in chunk.by {
+                        match held.by.iter_mut().find(|(by, _)| *by == pid) {
+                            Some((_, count)) => *count += slots,
+                            None => held.by.push((pid, slots)),
+                        }
+                    }
+                }
+                None => self.held.push(chunk),
+            }
+        }
+        self.held.sort_unstable_by_key(|held| held.chunk);
+        self.free.extend(other.free);
+        self.free.sort_unstable();
+        self.free.dedup();
+        self.headroom = match (self.headroom, other.headroom) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.segment_chunks = self.segment_chunks.max(other.segment_chunks);
+    }
+
     /// The processes whose eviction empties the cheapest `pieces` disjoint
     /// runs of `run` adjacent chunks, each chunk free or emptiable
     /// ([`ChunkHeld::emptiable`]), cost the pages moved; `None` where no
@@ -236,6 +264,35 @@ pub trait PoolPort: Send + Sync + 'static {
     fn chunk_occupants(&self, pids: &[ProcessId]) -> ChunkMap {
         let _ = pids;
         ChunkMap::default()
+    }
+    /// Which processes' parked state lies on the device in which physical
+    /// chunk of a shared pool (role slots a park found no room below for,
+    /// [`crate::store::roles::Roles::parked_chunk_slots`]), `except`'s left
+    /// out, and the chunks free now: what moving that state down a tier
+    /// ([`Self::move_parked_down`]) empties. Empty where the pool keeps no
+    /// chunks or nothing parked lies on the device.
+    fn parked_occupants(&self, except: ProcessId) -> ChunkMap {
+        let _ = except;
+        ChunkMap::default()
+    }
+    /// Moves the parked state `pids` left on the device down a tier, as the
+    /// load's tiers lie: to the host where it has room, and where it has
+    /// none kv on the host goes on down to disk first to make it (idle
+    /// cache, then the parked sets of `order`, the victim order), the disk
+    /// taking it only once no kv makes host room; to the disk at once
+    /// where the load states no host tier (unified memory). True when a move is on its way, whose landing tells
+    /// `planner` ([`ResidencyPlanner::parked_down_done`]); false when
+    /// nothing can move.
+    ///
+    /// [`ResidencyPlanner::parked_down_done`]: super::ResidencyPlanner::parked_down_done
+    fn move_parked_down(
+        &self,
+        planner: &std::sync::Arc<super::ResidencyPlanner>,
+        pids: &[ProcessId],
+        order: &[ProcessId],
+    ) -> bool {
+        let _ = (planner, pids, order);
+        false
     }
     /// The device pool's count of room given back (a chunk opened for
     /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
@@ -486,6 +543,109 @@ impl PoolPort for RegistryPool {
                 segment_chunks: pool.pool().segments().segment_chunks(),
             }
         })
+    }
+
+    fn parked_occupants(&self, except: ProcessId) -> ChunkMap {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return ChunkMap::default();
+        };
+        let (Some(shared), Some(roles)) = (stores.shared.clone(), stores.roles.clone()) else {
+            return ChunkMap::default();
+        };
+        // Read before the pool's lock: the roles take it themselves.
+        let parked = roles.lock().unwrap().parked_chunk_slots(except);
+        let pool = shared.lock().unwrap();
+        let mut by: std::collections::BTreeMap<u32, (u32, Vec<(ProcessId, u32)>)> =
+            std::collections::BTreeMap::new();
+        for (logical, pid, slots) in parked {
+            if let Some(physical) = pool.pool().physical(logical) {
+                let entry = by
+                    .entry(physical)
+                    .or_insert_with(|| (pool.pool().chunk_used(logical), Vec::new()));
+                match entry.1.iter_mut().find(|(held, _)| *held == pid) {
+                    Some((_, count)) => *count += slots,
+                    None => entry.1.push((pid, slots)),
+                }
+            }
+        }
+        ChunkMap {
+            held: by
+                .into_iter()
+                .map(|(chunk, (used, by))| ChunkHeld { chunk, used, by })
+                .collect(),
+            free: pool.pool().state_open_chunks(),
+            headroom: Some(pool.pool().headroom()),
+            segment_chunks: pool.pool().segments().segment_chunks(),
+        }
+    }
+
+    fn move_parked_down(
+        &self,
+        planner: &std::sync::Arc<super::ResidencyPlanner>,
+        pids: &[ProcessId],
+        order: &[ProcessId],
+    ) -> bool {
+        if !self.suspend_capable {
+            return false;
+        }
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return false;
+        };
+        let Some(roles) = stores.roles.clone() else {
+            return false;
+        };
+        let holders: Vec<crate::store::roles::Holder> = pids.to_vec();
+        // The host first where the load states one; with none (unified
+        // memory) the disk at once.
+        let down = roles
+            .lock()
+            .unwrap()
+            .prepare_park_down(&holders, stores.host.is_none());
+        if let Some(txn) = down.txn {
+            super::exec::spawn_park_down(planner.clone(), txn);
+            return true;
+        }
+        if let Some(host) = stores.host.as_ref().filter(|_| down.host_chunks > 0) {
+            // The host is short: what it holds of kv goes on down to disk
+            // to make the room, the cache's first, then the parked sets',
+            // lowest first, so the tiers keep the newer above the older.
+            let chunks = u32::try_from(down.host_chunks).unwrap_or(u32::MAX);
+            let wanted = usize::try_from(host.lock().unwrap().list_slots_for_chunks(chunks))
+                .unwrap_or(usize::MAX)
+                .max(1);
+            let sets: Vec<crate::store::kv::page_table::WorkingSetId> = order
+                .iter()
+                .flat_map(|&pid| {
+                    crate::inferlet::process::residency::kv_working_set_ids(
+                        pid,
+                        self.model,
+                        self.engine,
+                    )
+                })
+                .collect();
+            let spill = self.with_kv_tagged("planner-park-down", |kv| {
+                kv.prepare_spill(wanted, crate::policy::retention::Installed)
+                    .or_else(|| kv.prepare_parked_spill(wanted, &sets))
+            });
+            if let Some(txn) = spill {
+                super::exec::spawn_spill(
+                    planner.clone(),
+                    txn,
+                    super::ResidencyPlanner::parked_down_done,
+                );
+                return true;
+            }
+        }
+        // No kv on the host to make room (or pages settled on their disk
+        // copies made it with nothing to copy): the host where it has room
+        // now, else the disk.
+        match roles.lock().unwrap().prepare_park_down(&holders, true).txn {
+            Some(txn) => {
+                super::exec::spawn_park_down(planner.clone(), txn);
+                true
+            }
+            None => false,
+        }
     }
 
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
