@@ -3783,6 +3783,17 @@ impl Shell {
                     .map(|seated| seated.lane.tokens.len() as u32)
                     .collect();
                 let carried = envelope.lanes();
+                // Its ports describe its own lanes only: past them they
+                // would set another request's positions and kv slots.
+                let owned = attached.lanes.max(1) as usize;
+                if carried > owned {
+                    return Err(Fault::GeometryLanes {
+                        lane: attached.lane,
+                        instance: attached.instance.0,
+                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
+                        owned: owned as u32,
+                    });
+                }
                 if first + carried > lanes.len() {
                     return Err(Fault::program(
                         "serve::prepare",
