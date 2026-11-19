@@ -144,6 +144,12 @@ pub const LAUNCH: u32 = 16;
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
 
+/// The most single-fire frames a queued rates frame keeps in flight
+/// (`Rig::queue`): enough that the device never waits on the host between
+/// them, few enough that a frame of thousands of tiny fires holds few
+/// command buffers at once.
+const QUEUED: usize = 4;
+
 /// The kv page the attention's pool is laid in.
 const PAGE: u32 = 16;
 
@@ -199,6 +205,13 @@ struct Rig<'a, B: Serve> {
     /// fire, which a settled frame's admission carries as its least worst
     /// ratio (the Adreno 840 swung ~10% inside one settled step).
     swing: std::cell::Cell<f64>,
+    /// Each fire of a frame its own submission, queued behind the one before
+    /// and the queue timed whole by the host's clock: so where the device
+    /// states a bound on one submission (but for the launch's chain, whose
+    /// dispatches are one submission by what it measures). No submission
+    /// then holds more than one fire's work, whatever the margin is yet
+    /// known to be, and the device stays loaded across them.
+    queue: std::cell::Cell<bool>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -217,6 +230,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
+            queue: std::cell::Cell::new(max_submit.is_some()),
         }
     }
 
@@ -240,6 +254,14 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// it fits the bound; a single fire past it refused by name.
     fn fitting(&self, count: u32) -> Result<u32> {
         let a = self.admission.get();
+        if self.queue.get() {
+            // Each fire its own submission: as many as asked where one fits.
+            return if a.fits(self.per_fire.get()) {
+                Ok(count.max(1))
+            } else {
+                Err(self.refuse(self.per_fire.get().unwrap_or(0.0), 1))
+            };
+        }
         a.fires(count, self.per_fire.get())
             .ok_or_else(|| self.refuse(self.per_fire.get().unwrap_or(0.0), 1))
     }
@@ -336,21 +358,64 @@ impl<'a, B: Serve> Rig<'a, B> {
             bound_ms = ?self.max_submit.map(|b| b.as_secs_f64() * 1e3),
             "submitting"
         );
-        // A frame whose estimate, at the worst error seen, passes the
+        // A submission whose estimate, at the worst error seen, passes the
         // device's bound on one submission is refused by name, never
-        // submitted: a submission past it loses the device.
-        if !self.admission.get().fits(estimate) {
-            return Err(self.refuse(self.per_fire.get().unwrap_or(0.0), count));
+        // submitted: a submission past it loses the device. Queued, each
+        // submission is one fire.
+        let queued = self.queue.get() && count > 1;
+        let submission = if queued {
+            self.per_fire.get()
+        } else {
+            estimate
+        };
+        if !self.admission.get().fits(submission) {
+            let refused = if queued { 1 } else { count };
+            return Err(self.refuse(self.per_fire.get().unwrap_or(0.0), refused));
         }
-        let mut f = self.device.frame()?;
-        {
-            let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-            for _ in 0..count {
+        let timed = if queued {
+            // Each fire its own frame, all but the last committed behind
+            // one another unawaited; the last, `then` on it, timed; the
+            // queue's time the host's from the first commit to the last
+            // landing (the adapter's span would time the last frame alone).
+            let started = std::time::Instant::now();
+            let mut pending = std::collections::VecDeque::with_capacity(QUEUED);
+            for _ in 1..count {
+                // No more than [`QUEUED`] frames in flight: the oldest
+                // waited for before the next is laid.
+                if pending.len() >= QUEUED
+                    && let Some(oldest) = pending.pop_front()
+                {
+                    crate::backend::Pending::wait(&oldest)?;
+                }
+                let f = self.device.frame()?;
+                {
+                    let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                    fire(&sink)?;
+                }
+                pending.push_back(crate::backend::Frame::commit_async(f, None)?);
+            }
+            let mut f = self.device.frame()?;
+            {
+                let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
                 fire(&sink)?;
             }
-        }
-        then(&mut f)?;
-        let timed = timer(f)?;
+            then(&mut f)?;
+            timer(f)?;
+            for p in &pending {
+                crate::backend::Pending::wait(p)?;
+            }
+            (None, started.elapsed().as_nanos() as u64)
+        } else {
+            let mut f = self.device.frame()?;
+            {
+                let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                for _ in 0..count {
+                    fire(&sink)?;
+                }
+            }
+            then(&mut f)?;
+            timer(f)?
+        };
         let took = timed.0.unwrap_or(timed.1) as f64;
         let mut admission = self.admission.get();
         admission.landed(estimate, took, count >= self.basis.get());
@@ -658,6 +723,38 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     say(&format!("[rates]: per-row ops: {elementwise:.0} GB/s"));
     let scan = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
     rig.release();
+    // Under a stated submit bound, the clock the device settles at under
+    // sustained load: the warm-up's cube rotated again once every rate is
+    // timed (the device loaded for the whole step, past the drop a phone's
+    // clock takes some seconds in), its settled rate against the warm-up's.
+    // The margin a serving step is held to carries the drop as measured
+    // (an Adreno 840 halved its clock ~10 s into load).
+    let sustained = if max_submit.is_some() {
+        let worst = rig.admission.get().worst;
+        match warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, worst)? {
+            Some(hot) => {
+                let drop = (warmed.rate / hot.rate.max(f64::MIN_POSITIVE)).max(1.0);
+                say(&format!(
+                    "[rates]: sustained: the {side}^3 matmul settled at {:.2} TFLOP/s after the \
+                     step, {:.2} at its start: x{drop:.2}",
+                    hot.rate / 1e3,
+                    warmed.rate / 1e3
+                ));
+                drop
+            }
+            None => {
+                return Err(Fault::Device {
+                    call: "rates",
+                    why: format!(
+                        "sustained: a {side}^3 matmul, timed at the step's start, no longer fits \
+                         the device's bound on one submission once the step has loaded it"
+                    ),
+                });
+            }
+        }
+    } else {
+        1.0
+    };
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
@@ -680,8 +777,14 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         // measured (the clock's swing at least): the margin a serving step's
         // estimate is held to the bound at (`crate::submit`), measured where
         // the platform states one.
-        submit_worst_ratio: max_submit
-            .map(|_| rig.admission.get().worst.max(rig.swing.get()).max(1.0)),
+        submit_worst_ratio: max_submit.map(|_| {
+            rig.admission
+                .get()
+                .worst
+                .max(rig.swing.get())
+                .max(sustained)
+                .max(1.0)
+        }),
         attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
     };
     // A rate that settled at nothing is refused by name, never saved or
@@ -856,7 +959,15 @@ fn warm_at<B: Serve>(
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
-    let fits = |left: u32| rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left);
+    // Queued, each fire is its own submission: the whole rotation where one
+    // fire fits, none where it does not.
+    let fits = |left: u32| {
+        if rig.queue.get() {
+            rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, 1) * left
+        } else {
+            rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left)
+        }
+    };
     let shrunk = std::cell::Cell::new(false);
     let warmed = engine::rates::warm_up(|| {
         let mut wall = 0u64;
@@ -1099,6 +1210,9 @@ fn copy_and_launch<B: Serve>(
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     };
     let nothing = |_: &mut B::Frame| Ok(());
+    // The launch is what a dispatch adds inside one submission: its chains
+    // are one submission each (their tiny fires far inside any bound).
+    let queued = rig.queue.replace(false);
     rig.step(format!("launch: one {LAUNCH}^3 matmul"), None);
     rig.frame(timer, 1, &tiny, &nothing)?;
     let single = median(
@@ -1154,6 +1268,7 @@ fn copy_and_launch<B: Serve>(
     ));
     // The longest chain's: its gap the least moved by the frame's submit.
     let launch = gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64;
+    rig.queue.set(queued);
 
     let device = rig.device;
     let copy = COPY_BYTES.min(device.max_buffer()) & !3;
