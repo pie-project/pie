@@ -977,9 +977,10 @@ impl Shell {
         id: engine::InstanceId,
         slots: crate::program::Slots,
     ) -> Result<()> {
+        let stream = self.device.stream();
         let pools = &self.pools;
         self.programs
-            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes))
+            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes), stream)
     }
 
     /// Settles the guest batches whose steps have landed: their channels'

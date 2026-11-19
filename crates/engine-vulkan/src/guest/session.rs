@@ -767,6 +767,22 @@ impl Session {
     /// lie in, in order), whose bytes the runtime copied there, and the
     /// instance's state and its pair's to `scratch` and `pair`, fresh room
     /// whose contents are dead.
+    /// Zeroes the instance's state and, where `pair` (a new taking of the
+    /// pair's slots), the pair's: room another owner left as it stood.
+    pub fn clear(&self, pair: bool) -> Result<()> {
+        self.instance.clear()?;
+        if pair {
+            self.pair.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Where its pair's state lies.
+    #[must_use]
+    pub fn pair_place(&self) -> &engine::program::ScratchPlace {
+        self.pair.place()
+    }
+
     pub fn retarget(
         &mut self,
         pools: &Pools<crate::device::Api>,
