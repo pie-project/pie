@@ -4,14 +4,17 @@
 
 use std::fmt::Write as _;
 
-use super::super::{Column, ColumnAsk, Kernel, R, Source};
+use super::super::{Column, ColumnAsk, Kernel, R, Source, UnitKernel};
 use crate::emit::stream::{COMMON, Fill, HostArray, buf, cfg_decl, kv_joint, rowp_array, rows_of};
 use crate::floor::Coord;
 use crate::floorplan::stream::KvColumn;
 use crate::stream::build::PYA;
 use crate::stream::build::Program;
 use crate::stream::place::KvSched;
-use crate::stream::unit::{Cols, Joint};
+use crate::stream::unit::{
+    Cols, Joint, Kda, Lowering, Side, State as StateCol, Step, View, side_of,
+};
+use poem_ir::{Dtype, Operation, Ssm, ValueId};
 
 /// A recurrence on a state column.
 pub struct State;
@@ -47,8 +50,410 @@ impl Kernel for State {
         ]
     }
 
+    fn unit(&self) -> Option<&dyn UnitKernel> {
+        Some(self)
+    }
+
     fn column(&self) -> Option<&dyn Column> {
         Some(self)
+    }
+}
+
+impl UnitKernel for State {
+    /// A recurrence from its conv: the conv, gates and step (and Mamba-2's gated norm) of a row.
+    fn lower(&self, cx: &mut Lowering, at: u32) -> R<bool> {
+        let name = cx.name;
+        let refuse = |at: u32, what: String| format!("{name}: node {at}: {what}");
+        let Lowering {
+            r,
+            nodes,
+            steps,
+            sides,
+            joint,
+            skip,
+            ..
+        } = cx;
+        let r = *r;
+        let nodes: &[u32] = nodes;
+        let trace = r.trace;
+        match &trace.nodes[at as usize].op {
+            // a gated delta rule (its conv, its gates, its recurrence): a step's row through
+            // its heads' state columns (P8), the conv's history and the gates at their roots
+            // Mamba-2 (its conv, its scan, its gated group norm): a step's row through its heads'
+            // state columns (P8's MAMBA), the norm as root regions and constant matvecs
+            // (crate::stream::mamba)
+            Operation::Ssm(Ssm::CausalConv1d {
+                x,
+                weight,
+                bias: Some(cb),
+                conv_width,
+                dilation: 1,
+                y: conv_y,
+                ..
+            }) if nodes.iter().any(|&n| {
+                matches!(&trace.nodes[n as usize].op,
+                Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
+            }) =>
+            {
+                use crate::stream::mamba::{Kind as MK, synth as msynth};
+                let refuse_at = |what: &str| refuse(at, format!("ssm.mamba2 {what}"));
+                let mn = nodes
+                    .iter()
+                    .copied()
+                    .find(|&n| {
+                        matches!(&trace.nodes[n as usize].op,
+                        Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
+                    })
+                    .unwrap_or_else(|| unreachable!());
+                let Operation::Ssm(Ssm::Mamba2 {
+                    dt,
+                    z,
+                    a_log,
+                    dt_bias,
+                    d,
+                    norm,
+                    eps,
+                    y,
+                    ..
+                }) = &trace.nodes[mn as usize].op
+                else {
+                    unreachable!()
+                };
+                let (h, g, n, p, inner) = crate::stream::mamba::dims(trace, mn)
+                    .ok_or_else(|| refuse_at("of no inner width"))?;
+                if g == 0 || !h.is_multiple_of(g) || !inner.is_multiple_of(g) {
+                    return Err(refuse_at(&format!("of {h} heads over {g} groups")));
+                }
+                skip.insert(mn);
+                let xc = r.cols(*x);
+                let dtc = r.cols(*dt);
+                for c in [xc, dtc] {
+                    if side_of(sides, c) != Some(Side::Col) {
+                        return Err(refuse_at("reads a value not at the column roots"));
+                    }
+                }
+                // xbc: [x (inner) | B (a group's n each) | C]: q C, k B, v x
+                let q = Cols {
+                    from: xc.from + inner + g * n,
+                    width: g * n,
+                    ..xc
+                };
+                let k = Cols {
+                    from: xc.from + inner,
+                    width: g * n,
+                    ..xc
+                };
+                let v = Cols { width: inner, ..xc };
+                let dth = Cols { width: h, ..dtc };
+                **joint = Some(Joint {
+                    q_heads: h,
+                    kv_heads: h,
+                    head_dim: n,
+                    scale: 1.0,
+                    causal: true,
+                    window: None,
+                    state: Some(StateCol {
+                        b: dth,
+                        a: dth,
+                        conv: *weight,
+                        taps: *conv_width,
+                        a_log: *a_log,
+                        dt: *dt_bias,
+                        k_from: inner,
+                        v_from: 0,
+                        ratio: h / g,
+                        q_from: inner + g * n,
+                        v_dim: p,
+                        mamba: Some(crate::stream::unit::Mamba { d: *d, bias: *cb }),
+                        kda: None,
+                    }),
+                    sink: None,
+                    kv_rep: 1,
+                });
+                steps.push(Step::Store { q, k, v });
+                let raw = msynth(mn, MK::Raw);
+                sides.insert(raw, Side::Col);
+                steps.push(Step::Attend {
+                    out: raw,
+                    round: false,
+                });
+                // the gate, each group's sum of squares and its spread, the norm
+                let zd = r.dtype(*z).unwrap_or(Dtype::Bf16);
+                steps.push(Step::Region {
+                    side: Side::Col,
+                    chain: crate::stream::mamba::gate(mn, *z, zd, inner)
+                        .map_err(|e| refuse(at, e))?,
+                });
+                for kind in [MK::Gated, MK::Squares] {
+                    sides.insert(msynth(mn, kind), Side::Col);
+                }
+                let gw = inner / g;
+                steps.push(Step::Matvec {
+                    node: mn,
+                    from: Side::Col,
+                    input: Cols {
+                        base: msynth(mn, MK::Squares),
+                        from: 0,
+                        width: inner,
+                    },
+                    weight: ValueId(crate::stream::host::UNIT),
+                    view: View::Sum { rep: gw },
+                    output: msynth(mn, MK::Sums),
+                    k: inner,
+                    n: g,
+                    x32: true,
+                    round: false,
+                });
+                sides.insert(msynth(mn, MK::Sums), Side::Row);
+                steps.push(Step::Matvec {
+                    node: mn,
+                    from: Side::Row,
+                    input: Cols {
+                        base: msynth(mn, MK::Sums),
+                        from: 0,
+                        width: g,
+                    },
+                    weight: ValueId(crate::stream::host::UNIT),
+                    view: View::Spread { rep: gw },
+                    output: msynth(mn, MK::Spread),
+                    k: g,
+                    n: inner,
+                    x32: true,
+                    round: false,
+                });
+                sides.insert(msynth(mn, MK::Spread), Side::Col);
+                let wd = r.dtype(*norm).unwrap_or(Dtype::Bf16);
+                let yd = r.dtype(*y).unwrap_or(Dtype::Bf16);
+                steps.push(Step::Region {
+                    side: Side::Col,
+                    chain: crate::stream::mamba::norm(mn, gw, *eps, *norm, wd, *y, yd, inner)
+                        .map_err(|e| refuse(at, e))?,
+                });
+                sides.insert(*y, Side::Col);
+            }
+            Operation::Ssm(Ssm::CausalConv1d {
+                x,
+                weight,
+                bias: None,
+                conv_width,
+                dilation: 1,
+                y: conv_y,
+                ..
+            }) => {
+                let refuse_at = |what: &str| refuse(at, format!("ssm.causal_conv1d {what}"));
+                let find = |pick: &dyn Fn(&Operation) -> bool| {
+                    nodes
+                        .iter()
+                        .copied()
+                        .find(|&n| n > at && pick(&trace.nodes[n as usize].op))
+                };
+                // Kimi's delta attention: a gated delta rule of a decay a key channel
+                if let Some(kn) = find(
+                    &|op| matches!(op, Operation::Ssm(Ssm::Kda { mixed, .. }) if mixed == conv_y),
+                ) {
+                    let Operation::Ssm(Ssm::Kda {
+                        f,
+                        b,
+                        dt_bias,
+                        a_log,
+                        heads,
+                        head_dim,
+                        norm_eps,
+                        gate_floor,
+                        y,
+                        ..
+                    }) = &trace.nodes[kn as usize].op
+                    else {
+                        unreachable!()
+                    };
+                    skip.insert(kn);
+                    let (h, d) = (*heads, *head_dim);
+                    let xc = r.cols(*x);
+                    let bc = r.cols(*b);
+                    for c in [xc, bc] {
+                        if side_of(sides, c) != Some(Side::Col) {
+                            return Err(refuse_at("reads a value not at the column roots"));
+                        }
+                    }
+                    // the forget logits (a low-rank projection's, at the row roots) to the
+                    // column roots: a constant matvec (one where its output is its input)
+                    let mut fc = r.cols(*f);
+                    match side_of(sides, fc) {
+                        Some(Side::Col) => {}
+                        Some(Side::Row) => {
+                            let moved =
+                                crate::stream::mamba::synth(kn, crate::stream::mamba::Kind::Moved);
+                            steps.push(Step::Matvec {
+                                node: kn,
+                                from: Side::Row,
+                                input: fc,
+                                weight: ValueId(crate::stream::host::UNIT),
+                                view: View::Spread { rep: 1 },
+                                output: moved,
+                                k: h * d,
+                                n: h * d,
+                                x32: true,
+                                round: false,
+                            });
+                            sides.insert(moved, Side::Col);
+                            fc = Cols {
+                                base: moved,
+                                from: 0,
+                                width: h * d,
+                            };
+                        }
+                        None => return Err(refuse_at("reads forget logits on no roots")),
+                    }
+                    let q = Cols { width: h * d, ..xc };
+                    let k = Cols {
+                        from: xc.from + h * d,
+                        width: h * d,
+                        ..xc
+                    };
+                    let v = Cols {
+                        from: xc.from + 2 * h * d,
+                        width: h * d,
+                        ..xc
+                    };
+                    **joint = Some(Joint {
+                        q_heads: h,
+                        kv_heads: h,
+                        head_dim: d,
+                        scale: 1.0,
+                        causal: true,
+                        window: None,
+                        state: Some(StateCol {
+                            b: Cols { width: h, ..bc },
+                            a: fc,
+                            conv: *weight,
+                            taps: *conv_width,
+                            a_log: *a_log,
+                            dt: *dt_bias,
+                            k_from: h * d,
+                            v_from: 2 * h * d,
+                            ratio: 1,
+                            q_from: 0,
+                            v_dim: 0,
+                            mamba: None,
+                            kda: Some(Kda {
+                                head_dim: d,
+                                eps: *norm_eps,
+                                floor: *gate_floor,
+                            }),
+                        }),
+                        sink: None,
+                        kv_rep: 1,
+                    });
+                    steps.push(Step::Store { q, k, v });
+                    sides.insert(*y, Side::Col);
+                    steps.push(Step::Attend {
+                        out: *y,
+                        round: r.round(*y),
+                    });
+                    return Ok(true);
+                }
+                let gd = find(&|op| {
+                matches!(op, Operation::Ssm(Ssm::GatedDelta { qkv, .. }) if qkv == conv_y)
+            })
+            .ok_or_else(|| refuse_at("feeds no gated delta rule"))?;
+                let Operation::Ssm(Ssm::GatedDelta {
+                    gates,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    y,
+                    ..
+                }) = &trace.nodes[gd as usize].op
+                else {
+                    unreachable!()
+                };
+                // (a state column a value head; several value heads a key head share its q / k)
+                if k_dim != v_dim || *k_heads == 0 || !v_heads.is_multiple_of(*k_heads) {
+                    return Err(refuse_at(&format!(
+                        "into {k_heads} key heads of {k_dim} beside {v_heads} value heads of \
+                     {v_dim}: a state column a value head, its key head's q / k"
+                    )));
+                }
+                let gn = find(&|op| {
+                matches!(op, Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
+            })
+            .or_else(|| {
+                // (the gates made before the conv)
+                nodes.iter().copied().find(|&n| {
+                    matches!(&trace.nodes[n as usize].op,
+                        Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
+                })
+            })
+            .ok_or_else(|| refuse_at("gated by no gdn_gates"))?;
+                let Operation::Ssm(Ssm::GdnGates {
+                    ba, dt_bias, a_log, ..
+                }) = &trace.nodes[gn as usize].op
+                else {
+                    unreachable!()
+                };
+                skip.extend([gn, gd]);
+                let (h, hk, d) = (*v_heads, *k_heads, *k_dim);
+                let xc = r.cols(*x);
+                let bac = r.cols(*ba);
+                for c in [xc, bac] {
+                    if side_of(sides, c) != Some(Side::Col) {
+                        return Err(refuse_at("reads a value not at the column roots"));
+                    }
+                }
+                let q = Cols {
+                    width: hk * d,
+                    ..xc
+                };
+                let k = Cols {
+                    from: xc.from + hk * d,
+                    width: hk * d,
+                    ..xc
+                };
+                let v = Cols {
+                    from: xc.from + 2 * hk * d,
+                    width: h * d,
+                    ..xc
+                };
+                **joint = Some(Joint {
+                    q_heads: h,
+                    kv_heads: h,
+                    head_dim: d,
+                    scale: 1.0,
+                    causal: true,
+                    window: None,
+                    state: Some(StateCol {
+                        b: Cols { width: h, ..bac },
+                        a: Cols {
+                            from: bac.from + h,
+                            width: h,
+                            ..bac
+                        },
+                        conv: *weight,
+                        taps: *conv_width,
+                        a_log: *a_log,
+                        dt: *dt_bias,
+                        k_from: hk * d,
+                        v_from: 2 * hk * d,
+                        ratio: h / hk,
+                        q_from: 0,
+                        v_dim: 0,
+                        mamba: None,
+                        kda: None,
+                    }),
+                    sink: None,
+                    kv_rep: 1,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*y, Side::Col);
+                steps.push(Step::Attend {
+                    out: *y,
+                    round: r.round(*y),
+                });
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 }
 

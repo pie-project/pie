@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 
-use super::super::{Column, ColumnAsk, Kernel, R, Source};
+use super::super::{Column, ColumnAsk, Kernel, R, Source, UnitKernel};
 use crate::emit::stream::{
     COMMON, Fill, HostArray, buf, cfg_decl, kv_consts, kv_joint, paging, rowp_array, rows_of,
 };
@@ -12,7 +12,8 @@ use crate::floor::Coord;
 use crate::floorplan::stream::KvColumn;
 use crate::stream::build::Program;
 use crate::stream::place::KvSched;
-use crate::stream::unit::Joint;
+use crate::stream::unit::{Joint, Lowering, Side, Step, side_of};
+use poem_ir::{Attn, Def, Operation};
 
 /// Attention on a K / V column.
 pub struct Attention;
@@ -48,8 +49,208 @@ impl Kernel for Attention {
         ]
     }
 
+    fn unit(&self) -> Option<&dyn UnitKernel> {
+        Some(self)
+    }
+
     fn column(&self) -> Option<&dyn Column> {
         Some(self)
+    }
+}
+
+impl UnitKernel for Attention {
+    /// The attention ops: each a row's q / k / v stored, then its query's output back.
+    fn lower(&self, cx: &mut Lowering, at: u32) -> R<bool> {
+        let name = cx.name;
+        let refuse = |at: u32, what: String| format!("{name}: node {at}: {what}");
+        let Lowering {
+            r,
+            nodes,
+            steps,
+            sides,
+            joint,
+            skip,
+            appended,
+            ..
+        } = cx;
+        let r = *r;
+        let nodes: &[u32] = nodes;
+        let trace = r.trace;
+        match &trace.nodes[at as usize].op {
+            Operation::Attn(Attn::Ragged {
+                q,
+                k,
+                v,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                o,
+                ..
+            }) => {
+                let (q, k, v) = (r.cols(*q), r.cols(*k), r.cols(*v));
+                for c in [q, k, v] {
+                    if side_of(sides, c) != Some(Side::Col) {
+                        return Err(refuse(
+                            at,
+                            "attn.ragged reads a q / k / v not at the column roots".into(),
+                        ));
+                    }
+                }
+                **joint = Some(Joint {
+                    q_heads: q.width / head_dim,
+                    kv_heads: *kv_heads,
+                    head_dim: *head_dim,
+                    scale: *sm_scale,
+                    causal: false,
+                    window: None,
+                    state: None,
+                    sink: None,
+                    kv_rep: 1,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*o, Side::Col);
+                steps.push(Step::Attend {
+                    out: *o,
+                    round: r.round(*o),
+                });
+            }
+            // the step's keys and values into the pages its prefill reads: stored with the
+            // row's query when the prefill comes
+            Operation::Attn(Attn::KvAppend {
+                k,
+                v: Some(v),
+                cache,
+                ..
+            }) => {
+                appended.push((*cache, r.cols(*k), r.cols(*v)));
+            }
+            Operation::Attn(Attn::Prefill {
+                q,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                causal,
+                o,
+                ..
+            }) => {
+                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
+                    return Err(refuse(
+                        at,
+                        "attn.prefill reads pages no step of its unit appends".into(),
+                    ));
+                };
+                let q = r.cols(*q);
+                for c in [q, k, v] {
+                    if side_of(sides, c) != Some(Side::Col) {
+                        return Err(refuse(
+                            at,
+                            "attn.prefill reads a q / k / v not at the column roots".into(),
+                        ));
+                    }
+                }
+                **joint = Some(Joint {
+                    q_heads: q.width / head_dim,
+                    kv_heads: *kv_heads,
+                    head_dim: *head_dim,
+                    scale: *sm_scale,
+                    causal: *causal,
+                    window: None,
+                    state: None,
+                    sink: None,
+                    kv_rep: 1,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*o, Side::Col);
+                steps.push(Step::Attend {
+                    out: *o,
+                    round: r.round(*o),
+                });
+            }
+            // a decode step's attention over its layer's cache: the row stored with its query
+            // (at its position), then attending every row stored at or before it
+            Operation::Attn(Attn::Decode {
+                q,
+                plan,
+                cache,
+                head_dim,
+                sm_scale,
+                window,
+                o,
+                lse,
+                ..
+            }) => {
+                // its log-sum-exp read by a sink alone: the sink folded in (the Attend's)
+                let sink = match lse {
+                    None => None,
+                    Some(l) => {
+                        let sn = nodes
+                            .iter()
+                            .copied()
+                            .find(|&n| {
+                                matches!(&trace.nodes[n as usize].op,
+                                Operation::Attn(Attn::Sink { o: so, lse: sl, .. })
+                                    if so == o && sl == l)
+                            })
+                            .ok_or_else(|| {
+                                refuse(at, "attn.decode's log-sum-exp is read by no sink".into())
+                            })?;
+                        let Operation::Attn(Attn::Sink { sink, .. }) = &trace.nodes[sn as usize].op
+                        else {
+                            unreachable!()
+                        };
+                        skip.insert(sn);
+                        Some(*sink)
+                    }
+                };
+                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
+                    return Err(refuse(
+                        at,
+                        "attn.decode reads pages no step of its unit appends".into(),
+                    ));
+                };
+                let kv_heads = match r.def(*plan) {
+                    Some(Def::Op(n)) => match &trace.nodes[*n as usize].op {
+                        Operation::Attn(Attn::PlanDecode { kv_heads, .. }) => *kv_heads,
+                        _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
+                    },
+                    _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
+                };
+                let q = r.cols(*q);
+                for c in [q, k, v] {
+                    if side_of(sides, c) != Some(Side::Col) {
+                        return Err(refuse(
+                            at,
+                            format!(
+                                "attn.decode reads a q / k / v not at the column roots (value \
+                             %{} at {:?})",
+                                c.base.0,
+                                side_of(sides, c)
+                            ),
+                        ));
+                    }
+                }
+                **joint = Some(Joint {
+                    q_heads: q.width / head_dim,
+                    kv_heads,
+                    head_dim: *head_dim,
+                    scale: *sm_scale,
+                    causal: true,
+                    window: *window,
+                    state: None,
+                    sink,
+                    kv_rep: 1,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*o, Side::Col);
+                steps.push(Step::Attend {
+                    out: *o,
+                    round: r.round(*o),
+                });
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 }
 

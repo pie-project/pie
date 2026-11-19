@@ -10,6 +10,7 @@
 //! [`KERNELS`].
 
 pub mod attn;
+pub mod linear;
 pub mod ssm;
 
 use crate::emit::stream::HostArray;
@@ -17,7 +18,7 @@ use crate::floor::Coord;
 use crate::floorplan::stream::KvColumn;
 use crate::stream::build::Program;
 use crate::stream::place::KvSched;
-use crate::stream::unit::{Cols, Joint};
+use crate::stream::unit::{Cols, Joint, Lowering};
 
 type R<T> = Result<T, String>;
 
@@ -32,10 +33,24 @@ pub trait Kernel: Sync {
     fn ops(&self) -> &'static [&'static str];
     /// The CSL op modules it owns (`programs/wafer/ops`), each owned by one kernel.
     fn sources(&self) -> &'static [Source];
+    /// How it lowers its ops into a unit's steps (the unit regime), where it runs there.
+    fn unit(&self) -> Option<&dyn UnitKernel> {
+        None
+    }
     /// Its mixer on a unit's K / V column, where it runs one (the unit regime).
     fn column(&self) -> Option<&dyn Column> {
         None
     }
+}
+
+/// A kernel in the unit regime (stream readings, decode through units): the steps its ops
+/// become in a unit, read node by node (`stream::unit::lower_through` asks the kernel whose op
+/// a node is).
+pub trait UnitKernel: Sync {
+    /// Lowers node `at` (one of its ops) into `cx`'s steps; `Ok(false)` where it runs no step
+    /// for that node as it is (the unit refuses it by name). A pattern over several nodes lowers
+    /// at its first and puts the rest in `cx.skip`.
+    fn lower(&self, cx: &mut Lowering, at: u32) -> R<bool>;
 }
 
 /// What sizes a K / V column's PEs ([`Column::pya`]).
@@ -92,7 +107,11 @@ pub fn column(j: Option<&Joint>) -> R<&'static dyn Column> {
 }
 
 /// Every kernel, in registry order: the order their sources are listed and digested in.
-pub static KERNELS: &[&dyn Kernel] = &[&attn::column::ATTENTION, &ssm::state::STATE];
+pub static KERNELS: &[&dyn Kernel] = &[
+    &attn::column::ATTENTION,
+    &ssm::state::STATE,
+    &linear::moe::MOE,
+];
 
 /// The kernel that implements the poem-ir op `op`, if one does.
 #[must_use]

@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem_compiler::fuse::chain::{self, Chain};
 use poem_ir::{
-    Attn, Def, Dim, Dtype, Gather, InputAxis, Linear, Operands, Operation, RuntimeInput, Ssm,
-    Trace, Ty, ValueId,
+    Attn, Def, Dim, Dtype, Gather, InputAxis, Linear, Operands, Operation, RuntimeInput, Trace, Ty,
+    ValueId,
 };
 
 type R<T> = Result<T, String>;
@@ -323,6 +323,42 @@ pub enum Src {
     Static,
 }
 
+/// A unit's lowering as a kernel's module ([`crate::kernel::UnitKernel`]) sees it while it
+/// lowers a node: the trace read for the unit's class, the unit's nodes, and the steps, sides and
+/// attention made so far.
+pub struct Lowering<'a, 't> {
+    pub r: &'a Reader<'t>,
+    /// The unit's nodes, in trace order.
+    pub nodes: &'a [u32],
+    /// The unit's name (refusals).
+    pub name: &'a str,
+    pub steps: &'a mut Vec<Step>,
+    /// Where each value made (or taken in) is.
+    pub sides: &'a mut BTreeMap<ValueId, Side>,
+    /// The attention (or recurrence) its rows take part in.
+    pub joint: &'a mut Option<Joint>,
+    /// Nodes a pattern lowered past the one it was asked for: no step of their own.
+    pub skip: &'a mut BTreeSet<u32>,
+    /// A routed layer's group, by its first select (`stream::moe`).
+    pub routed: &'a mut BTreeMap<u32, super::moe::Group>,
+    /// The keys and values appended to each cache, stored when its query comes.
+    pub appended: &'a mut Vec<(ValueId, Cols, Cols)>,
+}
+
+impl Lowering<'_, '_> {
+    /// A refusal of node `at`: `what`, the unit's and node's names on it.
+    #[must_use]
+    pub fn refuse(&self, at: u32, what: String) -> String {
+        format!("{}: node {at}: {what}", self.name)
+    }
+}
+
+/// The side the base of `c` is on, if any root has it.
+#[must_use]
+pub fn side_of(sides: &BTreeMap<ValueId, Side>, c: Cols) -> Option<Side> {
+    sides.get(&c.base).copied()
+}
+
 /// A value's copy on the other side of its unit, moved across by an identity matvec (a root
 /// region over values of both sides runs where the row stream is; a column value the row
 /// stream takes on leaves from the rows): its id is the value's with this bit set.
@@ -350,7 +386,7 @@ fn traced(v: ValueId) -> ValueId {
 }
 
 impl Reader<'_> {
-    fn def(&self, v: ValueId) -> Option<&Def> {
+    pub fn def(&self, v: ValueId) -> Option<&Def> {
         self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.def)
     }
 
@@ -501,7 +537,7 @@ impl Reader<'_> {
         }
     }
 
-    fn round(&self, v: ValueId) -> bool {
+    pub fn round(&self, v: ValueId) -> bool {
         matches!(self.dtype(v), Some(Dtype::Bf16 | Dtype::F16))
     }
 }
@@ -624,7 +660,6 @@ pub fn lower_through(
     let mut joint = None;
 
     // which side a base is on; an input entering where it is first read
-    let side_of = |sides: &BTreeMap<ValueId, Side>, c: Cols| sides.get(&c.base).copied();
 
     // the values a node reads that enter the unit
     let enter =
@@ -912,698 +947,26 @@ pub fn lower_through(
                     round: r.round(*y),
                 });
             }
-            Operation::Attn(Attn::Ragged {
-                q,
-                k,
-                v,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                o,
-                ..
-            }) => {
-                let (q, k, v) = (r.cols(*q), r.cols(*k), r.cols(*v));
-                for c in [q, k, v] {
-                    if side_of(&sides, c) != Some(Side::Col) {
-                        return Err(refuse(
-                            at,
-                            "attn.ragged reads a q / k / v not at the column roots".into(),
-                        ));
-                    }
-                }
-                joint = Some(Joint {
-                    q_heads: q.width / head_dim,
-                    kv_heads: *kv_heads,
-                    head_dim: *head_dim,
-                    scale: *sm_scale,
-                    causal: false,
-                    window: None,
-                    state: None,
-                    sink: None,
-                    kv_rep: 1,
-                });
-                steps.push(Step::Store { q, k, v });
-                sides.insert(*o, Side::Col);
-                steps.push(Step::Attend {
-                    out: *o,
-                    round: r.round(*o),
-                });
-            }
-            // the step's keys and values into the pages its prefill reads: stored with the
-            // row's query when the prefill comes
-            Operation::Attn(Attn::KvAppend {
-                k,
-                v: Some(v),
-                cache,
-                ..
-            }) => {
-                appended.push((*cache, r.cols(*k), r.cols(*v)));
-            }
-            Operation::Attn(Attn::Prefill {
-                q,
-                cache,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                causal,
-                o,
-                ..
-            }) => {
-                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
-                    return Err(refuse(
-                        at,
-                        "attn.prefill reads pages no step of its unit appends".into(),
-                    ));
-                };
-                let q = r.cols(*q);
-                for c in [q, k, v] {
-                    if side_of(&sides, c) != Some(Side::Col) {
-                        return Err(refuse(
-                            at,
-                            "attn.prefill reads a q / k / v not at the column roots".into(),
-                        ));
-                    }
-                }
-                joint = Some(Joint {
-                    q_heads: q.width / head_dim,
-                    kv_heads: *kv_heads,
-                    head_dim: *head_dim,
-                    scale: *sm_scale,
-                    causal: *causal,
-                    window: None,
-                    state: None,
-                    sink: None,
-                    kv_rep: 1,
-                });
-                steps.push(Step::Store { q, k, v });
-                sides.insert(*o, Side::Col);
-                steps.push(Step::Attend {
-                    out: *o,
-                    round: r.round(*o),
-                });
-            }
-            // routed experts: their gated sum over every expert ([`super::moe`])
-            // (lowered where its first select comes: its input made by then)
-            Operation::Linear(Linear::MoeRoute { .. }) => {
-                let g = super::moe::group(trace, at, nodes).map_err(|e| refuse(at, e))?;
-                skip.extend(g.nodes[2..].iter().copied());
-                routed.insert(g.nodes[1], g);
-            }
-            Operation::Linear(Linear::MoeSelect { .. }) if routed.contains_key(&at) => {
-                use super::moe::{Kind, synth};
-                let g = routed.remove(&at).unwrap_or_else(|| unreachable!());
-                let at = g.route;
-                let l = r.cols(g.logits);
-                let gs = side_of(&sides, l).ok_or_else(|| {
-                    refuse(at, "linear.moe_route reads logits no root has".into())
-                })?;
-                let (e, ei, h) = (g.experts, g.experts * g.inter, g.hidden);
-                let gate = synth(at, Kind::Gate);
-                steps.push(Step::Region {
-                    side: gs,
-                    chain: super::moe::router(trace, &g).map_err(|e| refuse(at, e))?,
-                });
-                sides.insert(gate, gs);
-                // the experts' columns over the column roots (the most PEs), from the rows: the
-                // gate and the layer's input on the rows, moved there where they are not
-                let (rows, o) = (Side::Row, Side::Col);
-                let to_rows = |steps: &mut Vec<Step>,
-                               sides: &mut BTreeMap<ValueId, Side>,
-                               c: Cols,
-                               from: Side,
-                               kind: Kind,
-                               x32: bool,
-                               round: bool| {
-                    if from == rows {
-                        return c;
-                    }
-                    let moved = synth(at, kind);
-                    steps.push(Step::Matvec {
-                        node: at,
-                        from,
-                        input: c,
-                        weight: ValueId(super::host::UNIT),
-                        view: View::Plain,
-                        output: moved,
-                        k: c.width,
-                        n: c.width,
-                        x32,
-                        round,
-                    });
-                    sides.insert(moved, rows);
-                    Cols {
-                        base: moved,
-                        from: 0,
-                        width: c.width,
-                    }
-                };
-                let gin = to_rows(
-                    &mut steps,
-                    &mut sides,
-                    Cols {
-                        base: gate,
-                        from: 0,
-                        width: e,
-                    },
-                    gs,
-                    Kind::GateRows,
-                    true,
-                    false,
-                );
-                let spread = synth(at, Kind::Spread);
-                steps.push(Step::Matvec {
-                    node: at,
-                    from: rows,
-                    input: gin,
-                    weight: ValueId(super::host::UNIT),
-                    view: View::Spread { rep: g.inter },
-                    output: spread,
-                    k: e,
-                    n: ei,
-                    x32: true,
-                    round: false,
-                });
-                sides.insert(spread, o);
-                let xc = r.cols(g.x);
-                let xs = side_of(&sides, xc).ok_or_else(|| {
-                    refuse(at, "linear.moe_select reads a value no root has".into())
-                })?;
-                let xin = to_rows(
-                    &mut steps,
-                    &mut sides,
-                    xc,
-                    xs,
-                    Kind::Input,
-                    r.dtype(g.x) == Some(Dtype::F32),
-                    r.round(g.x),
-                );
-                let narrow = r.dtype(synth(at, Kind::Gates)).unwrap_or(Dtype::Bf16);
-                // (a non-gated activation's experts: their ups alone)
-                let banks: Vec<(Kind, (ValueId, u32, u32))> = g
-                    .gate
-                    .map(|gt| (Kind::Gates, gt))
-                    .into_iter()
-                    .chain([(Kind::Ups, g.up)])
-                    .collect();
-                for (kind, (bank, stride, off)) in banks {
-                    steps.push(Step::Matvec {
-                        node: at,
-                        from: rows,
-                        input: xin,
-                        weight: bank,
-                        view: View::Rows {
-                            block: g.inter,
-                            stride,
-                            off,
-                        },
-                        output: synth(at, kind),
-                        k: h,
-                        n: ei,
-                        x32: r.dtype(g.x) == Some(Dtype::F32),
-                        round: true,
-                    });
-                    sides.insert(synth(at, kind), o);
-                }
-                steps.push(Step::Region {
-                    side: o,
-                    chain: super::moe::activation(&g, narrow).map_err(|e| refuse(at, e))?,
-                });
-                let acts = synth(at, Kind::Acts);
-                sides.insert(acts, o);
-                steps.push(Step::Matvec {
-                    node: at,
-                    from: o,
-                    input: Cols {
-                        base: acts,
-                        from: 0,
-                        width: ei,
-                    },
-                    weight: g.down,
-                    view: View::Blocks { block: g.inter },
-                    output: g.y,
-                    k: ei,
-                    n: h,
-                    x32: false,
-                    round: r.round(g.y),
-                });
-                sides.insert(g.y, rows);
-            }
-            // a gated delta rule (its conv, its gates, its recurrence): a step's row through
-            // its heads' state columns (P8), the conv's history and the gates at their roots
-            // Mamba-2 (its conv, its scan, its gated group norm): a step's row through its heads'
-            // state columns (P8's MAMBA), the norm as root regions and constant matvecs
-            // (super::mamba)
-            Operation::Ssm(Ssm::CausalConv1d {
-                x,
-                weight,
-                bias: Some(cb),
-                conv_width,
-                dilation: 1,
-                y: conv_y,
-                ..
-            }) if nodes.iter().any(|&n| {
-                matches!(&trace.nodes[n as usize].op,
-                    Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
-            }) =>
-            {
-                use super::mamba::{Kind as MK, synth as msynth};
-                let refuse_at = |what: &str| refuse(at, format!("ssm.mamba2 {what}"));
-                let mn = nodes
-                    .iter()
-                    .copied()
-                    .find(|&n| {
-                        matches!(&trace.nodes[n as usize].op,
-                            Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
-                    })
-                    .unwrap_or_else(|| unreachable!());
-                let Operation::Ssm(Ssm::Mamba2 {
-                    dt,
-                    z,
-                    a_log,
-                    dt_bias,
-                    d,
-                    norm,
-                    eps,
-                    y,
-                    ..
-                }) = &trace.nodes[mn as usize].op
-                else {
-                    unreachable!()
-                };
-                let (h, g, n, p, inner) =
-                    super::mamba::dims(trace, mn).ok_or_else(|| refuse_at("of no inner width"))?;
-                if g == 0 || !h.is_multiple_of(g) || !inner.is_multiple_of(g) {
-                    return Err(refuse_at(&format!("of {h} heads over {g} groups")));
-                }
-                skip.insert(mn);
-                let xc = r.cols(*x);
-                let dtc = r.cols(*dt);
-                for c in [xc, dtc] {
-                    if side_of(&sides, c) != Some(Side::Col) {
-                        return Err(refuse_at("reads a value not at the column roots"));
-                    }
-                }
-                // xbc: [x (inner) | B (a group's n each) | C]: q C, k B, v x
-                let q = Cols {
-                    from: xc.from + inner + g * n,
-                    width: g * n,
-                    ..xc
-                };
-                let k = Cols {
-                    from: xc.from + inner,
-                    width: g * n,
-                    ..xc
-                };
-                let v = Cols { width: inner, ..xc };
-                let dth = Cols { width: h, ..dtc };
-                joint = Some(Joint {
-                    q_heads: h,
-                    kv_heads: h,
-                    head_dim: n,
-                    scale: 1.0,
-                    causal: true,
-                    window: None,
-                    state: Some(State {
-                        b: dth,
-                        a: dth,
-                        conv: *weight,
-                        taps: *conv_width,
-                        a_log: *a_log,
-                        dt: *dt_bias,
-                        k_from: inner,
-                        v_from: 0,
-                        ratio: h / g,
-                        q_from: inner + g * n,
-                        v_dim: p,
-                        mamba: Some(super::unit::Mamba { d: *d, bias: *cb }),
-                        kda: None,
-                    }),
-                    sink: None,
-                    kv_rep: 1,
-                });
-                steps.push(Step::Store { q, k, v });
-                let raw = msynth(mn, MK::Raw);
-                sides.insert(raw, Side::Col);
-                steps.push(Step::Attend {
-                    out: raw,
-                    round: false,
-                });
-                // the gate, each group's sum of squares and its spread, the norm
-                let zd = r.dtype(*z).unwrap_or(Dtype::Bf16);
-                steps.push(Step::Region {
-                    side: Side::Col,
-                    chain: super::mamba::gate(mn, *z, zd, inner).map_err(|e| refuse(at, e))?,
-                });
-                for kind in [MK::Gated, MK::Squares] {
-                    sides.insert(msynth(mn, kind), Side::Col);
-                }
-                let gw = inner / g;
-                steps.push(Step::Matvec {
-                    node: mn,
-                    from: Side::Col,
-                    input: Cols {
-                        base: msynth(mn, MK::Squares),
-                        from: 0,
-                        width: inner,
-                    },
-                    weight: ValueId(super::host::UNIT),
-                    view: View::Sum { rep: gw },
-                    output: msynth(mn, MK::Sums),
-                    k: inner,
-                    n: g,
-                    x32: true,
-                    round: false,
-                });
-                sides.insert(msynth(mn, MK::Sums), Side::Row);
-                steps.push(Step::Matvec {
-                    node: mn,
-                    from: Side::Row,
-                    input: Cols {
-                        base: msynth(mn, MK::Sums),
-                        from: 0,
-                        width: g,
-                    },
-                    weight: ValueId(super::host::UNIT),
-                    view: View::Spread { rep: gw },
-                    output: msynth(mn, MK::Spread),
-                    k: g,
-                    n: inner,
-                    x32: true,
-                    round: false,
-                });
-                sides.insert(msynth(mn, MK::Spread), Side::Col);
-                let wd = r.dtype(*norm).unwrap_or(Dtype::Bf16);
-                let yd = r.dtype(*y).unwrap_or(Dtype::Bf16);
-                steps.push(Step::Region {
-                    side: Side::Col,
-                    chain: super::mamba::norm(mn, gw, *eps, *norm, wd, *y, yd, inner)
-                        .map_err(|e| refuse(at, e))?,
-                });
-                sides.insert(*y, Side::Col);
-            }
-            Operation::Ssm(Ssm::CausalConv1d {
-                x,
-                weight,
-                bias: None,
-                conv_width,
-                dilation: 1,
-                y: conv_y,
-                ..
-            }) => {
-                let refuse_at = |what: &str| refuse(at, format!("ssm.causal_conv1d {what}"));
-                let find = |pick: &dyn Fn(&Operation) -> bool| {
-                    nodes
-                        .iter()
-                        .copied()
-                        .find(|&n| n > at && pick(&trace.nodes[n as usize].op))
-                };
-                // Kimi's delta attention: a gated delta rule of a decay a key channel
-                if let Some(kn) = find(
-                    &|op| matches!(op, Operation::Ssm(Ssm::Kda { mixed, .. }) if mixed == conv_y),
-                ) {
-                    let Operation::Ssm(Ssm::Kda {
-                        f,
-                        b,
-                        dt_bias,
-                        a_log,
-                        heads,
-                        head_dim,
-                        norm_eps,
-                        gate_floor,
-                        y,
-                        ..
-                    }) = &trace.nodes[kn as usize].op
-                    else {
-                        unreachable!()
-                    };
-                    skip.insert(kn);
-                    let (h, d) = (*heads, *head_dim);
-                    let xc = r.cols(*x);
-                    let bc = r.cols(*b);
-                    for c in [xc, bc] {
-                        if side_of(&sides, c) != Some(Side::Col) {
-                            return Err(refuse_at("reads a value not at the column roots"));
-                        }
-                    }
-                    // the forget logits (a low-rank projection's, at the row roots) to the
-                    // column roots: a constant matvec (one where its output is its input)
-                    let mut fc = r.cols(*f);
-                    match side_of(&sides, fc) {
-                        Some(Side::Col) => {}
-                        Some(Side::Row) => {
-                            let moved = super::mamba::synth(kn, super::mamba::Kind::Moved);
-                            steps.push(Step::Matvec {
-                                node: kn,
-                                from: Side::Row,
-                                input: fc,
-                                weight: ValueId(super::host::UNIT),
-                                view: View::Spread { rep: 1 },
-                                output: moved,
-                                k: h * d,
-                                n: h * d,
-                                x32: true,
-                                round: false,
-                            });
-                            sides.insert(moved, Side::Col);
-                            fc = Cols {
-                                base: moved,
-                                from: 0,
-                                width: h * d,
-                            };
-                        }
-                        None => return Err(refuse_at("reads forget logits on no roots")),
-                    }
-                    let q = Cols { width: h * d, ..xc };
-                    let k = Cols {
-                        from: xc.from + h * d,
-                        width: h * d,
-                        ..xc
-                    };
-                    let v = Cols {
-                        from: xc.from + 2 * h * d,
-                        width: h * d,
-                        ..xc
-                    };
-                    joint = Some(Joint {
-                        q_heads: h,
-                        kv_heads: h,
-                        head_dim: d,
-                        scale: 1.0,
-                        causal: true,
-                        window: None,
-                        state: Some(State {
-                            b: Cols { width: h, ..bc },
-                            a: fc,
-                            conv: *weight,
-                            taps: *conv_width,
-                            a_log: *a_log,
-                            dt: *dt_bias,
-                            k_from: h * d,
-                            v_from: 2 * h * d,
-                            ratio: 1,
-                            q_from: 0,
-                            v_dim: 0,
-                            mamba: None,
-                            kda: Some(Kda {
-                                head_dim: d,
-                                eps: *norm_eps,
-                                floor: *gate_floor,
-                            }),
-                        }),
-                        sink: None,
-                        kv_rep: 1,
-                    });
-                    steps.push(Step::Store { q, k, v });
-                    sides.insert(*y, Side::Col);
-                    steps.push(Step::Attend {
-                        out: *y,
-                        round: r.round(*y),
-                    });
-                    i += 1;
-                    continue;
-                }
-                let gd = find(&|op| {
-                    matches!(op, Operation::Ssm(Ssm::GatedDelta { qkv, .. }) if qkv == conv_y)
-                })
-                .ok_or_else(|| refuse_at("feeds no gated delta rule"))?;
-                let Operation::Ssm(Ssm::GatedDelta {
-                    gates,
-                    k_heads,
-                    v_heads,
-                    k_dim,
-                    v_dim,
-                    y,
-                    ..
-                }) = &trace.nodes[gd as usize].op
-                else {
-                    unreachable!()
-                };
-                // (a state column a value head; several value heads a key head share its q / k)
-                if k_dim != v_dim || *k_heads == 0 || !v_heads.is_multiple_of(*k_heads) {
-                    return Err(refuse_at(&format!(
-                        "into {k_heads} key heads of {k_dim} beside {v_heads} value heads of \
-                         {v_dim}: a state column a value head, its key head's q / k"
-                    )));
-                }
-                let gn = find(&|op| {
-                    matches!(op, Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
-                })
-                .or_else(|| {
-                    // (the gates made before the conv)
-                    nodes.iter().copied().find(|&n| {
-                        matches!(&trace.nodes[n as usize].op,
-                            Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
-                    })
-                })
-                .ok_or_else(|| refuse_at("gated by no gdn_gates"))?;
-                let Operation::Ssm(Ssm::GdnGates {
-                    ba, dt_bias, a_log, ..
-                }) = &trace.nodes[gn as usize].op
-                else {
-                    unreachable!()
-                };
-                skip.extend([gn, gd]);
-                let (h, hk, d) = (*v_heads, *k_heads, *k_dim);
-                let xc = r.cols(*x);
-                let bac = r.cols(*ba);
-                for c in [xc, bac] {
-                    if side_of(&sides, c) != Some(Side::Col) {
-                        return Err(refuse_at("reads a value not at the column roots"));
-                    }
-                }
-                let q = Cols {
-                    width: hk * d,
-                    ..xc
-                };
-                let k = Cols {
-                    from: xc.from + hk * d,
-                    width: hk * d,
-                    ..xc
-                };
-                let v = Cols {
-                    from: xc.from + 2 * hk * d,
-                    width: h * d,
-                    ..xc
-                };
-                joint = Some(Joint {
-                    q_heads: h,
-                    kv_heads: h,
-                    head_dim: d,
-                    scale: 1.0,
-                    causal: true,
-                    window: None,
-                    state: Some(State {
-                        b: Cols { width: h, ..bac },
-                        a: Cols {
-                            from: bac.from + h,
-                            width: h,
-                            ..bac
-                        },
-                        conv: *weight,
-                        taps: *conv_width,
-                        a_log: *a_log,
-                        dt: *dt_bias,
-                        k_from: hk * d,
-                        v_from: 2 * hk * d,
-                        ratio: h / hk,
-                        q_from: 0,
-                        v_dim: 0,
-                        mamba: None,
-                        kda: None,
-                    }),
-                    sink: None,
-                    kv_rep: 1,
-                });
-                steps.push(Step::Store { q, k, v });
-                sides.insert(*y, Side::Col);
-                steps.push(Step::Attend {
-                    out: *y,
-                    round: r.round(*y),
-                });
-            }
-            // a decode step's attention over its layer's cache: the row stored with its query
-            // (at its position), then attending every row stored at or before it
-            Operation::Attn(Attn::Decode {
-                q,
-                plan,
-                cache,
-                head_dim,
-                sm_scale,
-                window,
-                o,
-                lse,
-                ..
-            }) => {
-                // its log-sum-exp read by a sink alone: the sink folded in (the Attend's)
-                let sink = match lse {
-                    None => None,
-                    Some(l) => {
-                        let sn = nodes
-                            .iter()
-                            .copied()
-                            .find(|&n| {
-                                matches!(&trace.nodes[n as usize].op,
-                                    Operation::Attn(Attn::Sink { o: so, lse: sl, .. })
-                                        if so == o && sl == l)
-                            })
-                            .ok_or_else(|| {
-                                refuse(at, "attn.decode's log-sum-exp is read by no sink".into())
-                            })?;
-                        let Operation::Attn(Attn::Sink { sink, .. }) = &trace.nodes[sn as usize].op
-                        else {
-                            unreachable!()
-                        };
-                        skip.insert(sn);
-                        Some(*sink)
-                    }
-                };
-                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
-                    return Err(refuse(
-                        at,
-                        "attn.decode reads pages no step of its unit appends".into(),
-                    ));
-                };
-                let kv_heads = match r.def(*plan) {
-                    Some(Def::Op(n)) => match &trace.nodes[*n as usize].op {
-                        Operation::Attn(Attn::PlanDecode { kv_heads, .. }) => *kv_heads,
-                        _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
-                    },
-                    _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
-                };
-                let q = r.cols(*q);
-                for c in [q, k, v] {
-                    if side_of(&sides, c) != Some(Side::Col) {
-                        return Err(refuse(
-                            at,
-                            format!(
-                                "attn.decode reads a q / k / v not at the column roots (value \
-                                 %{} at {:?})",
-                                c.base.0,
-                                side_of(&sides, c)
-                            ),
-                        ));
-                    }
-                }
-                joint = Some(Joint {
-                    q_heads: q.width / head_dim,
-                    kv_heads,
-                    head_dim: *head_dim,
-                    scale: *sm_scale,
-                    causal: true,
-                    window: *window,
-                    state: None,
-                    sink,
-                    kv_rep: 1,
-                });
-                steps.push(Step::Store { q, k, v });
-                sides.insert(*o, Side::Col);
-                steps.push(Step::Attend {
-                    out: *o,
-                    round: r.round(*o),
-                });
-            }
+            // a hand-written kernel's ops: its module lowers them ([`crate::kernel::UnitKernel`])
             op => {
-                return Err(refuse(at, format!("{} has no stream unit step", op.name())));
+                let mut cx = Lowering {
+                    r: &r,
+                    nodes,
+                    name,
+                    steps: &mut steps,
+                    sides: &mut sides,
+                    joint: &mut joint,
+                    skip: &mut skip,
+                    routed: &mut routed,
+                    appended: &mut appended,
+                };
+                let lowered = match crate::kernel::by_op(op.name()).and_then(|k| k.unit()) {
+                    Some(k) => k.lower(&mut cx, at)?,
+                    None => false,
+                };
+                if !lowered {
+                    return Err(refuse(at, format!("{} has no stream unit step", op.name())));
+                }
             }
         }
         i += 1;
