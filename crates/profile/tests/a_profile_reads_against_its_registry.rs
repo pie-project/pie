@@ -949,6 +949,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
             scan_gelems: Some(3000.0),
             hbm_gbps: Some(400.0),
+            cached_gbps: None,
             elementwise_gbps: None,
             launch_ns: None,
             few_row_tflops: None,

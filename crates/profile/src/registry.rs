@@ -1143,6 +1143,7 @@ impl<'a> Walk<'a> {
                 }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
+                "cached_gbps" => &mut rates.cached_gbps,
                 "scan_gelems" => &mut rates.scan_gelems,
                 "few_row_tflops" => &mut rates.few_row_tflops,
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
@@ -1168,7 +1169,7 @@ impl<'a> Walk<'a> {
                         k.span().start,
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
-                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
+                             `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `tile_tflops_by_rows`, `vector_tflops_by_rows`, `submit_worst_ratio` \
                              and `attn_tflops_by_rows_keys`, not `{other}`"

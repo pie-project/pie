@@ -146,12 +146,6 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     library: Option<Arc<crate::guest::session::Library>>,
 
-    /// Each program's stages' step uniforms, made at its first bind and
-    /// shared by every bind after: a round that binds the program afresh
-    /// makes none.
-    #[cfg(feature = "vulkan")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
-
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
 
@@ -193,8 +187,6 @@ impl Plane {
             id: id.0,
         })?;
         self.forms.forget(id);
-        #[cfg(feature = "vulkan")]
-        self.step_args.remove(&id);
         Ok(())
     }
 
@@ -1215,24 +1207,10 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
-            Some(args) => args.clone(),
-            None => {
-                let args = compiled
-                    .all()
-                    .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
-                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
-                args
-            }
-        };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
             compiled.all(),
-            &args,
             &extents,
             &library,
             Arc::clone(&self.kept),
