@@ -104,7 +104,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint klane = local.x;
     uint clane = local.y;
     uint col = group.x * PIE_NLANES + clane;
-    uint m = uint(params.m);
+    // A row of workgroups a PIE_VROWS rows: this one's first and its count.
+    uint row0 = group.y * PIE_VROWS;
+    uint m = min(uint(params.m) - min(row0, uint(params.m)), PIE_VROWS);
     uint n = uint(params.n);
     uint k8 = uint(params.k) / 8u;
     float acc[PIE_VROWS];
@@ -120,7 +122,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint4 w3 = w4[wbase + c + 3u * PIE_KLANES];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
                 if (r < m) {
-                    uint xb = r * k8 + c;
+                    uint xb = (row0 + r) * k8 + c;
                     acc[r] += dot8(x4[xb], w0) + dot8(x4[xb + PIE_KLANES], w1)
                         + dot8(x4[xb + 2u * PIE_KLANES], w2) + dot8(x4[xb + 3u * PIE_KLANES], w3);
                 }
@@ -129,7 +131,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (; c < k8; c += PIE_KLANES) {
             uint4 wv = w4[wbase + c];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-                if (r < m) acc[r] += dot8(x4[r * k8 + c], wv);
+                if (r < m) acc[r] += dot8(x4[(row0 + r) * k8 + c], wv);
             }
         }
     }
@@ -151,7 +153,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     if (klane == 0u && col < n) {
         [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-            if (r < m) slot_put(out_, r * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
+            if (r < m) slot_put(out_, (row0 + r) * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
         }
     }
 }

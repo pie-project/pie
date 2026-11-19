@@ -13,6 +13,8 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
+//! - its vector matmul kernels at each of [`FEW_ROWS`] over the widest
+//!   plane, the most flops over time any reaches, for `few_row_tflops`;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
 //!   longest keys, said beside it), through the kernel a served fire selects
@@ -56,16 +58,23 @@ pub const COPY_BYTES: u64 = 256 << 20;
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
-/// choice on these backends reads them, so a load measures neither.
-pub const KEYS: [&str; 6] = [
+/// `few_row_tflops` is the vector kernels' rate, which the dense matmul's
+/// kernel at each rung is chosen by (`crate::dense`). `workgroups_per_core`
+/// is not weighed here yet: no choice on these backends reads it, so a
+/// load measures none.
+pub const KEYS: [&str; 7] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
+    "few_row_tflops",
 ];
+
+/// The decode-shaped rows `few_row_tflops` is timed at: 4 to 256, the rows
+/// below the matmul curve's first.
+const FEW_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -486,6 +495,29 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
+    // `few_row_tflops`: the vector kernels at decode-shaped rows of the
+    // widest plane. Their time is their launch and the longer of their
+    // weight reads and their flops at that rate, so flops over time reaches
+    // the rate where the weights no longer bind them and stays under it
+    // everywhere: the rate is the most any of the rows reaches.
+    let vector = kernels_slang::linear::gemm::Tactic {
+        vector: true,
+        ..tactics.gemm(tier, 1)
+    };
+    let mut few_row = 0f64;
+    let w = engine::rates::GEMM_WIDTH;
+    for m in FEW_ROWS {
+        let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
+        rig.release();
+        let Some(rate) = dropped(&rig, rate, say)? else {
+            continue;
+        };
+        say(&format!(
+            "[rates]: vector matmul {m}x{w}x{w}: {:.1} TFLOP/s",
+            rate / 1e3
+        ));
+        few_row = few_row.max(rate);
+    }
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -543,7 +575,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         hbm_gbps: Some(bytes_per_ns),
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
-        few_row_tflops: None,
+        few_row_tflops: (few_row > 0.0).then_some(few_row / 1e3),
         workgroups_per_core: None,
     };
     // A rate that settled at nothing is refused by name, never saved or

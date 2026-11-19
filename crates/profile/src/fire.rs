@@ -59,7 +59,8 @@ pub struct Rates {
     /// Dense bf16 matmul TFLOP/s (two flops a multiply-add) at decode-shaped
     /// rows, 4 to 256 (below the first row count `gemm_tflops_by_rows`
     /// times), on the kernel serving picks at those rows (on the slang
-    /// backends the plain tiled `linear_gemm_tiled_bf16`): the rate its
+    /// backends the vector kernels, which a rung takes where the estimate
+    /// weighs them faster): the rate its
     /// compute runs at once its weight reads no longer bound it, its flops
     /// counted over the rows its kernel's tile pads to. A matmul of that few
     /// rows costs `launch_ns + max(bytes / hbm_gbps, padded flops /

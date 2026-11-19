@@ -118,6 +118,7 @@ fn gemm_tactic(coopmat: bool) -> kernels_slang::linear::gemm::Tactic {
         } else {
             kernels_slang::Tier::Baseline
         },
+        vector: false,
     }
 }
 
