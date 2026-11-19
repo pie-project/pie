@@ -4598,7 +4598,7 @@ impl<B: Serve> Shell<B> {
                 self.pools.segments(&self.handles)?,
             );
             if split {
-                run.flush_between_layers();
+                run.flush_between_layers(p.done.as_ref().map(|done| done.at));
             }
             walk(
                 &self.trace,
