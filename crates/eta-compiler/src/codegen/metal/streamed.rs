@@ -1078,7 +1078,14 @@ pub fn emit_streamed_region(
         &alias,
         &consumers,
         &escapes,
-        |v| value_types.get(v as usize).is_some_and(|ty| ty.dtype == eta_ir::Dtype::F32),
+        // Any float the guest wire carries: the fold loads through the
+        // runtime's dtype-aware reads and stores as every streamed op does.
+        |v| {
+            value_types.get(v as usize).is_some_and(|ty| {
+                matches!(ty.dtype, eta_ir::Dtype::F32 | eta_ir::Dtype::F16 | eta_ir::Dtype::Bf16)
+                    && eta_ir::types::to_wire(ty.dtype).is_some()
+            })
+        },
         |v| length_key(value_types, v),
     );
     let folded: BTreeSet<usize> = log_softmax
@@ -1129,8 +1136,9 @@ pub fn emit_streamed_region(
                         len: key_of(chain.x),
                         split: false,
                         two_level: format!(
-                            "    m4_reduce_two_levels({}u, {x}, {s}, temporary, {row_desc}, step.level, m4_group.x, m3_tid, m3_threads, m3_tgbuf, m4_simd_lane, m4_simd_id, reinterpret_cast<const device float*>({m}));\n",
-                            tags::REDUCE_SUM
+                            "    m4_reduce_two_levels({}u, {x}, {s}, temporary, {row_desc}, step.level, m4_group.x, m3_tid, m3_threads, m3_tgbuf, m4_simd_lane, m4_simd_id, {m}, descriptors[{}].dtype);\n",
+                            tags::REDUCE_SUM,
+                            chain.m
                         ),
                     },
                 ));
@@ -1143,15 +1151,15 @@ pub fn emit_streamed_region(
                 let (added_decl, added) = match chain.added {
                     Some(added) => (
                         format!(
-                            " const device float* la = reinterpret_cast<const device float*>({}); const M1ValueDesc la_from = descriptors[{}]; const M1ValueDesc la_to = descriptors[{}];",
+                            " const device uchar* la = {}; const M1ValueDesc la_from = descriptors[{}]; const M1ValueDesc la_to = descriptors[{}];",
                             value_ptr(added.row),
                             added.row,
                             added.spread
                         ),
                         if added.left {
-                            ("la[la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i)] + (", ")")
+                            ("m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype) + (", ")")
                         } else {
-                            ("(", ") + la[la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i)]")
+                            ("(", ") + m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype)")
                         },
                     ),
                     None => (String::new(), ("", "")),
@@ -1163,7 +1171,10 @@ pub fn emit_streamed_region(
                     node_u32,
                     Plan::Generic {
                         text: format!(
-                            "    {{ const device float* lx = reinterpret_cast<const device float*>({x}); const device float* lm = reinterpret_cast<const device float*>({m}); const device float* ls = reinterpret_cast<const device float*>({s});{added_decl} device float* ly = reinterpret_cast<device float*>({y});\n      const uint m4_n_{node} = descriptors[{out}].len; const uint m4_last_{node} = {row_desc}.last;\n      for (uint i = m4_gtid; i < m4_n_{node}; i += m4_gthreads) {{ const uint row = i / m4_last_{node}; ly[i] = {open_add}(lx[i] - lm[row]) - precise::log(ls[row]){close_add}; }} }}\n"
+                            "    {{ const device uchar* lx = {x}; const device uchar* lm = {m}; const device uchar* ls = {s};{added_decl} device uchar* ly = {y};\n      const uint lxd = descriptors[{xv}].dtype, lmd = descriptors[{mv}].dtype, lsd = descriptors[{sv}].dtype;\n      const uint m4_n_{node} = descriptors[{out}].len; const uint m4_last_{node} = {row_desc}.last;\n      uint lrow = 0xFFFFFFFFu; float lmax = 0.0f, llog = 0.0f;\n      for (uint i = m4_gtid; i < m4_n_{node}; i += m4_gthreads) {{ const uint row = i / m4_last_{node}; if (row != lrow) {{ lrow = row; lmax = m1_load_f(lm, row, lmd); llog = precise::log(m1_load_f(ls, row, lsd)); }} m1_store_f(ly, i, {open_add}(m1_load_f(lx, i, lxd) - lmax) - llog{close_add}); }} }}\n",
+                            xv = chain.x,
+                            mv = chain.m,
+                            sv = chain.s
                         ),
                         reads,
                         writes: out,
