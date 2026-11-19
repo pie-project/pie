@@ -360,7 +360,7 @@ pub fn load_capped(
     let device = DeviceBoot {
         max_buffer: Some(max_buffer),
         chunk_bytes: Some(chunk),
-        ..DeviceBoot::default()
+        ..crate::gpu::device_boot()
     };
     let residency = allowed(
         &device,
