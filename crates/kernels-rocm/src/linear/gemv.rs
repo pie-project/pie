@@ -112,6 +112,110 @@ pub(crate) fn skinny_swiglu_bf16(
     skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::Swiglu)
 }
 
+/// `pie::linear::SkinnyNorm`, field for field: the rows a skinny kernel
+/// multiplies normed where it stages them (`x + y` landed in `y_out`, then
+/// the RMS norm by `w`), all null for a plain activation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SkinnyNorm {
+    pub x: u64,
+    pub y: u64,
+    pub w: u64,
+    pub y_out: u64,
+    pub out: u64,
+    pub eps: f32,
+    pub plus_one: i32,
+}
+
+/// `out[m, n] = rmsnorm(x + y) · w[n, k]ᵀ` on the skinny kernel, the norm
+/// computed by every block where it stages the rows (`x + y` landed in
+/// `norm.y_out`, the normed rows in `norm.out`, by the first): one launch
+/// where the norm and the product were two. Under a gated `epilogue` the
+/// bank is a packed `[gate | up]` of 2n rows and `out` the n gated columns. `Ok(false)`, launching nothing, where that does not pay: the
+/// blocks' redundant reads (`grid · m · k` rows of x, y and the norm's
+/// weight) take longer at the device's copy rate than the launch they save
+/// (the profile's measured `[rates]`), or the plan stages no rows in LDS.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn skinny_norm_bf16(
+    ctx: &Ctx,
+    weight: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    norm: SkinnyNorm,
+    epilogue: SkinnyEpilogue,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.skinny";
+    let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
+    if !super::skinny::fits(m, n, k) {
+        return Ok(false);
+    }
+    let plan = skinny_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs() * if gated { 2 } else { 1 },
+        k.unsigned_abs(),
+        gated,
+        ctx.tuning().gemm_skinny_quad_from,
+        ctx.multiprocessors(OP)?,
+    );
+    let staged = m.unsigned_abs() * k.unsigned_abs() * 2;
+    if plan.quad || plan.act_global || staged > SKINNY_LDS {
+        return Ok(false);
+    }
+    let t = ctx.tuning();
+    let redundant = f64::from(plan.grid) * f64::from(m) * f64::from(k) * 3.0 * 2.0;
+    // GB/s is bytes a nanosecond.
+    let folds = t.launch_ns > 0
+        && t.hbm_gbps > 0
+        && redundant / f64::from(t.hbm_gbps) < f64::from(t.launch_ns);
+    told_fold(m, n, k, gated, plan.grid, redundant, t.launch_ns, t.hbm_gbps, folds);
+    if !folds {
+        return Ok(false);
+    }
+    for (address, what) in [
+        (norm.x, "the residual's addend"),
+        (norm.y, "the residual"),
+        (norm.w, "the norm's weight"),
+        (norm.y_out, "the residual's sum"),
+        (norm.out, "the normed rows"),
+        (weight, "the weight"),
+    ] {
+        if address == 0 || !aligned16(address) {
+            return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
+        }
+    }
+    skinny_launch(ctx, weight, 0, out, m, n, k, epilogue, plan, Some(norm))?;
+    Ok(true)
+}
+
+/// The fold's choice for a shape, said once.
+#[allow(clippy::too_many_arguments)]
+fn told_fold(
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+    grid: u32,
+    bytes: f64,
+    launch_ns: u32,
+    gbps: u32,
+    folds: bool,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static TOLD: Mutex<Option<HashSet<(i32, i32, i32, bool, u32)>>> = Mutex::new(None);
+    let mut told = TOLD.lock().expect("told lock poisoned");
+    if told.get_or_insert_with(HashSet::new).insert((m, n, k, gated, grid)) {
+        eprintln!(
+            "kernels-rocm: the norm {} the {m}x{n}x{k} skinny{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
+            if folds { "folds into" } else { "stays apart from" },
+            if gated { " gated" } else { "" },
+            bytes / 1e6
+        );
+    }
+}
+
 /// What the skinny kernel lands of each product: it as is, the gated
 /// activation of a packed `[gate | up]` bank of 2n rows (`n` columns),
 /// `cap · tanh(v / cap)`, or the f32 product unrounded into an f32 plane.
@@ -351,24 +455,49 @@ pub(crate) fn skinny_planned(
             return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
         }
     }
-    let (kernel, block_waves, smem) = skinny_kernel(m, k, epilogue, plan)?;
+    skinny_launch(ctx, weight, act, out, m, n, k, epilogue, plan, None)
+}
+
+/// The skinny kernel's launch, its rows normed where it stages them under
+/// `norm` (`act` then unread).
+#[allow(clippy::too_many_arguments)]
+fn skinny_launch(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+    plan: SkinnyPlan,
+    norm: Option<SkinnyNorm>,
+) -> Result<(), Error> {
+    const OP: &str = "linear.skinny";
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, epilogue, plan, norm.is_some())?;
     let SkinnyPlan { waves, grid, .. } = plan;
     let cap = match epilogue {
         SkinnyEpilogue::Softcap(cap) => cap,
         _ => 0.0,
     };
+    let norm = norm.unwrap_or_default();
+    let mut args = vec![
+        ArgValue::Ptr(weight),
+        ArgValue::Ptr(act),
+        ArgValue::Ptr(out),
+        ArgValue::I32(n),
+        ArgValue::I32(k),
+        ArgValue::I32(waves.min(block_waves) as i32),
+        ArgValue::F32(cap),
+    ];
+    // The whole-product kernel takes no norm.
+    if !plan.quad {
+        args.push(ArgValue::of(&norm));
+    }
     ctx.fire(
         OP,
         Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
-        &[
-            ArgValue::Ptr(weight),
-            ArgValue::Ptr(act),
-            ArgValue::Ptr(out),
-            ArgValue::I32(n),
-            ArgValue::I32(k),
-            ArgValue::I32(waves.min(block_waves) as i32),
-            ArgValue::F32(cap),
-        ],
+        &args,
     )
 }
 
@@ -379,6 +508,7 @@ fn skinny_kernel(
     k: i32,
     epilogue: SkinnyEpilogue,
     plan: SkinnyPlan,
+    normed: bool,
 ) -> Result<(&'static crate::jit::Kernel, u32, u32), Error> {
     const OP: &str = "linear.skinny";
     let (mu, ku) = (m.unsigned_abs(), k.unsigned_abs());
@@ -422,7 +552,7 @@ fn skinny_kernel(
         )
     } else {
         format!(
-            "::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {}, {act_global}>",
+            "::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {}, {act_global}, {normed}>",
             epilogue.code()
         )
     };
@@ -451,7 +581,7 @@ pub(crate) fn skinny_resident_blocks(ctx: &Ctx, m: i32, n: i32, k: i32) -> Resul
         ctx.tuning().gemm_skinny_quad_from,
         ctx.multiprocessors(OP)?,
     );
-    let (kernel, block_waves, smem) = skinny_kernel(m, k, SkinnyEpilogue::Store, plan)?;
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, SkinnyEpilogue::Store, plan, false)?;
     kernel.resident_blocks(64 * block_waves, smem)
 }
 

@@ -36,6 +36,15 @@ pub enum Refused {
         why: String,
     },
 
+    /// A stage whose tables name a value or an op past their own: the
+    /// device reads its descriptors, offsets and op params unchecked, so
+    /// the host refuses such a plan here.
+    Tables {
+        stage: usize,
+
+        why: String,
+    },
+
     /// A value the host writes before the stage's launches or reads after
     /// them that the stage's scratch is not laid to hold for it.
     Scratch {
@@ -67,6 +76,9 @@ impl std::fmt::Display for Refused {
             }
             Self::Lowering { stage, why } => {
                 write!(f, "step call {stage}'s WGSL did not lower: {why}")
+            }
+            Self::Tables { stage, why } => {
+                write!(f, "stage {stage}'s tables name past themselves: {why}")
             }
             Self::Scratch { stage, value, why } => {
                 write!(
@@ -153,6 +165,64 @@ fn scratch_holds_the_hosts_values(package: &LaunchPackage) -> Result<(), Refused
     Ok(())
 }
 
+/// Refuses a stage whose tables would have the device read past them: an
+/// op naming a value at or past the stage's values (an operand, a result,
+/// a pivot's payload), a value of more axes than a descriptor holds, or a
+/// step naming an op past the stage's. The WGSL runtime reads descriptors,
+/// offsets and op params at these indices unchecked: every one is written
+/// by the host, which checks them here, once, at registration.
+pub fn plan_tables_valid(
+    stage: usize,
+    plan: &LaunchStagePlan,
+    steps: &[wgsl::Step],
+) -> Result<(), Refused> {
+    let refused = |why: String| Refused::Tables { stage, why };
+    let values = plan.value_types.len() as u64;
+    if let Some((at, value)) = plan
+        .value_types
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.axes.len() > eta_ir::types::MAX_RANK)
+    {
+        return Err(refused(format!(
+            "value {at} has {} axes, past the {} a descriptor holds",
+            value.axes.len(),
+            eta_ir::types::MAX_RANK
+        )));
+    }
+    for (at, op) in plan.ops.iter().enumerate() {
+        if let Some(&arg) = op.args.iter().find(|&&arg| u64::from(arg) >= values) {
+            return Err(refused(format!(
+                "op {at} reads value {arg}, past the stage's {values}"
+            )));
+        }
+        let end = u64::from(op.result_id) + u64::from(op.result_count);
+        if end > values {
+            return Err(refused(format!(
+                "op {at} writes values {}..{end}, past the stage's {values}",
+                op.result_id
+            )));
+        }
+        if op.tag == eta_ir::op::tags::PIVOT_THRESHOLD && u64::from(op.pred_payload) >= values {
+            return Err(refused(format!(
+                "op {at}'s pivot reads value {}, past the stage's {values}",
+                op.pred_payload
+            )));
+        }
+    }
+    if let Some(step) = steps
+        .iter()
+        .find(|step| step.node as usize >= plan.ops.len())
+    {
+        return Err(refused(format!(
+            "a step names op {}, past the stage's {}",
+            step.node,
+            plan.ops.len()
+        )));
+    }
+    Ok(())
+}
+
 pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwise, Refused> {
     every_op_emits(stage, plan)?;
     wgsl::emit_launch_steps(ENTRY, plan).map_err(|why| Refused::Emitting {
@@ -183,8 +253,10 @@ impl Compiled {
         scratch_holds_the_hosts_values(package)?;
         let mut stages = Vec::with_capacity(package.plans.len());
         for (at, plan) in package.plans.iter().enumerate() {
+            let steps = step_source(at, plan)?.steps;
+            plan_tables_valid(at, plan, &steps)?;
             stages.push(Lowered {
-                steps: step_source(at, plan)?.steps,
+                steps,
                 strides_the_grid: true,
             });
         }
@@ -288,6 +360,55 @@ impl Forms {
 mod tests {
     use super::*;
     use eta_exec::Extents;
+
+    /// A stage of two values and one op, `args` its operands, its result at
+    /// `result`.
+    fn a_stage(args: Vec<u32>, result: u32) -> LaunchStagePlan {
+        use eta_compiler::codegen::launch::{LaunchOp, LaunchPlanValue};
+        LaunchStagePlan {
+            value_types: vec![LaunchPlanValue::default(), LaunchPlanValue::default()],
+            ops: vec![LaunchOp {
+                args,
+                result_id: result,
+                result_count: 1,
+                ..LaunchOp::default()
+            }],
+            ..LaunchStagePlan::default()
+        }
+    }
+
+    fn a_step(node: u32) -> wgsl::Step {
+        wgsl::Step {
+            entry: String::new(),
+            node,
+            call: 0,
+            rung: 0,
+            selector: 0,
+        }
+    }
+
+    #[test]
+    fn a_stage_whose_tables_stay_in_themselves_is_admitted() {
+        assert!(plan_tables_valid(0, &a_stage(vec![0], 1), &[a_step(0)]).is_ok());
+    }
+
+    #[test]
+    fn an_op_naming_a_value_past_its_stage_is_refused_at_registration() {
+        let why = plan_tables_valid(0, &a_stage(vec![5], 1), &[a_step(0)])
+            .expect_err("refused")
+            .to_string();
+        assert!(why.contains("reads value 5"), "{why}");
+        // Its results past the stage's values too.
+        assert!(plan_tables_valid(0, &a_stage(vec![0], 2), &[a_step(0)]).is_err());
+    }
+
+    #[test]
+    fn a_step_naming_an_op_past_its_stage_is_refused_at_registration() {
+        let why = plan_tables_valid(0, &a_stage(vec![0], 1), &[a_step(0), a_step(1)])
+            .expect_err("refused")
+            .to_string();
+        assert!(why.contains("names op 1"), "{why}");
+    }
 
     mod shipped {
         use eta_compiler::codegen::launch::LaunchPackage;

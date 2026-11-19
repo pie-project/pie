@@ -407,11 +407,17 @@ impl Inner {
             return RestoreGate::Serve;
         }
         let stalled = self.fleet_stalled();
+        // Short of runs for its roles: it goes again on runs that stand
+        // free whatever the fleet does (the plan looks, outside this lock);
+        // room is made for it by moving others only once the fleet is
+        // stalled or waits at binds. Waiting for a completion while its
+        // runs stood free, it waited on an event that need not come (Mac
+        // Pro's beam mix: 2 runs of 4 short, 440 such runs free, flat for
+        // 191 s with every thread parked).
         if let Some(need) = roles_short {
-            return if stalled || self.fleet_waits_at_binds() {
-                RestoreGate::Evict((need.run, need.pieces))
-            } else {
-                RestoreGate::Wait
+            return RestoreGate::Evict {
+                need: (need.run, need.pieces),
+                fund: stalled || self.fleet_waits_at_binds(),
             };
         }
         if spare < self.growth_reserve() && !stalled {
@@ -486,7 +492,8 @@ impl Inner {
 pub(super) enum RestoreGate {
     Serve,
     Wait,
-    /// Its role slots are short of `(run, pieces)` runs of whole chunks:
-    /// room is made for it ([`Step::EvictForRoles`](super::plan)).
-    Evict((u32, u32)),
+    /// Its role slots are short of `need`, `(run, pieces)` runs of whole
+    /// chunks: it goes again where they stand free, and (`fund`) room is
+    /// made for it ([`Step::EvictForRoles`](super::plan)).
+    Evict { need: (u32, u32), fund: bool },
 }

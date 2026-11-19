@@ -26,11 +26,13 @@ pub struct Cfg {
     pub value_count: u32,
     pub op_count: u32,
     pub lane: u32,
-    /// Holds the uniform at four words.
-    pub pad: u32,
+    /// The words of the stage's heap, past which the runtime refuses any
+    /// access (its `OUT_OF_BOUNDS` fault).
+    pub heap_words: u32,
+    pub pad: [u32; 4],
 }
 
-const _: () = assert!(size_of::<Cfg>() == 16);
+const _: () = assert!(size_of::<Cfg>() == 32);
 
 pub fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
     let mut out = [0u32; DESC_WORDS];
@@ -52,7 +54,16 @@ pub fn words_le(words: &[u32]) -> Vec<u8> {
 impl Cfg {
     #[must_use]
     pub fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.op_count, self.lane, self.pad])
+        words_le(&[
+            self.value_count,
+            self.op_count,
+            self.lane,
+            self.heap_words,
+            self.pad[0],
+            self.pad[1],
+            self.pad[2],
+            self.pad[3],
+        ])
     }
 }
 
@@ -247,11 +258,14 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
         .chain(&areas)
         .map(|&at| word("value offset", at))
         .collect::<Result<_, _>>()?;
+    // The heap the stage binds, which its runtime bounds every access by.
+    let heap = scratch.total.max(256);
     let config = Cfg {
         value_count: word("value count", plan.value_types.len() as u64)?,
         op_count: word("op count", plan.ops.len() as u64)?,
         lane: 0,
-        pad: 0,
+        heap_words: word("heap words", heap / 4)?,
+        pad: [0; 4],
     };
     Ok(StageTables {
         descriptors,
@@ -262,7 +276,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             sized(config.to_le_bytes(), 3)?,
         ],
         offsets: scratch.values,
-        scratch: scratch.total.max(256),
+        scratch: heap,
     })
 }
 

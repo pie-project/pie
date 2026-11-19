@@ -897,9 +897,10 @@ pub struct Evacuation {
 /// [`ChunkTable`]; host and disk refs name their place. Token runs are
 /// device to device only. The copy is ordered on the engine's stream after
 /// every fire submitted before it and before every fire after it, and
-/// copies among themselves in submission order, so the runtime may reuse a
-/// source slot, or name a destination slot again, as soon as the call
-/// returns.
+/// copies among themselves in submission order, so the runtime may name a
+/// destination slot again as soon as the call returns; it gives a source
+/// slot back only once the copy has read it
+/// ([`crate::Engine::copy_slots_landing`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotCopy {
     pub shape: ShapeId,

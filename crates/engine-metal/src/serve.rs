@@ -2045,8 +2045,21 @@ impl Shell {
 
     /// See `Engine::copy_slots`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if let Some(frame) = self.encode_copy(copy)? {
+            self.grafted = Some(frame.commit_async(None)?);
+        }
+        Ok(())
+    }
+
+    /// `copy` drained behind every frame and encoded (a host copy to or
+    /// from the host tier or the slot files done here); the frame to
+    /// commit, `None` for an empty copy.
+    fn encode_copy(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> Result<Option<Frame>> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.drain()?;
         // Every fold has landed and been told once drained: a record moved
@@ -2061,7 +2074,49 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
-        self.grafted = Some(frame.commit_async(None)?);
+        Ok(Some(frame))
+    }
+
+    /// See `Engine::copy_slots_landing`: whether `copy`'s sources may go
+    /// back now. A copy on the device is encoded into a command buffer the
+    /// device may still be running when this returns: `false`, and
+    /// `landed`'s sink is called with its token from that buffer's
+    /// completion; with no sink installed (the runtime installs it before
+    /// any copy) it is refused by name, before anything is encoded. A move
+    /// to or from the host tier or the slot files is a host copy done here,
+    /// past the drain: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<(engine::LandingSink, u64)>,
+    ) -> Result<bool> {
+        let device = engine::MemoryDomain::MetalShared;
+        if copy.src != device || copy.dst != device {
+            self.copy_slots(copy)?;
+            return Ok(true);
+        }
+        let Some((sink, token)) = landed else {
+            return Err(Fault::Unbound {
+                what: "a copy on the device with no landing sink installed \
+                       (Engine::on_landed comes before any copy_slots_landing)"
+                    .into(),
+            });
+        };
+        let Some(frame) = self.encode_copy(copy)? else {
+            return Ok(true);
+        };
+        // Told once the buffer retires, faulted or not: a faulted copy has
+        // stopped reading its sources too, and its fault reaches the next
+        // drain.
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        Ok(false)
+    }
+
+    /// See `Engine::settle_copies`: the last copy's command buffer retires.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        if let Some(grafted) = self.grafted.take() {
+            grafted.wait()?;
+        }
         Ok(())
     }
 
@@ -2897,7 +2952,13 @@ impl Shell {
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
-        self.fence_instances(&[instance_id])?;
+        // A close goes through whatever its fence met: a frame of the
+        // instance whose buffer failed has let its pass go at that harvest,
+        // and nothing of it is left to wait for.
+        // Each refusal is a harvested frame, so this ends.
+        while let Err(fault) = self.fence_instances(&[instance_id]) {
+            tracing::warn!(instance = %instance_id, %fault, "closing an instance past a failed frame");
+        }
         self.programs.close_instance(instance_id)?;
         Ok(())
     }
@@ -3250,6 +3311,11 @@ impl Shell {
                         other => Err(refused(&other, *instance)),
                     });
                 if let Err(fault) = outcome {
+                    if flight.told.is_none() {
+                        // The handler told this step from the epilogue's
+                        // status words; the full report is here.
+                        tracing::warn!(instance = %instance, %fault, "an attached epilogue did not commit");
+                    }
                     faulted.push((lanes.clone(), *instance, fault.to_string()));
                 }
             }
@@ -3273,6 +3339,22 @@ impl Shell {
         });
         if let Err(fault) = waited {
             self.arms.give(flight.arm);
+            // Nothing the buffer ran committed: each attached instance's
+            // pass is let go, so the instance stands where it stood before
+            // the fire and its next fire stages afresh (an airborne pass
+            // left set refused every later staging and fire of it).
+            for (instance, _) in &flight.attached {
+                self.programs.abandon_launched(*instance);
+            }
+            self.forgotten.remove(&flight.seq);
+            if flight.told.is_none() {
+                // The completion handler told the sink the step was lost:
+                // whoever harvests next (another submit's staging, a close's
+                // fence) is not the frame that failed and is not refused
+                // for it.
+                tracing::warn!(seq = flight.seq, %fault, "a frame's command buffer failed; its step was told lost");
+                return Ok(());
+            }
             return Err(match fault {
                 Fault::Device { call, why } => Fault::Device {
                     call,
@@ -5906,7 +5988,7 @@ impl engine::frame::Shell for Shell {
             for (name, ns, launches) in profile.iter().take(crate::diag::on().kernel_profile.rows())
             {
                 eprintln!(
-                    "  {:>9.1} ms  {:>5} launch(es)  {name}",
+                    "  {:>9.3} ms  {:>5} launch(es)  {name}",
                     *ns as f64 / 1e6,
                     launches
                 );
@@ -5983,18 +6065,40 @@ impl engine::frame::Shell for Shell {
         // One frame in flight: the engine settles inside submit, and the sink
         // has each step's reports before submit returns, told from the
         // harvest on this thread once the buffer completed. More: the
-        // completion handler tells it, unless a program is attached: its
-        // epilogue's verdict is read and committed on this thread, at the
-        // harvest, and the sink hears which lanes faulted from there.
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 || !attached.is_empty() {
+        // completion handler tells it, so a landing never waits on the
+        // lane's next activity. An attached instance's epilogue is read
+        // there from its status words and the commit its harvest will make
+        // (one pass airborne an instance, so nothing commits between); the
+        // harvest commits it on this thread when the runtime publishes the
+        // landed step (`Engine::publish_landed`).
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
             (None, Some(tell))
         } else {
-            (Some(tell), None)
+            let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
+                .iter()
+                .map(|(instance, lanes)| {
+                    (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
+                })
+                .collect();
+            (Some((tell, checks)), None)
         };
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
-            if let Some(tell) = in_handler.as_ref() {
-                tell(refused, &[]);
+            if let Some((tell, checks)) = in_handler.as_ref() {
+                let faulted: Vec<Faulted> = if refused.is_some() {
+                    Vec::new()
+                } else {
+                    checks
+                        .iter()
+                        .filter_map(|(lanes, instance, check)| {
+                            check
+                                .as_ref()
+                                .and_then(crate::program::session::EpilogueCheck::fault)
+                                .map(|why| (lanes.clone(), *instance, why))
+                        })
+                        .collect()
+                };
+                tell(refused, &faulted);
             }
         })));
         let pending = match pending {

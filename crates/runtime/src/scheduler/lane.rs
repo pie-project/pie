@@ -127,7 +127,24 @@ impl LaneCommit {
 /// A step on its way through the engine: the instances it attaches, and
 /// what they name in the roles, read until it lands
 /// ([`crate::store::roles::Roles::reading`]).
-type LandingReads = (Vec<::engine::InstanceId>, Vec<crate::store::roles::Owner>);
+/// A fired step's attachments and what they name in the roles, until its
+/// landing takes them (`None` once landed: steps land in any order).
+type LandingReads = Option<(Vec<::engine::InstanceId>, Vec<crate::store::roles::Owner>)>;
+
+/// Takes step `step` of `frame`'s reads at its landing, and the frame's
+/// entry once every step of it has landed, in whatever order they land.
+fn take_landing(
+    landed: &mut HashMap<::engine::FrameId, Vec<LandingReads>>,
+    frame: ::engine::FrameId,
+    step: usize,
+) -> LandingReads {
+    let steps = landed.get_mut(&frame)?;
+    let taken = steps.get_mut(step).and_then(Option::take);
+    if steps.iter().all(Option::is_none) {
+        landed.remove(&frame);
+    }
+    taken
+}
 
 fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
@@ -590,6 +607,18 @@ impl Lane {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
             engine.on_tapped(crate::offload::stream::sink());
+            // A copy still landing settles its tracked completion here: the
+            // runtime gives its source slots back only then.
+            let landed = broker.clone();
+            engine.on_landed(std::sync::Arc::new(move |token: u64| {
+                landed.notify(token, waker::FIRST_COMPLETION_EPOCH);
+                // The scheduler retires the copy's completion on its next
+                // turn: woken now, not at its idle backstop, so the move
+                // waiting on it commits (and its pages come back) at once.
+                if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
+                    let _ = handle.nudge();
+                }
+            }));
             if engine.settles_asynchronously() {
                 engine.on_complete(std::sync::Arc::new(
                     move |at: engine::StepDone, mut outcome: engine::StepOutcome| {
@@ -710,7 +739,13 @@ impl Lane {
                 LaneRequest::Control { item, reply } => {
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::execute_control(engine_idx, &mut engine, &mut channels, *item)
+                        Self::execute_control(
+                            engine_idx,
+                            &mut engine,
+                            &mut channels,
+                            &broker,
+                            *item,
+                        )
                     }));
                     let panicked = served.is_err();
                     let _ = reply.send(served.unwrap_or(on_panic));
@@ -725,11 +760,13 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (instances, reads) = landed_instances
-                        .get(&frame)
-                        .and_then(|steps| steps.get(step as usize))
-                        .cloned()
-                        .unwrap_or_default();
+                    // Taken, not read: a frame's steps land in any order (an
+                    // engine tells a step with no instance from its device's
+                    // completion, one with instances at a later harvest), and
+                    // each step's reads go back at its own landing.
+                    let (instances, reads) =
+                        take_landing(&mut landed_instances, frame, step as usize)
+                            .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
                         if let Err(error) = engine.publish_landed() {
                             tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
@@ -752,12 +789,7 @@ impl Lane {
                     }
                     tracing::debug!(frame = frame.0, step, "channels pumped out after landing");
                     settlements.settled(frame, step as usize, &outcome, &broker);
-                    if landed_instances
-                        .get(&frame)
-                        .is_some_and(|steps| step as usize + 1 >= steps.len())
-                    {
-                        landed_instances.remove(&frame);
-                    }
+
                 }))
                 .is_err(),
             };
@@ -767,6 +799,15 @@ impl Lane {
                      behind it rather than leaving them in flight"
                 );
                 settlements.close_all(&broker);
+                // No step of the lane's lands now: what they named is read
+                // no more, and goes back as their closes come.
+                if let Some(roles) = roles.get_or_init(|| roles_of(engine_idx)).as_ref() {
+                    let mut roles = roles.lock().unwrap();
+                    for (_, reads) in landed_instances.drain().flat_map(|(_, steps)| steps).flatten()
+                    {
+                        roles.landed(&reads);
+                    }
+                }
                 if let Some(stashed) = stash.take() {
                     fail_request(stashed, "the engine lane is down after a panic");
                 }
@@ -943,7 +984,7 @@ impl Lane {
                         ran.iter()
                             .zip(reads)
                             .map(|(step, reads)| {
-                                (step.attachments.iter().map(|a| a.instance).collect(), reads)
+                                Some((step.attachments.iter().map(|a| a.instance).collect(), reads))
                             })
                             .collect(),
                     );
@@ -1049,6 +1090,7 @@ impl Lane {
         engine_idx: usize,
         engine: &mut Option<EngineBox>,
         channels: &mut ChannelJoin,
+        broker: &crate::engine::CompletionBroker,
         item: QueuedItem,
     ) -> LaneCommit {
         match item {
@@ -1075,13 +1117,8 @@ impl Lane {
                 ..
             } => {
                 let operation = plan.label();
-                let submitted = backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
-                    })
-                });
+                let submitted =
+                    backend(engine).and_then(|engine| copy_settled_on_landing(engine, broker, plan));
                 match submitted {
                     Ok(completion) => LaneCommit::AsyncControl {
                         result: Ok(completion),
@@ -1300,13 +1337,7 @@ impl Lane {
                 }
             }
             QueuedItem::CopyTracked { plan, completion } => {
-                match backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
-                    })
-                }) {
+                match backend(engine).and_then(|engine| copy_settled_on_landing(engine, broker, plan)) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
                         result: Ok(native_completion),
                     },
@@ -1326,6 +1357,7 @@ impl Lane {
                         PoolOp::Rung { from, to } => engine.set_rung(from, to),
                         PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+                        PoolOp::SettleCopies => engine.settle_copies(),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),
                             &mut **engine,
@@ -1401,9 +1433,31 @@ impl Lane {
                         }
                         LaneCommit::CloseInstance { id }
                     }
+                    // The engine refused the close (an instance a failed
+                    // fire left unusable): it is closed all the same, here
+                    // as in the engine's eyes no fire of it can run again,
+                    // so its slots go back once no step on its way names it
+                    // (the roles' reads), and a pair it shares is held by
+                    // it no more. Kept, a failed process's items stayed on
+                    // the device and in its pair for good (Mac Pro's M5:
+                    // pairs of dead processes on the device and the host,
+                    // a 6-chunk bind short with 1850 chunks free).
                     Err(err) => {
-                        tracing::warn!(instance_id = id.0, ?err, "scheduler close_instance failed");
-                        LaneCommit::None
+                        tracing::warn!(
+                            instance_id = id.0,
+                            ?err,
+                            "scheduler close_instance failed; its slots go back all the same"
+                        );
+                        channels.unbind(id);
+                        if let Some(roles) = roles_of(engine_idx) {
+                            roles.lock().unwrap().close_instance(id);
+                        }
+                        if let Some(shared) =
+                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                        {
+                            shared.lock().unwrap().instance_closed(id);
+                        }
+                        LaneCommit::CloseInstance { id }
                     }
                 }
             }
@@ -1560,5 +1614,192 @@ impl Lane {
             table.deregister(wait_id);
             table.free(wait_id);
         }
+    }
+}
+
+/// Runs `plan` on `engine`: its completion settles once the copy has read
+/// its sources, so what waits on it gives them back only then, not while the
+/// copy may still read slots another owner now writes
+/// ([`::engine::Engine::copy_slots_landing`]).
+fn copy_settled_on_landing(
+    engine: &mut EngineBox,
+    broker: &crate::engine::CompletionBroker,
+    plan: PreLaunchCopy,
+) -> anyhow::Result<SubmissionCompletion> {
+    match plan {
+        PreLaunchCopy::Kv(plan) => crate::engine::verbs::settled(engine.copy_kv(&plan)),
+        PreLaunchCopy::State(plan) => crate::engine::verbs::settled(engine.copy_state(&plan)),
+        PreLaunchCopy::Slots(plan) => {
+            let landing = broker.landing_completion(waker::FIRST_COMPLETION_EPOCH);
+            if engine.copy_slots_landing(&plan, landing.wait_id())? {
+                Ok(SubmissionCompletion::ready())
+            } else {
+                Ok(landing)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+
+    /// An engine tells a frame's steps in any order (one with no instance
+    /// from its device's completion, one with instances at a later
+    /// harvest): each step's reads come back at its own landing, the
+    /// frame's entry goes only once every step has landed. Taken by
+    /// position, the last step landing first dropped the frame, and the
+    /// earlier step's reads were never let go (its items never freed).
+    #[test]
+    fn a_frame_s_steps_landing_out_of_order_each_give_their_reads_back() {
+        let frame = ::engine::FrameId(7);
+        let owner = |n: u64| crate::store::roles::Owner::Instance(::engine::InstanceId(n));
+        let mut landed: HashMap<::engine::FrameId, Vec<LandingReads>> = HashMap::new();
+        landed.insert(
+            frame,
+            vec![
+                Some((vec![::engine::InstanceId(1)], vec![owner(1)])),
+                Some((Vec::new(), Vec::new())),
+            ],
+        );
+        assert_eq!(take_landing(&mut landed, frame, 1), Some((Vec::new(), Vec::new())));
+        assert!(landed.contains_key(&frame), "step 0 has not landed");
+        assert_eq!(
+            take_landing(&mut landed, frame, 0),
+            Some((vec![::engine::InstanceId(1)], vec![owner(1)]))
+        );
+        assert!(landed.is_empty(), "every step landed");
+        assert_eq!(take_landing(&mut landed, frame, 0), None, "told once");
+    }
+
+    use ::engine::chunk::{ShapeId, SlotCopy};
+    use ::engine::fire::{FrameSubmission, FrameTicket};
+    use ::engine::load::{LoadRequest, Loaded};
+    use ::engine::transfer::MemoryDomain;
+    use ::engine::{Engine, LandingSink};
+
+    type Told = Arc<std::sync::Mutex<Option<LandingSink>>>;
+
+    /// A tier copy that lands inside the call, or lands only when the test
+    /// says so, through the sink the lane gave it.
+    struct LateCopies {
+        lands_in_call: bool,
+        sink: Told,
+        tokens: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl Engine for LateCopies {
+        fn kind(&self) -> &'static str {
+            "fake-late-copies"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
+            Err(::engine::Error::Load("no model".into()))
+        }
+
+        fn submit(&mut self, _frame: &FrameSubmission) -> ::engine::Result<FrameTicket> {
+            unreachable!("nothing fires here")
+        }
+
+        fn copy_slots(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            self.tokens.lock().unwrap().push(token);
+            Ok(self.lands_in_call)
+        }
+
+        fn on_landed(&mut self, sink: LandingSink) {
+            *self.sink.lock().unwrap() = Some(sink);
+        }
+    }
+
+    fn park() -> PreLaunchCopy {
+        PreLaunchCopy::Slots(SlotCopy {
+            shape: ShapeId(0),
+            src: MemoryDomain::CudaDevice(0),
+            dst: MemoryDomain::HostPinned,
+            slots: vec![(3, 0), (4, 1)],
+            runs: Vec::new(),
+        })
+    }
+
+    /// The engine, the tokens of its copies, and the sink the lane gave it.
+    fn engine(
+        lands_in_call: bool,
+        broker: &crate::engine::CompletionBroker,
+    ) -> (EngineBox, Arc<std::sync::Mutex<Vec<u64>>>, Told) {
+        let tokens: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+        let sink: Told = Arc::default();
+        let mut engine = LateCopies {
+            lands_in_call,
+            sink: Arc::clone(&sink),
+            tokens: Arc::clone(&tokens),
+        };
+        let told = broker.clone();
+        engine.on_landed(Arc::new(move |token| {
+            told.notify(token, waker::FIRST_COMPLETION_EPOCH);
+        }));
+        (Box::new(engine), tokens, sink)
+    }
+
+    /// A park still landing past the call settles only when the engine
+    /// tells it landed: what waits on it (the move's commit, which gives the
+    /// source slots back) waits for the copy to have read them.
+    #[test]
+    fn a_copy_still_landing_settles_only_when_it_has_landed() {
+        let broker = crate::engine::CompletionBroker::new();
+        let (mut late, tokens, sink) = engine(false, &broker);
+        let completion =
+            copy_settled_on_landing(&mut late, &broker, park()).expect("the copy is taken");
+        assert!(
+            !completion.is_settled(),
+            "the source slots stay out while the copy may still read them"
+        );
+        let token = tokens.lock().unwrap()[0];
+        let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
+        assert!(!completion.is_settled());
+        sink(token);
+        assert!(
+            completion.is_settled(),
+            "told landed, the copy's sources may go back"
+        );
+        assert!(completion.check().is_some_and(|settled| settled.is_ok()));
+    }
+
+    /// An engine whose copies land inside the call settles at once, as
+    /// before.
+    #[test]
+    fn a_copy_landed_in_the_call_settles_at_once() {
+        let broker = crate::engine::CompletionBroker::new();
+        let (mut inline, _, _) = engine(true, &broker);
+        let completion =
+            copy_settled_on_landing(&mut inline, &broker, park()).expect("the copy is taken");
+        assert!(completion.is_settled());
     }
 }
