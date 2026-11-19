@@ -1573,7 +1573,8 @@ mod tests {
         }
     }
 
-    /// Shape (2) as a seeded schedule: lanes submit frames in rounds, some
+    /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
+    /// two frames in flight per lane, landings out of order), some
     /// owners then stop submitting because they wait on the planner (their
     /// lanes stay awaited, holding the boundary open), and some owners are
     /// parked (suspended, or waiting at a bind) with a complete frame
@@ -1611,6 +1612,7 @@ mod tests {
             // 0 submitting, 1 waiting on the planner (silent, awaited), 2 parked.
             let mut state = vec![0u8; lanes.len()];
             let mut parked_fires: Vec<u64> = Vec::new();
+            let mut landing_late: Vec<ProcessId> = Vec::new();
             let mut schedule = vec![format!("k={k} lanes={}", lanes.len())];
             let mut failed = None;
             for round in 0..10 {
@@ -1644,7 +1646,9 @@ mod tests {
                         }
                     }
                 }
-                // Plan until it holds; posted fires land at once.
+                // Lanes whose landing came late land now.
+                policy.on_frame_retired(std::mem::take(&mut landing_late));
+                // Plan until it holds; posted fires land (some late).
                 for _ in 0..8 {
                     let ids: QueuedFireIds = queued.iter().copied().collect();
                     match plan(&mut policy, &ids, Instant::now()) {
@@ -1657,7 +1661,12 @@ mod tests {
                             parked_fires.retain(|id| !posted.contains(id));
                             let members: Vec<ProcessId> = lanes.clone();
                             policy.on_frame_posted(members.clone(), Instant::now());
-                            policy.on_frame_retired(members);
+                            // Landings out of order: some lanes retire now,
+                            // the rest with a later frame.
+                            let (now_lanes, later): (Vec<ProcessId>, Vec<ProcessId>) =
+                                members.into_iter().partition(|_| rng.below(3) != 0);
+                            policy.on_frame_retired(now_lanes);
+                            landing_late.extend(later);
                         }
                         _ => break,
                     }

@@ -4542,7 +4542,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut alive = residents.clone();
         for step in 0..8 {
             if step > 0 {
-                match rng.below(5) {
+                match rng.below(6) {
                     // A chunk taken: fragmentation.
                     0 => {
                         let mut free = pool.free.lock();
@@ -4573,6 +4573,29 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                         free.extend(0..count);
                         pool.gives.fetch_add(1, Ordering::Relaxed);
                         schedule.push("compaction carried out".into());
+                    }
+                    // An arrival: a new process admitted, waiting on a grant.
+                    4 => {
+                        let pid = ProcessId::new_v4();
+                        planner.register(pid);
+                        planner.note_admitted(pid);
+                        planner.with_inner(|inner| {
+                            inner.enqueue(
+                                pid,
+                                WaitKind::Allocation {
+                                    demand: Demand {
+                                        kv_pages: 1,
+                                        rs: RsUnits::default(),
+                                    },
+                                    notify: Arc::new(Notify::new()),
+                                    outcome: None,
+                                    yielded: false,
+                                    rise: false,
+                                },
+                            );
+                        });
+                        alive.push(pid);
+                        schedule.push("an arrival".into());
                     }
                     // A resident completes.
                     3 if !alive.is_empty() => {
