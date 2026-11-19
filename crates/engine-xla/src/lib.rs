@@ -19,6 +19,7 @@ pub mod pack;
 pub mod pjrt;
 pub mod program;
 pub mod readout;
+pub mod roll;
 pub mod rows;
 pub mod rs;
 pub mod run;
