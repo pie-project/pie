@@ -635,7 +635,8 @@ __global__ void copy_pages(
 }
 
 // Beam page lists (new-memory/designs/BEAM-PAGE-LISTS.md): one group's step.
-// The group's resident state, u32 words: a header (primed, fires run), its
+// The group's resident state, u32 words: a header (primed, fires run, the
+// pool's pages at the last fire), its
 // lists twice (the fire's and the one before, by the fire count's parity),
 // its free pages, a ring of `frames` pending pages (a page freed by fire t
 // joins the free ones at fire t + frames + 1), and this fire's copies.
@@ -724,6 +725,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
         for (u32 q = threadIdx.x; q < cap; q += blockDim.x)
             free_pages[q] = (q < Q && q >= B && !(q == 0u && tail > 0u)) ? 1u : 0u;
         for (u32 at = threadIdx.x; at < F * cap; at += blockDim.x) free_pages[cap + at] = 0u;
+        if (threadIdx.x == 0u) header[2] = Q;
         for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
             const bool copy = b > 0u && tail > 0u && o > 0u;
             copies[b * 3u + 0u] = 0u;
@@ -743,6 +745,11 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
                 parent_of[b] = p;
             }
         }
+        // The pool grows a column at a time (§3): pages that joined it since
+        // the last fire are free.
+        const u32 grown = header[2] < Q ? header[2] : Q;
+        for (u32 q = grown + threadIdx.x; q < Q; q += blockDim.x)
+            free_pages[q] = (q == 0u && tail > 0u) ? 0u : 1u;
         __syncthreads();
         if (threadIdx.x == 0u) {
             u32 k = 0u;
@@ -871,6 +878,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
     if (threadIdx.x == 0u) {
         header[0] = 1u;
         header[1] = fired + 1u;
+        header[2] = Q;
     }
 }
 

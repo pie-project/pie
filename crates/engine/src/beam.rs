@@ -22,6 +22,8 @@ pub struct State {
     pub frames: u32,
     /// Fires run: 0 until the first primes.
     pub fired: u32,
+    /// The pool's pages at the last fire: it grows a column at a time.
+    pub pool: u32,
     /// `map[b * cap + j]`: the pool page of beam `b`'s column `j`.
     pub map: Vec<u32>,
     pub free: Vec<bool>,
@@ -39,6 +41,7 @@ impl State {
             cap,
             frames,
             fired: 0,
+            pool: 0,
             map: vec![0; (lanes * cap) as usize],
             free: vec![false; cap as usize],
             pending: vec![false; (frames * cap) as usize],
@@ -111,6 +114,10 @@ pub fn step(state: &mut State, parents: &[u32], at: Fire) -> Step {
             }
         }
     } else {
+        // §3: pages that joined the pool since the last fire are free.
+        for q in state.pool.min(q_n)..q_n {
+            state.free[q as usize] = !(q == 0 && tail > 0);
+        }
         // §6.1.
         let parent: Vec<usize> = (0..b_n)
             .map(|b| match parents.get(b) {
@@ -221,6 +228,7 @@ pub fn step(state: &mut State, parents: &[u32], at: Fire) -> Step {
         }
     }
     state.fired += 1;
+    state.pool = q_n;
     Step {
         copies,
         lists,

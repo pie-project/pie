@@ -29,29 +29,28 @@ pub struct BeamGroup {
 }
 
 impl BeamGroup {
-    /// Reserves `ws`'s pool for `beams` beams decoding `steps` fires from
-    /// `folded` frozen slots, the first writing slot `folded`
-    /// (`BEAM-PAGE-LISTS.md` §3): each column's pages, the pages a fire hands
-    /// out, those freed in the fires still in flight, and the prompt's own
-    /// page where it ends mid-page.
+    /// Starts `beams` beams decoding `steps` fires from `folded` frozen
+    /// slots, the first writing slot `folded` (`BEAM-PAGE-LISTS.md` §3): `ws`
+    /// reserves what the first column needs (each beam's page, the pages a
+    /// fire hands out, those freed in the frames in flight, and the prompt's
+    /// own page where it ends mid-page); the runtime grows the reservation a
+    /// column at a time before the fire that opens it.
     pub fn new(ws: &WorkingSet, beams: u32, folded: u32, steps: u32) -> Result<BeamGroup, String> {
         if beams == 0 || steps == 0 {
             return Err("a beam group decodes at least one beam one step".to_string());
         }
         let page = kv_page_size().max(1);
         let f0 = folded / page;
-        let last = folded
+        folded
             .checked_add(steps - 1)
             .ok_or("the beams' slots pass the u32 range")?;
-        let columns = last / page - f0 + 1;
         // The frames the engine keeps in flight: a page freed by a fire is
         // handed out again only that many fires later (§3, §6.3).
         let frames = crate::model::frames_in_flight().max(1);
         let reserve = beams
-            .checked_mul(columns)
-            .and_then(|pages| pages.checked_add(beams))
+            .checked_mul(2)
             .and_then(|pages| pages.checked_add(beams.checked_mul(frames)?))
-            .and_then(|pages| pages.checked_add(u32::from(folded % page > 0)))
+            .and_then(|pages| pages.checked_add(1))
             .ok_or("the beams' pages pass the u32 range")?;
         let end = (f0 + reserve)
             .checked_mul(page)
@@ -96,7 +95,7 @@ impl BeamGroup {
         self.beams
     }
 
-    /// The pages of the reserve the group's pages come from.
+    /// The pool pages the group reserved for its first column.
     #[must_use]
     pub fn reserve(&self) -> u32 {
         self.reserve

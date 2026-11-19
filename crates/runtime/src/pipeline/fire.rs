@@ -3689,19 +3689,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             for (_, lanes) in &groups {
                 let lane = lanes[0];
                 let folded = pass_lanes.places[lane].folded;
-                let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
-                if reserved <= folded {
-                    return Ok(Err(format!(
-                        "pipeline: lane {lane} states its own page list, whose pages lie in \
-                         what `reserve` granted; its working set reserved {reserved} slot(s) \
-                         and froze {folded}. Reserve the pages its lanes may write"
-                    )));
-                }
-                // Only the pool pages the beams can name by this fire are
-                // backed: the step hands out the lowest free pages, so every
-                // page named or pending lies below `B (c + 2) + B F + 1`
-                // (BEAM-PAGE-LISTS.md §3), `c` this fire's column and `F`
-                // the engine's frames in flight.
+                // The beams' pool grows a column at a time (BEAM-PAGE-LISTS.md
+                // §3): before the fire that opens a column the set reserves
+                // what its column needs, waiting like any reservation. The
+                // step hands out the lowest free pages, so every page named or
+                // pending lies below `B (c + 2) + B F + 1`, `c` this fire's
+                // column and `F` the engine's frames in flight.
                 let f0 = u64::from(folded) / page;
                 let last = lanes
                     .iter()
@@ -3712,7 +3705,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let frames = crate::scheduler::configured_dispatch_depth().max(1) as u64;
                 let column = (last / page).saturating_sub(f0);
                 let named = beams * (column + 2) + beams * frames + 1;
-                let end = u64::from(reserved).div_ceil(page).min(f0 + named);
+                let end = f0 + named;
+                let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
+                if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
+                    &pass_lanes.kv[lane],
+                    end_slot,
+                ) {
+                    return Ok(Err(format!(
+                        "pipeline: lane {lane}'s beams' pool cannot grow to its column's {named} \
+                         page(s): {refusal}"
+                    )));
+                }
+                {
+                    let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
+                    cursor.reserved = cursor.reserved.max(end_slot);
+                }
                 reserves.push((f0..end).collect());
             }
             Some(reserves)

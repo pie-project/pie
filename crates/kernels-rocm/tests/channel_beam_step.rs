@@ -68,6 +68,8 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
         let slot = folded + t;
         let c = slot / PAGE - f0;
         let o = slot % PAGE;
+        // The pool grows a column at a time: what this fire's column needs.
+        let pool = (lanes * (c + 2) + lanes * FRAMES + u32::from(folded % PAGE > 0)).min(reserve);
         let parents = rng.parents(lanes);
         let parents_at = gpu.up(&parents);
         let offset_at = gpu.up(&vec![o as i32; lanes as usize]);
@@ -92,7 +94,7 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             faults: faults_at,
             lanes,
             cap,
-            reserve,
+            reserve: pool,
             page: PAGE,
             folded,
             slot,
@@ -100,7 +102,7 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             frames: FRAMES,
             // The pages the engine stages: the lowest-free rule keeps every
             // page the step names below them, or a lane faults.
-            backed: (lanes * (c + 2) + lanes * FRAMES + 1).min(reserve),
+            backed: pool,
             _pad: 0,
         };
         let run_at = gpu.up(&[run]);
@@ -112,7 +114,7 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             Fire {
                 page: PAGE,
                 folded,
-                reserve,
+                reserve: pool,
                 slot,
             },
         );
@@ -120,6 +122,7 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
         let at = format!("lanes {lanes} folded {folded} seed {seed} fire {t}");
         assert_eq!(held[0], 1, "{at}: primed");
         assert_eq!(held[1], replay.fired, "{at}: fires run");
+        assert_eq!(held[2], replay.pool, "{at}: the pool's pages");
         let map = 4 + (replay.fired as usize & 1) * (lanes * cap) as usize;
         for b in 0..lanes as usize {
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
