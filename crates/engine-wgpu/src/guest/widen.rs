@@ -311,7 +311,7 @@ mod tests {
         a.write(64, &bf16(&second)).unwrap();
         b.write(0, &bf16(&third)).unwrap();
         let widen = Widen::new(&device, &[&a, &b], &[&dst], 1, 3).unwrap();
-        let mut frame = device.frame().unwrap();
+        let frame = device.frame().unwrap();
         let rows = [
             Row {
                 src: &a,

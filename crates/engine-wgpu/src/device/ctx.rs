@@ -1190,7 +1190,7 @@ mod tests {
             other => panic!("refused as {other}, not by the bound"),
         };
         let owner = engine_gpu::books::owners::TEST;
-        let held = device.core.books.device();
+        let before = device.core.books.device();
         past(
             Buffer::zeroed(&device, bound + 4, owner)
                 .err()
@@ -1198,6 +1198,7 @@ mod tests {
             "bytes of one device reservation",
             bound,
         );
+        assert_eq!(device.core.books.device(), before, "nothing was reserved");
         // Scratch is stocked at load in chunks no larger than one
         // reservation, and a frame takes no more than its chunk.
         device.core.stock_rings(1);

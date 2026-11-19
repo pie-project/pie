@@ -142,12 +142,12 @@ pub(crate) mod thread {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod channel {
-    pub(crate) use std::sync::mpsc::{SendError, Sender, channel as unbounded};
+    pub(crate) use std::sync::mpsc::{Receiver, SendError, Sender, channel as unbounded};
 }
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod channel {
-    pub(crate) use web_std::channel::{SendError, Sender, unbounded};
+    pub(crate) use web_std::channel::{Receiver, SendError, Sender, unbounded};
 }
 
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
