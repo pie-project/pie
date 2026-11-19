@@ -2828,6 +2828,32 @@ fn working_set_flat_table(
     .map_err(|error| format!("pipeline: KV page translation: {error}"))
 }
 
+/// The slots lane `lane`'s rows may land at where the device places them,
+/// on a set frozen through `folded` that reserved through `reserved`: past
+/// its frozen prefix, inside what `reserve` granted. The engine is handed
+/// the set's whole page table to read through, and refuses a row its
+/// program places outside these ([`::engine::KvDelta::writable`]).
+fn device_writable(
+    lane: usize,
+    folded: u32,
+    reserved: u32,
+) -> Result<std::ops::Range<u32>, String> {
+    if reserved <= folded {
+        return Err(format!(
+            "pipeline: lane {lane}'s rows land where the device says, inside what \
+             `reserve` granted; its working set reserved {reserved} slot(s) and froze \
+             {folded}. Reserve the slots it may write"
+        ));
+    }
+    Ok(folded..reserved)
+}
+
+/// The pages under `writable`, which the fire makes its set's own (copied
+/// where shared) before it runs.
+fn writable_pages(writable: &std::ops::Range<u32>, page: u64) -> std::ops::Range<u64> {
+    u64::from(writable.start) / page..u64::from(writable.end).div_ceil(page)
+}
+
 fn stamp_lane_translation(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -5199,6 +5225,7 @@ async fn fire_device_geometry<C: FireContext>(
         .iter()
         .any(|binding| binding.port == Port::Positions);
     let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
+    let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
     for (_, lanes) in &groups {
         let lane = lanes[0];
         let place = &pass_lanes.places[lane];
@@ -5210,17 +5237,12 @@ async fn fire_device_geometry<C: FireContext>(
             )));
         }
         let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
-        if reserved <= place.folded {
-            return Ok(Err(format!(
-                "pipeline: lane {lane}'s rows land where the device says, inside what \
-                 `reserve` granted; its working set reserved {reserved} slot(s) and froze \
-                 {}. Reserve the slots it may write",
-                place.folded
-            )));
-        }
-        let first = u64::from(place.folded) / page;
-        let end = u64::from(reserved).div_ceil(page);
-        write_indexes.push((first..end).collect());
+        let writable = match device_writable(lane, place.folded, reserved) {
+            Ok(writable) => writable,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        write_indexes.push(writable_pages(&writable, page).collect());
+        write_ends.push(writable.end);
     }
 
     let split = ctx
@@ -5521,7 +5543,7 @@ async fn fire_device_geometry<C: FireContext>(
     let plain_decode =
         !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
-    for (((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated) in
+    for ((((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated), &end) in
         group_sets
             .iter()
             .zip(logged)
@@ -5529,11 +5551,15 @@ async fn fire_device_geometry<C: FireContext>(
             .zip(kvtxns)
             .zip(&groups)
             .zip(&stated)
+            .zip(&write_ends)
     {
-        // Each lane's mask speaks of the slots from the set's boundary on.
+        // Each lane's mask speaks of the slots from the set's boundary on,
+        // and its rows land between it and what `reserve` granted: the
+        // slots of the pages the fire made the set's own.
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.kv.folded = u32::try_from(boundary).unwrap_or(u32::MAX);
+                lane.kv.write_end = end;
             }
         }
         let mut tags = Vec::new();
@@ -9722,5 +9748,43 @@ mod mask_cut_tests {
         // One behind what the lane states moves nothing.
         restate_boundary(&mut lane, 3);
         assert_eq!(lane.kv.folded, 14);
+    }
+}
+
+#[cfg(test)]
+mod writable_tests {
+    use super::*;
+
+    /// A lane whose rows the device places may write from its set's frozen
+    /// prefix to what it reserved, and the pages the fire makes its set's
+    /// own are the ones under those slots: none of the frozen pages below,
+    /// none of the mapped pages past.
+    #[test]
+    fn a_device_placed_lane_writes_only_the_pages_made_its_own() {
+        let writable = device_writable(2, 6, 13).expect("a set that reserved past its prefix");
+        assert_eq!(writable, 6..13);
+        assert_eq!(
+            writable_pages(&writable, 4),
+            1..4,
+            "the page holding slot 6 through 12"
+        );
+        let lane = ::engine::KvDelta {
+            folded: 6,
+            write_end: writable.end,
+            ..::engine::KvDelta::default()
+        };
+        assert_eq!(
+            ::engine::fire::misplaced_write(lane.writable(), &[6, 12]),
+            None
+        );
+        let below = ::engine::fire::misplaced_write(lane.writable(), &[6, 5]).expect("below");
+        assert!(below.contains("kv slot 5"), "{below}");
+        assert!(::engine::fire::misplaced_write(lane.writable(), &[13]).is_some());
+
+        let refused = device_writable(2, 8, 8).expect_err("nothing reserved past the prefix");
+        assert!(
+            refused.contains("lane 2") && refused.contains("froze 8"),
+            "{refused}"
+        );
     }
 }

@@ -1555,7 +1555,17 @@ impl<B: Host> Gpu<B> {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
-        for lane in &submission.lanes {
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            // This load places every row itself (no `slots` port): a lane
+            // whose table is a working set's whole, for its program to
+            // place rows through, would land them in pages not its own.
+            if lane.list == engine::fire::ListKind::Translation {
+                return Err(Error::lane(
+                    u32::try_from(at).unwrap_or(u32::MAX),
+                    "its kv table is a translation its program places rows through, and this \
+                     load resolves no `slots` port: it places no row a program states",
+                ));
+            }
             pages_of.push(
                 lane.tables
                     .iter()

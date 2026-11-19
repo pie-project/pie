@@ -91,6 +91,13 @@ pub enum Fault {
         lane: u32,
     },
 
+    /// A row the lane's program places lands outside the slots the lane may
+    /// write (`engine::fire::misplaced_write`): refused before any of it runs.
+    KvWrite {
+        lane: u32,
+        why: String,
+    },
+
     AdapterWord {
         lane: u32,
         word: u64,
@@ -174,6 +181,7 @@ impl Fault {
             | Self::Maskless { lane, .. }
             | Self::MaskUnread { lane, .. }
             | Self::Adapterless { lane, .. }
+            | Self::KvWrite { lane, .. }
             | Self::AdapterWord { lane, .. } => Some(*lane),
             Self::Fire(error) => error.lane(),
             _ => None,
@@ -290,6 +298,7 @@ impl fmt::Display for Fault {
                  arm this engine applies a mask in, so the mask would be staged and never \
                  read: here `attn.decode`, a selection's and a bias's arms read no per-lane mask"
             ),
+            Self::KvWrite { lane, why } => write!(f, "lane {lane} refused: {why}"),
             Self::Adapterless { lane } => write!(
                 f,
                 "lane {lane} routes to an adapter bank and this load's artifact bakes \

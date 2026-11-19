@@ -1242,6 +1242,13 @@ impl Xla {
                                 .map(|&page| windows.get(page as usize).copied().unwrap_or(0))
                                 .collect::<Vec<u32>>()
                         });
+                        // A row lands only in what the lane may write: below
+                        // its floor is a frozen prefix other sets read, and
+                        // past its reservation is not its own.
+                        if let Some(why) = engine::fire::misplaced_write(lane.kv.writable(), slots)
+                        {
+                            return Err(Error::lane(source as u32, why));
+                        }
                         let writes = (
                             slots
                                 .iter()

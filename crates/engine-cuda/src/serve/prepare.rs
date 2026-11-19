@@ -564,6 +564,15 @@ impl Shell {
                             .collect(),
                     );
                 }
+                // The table is the working set's whole, to read through: a
+                // row lands only in the slots the lane may write.
+                let writable = lanes[source].folded..lanes[source].write_end;
+                if let Some(why) = engine::fire::misplaced_write(writable, slots) {
+                    return Err(Fault::KvWrite {
+                        lane: source as u32,
+                        why,
+                    });
+                }
                 device_writes[source] = Some((
                     slots
                         .iter()

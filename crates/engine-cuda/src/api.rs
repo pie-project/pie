@@ -347,7 +347,9 @@ fn fault(fault: Fault) -> Error {
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
         | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. } | Fault::AdapterWord { .. } | Fault::KvWrite { .. } => {
+            Error::Invalid(fault.to_string())
+        }
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -1739,6 +1741,7 @@ impl Cuda {
                     } else {
                         &[]
                     },
+                    write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),

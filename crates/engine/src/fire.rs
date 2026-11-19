@@ -195,6 +195,39 @@ pub struct KvDelta {
     /// the same `folded` there.
     #[serde(default)]
     pub folded: u32,
+    /// On a lane whose program places its rows ([`ListKind::Translation`]):
+    /// one past the last slot a row of it may land at, what the runtime
+    /// made the lane's own before the fire. Its rows land in
+    /// [`KvDelta::writable`], `[folded, write_end)`; every page of the
+    /// translation outside it may be read by another working set or the
+    /// prefix cache. An engine refuses the lane by name for a row its
+    /// program places outside it ([`misplaced_write`]), never the frame,
+    /// and never writes the row. Not read on a lane whose rows the host
+    /// places.
+    #[serde(default)]
+    pub write_end: u32,
+}
+
+impl KvDelta {
+    /// The slots a lane whose program places its rows may write.
+    #[must_use]
+    pub fn writable(&self) -> Range<u32> {
+        self.folded..self.write_end
+    }
+}
+
+/// Why a lane whose program places its rows at `slots` is refused, where
+/// one lands outside `writable` ([`KvDelta::writable`]): the first such
+/// slot, named. `None`: every row lands in what the lane may write.
+#[must_use]
+pub fn misplaced_write(writable: Range<u32>, slots: &[u32]) -> Option<String> {
+    let &slot = slots.iter().find(|slot| !writable.contains(slot))?;
+    Some(format!(
+        "its program places a row at kv slot {slot}, outside the slots it may write \
+         ({}..{}): below is its frozen prefix, which other working sets may read, and past \
+         is not its own",
+        writable.start, writable.end
+    ))
 }
 
 /// A lane's recurrent-state record, as the runtime states it.
