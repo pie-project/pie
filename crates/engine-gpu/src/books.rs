@@ -71,6 +71,8 @@ pub mod owners {
     pub const INPUTS: Owner = Owner::fire("inputs");
     pub const READOUT: Owner = Owner::fire("readout");
     pub const RS_SCRATCH: Owner = Owner::fire("rs scratch");
+    /// The lagged fold's carried rows' outputs, laid at load.
+    pub const RS_CARRIED: Owner = Owner::fire("rs carried rows");
     pub const SNAPSHOTS: Owner = Owner::fire("snapshot table");
     pub const EXPERT_SEATS: Owner = Owner::fire("expert seats");
     pub const STAGING: Owner = Owner::fire("staging");

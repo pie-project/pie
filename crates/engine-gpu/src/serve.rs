@@ -771,6 +771,8 @@ pub struct Shell<B: Serve> {
     rs_buffers: Option<crate::rs::Buffers>,
 
     rs_scratch: Option<B::Buffer>,
+    /// The lagged fold's decode replay, where the load lays one.
+    rs_lag: Option<std::sync::Arc<crate::rs::Lag>>,
 
     out: Option<ValueId>,
     readouts: Vec<ReadoutPlane>,
@@ -1090,6 +1092,13 @@ impl<B: Serve> Shell<B> {
         // An arm's inputs store for fires of a budget: where each input lies,
         // and its bytes.
         let binding = device.max_buffer();
+        // The lagged fold's lane table, where its replay kernels serve the
+        // load's buffered planes (`crate::rs::Lag`).
+        let lag_ints = if crate::rs::Lag::replays(rs_layout.as_deref()) {
+            kernels_slang::ssm::Lag::entry_ints(crate::rs::Lag::carry_of(boot.runahead))
+        } else {
+            0
+        };
         let lay_inputs = |budget: &poem_compiler::Budget,
                           compiled: &CompiledModel,
                           feeds: &poem_exec::feeds::Feeds,
@@ -1108,6 +1117,7 @@ impl<B: Serve> Shell<B> {
                 voxel_seat,
                 rows.pieces,
                 capture,
+                lag_ints,
                 binding,
             )
         };
@@ -1628,6 +1638,17 @@ impl<B: Serve> Shell<B> {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
 
+        let rs_lag = crate::rs::Lag::lay(
+            &device,
+            &handles,
+            &boot.trace,
+            &compiled,
+            rs_layout.as_ref(),
+            boot.budget.max_lanes,
+            boot.runahead,
+        )?
+        .map(std::sync::Arc::new);
+
         handles.seal();
 
         // A page table a list the kv rows lie in: the kv list's first (the
@@ -1897,6 +1918,7 @@ impl<B: Serve> Shell<B> {
             last_capture: None,
             rs_buffers,
             rs_scratch: None,
+            rs_lag,
             out,
             readouts,
             feeds,
@@ -2922,6 +2944,13 @@ impl<B: Serve> Shell<B> {
         self.rs_layout.is_some()
     }
 
+    /// The most rows a lane carries into a decode step that replays them
+    /// (`crate::rs::Lag`), where the load lays the decode replay.
+    #[must_use]
+    pub fn decode_replay_carry(&self) -> Option<u32> {
+        self.rs_lag.as_ref().map(|lag| lag.carry)
+    }
+
     /// The state rows of the record `record` names (fixed slot refs, a
     /// piece each), read on the host once every frame has landed.
     pub fn state_bytes(&mut self, record: &[u32]) -> Result<Vec<u8>> {
@@ -3564,7 +3593,11 @@ impl<B: Serve> Shell<B> {
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
 
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
-        let mut rs_active = false;
+        // Whether a lane buffers its rows that the decode replay
+        // (`crate::rs::Lag`) does not serve: that fire takes the extended
+        // path, the seat.
+        let mut rs_seat = false;
+        let mut lag_table: Vec<i32> = Vec::new();
 
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
 
@@ -3693,6 +3726,16 @@ impl<B: Serve> Shell<B> {
                 left.push((pieces, fold.left));
             }
             let plan = fold.plan;
+            let lag_serves = match (&self.rs_lag, &self.rs_buffers) {
+                (Some(lag), Some(buffers)) => lag.entry(
+                    &plan,
+                    row.rows,
+                    row.class as usize,
+                    buffers.page_tokens(),
+                    &mut lag_table,
+                )?,
+                _ => false,
+            };
             // A lane of a copy-on-write group that folds nothing reads the
             // run side, which no lane writes this fire (CONTRACT-BC 15).
             let state = match seated.record_run {
@@ -3878,7 +3921,7 @@ impl<B: Serve> Shell<B> {
                         ),
                     ));
                 }
-                rs_active = true;
+                rs_seat |= !lag_serves;
             }
             rs_plans.push(plan);
 
@@ -4151,11 +4194,11 @@ impl<B: Serve> Shell<B> {
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
-        if rs_active {
+        if rs_seat {
             let layout = self
                 .rs_layout
                 .as_ref()
-                .expect("rs_active implies a layout, checked at the lane");
+                .expect("a seat implies a layout, checked at the lane");
             let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
             if self
                 .rs_scratch
@@ -4280,8 +4323,9 @@ impl<B: Serve> Shell<B> {
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
-                rs_replay: rs_active.then_some(rs_replay.as_slice()),
-                rs_commit: rs_active.then_some(rs_commit.as_slice()),
+                rs_replay: rs_seat.then_some(rs_replay.as_slice()),
+                rs_commit: rs_seat.then_some(rs_commit.as_slice()),
+                rs_lag: self.rs_lag.is_some().then_some(lag_table.as_slice()),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
@@ -4480,7 +4524,26 @@ impl<B: Serve> Shell<B> {
             inputs: bound.inputs,
             voxels: bound.voxels,
             capture: bound.capture,
-            rs: if rs_active {
+            rs_lag: match (&self.rs_lag, &self.rs_buffers, bound.rs_lag) {
+                (Some(lag), Some(buffers), Some(table)) => {
+                    // The pool as the fire's state rows bind it: the rs
+                    // pages and the records lie in one chunk pool.
+                    let pool = caches
+                        .0
+                        .iter()
+                        .find_map(|pool| match pool {
+                            crate::run::CachePool::Recurrent(pool) => Some(pool.pool),
+                            crate::run::CachePool::Kv(_) => None,
+                        })
+                        .ok_or_else(|| Fault::Unbound {
+                            what: "the state rows of a load that lays the decode replay"
+                                .to_string(),
+                        })?;
+                    Some(lag.fire(buffers, pool, table)?)
+                }
+                _ => None,
+            },
+            rs: if rs_seat {
                 let (Some(layout), Some(buffers), Some(scratch)) =
                     (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
                 else {

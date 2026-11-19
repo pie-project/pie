@@ -225,6 +225,88 @@ impl<B: Backend> Run<'_, B> {
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
+            // The decode step of a fire whose lanes may carry rows (the
+            // lagged fold, `crate::rs::Lag`): each lane's carried rows are
+            // replayed from the rs buffer ahead of its own, its state kept
+            // as of the rows it folds.
+            Ssm::CausalConv1d {
+                x,
+                weight,
+                state,
+                conv_width,
+                dilation,
+                y,
+                ..
+            } if self
+                .rs_lag()
+                .is_some_and(|lag| lag.lag.layout.out_of.contains_key(&y.0)) =>
+            {
+                const OP: &str = "ssm.causal_conv1d_replay";
+                let lag = self.rs_lag().expect("guarded");
+                conv1d::conv1d_replay(
+                    ctx,
+                    self.slang_of(*x),
+                    self.slang_of(*weight),
+                    &self.state_pool(*state),
+                    &lag.kernel(self.window().span.lane_offset),
+                    &lag.plane(OP, *x)?,
+                    *conv_width,
+                    *dilation,
+                    self.slang_of(*y),
+                    lag.lag.carried_qkv,
+                )
+            }
+            Ssm::GdnGates {
+                ba,
+                dt_bias,
+                a_log,
+                gates,
+            } if self
+                .rs_lag()
+                .is_some_and(|lag| lag.lag.decode_gates.contains(&gates.0)) =>
+            {
+                const OP: &str = "ssm.gdn_gates_replay";
+                let lag = self.rs_lag().expect("guarded");
+                gdn_prep::gdn_prep_replay(
+                    ctx,
+                    self.slang_of(*ba),
+                    self.slang_of(*dt_bias),
+                    self.slang_of(*a_log),
+                    self.slang_of(*gates),
+                    &lag.kernel(self.window().span.lane_offset),
+                    &lag.plane(OP, *ba)?,
+                    lag.lag.carried_gates,
+                )
+            }
+            Ssm::GatedDelta {
+                qkv,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+                ..
+            } if self.rs_lag().is_some() => {
+                let lag = self.rs_lag().expect("guarded");
+                gdn_recurrent::gated_delta_replay(
+                    ctx,
+                    self.tuning().recurrent(),
+                    self.slang_of(*qkv),
+                    self.slang_of(*gates),
+                    &self.state_pool(*state),
+                    &lag.kernel(self.window().span.lane_offset),
+                    lag.lag.carried_qkv,
+                    lag.lag.carried_gates,
+                    lag.lag.work,
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    self.slang_of(*y),
+                )
+            }
             Ssm::CausalConv1d {
                 x,
                 weight,

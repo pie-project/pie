@@ -9,8 +9,8 @@ use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, Out, landed, noise};
 
-const C: usize = 6;
-const W: usize = 4;
+pub(super) const C: usize = 6;
+pub(super) const W: usize = 4;
 const SLOTS: usize = 3;
 
 fn silu(z: f64) -> f64 {
@@ -19,7 +19,7 @@ fn silu(z: f64) -> f64 {
 
 /// Rows `xs` convolved over the history `past` (`hist` rows of `C`): the
 /// outputs, and the history as of row `keep` (unchanged when `keep == 0`).
-fn walk(past: &[f64], xs: &[f64], w: &[f64], dil: usize, keep: usize) -> (Vec<f64>, Vec<f64>) {
+pub(super) fn walk(past: &[f64], xs: &[f64], w: &[f64], dil: usize, keep: usize) -> (Vec<f64>, Vec<f64>) {
     let hist = (W - 1) * dil + 1;
     let span = xs.len() / C;
     let tap = |src: isize, c: usize| {

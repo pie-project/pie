@@ -3,7 +3,7 @@
 
 use dtype::Dtype;
 
-use super::{Committed, StatePool, head_width, requests, rows, window_lanes};
+use super::{Committed, Lag, StatePool, head_width, requests, rows, window_lanes};
 use crate::encode::{
     Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, every, nonzero, refuse, stated,
 };
@@ -16,6 +16,13 @@ const GROUP: u32 = 128;
 
 /// The key width the register-state kernels hold.
 const REGISTER_K: u32 = 128;
+
+/// Whether a head of `k_dim`-wide keys and `v_dim`-wide values holds its
+/// state in a lane's registers: else a scan walks it in memory.
+#[must_use]
+pub const fn holds_in_registers(k_dim: u32, v_dim: u32) -> bool {
+    k_dim == REGISTER_K && v_dim <= GROUP
+}
 
 /// How an engine runs the recurrence on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +94,7 @@ impl Heads {
 
     /// Whether the state fits a lane's registers.
     fn registers(&self) -> bool {
-        self.k_dim == REGISTER_K && self.v_dim <= GROUP
+        holds_in_registers(self.k_dim, self.v_dim)
     }
 
     fn grid(&self, rows: u32) -> Grid {
@@ -262,6 +269,89 @@ pub fn gated_delta_committed(
             &state.piece_args(true),
             &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
             &state.snap_lane0(OP)?,
+        ]
+        .concat(),
+    )
+}
+
+/// The decode step of lanes that carry rows (the lagged fold): each value
+/// head's state loaded once, stepped over its lane's carried rows (their
+/// `[q | k | v]` and gates in `carried_qkv` / `carried_gates`, which the
+/// replaying conv and gates landed) and then its row, and stored once, as
+/// of the lane's kept row. A state walked in memory steps on a copy in
+/// `work` (a lane's); one held in registers needs none.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_replay(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    qkv: Tensor,
+    gates: Tensor,
+    state: &StatePool,
+    lag: &Lag,
+    carried_qkv: Tensor,
+    carried_gates: Tensor,
+    work: Option<Tensor>,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_replay";
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    let lanes = u64::from(lag.table.rows);
+    let carried_rows = lanes * u64::from(lag.carry);
+    if u64::from(carried_qkv.rows) * u64::from(carried_qkv.width) < carried_rows * u64::from(qkv.width)
+        || u64::from(carried_gates.rows) * u64::from(carried_gates.width)
+            < carried_rows * u64::from(gates.width)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the carried rows' inputs take {} rows a lane, past what was laid for them",
+                lag.carry
+            ),
+        ));
+    }
+    let (entry, work) = if heads.registers() {
+        ("ssm_gdn_recurrent_replay_r128_bf16", ctx.absent()?)
+    } else {
+        let need = lanes * u64::from(v_heads) * u64::from(v_dim) * u64::from(k_dim);
+        match work {
+            Some(work) if u64::from(work.rows) * u64::from(work.width) >= need => {
+                ("ssm_gdn_recurrent_replay_bf16", work.arg_mut())
+            }
+            _ => {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "a {k_dim}-wide key head walks its state in memory, on a copy of \
+                         {need} floats this fire laid no room for"
+                    ),
+                ));
+            }
+        }
+    };
+    let [kh, vh, kd, vd] = heads.args(OP)?;
+    let [lane0, carry] = lag.scalars(OP)?;
+    ctx.fire(
+        Fire::at(GDN_RECURRENT, entry)
+            .tier(tactic.tier)
+            .apply(heads.grid(rows(OP, qkv)?)),
+        &[
+            &[
+                qkv.arg(),
+                gates.arg(),
+                state.slots.arg(),
+                lag.table.arg(),
+                carried_qkv.arg(),
+                carried_gates.arg(),
+                work,
+                y.arg_mut(),
+            ][..],
+            &state.piece_args(true),
+            &[kh, vh, kd, vd, lane0, carry],
         ]
         .concat(),
     )

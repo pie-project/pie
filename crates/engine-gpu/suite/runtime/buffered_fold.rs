@@ -445,3 +445,103 @@ fn holds_the_contract(mut m: Model, name: &str) {
     }
     eprintln!("{name}: every claim holds over {} state bytes", folded.len());
 }
+
+/// The lagged fold (`new-memory/designs/lagged-fold.md`): lanes whose state
+/// stays `L` rows behind what they decoded (each decode step buffers its
+/// row and folds the one `L` back, replaying the `L` between from the rs
+/// buffer in the decode step's own kernels) answer the logits a plain
+/// decode answers, step after step for 30 steps, at `L` = 1, 2 and the
+/// bound, three lanes of one fire; and each state is a plain fold of the
+/// rows it took. On SPIR-V every lagged step after the first replays the
+/// decode body its first one recorded.
+#[test]
+fn a_lagged_decode_answers_as_the_fold() {
+    const STEPS: u32 = 30;
+    let Some(mut m) = Model::load("qwen35-tiny") else {
+        return;
+    };
+    let name = "qwen35-tiny";
+    let carry = m
+        .shell
+        .decode_replay_carry()
+        .expect("a gated-delta load lays the decode replay");
+    let fold = RsVerb::Fold;
+    let (fresh, held) = (RsReset::Fresh, RsReset::Held);
+    // A short prompt: a seat's rs run holds the context's pages, and the
+    // whole decode stays buffered behind its base.
+    let prompt = window(11)[..2].to_vec();
+    let k = prompt.len() as u32;
+    let steps: Vec<u32> = (0..STEPS).map(|i| (701 + i * 37) % 256).collect();
+    let reach = k + STEPS;
+
+    m.open(0);
+    m.one(0, &prompt, &fold, fresh, 0);
+    let reference: Vec<Vec<f32>> = (0..STEPS)
+        .map(|i| m.one(0, &steps[i as usize..=i as usize], &fold, held, k + i))
+        .collect();
+
+    let lags = [1u32, 2, carry.min(STEPS - 1)];
+    let seats = [1u32, 2, 3];
+    for &seat in &seats {
+        m.open(seat);
+        m.one(seat, &prompt, &fold, fresh, 0);
+    }
+    m.shell.recorded_serving();
+    m.shell.unkept_serving();
+    for i in 0..STEPS {
+        let verbs: Vec<RsVerb> = lags
+            .iter()
+            .map(|&lag| m.buffer_over(reach, k + i.saturating_sub(lag), u32::from(i >= lag)))
+            .collect();
+        let row = &steps[i as usize..=i as usize];
+        let lanes: Vec<(u32, &[u32], &RsVerb, RsReset, u32)> = seats
+            .iter()
+            .zip(&verbs)
+            .map(|(&seat, verb)| (seat, row, verb, held, k + i))
+            .collect();
+        let got = m.fire(&lanes);
+        for (lane, &lag) in lags.iter().enumerate() {
+            let d = spread(&reference[i as usize], &got[lane]);
+            assert!(
+                d <= LOGIT_FLOOR,
+                "{name}: step {i} at lag {lag} answers {d} from the plain decode"
+            );
+        }
+        if i == 0 && crate::backend::SPIRV {
+            // The first lagged step records the decode body.
+            m.shell.recorded_serving();
+            m.shell.unkept_serving();
+        }
+    }
+    if crate::backend::SPIRV {
+        assert_eq!(
+            (m.shell.recorded_serving(), m.shell.unkept_serving()),
+            (0, 0),
+            "{name}: a lagged decode step recorded again or walked unkept"
+        );
+    }
+    eprintln!("{name}: {STEPS} lagged steps at lags {lags:?} answer as the plain decode");
+
+    // Each state is a plain fold of the rows its lane took.
+    for (&seat, &lag) in seats.iter().zip(&lags) {
+        let took = (STEPS - lag) as usize;
+        let state = m.state(seat);
+        m.open(0);
+        let mut rows = prompt.clone();
+        rows.extend_from_slice(&steps[..took]);
+        m.one(0, &rows, &fold, fresh, 0);
+        let want = m.state(0);
+        m.open(0);
+        m.one(0, &rows[..rows.len() - 1], &fold, fresh, 0);
+        let before = m.state(0);
+        let scale = m
+            .distance(&want, &before, false)
+            .expect("integer planes are not counted");
+        m.assert_same_state(
+            &state,
+            &want,
+            &format!("{name}: lag {lag}, after {STEPS} steps, against a fold of {took}"),
+            scale,
+        );
+    }
+}

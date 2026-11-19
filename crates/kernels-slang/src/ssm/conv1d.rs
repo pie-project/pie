@@ -1,7 +1,7 @@
 //! The causal depthwise conv with its rolling history (`ssm.causal_conv1d`,
 //! its chunked and committed forms), from `kernels/ssm/conv1d.slang`.
 
-use super::{Committed, StatePool, requests, rows, window_lanes};
+use super::{Committed, Lag, RsPlane, StatePool, requests, rows, window_lanes};
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{RaggedTensor, Tensor};
@@ -188,6 +188,68 @@ pub fn conv1d_committed(
                 shape.dilation.arg(),
             ],
             &state.snap_lane0(OP)?,
+        ]
+        .concat(),
+    )
+}
+
+/// The decode step of lanes that carry rows (the lagged fold): each row's
+/// lane's history walked over its carried rows, read from the rs buffer
+/// `plane` (their outputs landed in `carried` for the scan that replays
+/// them), then over the row, which lands in the rs buffer too where the
+/// lane names a row for it; the history is kept as of the lane's kept row.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_replay(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    state: &StatePool,
+    lag: &Lag,
+    plane: &RsPlane,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    carried: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_replay";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_replay_bf16" });
+    let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
+    if plane.pool != state.pool {
+        return Err(refuse(
+            OP,
+            "the rs buffer lies in another pool than the history's, and this conv binds one",
+        ));
+    }
+    plane.holds(OP, x.width)?;
+    if u64::from(carried.rows) * u64::from(carried.width)
+        < u64::from(lag.table.rows) * u64::from(lag.carry) * u64::from(x.width)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the carried rows' outputs take {} rows of {} channels a lane, past the {} \
+                 elements laid for them",
+                lag.carry,
+                x.width,
+                u64::from(carried.rows) * u64::from(carried.width)
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(CONV1D, entry).apply(shape.grid(rows(OP, x)?)),
+        &[
+            &[
+                x.arg(),
+                weight.arg(),
+                state.slots.arg(),
+                lag.table.arg(),
+                y.arg_mut(),
+                carried.arg_mut(),
+            ][..],
+            &state.piece_args(true),
+            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+            &lag.scalars(OP)?,
+            &plane.args(OP)?,
         ]
         .concat(),
     )

@@ -149,6 +149,9 @@ pub struct Handles {
 
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    /// The lagged fold's lane table (`crate::rs::Lag`), where the load
+    /// lays one.
+    pub rs_lag: Option<Tensor>,
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -216,6 +219,9 @@ pub struct Fire<'a> {
 
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    /// The lagged fold's lane table: `kernels_slang::ssm::Lag::entry_ints`
+    /// a lane.
+    pub rs_lag: Option<&'a [i32]>,
 
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
@@ -269,6 +275,9 @@ pub struct Laid {
 
     rs_replay: u64,
     rs_commit: u64,
+    /// The lag table's place and ints a lane (0: the load lays none).
+    rs_lag: u64,
+    lag_ints: u32,
 
     group_of_lane: u64,
     packings: Vec<PackingAt>,
@@ -320,6 +329,7 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
+        lag_ints: u32,
         binding: u64,
     ) -> Laid {
         let pieces = pieces.max(1);
@@ -386,6 +396,7 @@ impl Laid {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let rs_lag = take(lanes * u64::from(lag_ints) * 4);
         let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
@@ -448,6 +459,8 @@ impl Laid {
             mrope,
             rs_replay,
             rs_commit,
+            rs_lag,
+            lag_ints,
             group_of_lane,
             packings,
             seats,
@@ -661,6 +674,27 @@ impl<B: Backend> Inputs<B> {
                 true
             }
             _ => false,
+        };
+
+        let rs_lag = match fire.rs_lag {
+            None => None,
+            Some(table) => {
+                let ints = u64::from(lanes) * u64::from(self.laid.lag_ints);
+                if self.laid.lag_ints == 0 || table.len() as u64 != ints {
+                    return Err(Fault::Ceiling {
+                        what: "lag table ints, an entry a lane",
+                        need: table.len() as u64,
+                        have: ints,
+                    });
+                }
+                self.store.write(self.laid.rs_lag, bytes_of(table))?;
+                Some(Tensor::new(
+                    handles.bind(&self.store, self.laid.rs_lag, ints * 4)?,
+                    lanes,
+                    self.laid.lag_ints,
+                    Dtype::I32,
+                ))
+            }
         };
 
         let adapter_routes = match fire.adapter_routes {
@@ -1039,6 +1073,7 @@ impl<B: Backend> Inputs<B> {
             } else {
                 None
             },
+            rs_lag,
             group_of_lane,
             packings,
             inputs,

@@ -14,15 +14,15 @@ use crate::gpu::{Gpu, Out, landed, noise};
 const SLOTS: usize = 3;
 
 #[derive(Clone, Copy)]
-struct Shape {
-    k_heads: usize,
-    v_heads: usize,
-    dk: usize,
-    dv: usize,
+pub(super) struct Shape {
+    pub(super) k_heads: usize,
+    pub(super) v_heads: usize,
+    pub(super) dk: usize,
+    pub(super) dv: usize,
 }
 
 impl Shape {
-    fn pitch(self) -> usize {
+    pub(super) fn pitch(self) -> usize {
         2 * self.k_heads * self.dk + self.v_heads * self.dv
     }
 
@@ -30,13 +30,13 @@ impl Shape {
         self.dk * self.dv
     }
 
-    fn slab(self) -> usize {
+    pub(super) fn slab(self) -> usize {
         self.v_heads * self.head()
     }
 
     /// Row `t` of `qkv`/`gates` stepped through the slot state `s`, its
     /// output written to `y`.
-    fn token(self, qkv: &[f64], gates: &[f64], t: usize, s: &mut [f64], y: &mut [f64]) {
+    pub(super) fn token(self, qkv: &[f64], gates: &[f64], t: usize, s: &mut [f64], y: &mut [f64]) {
         let keys = self.k_heads * self.dk;
         let row = &qkv[t * self.pitch()..][..self.pitch()];
         for hv in 0..self.v_heads {
@@ -70,7 +70,7 @@ impl Shape {
     }
 }
 
-fn gates_of(seed: u64, rows: usize, v_heads: usize) -> Vec<f32> {
+pub(super) fn gates_of(seed: u64, rows: usize, v_heads: usize) -> Vec<f32> {
     let raw = noise(seed, rows * 2 * v_heads);
     let mut g = vec![0.0; raw.len()];
     for t in 0..rows {
@@ -83,7 +83,7 @@ fn gates_of(seed: u64, rows: usize, v_heads: usize) -> Vec<f32> {
     g
 }
 
-fn f64s(v: &[f32]) -> Vec<f64> {
+pub(super) fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
 }
 

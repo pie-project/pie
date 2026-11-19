@@ -18,6 +18,15 @@
 // state in `work` (a lane's), and the slot takes the state as of row
 // `commit[lane0 + r]`.
 //
+// `PIE_REPLAY` is the decode step of a lane that carries rows
+// (`ssm/conv1d.slang` says how `lag` is laid): row `r` is lane `lane0 + r`'s
+// own row. The head's state is loaded once, stepped over the lane's carried
+// rows (their `[q | k | v]` and gates in `carried_qkv` / `carried_gates`,
+// lane `l`'s row `j` at row `l * carry + j`, as the conv and the gates
+// replaying them landed them; they land no output) and then its own row,
+// and stored once, as of row `keep` of the `L + 1` (none when 0). Walked in
+// memory, the state steps on a copy in `work` (a lane's).
+//
 // `PIE_SNAPS` (with either of the last two): a request's lane also lands
 // the state as of up to `PIE_RS_SNAPSHOTS` rows inside it in records of
 // their own (`prim/pool.slang`, CONTRACT-BC 16).
@@ -28,7 +37,18 @@
 
 #define KMAX 256
 
-#if defined(PIE_COMMITTED)
+#if defined(PIE_REPLAY)
+[[vk::binding(0)]] StructuredBuffer<uint> qkv;
+[[vk::binding(1)]] StructuredBuffer<float> gates;
+[[vk::binding(2)]] StructuredBuffer<uint> slots;
+[[vk::binding(3)]] StructuredBuffer<int> lag;
+[[vk::binding(4)]] StructuredBuffer<uint> carried_qkv;
+[[vk::binding(5)]] StructuredBuffer<float> carried_gates;
+[[vk::binding(6)]] RWStructuredBuffer<float> work;
+[[vk::binding(7)]] RWStructuredBuffer<float> y;
+#define SEGMENTS_AT 8
+#define STATE work
+#elif defined(PIE_COMMITTED)
 [[vk::binding(0)]] StructuredBuffer<uint> qkv;
 [[vk::binding(1)]] StructuredBuffer<int> indptr;
 [[vk::binding(2)]] StructuredBuffer<int> replay;
@@ -83,6 +103,10 @@ struct Params {
     int v_heads;
     int k_dim;
     int v_dim;
+#if defined(PIE_REPLAY)
+    int lane0;
+    uint carry;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
@@ -102,6 +126,21 @@ uint state_at(uint at, uint hv, uint head) {
     return pie_state_atom(at, hv, head);
 }
 
+// A token's `[q | k | v]` element and gate: the fire's own row, or, under
+// `PIE_REPLAY` while `from_carried`, a carried row's.
+#if defined(PIE_REPLAY)
+static bool from_carried = false;
+float qkv_get(uint i) {
+    return from_carried ? bf16_at(carried_qkv, i) : bf16_at(qkv, i);
+}
+float gate_get(uint i) {
+    return from_carried ? carried_gates[i] : gates[i];
+}
+#else
+#define qkv_get(i_) bf16_at(qkv, i_)
+#define gate_get(i_) gates[i_]
+#endif
+
 groupshared float sq[KMAX];
 groupshared float sk[KMAX];
 groupshared int gdn_lo;
@@ -110,6 +149,13 @@ groupshared int gdn_keep;
 
 #if defined(PIE_DK_REG)
 static float st[PIE_DK_REG];
+#endif
+
+// A token's output: none for a carried row.
+#if defined(PIE_REPLAY)
+#define Y_PUT(at_, v_) if (!from_carried) { y[at_] = v_; }
+#else
+#define Y_PUT(at_, v_) y[at_] = v_;
 #endif
 
 // Token `t` of value head `hv` (key head `hk`), its state at `state_base`.
@@ -126,8 +172,8 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
     float qsum = 0.0;
     float ksum = 0.0;
     for (uint i = tid; i < dk; i += uint(PIE_GROUP_X)) {
-        float qv = bf16_at(qkv, qbase + i);
-        float kv = bf16_at(qkv, kbase + i);
+        float qv = qkv_get(qbase + i);
+        float kv = qkv_get(kbase + i);
         sq[i] = qv;
         sk[i] = kv;
         qsum += qv * qv;
@@ -145,8 +191,8 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
     GroupMemoryBarrierWithGroupSync();
 
     uint fused = t * 2u * uint(params.v_heads) + hv;
-    float decay = exp(gates[fused]);
-    float beta = gates[fused + uint(params.v_heads)];
+    float decay = exp(gate_get(fused));
+    float beta = gate_get(fused + uint(params.v_heads));
     uint out = (t * uint(params.v_heads) + hv) * dv;
 #if defined(PIE_DK_REG)
     if (tid < dv) {
@@ -155,13 +201,13 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
             st[i] *= decay;
             kv_mem += st[i] * sk[i];
         }
-        float delta = (bf16_at(qkv, vbase + tid) - kv_mem) * beta;
+        float delta = (qkv_get(vbase + tid) - kv_mem) * beta;
         float acc = 0.0;
         [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
             st[i] += sk[i] * delta;
             acc += st[i] * sq[i];
         }
-        y[out + tid] = acc;
+        Y_PUT(out + tid, acc);
     }
 #else
     for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
@@ -172,14 +218,14 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
             STATE[cell + i] = s;
             kv_mem += s * sk[i];
         }
-        float delta = (bf16_at(qkv, vbase + c) - kv_mem) * beta;
+        float delta = (qkv_get(vbase + c) - kv_mem) * beta;
         float acc = 0.0;
         for (uint i = 0; i < dk; i++) {
             float s = STATE[cell + i] + sk[i] * delta;
             STATE[cell + i] = s;
             acc += s * sq[i];
         }
-        y[out + c] = acc;
+        Y_PUT(out + c, acc);
     }
 #endif
     GroupMemoryBarrierWithGroupSync();
@@ -256,7 +302,56 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 #endif
     uint r = group.z;
-#if defined(PIE_COMMITTED)
+#if defined(PIE_REPLAY)
+    uint lane = uint(params.lane0) + r;
+    uint entry = lane * (3u + params.carry);
+    if (tid == 0u) {
+        gdn_lo = lag[entry];
+        gdn_keep = lag[entry + 1u];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // Read uniformly: they bound the token loop.
+    int carries = workgroupUniformLoad(gdn_lo);
+    int keep = workgroupUniformLoad(gdn_keep);
+    uint bank = state_at(r, hv, head);
+#if defined(PIE_DK_REG)
+    reg_load(tid, bank);
+    for (int s = 0; s <= carries; s++) {
+        from_carried = s < carries;
+        token(tid, from_carried ? lane * params.carry + uint(s) : r, hv, hk, 0u);
+        if (s + 1 == keep) {
+            reg_store(tid, bank);
+        }
+    }
+#else
+    uint state_base = (lane * uint(params.v_heads) + hv) * head;
+    for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
+        uint seg, at;
+        pie_pool_find(params.state_origin + bank + c * dk, seg, at);
+#define GDN_REPLAY_LOAD(buf_) \
+        for (uint i = 0; i < dk; i++) { \
+            work[state_base + c * dk + i] = buf_[at + i]; \
+        }
+        PIE_POOL_BRANCH(seg, GDN_REPLAY_LOAD)
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (int s = 0; s <= carries; s++) {
+        from_carried = s < carries;
+        token(tid, from_carried ? lane * params.carry + uint(s) : r, hv, hk, state_base);
+        if (s + 1 == keep) {
+            for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
+                uint seg, at;
+                pie_pool_find(params.state_origin + bank + c * dk, seg, at);
+#define GDN_REPLAY_STORE(buf_) \
+                for (uint i = 0; i < dk; i++) { \
+                    buf_[at + i] = work[state_base + c * dk + i]; \
+                }
+                PIE_POOL_BRANCH(seg, GDN_REPLAY_STORE)
+            }
+        }
+    }
+#endif
+#elif defined(PIE_COMMITTED)
     uint lane = uint(params.lane0) + r;
     if (tid == 0u) {
         int begin = indptr[r];
@@ -395,6 +490,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate ssm_gdn_recurrent_r128_bf16 PIE_GROUP_X=128 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_gdn_recurrent_chunked_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_gdn_recurrent_committed_r128_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_replay_bf16 PIE_GROUP_X=128 PIE_REPLAY=1
+// pie:instantiate ssm_gdn_recurrent_replay_r128_bf16 PIE_GROUP_X=128 PIE_REPLAY=1 PIE_DK_REG=128
+// pie:instantiate ssm_gdn_recurrent_replay_bf16 PIE_GROUP_X=128 PIE_REPLAY=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_replay_r128_bf16 PIE_GROUP_X=128 PIE_REPLAY=1 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_gdn_recurrent_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1
 // pie:instantiate ssm_gdn_recurrent_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1
 // pie:instantiate ssm_gdn_recurrent_chunked_snap_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128 PIE_SNAPS=1

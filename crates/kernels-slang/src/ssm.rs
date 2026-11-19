@@ -5,7 +5,7 @@
 use dtype::Dtype;
 
 use crate::encode::{Arg, ArgValue};
-use crate::encode::{nonzero, refuse};
+use crate::encode::{nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{RaggedTensor, Segments, Tensor, words_of};
 
@@ -147,6 +147,78 @@ pub struct Committed {
     pub slots: Tensor,
 
     pub lane0: u32,
+}
+
+/// The lagged fold's decode tables (`new-memory/designs/lagged-fold.md`;
+/// `kernels/ssm/conv1d.slang`, `PIE_REPLAY`): a decode row `r` is lane
+/// `lane0 + r`, whose entry in `table` is [`Lag::entry_ints`] i32: its
+/// carried count (at most `carry`), the rows of its carried and own ones
+/// whose state its record keeps, the rs-buffer row its own row lands in
+/// (negative: none), then each carried row's rs-buffer row. An rs-buffer
+/// row `u` is token `u % page_tokens` of rs page `u / page_tokens`
+/// ([`RsPlane`]). The carried rows' outputs a replaying op lands for the
+/// next (a conv's for its scan, the gates' for theirs) lie lane `l`'s row
+/// `j` at row `l * carry + j`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Lag {
+    pub table: Tensor,
+    pub lane0: u32,
+    pub carry: u32,
+}
+
+impl Lag {
+    /// The ints ahead of a lane's carried rows: its count, its kept rows
+    /// and its own row's rs-buffer row.
+    pub const HEAD: u32 = 3;
+
+    /// A lane's entry, carrying at most `carry` rows.
+    #[must_use]
+    pub const fn entry_ints(carry: u32) -> u32 {
+        Self::HEAD + carry
+    }
+
+    fn scalars(&self, op: &'static str) -> Result<[ArgValue; 2], Error> {
+        Ok([stated(op, self.lane0)?.arg(), nonzero(op, "the carried rows a lane holds", self.carry)?.arg()])
+    }
+}
+
+/// Where one rs-buffer plane's rows lie in the chunk pool `pool`, in u32
+/// words: rs page `p`'s token `t` at word `p * page_words + plane_words +
+/// t * row_words` (`crate::rs` on the engine's side lays them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RsPlane {
+    pub pool: Segments,
+    pub page_tokens: u32,
+    pub page_words: u32,
+    pub plane_words: u32,
+    pub row_words: u32,
+}
+
+impl RsPlane {
+    /// Its scalars, after a kernel's lane scalars.
+    fn args(&self, op: &'static str) -> Result<[ArgValue; 4], Error> {
+        Ok([
+            nonzero(op, "the tokens an rs page holds", self.page_tokens)?.arg(),
+            self.page_words.arg(),
+            self.plane_words.arg(),
+            nonzero(op, "the words an rs row takes", self.row_words)?.arg(),
+        ])
+    }
+
+    /// Refused unless a row of this plane is `elems` bf16 elements.
+    fn holds(&self, op: &'static str, elems: u32) -> Result<(), Error> {
+        if u64::from(self.row_words) * 2 != u64::from(elems) {
+            return Err(refuse(
+                op,
+                format!(
+                    "the rs plane's row is {} words, and the row it buffers is {elems} bf16 \
+                     elements",
+                    self.row_words
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The widest head a scan stages in workgroup memory.

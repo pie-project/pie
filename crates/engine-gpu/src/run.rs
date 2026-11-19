@@ -211,6 +211,10 @@ pub struct FireBindings {
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
+    /// The lagged fold's decode replay this fire's decode windows run,
+    /// where the load lays one (`crate::rs::Lag`).
+    pub rs_lag: Option<crate::rs::LagFire>,
+
     /// Where the prompt scans land the state as of rows inside a lane, when
     /// a lane of the fire snapshots (CONTRACT-BC 16).
     pub rs_snaps: Option<Tensor>,
@@ -437,6 +441,12 @@ impl<'c, B: Backend> Run<'c, B> {
 
     pub fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
         self.fire.rs.clone()
+    }
+
+    /// The decode replay this window's decode ops run (`crate::rs::Lag`):
+    /// none where the fire takes the extended path ([`Run::rs_seat`]).
+    pub fn rs_lag(&self) -> Option<&crate::rs::LagFire> {
+        self.fire.rs_lag.as_ref().filter(|_| self.fire.rs.is_none())
     }
 
     /// The snapshot table this window's scans read, when a lane of the fire
