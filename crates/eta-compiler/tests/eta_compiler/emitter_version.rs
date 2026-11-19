@@ -8,7 +8,7 @@ use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_mo
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 76, 0x7fb1_077a_5ba5_1b36),
     ("hip", 36, 0x9cc5_7140_ac5e_ae48),
-    ("metal", 70, 0x1d9f_ba02_9e00_cd1b),
+    ("metal", 72, 0x1414_87a1_5b9a_ff04),
 ];
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it
