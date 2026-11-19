@@ -188,6 +188,13 @@ fn out_of_range_tokens<B: Serve>(
         let Some(&id) = tokens.iter().find(|&&id| id >= vocab) else {
             continue;
         };
+        // A skip row (`engine::ports::SKIP_TOKEN`) is a contract id, not an
+        // out-of-range one; this engine does not carry skip rows yet.
+        let what = if id == engine::ports::SKIP_TOKEN {
+            "a skip row (token -1), which this engine does not carry yet".to_string()
+        } else {
+            format!("token {id}, out of range for a vocabulary of {vocab}")
+        };
         let lane_at = u32::try_from(at).unwrap_or(u32::MAX);
         match step
             .attachments
@@ -195,19 +202,12 @@ fn out_of_range_tokens<B: Serve>(
             .find(|attachment| attachment_lanes(attachment).contains(&lane_at))
         {
             Some(attachment) => {
-                let why = format!(
-                    "instance {}: token {id} is out of range for a vocabulary of {vocab}",
-                    attachment.instance
-                );
+                let why = format!("instance {}: {what}", attachment.instance);
                 envelope.refused(step, attachment, &why, faulted);
             }
             None => {
                 envelope.tokens[at] = Some(vec![0; lane.tokens.len()]);
-                faulted.fault_lanes(
-                    lane_at..lane_at + 1,
-                    None,
-                    &format!("token {id} is out of range for a vocabulary of {vocab}"),
-                );
+                faulted.fault_lanes(lane_at..lane_at + 1, None, &what);
             }
         }
     }
