@@ -233,19 +233,48 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::UNIFORMS,
-        )
+    /// Stocks a uniform and a scratch chunk for each of `frames` frames in
+    /// flight, at load: a frame takes at most one of each, and gives it back
+    /// when it is dropped.
+    pub(crate) fn stock_rings(&self, frames: usize) {
+        let uniforms = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie uniforms"),
+                    size: UNIFORM_CHUNK,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::UNIFORMS,
+            )
+        });
+        self.return_uniforms(uniforms.collect());
+        let scratch = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie scratch"),
+                    size: SCRATCH_CHUNK,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::FRAME_SCRATCH,
+            )
+        });
+        self.return_scratch(scratch.collect());
+    }
+
+    pub(crate) fn uniform_chunk(&self) -> Result<Held> {
+        self.uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a uniform chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
@@ -255,30 +284,30 @@ impl Core {
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return chunk;
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
+        if bytes > SCRATCH_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes one frame stages through scratch",
+                need: bytes,
+                have: SCRATCH_CHUNK,
+            });
         }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::FRAME_SCRATCH,
-        )
+        self.scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a scratch chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+            .extend(chunks);
     }
 }
 
@@ -778,18 +807,25 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.uniform_chunk()?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        if at + bytes > UNIFORM_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes of uniforms one frame writes (its chunk)",
+                need: at + bytes,
+                have: UNIFORM_CHUNK,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -816,18 +852,25 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        if at + bytes > SCRATCH_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes one frame stages through scratch (its chunk)",
+                need: at + bytes,
+                have: SCRATCH_CHUNK,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -861,7 +904,7 @@ impl Frame {
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
         // wgpu refuses a copy whose ends are one buffer: it goes through
         // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
+        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
         self.encode(|encoder| match &stage {
             None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
             Some((scratch, at)) => {
@@ -1074,6 +1117,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::TEST).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();

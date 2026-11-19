@@ -151,7 +151,7 @@ impl Serve for Api {
                 })
                 .collect::<Result<Vec<_>>>()?,
             mailbox: std::sync::Arc::default(),
-            worker: crate::landing::Worker::default(),
+            worker: crate::landing::Worker::new(),
         })
     }
 

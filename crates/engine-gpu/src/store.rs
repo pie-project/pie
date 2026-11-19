@@ -592,6 +592,12 @@ pub fn slot_entries(units: &[u32]) -> Result<Vec<i32>> {
 }
 
 impl<B: Backend> Pools<B> {
+    /// The buffers of the pool's backed segments, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.pool.segment_buffers()
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
     /// and `host_chunks` host chunks beside it, its top chunks the
     /// activation span of `act_chunks`' rungs; nothing committed yet.

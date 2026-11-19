@@ -2873,6 +2873,12 @@ impl<B: Serve> Shell<B> {
             .collect()
     }
 
+    /// The pixel planes the load reads out.
+    #[must_use]
+    pub fn pixel_planes(&self) -> usize {
+        self.pixels.len()
+    }
+
     /// Pixel plane `plane`'s output name.
     #[must_use]
     pub fn pixel_output(&self, plane: usize) -> &str {

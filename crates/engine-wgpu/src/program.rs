@@ -1111,10 +1111,18 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 Refusal::Program(format!("the guest pipelines did not build: {why}"))
             })?;
             self.library = Some(Arc::new(library));
-            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-                Refusal::Program(format!("the readout widen did not build: {why}"))
-            })?;
+            let widen = crate::guest::widen::Widen::new(
+                place.device,
+                &place.seats,
+                &place.pools.segment_buffers(),
+                u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),
+                u64::from(place.max_lanes) * u64::from(place.planes),
+            )
+            .map_err(|why| Refusal::Program(format!("the readout widen did not build: {why}")))?;
             self.widen = Some(Arc::new(widen));
+            // The model's frames in flight, and the one a settle or a walk
+            // holds beside them.
+            place.device.core().stock_rings(place.frames + 1);
         }
         // A build with no device builds nothing, and binds no instance.
         #[cfg(not(feature = "wgpu"))]

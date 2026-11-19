@@ -176,7 +176,46 @@ struct WorkerState {
     runners: Vec<crate::device::host::channel::Sender<Runnable>>,
 }
 
+/// The threads guest passes run on beside the landing's own: one for each
+/// of the host's cores, made at load (a guest job holds its own instance and
+/// no lane, so jobs past them queue).
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub(crate) fn runners() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// The threads that run guest passes and so widen: the runners, the
+/// landing's (a step's one job runs there), and the engine's (prologues).
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub(crate) fn guest_threads() -> usize {
+    runners() + 2
+}
+
 impl Worker {
+    /// The landing thread and its guest runners, all started now (at load).
+    pub(crate) fn new() -> Worker {
+        let worker = Worker::default();
+        {
+            let tx = worker.start();
+            let mut state = worker.inner.lock().expect("lock poisoned");
+            state.tx = Some(tx);
+            #[cfg(feature = "wgpu")]
+            for at in 0..runners() {
+                let (tx, rx) = crate::device::host::channel::unbounded::<Runnable>();
+                crate::device::host::thread::spawn(format!("wgpu guest {at}"), move || {
+                    while let Ok(run) = rx.recv() {
+                        run();
+                    }
+                })
+                .expect("spawn a guest runner");
+                state.runners.push(tx);
+            }
+        }
+        worker
+    }
+
     #[cfg(feature = "wgpu")]
     fn run_all(&self, mut jobs: Vec<crate::program::Job>) -> Vec<crate::program::Faulted> {
         if jobs.len() == 1 {
@@ -209,21 +248,8 @@ impl Worker {
 
     #[cfg(feature = "wgpu")]
     fn runner(&self, at: usize) -> crate::device::host::channel::Sender<Runnable> {
-        let mut state = self.inner.lock().expect("lock poisoned");
-        while state.runners.len() <= at {
-            let (tx, rx) = crate::device::host::channel::unbounded::<Runnable>();
-            crate::device::host::thread::spawn(
-                format!("wgpu guest {}", state.runners.len()),
-                move || {
-                    while let Ok(run) = rx.recv() {
-                        run();
-                    }
-                },
-            )
-            .expect("spawn a guest runner");
-            state.runners.push(tx);
-        }
-        state.runners[at].clone()
+        let state = self.inner.lock().expect("lock poisoned");
+        state.runners[at % state.runners.len()].clone()
     }
     fn land(&self, landing: Landing) {
         let inline = {
@@ -231,7 +257,10 @@ impl Worker {
             if state.queued == 0 && landing.guests.is_none() {
                 Some(landing)
             } else {
-                let tx = state.tx.get_or_insert_with(|| self.start());
+                let tx = state
+                    .tx
+                    .as_ref()
+                    .expect("the landing thread starts at load");
                 match tx.send(landing) {
                     Ok(()) => {
                         state.queued += 1;
