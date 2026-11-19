@@ -50,11 +50,24 @@ pub fn layer_count(trace: &Trace) -> u32 {
 /// ones every layer reads alike.
 #[must_use]
 pub fn signature(trace: &Trace, layer: u32, shared: &[ValueId]) -> String {
-    let nodes: Vec<_> = (trace.nodes.iter())
+    let nodes: Vec<&poem_ir::Node> = (trace.nodes.iter())
         .filter(|n| n.layer == Some(layer))
         .collect();
+    nodes_signature(trace, &nodes, layer, 1, shared)
+}
+
+/// `nodes`' signature, every value by its role and every layer from `base`
+/// to `base + span` named relative to `base` (a layer the nodes name of
+/// their own, a per-layer table row, is the loop's counter in a body).
+fn nodes_signature(
+    trace: &Trace,
+    nodes: &[&poem_ir::Node],
+    base: u32,
+    span: u32,
+    shared: &[ValueId],
+) -> String {
     let mut own: HashMap<u32, usize> = HashMap::new();
-    for n in &nodes {
+    for n in nodes {
         let mut outs = Vec::new();
         poem_ir::Operands::outputs(&n.op, &mut outs);
         for v in outs {
@@ -66,7 +79,7 @@ pub fn signature(trace: &Trace, layer: u32, shared: &[ValueId]) -> String {
     // from the layer before; the first layer starts it (`into: None`).
     // Either way it is the layer's one accumulator, so both read `A`.
     let mut accumulators: Vec<u32> = Vec::new();
-    for n in &nodes {
+    for n in nodes {
         let text = format!("{:?}", n.op);
         let mut rest = text.as_str();
         while let Some(at) = rest.find(ACCUMULATED) {
@@ -82,13 +95,22 @@ pub fn signature(trace: &Trace, layer: u32, shared: &[ValueId]) -> String {
     }
     let mut carried: HashMap<u32, usize> = HashMap::new();
     let mut out = String::new();
-    for n in &nodes {
-        // An op naming its own layer (a per-layer row of a table, PLE) names
-        // the loop's counter in a body: `@`.
-        let text = format!("{:?}|{:?}", n.op, n.guard)
-            .replace("into: None", "into: Some(A)")
-            .replace(&format!("layer: {layer},"), "layer: @,")
-            .replace(&format!("layer: {layer} }}"), "layer: @ }");
+    for n in nodes {
+        let mut text = format!(
+            "{:?}|{:?}|{:?}",
+            n.op,
+            n.guard,
+            n.layer.map(|l| l.wrapping_sub(base))
+        )
+        .replace("into: None", "into: Some(A)");
+        for l in base..base + span {
+            text = text
+                .replace(&format!("layer: {l},"), &format!("layer: @{},", l - base))
+                .replace(
+                    &format!("layer: {l} }}"),
+                    &format!("layer: @{} }}", l - base),
+                );
+        }
         let mut rest = text.as_str();
         while let Some(at) = rest.find("ValueId(") {
             out.push_str(&rest[..at]);
@@ -257,4 +279,259 @@ pub fn stacks(trace: &Trace, runs: &[Run]) -> Vec<Vec<u32>> {
         }
     }
     stacks
+}
+
+/// A run of the compiled template's regions that repeats: `repeats` blocks
+/// of `regions` regions from region `start`, block `k` computing what block
+/// 0 computes `k * layers` layers on. A block may straddle a layer boundary
+/// (the compiler fuses a layer's last ops with the next layer's first):
+/// the body is whatever repeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    pub start: usize,
+    pub regions: usize,
+    pub repeats: u32,
+    pub layers: u32,
+    /// The lowest layer block 0's nodes name.
+    pub base: u32,
+}
+
+/// A block of regions' signature: each region's lowering, mask and phase,
+/// then its nodes as [`signature`] writes a layer's, a layer named relative
+/// to `base`.
+fn block_signature(
+    trace: &Trace,
+    compiled: &poem_compiler::CompiledModel,
+    regions: std::ops::Range<usize>,
+    base: u32,
+    span: u32,
+    shared: &[ValueId],
+) -> String {
+    let template = compiled.template();
+    let nodes: Vec<&poem_ir::Node> = (regions.clone())
+        .flat_map(|r| template[r].nodes.clone())
+        .map(|n| &trace.nodes[n as usize])
+        .collect();
+    let mut out = String::new();
+    for r in regions {
+        let region = &template[r];
+        let _ = write!(
+            out,
+            "[{:?} {:?} {:?} {:?} {} {}]",
+            region.lowering,
+            region.mask,
+            region.phase,
+            region.axis,
+            region.nodes.len(),
+            region.collective
+        );
+    }
+    out.push('\n');
+    out.push_str(&nodes_signature(trace, &nodes, base, span, shared));
+    out
+}
+
+/// The lowest and highest layer `regions`' nodes name.
+fn layers_of(
+    trace: &Trace,
+    compiled: &poem_compiler::CompiledModel,
+    regions: std::ops::Range<usize>,
+) -> Option<(u32, u32)> {
+    let template = compiled.template();
+    let mut span: Option<(u32, u32)> = None;
+    for r in regions {
+        for n in template[r].nodes.clone() {
+            if let Some(l) = trace.nodes[n as usize].layer {
+                span = Some(span.map_or((l, l), |(a, b)| (a.min(l), b.max(l))));
+            }
+        }
+    }
+    span
+}
+
+/// The template's repeating blocks: from each region, the run of blocks of
+/// the size that covers the most regions, two blocks at least, each block
+/// naming layers and every block the first's `layers` layers on.
+#[must_use]
+pub fn blocks(trace: &Trace, compiled: &poem_compiler::CompiledModel) -> Vec<Block> {
+    let shared = shared_inputs(trace);
+    let count = compiled.template().len();
+    let mut found = Vec::new();
+    let mut start = 0;
+    while start < count {
+        let mut best: Option<Block> = None;
+        for size in 1..=(count - start) / 2 {
+            let Some((base, top)) = layers_of(trace, compiled, start..start + size) else {
+                continue;
+            };
+            let Some((next, _)) = layers_of(trace, compiled, start + size..start + 2 * size) else {
+                continue;
+            };
+            if next <= base {
+                continue;
+            }
+            let step = next - base;
+            let span = top - base + 1;
+            let first = block_signature(trace, compiled, start..start + size, base, span, &shared);
+            let mut repeats = 1u32;
+            while start + (repeats as usize + 1) * size <= count {
+                let lo = start + repeats as usize * size;
+                let b = base + repeats * step;
+                if block_signature(trace, compiled, lo..lo + size, b, span, &shared) != first {
+                    break;
+                }
+                repeats += 1;
+            }
+            if repeats > 1
+                && best.is_none_or(|b| size * repeats as usize > b.regions * b.repeats as usize)
+            {
+                best = Some(Block {
+                    start,
+                    regions: size,
+                    repeats,
+                    layers: step,
+                    base,
+                });
+            }
+        }
+        match best {
+            Some(block) => {
+                start += block.regions * block.repeats as usize;
+                found.push(block);
+            }
+            None => start += 1,
+        }
+    }
+    found
+}
+
+/// What the load rolls: each repeating block of regions and its weights'
+/// stack passes, or why it stays spelled out.
+#[derive(Debug, Clone, Default)]
+pub struct Plan {
+    /// Each block, with the stack pass block 0 reads each weight at (by
+    /// param), or why the block does not roll.
+    pub blocks: Vec<(Block, Result<Vec<(u32, u32)>, String>)>,
+    pub layers: u32,
+}
+
+impl Plan {
+    /// The template's repeating blocks, each checked: every weight block
+    /// `k` reads is the stack pass block 0 reads at that place, `k` passes
+    /// on (`member`: param -> (stack, pass)).
+    pub fn of(
+        trace: &Trace,
+        compiled: &poem_compiler::CompiledModel,
+        member: &dyn Fn(u32) -> Option<(u32, u32)>,
+    ) -> Plan {
+        let layers = layer_count(trace);
+        let blocks = (blocks(trace, compiled).into_iter())
+            .map(|block| {
+                let weights = |k: u32| -> Vec<u32> {
+                    let lo = block.start + k as usize * block.regions;
+                    region_weights(trace, compiled, lo..lo + block.regions)
+                };
+                let first = weights(0);
+                let mut checked: Result<Vec<(u32, u32)>, String> = Ok(Vec::new());
+                let mut step: Vec<Option<u32>> = vec![None; first.len()];
+                'blocks: for k in 0..block.repeats {
+                    let at = weights(k);
+                    for (j, (&p0, &pk)) in first.iter().zip(&at).enumerate() {
+                        if p0 == pk {
+                            continue;
+                        }
+                        let (Some((s0, a0)), Some((sk, ak))) = (member(p0), member(pk)) else {
+                            let lone =
+                                &trace.params[if member(p0).is_none() { p0 } else { pk } as usize];
+                            checked = Err(if lone.source == poem_ir::ParamSource::Registered {
+                                format!(
+                                    "weight `{}` is an adapter bank, read through the pool's \
+                                     adapter slots, which a body does not yet address by its \
+                                     counter",
+                                    lone.name
+                                )
+                            } else {
+                                format!(
+                                    "weight `{}` lands in a buffer of its own (it streams, or \
+                                     lands with a partner plane or a tied copy)",
+                                    lone.name
+                                )
+                            });
+                            break 'blocks;
+                        };
+                        let d = ak.checked_sub(a0).filter(|d| d % k == 0).map(|d| d / k);
+                        let agrees =
+                            s0 == sk && d.is_some() && step[j].is_none_or(|s| Some(s) == d);
+                        if !agrees {
+                            checked = Err(format!(
+                                "weight `{}` is not its stack's pass a whole step on from \
+                                 block 0's `{}`",
+                                trace.params[pk as usize].name, trace.params[p0 as usize].name
+                            ));
+                            break 'blocks;
+                        }
+                        step[j] = d;
+                    }
+                }
+                let checked = checked.map(|_| {
+                    (first.iter())
+                        .filter_map(|&p| member(p).map(|(_, pass)| (p, pass)))
+                        .collect()
+                });
+                (block, checked)
+            })
+            .collect();
+        Plan { blocks, layers }
+    }
+
+    /// The layers in blocks that roll.
+    #[must_use]
+    pub fn rolled(&self) -> u32 {
+        (self.blocks.iter())
+            .filter(|(_, c)| c.is_ok())
+            .map(|(b, _)| b.layers * b.repeats)
+            .sum()
+    }
+
+    /// The load line: `rolled N of M layers`, then each block that stays
+    /// spelled out and why.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let mut line = format!("rolled {} of {} layers", self.rolled(), self.layers);
+        for (block, checked) in &self.blocks {
+            if let Err(why) = checked {
+                let _ = write!(
+                    line,
+                    "; layers {}..{} unrolled: {why}",
+                    block.base,
+                    block.base + block.layers * block.repeats
+                );
+            }
+        }
+        line
+    }
+}
+
+/// The weights `regions`' nodes read, in the order they first read them.
+fn region_weights(
+    trace: &Trace,
+    compiled: &poem_compiler::CompiledModel,
+    regions: std::ops::Range<usize>,
+) -> Vec<u32> {
+    let template = compiled.template();
+    let mut seen = Vec::new();
+    for r in regions {
+        for n in template[r].nodes.clone() {
+            let mut ins = Vec::new();
+            poem_ir::Operands::inputs(&trace.nodes[n as usize].op, &mut ins);
+            for v in ins {
+                if let Some(Def::Weight(param)) = trace.values.get(v.0 as usize).map(|d| &d.def)
+                    && !seen.contains(param)
+                {
+                    seen.push(*param);
+                }
+            }
+        }
+    }
+    seen
 }

@@ -90,6 +90,8 @@ pub struct Weights {
     /// The weight stacks (`crate::roll::stacks`): each run's weight of one
     /// place in its body, every pass's plane end to end in one buffer.
     stacks: Vec<Buffer>,
+    /// param -> (stack, pass) for every param landing in a stack.
+    member: BTreeMap<usize, (usize, usize)>,
     gemm_buffers: BTreeMap<u32, Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, AdapterBank>,
@@ -482,6 +484,7 @@ impl Weights {
         Ok(Weights {
             buffers,
             stacks: stack_buffers,
+            member,
             gemm_buffers,
             table: WeightTable(table, gemm_table),
             banks,
@@ -497,6 +500,12 @@ impl Weights {
     #[must_use]
     pub fn buffer(&self, param: u32) -> Option<&Buffer> {
         self.buffers.get(param as usize)?.as_ref()
+    }
+
+    /// The stack and pass param `param` lands as, when it lands in one.
+    #[must_use]
+    pub fn member_of(&self, param: u32) -> Option<(u32, u32)> {
+        (self.member.get(&(param as usize))).map(|&(stack, pass)| (stack as u32, pass as u32))
     }
 
     /// Weight stack `stack`'s buffer.
@@ -1458,6 +1467,7 @@ impl Weights {
         Ok(Weights {
             buffers: (0..trace.params.len()).map(|_| None).collect(),
             stacks: Vec::new(),
+            member,
             gemm_buffers: BTreeMap::new(),
             table: WeightTable(table, gemm_table),
             banks,

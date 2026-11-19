@@ -269,6 +269,8 @@ pub struct Shell {
     handles: Handles,
     trace: Trace,
     compiled: CompiledModel,
+    /// The layer stack's runs and what rolls (`crate::roll::Plan`).
+    rolling: crate::roll::Plan,
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
@@ -1039,6 +1041,14 @@ impl Shell {
                 poem_ir::Def::Input(poem_ir::RuntimeInput::ReadoutRows)
             )
         });
+        // The layer stack's runs, each one body of regions over stacked
+        // weights or spelled out with its reason (`crate::roll`).
+        let rolling =
+            crate::roll::Plan::of(&boot.trace, &compiled, &|param| weights.member_of(param));
+        tracing::info!(plan = %rolling.line(), "xla layer stack");
+        if timing() {
+            eprintln!("xla layer stack: {}", rolling.line());
+        }
         let adapter_fact = compiled.classes.adapter_fact(&corrected);
         let adapters = crate::adapter::Landings::default();
         let readout_rowed = (
@@ -1054,6 +1064,7 @@ impl Shell {
             handles,
             trace: boot.trace,
             compiled,
+            rolling,
             budgets,
             weights,
             pools,
@@ -1126,6 +1137,12 @@ impl Shell {
     #[must_use]
     pub fn staging_facts(&self) -> &StagingFacts {
         &self.staging_facts
+    }
+
+    /// What the load rolls of its layer stack (`crate::roll::Plan`).
+    #[must_use]
+    pub fn rolling(&self) -> &crate::roll::Plan {
+        &self.rolling
     }
 
     #[must_use]
