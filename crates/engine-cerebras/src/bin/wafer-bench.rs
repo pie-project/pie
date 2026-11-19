@@ -757,7 +757,11 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     if get.contains_key("rows") {
         // one step at the inputs' own timestep, the rows read back against the capture's
         let step = reading.step(&trace, grid, &inputs);
-        let entries = reading.entries(&mut host, &step)?;
+        let entries = if reading.batch > 1 {
+            reading.entries_batch(&mut host, std::slice::from_ref(&step))?
+        } else {
+            reading.entries(&mut host, &step)?
+        };
         let t0 = std::time::Instant::now();
         let mut rt = Runtime::new(sdk, Path::new(&program), platform, "WARNING")
             .map_err(|e| e.to_string())?;
@@ -779,7 +783,13 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         }
         rt.stop();
         let mut ok = true;
-        for c in reading.rows_back(&got)? {
+        let back = reading.rows_back(&got)?;
+        let back = if reading.batch > 1 {
+            reading.request_of(&back, 0)
+        } else {
+            back
+        };
+        for c in back {
             let engine_cpu::forward::Values::F32(v) = &c.values else {
                 continue;
             };
@@ -904,10 +914,27 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         );
         Ok(rt)
     };
+    // (the inputs bound into the first step's entries before any program loads: a run that
+    // cannot reach the fabric fails here, not after it lands; 1569)
+    {
+        let step = reading.step(&trace, grid, &inputs);
+        if reading.batch > 1 {
+            reading.entries_batch(&mut host, std::slice::from_ref(&step))?;
+        } else {
+            reading.entries(&mut host, &step)?;
+        }
+        println!("PROGRESS the inputs bound");
+    }
     let mut kept = if reload { None } else { Some(load()?) };
     let (_, vs) = d.run(&mut inputs, lanes, |i, ins| {
         let step = reading.step(&trace, grid, ins);
-        let entries = reading.entries(&mut host, &step)?;
+        // (a batched program: the request in its first slot, its values standing for the rest,
+        // as the engine fills a launch of fewer requests than the program's batch)
+        let entries = if reading.batch > 1 {
+            reading.entries_batch(&mut host, std::slice::from_ref(&step))?
+        } else {
+            reading.entries(&mut host, &step)?
+        };
         println!("PROGRESS step {i}: entries made, launching");
         let t0 = std::time::Instant::now();
         let io0 = kept.as_ref().map(|r| r.io);
@@ -936,6 +963,11 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
                 "d2h_words": b.d2h.2 - a.d2h.2})
         });
         let back = reading.rows_back(&got)?;
+        let back = if reading.batch > 1 {
+            reading.request_of(&back, 0)
+        } else {
+            back
+        };
         let v = reading
             .finish(&mut host, &trace, &step, &back, &[d.velocity.as_str()])?
             .remove(0);
