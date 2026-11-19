@@ -225,7 +225,9 @@ pub trait Tactics: std::fmt::Debug {
 
     fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
 
-    /// The dense matmul tactic for a fire of `rows` activation rows.
+    /// The tiled dense matmul tactic at `rows` activation rows; whether a
+    /// rung takes the vector kernels instead is the load's choice
+    /// ([`crate::dense`]).
     fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
 
     /// Every dense matmul tactic some fire of 1 to `capacity` rows takes:
