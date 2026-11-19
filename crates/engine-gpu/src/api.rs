@@ -922,6 +922,8 @@ where
         &self,
         program: ProgramId,
         extents: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         let Some(shell) = self.shell.as_ref() else {
             return Ok(engine::GuestState::default());
@@ -1798,6 +1800,7 @@ mod tests {
                 lanes: 2,
                 instance: InstanceId(100 + u64::from(at)),
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             })
             .collect();
         let mut ran = Vec::new();

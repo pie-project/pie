@@ -3847,6 +3847,7 @@ mod tests {
                             lanes: 1,
                             instance: instance(lane),
                             adapter_only: false,
+                            scratch: ::engine::ScratchPlace::None,
                         })
                         .collect(),
                     media: Vec::new(),
@@ -4128,6 +4129,7 @@ mod tests {
                             lanes: 1,
                             instance: ::engine::InstanceId(fires[lane as usize].0),
                             adapter_only: false,
+                            scratch: ::engine::ScratchPlace::None,
                         })
                         .collect(),
                     media: Vec::new(),

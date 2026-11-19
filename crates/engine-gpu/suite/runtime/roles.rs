@@ -131,6 +131,7 @@ impl Bound {
                     lanes: 1,
                     instance: self.instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

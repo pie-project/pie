@@ -115,6 +115,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
                     lanes: 1,
                     instance: noised,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 Vec::new(),
             ))

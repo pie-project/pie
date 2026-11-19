@@ -200,7 +200,7 @@ impl Plane {
 
     /// The value scratch an instance's state holds: its widest launching
     /// stage's, once, in which it fires every stage, alone or as a lane of
-    /// its pair's batch (`engine::GuestState::per_instance`). Once, not a
+    /// its pair's batch (`engine::GuestState::resident`). Once, not a
     /// frame in flight each: an instance's next fire is staged only once
     /// its last has landed (`fence_instances`), so no two of its fires read
     /// its scratch at once, and a second set held half its state for
@@ -465,7 +465,7 @@ impl Plane {
             Some(held) => held.place.clone(),
             None => take(state.per_pair),
         };
-        let scratch = take(state.per_instance);
+        let scratch = take(state.resident);
         self.bind(
             context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )
@@ -1407,7 +1407,7 @@ struct Bound {
     /// The pair whose batch sets its grouped stages fire with.
     pair: u64,
     /// Where its value scratch lies, one a frame in flight, for the stages
-    /// it fires alone (`engine::GuestState::per_instance`).
+    /// it fires alone (`engine::GuestState::resident`).
     scratch_place: engine::ScratchPlace,
     scratch: Vec<launch::ScratchAt>,
     program_id: ProgramId,
