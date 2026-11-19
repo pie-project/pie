@@ -474,3 +474,100 @@ layout; or a kernel that is load-issue-bound at the M1's rate rather than per-la
 a34acca57 (Mac Pro, same method): greedy ×1 5.08 ms, 4 parallel 5.52 ms (1.09×), beam-4 6.09 ms (1.20×);
 the 4-row projections take the few-row vector forms there too (3.4 + 1.3 ms against 3.2 + 1.1 at one row),
 so the M5 meets the rule within ~20% and the gap is the M1's.
+Then tried at the user's ask, the packed form (prototype, not landed; patch in the Metal session's
+scratchpad, gemv-mma8-packed.patch): weights packed at load per 8-column block and 32-wide K group so a
+lane's four 8×8-block operands are one 16-byte load, K permuted inside a group so a lane's activations of
+a row are one 8-byte load, the contraction split across a threadgroup's 8 simdgroups (partial tiles summed
+in threadgroup memory). Device time of Qwen3-0.6B's four projection shapes, summed: routed (0bc7019c8)
+88–100 / 116–132 / 155–185 / 271–289 µs at 1 / 2 / 4 / 8 rows; packed 164 / 165 / 145 / 129 µs. Flat in
+the rows, but it floors at ~145–160 µs at 4 rows against ~90 µs for the routed one row (which runs near
+the M1's bandwidth): 1.6–1.8×, not the ≤1.05× asked. Each step removed what it targeted (split widths 4 /
+16 and four independent accumulators changed nothing), so the floor is the M1's simdgroup-matrix rate
+(Apple7 has no tensor units). Taking it would mean a second copy of every dense weight (one row stays on
+the routed forms): ~0.88 GB for Qwen3-0.6B, ~1.19 GB with the LM head, for −10–15% at 4 rows. Not taken;
+the M1's gap to the rule stays here.
+
+## F34. Tensor-parallel score capture: the score row's reduce across ranks
+Since Dim::Capturing (9e78d2281) a capturing lane's key row is summed over the layers in place, so under tensor parallelism each rank holds a partial row and the shard pass emits one all_reduce on it, in place on the Capture-placed row (the arena's one exact Capture-to-Capture share; `sc/gpu-poem-suite-mask`). Guest epilogues read that row on the device (CUDA: the reading guest's instance slots, `engine-cuda/src/scores.rs`; engine-gpu: the pair's score room), so it can't be summed at host readout. The rows are scattered one per capturing lane, outside the arena, so engine-cuda (CUDA / ROCm) and engine-gpu (the band collective) refuse a tensor-parallel load that captures scores, by name, instead of reducing the wrong memory. Metal (collectives unsupported) and XLA (single replica) never see it; the CPU oracle sums correctly.
+What's owed: a reduce that sums each lane's row (and its page sums) across ranks through the row tables, under graph capture (gather, reduce, scatter, or a reduce that walks the row table), then the refusal lifted. Needs a box with 2+ GPUs per backend to build and test; none of the current machines has one (L40S: 1 GPU; AMD: one MI300X VF).
+
+## F35. XLA does not roll the layer stack: no cross-iteration weight prefetch on TPU
+
+A fire program spells out every layer. Its compiled code, and the host RAM that libtpu
+holds for a loaded program (about 2.2× the code), are linear in the layer count:
+qwen3-0.6b costs about 1.5 MB of code a layer in a prefill program. The base ladder
+holds 126–128 GiB of host at ready.
+
+`sc/xla-roll` (a180bdbc0, parked unlanded) traces each repeating block of regions as one
+`stablehlo.while`:
+- runs found by `roll::blocks`;
+- weights landed as stacks;
+- kv page maps and adapter starts at the counter's pass;
+- the body's writes carried.
+
+It meets contract A, and on qwen3-0.6b (27 of 28 layers rolled) it moves the serving
+numbers as follows:
+
+| | unrolled | rolled |
+|---|---|---|
+| cold boot | 2683 s, 128 GiB | 512 s, 20 GiB |
+| warm boot | ~220 s, 122 GiB | 30 s, 15 GiB |
+| program cache | 13 GB | 0.9 GB |
+| code per program | 49 MB | 4 MB |
+
+It does not land: every shape class is slower than 2%.
+
+Engine probe, rolled vs unrolled, v6e:
+
+| shape | delta |
+|---|---|
+| decode 1 | −14.5% |
+| decode 64 | −14% |
+| decode 256 | −4.1% |
+| prefill 512 | −11% |
+| prefill 2048 | −13.8% |
+
+Serving c64 is −3.2%.
+
+Why: decode is bound by weight bandwidth. Unrolled, MSA prefetches each layer's weight
+operands into VMEM while the layer before computes: 706 ms of copy-done per decode:64
+step, matmul fusions 1047 ms. In the loop, every weight is a dynamic slice of a stack
+(176 MB for gate/up) at the counter. MSA prefetches whole operands only, never a
+counter-indexed slice. So each dot streams its weight unhidden: matmul fusions 3129 ms,
+copy-done 5 ms.
+
+Tried, none closing it (decode:64 on rolled, base ~21350 tok/s, rolled ~18300):
+
+| attempt | decode:64 tok/s |
+|---|---|
+| bodies of u blocks, u = 2 / 4 / 7 | 18501 / 18825 / 18897 (prefill 512: 99578 / 104142 / 105314) |
+| the next pass's weights carried, each turn cutting the next | 14316 (the cuts became synchronous dynamic-slice copies) |
+| a barrier keeping each slice its own op, for MSA's async dynamic-slice path | worse; 28-layer chain 579–694 µs against 470–548 and ~425 unrolled (the slices became synchronous copies; async dynamic-slice is used only for small index tables) |
+| the Mosaic grouped matmul (`moe_gmm`) reading the stack as a bank, expert = counter | no better than XLA's dot: 549 / 543 / 547 / 651 µs at m = 1 / 64 / 256 / 512 (its pipeline overlaps blocks within one call; the cross-layer start is what is missing) |
+
+Flags tried, none helping:
+
+| flag | decode:64 tok/s |
+|---|---|
+| `xla_tpu_enable_pipelined_loop_unrolling` | 18414 |
+| `xla_msa_enable_window_prefetch` | 18272 |
+| `xla_while_loop_unroll_count=2` | 18345 |
+| `xla_tpu_sliced_prefetch_max_slices=8` | 18325 |
+| `xla_gpu_enable_while_loop_double_buffering` | fails on TPU |
+| `xla_tpu_impure_asyncify_cross_buffer_slice` with its rewriter | the TPU compiler crashes on the attention fusion |
+
+What would make it land: a way to start layer l+1's weight copy into VMEM inside
+iteration l and use it in iteration l+1 (a cross-iteration async start/done that MSA or
+a kernel can own). VMEM does not persist across custom calls, so no per-layer kernel can
+do it alone.
+
+The branch also records that a run whose experts stream cannot roll, even with the
+prefetch:
+- a fire with a non-resident layer is cut before that layer's first select;
+- its misses are staged per param from pinned host banks between segments;
+- a loop cannot span those cuts.
+
+Streamed PLE rows (per-fire row indices, no cut) could roll as adapter banks do.
+
+Host RAM is attacked by shrinking the ladder instead: logprobs sharing the forward's
+programs, and prefill buckets chosen from measured costs.

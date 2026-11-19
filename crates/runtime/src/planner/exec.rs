@@ -427,12 +427,17 @@ fn abort(model: usize, engine: usize, txn: Move) {
     }
 }
 
-/// Aborts the move it still holds when dropped, after any copy in flight.
+/// Aborts the move it still holds when dropped, after any copy in flight
+/// has landed: a copy's completion may settle before it has written its
+/// destinations (its sources go back at once where nothing can reach them
+/// first), so the slots an abort gives back wait for every copy to land.
 struct MoveGuard {
     model: usize,
     engine: usize,
     txn: Option<Move>,
     in_flight: Vec<crate::scheduler::ControlCompletion>,
+    /// A copy of the move was handed to the engine.
+    submitted: bool,
 }
 
 impl MoveGuard {
@@ -442,6 +447,7 @@ impl MoveGuard {
             engine,
             txn: Some(txn),
             in_flight: Vec::new(),
+            submitted: false,
         }
     }
 
@@ -453,6 +459,7 @@ impl MoveGuard {
             let started = Instant::now();
             let completion = crate::scheduler::copy_tier_tracked(self.engine, &copy)
                 .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+            self.submitted = true;
             self.in_flight.push(completion.clone());
             waits.push((copy, started, completion));
         }
@@ -482,7 +489,7 @@ impl Drop for MoveGuard {
             return;
         };
         let in_flight = std::mem::take(&mut self.in_flight);
-        if in_flight.is_empty() {
+        if !self.submitted {
             abort(self.model, self.engine, txn);
             return;
         }
@@ -497,10 +504,20 @@ impl Drop for MoveGuard {
             return;
         };
         crate::rt::spawn(async move {
-            for completion in in_flight {
-                let _ = completion.wait().await;
+            let settled = crate::scheduler::settle_copies(engine);
+            if let Err(error) =
+                crate::scheduler::abort_once_landed(in_flight, settled, || abort(model, engine, txn))
+                    .await
+            {
+                tracing::error!(
+                    model,
+                    engine,
+                    %error,
+                    "a residency move's copies did not settle; preserving its pages and \
+                     slots to avoid reuse under a copy"
+                );
+                return;
             }
-            abort(model, engine, txn);
             if let Some(planner) = crate::planner::planner_for(model, engine) {
                 planner.pages_freed();
             }
@@ -559,11 +576,17 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let began = Instant::now();
     let mut fence = FenceGuard::raise(handles, pid, (model, engine));
     crate::scheduler::worker::notify_process_suspend(pid);
+    // Each wait of the prelude said as it begins: an eviction that never
+    // reports done names the wait it sits in (Mac Pro's beam mix: evicting
+    // stuck at 2 after a bind-suspend, nothing said).
+    tracing::debug!(%pid, "planner: an eviction drains its detachable fires");
     drain_detachable(pid).await;
     let drained = began.elapsed();
+    tracing::debug!(%pid, sets = fence.handles.len(), "planner: an eviction waits for its sets' fires");
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
+    tracing::debug!(%pid, "planner: an eviction waits for its state's device folds");
     let stores = crate::store::registry::get(model, engine);
     // A set a fire still folds by a count the device computes keeps its
     // state where the engine holds the record, whose length is the engine's
@@ -814,6 +837,12 @@ async fn restore(
         }
     }
     drop(slots);
+    // Taken before the unpark: a move of its pair that ends meanwhile is
+    // not lost.
+    let pair_watch = stores
+        .roles
+        .as_ref()
+        .map(|roles| roles.lock().unwrap().room_watch());
     // The instance tables and rings parked with it come back into fresh
     // device slots, which the engine is told before the process fires.
     let roles = match stores
@@ -842,8 +871,37 @@ async fn restore(
             }
             // Its pair is on its way back with another process's restore:
             // it goes again once that lands, its instances rebound to it.
-            if matches!(error, crate::store::roles::RolesError::PairParked(_)) {
-                tracing::debug!(%pid, %error, "planner: a restore waits for its pair's move");
+            // It goes again once that move ends (committed or aborted, the
+            // roles say so), never at once: queued again straight away it
+            // was served, short and queued again, round after round, as
+            // long as the move took (Mac Pro's M5: 27702 rounds).
+            // Said once a wait, with what the move carries; woken by the
+            // move's end alone (a commit or an abort tells the roles' watch,
+            // and the pair no longer moves), never re-planned meanwhile.
+            // The move is a park's or a restore's copies of the instances
+            // it names: it waits on no queued fire, so nothing queued
+            // behind this restore (a holder's fire, an eviction) holds it.
+            if let crate::store::roles::RolesError::PairParked(pair) = &error {
+                let pair = *pair;
+                let roles = stores.roles.as_ref().expect("a pair is a roles item");
+                if let Some(moving) = roles.lock().unwrap().pair_moving(pair) {
+                    tracing::debug!(
+                        %pid,
+                        %pair,
+                        ?moving,
+                        "planner: a restore waits for its pair's move: copies of the \
+                         instances it moves with, landing on the engine's lane"
+                    );
+                }
+                let mut watch = pair_watch;
+                while let Some(waiting) = watch.take() {
+                    let next = roles.lock().unwrap().room_watch();
+                    if roles.lock().unwrap().pair_moving(pair).is_none() {
+                        break;
+                    }
+                    waiting.freed().await;
+                    watch = Some(next);
+                }
                 planner.requeue_restore(pid);
                 return;
             }

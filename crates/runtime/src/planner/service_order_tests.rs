@@ -144,8 +144,12 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     assert!(!inner.nothing_in_flight());
     assert_eq!(
         inner.restore_gate(pids[0], 64),
-        RestoreGate::Wait,
-        "spare pages are no room; the fleet decodes"
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: false
+        },
+        "spare pages are no room; the fleet decodes: it goes again only on \
+         free runs of its need, nothing moved for it"
     );
     inner.completion_credit = 1;
     assert_eq!(
@@ -162,7 +166,13 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         proc.bind_waiting = true;
     }
     assert!(inner.nothing_in_flight(), "nothing in flight frees room");
-    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict((3, 1)));
+    assert_eq!(
+        inner.restore_gate(pids[0], 0),
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: true
+        }
+    );
 }
 
 /// Mac Pro's M5 ramp (500 at once): processes evicted in the first minute

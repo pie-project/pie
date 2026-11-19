@@ -407,11 +407,11 @@ impl Inner {
     /// each resident lane's next one: suspended processes come back as
     /// soon as room appears, every one it holds at once, not one a
     /// completion. One whose role slots found no room last time
-    /// ([`super::proc::Proc::roles_short`]) waits while the fleet decodes
-    /// (a completion frees room; funding it then thrashed), and once the
-    /// fleet is stalled (a fleet waiting at binds included) has room made
-    /// for its runs: idle cache, a coming grow, then the occupants of the
-    /// chunks it could take.
+    /// ([`super::proc::Proc::roles_short`]) goes again on the runs that
+    /// stand free, and has room made for its runs (idle cache, a coming
+    /// grow, then the occupants of the chunks it could take) only once
+    /// nothing in flight can free room, a fleet waiting at binds included:
+    /// funding it while the fleet decoded thrashed.
     pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
         let roles_short = self.procs.get(&pid).and_then(|proc| proc.roles_short);
         if self.completion_credit > 0 {
@@ -419,11 +419,17 @@ impl Inner {
             return RestoreGate::Serve;
         }
         let stalled = self.nothing_in_flight();
+        // Short of runs for its roles: it goes again on runs that stand
+        // free whatever the fleet does (the plan looks, outside this lock);
+        // room is made for it by moving others only once nothing in flight
+        // can free room (a fleet waiting at binds included). Waiting for a
+        // completion while its runs stood free, it waited on an event that
+        // need not come (Mac Pro's beam mix: 2 runs of 4 short, 440 such
+        // runs free, flat for 191 s with every thread parked).
         if let Some(need) = roles_short {
-            return if stalled {
-                RestoreGate::Evict((need.run, need.pieces))
-            } else {
-                RestoreGate::Wait
+            return RestoreGate::Evict {
+                need: (need.run, need.pieces),
+                fund: stalled,
             };
         }
         if spare < self.growth_reserve() && !stalled {
@@ -505,7 +511,8 @@ impl Inner {
 pub(super) enum RestoreGate {
     Serve,
     Wait,
-    /// Its role slots are short of `(run, pieces)` runs of whole chunks:
-    /// room is made for it ([`Step::EvictForRoles`](super::plan)).
-    Evict((u32, u32)),
+    /// Its role slots are short of `need`, `(run, pieces)` runs of whole
+    /// chunks: it goes again where they stand free, and (`fund`) room is
+    /// made for it ([`Step::EvictForRoles`](super::plan)).
+    Evict { need: (u32, u32), fund: bool },
 }

@@ -44,7 +44,9 @@ enum Step {
     /// else will free any: a resident process is evicted for it.
     /// The head restore's role slots are short of `need`, `(run, pieces)`
     /// runs of whole chunks.
-    EvictForRoles { need: (u32, u32) },
+    /// Room is made for it only where `fund` (the fleet stalled or
+    /// waiting at binds); free runs of its need send it again either way.
+    EvictForRoles { need: (u32, u32), fund: bool },
     /// The head is a restore of a process a bind short of guest-state
     /// room suspended, its kv gathered: it waits for the room that bind
     /// asks as the bind would ([`Self::BindRoom`]).
@@ -211,7 +213,9 @@ impl ResidencyPlanner {
                         _ => match inner.restore_gate(pid, spare) {
                             RestoreGate::Serve => Step::ServeRestore { key, pid },
                             RestoreGate::Wait => Step::Done,
-                            RestoreGate::Evict(need) => Step::EvictForRoles { need },
+                            RestoreGate::Evict { need, fund } => {
+                                Step::EvictForRoles { need, fund }
+                            }
                         },
                     },
                 }
@@ -291,7 +295,10 @@ impl ResidencyPlanner {
                     }
                     true
                 }
-                Step::EvictForRoles { need: (run, pieces) } => {
+                Step::EvictForRoles {
+                    need: (run, pieces),
+                    fund,
+                } => {
                     // Its runs stand free (a completion or a commit gave
                     // them back): it goes again, once a need. Short again
                     // with the same need, the need understates its unpark
@@ -314,6 +321,11 @@ impl ResidencyPlanner {
                             inner.roles_retry_head();
                         });
                         continue;
+                    }
+                    // Not funded yet: it waits for a completion (one that
+                    // frees room pokes the plan, which looks again here).
+                    if !fund {
+                        return false;
                     }
                     // Idle cache holds chunks too: one set goes, and the
                     // restore tries again in what it left, before any

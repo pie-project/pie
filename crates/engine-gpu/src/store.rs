@@ -1608,6 +1608,23 @@ impl<B: Backend> Pools<B> {
         Ok(self.disk_pages())
     }
 
+    /// Whether the host chunks are device-mapped memory a frame copies
+    /// to and from (else a heap the host copies through, in the call).
+    #[must_use]
+    pub fn host_mapped(&self) -> bool {
+        matches!(self.host, HostChunks::Mapped(_))
+    }
+
+    /// Waits out a slot file read's copy onto the device still in flight.
+    pub fn settle_spill(&mut self) -> Result<()> {
+        match &mut self.disk {
+            Some(Spill::Mapped { landing, .. }) => {
+                landing.take().map_or(Ok(()), |landing| landing.wait())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn unseat_disk(&mut self) {
         self.disk = None;
     }

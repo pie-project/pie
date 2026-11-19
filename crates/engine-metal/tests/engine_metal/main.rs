@@ -38,6 +38,8 @@ mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
+mod an_idle_lane_reports_its_last_landing;
+mod an_instance_outlives_its_failed_frame;
 mod an_operand_past_an_ints_reach_reads_its_last_rows;
 mod an_operator_declared_adapter_is_refused;
 mod an_rs_page_past_the_first_buffer_holds_its_rows;
@@ -134,9 +136,9 @@ pub(crate) fn guest_places(
         }
     };
     let pair_at = layout.free_chunk() + 8;
-    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.per_instance);
-    let places = (place(state.per_instance, own_at), place(state.per_pair, pair_at));
-    let end = own_at + chunks_of(state.per_instance);
+    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
+    let end = own_at + chunks_of(state.instance_bytes());
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
         .expect("the guest state's segments commit");
