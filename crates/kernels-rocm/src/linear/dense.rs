@@ -43,6 +43,24 @@ enum Route {
 
 /// Whether the diagonal kernels' vector reads take these planes: each one
 /// there, and the weight and the activation 16-byte aligned.
+/// [`act_x_wt`] over rows normed where the skinny kernel stages them
+/// (`super::gemv::skinny_norm_bf16`), where the product takes the skinny
+/// kernel; `Ok(false)` otherwise or where the fold does not pay.
+pub(crate) fn act_x_wt_normed(
+    ctx: &Ctx,
+    w: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    norm: super::gemv::SkinnyNorm,
+) -> Result<bool, Error> {
+    if m <= 0 || n <= 0 || k <= 0 || route(ctx, m, n, k, vector_operands(w, norm.x, y)) != Route::Skinny {
+        return Ok(false);
+    }
+    super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm)
+}
+
 fn vector_operands(w: u64, act: u64, y: u64) -> bool {
     w != 0 && act != 0 && y != 0 && aligned16(w) && aligned16(act)
 }

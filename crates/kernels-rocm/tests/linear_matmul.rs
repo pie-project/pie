@@ -405,3 +405,77 @@ fn the_live_lm_head_writes_the_last_columns_of_a_wide_vocabulary() {
         );
     }
 }
+
+/// The residual norm folded into the skinny product
+/// (`ResidualAddRmsnormMatmul`): the sum lands in its own plane, the product
+/// is the normed rows' as the norm would land them, where the measured
+/// rates say the fold pays; where they say it does not, nothing lands.
+#[test]
+fn the_normed_skinny_product_is_the_norm_then_the_product() {
+    let Some(gpu) = Gpu::open() else { return };
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.launch_ns = 1536;
+    t.hbm_gbps = 4090;
+    let ctx = gpu.ctx().with_tuning(t);
+    // (m, n, k, plus_one, folds): one row past a 304-block grid reads less
+    // than a launch's worth again, eight rows do not.
+    for (m, n, k, plus_one, folds) in [
+        (1u32, 4096u32, 1024u32, false, true),
+        (1, 3000, 1024, true, true),
+        (2, 6144, 1024, false, true),
+        (8, 4096, 1024, false, false),
+    ] {
+        let x: Vec<f32> = values((m * k) as usize, 41, 1.0).into_iter().map(round_bf16).collect();
+        let y: Vec<f32> = values((m * k) as usize, 42, 1.0).into_iter().map(round_bf16).collect();
+        let nw: Vec<f32> = values(k as usize, 43, 0.5).into_iter().map(round_bf16).collect();
+        let w: Vec<f32> = values((n * k) as usize, 44, 0.05).into_iter().map(round_bf16).collect();
+        let (xt, yt, nwt, wt) = (
+            gpu.tensor(&x, m, k, Dtype::Bf16),
+            gpu.tensor(&y, m, k, Dtype::Bf16),
+            // The norm's weight as a load lays it: k rows of one.
+            gpu.tensor(&nw, k, 1, Dtype::Bf16),
+            gpu.tensor(&w, n, k, Dtype::Bf16),
+        );
+        let mut y_out = gpu.tensor(&vec![7.0; (m * k) as usize], m, k, Dtype::Bf16);
+        let mut z = gpu.tensor(&vec![7.0; (m * n) as usize], m, n, Dtype::Bf16);
+        let mut folded_normed = gpu.tensor(&vec![7.0; (m * k) as usize], m, k, Dtype::Bf16);
+        let landed = gpu
+            .laid(&ctx, |ctx| {
+                gemm::residual_add_rmsnorm_matmul(
+                    ctx, xt, yt, nwt, plus_one, 1e-6, wt, &mut y_out, &mut folded_normed, &mut z,
+                )
+            })
+            .unwrap();
+        assert_eq!(landed, folds, "{m}x{n}x{k}: the fold's choice");
+        if !folds {
+            assert!(gpu.read(&z).iter().all(|&v| v == 7.0), "{m}x{n}x{k}: nothing lands");
+            continue;
+        }
+        let sums: Vec<f32> = y.iter().zip(&x).map(|(y, x)| round_bf16(y + x)).collect();
+        assert_eq!(gpu.read(&y_out), sums, "{m}x{n}x{k}: the sum lands as it is");
+        // The norm then the product apart, on the same kernels: the same bits.
+        let mut apart_sum = gpu.zeros(m, k, Dtype::Bf16);
+        let mut normed = gpu.zeros(m, k, Dtype::Bf16);
+        let mut apart = gpu.zeros(m, n, Dtype::Bf16);
+        gpu.laid(&ctx, |ctx| {
+            kernels_rocm::elemwise::norm_residual::residual_add_rmsnorm_into(
+                ctx, xt, yt, &mut apart_sum, nwt, plus_one, 1e-6, &mut normed,
+            )?;
+            gemm::lm_head(ctx, normed, wt, &mut apart)
+        })
+        .unwrap();
+        assert_eq!(gpu.read(&apart_sum), sums, "{m}x{n}x{k}: the norm's sum");
+        assert_eq!(
+            gpu.read(&folded_normed),
+            gpu.read(&normed),
+            "{m}x{n}x{k}: the normed rows land for their other readers"
+        );
+        assert_eq!(
+            gpu.read(&z),
+            gpu.read(&apart),
+            "{m}x{n}x{k} plus_one={plus_one}: the folded product is the norm's then the product's"
+        );
+        let want = reference(&gpu.read(&normed), &w, None, m as usize, n as usize, k as usize);
+        close_abs(&format!("{m}x{n}x{k} against the host"), &gpu.read(&z), &want, 2e-2);
+    }
+}

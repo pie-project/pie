@@ -89,6 +89,30 @@ pub enum Fused {
         #[output]
         out: ValueId,
     },
+    /// [`Fused::ResidualAddRmsnorm`] and the product `z = out · wᵀ` of its
+    /// normed rows (`Linear::Matmul`): a backend may norm the rows where it
+    /// stages them for the product, each block its own copy, one of them
+    /// landing `out` for its other readers (an adapter's correction). `y_out`
+    /// is a plane of its own (not `y`'s): every block reads `y` while one
+    /// lands the sum.
+    ResidualAddRmsnormMatmul {
+        #[input]
+        x: ValueId,
+        #[input]
+        y: ValueId,
+        #[output]
+        y_out: ValueId,
+        #[input]
+        weight: ValueId,
+        plus_one: bool,
+        eps: f32,
+        #[output]
+        out: ValueId,
+        #[input]
+        w: ValueId,
+        #[output]
+        z: ValueId,
+    },
     RmsnormResidualAdd {
         #[input]
         x: ValueId,
