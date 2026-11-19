@@ -642,3 +642,42 @@ duration. Kernel choices are compared on device durations.
 What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
 that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
 slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
+
+## F40. ROCm 4-row decode: where the 4-parallel step's ~170 µs over 1 greedy goes (MI300X, qwen3-0.6b)
+
+At short context 1 greedy is 1.31 ms a step and 4 parallel 1.48 (after the turned norm
+fold). The attach kernel trace attributed the gap mostly to o-proj + down (+78 µs). That
+was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts after a
+~290 µs idle gap, so its durations describe a cold, down-clocked device, not graph replay.
+The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
+are 0.
+
+The instrument that measures in context is ablation by duplication. Launch one product
+twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
+median of 5, two rounds):
+
+| product (per call) | m = 1 | m = 4 | 4-row extra a step |
+|---|---|---|---|
+| o-proj 1024 x 2048, skinny | 3.7 µs | 3.7 µs | 0 |
+| down 1024 x 3072, skinny | 4.6 µs | 4.8 µs | +6 |
+| qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
+| gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
+
+About 100 µs is the folded products on the turned kernel. The other ~70 µs is not yet
+ablated: attention, the qkv/rope kernel, the m = 4 lm head, and the host side (four lanes'
+sampling and channel work).
+
+Tried, none kept (4-parallel ms a step, against 1.475–1.484):
+- skinny at m = 4: staging the activation four loads at a time (worse); reading it from
+  global, not LDS (no change); 16-wave blocks over 64 (worse); a grid trimmed to the blocks
+  with rows (noise); the quad kernel on narrow banks (much worse, 402 vs 306 µs traced);
+- turn_min_n removed (o-proj on turn): 1.510 (F39);
+- the turned kernel's tiles spread evenly (192 two-tile blocks for gate-up's 384 tiles over
+  304 CUs): 1.498–1.505.
+
+Next:
+- gated turned product at m = 4 (9.0 vs 6.6 µs at m = 1 on skinny): an exact device-duration
+  breakdown (the norm stage per block × 384 blocks, the gated epilogue, residency);
+- ablate the remaining ~70 µs the same way;
+- the duplication switch is a scratch patch: a profile probe that times a kernel in place
+  (in a captured body) would make it a standing instrument.
