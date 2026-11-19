@@ -4687,42 +4687,111 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                     planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some()),
                 )
         };
-        planner.poke();
-        for _ in 0..200 {
-            crate::rt::yield_now().await;
-        }
-        let served_bind = bind.as_ref().is_some_and(|bind| bind.is_finished());
-        let made = progress(&planner, &pool) + u64::from(served_bind);
-        let stands = pool.guest_room_free(run, pieces);
-        let servable = stands
-            && understated_at.is_none_or(|at| pool.guest_free_runs(run) > at);
-        let compactable = !stands && pool.compactable.load(Ordering::Acquire);
-        if (servable || compactable) && made == 0 {
-            failures.push(format!(
-                "seed {seed}: total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
-                 understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-                 servable={servable} compactable={compactable}: no progress",
-                residents.len()
-            ));
-        }
-        // Quiescent: nothing more happens without an event.
-        let before = (
-            progress(&planner, &pool),
-            planner.stats.compaction_waits.load(Ordering::Relaxed),
-            planner.stats.grow_waits.load(Ordering::Relaxed),
-        );
-        for _ in 0..100 {
-            crate::rt::yield_now().await;
-        }
-        let after = (
-            progress(&planner, &pool),
-            planner.stats.compaction_waits.load(Ordering::Relaxed),
-            planner.stats.grow_waits.load(Ordering::Relaxed),
-        );
-        if before != after {
-            failures.push(format!(
-                "seed {seed}: a quiescent planner kept stepping: {before:?} -> {after:?}"
-            ));
+        // Time steps: at each, an event (or none), then quiescence, then
+        // the property; the schedule is kept to print.
+        let mut schedule = vec![format!(
+            "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
+             understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
+             compactable={}",
+            residents.len(),
+            pool.compactable.load(Ordering::Acquire)
+        )];
+        let mut applied = 0u32;
+        let mut alive = residents.clone();
+        for step in 0..8 {
+            if step > 0 {
+                match rng.below(5) {
+                    // A chunk taken: fragmentation.
+                    0 => {
+                        let mut free = pool.free.lock();
+                        if !free.is_empty() {
+                            let at = rng.below(free.len() as u64) as usize;
+                            let id = free.remove(at);
+                            schedule.push(format!("take {id}"));
+                        }
+                    }
+                    // A chunk given back.
+                    1 => {
+                        let held: Vec<u32> =
+                            (0..total).filter(|id| !pool.free.lock().contains(id)).collect();
+                        if !held.is_empty() {
+                            let id = held[rng.below(held.len() as u64) as usize];
+                            pool.free.lock().push(id);
+                            pool.gives.fetch_add(1, Ordering::Relaxed);
+                            schedule.push(format!("give {id}"));
+                        }
+                    }
+                    // An asked compaction carried out: the free chunks moved
+                    // to the lowest ids, a run standing where they suffice.
+                    2 if pool.compactions.load(Ordering::Relaxed) > applied => {
+                        applied = pool.compactions.load(Ordering::Relaxed);
+                        let mut free = pool.free.lock();
+                        let count = free.len() as u32;
+                        free.clear();
+                        free.extend(0..count);
+                        pool.gives.fetch_add(1, Ordering::Relaxed);
+                        schedule.push("compaction carried out".into());
+                    }
+                    // A resident completes.
+                    3 if !alive.is_empty() => {
+                        let pid = alive.remove(rng.below(alive.len() as u64) as usize);
+                        planner.unregister(pid);
+                        schedule.push("a resident completes".into());
+                    }
+                    _ => schedule.push("nothing".into()),
+                }
+            }
+            let before = progress(&planner, &pool)
+                + u64::from(bind.as_ref().is_some_and(|bind| bind.is_finished()));
+            planner.pages_freed();
+            planner.poke();
+            for _ in 0..200 {
+                crate::rt::yield_now().await;
+            }
+            let served_bind = bind.as_ref().is_some_and(|bind| bind.is_finished());
+            let made = progress(&planner, &pool) + u64::from(served_bind);
+            let head_served = planner.stats.restores.load(Ordering::Relaxed) > 0 || served_bind;
+            if head_served {
+                break;
+            }
+            let stands = pool.guest_room_free(run, pieces);
+            let retried = planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some());
+            let at = planner.with_inner(|inner| {
+                let proc = &inner.procs[&head];
+                proc.roles_free_short.map(|_| proc.roles_free_short_at)
+            });
+            let servable = stands && at.is_none_or(|at| pool.guest_free_runs(run) > at);
+            let compactable = !stands && pool.compactable.load(Ordering::Acquire);
+            if (servable || compactable) && made == before && !retried && made == 0 {
+                failures.push(format!(
+                    "seed {seed} step {step}: servable={servable} compactable={compactable}: no \
+                     progress\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Quiescent: nothing more happens without an event.
+            let still = (
+                progress(&planner, &pool),
+                planner.stats.compaction_waits.load(Ordering::Relaxed),
+                planner.stats.grow_waits.load(Ordering::Relaxed),
+            );
+            for _ in 0..100 {
+                crate::rt::yield_now().await;
+            }
+            let after = (
+                progress(&planner, &pool),
+                planner.stats.compaction_waits.load(Ordering::Relaxed),
+                planner.stats.grow_waits.load(Ordering::Relaxed),
+            );
+            if still != after {
+                failures.push(format!(
+                    "seed {seed} step {step}: a quiescent planner kept stepping: {still:?} -> \
+                     {after:?}\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
         }
         if let Some(bind) = bind {
             bind.abort();

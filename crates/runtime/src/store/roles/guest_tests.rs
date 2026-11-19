@@ -2355,3 +2355,105 @@ fn a_restore_of_a_shared_pair_leaves_another_s_instance_parked_where_it_lies_unb
     );
     assert!(!named_nothing(&stale), "with its scratch: {stale:?}");
 }
+
+/// Bindings are never lost nor empty, as a property over seeded schedules:
+/// four processes bind instances of one program (sharing its pair), then
+/// park and restore in random order, with a host tier below or none (each
+/// parking where it lies, its scratch given back). After every restore,
+/// each rebind names its instance's tables and a place for its scratch and
+/// its pair (never an emptied part), only that process's own instances
+/// and those of a pair's holders that lie whole on the device are rebound,
+/// and every instance of a process on the device is bound somewhere.
+/// Failing seeds print their schedules to replay.
+#[test]
+fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedules() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+    let mut failures = Vec::new();
+    for seed in 0..300u64 {
+        let mut rng = Rng(seed);
+        let host_tier = rng.below(2) == 0;
+        let facts = facts(64);
+        let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+        let host = host_tier.then(|| {
+            Arc::new(Mutex::new(
+                SharedPool::tier(&facts, facts.host_chunks).unwrap().unwrap(),
+            ))
+        });
+        let roles = Arc::new(Mutex::new(Roles::new(&device, host.as_ref()).unwrap()));
+        let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+        let procs = 2 + rng.below(3) as u128;
+        let mut ids = Vec::new();
+        for by in 1..=procs {
+            ids.push((by, bind(&roles, &mut engine, by).unwrap()));
+        }
+        let mut parked = vec![false; procs as usize + 1];
+        let mut schedule = vec![format!("host_tier={host_tier} procs={procs}")];
+        let mut failed = None;
+        for _ in 0..12 {
+            let by = 1 + rng.below(procs as u64) as u128;
+            if parked[by as usize] {
+                let back = roles.lock().unwrap().prepare_unpark(holder(by));
+                match back {
+                    Ok(Some(txn)) => {
+                        roles.lock().unwrap().commit(txn);
+                        schedule.push(format!("restore {by}"));
+                    }
+                    Ok(None) => schedule.push(format!("restore {by} (nothing moved)")),
+                    Err(error) => {
+                        schedule.push(format!("restore {by} refused: {error}"));
+                        continue;
+                    }
+                }
+                parked[by as usize] = false;
+                let stale = roles.lock().unwrap().stale(holder(by));
+                for rebind in &stale {
+                    if let Rebind::Instance {
+                        id, scratch, pair, ..
+                    } = rebind
+                    {
+                        let owner = ids.iter().find(|(_, at)| at == id).map(|(by, _)| *by);
+                        if owner.is_some_and(|owner| parked[owner as usize]) {
+                            failed = Some(format!("rebound {id:?} of parked process {owner:?}"));
+                        } else if matches!(scratch, ScratchPlace::None)
+                            || matches!(pair, ScratchPlace::None)
+                        {
+                            failed = Some(format!("{rebind:?} names an emptied part"));
+                        }
+                    }
+                }
+                for rebind in stale {
+                    roles.lock().unwrap().rebound(super::Owner::of(&rebind));
+                }
+            } else {
+                let park = roles.lock().unwrap().prepare_park(holder(by));
+                if let Some(txn) = park {
+                    roles.lock().unwrap().commit(txn);
+                }
+                parked[by as usize] = true;
+                schedule.push(format!("park {by}"));
+            }
+            if failed.is_some() {
+                break;
+            }
+        }
+        if let Some(why) = failed {
+            failures.push(format!("seed {seed}: {why}\n  schedule: {}", schedule.join(" -> ")));
+            if failures.len() > 10 {
+                break;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
+}
