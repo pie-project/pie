@@ -1555,6 +1555,62 @@ milestone's tail.
       unshuffle on the wafer); a clip other than a square of powers of two.
     - `pie run text-to-media` on the simulator with the tiled decode (compile on load now
       picks it; M1i's run used the rows regime); klein's VAE on a system.
+  - **klein's 128² decode on the chip** (requests 1552-1565). 1552 / 1555 hung at the mid-block
+    attention's first key: a PE sent towards the hub before posting its receive of the
+    broadcast, and a 512-word key overflows the loop's routers and queues (flux2-mini's 32-word
+    keys fit). On the simulator (a 4 x 4-latent cut through the attention) the 24 last-column
+    PEs below the key's row stall forwarding it south with `q_bi` full. The hub's loops are now
+    sent async (`check::hazard::hub_loops`; the emitter refuses an open one). 1562 ran it; 1565
+    held the pixels to engine-cpu's decode of the same latent (`wafer-bench --rows 1
+    --checkpoint`, `READING_CPU`): **rel L2 3.78e-3, cosine 0.9999929, 66.6 dB**.
+  - **The price on the chip** (1565, the tape's stamps: each tape PE stamps its own words gone,
+    the array having read the stream to there; `tools/wafer/stream/tape_profile.py` over `wafer-compile --parts`'s
+    words an op). The launch's stamps read 114.4M cycles against 58.4M priced, but a PE's stamps
+    are its own time since its launch arrived, and the launch reached parts of the fabric up to
+    ~51M cycles apart: the 1,024 PEs of the image's rows `Y % 8 == 0` end at 63.5-63.8M, the
+    other 15,360 at 114.4M; the tape's own clock jumps by -18.6M and -2.9M where its snake
+    enters rows 12 and 17. Spliced at those turns (the stream through the tape is continuous),
+    the stream ends at 63.3M, with the last PEs' 63.5M: **the decode computes in ~63.5M**, the
+    rest is the launch's arrival. Co-resident in Pie's program (1566, the e2e through Pie) the
+    same decode's stamps read 63.54M, 87 ms.
+
+    | by kind and resolution | priced | chip (spliced) | |
+    |---|---|---|---|
+    | conv 16² | 29.03M | 32.35M | 1.11x |
+    | conv 32² | 18.76M | 20.29M | 1.08x |
+    | conv 64² | 7.58M | 8.33M | 1.10x |
+    | conv 128² | 1.96M | 2.25M | 1.15x |
+    | the attention (between conv 16's and conv 19's words, less conv 19) | 0.85M | ~1.74M | ~2x |
+
+    Every 512-channel 3 x 3 convolution reads its 1,180,160 words in 2.91M cycles at every
+    resolution (priced 2.68M): the weight stream's words are 0.17 cycles dearer than a
+    wavelet (`cost::tiled::STREAM_WORD` 1.17, the rest the ops' tails: a norm's apply, priced with
+    the norm, falls before the next op's words). A key's turn through the hub's loop is serial
+    (the next key's sender waits for the last one's broadcast): `KEY` 1,350 + `KEY_HOP` 8.3 a PE
+    of `gx + gy`, fitted on the simulator's 32 x 32 attention (16 keys, 83.3k cycles; priced
+    88.3k now) and the chip's 128 x 128 one. Priced so, klein's 128² decode is **63.6M** (the
+    chip's 63.3-63.8M); flux2-mini's 2 x 2-tile decode 1.0M (0.9M before; the simulator's
+    0.76M). At 1024² the attention's 16,384 keys dominate: the search moves klein's 1024² decode
+    from the 512 x 1024 array (now 348M, 285M of it the attention) to 256 x 512 (254M). The hop
+    term is fitted at 64 and 256 PEs of `gx + gy` and extrapolated to 1,536 there: measure it
+    before relying on it; the remedy is the attention's (keys pipelined through the loop, not
+    one at a time), not the tile.
+  - **The picks on the chip** (1568: each decode one step at a drawn latent, held to engine-cpu,
+    the tape's stamps spliced as above; the longest PE's own clock in brackets, the launch's
+    arrival in it):
+
+    | decode | tile, array | priced old / new | chip, spliced (raw) | vs engine-cpu |
+    |---|---|---|---|---|
+    | flux2-mini 128² | 1,1, 128 x 128 | 0.9M / 1.8M | 1.38M (1.79M) | |
+    | flux2-mini 128² | 2,2, 64 x 64 | 1.0M / 1.6M | **1.19M** (1.41M) | 50.4 dB |
+    | klein 512² | 1,1, 512 x 512 | 71.3M / 115.8M | 112.7M (162.0M) | |
+    | klein 512² | 1,2, 256 x 512 | 72.3M / 108.1M | **105.7M** (157.5M) | 64.9 dB |
+
+    The new price ranks both pairs as the chip does (the old one ranked klein's the other way)
+    and holds klein within 3% (the key's hop term at `gx + gy` 768 and 1,024, three and four
+    times its fit's). flux2-mini it prices 30-35% high: its keys are 32 words to klein's 512,
+    and a key's turn on the chip is about half the fitted one there; the turn's part a key's
+    words make is not modelled.
 
 - **M1j** (flux2-mini on the CS-3: the stream, tiled and rows programs on a system for the first
   time; requests 1458-1468, one session). Each program linked on the worker by its own cslc

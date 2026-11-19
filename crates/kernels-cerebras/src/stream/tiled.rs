@@ -1887,7 +1887,10 @@ mod tests {
     }
 
     /// klein-4B's decode at 1024² (latent 128²) places within a system's fabric: the search's
-    /// array 512 x 1024, each PE's data within its budget.
+    /// array 256 x 512 (a 2 x 2 top tile), each PE's data within its budget. (With a key's turn
+    /// through the hub's loop priced, `cost::tiled::KEY_HOP`, the mid-block attention's 16,384
+    /// keys cost a row and column's length each: the 512 x 1024 array, 1 x 1 pixels a PE, prices
+    /// at more than twice the 256 x 512's.)
     #[test]
     fn kleins_vae_decode_places_at_1024() {
         let t = trace("flux2-klein-4b-bf16-kv-bf16");
@@ -1901,7 +1904,7 @@ mod tests {
             Some((b.w, b.h)),
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((p.gx, p.gy), (512, 1024));
+        assert_eq!((p.gx, p.gy), (256, 512));
         let (w, h) = p.fabric();
         assert!(w <= b.w && h <= b.h);
         assert!(p.arena + p.hx / 2 + p.wb <= DATA_WORDS);

@@ -2,7 +2,8 @@
 //! the next, every PE in lockstep with the weight stream and the all-reduces, so an op costs its
 //! busiest PE's work plus what passes through every PE (the stream's words, the keys):
 //!
-//! - **A convolution**: its weight blocks' words received ([`WORD`] a word, two weights a word)
+//! - **A convolution**: its weight blocks' words received ([`STREAM_WORD`] a word, two weights a
+//!   word)
 //!   and multiplied ([`super::stream::P1_STREAM`] an element, `P` pixels a PE), not
 //!   overlapped (the receive is synchronous); its input staged 16-bit and its halos exchanged
 //!   (eight phases, each a border's words and its hops); its bias added.
@@ -14,7 +15,8 @@
 //! - **An upsampling**: the copy, a move's words and hops.
 //! - **The attention**: every key past every PE: its 16-bit [k | v] received (and forwarded on
 //!   the row and column it comes along), widened, and each of a PE's queries' score (a product,
-//!   a halving sum), its exponent ([`SCALAR`]s) and its value's accumulation.
+//!   a halving sum), its exponent ([`SCALAR`]s) and its value's accumulation; and a key's turn
+//!   through the hub's loop ([`KEY`], [`KEY_HOP`]).
 //!
 //! Each op but the host's in and out adds [`OP`], fitted on the simulator.
 
@@ -28,6 +30,21 @@ use crate::stream::tiled::{TOp, TileProgram};
 
 /// A wavelet received or sent.
 pub const WORD: f64 = 1.0;
+/// A wavelet of the weight stream: from the tape's snake up the spine and along every row to
+/// every PE at once, the array reading it in lockstep. On the chip (1565, klein's 128² decode,
+/// its tape's stamps: each tape PE's own words gone) the 512-channel convolutions read it at
+/// 1.088x their price with [`WORD`] (2.91M against 2.68M cycles, 1,180,160 words each, at every
+/// resolution alike), the decode's 24.8M words 5.9M cycles past it: 0.17 a word more, the rest
+/// the ops' own tails (a norm's apply, priced with the norm, read before the next op's words).
+pub const STREAM_WORD: f64 = 1.17;
+/// A key's turn through the hub's loop (its row and the last column forwarded by every PE on
+/// the way, the hub, the broadcast tree back) on top of its words and its queries' work: a fixed
+/// part and a part an array's row and column long. Fitted on two attentions of klein's decode at
+/// 512 channels: a 4 x 4 latent's 16 keys over a 32 x 32 array on the simulator (83.3k cycles,
+/// 1.9k a key past the price without it) and the 128² decode's 256 keys over 128 x 128 on the
+/// chip (1565: ~1.74M cycles between its neighbours' stream words, 3.5k a key past it).
+pub const KEY: f64 = 1_350.0;
+pub const KEY_HOP: f64 = 8.3;
 /// A DSD op's or a call's fixed cycles.
 pub const CALL: f64 = 40.0;
 /// A wavelet's hop through a router.
@@ -115,7 +132,7 @@ pub fn time(p: &TileProgram) -> TileCost {
                 let weights = taps * cin_ * cout_;
                 let kb = f64::from(p.kb[i].max(1));
                 let blocks = taps * cin_ / kb;
-                let recv = weights / 2.0 * WORD + blocks * CALL;
+                let recv = weights / 2.0 * STREAM_WORD + blocks * CALL;
                 let mac = px * weights * P1_STREAM + blocks * px * CALL;
                 let lx = p.lay_of(*x);
                 // the input staged a chunk of kc channels at a time, its halo exchanged
@@ -134,7 +151,7 @@ pub fn time(p: &TileProgram) -> TileCost {
                     px * cin_ * DSD_ELEM
                 };
                 let tail = if bias.is_some() {
-                    cout_ * WORD + px * cout_ * DSD_ELEM
+                    cout_ * STREAM_WORD + px * cout_ * DSD_ELEM
                 } else {
                     0.0
                 } + if p.vals[y].round {
@@ -152,7 +169,7 @@ pub fn time(p: &TileProgram) -> TileCost {
                 let px = f64::from(l.px());
                 let local = px * c * 4.0 * DSD_ELEM + 2.0 * c * SCALAR / 4.0;
                 let ar = 2.0 * all_reduce(p, *groups);
-                let recv = 2.0 * c * WORD + c * SCALAR;
+                let recv = 2.0 * c * STREAM_WORD + c * SCALAR;
                 ("norm", *y, local + ar + recv + region(p, *reg, l.px()))
             }
             TOp::Region(r) => {
@@ -161,7 +178,7 @@ pub fn time(p: &TileProgram) -> TileCost {
                 let l = p.lay_of(out);
                 let res = g.ins.iter().filter(|i| matches!(i, RegIn::Res(_))).count() as f64
                     * f64::from(g.region.width)
-                    * WORD;
+                    * STREAM_WORD;
                 ("region", out, res + region(p, *r, l.px()))
             }
             TOp::Up { x, y, axis, .. } => {
@@ -184,7 +201,9 @@ pub fn time(p: &TileProgram) -> TileCost {
                 // a key: forwarded along its row and column, received off the broadcast (two
                 // 16-bit values a wavelet), widened; each query's product, halving sum,
                 // exponent, accumulation
-                let per = c * WORD
+                let per = KEY
+                    + f64::from(p.gx + p.gy) * KEY_HOP
+                    + c * WORD
                     + c * WORD
                     + 2.0 * c * DSD_ELEM
                     + f64::from(l.px())
