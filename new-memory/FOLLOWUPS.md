@@ -294,3 +294,44 @@ a device test that a park of guest state an owed epilogue is still writing
 waits for it, and one with none owed does not. Gate: 0 divergences on the
 200 + 300 load at depths 1 / 2 / 4, eviction copy phase and load walls
 against the landing hash.
+
+## F27. The ROCm audit items, measured on MI300X (gfx942)
+
+From the serialization audit's six ROCm items (5355faa9a), each measured
+before any change, on memory-redesign 5963ceb17 / c1188a53d:
+
+1. **lm head over padded rows below 129** (`kernels-rocm linear/gemm.rs:142`
+   `lm_head_live`, `engine-cuda profiles/gfx94.toml:45` `gemm.live_from =
+   129`): no change. Activation rungs are powers of two, so a body's live
+   rows are always more than half its rung. Qwen-7B-shaped head (151936 ×
+   3584): from half to full live, the live route is 0–55 µs slower than the
+   padded product at 32–128 rows (e.g. 64 rows: 351–365 µs padded,
+   374–385 µs live); it wins (up to ~115 µs) only at ≤ ¼ live, which a
+   power-of-two rung never leaves. 129 stands.
+2. **Only gfx94 is tuned** (`engine-cuda chip.rs:217`): MI200 (gfx90a) and
+   gfx950 boot on the defaults (`gemm.live_from` 0, the turned GEMM off,
+   `gemm.turn_from` / `turn_until` unset). Not measurable here (gfx942
+   only); needs a tune on each chip.
+3. **HIP graphs have no conditional node** (`engine-cuda chip.rs:155`,
+   `window.rs:1194`): the per-node fixed cost is real but not the
+   conditionals'. A graph node replays at ~1.55–1.6 µs even when empty
+   (hipcc microbench: 367 empty kernel nodes replay in 567–594 µs). The
+   1-lane decode body `b1[c1:1]` has 367 nodes and replays at 1756 µs a fire
+   (`arm-bench`), the served greedy step's 1.76 ms: ~0.57 ms (a third) is
+   the node floor. A conditional skips no node there: bodies are keyed by
+   the classes present (`record.rs` `Ladder`), so a single-class body holds
+   none to skip. The lever is fewer nodes a step (fusions, one launch for
+   what is now several), not conditionals; gate on `arm-bench` µs/fire and
+   the greedy wall.
+4. **Staging over 1 MiB falls back to a pageable `hipMemcpyAsync`**
+   (`engine-cuda device/hip/held.rs:17`, `:20` `RING_SLOT_BYTES`): never
+   reached; an instrumented build counted 0 such copies on c64 and on the
+   200 + 300 beam load. No change.
+5. **One block per argmax row** (`kernels-rocm sampling/topk.rs:15`): bf16
+   at 151936 columns, 7.5 µs at 1 row, 7.8 at 8, 8.4 at 64, 21.7 at 256
+   (3.6 TB/s); f32 8.9–40 µs. A split-row argmax might save ~4–5 µs a step,
+   ≤ 0.3% of a 1-lane greedy step. Not worth a kernel today.
+6. **`kernels_rocm::tally::declined()` had no caller**: fixed
+   (sc/amd-rocm-declined c6fbc79af): counted where `hip/lt.rs:387`
+   answers `Ok(false)` (rocBLAS takes the product). No shape declines on c64
+   or the beam load.
