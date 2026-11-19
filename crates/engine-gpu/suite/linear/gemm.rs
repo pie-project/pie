@@ -2,7 +2,7 @@
 //! vector kernels at 1 to 16 rows on each workgroup's rows (an even
 //! contraction in eight-wide loads, an odd one; odd column counts on
 //! SPIR-V; at the subgroup tier too where every subgroup is 32 lanes), the
-//! tiled kernel over ragged tiles, the register tile from 96 rows at its
+//! tiled kernel over ragged tiles, the register tile from 256 rows at its
 //! 64- and 32-column forms, the cooperative-matrix tier where the device has
 //! one, and the f32 lane form at every weight and result dtype (f32 results
 //! only on WGSL).
@@ -57,9 +57,9 @@ fn the_dense_matmuls_answer_the_reference() {
         (9, 22, 61, kernels_slang::Tier::Baseline, 16),
         (40, 50, 70, kernels_slang::Tier::Baseline, 0),
         (70, 66, 33, kernels_slang::Tier::Baseline, 0),
-        // The register tile from 96 rows: its 64- and 32-column forms.
-        (130, 70, 48, kernels_slang::Tier::Baseline, 0),
-        (100, 96, 32, kernels_slang::Tier::Baseline, 0),
+        // The register tile from 256 rows: its 64- and 32-column forms.
+        (260, 70, 48, kernels_slang::Tier::Baseline, 0),
+        (300, 96, 32, kernels_slang::Tier::Baseline, 0),
     ];
     // The eight-column kernel at 1 to 16 rows on each workgroup's rows:
     // a block of them, the last part-filled, past them.

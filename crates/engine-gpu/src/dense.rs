@@ -221,4 +221,36 @@ mod tests {
         let refused = choose(Target::Spirv, &[1, 2], tiled, &rates(None), &counts());
         assert_eq!(refused.unwrap_err(), "few_row_tflops");
     }
+
+    /// The tiled kernels' cost never falls as a rung's rows grow, on every
+    /// target and tier, at one rate (a flat curve, so only the padding
+    /// moves): each rung pads to the tile the kernel takes there.
+    #[test]
+    fn the_tiled_cost_grows_with_the_rows() {
+        let rungs: Vec<u32> = engine::memory::rungs(1, 8192);
+        for target in [Target::Spirv, Target::Wgsl] {
+            for tier in [Tier::Baseline, Tier::Coopmat] {
+                let tiled = |_| Tactic { tier, vector: 0 };
+                let flat = profile::fire::Rates {
+                    gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0)])]),
+                    ..rates(Some(5.0))
+                };
+                let (_, weighed) = choose(target, &rungs, tiled, &flat, &counts()).unwrap();
+                for pair in weighed.windows(2) {
+                    assert!(
+                        pair[1].tiled_ns >= pair[0].tiled_ns
+                            && pair[1].vector_ns >= pair[0].vector_ns,
+                        "{target:?} {tier:?}: {pair:?}"
+                    );
+                }
+                // Past the widest tile the padding is the rows': twice the
+                // rows, twice the flops (the curve is flat past its last point).
+                let last = &weighed[weighed.len() - 2..];
+                assert!(
+                    last[1].tiled_ns > 1.9 * last[0].tiled_ns,
+                    "{target:?} {tier:?}: {last:?}"
+                );
+            }
+        }
+    }
 }
