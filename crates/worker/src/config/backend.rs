@@ -193,8 +193,8 @@ pub struct CerebrasEngineOptions {
     pub target: String,
     /// The CS system's `host:port`. Omit to run the fabric simulator.
     pub cmaddr: Option<String>,
-    /// Host threads the simulator uses.
-    pub num_threads: u32,
+    /// Host threads the simulator uses; omit for the host's available parallelism.
+    pub num_threads: Option<u32>,
     /// The most tokens one fire carries. Omit for the engine's own.
     pub max_forward_tokens: Option<u32>,
     /// The most requests one fire carries. Omit for the engine's own.
@@ -211,17 +211,14 @@ pub struct CerebrasEngineOptions {
     /// the engine's default (off).
     #[serde(rename = "async")]
     pub asynchronous: Option<bool>,
-    /// Steps a posted token loop runs past its row; omit for the program's own.
-    pub posted_loop: Option<u32>,
-    /// `[engine.wafer]`: `preset` (the family's preset by name, else the first that builds),
-    /// `build` (`"on_load"`, or `"never"`: refuse a program not compiled before), `tiles`
-    /// (`"cache"`, or `"memory"`: cut for each load). Checked by the engine at boot.
+    /// `[engine.wafer]`: `build` (`"on_load"`, or `"never"`: refuse a program not compiled
+    /// before), `tiles` (`"cache"`, or `"memory"`: cut for each load). Checked by the engine.
     pub wafer: Option<toml::Table>,
     /// `[engine.toolchain]`: where the SDK image's toolchain is when off its default layout
     /// (`cslc`, `cslang_root`, `python`, `sdk_lib`, `compile_timeout`).
     pub toolchain: Option<toml::Table>,
-    /// `[engine.debug]`: bench and experiment settings (`program`, `weights`, `set`, `levers`,
-    /// `force_prompt`, `posted`, `loop_room`); a load with any logs them.
+    /// `[engine.debug]`: bench and experiment settings (`program`, `link`, `stream_fabric`,
+    /// `weights`, `preset`, `set`, `levers`); a load with any logs them.
     pub debug: Option<toml::Table>,
 }
 
@@ -230,14 +227,13 @@ impl Default for CerebrasEngineOptions {
         Self {
             target: "wse3".to_string(),
             cmaddr: None,
-            num_threads: 16,
+            num_threads: None,
             max_forward_tokens: None,
             max_forward_requests: None,
             max_state_slots: Removed::default(),
             max_model_len: None,
             lookahead: None,
             asynchronous: None,
-            posted_loop: None,
             wafer: None,
             toolchain: None,
             debug: None,
@@ -252,7 +248,10 @@ impl CerebrasEngineOptions {
             "engine.target must be one of \"wse2\", \"wse3\"; got {:?}",
             self.target
         );
-        ensure!(self.num_threads > 0, "engine.num_threads must be > 0");
+        ensure!(
+            self.num_threads != Some(0),
+            "engine.num_threads must be > 0 (omit it for the host's available parallelism)"
+        );
         limits_are_positive(self.max_forward_tokens, self.max_forward_requests)
     }
 }

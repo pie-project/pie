@@ -1,24 +1,19 @@
-//! The wafer program host's whole output for one artifact and prep, on a recording device: the
-//! artifact `wafer-compile build` wrote, read as the engine reads it, then what `ArtifactModel::open`
-//! places (every PE's words of every symbol, rcfg in full),
-//! the calls it makes, the values it derives, and one greedy launch's host
-//! traffic. Two runs (before and after a change) compare file for file
-//! (`crates/kernels-cerebras/tools/wafer/baseline`).
+//! The wafer program host's whole output for one artifact and prep, on a recording device: what
+//! `ArtifactModel::open` places, the calls it makes, the values it derives and one greedy
+//! launch's traffic. Two runs (before and after a change) compare file for file.
 //!
 //! `artifact_baseline <artifact dir> <prep dir> <prefix> <vocab> <out dir>`
 //!
-//! Writes into `<out dir>`: `pe.tsv` (`sym x y n bits sha256` a PE, the last
-//! write of each symbol, sorted), `rcfg.txt` (`x y w..` a PE), `calls.log`
-//! (every device call in order, copies as `sym x y w h n bits sha256`) and
-//! `derived.json` (the model's public fields after open).
+//! Writes into `<out dir>`: `pe.tsv` (`sym x y n bits sha256` a PE), `rcfg.txt` (`x y w..` a PE),
+//! `calls.log` (every device call in order) and `derived.json` (the model's fields after open).
 
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use engine_cerebras::artifact::{ArtifactModel, Weights};
+use engine_cerebras::device::Device;
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
-use engine_cerebras::spatial::artifact::{ArtifactModel, Weights};
-use engine_cerebras::spatial::device::Device;
-use kernels_cerebras::spatial::artifact::Artifact;
+use kernels_cerebras::compile::artifact::Artifact;
 use sha2::{Digest, Sha256};
 
 fn hex(d: &[u8]) -> String {

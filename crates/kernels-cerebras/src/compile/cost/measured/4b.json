@@ -1,0 +1,9 @@
+{
+  "name": "4b",
+  "kernels": "own",
+  "ms": 0.48,
+  "source": "Qwen3.5 4B: the bare step (wafer-bench) where the chip ran it, else Pie decode",
+  "measured_on": [2560, 32, 9216],
+  "keys": {"G2": 12, "G2Y": 12, "HR": 1153, "K": 4, "NE": 86, "PX": 256, "PY": 192, "UNX": 2, "UNY": 4, "VR": 216, "WL": 1},
+  "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
+}

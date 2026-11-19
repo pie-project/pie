@@ -669,7 +669,7 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             if append.is_some_and(|a| a.cache == v) {
                 continue;
             }
-            if read.by.is_some() || read.from > 0 || read.half {
+            if read.by.is_some() || read.from > 0 || read.half || read.elem {
                 return None;
             }
             let input = match chain::form(trace, v)? {

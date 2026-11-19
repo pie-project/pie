@@ -42,8 +42,8 @@ use kernels_ir::build::{self, Ops};
 use kernels_ir::{Binary, Op, Reduce, Region, Shape, Unary};
 use poem_ir::{
     ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Gather, GluAct, Linear,
-    ModulateForm, Node, NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate, Trace,
-    Turn, Ty, ValueId,
+    ModulateForm, Node, NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate,
+    RopeForm, Trace, Turn, Ty, ValueId,
 };
 
 /// The most ops one chain holds.
@@ -378,8 +378,13 @@ pub(super) struct Rows {
 /// The rows `node` runs over, if this module lowers it: every value it
 /// reads or writes is a row of one width (or a weight that wide).
 pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
+    row_of_with(trace, node, false)
+}
+
+/// [`row_of`], `explicit`: also over the ops only a named run lowers ([`lower_run`]).
+fn row_of_with(trace: &Trace, node: u32, explicit: bool) -> Option<Rows> {
     let op = &trace.nodes[node as usize].op;
-    if !lowers(op) {
+    if !lowers(op) && !(explicit && lowers_explicitly(op)) {
         return None;
     }
     // A device scale is its first element: a region reads one of a weight
@@ -397,9 +402,9 @@ pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
     op.outputs(&mut outs);
     // what the op reads of a row by id or from a column on is a row's part
     // of another plane, its width that plane's
-    let parted = reads_of(op, 0)
+    let parted = reads_with(op, 0, explicit)
         .into_iter()
-        .filter(|read| read.by.is_some() || read.from > 0 || read.half)
+        .filter(|read| read.by.is_some() || read.from > 0 || read.half || read.elem)
         .map(|read| read.value)
         .collect::<Vec<_>>();
     ins.retain(|v| !parted.contains(v));
@@ -448,13 +453,15 @@ fn ins_of(op: &Operation) -> Vec<ValueId> {
 }
 
 /// One value an op reads, and how: as its own rows, or by id (`by`, one
-/// element a row) and from a column on; `half`, a part of a wider row.
+/// element a row) and from a column on; `half`, a part of a wider row;
+/// `elem`, its row's element `from` alone (one of a row's positions).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Read {
     pub(super) value: ValueId,
     pub(super) by: Option<ValueId>,
     pub(super) from: u32,
     pub(super) half: bool,
+    pub(super) elem: bool,
 }
 
 impl Read {
@@ -464,6 +471,7 @@ impl Read {
             by: None,
             from: 0,
             half: false,
+            elem: false,
         }
     }
 }
@@ -477,6 +485,7 @@ pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
         by,
         from,
         half: true,
+        elem: false,
     };
     match op {
         Operation::Elemwise(Elemwise::Modulate {
@@ -516,7 +525,46 @@ pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
             width: part,
             ..
         }) => vec![parted(*table, None, layer.saturating_mul(*part))],
+        // a rotation over position axes: each axis's position, one element a row
+        Operation::Elemwise(Elemwise::RopeAxes {
+            x, positions, dims, ..
+        }) => {
+            let mut reads = vec![Read::plain(*x)];
+            for (axis, _) in (0u32..).zip(dims).filter(|(_, d)| **d > 0) {
+                reads.push(Read {
+                    value: *positions,
+                    by: None,
+                    from: axis,
+                    half: false,
+                    elem: true,
+                });
+            }
+            reads
+        }
         _ => ins_of(op).into_iter().map(Read::plain).collect(),
+    }
+}
+
+/// [`reads_of`], and, for a named run, a gated MLP's packed `[gate | up]` row read as its
+/// two halves.
+fn reads_with(op: &Operation, width: u32, explicit: bool) -> Vec<Read> {
+    match op {
+        Operation::Linear(Linear::Glu {
+            packed: Some(packed),
+            gate: None,
+            up: None,
+            intermediate,
+            ..
+        }) if explicit => [0, *intermediate]
+            .map(|from| Read {
+                value: *packed,
+                by: None,
+                from,
+                half: true,
+                elem: false,
+            })
+            .to_vec(),
+        _ => reads_of(op, width),
     }
 }
 
@@ -632,6 +680,43 @@ fn lowers(op: &Operation) -> bool {
         | Operation::Gather(Gather::Select { .. }) => true,
         _ => false,
     }
+}
+
+/// Whether this module lowers `op` when a run names it though no chain forms over it:
+/// axial rotations, a packed `[gate | up]` activation, a VAE latent's standardisation.
+fn lowers_explicitly(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Elemwise(Elemwise::RopeAxes {
+            form: RopeForm::Interleaved | RopeForm::Split | RopeForm::Neox,
+            ..
+        }) | Operation::Elemwise(Elemwise::Rope {
+            turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. } | Turn::Yarn { .. },
+            ..
+        }) | Operation::Linear(
+            Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                up: None,
+                weights: None,
+                limit: None,
+                act: GluAct::Swiglu | GluAct::GegluTanh | GluAct::Situ { .. },
+                ..
+            } | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                up: Some(_),
+                weights: None,
+                limit: None,
+                act: GluAct::Swiglu | GluAct::GegluTanh,
+                ..
+            }
+        ) | Operation::Elemwise(
+            Elemwise::Standardize { .. }
+                | Elemwise::RmsnormGated { .. }
+                | Elemwise::RmsnormGatedBy { .. }
+        ) | Operation::Linear(Linear::MoeSigmoidGateAdd { .. } | Linear::Relu2 { .. })
+    )
 }
 
 /// The rotation `turn` states of `head_dim`-wide heads of a row of `width`
@@ -824,7 +909,105 @@ impl Escapes {
 }
 
 /// The region `run` lowers to, or `None` where an op of it does not lower.
+/// A spatial target's root phase lowers its ops this way; the run need not be one a chain
+/// forms.
+#[must_use]
+pub fn lower_run(trace: &Trace, run: &[u32]) -> Option<Chain> {
+    lower_with(trace, run, &Escapes::of(trace), true)
+}
+
+/// [`lower_run`]'s regions for `run`: where q and k turn together at different widths (GQA),
+/// a region a side at the same positions; otherwise the run's one region. `None` where it
+/// does not lower.
+#[must_use]
+pub fn lower_run_parts(trace: &Trace, run: &[u32]) -> Option<Vec<Chain>> {
+    let escapes = Escapes::of(trace);
+    let width = |v: ValueId| match form(trace, v) {
+        Some(Form::Rows { width, .. }) => Some(width),
+        _ => None,
+    };
+    let pair = run.iter().position(|&n| {
+        matches!(&trace.nodes[n as usize].op,
+            Operation::Elemwise(Elemwise::Rope { q, k: Some(k), .. }) if width(*q) != width(*k))
+    });
+    let Some(at) = pair else {
+        return lower_with(trace, run, &escapes, true).map(|c| vec![c]);
+    };
+    let node = run[at];
+    let Operation::Elemwise(Elemwise::Rope {
+        q,
+        k: Some(k),
+        positions,
+        head_dim,
+        theta,
+        turn,
+        freqs,
+        q_out,
+        k_out: Some(k_out),
+    }) = trace.nodes[node as usize].op.clone()
+    else {
+        return None;
+    };
+    // each side's nodes: what makes its rotated input (transitively), then what reads its output;
+    // a node of neither side does not lower here
+    let lineage = |root: ValueId, out: ValueId| -> Vec<u32> {
+        let mut want = vec![root];
+        let mut mine = Vec::new();
+        for &n in run[..at].iter().rev() {
+            let outs = outs_of(&trace.nodes[n as usize].op);
+            if outs.iter().any(|o| want.contains(o)) {
+                want.extend(ins_of(&trace.nodes[n as usize].op));
+                mine.push(n);
+            }
+        }
+        mine.reverse();
+        mine.push(node);
+        let mut have = vec![out];
+        for &n in &run[at + 1..] {
+            let op = &trace.nodes[n as usize].op;
+            if ins_of(op).iter().any(|i| have.contains(i)) {
+                have.extend(outs_of(op));
+                mine.push(n);
+            }
+        }
+        mine
+    };
+    let (qs, ks) = (lineage(q, q_out), lineage(k, k_out));
+    if run
+        .iter()
+        .any(|n| *n != node && qs.contains(n) == ks.contains(n))
+    {
+        return None;
+    }
+    let half = |x: ValueId, out: ValueId, nodes: &[u32]| -> Option<Chain> {
+        let mut t = trace.clone();
+        t.nodes[node as usize].op = Operation::Elemwise(Elemwise::Rope {
+            q: x,
+            k: None,
+            positions,
+            head_dim,
+            theta,
+            turn,
+            freqs: freqs.clone(),
+            q_out: out,
+            k_out: None,
+        });
+        lower_with(&t, nodes, &escapes, true)
+    };
+    Some(vec![half(q, q_out, &qs)?, half(k, k_out, &ks)?])
+}
+
+fn outs_of(op: &Operation) -> Vec<ValueId> {
+    let mut outs = Vec::new();
+    op.outputs(&mut outs);
+    outs
+}
+
 fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
+    lower_with(trace, run, escapes, false)
+}
+
+fn lower_with(trace: &Trace, run: &[u32], escapes: &Escapes, explicit: bool) -> Option<Chain> {
     // An embedding's table holds its whole vocabulary, so an id past it
     // picks row 0 in the skeleton as in the gather (a table cut by its rows
     // gathers each rank's share).
@@ -837,7 +1020,17 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             return None;
         }
     }
-    let row = row_of(trace, run[0])?;
+    // q and k turned together are rows of one width ([`lower_run_parts`] cuts them apart)
+    for &node in run {
+        if let Operation::Elemwise(Elemwise::Rope { q, k: Some(k), .. }) =
+            &trace.nodes[node as usize].op
+            && !matches!((form(trace, *q), form(trace, *k)),
+                (Some(Form::Rows { width: a, .. }), Some(Form::Rows { width: b, .. })) if a == b)
+        {
+            return None;
+        }
+    }
+    let row = row_of_with(trace, run[0], explicit)?;
     let row_width = u32::try_from(row.width).ok()?;
     // The region's row: a head, where every op is a head's alone (each
     // row cut into its heads, each the kernel's row), else the row.
@@ -850,7 +1043,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     let mut ids = Vec::new();
     for &node in run {
         let op = &trace.nodes[node as usize].op;
-        for read in reads_of(op, width) {
+        for read in reads_with(op, width, explicit) {
             let v = read.value;
             let held = ins
                 .iter()
@@ -872,12 +1065,20 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
                     return None;
                 }
             }
+            // (a table of one row read whole: the row every row reads, AttnRes's projection)
+            let one_row = matches!(form, Form::Table { .. })
+                && read.by.is_none()
+                && !read.half
+                && matches!(
+                    &trace.values[v.0 as usize].ty,
+                    Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Const(1)))
+                );
             ins.push(In {
                 value: v,
                 dtype: dtype_of(trace, v),
-                shared: matches!(form, Form::Shared { .. }),
+                shared: matches!(form, Form::Shared { .. }) || one_row,
                 one: matches!(form, Form::One),
-                each: matches!(form, Form::Each) && !read.half,
+                each: (matches!(form, Form::Each) && !read.half) || read.elem,
                 by: read.by,
                 from: read.from,
             });
@@ -889,7 +1090,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
 
     let mut b = Builder::new(u32::try_from(ins.len()).ok()?, width);
     for (k, input) in (0u32..).zip(&ins) {
-        if input.by.is_some() || input.from > 0 || reads_parted(trace, run, input.value) {
+        if input.by.is_some() || input.from > 0 || reads_parted(trace, run, input.value, explicit) {
             b.parts.insert((input.value, input.from), k);
         } else {
             b.of.insert(input.value, k);
@@ -933,6 +1134,8 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             Some(match form(trace, input.value)? {
                 Form::One => Shape::Scalar,
                 Form::Each if input.by.is_none() && input.from == 0 => Shape::Scalar,
+                // a row's element: one of its positions
+                Form::Rows { .. } if input.each => Shape::Scalar,
                 _ => Shape::Row,
             })
         })
@@ -963,11 +1166,19 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
     for &node in run {
         let op = &trace.nodes[node as usize].op;
         let head = match op {
+            // q and k turned together: two rows, each cut at its own heads, so the region's
+            // row stays whole
+            Operation::Elemwise(Elemwise::Rope { k: Some(_), .. }) => return None,
             Operation::Elemwise(Elemwise::Rmsnorm {
                 axis: NormAxis::Head(head),
                 ..
             })
-            | Operation::Elemwise(Elemwise::Rope { head_dim: head, .. }) => Some(*head),
+            | Operation::Elemwise(Elemwise::Rope { head_dim: head, .. })
+            | Operation::Elemwise(Elemwise::RmsnormGated { head_dim: head, .. }) => Some(*head),
+            // (its heads by count: the row's width over them)
+            Operation::Elemwise(Elemwise::RmsnormGatedBy { heads, .. }) => {
+                (*heads > 0 && width.is_multiple_of(*heads)).then(|| width / heads)
+            }
             Operation::Elemwise(
                 Elemwise::ResidualAdd { gate: None, .. }
                 | Elemwise::Binary { .. }
@@ -997,11 +1208,11 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
 
 /// Whether an op of `run` reads `v` as a part of a wider row (a
 /// modulation's half, a lane's gate).
-fn reads_parted(trace: &Trace, run: &[u32], v: ValueId) -> bool {
+fn reads_parted(trace: &Trace, run: &[u32], v: ValueId, explicit: bool) -> bool {
     run.iter().any(|&node| {
-        reads_of(&trace.nodes[node as usize].op, 0)
+        reads_with(&trace.nodes[node as usize].op, 0, explicit)
             .iter()
-            .any(|read| read.value == v && read.half)
+            .any(|read| read.value == v && (read.half || read.elem))
     })
 }
 
@@ -1103,6 +1314,20 @@ impl Builder {
     pub(super) fn node(&mut self, trace: &Trace, op: &Operation) -> Option<()> {
         match op {
             Operation::Elemwise(e) => self.elemwise(trace, e),
+            // a shared expert gated in: `routed + sigmoid(gate) shared`, the gate a row's one
+            Operation::Linear(Linear::MoeSigmoidGateAdd {
+                routed,
+                shared,
+                gate,
+                y,
+            }) => {
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let gs = self.push(Op::Binary(Binary::Mul, s, self.get(*shared)?));
+                let out = self.push(Op::Binary(Binary::Add, self.get(*routed)?, gs));
+                self.set(*y, out);
+                Some(())
+            }
             // the row an id picks of the table, a parameter read so
             Operation::Gather(Gather::Embed { table, y, .. }) => {
                 let row = self.part(*table, 0)?;
@@ -1157,6 +1382,51 @@ impl Builder {
                 y,
             } if intermediate == self.width => {
                 let (gate, up) = (self.part(packed, 0)?, self.part(packed, self.width)?);
+                let gated = match act {
+                    GluAct::Swiglu => {
+                        let s = self.sigmoid(gate);
+                        self.push(Op::Binary(Binary::Mul, gate, s))
+                    }
+                    GluAct::GegluTanh => self.gelu_tanh(gate),
+                    // Kimi's SiTU: `beta tanh(gate / beta) sigmoid(gate)`, the up capped as
+                    // `cap tanh(up / cap)` where stated
+                    GluAct::Situ { beta, .. } if beta > 0.0 => {
+                        let (b, ib) = (self.konst(beta), self.konst(1.0 / beta));
+                        let gb = self.push(Op::Binary(Binary::Mul, gate, ib));
+                        let t = self.tanh(gb);
+                        let bt = self.push(Op::Binary(Binary::Mul, b, t));
+                        let s = self.sigmoid(gate);
+                        self.push(Op::Binary(Binary::Mul, bt, s))
+                    }
+                    _ => return None,
+                };
+                let up = match act {
+                    GluAct::Situ {
+                        up_cap: Some(cap), ..
+                    } if cap > 0.0 => {
+                        let (c, ic) = (self.konst(cap), self.konst(1.0 / cap));
+                        let uc = self.push(Op::Binary(Binary::Mul, up, ic));
+                        let t = self.tanh(uc);
+                        self.push(Op::Binary(Binary::Mul, c, t))
+                    }
+                    _ => up,
+                };
+                let out = self.push(Op::Binary(Binary::Mul, gated, up));
+                self.set(y, out);
+            }
+            // a GLU of its gate and up apart (a per-layer embedding's gate by the layer's
+            // row): the same, each read whole
+            Linear::Glu {
+                packed: None,
+                gate: Some(gate),
+                up: Some(up),
+                weights: None,
+                act,
+                limit: None,
+                y,
+                ..
+            } => {
+                let (gate, up) = (self.get(gate)?, self.get(up)?);
                 let gated = match act {
                     GluAct::Swiglu => {
                         let s = self.sigmoid(gate);
@@ -1223,6 +1493,16 @@ impl Builder {
                 let z = self.push(Op::Binary(Binary::Add, self.get(*out)?, self.get(*bias)?));
                 self.set(*out_out, z);
             }
+            Elemwise::Standardize {
+                x,
+                bias,
+                scale,
+                x_out,
+            } => {
+                let d = self.push(Op::Binary(Binary::Sub, self.get(*x)?, self.get(*bias)?));
+                let z = self.push(Op::Binary(Binary::Mul, d, self.get(*scale)?));
+                self.set(*x_out, z);
+            }
             Elemwise::Binary { x, y, op, z } => {
                 let (x, y) = (self.get(*x)?, self.get(*y)?);
                 let id = self.push(match op {
@@ -1247,6 +1527,75 @@ impl Builder {
                     NormWeight::Scale(w) => self.scaled(n, self.get(*w)?, false),
                     NormWeight::PlusOne(w) => self.scaled(n, self.get(*w)?, true),
                 };
+                self.set(*y, out);
+            }
+            // A gated norm (named runs only): each head normed, times its weight where given, times
+            // the gate's activation.
+            Elemwise::RmsnormGated {
+                x,
+                gate,
+                weight,
+                head_dim,
+                eps,
+                act,
+                y,
+            } => {
+                let (width, head) = (self.width, *head_dim);
+                if head == 0 || width % head != 0 {
+                    return None;
+                }
+                let x = self.get(*x)?;
+                let mut n = if head == width {
+                    self.rms_normed(x, *eps)
+                } else {
+                    self.b.rms_normed_heads(x, head, *eps)
+                };
+                if let Some(w) = weight {
+                    let w = self.get(*w)?;
+                    n = self.push(Op::Binary(Binary::Mul, n, w));
+                }
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let a = match act {
+                    poem_ir::GateActivation::Sigmoid => s,
+                    poem_ir::GateActivation::Silu => self.push(Op::Binary(Binary::Mul, g, s)),
+                };
+                let out = self.push(Op::Binary(Binary::Mul, n, a));
+                self.set(*y, out);
+            }
+            // A gated norm by head count (Kimi's KDA output): each head normed, times its weight,
+            // times the gate's sigmoid.
+            Elemwise::RmsnormGatedBy {
+                x,
+                gate,
+                weight,
+                heads,
+                eps,
+                y,
+            } => {
+                // (the region a head where the run is cut so)
+                let row = match form(trace, *x) {
+                    Some(Form::Rows { width, .. }) => u32::try_from(width).ok()?,
+                    _ => return None,
+                };
+                if *heads == 0 || !row.is_multiple_of(*heads) {
+                    return None;
+                }
+                let (width, head) = (self.width, row / heads);
+                if !width.is_multiple_of(head) {
+                    return None;
+                }
+                let x = self.get(*x)?;
+                let mut n = if head == width {
+                    self.rms_normed(x, *eps)
+                } else {
+                    self.b.rms_normed_heads(x, head, *eps)
+                };
+                let w = self.get(*weight)?;
+                n = self.push(Op::Binary(Binary::Mul, n, w));
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let out = self.push(Op::Binary(Binary::Mul, n, s));
                 self.set(*y, out);
             }
             // A head as wide as the row is the row's norm.
@@ -1309,6 +1658,112 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
+            }
+            // a rotation at frequencies stated outright (rope scaling; named runs only), q
+            // alone or q and k at the same positions
+            Elemwise::Rope {
+                q,
+                k,
+                positions,
+                head_dim,
+                theta,
+                turn,
+                freqs: Some(f),
+                q_out,
+                k_out,
+            } if f.mscale == 1.0 => {
+                let turn = rotation(self.width, *head_dim, *theta, turn)?;
+                let pos = self.get(*positions)?;
+                let qo = self
+                    .b
+                    .rotate_with(self.get(*q)?, pos, &turn, Some(&f.inv_freq));
+                self.set(*q_out, qo);
+                if let (Some(k), Some(k_out)) = (k, k_out) {
+                    let ko = self
+                        .b
+                        .rotate_with(self.get(*k)?, pos, &turn, Some(&f.inv_freq));
+                    self.set(*k_out, ko);
+                }
+            }
+            // q and k turned together (named runs only), each its own rotation, same positions
+            Elemwise::Rope {
+                q,
+                k: Some(k),
+                positions,
+                head_dim,
+                theta,
+                turn,
+                freqs: None,
+                q_out,
+                k_out: Some(k_out),
+            } => {
+                let turn = rotation(self.width, *head_dim, *theta, turn)?;
+                let pos = self.get(*positions)?;
+                let qo = self.b.rotate(self.get(*q)?, pos, &turn);
+                let ko = self.b.rotate(self.get(*k)?, pos, &turn);
+                self.set(*q_out, qo);
+                self.set(*k_out, ko);
+            }
+            // a rotation over position axes, pairs interleaved, each
+            // axis's position a row's element (a scalar parameter)
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form: RopeForm::Interleaved,
+                rotary_dim,
+                head_dim,
+                x_out,
+            } => {
+                if *rotary_dim != *head_dim
+                    || dims.iter().sum::<u32>() != *head_dim
+                    || *head_dim == 0
+                    || !self.width.is_multiple_of(*head_dim)
+                    || dims.iter().any(|d| d % 2 != 0)
+                {
+                    return None;
+                }
+                let mut axes = Vec::new();
+                for (axis, (&dim, &theta)) in (0u32..).zip(dims.iter().zip(thetas)) {
+                    if dim > 0 {
+                        axes.push((dim, theta, self.part(*positions, axis)?));
+                    }
+                }
+                let out = self.b.rotate_axes(self.get(*x)?, *head_dim, &axes);
+                self.set(*x_out, out);
+            }
+            // a rotation over position axes in a head's halves: each axis its own (split) or
+            // the axes' angles over the rotated half (NeoX), the rest of the head as it is
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form: form @ (RopeForm::Split | RopeForm::Neox),
+                rotary_dim,
+                head_dim,
+                x_out,
+            } => {
+                let split = matches!(form, RopeForm::Split);
+                if *rotary_dim > *head_dim
+                    || dims.iter().sum::<u32>() != *rotary_dim
+                    || *head_dim == 0
+                    || !self.width.is_multiple_of(*head_dim)
+                    || dims.iter().any(|d| d % 2 != 0)
+                {
+                    return None;
+                }
+                let mut axes = Vec::new();
+                for (axis, (&dim, &theta)) in (0u32..).zip(dims.iter().zip(thetas)) {
+                    if dim > 0 {
+                        axes.push((dim, theta, self.part(*positions, axis)?));
+                    }
+                }
+                let out =
+                    self.b
+                        .rotate_axes_halves(self.get(*x)?, *head_dim, &axes, split, *rotary_dim);
+                self.set(*x_out, out);
             }
             // AttnRes's blend: each candidate (the closed blocks, then the
             // prefix) scaled by the norm's weight and the projection and

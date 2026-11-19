@@ -21,6 +21,9 @@ MODELS = [
     model("gemma4-31b-mini-l30", mini = True, template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-12b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 48, vocab = 262144),
     model("gemma4-e2b", template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 35, vocab = 262144),
+    # A random-weight E2B slice for the simulator gate (its golden: Hugging Face's
+    # forward on the same weights).
+    model("gemma4-sim", template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 2, vocab = 512),
     model("gemma4-e4b", template = GEMMA, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
     model("gemma4-e4b-mini-l1", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 1, vocab = 262144),
     model("gemma4-e4b-mini-l6", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 6, vocab = 262144),
@@ -44,6 +47,7 @@ DEPLOYMENTS = [
     deployment("gemma4-12b", weights = BF, kv = BF),
     deployment("gemma4-e2b", weights = BF, kv = BF),
     deployment("gemma4-e2b", weights = U4, kv = BF),
+    deployment("gemma4-sim", weights = BF, kv = BF),
     deployment("gemma4-e4b", weights = U4, kv = BF),
     deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("gemma4-e4b", weights = BF, kv = BF),
@@ -104,7 +108,7 @@ ASSISTANT_INTER = 8192
 ASSISTANT_READINGS = [SLIDING, SLIDING, SLIDING, GLOBAL]
 
 def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None,
-          full_every = 6, wide_tail = False):
+          full_every = 6, wide_tail = False, vocab = 262144):
     """`full_every`: every that many layers one reads globally, the last of
     each run. `wide_tail`: the layers that borrow their kv run an MLP twice as
     wide (E2B's `use_double_wide_mlp`)."""
@@ -113,7 +117,7 @@ def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, sha
         global_kv_heads = global_kv_heads, inter = inter, window = window,
         shared_tail = shared_tail, ple_dim = ple_dim, moe = moe, wide_tail = wide_tail,
         full_every = full_every, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
-        theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = 262144,
+        theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = vocab,
         softcap = 30.0, norm_eps = 1e-6,
     )
 
@@ -146,6 +150,10 @@ TRUNKS = {
     "gemma4-31b-mini-l30": g31b(30),
     "gemma4-12b": g12b(48),
     "gemma4-e2b": E2B,
+    # E2B's head widths, rotations, per-layer embeddings, sliding window and softcap, its sizes
+    # shrunk
+    "gemma4-sim": trunk(hidden = 256, layers = 2, q_heads = 2, kv_heads = 1, global_kv_heads = 1, inter = 256,
+                        window = 512, ple_dim = 256, full_every = 5, wide_tail = True, vocab = 512),
     "gemma4-e4b": e4b(42),
     "gemma4-e4b-mini-l1": e4b(1),
     "gemma4-e4b-mini-l6": e4b(6),
