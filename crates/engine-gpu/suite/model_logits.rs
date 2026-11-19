@@ -1246,12 +1246,12 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     );
 }
 
-/// A park to the host tier has read its device slots when the copy
-/// returns (`Engine::copy_slots_landing` answers `true` for it): what the
-/// runtime gives those slots to next (any shape, written by anything, not a
-/// fire alone) cannot reach the parked bytes. The slots are overwritten
-/// from the host the moment the park returns, outside any frame, and the
-/// host tier still holds what they held.
+/// A park to the host tier is told landed only once it has read its device
+/// slots (or has read them when it returns): what the runtime gives those
+/// slots to next (any shape, written by anything, not a fire alone) cannot
+/// reach the parked bytes. The slots are overwritten from the host the
+/// moment the park is told landed, outside any frame, and the host tier
+/// still holds what they held.
 #[test]
 fn a_park_is_told_landed_once_it_has_read_its_slots() {
     use engine::chunk::{SlotCopy, SlotKind};
@@ -1308,9 +1308,22 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
         shell
             .copy_slots(&copy(host, device, pairs(&seed, &slots)))
             .expect("the slots land on the device");
-        shell
-            .copy_slots(&copy(device, host, pairs(&slots, &parked)))
+        // On the queue past the call where the host chunks are mapped, told
+        // landed from its fence; else waited out in the call.
+        let (told, landed) = std::sync::mpsc::channel();
+        let now = shell
+            .copy_slots_landing(
+                &copy(device, host, pairs(&slots, &parked)),
+                Some(Box::new(move || {
+                    let _ = told.send(());
+                })),
+            )
             .expect("the slots park");
+        if !now {
+            landed
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the park is told landed");
+        }
         // The slots go to their next owner, which writes them at once.
         for &slot in &slots {
             let (buffer, at) = shell
@@ -1326,7 +1339,7 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
             .expect("the parked slots read");
         assert!(
             held == pattern,
-            "round {round}: the host tier holds what the slots held when the park returned"
+            "round {round}: the host tier holds what the slots held when the park landed"
         );
         // The overwrite reached the device slots.
         shell

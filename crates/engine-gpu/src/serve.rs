@@ -1977,24 +1977,62 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`: on the device in queue order; to or from
-    /// the host chunks or the slot file once every frame has landed.
+    /// See `Engine::copy_slots`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        self.copy_slots_landing(copy, None).map(drop)
+    }
+
+    /// See `Engine::copy_slots_landing`: whether the copy's sources may go
+    /// back when this returns.
+    /// - Within the device, and between the device and mapped host chunks:
+    ///   in queue order, behind every frame submitted before, with no
+    ///   drain. A move off the device answers `false` where `landed` is
+    ///   given, and `landed` runs once its frame's fence lands: its device
+    ///   slots, once back, may be written by anything. The rest answer
+    ///   `true`: a later write reaching a device source is a fire or copy on
+    ///   the same queue, or a host write that first settles the queue
+    ///   (`Frame::update`, a record's clear after a drain); one reaching a
+    ///   host source is a move onto it on the queue, or a tier write, which
+    ///   drains.
+    /// - A heap host tier and the slot file: every frame lands first and the
+    ///   copy is waited out (or read on the host) in the call: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<bool> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
-        let on_device = B::is_device(copy.src) && B::is_device(copy.dst);
-        if !on_device {
+        let (src, dst) = (B::is_device(copy.src), B::is_device(copy.dst));
+        let host = |domain| matches!(domain, engine::transfer::MemoryDomain::HostPinned);
+        let queued = (src && dst)
+            || (self.pools.host_mapped() && ((src && host(copy.dst)) || (host(copy.src) && dst)));
+        if !queued {
             self.drain()?;
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&self.device, &mut frame, copy)?;
-        if on_device {
-            self.grafted = Some(frame.commit_async(None)?);
-        } else {
+        if !queued {
             frame.commit()?;
+            return Ok(true);
         }
-        Ok(())
+        let parks = src && !dst;
+        match landed.filter(|_| parks) {
+            Some(landed) => {
+                // Told landed whether or not the submission faulted: the
+                // fault reaches the next wait on it (`drain`).
+                let on_done: crate::backend::OnDone = Box::new(move |_refused| landed());
+                self.grafted = Some(frame.commit_async(Some(on_done))?);
+                Ok(false)
+            }
+            // A park no one is told of lands in the call.
+            None if parks => frame.commit().map(|()| true),
+            None => {
+                self.grafted = Some(frame.commit_async(None)?);
+                Ok(true)
+            }
+        }
     }
 
     /// See `Engine::settle_copies`: every frame and copy in flight lands,
