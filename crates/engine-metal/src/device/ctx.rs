@@ -899,6 +899,7 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             let flushed = std::mem::take(self.flushed.get_mut());
+            #[cfg(feature = "fault-injection")]
             let injected = FAIL_NEXT.with(|next| next.replace(false));
             if let Some(on_done) = on_done {
                 let heads = Flushed(flushed.clone());
@@ -916,7 +917,9 @@ impl Frame {
                             .find_map(|head| head.error())
                             .or_else(|| buffer.error());
                         let refused = refused.map(|error| error.localizedDescription().to_string());
-                        on_done(if injected { Some(INJECTED.to_string()) } else { refused });
+                        #[cfg(feature = "fault-injection")]
+                        let refused = if injected { Some(INJECTED.to_string()) } else { refused };
+                        on_done(refused);
                     },
                 );
                 // SAFETY: `addCompletedHandler:` copies the block, so the
@@ -931,6 +934,7 @@ impl Frame {
             Ok(Pending {
                 buffer: self.commit_buffer(),
                 flushed,
+                #[cfg(feature = "fault-injection")]
                 injected,
             })
         }
@@ -969,17 +973,18 @@ pub struct Pending {
     #[cfg(target_vendor = "apple")]
     flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Answers as failed whatever the device did ([`fail_next_frame`]).
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
     injected: bool,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
 }
 
+#[cfg(feature = "fault-injection")]
 thread_local! {
     static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
 const INJECTED: &str = "a failure injected by `fail_next_frame`";
 
 /// Answers the next frame this thread commits with a completion handler
@@ -987,10 +992,11 @@ const INJECTED: &str = "a failure injected by `fail_next_frame`";
 /// [`Pending::wait`], whatever the device did: tests of what a failed
 /// command buffer leaves, which a real device fault can't be made to give.
 ///
-/// A test seam only: nothing in serving calls it, and no config, env var
-/// or protocol path reaches it. Its flag is per thread and inert unless
-/// this is called on that thread.
-#[doc(hidden)]
+/// A test seam only, compiled under the `fault-injection` feature (off by
+/// default; engine-metal's tests turn it on): a served binary has no such
+/// path, and nothing in serving, no config, env var or protocol, reaches
+/// it. Its flag is per thread and inert unless this is called there.
+#[cfg(feature = "fault-injection")]
 pub fn fail_next_frame() {
     FAIL_NEXT.with(|next| next.set(true));
 }
@@ -1045,6 +1051,7 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
+            #[cfg(feature = "fault-injection")]
             if self.injected {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
