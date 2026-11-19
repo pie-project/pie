@@ -80,6 +80,13 @@ pub trait Serve: Backend {
     /// of a ring lies on the host.
     const CHANNEL_CELLS: bool;
 
+    /// Whether a program reading a fire's outputs on the device runs before
+    /// any later fire on the queue, so it may read them where the fire left
+    /// them in its span (a span no later fire has carved over yet). Else it
+    /// runs once the step landed, after later fires may have been submitted,
+    /// and reads them from the arm's readout seat, a gather of its own.
+    const READS_SPAN: bool;
+
     /// Whether the backend's fires are walks that fire nothing, a naming
     /// load's (`named::Named`): a fire of a capturing class then lays its
     /// score rows nowhere a kernel runs, and asks no pair's room for them.
@@ -159,14 +166,33 @@ pub trait Serve: Backend {
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
+    /// Whether the backend builds what a dispatch binds for each set of
+    /// views it binds and keeps it (wgpu's bind groups): its load then
+    /// walks every fire shape it serves on the device, bind-only
+    /// ([`Shell::walk_binds`]), so none is built in a fire. A fact of the
+    /// backend: one that keeps nothing per set of views states false.
+    const BINDS_AT_LOAD: bool;
+
+    /// The frame a bind walk walks into: its sink builds and keeps what each
+    /// dispatch binds and encodes nothing, and the frame is never submitted.
+    /// Called only where [`Self::BINDS_AT_LOAD`] holds.
+    fn bind_frame(device: &Self::Context) -> Result<Self::Frame>;
+
+    /// What a dispatch binds the backend has built and kept so far (its bind
+    /// groups): read at ready and after, those built since are a fire's
+    /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
+    fn bound(pipelines: &Self::Pipelines) -> u64;
+
     /// The backend's state of a fresh load over its `readout` seats, with
-    /// whatever device memory it keeps for every fire (made before the pool
-    /// is sized, so the pool is sized past it).
+    /// whatever device memory it keeps for every fire and its guest plane
+    /// takes (`guest`), made before the pool is sized, so the pool is sized
+    /// past it.
     fn shelf(
         device: &Self::Context,
         pipelines: &Self::Pipelines,
         readout: &[Self::Buffer],
         weights_stream: bool,
+        guest: GuestRoom,
     ) -> Result<Self::Shelf>;
 
     /// What a kept step binds moved: the segments, or a layer's stage.
@@ -445,6 +471,12 @@ pub struct Seated<'a, B: Serve> {
 
     pub readout: Option<&'a [u32]>,
 
+    /// Whether the host reads back what the lane reads out (its readout
+    /// rows, and the outputs its program reads): a lane whose readout is
+    /// `None` hosts nothing. Its rows are laid for the fire all the same,
+    /// for a program that reads them on the device.
+    pub hosts: bool,
+
     /// The outputs the lane's program reads.
     pub reads: &'a [String],
 
@@ -502,6 +534,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             adapter: None,
             positions: &[],
             readout: None,
+            hosts: true,
             reads: &[],
             scores: None,
             rs: &FOLD,
@@ -596,7 +629,12 @@ impl ReadoutPlane {
 
 /// A lane's read of `plane`: `rows` table entries from `first`, or with
 /// `direct` the plane's rows from `first`, each of its `layers` after the
-/// last at byte `at` of the seat. The host reads back its lane's `host` span.
+/// last at byte `at` of the seat. A lane's `own` span (one a lane, at its
+/// index) is its readout rows; the others are outputs its program reads.
+/// A `seated` span's rows are copied into the arm's readout seat; the host
+/// reads back the `hosted` ones, and a span neither seated nor read by a
+/// program on the device is laid for the fire alone (its rows computed,
+/// nothing copied).
 #[derive(Clone, Copy, Debug)]
 pub struct ReadSpan {
     pub lane: u32,
@@ -608,7 +646,14 @@ pub struct ReadSpan {
     pub layers: u32,
     pub dtype: Dtype,
     pub direct: bool,
-    pub host: bool,
+    pub own: bool,
+    pub hosted: bool,
+    pub seated: bool,
+    /// Read by a program on the device where its rows lie, one run of
+    /// them, in the fire's span ([`Serve::READS_SPAN`]): `at` is then the
+    /// run's byte in the span's buffer, laid by the walk (and kept in the
+    /// layout a recording replays), and nothing is copied.
+    pub spanned: bool,
 }
 
 impl ReadSpan {
@@ -623,7 +668,10 @@ impl ReadSpan {
             layers: 1,
             dtype: Dtype::Bf16,
             direct: false,
-            host: true,
+            own: true,
+            hosted: false,
+            seated: false,
+            spanned: false,
         }
     }
 
@@ -686,6 +734,9 @@ pub struct Shell<B: Serve> {
     /// Every fire walked eagerly, none recorded or replayed: a check's
     /// walked load ([`Shell::walk_every_fire`]).
     walk_only: bool,
+    /// The rows the host has had read back for it, and the bytes copied
+    /// into readout seats, by every fire so far ([`Shell::readout_tally`]).
+    readout_tally: (u64, u64),
     /// The rungs the load laid and the estimate it weighed them by, where
     /// the profile states every `[rates]` key.
     weighed: Option<engine::load::check::Weighed>,
@@ -758,6 +809,10 @@ pub struct Shell<B: Serve> {
     blobs: crate::blob::Store,
 
     held: Vec<u32>,
+
+    /// What a dispatch binds the backend had built at the last count
+    /// ([`Shell::bound_serving`]).
+    bound: u64,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
@@ -1718,7 +1773,18 @@ impl<B: Serve> Shell<B> {
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         let weights_stream = weights.streams() || weights.gathered().is_some();
-        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream)?;
+        let shelf = B::shelf(
+            &device,
+            &pipelines,
+            &readout,
+            weights_stream,
+            GuestRoom {
+                chunk_bytes: chunk,
+                seats: readout.len() + pixel_out.len(),
+                max_lanes: boot.budget.max_lanes,
+                planes: u32::try_from(readouts.len() + pixels.len()).unwrap_or(u32::MAX),
+            },
+        )?;
 
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation beside the
@@ -1854,6 +1920,7 @@ impl<B: Serve> Shell<B> {
             unkept: 0,
             walked: (0, 0),
             walk_only: false,
+            readout_tally: (0, 0),
             weighed,
             pipelines,
             asks,
@@ -1892,6 +1959,7 @@ impl<B: Serve> Shell<B> {
 
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
+            bound: 0,
             rs_layout,
             snaps: None,
             last_capture: None,
@@ -2441,6 +2509,13 @@ impl<B: Serve> Shell<B> {
         B::built_since(&self.pipelines, from)
     }
 
+    /// What a dispatch binds built since the last count
+    /// ([`Serve::bound`]): after the load's own walk, each one a fire built.
+    pub fn bound_serving(&mut self) -> u64 {
+        let now = B::bound(&self.pipelines);
+        now - std::mem::replace(&mut self.bound, now)
+    }
+
     /// The steps walked to be kept since the last count: each is a shape a
     /// fire waited on, recorded at its first fire and replayed after.
     pub fn recorded_serving(&mut self) -> u64 {
@@ -2655,7 +2730,9 @@ impl<B: Serve> Shell<B> {
         self.harvest_through(landed.seq)?;
         let _ = self.landed.remove(&landed.seq);
         // Nothing fired since: the arm's seat holds this step's reads.
-        let read: Vec<&ReadSpan> = layout.iter().filter(|span| span.rows > 0).collect();
+        let read: Vec<&ReadSpan> = (layout.iter())
+            .filter(|span| span.rows > 0 && span.seated)
+            .collect();
         let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
@@ -2950,6 +3027,30 @@ impl<B: Serve> Shell<B> {
                     landed.seq
                 ),
             })
+    }
+
+    /// The rows the host has had read back for it, and the bytes the fires
+    /// copied into readout seats, since the load.
+    #[must_use]
+    pub fn readout_tally(&self) -> (u64, u64) {
+        self.readout_tally
+    }
+
+    fn tally_reads(&mut self, layout: &[ReadSpan]) {
+        for span in layout {
+            if span.hosted {
+                self.readout_tally.0 += u64::from(span.rows);
+            }
+            if span.seated {
+                self.readout_tally.1 += span.bytes();
+            }
+        }
+    }
+
+    /// The buffer a fire's span lies in: a [`ReadSpan::spanned`] read's
+    /// rows lie there, at its `at`, until a later fire carves over them.
+    pub fn span_buffer(&self) -> Result<&B::Buffer> {
+        self.span.buffer()
     }
 
     /// Readout plane `plane`'s output name.
@@ -4267,9 +4368,14 @@ impl<B: Serve> Shell<B> {
             .capture()
             .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
         let (readout_rows, readout_layout) =
-            readout_table(&composition, lanes, &self.readouts, &scored, |class| {
-                self.readout_for(class)
-            })?;
+            readout_table(
+                &composition,
+                lanes,
+                &self.readouts,
+                &scored,
+                |class| self.readout_for(class),
+                |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+            )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4554,7 +4660,7 @@ impl<B: Serve> Shell<B> {
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
         let place = At::new();
-        self.walk_with(p, keep, split, &place, &mut Cursor::new(&place))
+        self.walk_with(p, keep, split, false, &place, &mut Cursor::new(&place))
     }
 
     /// [`Shell::walk_once`] with the walk's sink the caller's: `cursor` moves
@@ -4564,10 +4670,15 @@ impl<B: Serve> Shell<B> {
         p: &Prepared<'_, B>,
         keep: bool,
         split: bool,
+        bind_only: bool,
         place: &At,
         cursor: &mut S,
     ) -> Result<Walked<B>> {
-        let mut frame = Some(B::walk_frame(&self.device, keep)?);
+        let mut frame = Some(if bind_only {
+            B::bind_frame(&self.device)?
+        } else {
+            B::walk_frame(&self.device, keep)?
+        });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
         // with this block.
@@ -4766,12 +4877,15 @@ type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
 /// Each lane's host span (at its index) and then a span of every other
 /// output its program reads, with the readout table the host spans pick.
+/// `gathered(plane)` tells a plane whose table rows the program gathers into
+/// rows of their own, in table order.
 fn readout_table<B: Serve>(
     composition: &Composition,
     lanes: &[Seated<'_, B>],
     planes: &[ReadoutPlane],
     scored: &Scored,
     host_of: impl Fn(usize) -> Option<usize>,
+    gathered: impl Fn(usize) -> bool,
 ) -> Result<ReadoutTable> {
     let span_of = |plane: usize, first: u32, rows: u32, at: u64, direct: bool, lane: u32| {
         let read = &planes[plane];
@@ -4785,8 +4899,33 @@ fn readout_table<B: Serve>(
             layers: u32::try_from(read.values.len()).unwrap_or(u32::MAX),
             dtype: read.dtype,
             direct,
-            host: false,
+            own: false,
+            hosted: false,
+            seated: false,
+            spanned: false,
         }
+    };
+    // A span is copied into the seat where the host reads it, or where a
+    // program reads it there: one a program reads on the device where it
+    // lies in the span, as one run (`run`), is copied nowhere.
+    let placed = |mut span: ReadSpan, at: &mut u64, hosted: bool, read: bool, run: bool| {
+        span.hosted = hosted;
+        // Score rows lie in rooms of their own, not the span.
+        let in_span = planes[span.plane as usize].captured.is_none();
+        span.spanned = !hosted && read && run && in_span && B::READS_SPAN;
+        span.seated = hosted || (read && !span.spanned);
+        if span.seated {
+            span.at = *at;
+            *at += span.bytes();
+        }
+        span
+    };
+    // Rows the table picks lie as one run where the program gathers them,
+    // or where they follow one another; a span of more layers than one
+    // lies in as many runs.
+    let one_run = |plane: usize, picks: &[i32]| {
+        planes[plane].values.len() == 1
+            && (gathered(plane) || picks.windows(2).all(|w| w[1] == w[0] + 1))
     };
     let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
     let mut layout: Vec<ReadSpan> = (0..lanes.len()).map(ReadSpan::empty).collect();
@@ -4797,6 +4936,16 @@ fn readout_table<B: Serve>(
             continue;
         };
         let plane = &planes[host];
+        let seated = lanes.get(source);
+        let hosts = seated.is_some_and(|seated| seated.hosts);
+        // Its program reads the plane at the lane's own rows.
+        let read = seated.is_some_and(|seated| {
+            seated.reads.iter().any(|name| {
+                planes.iter().position(|plane| {
+                    plane.output == *name && plane.classes.contains(row.class as usize)
+                }) == Some(host)
+            })
+        });
         let (first, owned) = if plane.voxels {
             (row.voxel_offset, row.voxels)
         } else {
@@ -4806,11 +4955,16 @@ fn readout_table<B: Serve>(
             continue;
         }
         if plane.voxels {
-            layout[source] = ReadSpan {
-                host: true,
-                ..span_of(host, first, owned, at, true, row.source)
-            };
-            at += layout[source].bytes();
+            layout[source] = placed(
+                ReadSpan {
+                    own: true,
+                    ..span_of(host, first, owned, 0, true, row.source)
+                },
+                &mut at,
+                hosts,
+                read,
+                plane.values.len() == 1,
+            );
             continue;
         }
         let named = lanes.get(source).and_then(|seated| seated.readout);
@@ -4830,18 +4984,26 @@ fn readout_table<B: Serve>(
             _ if plane.seam != Kind::Readout => (first..first + owned).collect(),
             _ => vec![first + owned - 1],
         };
-        layout[source] = ReadSpan {
-            host: true,
-            ..span_of(
-                host,
-                u32::try_from(table.len()).unwrap_or(u32::MAX),
-                u32::try_from(picks.len()).unwrap_or(u32::MAX),
-                at,
-                false,
-                row.source,
-            )
-        };
-        at += layout[source].bytes();
+        let rows: Vec<i32> = (picks.iter())
+            .map(|&at| i32::try_from(at).unwrap_or(i32::MAX))
+            .collect();
+        layout[source] = placed(
+            ReadSpan {
+                own: true,
+                ..span_of(
+                    host,
+                    u32::try_from(table.len()).unwrap_or(u32::MAX),
+                    u32::try_from(picks.len()).unwrap_or(u32::MAX),
+                    0,
+                    false,
+                    row.source,
+                )
+            },
+            &mut at,
+            hosts,
+            read,
+            one_run(host, &rows),
+        );
         table.extend(
             picks
                 .iter()
@@ -4852,6 +5014,7 @@ fn readout_table<B: Serve>(
         let source = row.source as usize;
         let class = row.class as usize;
         let host = layout[source];
+        let hosts = lanes.get(source).is_some_and(|seated| seated.hosts);
         for name in lanes.get(source).map_or(&[][..], |seated| seated.reads) {
             let Some(index) = planes
                 .iter()
@@ -4899,9 +5062,14 @@ fn readout_table<B: Serve>(
             if rows == 0 {
                 continue;
             }
-            let span = span_of(index, first, rows, at, direct, row.source);
-            at += span.bytes();
-            layout.push(span);
+            let span = span_of(index, first, rows, 0, direct, row.source);
+            let run = if direct {
+                plane.values.len() == 1
+            } else {
+                let picked = &table[first as usize..(first + rows) as usize];
+                one_run(index, picked)
+            };
+            layout.push(placed(span, &mut at, hosts, true, run));
         }
     }
     Ok((table, layout))
@@ -4995,6 +5163,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let need = prepared
             .readout_layout
             .iter()
+            .filter(|span| span.seated)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
@@ -5019,6 +5188,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 launches,
                 pixels,
             } => {
+                self.tally_reads(&rows);
                 return Ok(Enqueued {
                     pending,
                     fed,
@@ -5041,7 +5211,9 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // Each read plane's buffer (the span's, or a score room's) and every
         // layer's base in it.
         let mut bases: Vec<Option<(B::Buffer, Vec<u64>)>> = vec![None; self.readouts.len()];
-        for span in prepared.readout_layout.iter().filter(|span| span.rows > 0) {
+        for span in (prepared.readout_layout.iter())
+            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        {
             let at = span.plane as usize;
             if bases[at].is_some() {
                 continue;
@@ -5075,8 +5247,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             bases[at] = buffer.map(|buffer| (buffer, layers));
         }
 
-        let layout = prepared.readout_layout.clone();
-        for span in layout.iter().filter(|span| span.rows > 0) {
+        // Every read lands in the arm's seat by one copy of all its regions
+        // a source buffer: a pair of barriers each, not one a lane.
+        let mut layout = prepared.readout_layout.clone();
+        let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>)> = Vec::new();
+        for span in (layout.iter_mut())
+            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        {
             let plane = &self.readouts[span.plane as usize];
             let (from, layers) = bases[span.plane as usize]
                 .as_ref()
@@ -5085,25 +5262,46 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 })?;
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
+            let (first, direct) = (span.first, span.direct);
+            // A direct span's rows run from `first` (as `span_copies` lays
+            // them); a gathered plane's rows are the table's, in order.
             let source_row = |k: u32| {
-                let cursor = u64::from(span.first + k);
-                if gathered {
+                let cursor = u64::from(first + k);
+                if gathered || direct {
                     cursor
                 } else {
                     u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
                 }
             };
-            for copy in span_copies(span, layers, row_bytes, source_row) {
-                frame.copy(
-                    from,
-                    copy.from,
-                    &self.readout[prepared.arm],
-                    copy.to,
-                    copy.bytes,
-                )?;
+            if span.spanned {
+                // One run, one layer: its first row's byte in the span, the
+                // buffer a reader of it is offered (`Shell::span_buffer`).
+                if from.slab_id() != self.span.buffer()?.slab_id() {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "output `{}`, read on the device where it lies, and it lies \
+                             outside the fire's span",
+                            plane.output
+                        ),
+                    });
+                }
+                span.at = layers[0] + source_row(0) * row_bytes;
+                continue;
+            }
+            let copies = span_copies(span, layers, row_bytes, source_row)
+                .into_iter()
+                .map(|copy| (copy.from, copy.to, copy.bytes));
+            match regions.iter_mut().find(|(buffer, _)| buffer.slab_id() == from.slab_id()) {
+                Some((_, list)) => list.extend(copies),
+                None => regions.push((from.clone(), copies.collect())),
             }
         }
+        // One copy of all its regions a source buffer.
+        for (from, list) in &regions {
+            frame.copy_regions(from, &self.readout[prepared.arm], list)?;
+        }
 
+        self.tally_reads(&layout);
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
         self.walked = (
             self.walked.0.max(frame.dispatches()),
@@ -5162,7 +5360,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             pixels,
             step: _,
         } = enqueued;
-        let lanes = rows.iter().filter(|span| span.host).count();
+        let lanes = rows.iter().filter(|span| span.own).count();
         self.arms.take(arm);
         self.inflight.push_back(Flight {
             seq,
@@ -5235,13 +5433,17 @@ fn elem(dtype: Dtype) -> u64 {
     poem_compiler::arena::elem_bytes(dtype).unwrap_or(2)
 }
 
-/// Each host span of `layout` in `raw`, widened to f32.
+/// Each lane's own span of `layout` in `raw`, widened to f32: nothing for
+/// a lane the host reads back nothing of.
 #[must_use]
 pub fn rows_from(raw: &[u8], layout: &[ReadSpan]) -> Vec<Vec<f32>> {
     layout
         .iter()
-        .filter(|span| span.host)
+        .filter(|span| span.own)
         .map(|span| {
+            if !span.hosted {
+                return Vec::new();
+            }
             let from = span.at as usize;
             let row = &raw[from..from + span.bytes() as usize];
             if span.dtype == Dtype::F32 {
@@ -5544,10 +5746,13 @@ struct NamingLane<B: Serve> {
     media: Option<NamingMedia>,
     boxes: Vec<[u32; 3]>,
     payload: Vec<u8>,
-    inputs: Vec<(engine::fire::InputFeed, InputCell<Named<B>>)>,
+    inputs: Vec<(engine::fire::InputFeed, InputCell<B>)>,
     /// The score rows the class writes: a capturing lane named reads them
     /// all, so its fire names every kernel a capture asks for.
     reads: Vec<String>,
+    /// Where it names its slots by ref, its pages and its record (the null
+    /// record, ref 0 a piece), as a fire of more lanes than seats names them.
+    by_ref: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 struct NamingMedia {
@@ -5558,7 +5763,234 @@ struct NamingMedia {
     grids: Vec<i32>,
 }
 
-impl<B: Serve> Shell<Named<B>> {
+/// What a load's guest plane reserves by, which a backend's shelf reserves
+/// before the pool is sized ([`Serve::shelf`]): a guest pass reads at most
+/// one row of each of the `planes` a fire reads out per lane, from the
+/// `seats` (each arm's readout and pixel seats), and reads back at most a
+/// chunk of the pool.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestRoom {
+    pub chunk_bytes: u64,
+    pub seats: usize,
+    pub max_lanes: u32,
+    pub planes: u32,
+}
+
+/// The views a fire of `owned` lanes stages: its seated lanes, their media
+/// and their clips, each lane at its own slot.
+#[allow(clippy::type_complexity)]
+/// Lane `at`'s share of `total` over `lanes`: an equal part, the last
+/// taking what the division leaves.
+fn spread(total: u64, lanes: u64, at: u64) -> u64 {
+    let each = total / lanes;
+    if at + 1 == lanes {
+        total - each * (lanes - 1)
+    } else {
+        each
+    }
+}
+
+fn lane_views<B: Serve>(
+    owned: &[NamingLane<B>],
+) -> (Vec<Seated<'_, B>>, Vec<Media<'_>>, Vec<Clips<'_>>) {
+    let seated = owned
+        .iter()
+        .enumerate()
+        .map(|(at, lane)| Seated {
+            mask: lane.mask.as_ref(),
+            adapter: lane.adapter,
+            inputs: &lane.inputs,
+            reads: &lane.reads,
+            refs: lane.by_ref.is_some(),
+            held: lane.by_ref.as_ref().map(|_| 0),
+            pages: lane.by_ref.as_ref().map_or(&[][..], |(pages, _)| pages),
+            record: lane.by_ref.as_ref().map(|(_, record)| record.as_slice()),
+            ..Seated::of(Lane {
+                slot: at as u32,
+                word: lane.word,
+                tokens: &lane.tokens,
+            })
+        })
+        .collect();
+    let media = owned
+        .iter()
+        .enumerate()
+        .filter_map(|(at, lane)| {
+            lane.media.as_ref().map(|shot| Media {
+                lane: at as u32,
+                rows: &shot.rows,
+                patches: &shot.patches,
+                routes: &shot.routes,
+                positions: &shot.positions,
+                grids: &shot.grids,
+                token_positions: &[],
+            })
+        })
+        .collect();
+    let clips = owned
+        .iter()
+        .enumerate()
+        .filter(|(_, lane)| !lane.boxes.is_empty())
+        .map(|(at, lane)| Clips {
+            lane: at as u32,
+            boxes: &lane.boxes,
+            payload: &lane.payload,
+        })
+        .collect();
+    (seated, media, clips)
+}
+
+/// A lane of a class, as a load's walks make one: the naming walk over
+/// its named shell, the bind walk over the device's.
+impl<B: Serve> Shell<B> {
+    /// Walks every fire shape this load serves on the device, bind-only
+    /// ([`Serve::BINDS_AT_LOAD`]), before it serves: for every class, a
+    /// decode of each power of two of lanes up to the lane cap and a prefill
+    /// of each power of two of rows up to the top rung, each on every arm.
+    /// A backend whose dispatch binds a group per set of views (each view
+    /// the power of two over what it holds) builds every group a fire of
+    /// the load can ask for here. Nothing is encoded or submitted. The fires
+    /// walked.
+    pub fn walk_binds(&mut self) -> Result<u64> {
+        if !B::BINDS_AT_LOAD {
+            return Ok(0);
+        }
+        let top = self
+            .span
+            .rungs()
+            .last()
+            .map_or(1, |rung| rung.tokens)
+            .max(1);
+        // A fire of more lanes than the load holds seats names its slots by
+        // ref, as the runtime's fires do: every count of lanes it serves.
+        let seats = u32::try_from(self.held.len()).unwrap_or(u32::MAX);
+        let lanes_cap = self.budget().max_lanes.clamp(1, top);
+        // Each power of two under the cap, and the cap.
+        let mut counts: Vec<u32> = std::iter::successors(Some(1u32), |n| n.checked_mul(2))
+            .take_while(|&n| n < lanes_cap)
+            .collect();
+        counts.push(lanes_cap);
+        let mut shapes: Vec<Vec<(usize, u32)>> = Vec::new();
+        // A capturing class's lanes lay score rows in a bound program's score
+        // room, which no instance has at load: the walk leaves those classes
+        // to the fires that bind them.
+        let classes: Vec<usize> = (0..self.compiled.classes.classes.len())
+            .filter(|&class| !self.captures(class))
+            .collect();
+        for class in classes {
+            // Every count of lanes with every power of two of rows they can
+            // bring between them (a decode is rows = lanes, a prefill one
+            // lane), the rows spread over the lanes: each rung's views are
+            // fixed (bound at what the rung lays), and what changes with the
+            // rows and lanes is the kernels a fire takes. Kernels of one
+            // layout share a group, so a variant the walk's rows don't pick
+            // binds what its sibling's fire built.
+            for &lanes in &counts {
+                let lanes = u64::from(lanes);
+                let mut rows = lanes.next_power_of_two();
+                while rows <= u64::from(top) {
+                    shapes.push(
+                        (0..lanes)
+                            .map(|at| {
+                                (
+                                    class,
+                                    u32::try_from(spread(rows, lanes, at)).unwrap_or(u32::MAX),
+                                )
+                            })
+                            .collect(),
+                    );
+                    rows = rows.saturating_mul(2);
+                }
+            }
+        }
+        let depth = self.arms.depth();
+        tracing::info!(
+            top,
+            seats,
+            lanes_cap,
+            shapes = shapes.len(),
+            arms = depth,
+            rungs = ?self.span.rungs().iter().map(|rung| rung.tokens).collect::<Vec<_>>(),
+            "the bind walk's fire shapes"
+        );
+        let mut walked = 0u64;
+        for lanes in &shapes {
+            // Every arm: each walk holds its arm until the shape has taken
+            // them all, then gives them back.
+            let mut taken = Vec::with_capacity(depth);
+            let mut fault = None;
+            for _ in 0..depth {
+                match self.bind_fire(lanes) {
+                    Ok(arm) => {
+                        // A bind-only fire settles nothing, which is where
+                        // a fire takes its arm: the walk takes it, so the
+                        // next fire stages on the next arm.
+                        self.arms.take(arm);
+                        taken.push(arm);
+                        walked += 1;
+                    }
+                    Err(why) => {
+                        fault = Some(why);
+                        break;
+                    }
+                }
+            }
+            for arm in taken {
+                self.arms.give(arm);
+            }
+            if let Some(why) = fault {
+                return Err(why);
+            }
+        }
+        Ok(walked)
+    }
+
+    /// One fire of `lanes`, each `(class, rows)`, staged and walked
+    /// bind-only; the arm it took.
+    fn bind_fire(&mut self, lanes: &[(usize, u32)]) -> Result<usize> {
+        let owned = lanes
+            .iter()
+            .map(|&(class, rows)| {
+                let mut lane = self.naming_lane(class, rows)?;
+                if lanes.len() > self.held.len() {
+                    // Refs the pool takes as any lane's: a bind-only fire
+                    // reads and writes none, and a load need lay no seat
+                    // runs ([`Pools::walk_refs`]).
+                    let page = self.pools.paging().page_size.max(1);
+                    lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
+                }
+                Ok(lane)
+            })
+            .collect::<Result<Vec<NamingLane<B>>>>()?;
+
+        let (seated, media, clips) = lane_views(&owned);
+        if seated.iter().any(|lane| !lane.refs) {
+            let seats = self.pools.seat_segments();
+            self.commit_segments(seats)?;
+        }
+        let prepared = self.stage(StepView {
+            lanes: &seated,
+            attachments: &[],
+            media: &media,
+            clips: &clips,
+            folds: &[],
+            done: None,
+            guests: None,
+        })?;
+        let arm = prepared.arm;
+        self.feed(&prepared)?;
+        let place = At::new();
+        self.walk_with(
+            &prepared,
+            false,
+            false,
+            true,
+            &place,
+            &mut Cursor::new(&place),
+        )?;
+        Ok(arm)
+    }
+
     /// Whether a lane of `class` runs a region of `axis`.
     fn class_runs(&self, class: usize, axis: poem_ir::RowAxis) -> bool {
         self.compiled
@@ -5626,10 +6058,10 @@ impl<B: Serve> Shell<Named<B>> {
             let bytes = cells * seat.row_bytes();
             // A cell the device keeps arrives f32 and is cast where the
             // seat is bf16: the one kernel a fire asks for beside its walk.
-            let cell = if Named::<B>::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
+            let cell = if B::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
                 InputCell::Device {
                     cell: DeviceCell {
-                        buffer: crate::backend::Buffer::<Named<B>>::host(
+                        buffer: crate::backend::Buffer::<B>::host(
                             &self.device,
                             bytes * 2,
                             crate::books::owners::CHANNELS,
@@ -5671,6 +6103,7 @@ impl<B: Serve> Shell<Named<B>> {
                 .filter(|plane| plane.captured.is_some() && plane.classes.contains(class))
                 .map(|plane| plane.output.clone())
                 .collect(),
+            by_ref: None,
         })
     }
 
@@ -5696,7 +6129,9 @@ impl<B: Serve> Shell<Named<B>> {
             seat => Some(seat),
         }
     }
+}
 
+impl<B: Serve> Shell<Named<B>> {
     /// The fires that cut a mask into runs. A fire's rows go in the class
     /// order, so a mask the order leaves in more than one run is cut by
     /// three lanes in the order's turn, the middle one outside the mask.
@@ -5772,47 +6207,8 @@ impl<B: Serve> Shell<Named<B>> {
         let owned = lanes
             .iter()
             .map(|&(class, rows)| self.naming_lane(class, rows))
-            .collect::<Result<Vec<NamingLane<B>>>>()?;
-        let seated: Vec<Seated<'_, Named<B>>> = owned
-            .iter()
-            .enumerate()
-            .map(|(at, lane)| Seated {
-                mask: lane.mask.as_ref(),
-                adapter: lane.adapter,
-                inputs: &lane.inputs,
-                reads: &lane.reads,
-                ..Seated::of(Lane {
-                    slot: at as u32,
-                    word: lane.word,
-                    tokens: &lane.tokens,
-                })
-            })
-            .collect();
-        let media: Vec<Media<'_>> = owned
-            .iter()
-            .enumerate()
-            .filter_map(|(at, lane)| {
-                lane.media.as_ref().map(|shot| Media {
-                    lane: at as u32,
-                    rows: &shot.rows,
-                    patches: &shot.patches,
-                    routes: &shot.routes,
-                    positions: &shot.positions,
-                    grids: &shot.grids,
-                    token_positions: &[],
-                })
-            })
-            .collect();
-        let clips: Vec<Clips<'_>> = owned
-            .iter()
-            .enumerate()
-            .filter(|(_, lane)| !lane.boxes.is_empty())
-            .map(|(at, lane)| Clips {
-                lane: at as u32,
-                boxes: &lane.boxes,
-                payload: &lane.payload,
-            })
-            .collect();
+            .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
+        let (seated, media, clips) = lane_views(&owned);
         // Its seat-addressed lanes read the seats' runs: back their segments
         // before staging, as a direct fire does (`Shell::fire_seated`).
         if seated.iter().any(|lane| !lane.refs) {
@@ -5846,7 +6242,7 @@ impl<B: Serve> Shell<Named<B>> {
             began: 0,
             made: Vec::with_capacity(whole.len()),
         };
-        match self.walk_with(&prepared, false, false, &place, &mut sink) {
+        match self.walk_with(&prepared, false, false, false, &place, &mut sink) {
             Ok(_) => {}
             Err(Fault::Fire(poem_exec::Error::Kernel(refusal))) => {
                 self.pipelines.0.abandon();
@@ -6069,7 +6465,10 @@ mod tests {
             layers: 2,
             dtype: Dtype::F32,
             direct: false,
-            host: true,
+            own: true,
+            hosted: true,
+            seated: true,
+            spanned: false,
         }
     }
 

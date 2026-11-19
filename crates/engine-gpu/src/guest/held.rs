@@ -3,7 +3,9 @@
 //! of role `Instance`, and the cells a channel keeps on the device in slots
 //! of role `Channel`, which the runtime took for them. An item past one slot
 //! lies in a run of adjacent slots of one chunk (`Footprint::contiguous`);
-//! an item past a chunk is refused.
+//! an item past a chunk is refused. An instance's tables lie in one run
+//! whatever their sizes, so in one segment: a backend binds that segment
+//! once for every instance whose tables lie in it.
 //!
 //! A [`Held`] is a span of one slot ref (or one run), addressed through the
 //! segment buffer its chunk sits in. Evacuation moves the chunk under a ref
@@ -137,6 +139,14 @@ impl<B: Backend> Held<B> {
         self.offset
     }
 
+    /// The bytes of [`Held::buffer`] its slot (or run) spans, of slots of
+    /// `slot_bytes`: what the instance holds there, the span among it.
+    #[must_use]
+    pub fn run_span(&self, slot_bytes: u64) -> (u64, u64) {
+        let start = self.offset - self.at;
+        (start, start + u64::from(self.run) * slot_bytes)
+    }
+
     /// Writes `from` at `at` of the span through the queue (the segment is
     /// device memory), before the work submitted next.
     pub fn write(&self, at: u64, from: &[u8]) -> Result<()> {
@@ -154,72 +164,45 @@ impl<B: Backend> Held<B> {
     }
 }
 
-/// Lays tables of `sizes` out in slots of `slot_bytes`: each aligned to
-/// `align` and never straddling a slot. Each table's slot index and byte
-/// there, and the slots taken; `None` where a table is larger than a slot.
-#[must_use]
-pub fn pack(sizes: &[u64], slot_bytes: u64, align: u64) -> Option<(Vec<(u32, u64)>, u32)> {
-    let align = align.max(1);
-    let mut places = Vec::with_capacity(sizes.len());
-    let (mut slot, mut cursor) = (0u32, 0u64);
-    for &bytes in sizes {
-        let bytes = bytes.max(1);
-        if bytes > slot_bytes {
-            return None;
-        }
-        let at = cursor.next_multiple_of(align);
-        if at + bytes > slot_bytes {
-            slot += 1;
-            cursor = 0;
-        } else {
-            cursor = at;
-        }
-        places.push((slot, cursor));
-        cursor += bytes;
-    }
-    let slots = if sizes.is_empty() { 0 } else { slot + 1 };
-    Some((places, slots))
-}
-
-/// How an instance's tables lie in its `Instance` slots: packed a slot
-/// ([`pack`]), or, where a table is larger than a slot, one after another
-/// in one run of adjacent slots (`Footprint::contiguous`).
+/// How an instance's tables lie in its `Instance` slots: one after another,
+/// each aligned, in one run of adjacent slots of one chunk
+/// (`Footprint::contiguous` where it takes more than one), so in one
+/// segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableLayout {
-    /// Each table's slot index (0 in a run) and byte there.
-    pub places: Vec<(u32, u64)>,
+    /// Each table's byte in the run.
+    pub places: Vec<u64>,
     pub slots: u32,
-    pub run: bool,
 }
 
 impl TableLayout {
     #[must_use]
     pub fn of(sizes: &[u64], slot_bytes: u64, align: u64) -> TableLayout {
-        if let Some((places, slots)) = pack(sizes, slot_bytes, align) {
-            return TableLayout {
-                places,
-                slots,
-                run: false,
-            };
-        }
         let mut places = Vec::with_capacity(sizes.len());
         let mut end = 0u64;
         for &bytes in sizes {
             let at = end.next_multiple_of(align.max(1));
-            places.push((0, at));
+            places.push(at);
             end = at + bytes.max(1);
         }
         TableLayout {
             places,
-            slots: u32::try_from(end.div_ceil(slot_bytes)).unwrap_or(u32::MAX),
-            run: true,
+            slots: u32::try_from(end.div_ceil(slot_bytes.max(1))).unwrap_or(u32::MAX),
         }
     }
 
-    /// Whether the slots fit one chunk of `per_chunk` slots: a run must.
+    /// Whether the run fits one chunk of `per_chunk` slots: it must.
     #[must_use]
     pub fn fits(&self, per_chunk: u32) -> bool {
-        !self.run || self.slots <= per_chunk
+        self.slots <= per_chunk
+    }
+
+    /// Whether the runtime must take the slots as one run
+    /// (`Footprint::contiguous`): wherever they are more than one, whatever
+    /// each table's size.
+    #[must_use]
+    pub fn contiguous(&self) -> bool {
+        self.slots > 1
     }
 }
 
@@ -258,28 +241,27 @@ pub fn table_footprint<B: Backend>(
     Ok(engine::program::Footprint {
         bytes: sizes.iter().sum(),
         slots: layout.slots,
-        contiguous: layout.run,
+        contiguous: layout.contiguous(),
     })
 }
 
 /// Places `tables` (sizes in [`TableLayout`] order) in `slots`, slot refs of
-/// `shape`, and writes each one's bytes: one write per slot or run, so a
-/// bind costs one host copy through the queue for every slot it fills.
-/// Each table's span, and whether they lie in one run.
+/// `shape` (one run, in order), and writes their bytes in one write through
+/// the queue. Each table's span.
 pub fn place_tables<B: Backend>(
     pools: &Pools<B>,
     shape: ShapeId,
     slots: &[u32],
     tables: &[Vec<u8>],
     align: u64,
-) -> Result<(Vec<Held<B>>, bool)> {
+) -> Result<Vec<Held<B>>> {
     let sizes: Vec<u64> = tables.iter().map(|t| t.len() as u64).collect();
     let layout = TableLayout::of(&sizes, pools.slot_bytes(shape)?, align);
-    if layout.slots as usize != slots.len() || (layout.run && !consecutive(slots)) {
+    if layout.slots as usize != slots.len() || !consecutive(slots) {
         return Err(refused(format!(
-            "this instance's tables take {} instance slot(s){} and the binding names {slots:?}",
+            "this instance's tables take a run of {} instance slot(s) and the binding names \
+             {slots:?}",
             layout.slots,
-            if layout.run { " in one run" } else { "" },
         )));
     }
     let count = u32::try_from(slots.len()).unwrap_or(u32::MAX);
@@ -287,26 +269,11 @@ pub fn place_tables<B: Backend>(
         .places
         .iter()
         .zip(&sizes)
-        .map(|(&(slot, at), &bytes)| {
-            if layout.run {
-                Held::in_run(pools, shape, slots[0], count, at, bytes.max(1))
-            } else {
-                Held::in_slot(pools, shape, slots[slot as usize], at, bytes.max(1))
-            }
-        })
+        .map(|(&at, &bytes)| Held::in_run(pools, shape, slots[0], count, at, bytes.max(1)))
         .collect::<Result<Vec<_>>>()?;
-    // One image a slot (or the run), from the slot's first byte, written
-    // once.
-    let mut images: Vec<(usize, &Held<B>, Vec<u8>)> = Vec::new();
-    for ((&(slot, at), table), span) in layout.places.iter().zip(tables).zip(&held) {
-        let index = if layout.run { 0 } else { slot as usize };
-        let image = match images.iter().position(|(k, _, _)| *k == index) {
-            Some(found) => &mut images[found].2,
-            None => {
-                images.push((index, span, Vec::new()));
-                &mut images.last_mut().expect("just pushed").2
-            }
-        };
+    // One image of the run, from its first byte, written once.
+    let mut image = Vec::new();
+    for (&at, table) in layout.places.iter().zip(tables) {
         let at = usize::try_from(at).unwrap_or(usize::MAX);
         let end = (at + table.len()).next_multiple_of(4);
         if image.len() < end {
@@ -314,38 +281,46 @@ pub fn place_tables<B: Backend>(
         }
         image[at..at + table.len()].copy_from_slice(table);
     }
-    for (_, span, image) in images {
-        span.buffer()
-            .write_shared(span.offset() - span.at, &image)?;
+    if let Some(first) = held.first() {
+        first
+            .buffer()
+            .write_shared(first.offset() - first.at, &image)?;
     }
-    Ok((held, layout.run))
+    Ok(held)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TableLayout, consecutive, item_slots, pack};
+    use super::{TableLayout, consecutive, item_slots};
 
+    /// The tables lie one after another, each aligned, in one run: small
+    /// ones in one slot, and past a slot in as many adjacent slots as they
+    /// take, never more than a chunk.
     #[test]
-    fn tables_pack_aligned_and_never_straddle_a_slot() {
-        let (places, slots) = pack(&[100, 40, 4000, 8], 4096, 16).expect("every table fits");
-        assert_eq!(places, vec![(0, 0), (0, 112), (1, 0), (1, 4000)]);
-        assert_eq!(slots, 2);
-        let (places, _) = pack(&[100, 40], 4096, 64).expect("both fit");
-        assert_eq!(places, vec![(0, 0), (0, 128)]);
-        assert_eq!(pack(&[], 4096, 16), Some((Vec::new(), 0)));
-        assert_eq!(pack(&[5000], 4096, 16), None);
-    }
-
-    #[test]
-    fn tables_past_a_slot_lie_one_after_another_in_one_run() {
-        let packed = TableLayout::of(&[100, 40], 4096, 16);
-        assert!(!packed.run);
-        assert_eq!(packed.slots, 1);
+    fn tables_lie_one_after_another_in_one_run() {
+        let small = TableLayout::of(&[100, 40], 4096, 16);
+        assert_eq!((small.places.clone(), small.slots), (vec![0, 112], 1));
         let run = TableLayout::of(&[5000, 100, 8], 4096, 16);
-        assert!(run.run, "a table past a slot makes the tables a run");
-        assert_eq!(run.places, vec![(0, 0), (0, 5008), (0, 5120)]);
+        assert_eq!(run.places, vec![0, 5008, 5120]);
         assert_eq!(run.slots, 2);
         assert!(run.fits(2) && !run.fits(1));
+        let packed_before = TableLayout::of(&[100, 40, 4000, 8], 4096, 16);
+        assert_eq!(packed_before.places, vec![0, 112, 160, 4160]);
+        assert_eq!(packed_before.slots, 2, "past a slot, as a run");
+        assert_eq!(TableLayout::of(&[], 4096, 16).slots, 0);
+    }
+
+    /// Tables none of which passes a slot, but which take two between them,
+    /// ask the runtime for one run (which it lays in adjacent slots of one
+    /// chunk: the runtime's `instance_tables_past_a_slot_take_one_run`), so
+    /// they lie in one segment; tables in one slot ask for none.
+    #[test]
+    fn tables_in_two_slots_ask_for_one_run() {
+        let two = TableLayout::of(&[3000, 3000], 4096, 16);
+        assert_eq!((two.slots, two.contiguous()), (2, true));
+        assert_eq!(two.places, vec![0, 3008]);
+        let one = TableLayout::of(&[100, 40], 4096, 16);
+        assert_eq!((one.slots, one.contiguous()), (1, false));
     }
 
     #[test]

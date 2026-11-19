@@ -543,12 +543,14 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0)]),
             hbm_gbps: Some(700.0),
+            cached_gbps: None,
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         };
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [
@@ -576,6 +578,7 @@ mod tests {
             (
                 profile::fire::Rates {
                     hbm_gbps: Some(-1.0),
+                    cached_gbps: None,
                     ..all.clone()
                 },
                 "hbm_gbps",
