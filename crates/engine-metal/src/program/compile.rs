@@ -889,7 +889,9 @@ impl Builder<'_> {
 /// view: what the emitter did not account for gets no reuse.
 fn step_launches(published: StepNodes, region: &[u32]) -> StepNodes {
     let accounted = |node: &u32| {
-        published.views.contains(node) || published.steps.iter().any(|nodes| nodes.contains(node))
+        published.views.contains(node)
+            || published.folded.iter().any(|&(_, folded)| folded == *node)
+            || published.steps.iter().any(|nodes| nodes.contains(node))
     };
     if region.iter().all(accounted) {
         published

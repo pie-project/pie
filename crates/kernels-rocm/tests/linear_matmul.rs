@@ -413,18 +413,28 @@ fn the_live_lm_head_writes_the_last_columns_of_a_wide_vocabulary() {
 #[test]
 fn the_normed_skinny_product_is_the_norm_then_the_product() {
     let Some(gpu) = Gpu::open() else { return };
-    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
-    t.launch_ns = 1536;
-    t.hbm_gbps = 4090;
-    let ctx = gpu.ctx().with_tuning(t);
-    // (m, n, k, plus_one, folds): one row past a 304-block grid reads less
-    // than a launch's worth again, eight rows do not.
-    for (m, n, k, plus_one, folds) in [
-        (1u32, 4096u32, 1024u32, false, true),
-        (1, 3000, 1024, true, true),
-        (2, 6144, 1024, false, true),
-        (8, 4096, 1024, false, false),
+    // (m, n, k, plus_one, cached GB/s, folds): priced at device memory's
+    // rate (no cached rate), one row past a 304-block grid reads less than a
+    // launch's worth again, eight rows do not; at a cached rate every row
+    // count the kernel stages folds, and lands the unfused path's bits.
+    for (m, n, k, plus_one, cached, folds) in [
+        (1u32, 4096u32, 1024u32, false, 0u32, true),
+        (1, 3000, 1024, true, 0, true),
+        (2, 6144, 1024, false, 0, true),
+        (8, 4096, 1024, false, 0, false),
+        (3, 4096, 1024, false, 1_000_000, true),
+        (4, 4096, 1024, true, 1_000_000, true),
+        (4, 6144, 1024, false, 1_000_000, true),
+        (5, 2048, 1024, false, 1_000_000, true),
+        (6, 2048, 1024, true, 1_000_000, true),
+        (8, 2048, 1024, false, 1_000_000, true),
+        (4, 2048, 3072, false, 1_000_000, true),
     ] {
+        let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+        t.launch_ns = 1536;
+        t.hbm_gbps = 4090;
+        t.cached_gbps = cached;
+        let ctx = gpu.ctx().with_tuning(t);
         let x: Vec<f32> = values((m * k) as usize, 41, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 42, 1.0).into_iter().map(round_bf16).collect();
         let nw: Vec<f32> = values(k as usize, 43, 0.5).into_iter().map(round_bf16).collect();
@@ -490,8 +500,14 @@ fn the_normed_gated_skinny_product_is_the_norm_then_the_gated_product() {
     let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
     t.launch_ns = 1536;
     t.hbm_gbps = 4090;
-    let ctx = gpu.ctx().with_tuning(t);
-    for (m, i, k, plus_one) in [(1u32, 3072u32, 1024u32, false), (2, 1536, 1024, true)] {
+    for (m, i, k, plus_one, cached) in [
+        (1u32, 3072u32, 1024u32, false, 0u32),
+        (2, 1536, 1024, true, 0),
+        (4, 3072, 1024, false, 1_000_000),
+    ] {
+        let mut t = t;
+        t.cached_gbps = cached;
+        let ctx = gpu.ctx().with_tuning(t);
         let x: Vec<f32> = values((m * k) as usize, 51, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 52, 1.0).into_iter().map(round_bf16).collect();
         let nw: Vec<f32> = values(k as usize, 53, 0.5).into_iter().map(round_bf16).collect();

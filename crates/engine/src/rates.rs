@@ -29,6 +29,12 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
+//! - `tile_tflops_by_rows`: each tiled matmul kernel the backend can take
+//!   at decode-shaped and short prompt rows, below the matmul curve's first,
+//!   its flops at the rows it lands over its time (slang backends).
+//! - `vector_tflops_by_rows`: each vector matmul kernel (keyed by the rows a
+//!   workgroup carries) at 1 to 256 rows, its flops over its time, its
+//!   weight passes in it (slang backends).
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
@@ -303,6 +309,20 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         for (w, curve) in widths {
             if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
                 return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(tiles) = &rates.tile_tflops_by_rows {
+        for (tile, curve) in tiles {
+            if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (a {tile}-row tile)")));
+            }
+        }
+    }
+    if let Some(vectors) = &rates.vector_tflops_by_rows {
+        for (rows, curve) in vectors {
+            if let Some((key, at)) = point("vector_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} ({rows} rows a workgroup)")));
             }
         }
     }
@@ -1350,10 +1370,13 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
             hbm_gbps: Some(700.0),
+            cached_gbps: Some(20000.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
         }
     }
 
@@ -1468,10 +1491,84 @@ mod tests {
         assert!(!second.tuned().measured_this_load);
     }
 
+    /// A saved profile lacking one key a newer pie reads: the load asks for
+    /// that key alone and the file keeps every other rate as it was.
+    #[test]
+    fn a_profile_lacking_one_key_gains_it_and_keeps_the_rest() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-one-key-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        let save = || SaveTo {
+            path: path.clone(),
+            provenance: provenance("toy", "a test"),
+            registry: &registry,
+        };
+        let older = profile::fire::Rates {
+            few_row_tflops: None,
+            ..all()
+        };
+        // An older pie, which read every key but this one, saved the file.
+        let older_keys: Vec<&'static str> = profile::fire::KEYS
+            .iter()
+            .copied()
+            .filter(|&key| key != "few_row_tflops")
+            .collect();
+        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        rates_at_load(first, &older_keys, Some(save()), None, None, |_| {
+            Ok(Measured {
+                rates: older.clone(),
+                unsettled: false,
+            })
+        })
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert_eq!(
+            second.rates().missing(&profile::fire::KEYS),
+            ["few_row_tflops"]
+        );
+        let lacked = second.rates().missing(&profile::fire::KEYS);
+        let loaded = rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            Some(save()),
+            None,
+            None,
+            |_| {
+                // A backend times only what the profile lacks.
+                Ok(Measured {
+                    rates: all().only(&lacked),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded.rates(), all());
+        let rates_of = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|line| *line != "[rates]")
+                .take_while(|line| !line.starts_with("[provenance]"))
+                .filter(|line| !line.starts_with("few_row_tflops"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(rates_of(&before), rates_of(&after));
+        assert!(after.contains("few_row_tflops = 4.0"), "{after}");
+    }
+
     #[test]
     fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
         let measured = profile::fire::Rates {
             hbm_gbps: Some(700.0),
+            cached_gbps: None,
             ..profile::fire::Rates::default()
         };
         let how = ("rates", "\"measured at load\"".to_string());
@@ -1779,7 +1876,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("measured no [\"few_row_tflops\", \"workgroups_per_core\"]"),
+            err.contains(
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+            ),
             "{err}"
         );
     }
@@ -2105,10 +2204,13 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
             hbm_gbps: Some(800.0),
+            cached_gbps: None,
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: None,
+            vector_tflops_by_rows: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");
