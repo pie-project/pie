@@ -287,6 +287,9 @@ pub struct Run<'c, B: Backend> {
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
     tier: kernels_slang::Tier,
+
+    /// The dense matmul's tactic at each rung.
+    dense: &'c crate::dense::Dense,
 }
 
 impl<'c, B: Backend> Run<'c, B> {
@@ -311,6 +314,7 @@ impl<'c, B: Backend> Run<'c, B> {
         hashes: &'c crate::weights::NgramHashes<B>,
         tuning: &'c B::Tuning,
         tier: kernels_slang::Tier,
+        dense: &'c crate::dense::Dense,
         rows: Option<&'c crate::experts::Gathered<B>>,
         host: Option<&'c crate::experts::HostTier<B>>,
     ) -> Self {
@@ -341,11 +345,17 @@ impl<'c, B: Backend> Run<'c, B> {
             tuning,
             split: None,
             tier,
+            dense,
         }
     }
 
     pub fn tier(&self) -> kernels_slang::Tier {
         self.tier
+    }
+
+    /// The dense matmul's tactic at each rung.
+    pub fn dense(&self) -> &'c crate::dense::Dense {
+        self.dense
     }
 
     /// Submits the frame each time a node of a new layer has run.

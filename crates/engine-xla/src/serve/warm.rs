@@ -404,6 +404,9 @@ impl Shell {
         }
         let traced_s = started.elapsed().as_secs_f64();
         let skipped = self.compile_deferred(deferred)?;
+        // A prompt reading every row of itself fires as the plain fire of its
+        // rows and reads its rows again with its row count's readout program.
+        let readouts = self.lay_readouts()?;
         self.warm_gathers()?;
         self.pools.warm_copies(&self.device, &self.handles)?;
         let touched = shapes.iter().map(Vec::len).max().unwrap_or(0) as u32;
@@ -415,6 +418,7 @@ impl Shell {
             parts = ?added,
             programs = self.traced.len(),
             skipped,
+            readouts,
             traced_s,
             s = started.elapsed().as_secs(),
             "xla warm ladder compiled"

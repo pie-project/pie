@@ -75,3 +75,49 @@ pub fn readout_probe(trace: &Trace) -> Option<ValueId> {
         })
         .map(|(at, _)| ValueId(at as u32))
 }
+
+/// The values a readout program reads to land readout output `name` at any
+/// rows of a fire: the token-rowed values the output's backward slice over
+/// readout-rowed nodes reads (the final hidden rows, for a plain model's
+/// logits), with the slice's nodes in order; or why it cannot, when the
+/// slice writes a cache (an MTP head's draft, whose attention appends kv).
+pub fn readout_slice(trace: &Trace, name: &str) -> Result<(Vec<ValueId>, Vec<usize>), String> {
+    let out = (trace.outputs.iter())
+        .find(|o| o.name == name)
+        .ok_or_else(|| format!("the trace states no output `{name}`"))?;
+    let rowed = |v: ValueId| matches!(lead(trace, v), Some(Dim::Readouts));
+    let mut wanted: Vec<ValueId> = vec![out.value];
+    let mut slice: Vec<usize> = Vec::new();
+    let mut entries: Vec<ValueId> = Vec::new();
+    for (at, node) in trace.nodes.iter().enumerate().rev() {
+        let mut outs = Vec::new();
+        node.op.outputs(&mut outs);
+        if !outs.iter().any(|v| wanted.contains(v)) {
+            continue;
+        }
+        if matches!(node.op, poem_ir::Operation::Attn(_)) {
+            return Err(format!(
+                "output `{name}` is computed by attention over readout rows (node {at}), which \
+                 writes the kv cache"
+            ));
+        }
+        slice.push(at);
+        let mut ins = Vec::new();
+        node.op.inputs(&mut ins);
+        for v in ins {
+            let def = &trace.values[v.0 as usize].def;
+            if rowed(v) {
+                if !wanted.contains(&v) {
+                    wanted.push(v);
+                }
+            } else if matches!(def, Def::Op(_) | Def::Merge(_))
+                && matches!(lead(trace, v), Some(Dim::Tokens | Dim::TokensTimes(_)))
+                && !entries.contains(&v)
+            {
+                entries.push(v);
+            }
+        }
+    }
+    slice.reverse();
+    Ok((entries, slice))
+}

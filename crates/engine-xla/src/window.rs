@@ -153,6 +153,25 @@ impl Windows {
         })
     }
 
+    /// One window, `span`, every region's: a program traced outside a
+    /// walk of the template (a readout program over a fire's rows).
+    #[must_use]
+    pub fn single(span: MaskSpan, indptr_host: Vec<i32>) -> Windows {
+        Windows {
+            windows: vec![Window {
+                span,
+                indptr_host,
+                indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+                patch: MaskSpan::default(),
+                voxel: MaskSpan::default(),
+                pass: 0,
+                passes: 1,
+            }],
+            runs: vec![0],
+            of_region: vec![(0, 1)],
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.windows.len()

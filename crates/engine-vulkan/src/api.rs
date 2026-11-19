@@ -195,6 +195,9 @@ impl Host for Api {
                     Ok(count) => count,
                     Err(refused) => break 'pass Some(refused.to_string()),
                 };
+                if let Some(why) = engine_gpu::api::overreach(attachment, lane_count) {
+                    break 'pass Some(why);
+                }
                 for lane_at in 0..lane_count {
                     let lane_index = attachment.lane as usize + lane_at;
                     let Some(lane) = step.lanes.get(lane_index) else {
