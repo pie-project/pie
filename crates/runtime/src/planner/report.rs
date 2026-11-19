@@ -222,9 +222,18 @@ impl ResidencyPlanner {
         });
     }
 
-    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId, need: (u32, u32)) {
+    /// `refused_free_runs`: the free runs of the need's length the refusal
+    /// itself saw, where it says ([`crate::store::roles::RolesError::unpark_free_runs`]).
+    /// A refusal that saw runs of its need standing and was short all the
+    /// same understates what the unpark takes; one that saw too few is a
+    /// plain short head, sent again as soon as the runs stand.
+    pub(super) fn requeue_restore_roles(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        need: (u32, u32),
+        refused_free_runs: Option<u32>,
+    ) {
         let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
-        let gives = self.port.room_gives();
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
@@ -235,11 +244,17 @@ impl ResidencyPlanner {
                     pieces: need.1,
                     pages,
                 });
-                // It went again on free runs of this need and was short all
-                // the same: the need understates its unpark.
-                if proc.roles_free_retry.take() == Some(need) {
-                    proc.roles_free_short = Some(need);
-                    proc.roles_free_short_at = gives;
+                // Refused while runs of this need stood (its refusal's own
+                // view): the need understates its unpark. Refused with too
+                // few standing, it is a plain short head, whatever it was
+                // sent on.
+                proc.roles_free_retry = None;
+                match refused_free_runs {
+                    Some(free) if free >= need.1 => {
+                        proc.roles_free_short = Some(need);
+                        proc.roles_free_short_at = free;
+                    }
+                    _ => proc.roles_free_short = None,
                 }
             }
         });

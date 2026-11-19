@@ -216,6 +216,27 @@ impl RolesError {
         }
     }
 
+    /// The free runs of its need's length the pool held when an unpark was
+    /// refused short of runs of whole chunks ([`Self::UnparkShort`]): the
+    /// refusal's own view. `None` for a run of slots, or another refusal.
+    #[must_use]
+    pub fn unpark_free_runs(&self) -> Option<u32> {
+        let Self::UnparkShort(short) = self else {
+            return None;
+        };
+        match short.as_ref() {
+            Self::GuestShort {
+                room: GuestRoom::Runs { free_runs, .. },
+                ..
+            }
+            | Self::GuestGrow {
+                room: GuestRoom::Runs { free_runs, .. },
+                ..
+            } => Some(*free_runs),
+            _ => None,
+        }
+    }
+
     /// What an unpark short of room ([`Self::UnparkShort`]) needs, as runs
     /// of whole chunks `(run, pieces)`: a guest state's runs, or one chunk
     /// for slots in a chunk (a run of Channel slots too).

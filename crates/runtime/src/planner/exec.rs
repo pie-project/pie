@@ -922,7 +922,7 @@ async fn restore(
                     ?need,
                     "planner: a restore waits for room for its roles"
                 );
-                planner.requeue_restore_roles(pid, need);
+                planner.requeue_restore_roles(pid, need, error.unpark_free_runs());
                 planner.note_roles_short_why(pid, format!("{error:?}"));
                 return;
             }
@@ -978,7 +978,7 @@ async fn restore(
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
         tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid, (need.run, need.pieces));
+        planner.requeue_restore_roles(pid, (need.run, need.pieces), None);
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });

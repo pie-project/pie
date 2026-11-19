@@ -78,11 +78,11 @@ pub(super) struct Proc {
     /// again; room is made for it (idle cache, a grow, the chunks'
     /// occupants) until its restore lands.
     pub(super) roles_free_short: Option<(u32, u32)>,
-    /// The pool's count of room given back when its need was marked
-    /// understated ([`Self::roles_free_short`]): once room has been given
-    /// back since, the free runs of its need send it once more, never on
-    /// the same room twice.
-    pub(super) roles_free_short_at: u64,
+    /// The free runs of its need's length its refusal saw when its need
+    /// was marked understated ([`Self::roles_free_short`]): once the pool
+    /// holds more, it goes again (a change a quiescent pool can show, as
+    /// room moves or comes), never twice on the same runs.
+    pub(super) roles_free_short_at: u32,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside

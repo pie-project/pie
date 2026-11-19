@@ -2585,6 +2585,9 @@ impl PoolPort for BindRoomPool {
     fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
         self.runs_free(run, pieces)
     }
+    fn guest_free_runs(&self, run: u32) -> u32 {
+        (0..).take_while(|&k| self.runs_free(run, k + 1)).count() as u32
+    }
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
         let comes = !self.runs_free(run, pieces) && self.compactable.load(Ordering::Acquire);
         if comes {
@@ -3382,9 +3385,11 @@ async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_
 /// head restore short of role slots, and free runs of its need standing,
 /// so the planner sent it again, its unpark came back short (the need
 /// understated what the unpark takes), and so on 20 million times, never
-/// reclaiming the idle cache that held the device. A restore sent again
-/// on free runs of a need and short of that need once more marks it
-/// understated; a different need does not.
+/// reclaiming the idle cache that held the device. A restore refused while
+/// runs of its need stood (the refusal's own view) marks it understated;
+/// one refused with too few standing is a plain short head (the
+/// 500-at-once census: refused with free_runs 0, then held behind room
+/// given back on a quiescent pool).
 #[test]
 fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -3400,20 +3405,24 @@ fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
             proc.roles_free_retry = retried;
         });
     };
-    restoring(&planner, Some((2, 1)));
-    planner.requeue_restore_roles(pid, (1, 1));
+    // Refused with no run of its need standing (its own view): a plain
+    // short head, whatever it was sent on.
+    restoring(&planner, Some((1, 1)));
+    planner.requeue_restore_roles(pid, (1, 1), Some(0));
     assert_eq!(
         planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
         None,
-        "a different need: not understated"
+        "refused short of runs: not understated"
     );
+    // Refused while runs of its need stood: understated, at what it saw.
     restoring(&planner, Some((1, 1)));
-    planner.requeue_restore_roles(pid, (1, 1));
+    planner.requeue_restore_roles(pid, (1, 1), Some(2));
     assert_eq!(
         planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
         Some((1, 1)),
-        "short again on free runs of the same need: understated"
+        "refused with runs of its need standing: understated"
     );
+    assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_short_at), 2);
     assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_retry), None);
 }
 
@@ -3439,6 +3448,8 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
             pages: 1,
         });
         proc.roles_free_short = Some((1, 1));
+        // Refused while the four free runs stood.
+        proc.roles_free_short_at = 4;
         inner.enqueue(
             restoring,
             WaitKind::Restore {
@@ -4471,11 +4482,12 @@ async fn a_restore_head_among_residents_waiting_on_grants_is_served_after_a_comp
 /// Mac Pro's disk-only home on 45cf89b8c (500 at once, stalled in
 /// seconds): the head a restore with no kv to ask (head_pages=0) and a
 /// roles need of a run of 3, 70 free runs of 3 standing (the map's
-/// cheapest cost 0), every resident waiting on a grant. A head whose runs
-/// stand is sent at once. One whose need was marked understated (it went
-/// on free runs before and came back short) is not sent again on the same
-/// room (the 20M-round livelock) but is once room has been given back
-/// since; it is never held for good on runs that stand.
+/// cheapest cost 0), every resident waiting on a grant, nothing firing.
+/// The census showed it refused with free_runs 0: a plain short head,
+/// sent at once now its runs stand, with no wait on room given back (a
+/// quiescent pool gives none). One truly understated (refused while as
+/// many runs stood) is not sent again on the same runs (the 20M-round
+/// livelock), but is once the pool holds more of them than it saw.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_room_is_given() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -4503,9 +4515,10 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
                 pieces: 1,
                 pages: 3,
             });
+            // Understated: refused while as many runs stood as stand now.
             if understated {
                 proc.roles_free_short = Some((3, 1));
-                proc.roles_free_short_at = 0;
+                proc.roles_free_short_at = 2;
             }
             inner.enqueue(
                 head,
@@ -4546,10 +4559,11 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
             assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
             continue;
         }
-        assert!(!sent(&planner), "understated: not sent again on the same room");
+        assert!(!sent(&planner), "understated: not sent again on the same runs");
         assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one moved");
-        // Room is given back: the runs that stand send it once more.
-        pool.gives.fetch_add(1, Ordering::Relaxed);
+        // More runs of its need stand than its refusal saw (room moved, no
+        // completion): it goes once more.
+        pool.free.lock().extend([3, 4, 5]);
         planner.pages_freed();
         for _ in 0..200 {
             crate::rt::yield_now().await;

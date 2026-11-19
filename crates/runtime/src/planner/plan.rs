@@ -333,18 +333,18 @@ impl ResidencyPlanner {
                     // (Mac Pro's M5 livelock: free runs of it stood, every
                     // unpark came back short, 20M times, and nothing was
                     // ever reclaimed or moved); then room is made for it.
-                    // Understated, it goes again on free runs only once room
-                    // has been given back since: never twice on the same
-                    // room (the livelock), and never held on runs that
-                    // stand while room comes and goes (Mac Pro's disk-only
-                    // home: 70 free runs of its need, every resident
-                    // waiting on a grant, the head held for good).
-                    let gives = self.port.room_gives();
+                    // Understated (refused while runs of its need stood), it
+                    // goes again only once the pool holds more of them than
+                    // its refusal saw: never twice on the same runs (the
+                    // livelock), and on a change a quiescent pool shows (no
+                    // completion needed: Mac Pro's disk-only home, 64 free
+                    // runs, nothing firing, the head held for good).
+                    let free_runs = self.port.guest_free_runs(run);
                     let understated = self.with_inner(|inner| {
                         inner.unmet_head().is_some_and(|(_, waiter)| {
                             inner.procs.get(&waiter.pid).is_some_and(|proc| {
                                 proc.roles_free_short == Some((run, pieces))
-                                    && proc.roles_free_short_at == gives
+                                    && free_runs <= proc.roles_free_short_at
                             })
                         })
                     });

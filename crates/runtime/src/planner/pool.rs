@@ -283,6 +283,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (run, pieces);
         false
     }
+    /// The free runs of `run` adjacent chunks a guest's state could take
+    /// now ([`Self::guest_room_free`] counted): what a restore head short of
+    /// them watches change.
+    fn guest_free_runs(&self, run: u32) -> u32 {
+        u32::from(self.guest_room_free(run, 1))
+    }
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
     /// the guest state `pid`'s restore retakes first (its parked dead
     /// parts, [`crate::store::roles::Roles::fits_beside_unpark`]): room for
@@ -528,9 +534,13 @@ impl PoolPort for RegistryPool {
     }
 
     fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
+        self.guest_free_runs(run) >= pieces
+    }
+
+    fn guest_free_runs(&self, run: u32) -> u32 {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
-            .is_some_and(|shared| shared.lock().unwrap().pool().free_chunk_runs(run) >= pieces)
+            .map_or(0, |shared| shared.lock().unwrap().pool().free_chunk_runs(run))
     }
 
     fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {
