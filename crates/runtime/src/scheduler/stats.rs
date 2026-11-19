@@ -142,6 +142,8 @@ pub struct QuorumStats {
     pub seal_events: u64,
     pub seal_while_executing: u64,
     pub dispatch_blocked_holds: u64,
+    pub frames_parked_on_lane: u64,
+    pub frames_past_waiting_lane: u64,
     pub device_idle_us: u64,
     pub device_idle_gaps: u64,
     pub idle_break_control: u64,
@@ -237,6 +239,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut q_seal_events = 0u64;
     let mut q_seal_while_executing = 0u64;
     let mut q_dispatch_blocked_holds = 0u64;
+    let mut q_frames_parked_on_lane = 0u64;
+    let mut q_frames_past_waiting_lane = 0u64;
     let mut q_device_idle_us = 0u64;
     let mut q_device_idle_gaps = 0u64;
     let mut q_idle_break_control = 0u64;
@@ -290,6 +294,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         q_seal_events += f.quorum.seal_events.load(Relaxed);
         q_seal_while_executing += f.quorum.seal_while_executing.load(Relaxed);
         q_dispatch_blocked_holds += f.quorum.dispatch_blocked_holds.load(Relaxed);
+        q_frames_parked_on_lane += f.quorum.frames_parked_on_lane.load(Relaxed);
+        q_frames_past_waiting_lane += f.quorum.frames_past_waiting_lane.load(Relaxed);
         q_device_idle_us += f.quorum.device_idle_us.load(Relaxed);
         q_device_idle_gaps += f.quorum.device_idle_gaps.load(Relaxed);
         q_idle_break_control += f.quorum.idle_break_control.load(Relaxed);
@@ -393,6 +399,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 seal_events: q_seal_events,
                 seal_while_executing: q_seal_while_executing,
                 dispatch_blocked_holds: q_dispatch_blocked_holds,
+                frames_parked_on_lane: q_frames_parked_on_lane,
+                frames_past_waiting_lane: q_frames_past_waiting_lane,
                 device_idle_us: q_device_idle_us,
                 device_idle_gaps: q_device_idle_gaps,
                 idle_break_control: q_idle_break_control,

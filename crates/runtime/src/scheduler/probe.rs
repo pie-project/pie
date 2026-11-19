@@ -38,6 +38,13 @@ pub struct QuorumProbes {
     pub seal_while_executing: AtomicU64,
 
     pub dispatch_blocked_holds: AtomicU64,
+    /// Frames whose seal waited on an awaited lane that had not submitted
+    /// (parked behind a running frame, or held with none running): each
+    /// frame once.
+    pub frames_parked_on_lane: AtomicU64,
+    /// Frames sealed without a lane that waits on its own output from a
+    /// frame still running: it joins the next frame it submits for.
+    pub frames_past_waiting_lane: AtomicU64,
 
     pub device_idle_us: AtomicU64,
     pub device_idle_gaps: AtomicU64,

@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::stats::SchedulerStats;
+use crate::engine::WorkItemCompletion;
 use crate::scheduler::ProcessId;
 
 const DEFAULT_DISPATCH_DEPTH: usize = 2;
@@ -106,6 +107,10 @@ struct LaneState {
     /// Its last sealed frame carried a prompt: its next pass is built on the
     /// host from what that prompt answers, so only decodes wait for it.
     prompting: bool,
+    /// The fire whose output its process waits on, having submitted
+    /// nothing since ([`FramePolicy::on_lane_waits`]): until that fire
+    /// settles the lane submits nothing, so no frame waits on it.
+    waits_on: Option<WorkItemCompletion>,
 }
 
 pub(super) const ABANDONED: &str = "pipeline abandoned: silent past the silence timeout without \
@@ -115,16 +120,22 @@ pub(super) const ABANDONED: &str = "pipeline abandoned: silent past the silence 
 enum GateVerdict {
     Satisfied,
     Blocking,
-    SkippedOwed,
+    /// It waits on its own output from a fire not yet settled: it can
+    /// submit nothing before that frame lands, so the frame goes without
+    /// it and it joins the next one it submits for.
+    Waits,
 }
 
 impl LaneState {
-    fn gate_verdict(&self, relax: bool, owes: bool) -> GateVerdict {
+    fn gate_verdict(&mut self) -> GateVerdict {
         if !self.awaited || self.frames.front().is_some_and(PendingFrame::is_complete) {
             return GateVerdict::Satisfied;
         }
-        if relax && owes && self.frames.is_empty() {
-            return GateVerdict::SkippedOwed;
+        if self.waits_on.as_ref().is_some_and(WorkItemCompletion::is_settled) {
+            self.waits_on = None;
+        }
+        if self.waits_on.is_some() && self.frames.is_empty() {
+            return GateVerdict::Waits;
         }
         GateVerdict::Blocking
     }
@@ -212,6 +223,10 @@ pub(crate) struct FramePolicy {
     strict_watchdog_deadline: Option<Instant>,
     /// When a held frame last said which lanes it waits on.
     hold_said: Option<Instant>,
+    /// The frame to seal next has waited on a lane that had not submitted
+    /// (counted once a frame: [`super::probe::FireProbes`]'s
+    /// `frames_parked_on_lane`).
+    parked_on_lane: bool,
     join_hold: Option<Instant>,
     gather_seq: u64,
     quiesce_mark: Option<u64>,
@@ -306,6 +321,7 @@ impl FramePolicy {
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             hold_said: None,
+            parked_on_lane: false,
             join_hold: None,
             gather_seq: 0,
             quiesce_mark: None,
@@ -411,6 +427,7 @@ impl FramePolicy {
             frames: VecDeque::new(),
             fired_this_boundary: true,
             prompting: false,
+            waits_on: None,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -421,6 +438,7 @@ impl FramePolicy {
         }
         lane.leashed = false;
         lane.clock_from = None;
+        lane.waits_on = None;
         let for_front_frame = lane
             .frames
             .front()
@@ -480,6 +498,7 @@ impl FramePolicy {
             frames: VecDeque::new(),
             fired_this_boundary: true,
             prompting: false,
+            waits_on: None,
         });
     }
 
@@ -703,6 +722,20 @@ impl FramePolicy {
         // Not joining while it waits: it holds no frame back as one.
         self.forget_staged(owner);
         self.maybe_reset_episode();
+    }
+
+    /// `lane`'s process waits on the output of the fire `completion`
+    /// settles, having submitted nothing since: it submits nothing before
+    /// that fire's frame lands, so the frames sealed until then go without
+    /// it. Its next submit ends the wait ([`Self::record_arrival`]), as the
+    /// fire settling does.
+    pub fn on_lane_waits(&mut self, lane: ProcessId, completion: WorkItemCompletion) {
+        if completion.is_settled() {
+            return;
+        }
+        if let Some(state) = self.lanes.get_mut(&lane) {
+            state.waits_on = Some(completion);
+        }
     }
 
     pub fn on_process_resume(&mut self, owner: ProcessId) {
@@ -994,6 +1027,21 @@ impl FramePolicy {
             }
             self.record_sealed_waves(waves.iter().filter(|wave| !wave.is_empty()).count());
             self.record_seal_engagement();
+            self.parked_on_lane = false;
+            if let Some(stats) = &self.stats
+                && self.lanes.iter().any(|(lane_id, lane)| {
+                    !members.contains(lane_id)
+                        && lane.awaited
+                        && lane.frames.is_empty()
+                        && lane.waits_on.as_ref().is_some_and(|c| !c.is_settled())
+                })
+            {
+                stats
+                    .fire
+                    .quorum
+                    .frames_past_waiting_lane
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = &fire_waves;
             self.sealed.push_back(SealedFrame {
                 waves,
@@ -1209,9 +1257,9 @@ ready_age_newest={}us",
                 };
                 let owes_forever = debt_since
                     .is_some_and(|from| now.saturating_duration_since(from) >= silence * 2);
-                let blocking = match lane.gate_verdict(false, owes) {
+                let blocking = match lane.gate_verdict() {
                     GateVerdict::Blocking => true,
-                    GateVerdict::SkippedOwed | GateVerdict::Satisfied => false,
+                    GateVerdict::Waits | GateVerdict::Satisfied => false,
                 };
                 if !blocking && !lane.leashed {
                     lane.clock_from = None;
@@ -1296,6 +1344,16 @@ ready_age_newest={}us",
             }
             if missing == 0 {
                 self.hold_said = None;
+            }
+            if missing > 0 && !self.parked_on_lane {
+                self.parked_on_lane = true;
+                if let Some(stats) = &self.stats {
+                    stats
+                        .fire
+                        .quorum
+                        .frames_parked_on_lane
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             if missing > 0 {
                 if executing {
@@ -1436,6 +1494,7 @@ mod tests {
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
+        a_lane_waiting_on_its_output_holds_no_one_elses_next_frame();
     }
 
     /// A prompt split across a lower: its last piece, cut under the cap
@@ -1942,5 +2001,86 @@ mod tests {
             ),
             "a drained release must not hold for a staged bystander"
         );
+    }
+
+    /// Eight lanes that run ahead and one that reads each output before
+    /// its next pass (a beam on host geometry): while a frame runs, the
+    /// next goes with the eight, and the slow lane joins the next frame it
+    /// submits for, its passes in order.
+    fn a_lane_waiting_on_its_output_holds_no_one_elses_next_frame() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = Arc::new(SchedulerStats::default());
+        let mut policy = FramePolicy::new(1, 64, 4096, Some(Arc::clone(&stats)))
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let fast: Vec<ProcessId> = (0..8).map(|_| pid()).collect();
+        let slow = pid();
+        let mut queued: Vec<u64> = Vec::new();
+        let next_id = std::cell::Cell::new(1u64);
+        let submit = |policy: &mut FramePolicy, queued: &mut Vec<u64>, lane: ProcessId, seq: u64| {
+            let id = next_id.replace(next_id.get() + 1);
+            policy.on_fire_enqueued(stamp(lane, seq, 0, 1), Some(lane), id, 1, 1);
+            queued.push(id);
+            id
+        };
+        let queue = |queued: &Vec<u64>| queued.iter().copied().collect::<QueuedFireIds>();
+
+        // Frame 0: every lane's first pass.
+        for &lane in fast.iter().chain([&slow]) {
+            submit(&mut policy, &mut queued, lane, 0);
+        }
+        let frame0 = fires(&plan(&mut policy, &queue(&queued), Instant::now()));
+        assert_eq!(frame0.len(), 9);
+        queued.retain(|id| !frame0.contains(id));
+        policy.on_frame_posted(fast.iter().copied().chain([slow]), Instant::now());
+
+        // Frame 0 runs: the fast lanes run ahead; the slow one waits on its
+        // pass's output and submits nothing.
+        let slow_out0 = WorkItemCompletion::deferred_with_guard(None);
+        policy.on_lane_waits(slow, slow_out0.clone());
+        for &lane in &fast {
+            submit(&mut policy, &mut queued, lane, 1);
+        }
+        let FramePlan::Dispatch(frame1) =
+            policy.plan_dispatch(&queue(&queued), &HashSet::new(), true, Instant::now())
+        else {
+            panic!("a lane waiting on its output parked the others' next frame");
+        };
+        let frame1: Vec<u64> = frame1.into_iter().flatten().collect();
+        assert_eq!(frame1.len(), 8, "the next frame is the eight that submitted");
+        queued.retain(|id| !frame1.contains(id));
+        assert_eq!(stats.fire.quorum.frames_past_waiting_lane.load(Relaxed), 1);
+        assert_eq!(stats.fire.quorum.frames_parked_on_lane.load(Relaxed), 0);
+
+        // Frame 0 lands: the slow lane's wait ends and it submits its second
+        // pass; the fast lanes their third, behind frame 1.
+        slow_out0.reject("landed");
+        policy.on_frame_retired(fast.iter().copied().chain([slow]));
+        policy.on_frame_posted(fast.iter().copied(), Instant::now());
+        let slow1 = submit(&mut policy, &mut queued, slow, 1);
+        for &lane in &fast {
+            submit(&mut policy, &mut queued, lane, 2);
+        }
+        let frame2 = fires(&policy.plan_dispatch(
+            &queue(&queued),
+            &HashSet::new(),
+            true,
+            Instant::now(),
+        ));
+        assert_eq!(frame2.len(), 9, "the slow lane joins the next frame it is ready for");
+        assert!(frame2.contains(&slow1), "its second pass, after its first");
+        queued.retain(|id| !frame2.contains(id));
+
+        // A lane that has not submitted and waits on nothing still holds the
+        // frame: it is on its way.
+        policy.on_frame_retired(fast.iter().copied());
+        policy.on_frame_posted(fast.iter().copied().chain([slow]), Instant::now());
+        for &lane in &fast[1..] {
+            submit(&mut policy, &mut queued, lane, 3);
+        }
+        assert_eq!(
+            policy.plan_dispatch(&queue(&queued), &HashSet::new(), true, Instant::now()),
+            FramePlan::Park
+        );
+        assert_eq!(stats.fire.quorum.frames_parked_on_lane.load(Relaxed), 1);
     }
 }
