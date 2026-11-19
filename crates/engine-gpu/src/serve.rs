@@ -658,6 +658,11 @@ pub struct Seated<'a, B: Serve> {
 
     pub positions: &'a [u32],
 
+    /// A refused lane whose program places its rows: it fires to keep the
+    /// composition, its tables the null chunk (unit 0, which no table
+    /// names), so it writes nothing a working set holds.
+    pub sunk: bool,
+
     /// The slot of its working set each row lands at, where its program
     /// places a one-row lane off the run `held..held + rows` (device
     /// geometry): `pages` names the slots' pages. `None` appends the run.
@@ -727,6 +732,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             mask: None,
             adapter: None,
             positions: &[],
+            sunk: false,
             slots: None,
             readout: None,
             hosts: true,
@@ -5853,7 +5859,9 @@ impl<B: Serve> Shell<B> {
             let pages = (u64::from(have) + u64::from(row.rows))
                 .div_ceil(u64::from(self.pools.paging().page_size.max(1)))
                 .max(1);
-            tables.push(std::borrow::Cow::Owned(if seated.refs {
+            tables.push(std::borrow::Cow::Owned(if seated.sunk {
+                vec![0; pages as usize]
+            } else if seated.refs {
                 self.pools.kv_pages(seated.pages, None)?
             } else {
                 self.pools.kv_pages(
@@ -5874,6 +5882,10 @@ impl<B: Serve> Shell<B> {
                     .filter(|_| seated.refs);
                 let table = match named {
                     _ if seated.kv_less => Vec::new(),
+                    _ if seated.sunk => {
+                        let tokens = self.pools.paging_of(paged).page_size.max(1);
+                        vec![0; u64::from(row.rows).div_ceil(u64::from(tokens)).max(1) as usize]
+                    }
                     Some(refs) => self.pools.list_pages(paged, refs, None)?,
                     None if seated.refs => {
                         return Err(program(

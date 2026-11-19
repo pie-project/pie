@@ -715,8 +715,9 @@ pub fn device_lanes(
     let carried = envelope.lanes();
     if carried > stated.len() {
         return Err(Refusal::Program(format!(
-            "instance {instance} is attached at lane {first} over {} lane(s), and its \
-             `embed_indptr` port describes {carried}",
+            "instance {instance} is attached over {} lane(s) at lane {first} and its \
+             `embed_indptr` port describes {carried}: a program's ports state its own \
+             lanes' geometry, never the next request's",
             stated.len()
         )));
     }
@@ -864,6 +865,25 @@ mod tests {
         let lanes = placed(17).expect("a slot past the fold");
         assert_eq!(lanes[0].have, Some(17));
         assert_eq!(lanes[0].slots, None, "slot 17 is the run the fire appends");
+    }
+
+    #[test]
+    fn ports_describing_more_lanes_than_the_attachment_owns_are_refused_by_name() {
+        let mut envelope = engine::ports::Envelope {
+            qo_indptr: Some(vec![0, 1, 2]),
+            slots: Some(vec![17, 17]),
+            kv_len: Some(vec![18, 18]),
+            ..engine::ports::Envelope::default()
+        };
+        let lane = engine::fire::Lane {
+            tokens: vec![0],
+            list: engine::fire::ListKind::Translation,
+            ..engine::fire::Lane::default()
+        };
+        let why = device_lanes(&mut envelope, &[lane], 3, InstanceId(7))
+            .expect_err("two lanes described over one owned")
+            .to_string();
+        assert!(why.contains("describes 2") && why.contains("lane 3"), "{why}");
     }
 
     #[test]
