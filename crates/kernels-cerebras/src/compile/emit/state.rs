@@ -49,6 +49,9 @@ pub struct Region {
 pub struct StateRoot {
     pub lanes: u32,
     pub regions: Vec<Region>,
+    /// Every `rowp` PE advances each row's position at a launch's end (`Column::advances`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub advances: bool,
 }
 
 impl StateRoot {

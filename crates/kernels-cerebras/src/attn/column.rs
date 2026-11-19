@@ -330,6 +330,10 @@ impl Column for Attention {
         j.state.is_none()
     }
 
+    fn advances(&self) -> bool {
+        true
+    }
+
     fn region(&self, _j: &Joint) -> &'static str {
         "kv"
     }
@@ -519,7 +523,7 @@ fn kv_pe_file(p: &Program, k: usize, ks: &KvSched) -> R<(String, String)> {
         pya,
         match paged {
             Some(g) => format!(
-                ", .PAGED = true, .EP = {}, .LANES = {}, .MAXP = {}, .ROWS = {total}",
+                ", .PAGED = true, .EP = {}, .LANES = {}, .MAXP = {}, .ROWS = {total}, .ADVANCE = true",
                 g.size / pya,
                 g.lanes,
                 g.pages

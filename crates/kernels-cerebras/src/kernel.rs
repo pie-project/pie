@@ -203,6 +203,10 @@ pub trait Column: Sync {
     fn replicates(&self) -> bool;
     /// The PEs a column takes.
     fn pya(&self, ask: &ColumnAsk) -> u32;
+    /// Whether its PEs advance `rowp`'s positions at a decode step's end.
+    fn advances(&self) -> bool {
+        false
+    }
     /// What a store sends past a head `h`'s `[q | k | v]`: (value, first column, width).
     fn head_parts(&self, _j: &Joint, _h: u32) -> Vec<(Cols, u32, u32)> {
         Vec::new()

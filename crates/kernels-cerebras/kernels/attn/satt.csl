@@ -12,6 +12,9 @@
 // `rowp` each row's (lane slot, state slot, position); pages of EP x PYA positions; WIN > 0 adds
 // a sliding window.
 //
+// ADVANCE (PAGED): after the step's last row reads `rowp`, every row's position += 1 (before its
+// query sends), so the host writes `rowp` only where its rows differ.
+//
 // Params: fab, math, red (the column chain), YM (the root's multicast queue), Qh, Dc, NE (entries
 // a row), PYA (the column's rows), SC (the scores' scale), PMAX (the 16-bit probabilities'
 // ceiling), QH, CAUSAL, PAGED, EP, LANES, MAXP, ROWS.
@@ -33,6 +36,7 @@ param EP: u16 = 1;
 param LANES: u16 = 1;
 param MAXP: u16 = 1;
 param ROWS: u16 = 1;
+param ADVANCE: bool = false;
 
 const matvec = @import_module("ops/mv.csl");
 
@@ -174,7 +178,13 @@ fn query_t(t: u16) void {
   }
   red.send(qf_d, QD);
   lane_mask(t);
+  if (ADVANCE and t + 1 == ROWS) { advance(); }
   query();
+}
+
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
 }
 
 // Entries [a, b) of page `page` attended.

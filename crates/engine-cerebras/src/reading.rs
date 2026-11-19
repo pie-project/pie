@@ -97,6 +97,24 @@ pub trait Fabric {
         let _ = reading;
         Ok(None)
     }
+    /// `rowp` as the device holds it, where followed (`None`: written every step).
+    fn rows_held(&self) -> Option<&[u32]> {
+        None
+    }
+    /// `rowp` written (`Some`: followed, the program advances it).
+    fn rows_written(&mut self, rows: Option<Vec<u32>>) {
+        let _ = rows;
+    }
+}
+
+/// `rowp` (lane slot, state slot, position a row) after a launch of a program that advances it.
+#[must_use]
+pub fn rows_advanced(rows: &[u32]) -> Vec<u32> {
+    let mut v = rows.to_vec();
+    for p in v.iter_mut().skip(2).step_by(3) {
+        *p = p.wrapping_add(1);
+    }
+    v
 }
 
 /// The SDK runtime of one program at a time, each created on the thread that holds this (the
@@ -122,6 +140,16 @@ impl Fabric for Programs {
 
     fn argmax(&mut self, reading: &Reading) -> R<Option<Vec<u32>>> {
         Fabric::argmax(self.rt.as_mut().ok_or("no program is open")?, reading)
+    }
+
+    fn rows_held(&self) -> Option<&[u32]> {
+        self.rt.as_ref().and_then(|rt| Fabric::rows_held(rt))
+    }
+
+    fn rows_written(&mut self, rows: Option<Vec<u32>>) {
+        if let Some(rt) = self.rt.as_mut() {
+            Fabric::rows_written(rt, rows);
+        }
     }
 
     fn switch(&mut self, link: &Path) -> R<bool> {
@@ -186,6 +214,8 @@ pub struct Reading {
     pub stamped: bool,
     /// Whether a launch is timed to its end: a one-word read of its first PE right after the call.
     pub poll: bool,
+    /// Its program advances `rowp` itself (`state.advances`): written only where it differs.
+    pub rows_advance: bool,
     /// Its PEs' first column and row in a program of co-resident readings (`stream::coresident`).
     pub origin: (i32, i32),
     /// The id its launch takes in a program of co-resident readings (`None`: a program its own).
@@ -397,6 +427,7 @@ impl Reading {
             host_only: false,
             stamped: true,
             poll: false,
+            rows_advance: state.advances,
             origin: (
                 host["origin"][0].as_i64().unwrap_or(0) as i32,
                 host["origin"][1].as_i64().unwrap_or(0) as i32,
@@ -460,6 +491,7 @@ impl Reading {
             host_only: true,
             stamped: true,
             poll: false,
+            rows_advance: false,
             origin: (0, 0),
             rd: None,
             clip: None,
@@ -1064,7 +1096,12 @@ impl Reading {
             words[3 * t + 1] = state;
             words[3 * t + 2] = at;
         }
-        write_all(rt, &self.rowp, "rowp", &words)
+        if self.rows_advance && rt.rows_held() == Some(&words[..]) {
+            return Ok(());
+        }
+        write_all(rt, &self.rowp, "rowp", &words)?;
+        rt.rows_written(self.rows_advance.then_some(words));
+        Ok(())
     }
 
     /// One sequence's page table: lane slot 0's pages in order.
@@ -1246,8 +1283,16 @@ impl Fabric for Runtime {
         self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.keep_for(reading);
-        self.launch("run", &args).map_err(|x| x.to_string())?;
+        self.launch_followed(reading, &args)?;
         self.stamps(reading)
+    }
+
+    fn rows_held(&self) -> Option<&[u32]> {
+        self.rows_held.as_deref()
+    }
+
+    fn rows_written(&mut self, rows: Option<Vec<u32>>) {
+        self.rows_held = rows;
     }
 
     fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
@@ -1367,7 +1412,7 @@ impl Fabric for Runtime {
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.keep_for(reading);
         let t0 = std::time::Instant::now();
-        self.launch("run", &args).map_err(e)?;
+        self.launch_followed(reading, &args)?;
         if reading.poll && self.rpc().symbols().contains_key("tsc") {
             // (a word of the first PE's stamps: the read waits on the launch there)
             let mut one = [0u32; 1];
@@ -1480,6 +1525,25 @@ fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R
 }
 
 impl Runtime {
+    /// `run` launched: the followed `rowp` advanced where the program advances it, else (or on
+    /// failure) forgotten.
+    fn launch_followed(&mut self, reading: &Reading, args: &[u32]) -> R<()> {
+        match self.launch("run", args) {
+            Ok(()) => {
+                self.rows_held = if reading.rows_advance {
+                    self.rows_held.as_deref().map(rows_advanced)
+                } else {
+                    None
+                };
+                Ok(())
+            }
+            Err(x) => {
+                self.rows_held = None;
+                Err(x.to_string())
+            }
+        }
+    }
+
     /// Before `reading`'s launch: forgets the kept words of arrays it does not keep (another
     /// co-resident reading may write them).
     fn keep_for(&mut self, reading: &Reading) {

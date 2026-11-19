@@ -2447,6 +2447,7 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
     let s = &p.stream;
     let g = paging(p);
     let mut regions = Vec::new();
+    let mut advances = true;
     for kc in &s.kv {
         let ks = &p.kv[kc.block as usize];
         let j = kv_joint(p, ks);
@@ -2480,6 +2481,9 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
             rows: of("rowp"),
             tables: of("ptab"),
         });
+        if regions.last().is_some_and(|r| !r.rows.is_empty()) && !col.advances() {
+            advances = false;
+        }
     }
     // the roots whose kernels keep a lane slot's state (a root kernel's `rowp`): one region
     let columns: Vec<Coord> = (s.kv.iter())
@@ -2493,6 +2497,7 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
         })
         .collect();
     if !roots.is_empty() {
+        advances = false;
         roots.sort_unstable();
         regions.push(Region {
             kind: "rows".into(),
@@ -2505,7 +2510,12 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
             tables: Vec::new(),
         });
     }
-    Some(StateRoot { lanes, regions })
+    let advances = advances && regions.iter().any(|r| !r.rows.is_empty());
+    Some(StateRoot {
+        lanes,
+        regions,
+        advances,
+    })
 }
 
 /// The fewest positions a page holds.
