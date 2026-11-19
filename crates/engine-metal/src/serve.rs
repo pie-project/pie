@@ -2286,37 +2286,44 @@ impl Shell {
         // ones' are the capture's, which no rung's rows key.
         let rungs = self.arena.rung_tokens();
         let octaves = engine::load::armed::scored_buckets(&rungs);
+        // Beside each rung's own rows, every band start of the matmul
+        // routing below it and above the rung before
+        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
+        // a fire's rows reach every band its rungs span, and each band's
+        // kernel is built here, not refused while serving.
+        let mut below = 0u32;
+        let sized: Vec<(u32, Vec<u32>)> = rungs
+            .iter()
+            .map(|&rung| {
+                let mut sizes = vec![rung];
+                sizes.extend(
+                    kernels_metal::linear::gemm::ROW_BANDS
+                        .iter()
+                        .copied()
+                        .filter(|&band| band > below && band < rung),
+                );
+                below = rung;
+                (rung, sizes)
+            })
+            .collect();
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
-            for rung in rungs {
+            for (rung, sizes) in sized {
                 self.set_rung(self.rung, rung)?;
-                for &form in forms
-                    .iter()
-                    .filter(|(_, scores)| !scores || octaves.contains(&rung))
-                {
-                    for (verb, held) in &verbs {
-                        let prompt = rung
-                            .min(self.budgets.tokens.max_tokens)
-                            .min(context.saturating_sub(*held))
-                            .max(1);
-                        let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                        let prompt_tokens = vec![0u32; prompt as usize];
-                        let one = [0u32];
-                        let prefill = [Seated {
-                            held: Some(*held),
-                            rs: verb,
-                            refs: true,
-                            pages: &kv_pages,
-                            record: (!record.is_empty()).then_some(&record[..]),
-                            windows: &windows,
-                            ..Seated::of(Lane {
-                                slot: 0,
-                                word: word(prompt, form),
-                                tokens: &prompt_tokens,
-                            })
-                        }];
-                        let decode: Vec<Seated<'_>> = (0..lanes)
-                            .map(|slot| Seated {
+                for size in sizes {
+                    for &form in forms
+                        .iter()
+                        .filter(|(_, scores)| !scores || octaves.contains(&rung))
+                    {
+                        for (verb, held) in &verbs {
+                            let prompt = size
+                                .min(self.budgets.tokens.max_tokens)
+                                .min(context.saturating_sub(*held))
+                                .max(1);
+                            let lanes = size.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                            let prompt_tokens = vec![0u32; prompt as usize];
+                            let one = [0u32];
+                            let prefill = [Seated {
                                 held: Some(*held),
                                 rs: verb,
                                 refs: true,
@@ -2324,34 +2331,49 @@ impl Shell {
                                 record: (!record.is_empty()).then_some(&record[..]),
                                 windows: &windows,
                                 ..Seated::of(Lane {
-                                    slot,
-                                    word: word(1, form),
-                                    tokens: &one,
+                                    slot: 0,
+                                    word: word(prompt, form),
+                                    tokens: &prompt_tokens,
                                 })
-                            })
-                            .collect();
-                        for lanes in [&prefill[..], &decode[..]] {
-                            // Each dropped fire's command buffer goes back
-                            // with its own pool: left to the thread's, a
-                            // walk of more fires than the queue holds
-                            // command buffers blocks making the next one.
-                            let walked = pooled(|| -> Result<()> {
-                                let prepared = FrameShell::prepare(
-                                    self,
-                                    StepView {
-                                        lanes,
-                                        attachments: &[],
-                                        media: &[],
-                                        clips: &[],
-                                        done: None,
-                                    },
-                                    None,
-                                )?;
-                                drop(self.walk(&prepared, true)?);
-                                Ok(())
-                            });
-                            walked?;
-                            fires += 1;
+                            }];
+                            let decode: Vec<Seated<'_>> = (0..lanes)
+                                .map(|slot| Seated {
+                                    held: Some(*held),
+                                    rs: verb,
+                                    refs: true,
+                                    pages: &kv_pages,
+                                    record: (!record.is_empty()).then_some(&record[..]),
+                                    windows: &windows,
+                                    ..Seated::of(Lane {
+                                        slot,
+                                        word: word(1, form),
+                                        tokens: &one,
+                                    })
+                                })
+                                .collect();
+                            for lanes in [&prefill[..], &decode[..]] {
+                                // Each dropped fire's command buffer goes back
+                                // with its own pool: left to the thread's, a
+                                // walk of more fires than the queue holds
+                                // command buffers blocks making the next one.
+                                let walked = pooled(|| -> Result<()> {
+                                    let prepared = FrameShell::prepare(
+                                        self,
+                                        StepView {
+                                            lanes,
+                                            attachments: &[],
+                                            media: &[],
+                                            clips: &[],
+                                            done: None,
+                                        },
+                                        None,
+                                    )?;
+                                    drop(self.walk(&prepared, true)?);
+                                    Ok(())
+                                });
+                                walked?;
+                                fires += 1;
+                            }
                         }
                     }
                 }
