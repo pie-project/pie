@@ -91,7 +91,7 @@ pub struct InstanceBinding {
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
     /// Where this instance's lanes' scratch lies
-    /// ([`GuestState::per_instance`]).
+    /// ([`GuestState::resident`]).
     #[serde(default)]
     pub scratch: ScratchPlace,
     /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
@@ -110,27 +110,33 @@ pub struct InstanceBinding {
 }
 
 /// What a guest program bound at given extents holds in the pool, as state
-/// (REDESIGN §6): the scratch each bound instance keeps for its lanes, and
-/// what the (program, extents) pair keeps once while any instance of it is
-/// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
-/// taken at the bind and held while bound ([`InstanceBinding::scratch`],
-/// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
-/// between fires: a park gives them back and an unpark takes fresh room,
-/// nothing copied, the engine told where ([`Rebind::Instance`]).
+/// (REDESIGN §6): what each bound instance keeps between fires, the value
+/// scratch one fire of it reads, and what the (program, extents) pair keeps
+/// once while any instance of it is bound ([`crate::Engine::guest_state`]).
+/// The resident state and the pair's are taken at the bind and held while
+/// bound ([`InstanceBinding::pair`], [`ScratchPlace`]). The scratch is held
+/// only while a fire naming it is in flight: the runtime hands a fire one
+/// of the instance's arms on its attachment ([`crate::Attachment::scratch`])
+/// and takes it back at the landing; an engine keeps none across fires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes each bound instance holds for its lanes' scratch.
+    /// Bytes each bound instance keeps between fires.
     #[serde(default)]
-    pub per_instance: u64,
+    pub resident: u64,
+    /// Bytes one fire of an instance reads as its value scratch.
+    #[serde(default)]
+    pub scratch: u64,
+    /// The arms an instance's fires need at most, one a fire in flight, for
+    /// the geometry class asked: at least 1.
+    #[serde(default)]
+    pub scratch_arms: u32,
     /// Bytes the pair holds once while any instance of it is bound.
     #[serde(default)]
     pub per_pair: u64,
-    /// The chunks a piece of either takes where it lies in whole chunks: a
-    /// run of `run` adjacent chunks inside one segment, the least that
-    /// holds the program's widest value (or its temporary area) whole, so
-    /// each piece is addressed from its first chunk (0 or 1: a chunk). Its
-    /// bytes past a chunk's are whole runs, `per_instance` and `per_pair`
-    /// a multiple of `run` chunks.
+    /// The chunks a piece of any of them takes where it lies in whole
+    /// chunks: a run of `run` adjacent chunks inside one segment, the least
+    /// that holds the program's widest value (or its temporary area) whole,
+    /// so each piece is addressed from its first chunk (0 or 1: a chunk).
     #[serde(default)]
     pub run: u32,
 }

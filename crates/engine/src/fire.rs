@@ -738,7 +738,7 @@ pub enum FoldLen {
 }
 
 /// A pass's program on a fire: the prologue before input staging, the epilogue after the forward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
@@ -746,6 +746,11 @@ pub struct Attachment {
     pub instance: InstanceId,
     /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
     pub adapter_only: bool,
+    /// The value scratch this fire's stages read ([`crate::GuestState::scratch`]):
+    /// one of the instance's arms, held until the fire lands. None only
+    /// where the program reads no scratch.
+    #[serde(default)]
+    pub scratch: crate::program::ScratchPlace,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1247,6 +1252,7 @@ mod tests {
             lanes: 1,
             instance: InstanceId(7),
             adapter_only: true,
+            scratch: crate::program::ScratchPlace::None,
         });
         assert!(
             step.validate_captures(captures).is_err(),
