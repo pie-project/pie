@@ -1340,6 +1340,7 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
             "round {round}: the next owner's bytes are on the device"
         );
     }
+    shell.settle_copies().expect("every copy settles");
 }
 
 /// A masked fire after a partial fold: a lane's mask speaks of the keys from
