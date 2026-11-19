@@ -58,6 +58,7 @@ pub(crate) fn published_launches<'a>(
         if let Some(published) = published {
             // The streamed form dispatches its steps one after another, a
             // launch a step; a node two steps compute lies in both.
+            let first = each.len();
             each.extend(published.steps.iter().map(|nodes| Launch {
                 nodes,
                 stepwise: false,
@@ -67,6 +68,17 @@ pub(crate) fn published_launches<'a>(
                 held: Vec::new(),
             }));
             idle.extend_from_slice(&published.views);
+            // A folded node's step computes it in another form: its results
+            // take no bytes (idle, so hollow), and what it reads is held
+            // through that step.
+            for &(step, node) in &published.folded {
+                idle.push(node);
+                if let (Some(launch), Some(op)) =
+                    (each.get_mut(first + step as usize), plan.ops.get(node as usize))
+                {
+                    launch.held.extend(op.reads());
+                }
+            }
         } else {
             each.push(Launch {
                 nodes: &region.nodes,

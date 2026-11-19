@@ -55,7 +55,8 @@ pub const STEP_VIEW: u32 = 0xF2;
 /// The low byte of a step table word `(node << 8) | STEP_FOLD`, among a
 /// step's node words: a node the step stands for, computed in another form
 /// inside it (a log-softmax's centred row in the sum's load) and its result
-/// never written. It holds what it reads to the step, as a listed node.
+/// never written. It is not one of the step's nodes: its results take no
+/// bytes, and what it reads is held to the step ([`StepNodes::folded`]).
 pub const STEP_FOLD: u32 = 0xF3;
 
 /// What a streamed kernel publishes beside its dispatch words: the nodes
@@ -65,8 +66,10 @@ pub const STEP_FOLD: u32 = 0xF3;
 pub struct StepNodes {
     pub steps: Vec<Vec<u32>>,
     pub views: Vec<u32>,
-    /// The nodes of `steps` published as folded ([`STEP_FOLD`]).
-    pub folded: Vec<u32>,
+    /// The nodes published as folded ([`STEP_FOLD`]), each with the step
+    /// that stands for it: in no step's list, its results take no bytes,
+    /// and what it reads is held through that step.
+    pub folded: Vec<(u32, u32)>,
 }
 
 /// A streamed region's step table split into its dispatch words and, where
@@ -98,8 +101,8 @@ pub fn step_node_table(table: &[u32]) -> (&[u32], Option<StepNodes>) {
                 nodes.last_mut().expect("opened").push(word >> 8);
             }
             STEP_FOLD if published.views.is_empty() && !nodes.is_empty() => {
-                nodes.last_mut().expect("opened").push(word >> 8);
-                published.folded.push(word >> 8);
+                let step = u32::try_from(nodes.len() - 1).unwrap_or(u32::MAX);
+                published.folded.push((step, word >> 8));
             }
             STEP_VIEW => published.views.push(word >> 8),
             _ => return (steps, None),
