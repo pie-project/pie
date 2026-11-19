@@ -1518,30 +1518,26 @@ impl Fabric for Runtime {
             self.io.done.0 += 1;
             self.io.done.1 += t0.elapsed().as_nanos() as u64;
         }
-        let mut got = Vec::new();
-        // a run of one-PE reads along a row (a head's column roots, the logits) one memcpy
-        for run in runs(&reading.d2h) {
-            let (b, n) = (&reading.d2h[run.start], run.len() as i32);
-            let (w, h) = if n > 1 { (n, 1) } else { (b.w, b.h) };
-            let mut out = vec![0u32; b.len * (w * h) as usize];
-            let rect = Rect {
-                x: b.x,
-                y: b.y,
-                w,
-                h,
-            };
+        let mut got: Vec<Vec<f32>> = vec![Vec::new(); reading.d2h.len()];
+        // a band's backs (one symbol and length, the same rows) one memcpy of the rectangle
+        // around them: a call's latency, not its words, is a step's readback
+        for (rect, members) in packs(&reading.d2h) {
+            let len = reading.d2h[members[0]].len;
+            let mut out = vec![0u32; len * (rect.w * rect.h) as usize];
             self.memcpy_d2h(
-                &b.sym,
+                &reading.d2h[members[0]].sym,
                 &mut out,
                 rect,
-                b.len,
+                len,
                 Order::RowMajor,
                 DataType::Bits32,
             )
             .map_err(e)?;
-            let per = out.len() / run.len();
-            for c in out.chunks(per) {
-                got.push(c.iter().map(|&x| f32::from_bits(x)).collect());
+            for i in members {
+                got[i] = cut(&out, rect, &reading.d2h[i])
+                    .iter()
+                    .map(|&x| f32::from_bits(x))
+                    .collect();
             }
         }
         let cycles = self.stamps(reading)?;
@@ -1617,6 +1613,73 @@ fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R
         rt.write(&a, &all)?;
     }
     Ok(())
+}
+
+/// How many times a back's words the rectangle read around a band's backs may hold (the
+/// columns between them, read and dropped) before they are read a back at a time.
+const PACK_SLACK: usize = 4;
+
+/// The reads of `d2h`: each band's backs (one symbol, length, top row and height) one read of
+/// the rectangle around them where it holds at most [`PACK_SLACK`] times their words, else a
+/// back (or a run along a row, [`runs`]) a read. Each read with the backs it holds, in order.
+fn packs(d2h: &[Back]) -> Vec<(Rect, Vec<usize>)> {
+    // (symbol, words a PE, top row, height): a band
+    type Band<'a> = (&'a str, usize, i32, i32);
+    let mut bands: Vec<(Band<'_>, Vec<usize>)> = Vec::new();
+    for (i, b) in d2h.iter().enumerate() {
+        let k = (b.sym.as_str(), b.len, b.y, b.h);
+        match bands.iter_mut().find(|(g, _)| *g == k) {
+            Some((_, m)) => m.push(i),
+            None => bands.push((k, vec![i])),
+        }
+    }
+    let mut out = Vec::new();
+    for ((_, len, y, h), m) in bands {
+        let x0 = m.iter().map(|&i| d2h[i].x).min().unwrap_or(0);
+        let x1 = m.iter().map(|&i| d2h[i].x + d2h[i].w).max().unwrap_or(0);
+        let words: usize = m
+            .iter()
+            .map(|&i| (d2h[i].w * d2h[i].h) as usize * len)
+            .sum();
+        let around = ((x1 - x0) * h) as usize * len;
+        if m.len() > 1 && around <= PACK_SLACK * words {
+            out.push((
+                Rect {
+                    x: x0,
+                    y,
+                    w: x1 - x0,
+                    h,
+                },
+                m,
+            ));
+            continue;
+        }
+        let sub: Vec<Back> = m.iter().map(|&i| d2h[i].clone()).collect();
+        for run in runs(&sub) {
+            let (b, n) = (&sub[run.start], run.len() as i32);
+            let (w, hh) = if n > 1 { (n, 1) } else { (b.w, b.h) };
+            out.push((
+                Rect {
+                    x: b.x,
+                    y: b.y,
+                    w,
+                    h: hh,
+                },
+                run.map(|j| m[j]).collect(),
+            ));
+        }
+    }
+    out
+}
+
+/// `b`'s words (row-major, `len` a PE) out of a read of `rect` that holds it.
+fn cut(out: &[u32], rect: Rect, b: &Back) -> Vec<u32> {
+    let mut v = Vec::with_capacity((b.w * b.h) as usize * b.len);
+    for yy in 0..b.h {
+        let at = (((b.y - rect.y + yy) * rect.w + (b.x - rect.x)) as usize) * b.len;
+        v.extend_from_slice(&out[at..at + b.w as usize * b.len]);
+    }
+    v
 }
 
 /// `d2h` in runs read by one memcpy each: consecutive one-PE reads of one symbol and length, at
@@ -1822,5 +1885,54 @@ mod held_tests {
         assert!(e(r.pages_held(&[0, 1, 2])).contains("3 entries for 2 lane slots of 3 pages"));
         assert!(e(r.pages_held(&[0, 1, 2, 2, 3, 2])).contains("page 3 (lane slot 1, entry 1)"));
         assert!(e(r.position_held(500)).contains("position 500"));
+    }
+
+    #[test]
+    fn a_bands_backs_read_as_one_rectangle_cut_as_each_alone() {
+        // a 128\u00b2 denoise's backs: 1 x 64 strips every third column in four bands, and one
+        // lone 3 x 2 back, a word or two a PE
+        let back = |x: i32, y: i32, w: i32, h: i32, len: usize| Back {
+            sym: "hout".into(),
+            x,
+            y,
+            w,
+            h,
+            len,
+            rows: Vec::new(),
+            parts: Vec::new(),
+        };
+        let mut d2h: Vec<Back> = Vec::new();
+        for x in (2..384).step_by(3) {
+            for y in [64, 192, 320, 448] {
+                d2h.push(back(x, y, 1, 64, 1));
+            }
+        }
+        d2h.push(back(5, 600, 3, 2, 2));
+        let reads = packs(&d2h);
+        assert_eq!(reads.len(), 5);
+        let mut seen = vec![0; d2h.len()];
+        // each PE's word k: its place and k, as a read of the rectangle returns them
+        let word = |x: i32, y: i32, k: usize| (y as u32) << 16 | (x as u32) << 4 | k as u32;
+        for (rect, members) in &reads {
+            let len = d2h[members[0]].len;
+            let mut out = Vec::new();
+            for y in rect.y..rect.y + rect.h {
+                for x in rect.x..rect.x + rect.w {
+                    out.extend((0..len).map(|k| word(x, y, k)));
+                }
+            }
+            for &i in members {
+                let b = &d2h[i];
+                let mut alone = Vec::new();
+                for y in b.y..b.y + b.h {
+                    for x in b.x..b.x + b.w {
+                        alone.extend((0..b.len).map(|k| word(x, y, k)));
+                    }
+                }
+                assert_eq!(cut(&out, *rect, b), alone);
+                seen[i] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1));
     }
 }

@@ -4021,6 +4021,12 @@ refusal of the program where any is open):
     1575 (the same linked program, A/B in one session): h2d 23.1 -> 6.8 ms, done 239.6 ->
     220.7-222.9 ms (-7%), wall 297 -> 264-267 ms (-11%), the stamps' span 179.6M -> 165.4-167.1M
     (the array's 163.5M); every velocity and latent the same bit for bit.
+  - **A step's readback is calls, not words.** 128²'s 512 backs (1 x 64 strips every third
+    column, four bands) were a memcpy each: 140 ms of d2h for 43.8 ms on the device. The engine
+    reads each band's backs (one symbol, words a PE, top row and height) as one rectangle where
+    it holds at most 4x their words (`PACK_SLACK`), each back cut out of it: 1576, 514 calls ->
+    6, d2h 140 -> 50 ms, wall 145.2 -> 55.0 ms (2.6x), every velocity and latent the same bit
+    for bit; with the stamps read too 55.1 ms.
   - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
     (chip 1.858M, 1.71M before); the 576-row one 168.7M.
 - **A PE's low data** (`check::lo_dsds`, `LO_DSDS`). cslc keeps every constant DSD value a PE
