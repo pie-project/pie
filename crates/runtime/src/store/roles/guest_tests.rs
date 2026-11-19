@@ -2217,3 +2217,69 @@ fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() 
     roles.lock().unwrap().close_instance(second);
     assert_eq!(held(&device), before);
 }
+
+/// F21's bind at the pool's limit (every segment committed, nothing left
+/// to evict for it): free chunks scattered by the binds before it, enough
+/// for its run of 4 but none adjacent. It is short (`BindShort`, to the
+/// planner); the planner asks for a compaction, the walk moves chunks
+/// until the run stands (each move's chunks closed until the fire that
+/// copies it retires), and the bind lands. The singles moved keep their
+/// instances, bound on their logical chunks.
+#[test]
+fn a_bind_short_of_a_run_among_scattered_free_chunks_lands_after_a_compaction() {
+    let segments = 8;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, segments));
+    let ids = fill_with_singles(&roles);
+    for (k, id) in ids.iter().enumerate() {
+        if k % 2 == 0 {
+            roles.lock().unwrap().close_instance(*id);
+        }
+    }
+    {
+        let pool = device.lock().unwrap();
+        assert!(pool.pool().free_chunks() >= 4);
+        assert_eq!(pool.pool().free_chunk_runs(4), 0, "none of four adjacent");
+    }
+    let (long, mut long_engine) = runs_of(8, 4, 1, 0);
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no run of 4");
+    assert!(
+        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::BindShort(_))),
+        "at the limit, short of a run: to the planner: {error}"
+    );
+    roles.lock().unwrap().leave_guest_wait(holder(1));
+
+    // The planner's ask, then the walk's steps.
+    assert!(
+        !device.lock().unwrap().compaction_comes(4, 1),
+        "control: no walk steers the pool, nothing would carry it out"
+    );
+    let _grow = crate::store::shared::SharedGrow::new(0, 74, device.clone());
+    assert!(device.lock().unwrap().compaction_comes(4, 1));
+    let mut epoch = 10;
+    let mut compactions = 0;
+    loop {
+        let step = device.lock().unwrap().next_move(segments, epoch);
+        match step {
+            Some(crate::store::shared::SegmentMove::Compact {
+                evacuation,
+                applied,
+                epoch: at,
+            }) => {
+                assert_eq!(at, epoch);
+                assert_eq!(evacuation.moves.len(), applied.len());
+                compactions += 1;
+                let mut pool = device.lock().unwrap();
+                pool.compaction_copied(at, at);
+                assert_eq!(pool.pool().free_chunk_runs(4), 0, "closed until its fire retires");
+                pool.pool_mut().retire_through(at);
+                epoch += 1;
+            }
+            None => break,
+            other => panic!("only compactions at the limit: {other:?}"),
+        }
+    }
+    assert_eq!(compactions, 1, "one compaction stands the run");
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 1);
+    assert!(!device.lock().unwrap().compaction_comes(4, 1), "the run stands: nothing to move");
+    bind_as(&roles, &mut long_engine, long, 1).expect("the run stands: it binds");
+}

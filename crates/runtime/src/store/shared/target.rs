@@ -556,6 +556,7 @@ impl SharedGrow {
             let goal = self.goal();
             let (current, retired) = self.epochs();
             let mut evacuating = None;
+            let mut compacting = None;
             let step = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -583,6 +584,14 @@ impl SharedGrow {
                     applied,
                 }) => {
                     evacuating = Some(applied);
+                    PoolOp::Evacuate(evacuation)
+                }
+                Some(SegmentMove::Compact {
+                    evacuation,
+                    applied,
+                    epoch,
+                }) => {
+                    compacting = Some((applied, epoch));
                     PoolOp::Evacuate(evacuation)
                 }
                 Some(SegmentMove::Release { prefix }) => PoolOp::ReleaseSegments(prefix),
@@ -641,6 +650,15 @@ impl SharedGrow {
                         self.shared.lock().unwrap().evacuation_refused(applied);
                         self.no_room.store(true, Ordering::Release);
                     }
+                    // A refused compaction copied nothing either: the bind
+                    // it was for is funded as before, by the planner.
+                    if let Some((applied, _)) = &compacting {
+                        self.shared.lock().unwrap().compaction_refused(applied);
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                        {
+                            planner.pages_freed();
+                        }
+                    }
                     return;
                 }
             }
@@ -650,6 +668,14 @@ impl SharedGrow {
                 // fires handed out by now retire, at once on an idle pool.
                 let (current, _) = self.epochs();
                 self.shared.lock().unwrap().evacuated(current);
+            }
+            if let Some((_, planned)) = compacting {
+                // The engine took the copy on its stream ahead of every
+                // later fire: the chunks moved off open once the fires
+                // handed out by now retire (the loop's next step reads
+                // that), and the run they clear is room given back.
+                let (current, _) = self.epochs();
+                self.shared.lock().unwrap().compaction_copied(planned, current);
             }
         }
     }

@@ -698,6 +698,16 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
+    /// Copy `evacuation`, chunk moves that stand a free run for a bind
+    /// waiting on one (`applied` in the pool already, the chunks moved off
+    /// fenced until the fire at `epoch`): [`SharedPool::compaction_copied`]
+    /// once the engine took it, [`SharedPool::compaction_refused`] where it
+    /// refused it.
+    Compact {
+        evacuation: EngineEvacuation,
+        applied: Vec<super::segments::ChunkMove>,
+        epoch: u64,
+    },
     /// Back the top `n` span segments (`commit_span(n)`), where the span is
     /// backed on demand: the rung lends a chunk there no segment backs. The
     /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
@@ -797,6 +807,10 @@ pub struct SharedPool {
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
     /// while their slot count is short.
     guest_head: Option<(u32, u32)>,
+    /// The runs a bind waiting in the planner asks, `(run, pieces)`, where
+    /// free chunks are enough but no run of them stands
+    /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
+    compact_for: Option<(u32, u32)>,
     /// The governor's segment target the walk steers this pool to, shared
     /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
     walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1052,6 +1066,7 @@ impl SharedPool {
             lowering: None,
             span_commit_blocked: false,
             guest_head: None,
+            compact_for: None,
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
@@ -2115,11 +2130,15 @@ impl SharedPool {
         if let Some(step) = self.grow_step(target, self.grow_for()) {
             return Some(step.into());
         }
+        if let Some(step) = self.compact_step(epoch) {
+            return Some(step);
+        }
         let mapped = self.mapped_segments();
         if mapped <= target || prefix == 0 {
             return None;
         }
         let last = prefix - 1;
+        let segments = self.pool.segments();
         match segments.state(last) {
             SegmentState::Draining { .. } => Some(match self.pool.release_segment(last) {
                 Ok(()) => SegmentMove::Release { prefix: last },
@@ -2146,6 +2165,61 @@ impl SharedPool {
             }
             SegmentState::Uncommitted => None,
         }
+    }
+
+    /// A compaction for the bind waiting on runs that free chunks would
+    /// stand, if one is due: each step clears one run, the next planned
+    /// once its moves' fence lifts. Over once the runs stand.
+    fn compact_step(&mut self, epoch: u64) -> Option<SegmentMove> {
+        let (run, pieces) = self.compact_for?;
+        if self.pool.free_chunk_runs(run) >= pieces {
+            self.compact_for = None;
+            return None;
+        }
+        let moves = self.pool.plan_compaction(run)?;
+        self.pool
+            .apply_compaction(&moves, epoch)
+            .expect("a compaction planned under the lock applies");
+        Some(SegmentMove::Compact {
+            evacuation: engine_moves(&moves),
+            applied: moves,
+            epoch,
+        })
+    }
+
+    /// Whether moving chunks stands `pieces` free runs of `run` for a bind
+    /// waiting in the planner, where no run stands now: one planned (the
+    /// walk asked to make it), or one on its way. Where it is, the planner
+    /// moves no resident for the bind; where none can (free chunks too few
+    /// whatever moves, or no walk steers the pool), it is no answer, and
+    /// the planner goes on.
+    pub fn compaction_comes(&mut self, run: u32, pieces: u32) -> bool {
+        // No walk steers this pool: nothing would carry a compaction out.
+        if self.walk_target.is_none() || self.pool.free_chunk_runs(run) >= pieces {
+            return false;
+        }
+        if self.compact_for.is_some() && self.pool.compacting() {
+            return true;
+        }
+        if self.pool.plan_compaction(run).is_none() {
+            return false;
+        }
+        self.compact_for = Some((run, pieces));
+        true
+    }
+
+    /// The engine took a compaction's copy (planned to ride the fire at
+    /// `planned`) and waits it out: its chunks' fence lifts once the fires
+    /// handed out by `current` retire, at once on an idle pool.
+    pub fn compaction_copied(&mut self, planned: u64, current: u64) {
+        self.pool.compaction_copied(planned, current);
+    }
+
+    /// The engine refused a compaction before its copy: the pool takes it
+    /// back, and no other is planned for that bind.
+    pub fn compaction_refused(&mut self, moves: &[super::segments::ChunkMove]) {
+        self.pool.undo_compaction(moves);
+        self.compact_for = None;
     }
 
     /// Whom a grow is for now: a live waiter while any is parked short of

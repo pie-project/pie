@@ -2441,6 +2441,10 @@ struct BindRoomPool {
     /// The moves of parked state down a tier, in order: `"spill"` (host kv
     /// on down to disk) or `"park"` (role slots to the host).
     moved: parking_lot::Mutex<Vec<&'static str>>,
+    /// Scattered free ids a compaction would join into the runs asked
+    /// ([`PoolPort::compaction_comes`]), and how often it was asked.
+    compactable: std::sync::atomic::AtomicBool,
+    compactions: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2458,6 +2462,8 @@ impl BindRoomPool {
             host_used: AtomicU32::new(0),
             disk_free: AtomicU32::new(0),
             moved: parking_lot::Mutex::new(Vec::new()),
+            compactable: std::sync::atomic::AtomicBool::new(false),
+            compactions: AtomicU32::new(0),
         }
     }
 
@@ -2578,6 +2584,13 @@ impl PoolPort for BindRoomPool {
     }
     fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
         self.runs_free(run, pieces)
+    }
+    fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
+        let comes = !self.runs_free(run, pieces) && self.compactable.load(Ordering::Acquire);
+        if comes {
+            self.compactions.fetch_add(1, Ordering::Relaxed);
+        }
+        comes
     }
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
@@ -4291,5 +4304,57 @@ async fn a_roles_short_restore_is_funded_beside_a_steady_decoder_once_a_bind_wai
             Residency::Resident,
             "the decoder keeps firing"
         );
+    }
+}
+
+/// F21's bind on the planner's side: no run of its stands, but moving
+/// chunks would stand one. The planner asks for the compaction and moves
+/// no resident for the bind; the run the compaction stands (room given
+/// back) serves it. Control: with no compaction possible, a resident is
+/// parked for it as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_whose_run_a_compaction_stands_moves_no_resident_and_is_served_after_it() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for compactable in [true, false] {
+        let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+        // Scattered: no two adjacent.
+        pool.free.lock().extend([0, 2, 4, 6]);
+        pool.compactable.store(compactable, Ordering::Release);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let (binder, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [binder, resident] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        *pool.occupant.lock() = Some(resident);
+        let p = planner.clone();
+        let mut bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if planner.stats.evictions_started.load(Ordering::Relaxed) > 0
+                || pool.compactions.load(Ordering::Relaxed) > 0
+            {
+                break;
+            }
+        }
+        let started = planner.stats.evictions_started.load(Ordering::Relaxed);
+        if !compactable {
+            assert!(started > 0, "control: no compaction stands it, a resident is parked");
+            bind.abort();
+            continue;
+        }
+        assert!(pool.compactions.load(Ordering::Relaxed) > 0, "a compaction is asked");
+        assert_eq!(started, 0, "no resident moved for it");
+        assert!(!bind.is_finished(), "it waits for the run");
+        // The compaction lands: 2 moved to 1, a run of 2 at 0..2.
+        pool.free.lock().retain(|&id| id != 2);
+        pool.free.lock().push(1);
+        planner.pages_freed();
+        let served = crate::rt::time::timeout(Duration::from_secs(10), &mut bind)
+            .await
+            .expect("room given back serves it")
+            .expect("the wait ends");
+        assert_eq!(served, Ok(crate::planner::BindRoomWait::Served));
+        assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
     }
 }

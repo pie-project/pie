@@ -251,6 +251,16 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pid;
         self.guest_room_free(run, pieces)
     }
+    /// Whether moving chunks will stand `pieces` free runs of `run`
+    /// adjacent chunks where free chunks are enough but scattered (F21): a
+    /// compaction planned, the pool's walk asked to carry it out, or one on
+    /// its way. Where it is, no resident is moved for the bind; where no
+    /// moves could stand the runs, `false`. None where the pool keeps no
+    /// guest state.
+    fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
+        let _ = (run, pieces);
+        false
+    }
     /// The device pages that, moved out whole, free `chunks` chunks for a
     /// guest's state, as [`Self::rs_as_pages`] for state.
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
@@ -472,6 +482,16 @@ impl PoolPort for RegistryPool {
             Some(roles) => roles.lock().unwrap().fits_beside_unpark(pid, run, pieces),
             None => self.guest_room_free(run, pieces),
         }
+    }
+
+    fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
+        let comes = crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| shared.lock().unwrap().compaction_comes(run, pieces));
+        if comes {
+            crate::store::shared::ask_walk(self.engine);
+        }
+        comes
     }
 
     fn room_gives(&self) -> u64 {

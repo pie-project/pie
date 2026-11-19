@@ -249,6 +249,13 @@ impl ResidencyPlanner {
                     if self.wait_on_grow(no_grow, need) {
                         return true;
                     }
+                    // Free chunks enough but scattered: chunks are moved
+                    // until its runs stand (the walk carries it out, room
+                    // given back wakes it), no one parked for it.
+                    if self.port.compaction_comes(run, pieces) {
+                        ptrace!("plan waits on a compaction run={} pieces={}", run, pieces);
+                        return false;
+                    }
                     // Parked state lying on the device moves down a tier
                     // before any resident does.
                     if self.park_down_for(run, pieces) {

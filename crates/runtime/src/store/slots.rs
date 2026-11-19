@@ -53,7 +53,7 @@
 //! class in use.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use state::key::Hash256;
 
@@ -203,6 +203,8 @@ pub enum SlotError {
     NoRoom { rung: u32, chunks: u32 },
     #[error("a rung evacuation no longer matches the pool")]
     StaleRung,
+    #[error("a compaction no longer matches the pool")]
+    StaleCompaction,
     /// A claim named a chunk that cannot be taken whole as it stands.
     #[error("chunk {chunk} cannot be claimed: {why}")]
     Unclaimable { chunk: u32, why: &'static str },
@@ -1117,6 +1119,162 @@ impl SlotPool {
         }
         self.set_act(act);
         Ok(())
+    }
+
+    /// The fewest chunk moves that stand one free run of `run` adjacent
+    /// chunks inside one committed segment, where free chunks are enough
+    /// but scattered (a guest bind's run, F21: pages and slots of many
+    /// owners interleave across chunks). The window of `run` chunks whose
+    /// held chunks are fewest is cleared: each held chunk in it moves to a
+    /// free chunk outside it, the lowest first. A chunk moves on its
+    /// logical id, so its holders keep their refs and the engine copies its
+    /// bytes ([`Engine::evacuate`]). `None` where a run stands already,
+    /// where a move this pool made is still fenced (one at a time), or
+    /// where no window can be cleared: no free chunks outside it for what
+    /// it holds, or something in it that does not move (a reserved chunk,
+    /// a run taken whole, a fenced one).
+    ///
+    /// [`Engine::evacuate`]: ::engine::Engine::evacuate
+    #[must_use]
+    pub fn plan_compaction(&self, run: u32) -> Option<Vec<ChunkMove>> {
+        let run = run.max(1);
+        if run > self.segments.segment_chunks()
+            || !self.fences.is_empty()
+            || !self.runs_where(run, run, |chunk| self.open.get(chunk)).is_empty()
+        {
+            return None;
+        }
+        let in_runs: HashSet<u32> = self
+            .runs
+            .iter()
+            .flat_map(|(&first, &len)| {
+                let at = self.logical_to_physical[first as usize];
+                at..at + len
+            })
+            .collect();
+        let movable = |chunk: u32| {
+            chunk >= self.reserved
+                && !self.free.get(chunk)
+                && !in_runs.contains(&chunk)
+                && self.chunks[self.physical_to_logical[chunk as usize] as usize].shape != NO_SHAPE
+        };
+        let limit = self.state_limit().min(self.ceiling);
+        let open = self.open.iter_in(0, limit).count() as u32;
+        let mut best: Option<(u32, u32)> = None;
+        for segment in 0..self.segments.count() {
+            if self.segments.state(segment) != SegmentState::Committed {
+                continue;
+            }
+            let range = self.segments.range(segment);
+            let end = range.end.min(limit);
+            let mut start = range.start;
+            while start + run <= end {
+                let mut held = 0u32;
+                let mut blocked = None;
+                for chunk in start..start + run {
+                    if self.open.get(chunk) {
+                        continue;
+                    }
+                    if movable(chunk) {
+                        held += 1;
+                    } else {
+                        blocked = Some(chunk);
+                        break;
+                    }
+                }
+                if let Some(chunk) = blocked {
+                    start = chunk + 1;
+                    continue;
+                }
+                let outside = open - (run - held);
+                if outside >= held && best.is_none_or(|(fewest, _)| held < fewest) {
+                    best = Some((held, start));
+                }
+                start += 1;
+            }
+        }
+        let (_, start) = best?;
+        let window = start..start + run;
+        let mut targets = self
+            .open
+            .iter_in(0, limit)
+            .filter(|chunk| !window.contains(chunk));
+        let moves = window
+            .clone()
+            .filter(|&chunk| !self.open.get(chunk))
+            .map(|from| {
+                targets.next().map(|to| ChunkMove {
+                    logical: self.physical_to_logical[from as usize],
+                    from,
+                    to,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(moves)
+    }
+
+    /// Carries out `moves` ([`Self::plan_compaction`]'s), which the fire at
+    /// `epoch` copies: each chunk moved off stays closed until that fire
+    /// retires, and then the run it cleared stands free. All or nothing.
+    pub fn apply_compaction(&mut self, moves: &[ChunkMove], epoch: u64) -> Result<(), SlotError> {
+        let mut targets = BTreeSet::new();
+        for step in moves {
+            let fits = (step.logical as usize) < self.logical_to_physical.len()
+                && self.chunks[step.logical as usize].shape != NO_SHAPE
+                && self.logical_to_physical[step.logical as usize] == step.from
+                && !self.free.get(step.from)
+                && self.open.get(step.to)
+                && targets.insert(step.to);
+            if !fits {
+                return Err(SlotError::StaleCompaction);
+            }
+        }
+        for step in moves {
+            // Fenced before the move reopens it: closed until the copy.
+            self.fenced.set(step.from);
+            self.move_chunk(*step);
+        }
+        if !moves.is_empty() {
+            self.fences
+                .entry(epoch)
+                .or_default()
+                .extend(moves.iter().map(|step| step.from));
+        }
+        Ok(())
+    }
+
+    /// Takes back `moves`, applied with [`Self::apply_compaction`] and
+    /// refused by the engine before its copy: each chunk goes back to where
+    /// it lay, and its fence lifts.
+    pub fn undo_compaction(&mut self, moves: &[ChunkMove]) {
+        for step in moves.iter().rev() {
+            for chunks in self.fences.values_mut() {
+                chunks.retain(|&chunk| chunk != step.from);
+            }
+            self.fenced.clear(step.from);
+            self.move_chunk(ChunkMove {
+                logical: step.logical,
+                from: step.to,
+                to: step.from,
+            });
+        }
+        self.fences.retain(|_, chunks| !chunks.is_empty());
+    }
+
+    /// Whether chunks moved off by a compaction (or a rung raise) are
+    /// still fenced: the run it clears is on its way.
+    #[must_use]
+    pub fn compacting(&self) -> bool {
+        !self.fences.is_empty()
+    }
+
+    /// Re-fences the chunks a compaction fenced until `from` to `to`: the
+    /// engine took the copy and waits it out ([`Self::drains_through`]'s
+    /// counterpart for chunk moves).
+    pub fn compaction_copied(&mut self, from: u64, to: u64) {
+        if from > to {
+            self.refence(from, to);
+        }
     }
 
     /// Takes back `evacuation`, applied with [`Self::apply_rung`] and
@@ -2999,6 +3157,96 @@ mod tests {
             pool.plan_evacuation(2).is_none(),
             "2..4 and 6..8 free, four chunks, and no run of 3 in a lower segment"
         );
+    }
+
+    /// F21's bind: free chunks enough for a run of 3 but none adjacent
+    /// (pages and slots of many owners interleave across chunks), nothing
+    /// left to evict. The cheapest window is cleared, one held chunk moved
+    /// out on its logical id, its chunk closed until the fire carrying the
+    /// copy retires; then the run stands and the bind takes it. Every
+    /// resident reads its bytes where its refs lead, as before the move.
+    /// Free chunks too few for the run whatever moves: no compaction.
+    #[test]
+    fn scattered_free_chunks_are_compacted_into_a_run_and_residents_keep_their_bytes() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let resident = Holder::WorkingSet(1);
+        let singles: Vec<Vec<Slot>> = (0..11)
+            .map(|_| pool.acquire_chunk_runs(resident, 0, 1, 1).unwrap())
+            .collect();
+        // The engine's bytes, by physical chunk: each chunk's own mark.
+        let mut bytes = vec![0u32; 16];
+        for slots in &singles {
+            let logical = slots[0].chunk;
+            bytes[pool.physical(logical).unwrap() as usize] = 1000 + logical;
+        }
+        let marks: Vec<(Slot, u32)> = singles
+            .iter()
+            .flatten()
+            .map(|&slot| (slot, 1000 + slot.chunk))
+            .collect();
+        // Free 2, 4, 6, 8, 10: five free, no three adjacent in a segment.
+        let mut kept = Vec::new();
+        for (i, slots) in singles.into_iter().enumerate() {
+            let physical = pool.physical(slots[0].chunk).unwrap();
+            if [2, 4, 6, 8, 10].contains(&physical) {
+                pool.release(resident, &slots, 0);
+            } else {
+                kept.push((i, slots));
+            }
+        }
+        assert_eq!(pool.free_chunk_runs(1), 5);
+        assert_eq!(pool.free_chunk_runs(3), 0, "no run of 3 stands");
+        assert!(
+            matches!(
+                pool.acquire_chunk_runs(Holder::WorkingSet(2), 0, 3, 1),
+                Err(SlotError::NoChunkRun { .. })
+            ),
+            "the bind is short"
+        );
+
+        let moves = pool.plan_compaction(3).expect("five free chunks stand a run of 3");
+        assert_eq!(moves.len(), 1, "the cheapest window: one chunk moved");
+        assert_eq!((moves[0].from, moves[0].to), (5, 2), "4..7 cleared, its 5 to the lowest free");
+        pool.apply_compaction(&moves, 7).unwrap();
+        // The engine's copy (`Engine::evacuate`): bytes follow the logical chunk.
+        for step in &moves {
+            bytes[step.to as usize] = bytes[step.from as usize];
+        }
+        assert_eq!(pool.free_chunk_runs(3), 0, "closed until the copy's fire retires");
+        assert!(pool.compacting());
+        assert_eq!(pool.plan_compaction(3), None, "one at a time");
+        pool.retire_through(7);
+        assert!(!pool.compacting());
+        assert_eq!(pool.free_chunk_runs(3), 1, "the run stands");
+        let bound = pool
+            .acquire_chunk_runs(Holder::WorkingSet(2), 0, 3, 1)
+            .expect("the bind takes it");
+        let mut chunks: Vec<u32> = bound.iter().map(|slot| pool.physical(slot.chunk).unwrap()).collect();
+        chunks.dedup();
+        assert_eq!(chunks, [4, 5, 6]);
+        for (slot, mark) in &marks {
+            if kept.iter().any(|(_, slots)| slots.contains(slot)) {
+                assert_eq!(
+                    bytes[pool.physical(slot.chunk).unwrap() as usize],
+                    *mark,
+                    "a resident reads its own bytes through its unchanged ref"
+                );
+            }
+        }
+        assert_eq!(pool.plan_compaction(3), None, "a run stands: nothing to do");
+
+        // Over-demand: two free chunks never make a run of 3.
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let all: Vec<Vec<Slot>> = (0..11)
+            .map(|_| pool.acquire_chunk_runs(resident, 0, 1, 1).unwrap())
+            .collect();
+        for slots in all {
+            if [3, 9].contains(&pool.physical(slots[0].chunk).unwrap()) {
+                pool.release(resident, &slots, 0);
+            }
+        }
+        assert_eq!(pool.plan_compaction(3), None, "too few free chunks: it waits");
     }
 
     /// The run-class pool these tests take from: 1024-slot chunks of one
