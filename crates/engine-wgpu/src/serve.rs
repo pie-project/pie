@@ -143,6 +143,12 @@ impl Serve for Api {
     }
 
     fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
+        // A frame takes a uniform and a scratch chunk from the rings: they
+        // are stocked here, at the load, for each frame in flight (an arm a
+        // readout seat) and the one a settle or a walk holds beside them. A
+        // shell fires frames with or without a guest program.
+        #[cfg(feature = "wgpu")]
+        device.core().stock_rings(readout.len() + 1);
         Ok(Shelf {
             mirror: readout
                 .iter()
