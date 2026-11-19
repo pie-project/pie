@@ -40,11 +40,14 @@ struct M1OpParams {
 // An output's slot: its lane's first element, how it is stored
 // (0 f32, 1 bf16, 2 i32; 3 bf16 and 4 f32 rows through a table of row
 // addresses at `at`, a lane-0 read's rows seated at the instance's lanes)
-// and its row pitch in elements (0: its width).
+// its row pitch in elements (0: its width) and the rows from `at` that are
+// its lane's own (a read past them is another request's rows: refused).
 struct M1OutputSeat {
   ulong at;
   uint storage;
   uint stride;
+  uint rows;
+  uint reserved;
 };
 
 struct M1ArgmaxCandidate {
