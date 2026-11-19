@@ -140,7 +140,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
         query_len: ROWS,
         ..eta_exec::Extents::default()
     };
-    let (scratch, pair) = crate::guest_places(shell, program, &extents, slot);
+    let (scratch, pair, own) = crate::guest_places(shell, program, &extents, slot);
     let id = shell
         .bind_program(
             program,
@@ -155,7 +155,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
             &pair,
             0,
         )
-        .expect("the device-geometry instance binds");
+        .map(|id| crate::remember_scratch(id, &own)).expect("the device-geometry instance binds");
     shell.open(slot).expect("the slot opens");
     let heard: Arc<Mutex<Vec<engine::StepOutcome>>> = Arc::default();
     let sink: engine::CompletionSink = {
@@ -176,6 +176,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
         lanes: 1,
         instance: id,
         adapter_only: false,
+        scratch: crate::scratch_of(id),
     }];
     let at = engine::StepDone {
         frame: engine::FrameId(0),

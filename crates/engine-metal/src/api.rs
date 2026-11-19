@@ -1219,6 +1219,7 @@ impl Metal {
                 lanes: attachment.lanes,
                 instance: attachment.instance,
                 adapter_only: attachment.adapter_only,
+                scratch: attachment.scratch.clone(),
             })
             .collect();
 

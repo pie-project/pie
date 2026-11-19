@@ -129,7 +129,7 @@ pub(super) fn bind_reader(
         query_len: rows,
         ..eta_exec::Extents::default()
     };
-    let (scratch, pair) = crate::guest_places(shell, program, &extents, chunk);
+    let (scratch, pair, own) = crate::guest_places(shell, program, &extents, chunk);
     let id = shell
         .bind_program(
             program,
@@ -144,7 +144,7 @@ pub(super) fn bind_reader(
             &pair,
             0,
         )
-        .expect("the reader binds");
+        .map(|id| crate::remember_scratch(id, &own)).expect("the reader binds");
     (id, slots, rings)
 }
 
@@ -155,6 +155,7 @@ pub(super) fn at_lane(lane: u32, id: engine::InstanceId) -> Attached {
         lanes: 1,
         instance: id,
         adapter_only: false,
+        scratch: crate::scratch_of(id),
     }
 }
 

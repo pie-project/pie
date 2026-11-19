@@ -78,13 +78,19 @@ pub fn state_of(sets: &[u64], room: Room) -> (u64, u32) {
 #[must_use]
 pub fn guest_state(pair_sets: &[u64], instance_sets: &[u64], room: Room) -> GuestState {
     let (per_pair, pair_run) = state_of(pair_sets, room);
-    let (per_instance, instance_run) = state_of(instance_sets, room);
+    let (scratch, instance_run) = state_of(instance_sets, room);
     GuestState {
-        // Today's arms are folded into the instance's bytes: one arm, no
-        // scratch apart.
-        resident: per_instance,
-        scratch: 0,
+        // An instance keeps nothing in guest state between fires: its
+        // tables and rings lie in its own `Instance` and `Channel` slots.
+        resident: 0,
+        // One fire's value scratch, given with the fire
+        // (`engine::fire::Attachment::scratch`): an instance's next fire is
+        // staged only once its last has landed (`fence_instances`), so one
+        // arm whatever the class.
+        scratch,
         scratch_arms: 1,
+        // A set a frame in flight (`Plane::pair_sets`): consecutive frames
+        // fire different instances of one pair.
         per_pair,
         run: pair_run.max(instance_run),
     }

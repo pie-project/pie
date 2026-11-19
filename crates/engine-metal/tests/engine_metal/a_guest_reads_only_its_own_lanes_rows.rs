@@ -114,7 +114,7 @@ fn bind(shell: &mut Shell, program: engine::ProgramId, rows: u32, chunk: u32) ->
         query_len: 1,
         ..eta_exec::Extents::default()
     };
-    let (scratch, pair) = crate::guest_places(shell, program, &extents, chunk);
+    let (scratch, pair, own) = crate::guest_places(shell, program, &extents, chunk);
     shell
         .bind_program(
             program,
@@ -129,7 +129,7 @@ fn bind(shell: &mut Shell, program: engine::ProgramId, rows: u32, chunk: u32) ->
             &pair,
             0,
         )
-        .expect("the reader binds")
+        .map(|id| crate::remember_scratch(id, &own)).expect("the reader binds")
 }
 
 /// Two lanes prefilled, then one decode of both with a reader of `rows`

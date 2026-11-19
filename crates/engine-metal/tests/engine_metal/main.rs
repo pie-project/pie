@@ -104,7 +104,7 @@ pub(crate) fn guest_places(
     program: engine::ProgramId,
     extents: &eta_exec::Extents,
     nth: u32,
-) -> (engine::ScratchPlace, engine::ScratchPlace) {
+) -> (engine::ScratchPlace, engine::ScratchPlace, engine::ScratchPlace) {
     let state = shell.guest_state(program, extents).expect("the program's guest state");
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
@@ -135,10 +135,38 @@ pub(crate) fn guest_places(
     };
     let pair_at = layout.free_chunk() + 8;
     let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
-    let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
+    // The instance's resident state at bind (none on Metal), its pair's
+    // tables, and the one arm of value scratch its fires take
+    // (`engine::fire::Attachment::scratch`).
+    let places = (
+        place(state.resident, own_at),
+        place(state.per_pair, pair_at),
+        place(state.scratch, own_at + chunks_of(state.resident)),
+    );
     let end = own_at + chunks_of(state.instance_bytes());
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
         .expect("the guest state's segments commit");
     places
+}
+
+#[cfg(target_vendor = "apple")]
+thread_local! {
+    /// Each bound instance's scratch arm ([`guest_places`]), for the
+    /// attachments its fires carry.
+    static SCRATCH: std::cell::RefCell<std::collections::HashMap<engine::InstanceId, engine::ScratchPlace>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Records `id`'s scratch arm `place`; answers `id`.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn remember_scratch(id: engine::InstanceId, place: &engine::ScratchPlace) -> engine::InstanceId {
+    SCRATCH.with(|map| map.borrow_mut().insert(id, place.clone()));
+    id
+}
+
+/// Instance `id`'s scratch arm, for an attachment of its fire.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn scratch_of(id: engine::InstanceId) -> engine::ScratchPlace {
+    SCRATCH.with(|map| map.borrow().get(&id).cloned().unwrap_or_default())
 }

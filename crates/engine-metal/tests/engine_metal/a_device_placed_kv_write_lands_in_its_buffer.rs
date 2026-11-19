@@ -162,7 +162,7 @@ fn serve(
             query_len: PROMPT,
             ..eta_exec::Extents::default()
         };
-        let (scratch, pair) = crate::guest_places(shell, program, &extents, 0);
+        let (scratch, pair, own) = crate::guest_places(shell, program, &extents, 0);
         let id = shell
             .bind_program(
                 program,
@@ -177,7 +177,7 @@ fn serve(
                 &pair,
                 0,
             )
-            .expect("the device-geometry instance binds");
+            .map(|id| crate::remember_scratch(id, &own)).expect("the device-geometry instance binds");
         let lane = Seated {
             pages: &[],
             translation: pages,
@@ -192,6 +192,7 @@ fn serve(
                         lanes: 1,
                         instance: id,
                         adapter_only: false,
+                        scratch: crate::scratch_of(id),
                     }],
                 )
                 .expect("the device-placed prefill lands"),

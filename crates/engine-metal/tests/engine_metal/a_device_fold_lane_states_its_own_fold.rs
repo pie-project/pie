@@ -201,7 +201,7 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
         query_len: ROWS,
         ..eta_exec::Extents::default()
     };
-    let (scratch, pair) = crate::guest_places(&mut shell, program, &extents, 0);
+    let (scratch, pair, own) = crate::guest_places(&mut shell, program, &extents, 0);
     let id = shell
         .bind_program(
             program,
@@ -216,7 +216,7 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
             &pair,
             0,
         )
-        .expect("the device-geometry instance binds");
+        .map(|id| crate::remember_scratch(id, &own)).expect("the device-geometry instance binds");
     // A lane past the attachment is a plain request's: its fold is its own.
     let verbs: Vec<RsVerb> = (0..lanes)
         .map(|lane| {
@@ -252,6 +252,7 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
                 lanes: owned,
                 instance: id,
                 adapter_only: false,
+                scratch: crate::scratch_of(id),
             }],
         )
         .err()

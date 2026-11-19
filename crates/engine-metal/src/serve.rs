@@ -264,7 +264,7 @@ struct InputFeedPlan {
     lane: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attached {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
@@ -272,6 +272,9 @@ pub struct Attached {
     pub instance: engine::InstanceId,
     /// Carries the pass's adapter alone and runs none of its stages.
     pub adapter_only: bool,
+    /// Where this fire seats the instance's value scratch: the arm the
+    /// runtime took for it (`engine::fire::Attachment::scratch`).
+    pub scratch: engine::ScratchPlace,
 }
 
 pub struct Shell {
@@ -3601,7 +3604,11 @@ impl Shell {
                     why,
                 });
             }
-            staged.push(attached.instance);
+            staged.push((
+                attached.instance,
+                self.programs
+                    .scratch_at(&self.pools, attached.instance, &attached.scratch)?,
+            ));
         }
         let mut refusal = None;
         for (instance, launched) in
@@ -3709,11 +3716,11 @@ impl Shell {
     /// verdict, the descriptor ports and input feeds), so the wait stays,
     /// once a step rather than once a region an instance.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        let ids: Vec<engine::InstanceId> = attachments
+        let ids: Vec<(engine::InstanceId, Option<crate::program::launch::ScratchAt>)> = attachments
             .iter()
             .filter(|a| !a.adapter_only && self.programs.prologue_runs(a.instance))
-            .map(|a| a.instance)
-            .collect();
+            .map(|a| Ok((a.instance, self.programs.scratch_at(&self.pools, a.instance, &a.scratch)?)))
+            .collect::<Result<_>>()?;
         if ids.is_empty() {
             return Ok(());
         }

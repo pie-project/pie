@@ -64,7 +64,7 @@ fn a_bound_guest_leaves_the_span_as_it_was() {
                 }
             })
             .collect();
-        let (scratch, pair) = crate::guest_places(&mut shell, program, &extents, nth);
+        let (scratch, pair, own) = crate::guest_places(&mut shell, program, &extents, nth);
         ids.push(
             shell
                 .bind_program(
@@ -80,7 +80,7 @@ fn a_bound_guest_leaves_the_span_as_it_was() {
                     &pair,
                     0,
                 )
-                .expect("the reader binds"),
+                .map(|id| crate::remember_scratch(id, &own)).expect("the reader binds"),
         );
     }
     assert_eq!(
