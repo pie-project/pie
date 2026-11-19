@@ -3939,7 +3939,7 @@ impl<B: Serve> Shell<B> {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,

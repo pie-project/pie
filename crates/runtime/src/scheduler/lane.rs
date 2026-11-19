@@ -187,6 +187,179 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     })
 }
 
+/// Fails the fires of `steps[at]` whose lanes the engine `refused`, each
+/// by its first such lane's reason, and every later fire of their
+/// instances, which reads what they would have left; and takes them out of
+/// `rest` (the submissions of `steps[at..]`, which never ran), dropping a
+/// step left with no lane. What stays of `rest` goes to the engine again:
+/// nothing of it ran, so nothing of it is lost or run twice.
+fn refuse_lanes(
+    steps: &mut Vec<crate::engine::StepFire>,
+    at: usize,
+    mut rest: Vec<::engine::Step>,
+    refused: &[::engine::LaneFault],
+) -> std::result::Result<Vec<::engine::Step>, String> {
+    use crate::engine::completion;
+
+    let named = || {
+        refused
+            .iter()
+            .map(|fault| format!("lane {}: {}", fault.lane, fault.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    if rest.len() != steps.len().saturating_sub(at) || rest.is_empty() {
+        return Err(format!(
+            "the engine refused lanes of a step past the frame's end: {}",
+            named()
+        ));
+    }
+    let mut gone: Vec<(::engine::InstanceId, String)> = Vec::new();
+    for (offset, step) in rest.iter_mut().enumerate() {
+        let fire = &mut steps[at + offset];
+        let members = fire.member_lanes.len().saturating_sub(1);
+        let mut why: Vec<Option<String>> = vec![None; members];
+        for (member, slot) in why.iter_mut().enumerate() {
+            let lanes = fire.member_lanes[member]..fire.member_lanes[member + 1];
+            let instance = fire.instances.get(lanes.start as usize).copied();
+            if offset == 0
+                && let Some(fault) = refused.iter().find(|fault| lanes.contains(&fault.lane))
+            {
+                *slot = Some(format!(
+                    "engine: lane {} refused: {}",
+                    fault.lane, fault.reason
+                ));
+            } else if let Some((_, reason)) = gone
+                .iter()
+                .find(|(gone, _)| instance.is_some_and(|instance| instance == *gone))
+            {
+                *slot = Some(format!(
+                    "an earlier fire of this instance in its frame was refused: {reason}"
+                ));
+            }
+        }
+        if offset == 0 && why.iter().all(Option::is_none) {
+            return Err(format!(
+                "the engine refused lanes no fire of the step holds: {}",
+                named()
+            ));
+        }
+        for (member, reason) in why.iter().enumerate() {
+            let Some(reason) = reason else { continue };
+            let start = fire.member_lanes[member] as usize;
+            if let Some(&instance) = fire.instances.get(start)
+                && !gone.iter().any(|(gone, _)| *gone == instance)
+            {
+                gone.push((instance, reason.clone()));
+            }
+            tracing::warn!(%reason, "a fire's lanes were refused; it fails alone");
+            if let Some(&cell) = fire.terminal_cells.get(member) {
+                completion::settle(&[cell], completion::TERMINAL_OUTCOME_FAILED);
+            }
+            if let Some(completion) = fire.completions.get(member) {
+                completion.reject_unsubmitted(reason.clone());
+            }
+        }
+        strip_members(fire, step, &why);
+    }
+    let mut kept = Vec::with_capacity(rest.len());
+    let mut index = at;
+    for step in rest {
+        if step.lanes.is_empty() {
+            steps.remove(index);
+        } else {
+            kept.push(step);
+            index += 1;
+        }
+    }
+    Ok(kept)
+}
+
+/// Takes the members `drop` marks out of a step: their lanes, their cells
+/// and completions, their attachments and media, every lane index after
+/// them renumbered, and the lane groups left packed in order.
+fn strip_members(
+    fire: &mut crate::engine::StepFire,
+    step: &mut ::engine::Step,
+    drop: &[Option<String>],
+) {
+    if drop.iter().all(Option::is_none) {
+        return;
+    }
+    let lanes = step.lanes.len();
+    // Each old lane's new index, `None` where it goes.
+    let mut to: Vec<Option<u32>> = vec![None; lanes];
+    let mut member_lanes = vec![0u32];
+    let mut next = 0u32;
+    for (member, dropped) in drop.iter().enumerate() {
+        let span = fire.member_lanes[member] as usize..fire.member_lanes[member + 1] as usize;
+        if dropped.is_none() {
+            for lane in span {
+                if let Some(slot) = to.get_mut(lane) {
+                    *slot = Some(next);
+                    next += 1;
+                }
+            }
+            member_lanes.push(next);
+        }
+    }
+    let keep = |lane: u32| to.get(lane as usize).copied().flatten();
+    let mut kept_lanes = Vec::with_capacity(next as usize);
+    let mut instances = Vec::with_capacity(next as usize);
+    for (lane, moved) in std::mem::take(&mut step.lanes).into_iter().enumerate() {
+        if to[lane].is_some() {
+            kept_lanes.push(moved);
+            instances.extend(fire.instances.get(lane).copied());
+        }
+    }
+    // A pass's group id is unique in its step: the kept ones, packed.
+    let mut ids: Vec<u32> = kept_lanes.iter().filter_map(|lane| lane.group).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for lane in &mut kept_lanes {
+        lane.group = lane
+            .group
+            .and_then(|id| ids.binary_search(&id).ok())
+            .map(|at| u32::try_from(at).unwrap_or(u32::MAX));
+    }
+    step.lanes = kept_lanes;
+    step.attachments.retain_mut(|attachment| match keep(attachment.lane) {
+        Some(lane) => {
+            attachment.lane = lane;
+            true
+        }
+        None => false,
+    });
+    step.media.retain_mut(|media| match keep(media.lane) {
+        Some(lane) => {
+            media.lane = lane;
+            true
+        }
+        None => false,
+    });
+    step.voxels.retain_mut(|voxels| match keep(voxels.lane) {
+        Some(lane) => {
+            voxels.lane = lane;
+            true
+        }
+        None => false,
+    });
+    let mut member = 0;
+    fire.terminal_cells.retain(|_| {
+        let kept = drop.get(member).is_none_or(Option::is_none);
+        member += 1;
+        kept
+    });
+    let mut member = 0;
+    fire.completions.retain(|_| {
+        let kept = drop.get(member).is_none_or(Option::is_none);
+        member += 1;
+        kept
+    });
+    fire.member_lanes = member_lanes;
+    fire.instances = instances;
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -678,15 +851,13 @@ impl Lane {
             *stash = Some(queued);
         }
 
-        let submitted = ::engine::FrameSubmission {
-            steps: frame
-                .steps
-                .iter_mut()
-                .map(|step| std::mem::take(&mut step.submission))
-                .collect(),
-        };
+        let mut pending: Vec<::engine::Step> = frame
+            .steps
+            .iter_mut()
+            .map(|step| std::mem::take(&mut step.submission))
+            .collect();
 
-        for step in &submitted.steps {
+        for step in &pending {
             for attachment in &step.attachments {
                 let instance = attachment.instance;
                 if let Err(error) = crate::store::roles::pump(roles, instance, Pump::In, || {
@@ -696,113 +867,181 @@ impl Lane {
                 }
             }
         }
-        tracing::debug!(
-            steps = submitted.steps.len(),
-            "submitting a frame to the engine"
-        );
-        let ticket = match engine.submit(&submitted) {
-            Ok(ticket) => ticket,
-            Err(error) if error.is_retryable() => {
-                return Err(format!(
-                    "frame admission answered a retryable refusal past static \
-                     admission, which the frame contract forbids: {error}"
-                ));
-            }
-            Err(error) => {
-                if matches!(error, ::engine::Error::Impossible(_)) {
-                    crate::store::shared::programs::impossible_submission(engine_idx, &error);
-                }
-                return Err(format!("{error}"));
-            }
-        };
 
-        // What each step's attachments name (their instances, and the pair,
-        // channels and adapter each shares) is read until the step lands:
-        // let go meanwhile (a last close, a park), it waits for that.
-        let reads: Vec<Vec<crate::store::roles::Owner>> = submitted
-            .steps
-            .iter()
-            .map(|step| {
-                roles.map_or_else(Vec::new, |roles| {
-                    roles
-                        .lock()
-                        .unwrap()
-                        .reading(step.attachments.iter().map(|a| a.instance))
-                })
-            })
-            .collect();
         let asynchronous = engine.settles_asynchronously();
-        if asynchronous {
-            landed.insert(
-                ticket.id,
-                submitted
-                    .steps
-                    .iter()
-                    .zip(reads)
-                    .map(|(step, reads)| {
-                        (step.attachments.iter().map(|a| a.instance).collect(), reads)
+        // The engine frames this one took, where they settle off the
+        // submit: each one's id, the steps of `frame` it fired, and the
+        // waiters on what each step puts.
+        let mut booked: Vec<(::engine::FrameId, std::ops::Range<usize>, Vec<Vec<u64>>)> =
+            Vec::new();
+        // Where `pending` starts in `frame.steps`.
+        let mut at = 0usize;
+        while !pending.is_empty() {
+            let submitted = ::engine::FrameSubmission { steps: pending };
+            // What each step's attachments name (their instances, and the
+            // pair, channels and adapter each shares) is read until the step
+            // lands: let go meanwhile (a last close, a park), it waits for
+            // that. A step the engine did not fire is read no more.
+            let mut reads: Vec<Vec<crate::store::roles::Owner>> = submitted
+                .steps
+                .iter()
+                .map(|step| {
+                    roles.map_or_else(Vec::new, |roles| {
+                        roles
+                            .lock()
+                            .unwrap()
+                            .reading(step.attachments.iter().map(|a| a.instance))
                     })
-                    .collect(),
-            );
-        } else if let Some(roles) = roles {
-            // Settled inside `submit`: the device is done with it.
-            let mut roles = roles.lock().unwrap();
-            for reads in &reads {
-                roles.landed(reads);
-            }
-        }
-        let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); submitted.steps.len()];
-        for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
-            for attachment in &step.attachments {
-                let deferred = asynchronous.then_some(&mut *woken);
-                let instance = attachment.instance;
-                if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
-                    channels.pump_out_with(engine.as_mut(), instance, deferred)
-                }) {
-                    return Err(format!("channel take: {error}"));
+                })
+                .collect();
+            let let_go = |reads: &[Vec<crate::store::roles::Owner>]| {
+                if let Some(roles) = roles {
+                    let mut roles = roles.lock().unwrap();
+                    for reads in reads {
+                        roles.landed(reads);
+                    }
                 }
-            }
-        }
+            };
+            tracing::debug!(
+                steps = submitted.steps.len(),
+                "submitting a frame to the engine"
+            );
+            // A refusal of lanes names lanes of the first step that did not
+            // fire: the frame fired the steps before it (`Engine::submit`).
+            let (ticket, refused) = match engine.submit(&submitted) {
+                Ok(mut ticket) => {
+                    let refused = std::mem::take(&mut ticket.refused);
+                    (Some(ticket), refused)
+                }
+                Err(::engine::Error::Lanes(refused)) => (None, refused),
+                Err(error) if error.is_retryable() => {
+                    let_go(&reads);
+                    return Err(format!(
+                        "frame admission answered a retryable refusal past static \
+                         admission, which the frame contract forbids: {error}"
+                    ));
+                }
+                Err(error) => {
+                    let_go(&reads);
+                    if matches!(error, ::engine::Error::Impossible(_)) {
+                        crate::store::shared::programs::impossible_submission(engine_idx, &error);
+                    }
+                    return Err(format!("{error}"));
+                }
+            };
+            let fired = ticket.as_ref().map_or(0, |ticket| ticket.steps.len());
+            let mut rest = submitted.steps;
+            let ran: Vec<::engine::Step> = rest.drain(..fired.min(rest.len())).collect();
+            let ran_at = at..at + ran.len();
+            let unfired = reads.split_off(ran.len().min(reads.len()));
+            let_go(&unfired);
 
-        if !asynchronous {
-            // The lanes the engine told faulted fail their own fires; every
-            // other fire of the frame commits.
-            let faulted = std::mem::take(&mut *inline_faults.lock().unwrap());
-            for (at, step) in frame.steps.iter().enumerate() {
-                let faults: Vec<::engine::LaneFault> = faulted
-                    .iter()
-                    .filter(|(step, _)| *step == at)
-                    .flat_map(|(_, faults)| faults.iter().cloned())
-                    .collect();
-                if faults.is_empty() {
-                    completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
-                } else {
-                    completion::settle_fires(
-                        &step.terminal_cells,
-                        &step.completions,
-                        &step.member_lanes,
-                        &faults,
-                        "frame settle",
+            match &ticket {
+                Some(ticket) if asynchronous && !ran.is_empty() => {
+                    landed.insert(
+                        ticket.id,
+                        ran.iter()
+                            .zip(reads)
+                            .map(|(step, reads)| {
+                                (step.attachments.iter().map(|a| a.instance).collect(), reads)
+                            })
+                            .collect(),
                     );
                 }
+                // Settled inside `submit` (or nothing fired): the device is
+                // done with what it named.
+                _ => let_go(&reads),
             }
-            return Ok(SubmissionCompletion::ready());
+            let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); ran.len()];
+            for (step, woken) in ran.iter().zip(&mut wakes) {
+                for attachment in &step.attachments {
+                    let deferred = asynchronous.then_some(&mut *woken);
+                    let instance = attachment.instance;
+                    if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
+                        channels.pump_out_with(engine.as_mut(), instance, deferred)
+                    }) {
+                        return Err(format!("channel take: {error}"));
+                    }
+                }
+            }
+
+            if !asynchronous {
+                // The lanes the engine told faulted fail their own fires;
+                // every other fire of the frame commits.
+                let faulted = std::mem::take(&mut *inline_faults.lock().unwrap());
+                for (index, step) in frame.steps[ran_at.clone()].iter().enumerate() {
+                    let faults: Vec<::engine::LaneFault> = faulted
+                        .iter()
+                        .filter(|(step, _)| *step == index)
+                        .flat_map(|(_, faults)| faults.iter().cloned())
+                        .collect();
+                    if faults.is_empty() {
+                        completion::settle(
+                            &step.terminal_cells,
+                            completion::TERMINAL_OUTCOME_SUCCESS,
+                        );
+                    } else {
+                        completion::settle_fires(
+                            &step.terminal_cells,
+                            &step.completions,
+                            &step.member_lanes,
+                            &faults,
+                            "frame settle",
+                        );
+                    }
+                }
+            } else if let Some(ticket) = &ticket
+                && !ran.is_empty()
+            {
+                booked.push((ticket.id, ran_at.clone(), wakes));
+            }
+
+            at = ran_at.end;
+            if refused.is_empty() {
+                if !rest.is_empty() {
+                    return Err(format!(
+                        "the engine fired {fired} of a frame's {} steps and named no lane it \
+                         refused",
+                        fired + rest.len()
+                    ));
+                }
+                break;
+            }
+            // The refused lanes' fires fail alone, with every later fire of
+            // their instances; the rest go to the engine again.
+            pending = refuse_lanes(&mut frame.steps, at, rest, &refused)?;
         }
 
+        if !asynchronous || booked.is_empty() {
+            return Ok(SubmissionCompletion::ready());
+        }
         let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
-        // Each step publishes its own cells and waiters as it lands.
-        let steps = frame
-            .steps
-            .iter()
-            .zip(wakes)
-            .map(|(step, wakes)| completion::LandingStep {
-                cells: step.terminal_cells.clone(),
-                completions: step.completions.clone(),
-                member_lanes: step.member_lanes.clone(),
-                wakes,
-            })
-            .collect();
-        settlements.expect(ticket.id, steps, &completion, broker);
+        let last = booked.len() - 1;
+        // A launch of several frames is checked to land in order.
+        let split = (last > 0).then(|| completion::SplitLaunch::new(booked.len()));
+        for (index, (id, steps, wakes)) in booked.into_iter().enumerate() {
+            // Each step publishes its own cells and waiters as it lands.
+            let steps = frame.steps[steps]
+                .iter()
+                .zip(wakes)
+                .map(|(step, wakes)| completion::LandingStep {
+                    cells: step.terminal_cells.clone(),
+                    completions: step.completions.clone(),
+                    member_lanes: step.member_lanes.clone(),
+                    wakes,
+                })
+                .collect();
+            // A lane's frames land in the order they were submitted, which
+            // the split launch checks: the submission is in once its last
+            // frame is.
+            settlements.expect(
+                id,
+                steps,
+                (index == last).then_some(&completion),
+                split.as_ref().map(|split| (Arc::clone(split), index)),
+                broker,
+            );
+        }
         Ok(completion)
     }
 

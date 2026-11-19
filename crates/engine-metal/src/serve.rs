@@ -4623,7 +4623,7 @@ impl Shell {
         )?;
         let boundaries = windows.packed();
 
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();

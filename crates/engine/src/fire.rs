@@ -1030,6 +1030,27 @@ impl FrameSubmission {
 pub struct FrameTicket {
     pub id: FrameId,
     pub steps: Vec<FireTicket>,
+    /// The lanes step `steps.len()` of the submission refused for their
+    /// own sake ([`Error::Lanes`]), where one did: the frame fired the
+    /// steps before it alone, and it and every step after it never ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<crate::LaneFault>,
+}
+
+impl FrameTicket {
+    /// Frame `id`, as its fired `steps`, stopped short where a step
+    /// refused lanes (`refusal`, an [`Error::Lanes`]) or whole.
+    #[must_use]
+    pub fn of(id: FrameId, steps: Vec<FireTicket>, refusal: Option<Error>) -> FrameTicket {
+        FrameTicket {
+            id,
+            steps,
+            refused: match refusal {
+                Some(Error::Lanes(lanes)) => lanes,
+                _ => Vec::new(),
+            },
+        }
+    }
 }
 
 /// The rows a lane read back of `output`, the last row or voxel output its
