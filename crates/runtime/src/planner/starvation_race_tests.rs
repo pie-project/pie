@@ -2341,7 +2341,7 @@ fn short_of_a_grow(
 fn reached_eviction(planner: &ResidencyPlanner, key: EntryKey) -> bool {
     planner.stats.eviction_deferrals.load(Ordering::Relaxed) > 0
         || planner.stats.evictions_started.load(Ordering::Relaxed) > 0
-        || planner.short.lock().worst(key.1).is_some()
+        || planner.short.lock().is_short(key.1)
 }
 
 /// Mac's over-demand stall reworked (Metal, M1, Qwen3-0.6B, 64 single-lane
@@ -3173,11 +3173,12 @@ async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
 
 /// The policy's answer of nothing is process-wide (any planner's, any
 /// tier's), and an evicted gate woke on every one, a restore of its own
-/// queued or not, to find nothing changed and park again. A gate with no
-/// short restore sleeps through such answers; a gate whose queued restore
-/// is short on the tier answered wakes on it, once, and gives up.
+/// queued or not, to find nothing changed and park again. A gate sleeps
+/// through such answers, its restore short or not: no answer refuses a
+/// need that fits. Only a restore past the whole device pool is refused,
+/// its gate told as that need is learned.
 #[tokio::test(flavor = "current_thread")]
-async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
+async fn a_gate_sleeps_through_policy_answers_and_is_refused_only_past_the_pool() {
     use crate::policy::pressure::{Tier, answered_nothing};
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
@@ -3209,7 +3210,8 @@ async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
     assert!(!idle_gate.is_finished(), "still evicted");
     assert_eq!(parks(&planner), 1, "answers that are not its wake it not once");
 
-    // Control: a restore queued short of host room gives up on the answer.
+    // A restore queued short of host room: the answer of nothing is no
+    // refusal either; it waits for room, however long.
     let key = planner.with_inner(|inner| {
         inner.enqueue(
             short,
@@ -3229,6 +3231,19 @@ async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
     }
     assert_eq!(parks(&planner), 2, "the short gate parked, once");
     answered_nothing(Tier::Host);
+    answered_nothing(Tier::Device);
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!short_gate.is_finished(), "short and fitting: it waits on");
+    assert!(!idle_gate.is_finished(), "the other gate sleeps through it");
+    assert_eq!(parks(&planner), 2, "neither parked again");
+
+    // Its unpark comes back short of runs past the whole pool (three runs
+    // of three in eight chunks): its gate is told and refuses it by name.
+    planner.with_inner(|inner| inner.procs.get_mut(&short).unwrap().state = Residency::Restoring);
+    planner.with_inner(|inner| inner.queue.remove(&key));
+    planner.requeue_restore_roles(short, (3, 3), None);
     for _ in 0..50 {
         crate::rt::yield_now().await;
         if short_gate.is_finished() {
@@ -3237,11 +3252,10 @@ async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
     }
     let ended = short_gate.await.expect("the gate ends");
     assert!(
-        matches!(ended, Err(PlannerError::Short { tier: Tier::Host, .. })),
-        "its own restore's answer wakes it and it gives up: {ended:?}"
+        matches!(ended, Err(PlannerError::PastDevice { runs: Some((3, 3)), .. })),
+        "past the pool: refused by name: {ended:?}"
     );
     assert!(!idle_gate.is_finished(), "the other gate sleeps through it");
-    assert_eq!(parks(&planner), 2, "neither parked again");
     idle_gate.abort();
 }
 
@@ -3481,8 +3495,7 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
 /// park) sit between the free chunks, and nothing moved them, nor was
 /// anyone resident to evict. Parked state on the device is room a move
 /// makes: host kv goes on down to disk to make host room, the parked role
-/// slots go to the host, and the restore lands in the run that leaves. The
-/// planner counts it movable ([`ResidencyPlanner::movable_parked_room`]).
+/// slots go to the host, and the restore lands in the run that leaves.
 #[tokio::test(flavor = "current_thread")]
 async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3520,14 +3533,6 @@ async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
     });
     assert!(!pool.guest_room_free(3, 1), "no run of its need stands");
     assert!(planner.with_inner(|inner| inner.fleet_stalled()), "nothing resident");
-    assert!(
-        planner.movable_parked_room(head, 3, 1),
-        "the parked state counts as movable room"
-    );
-    assert!(
-        !planner.movable_parked_room(head, 3, 3),
-        "three runs of three do not fit eight chunks however much moves"
-    );
     planner.poke();
     for _ in 0..400 {
         crate::rt::yield_now().await;
@@ -3595,7 +3600,6 @@ async fn with_no_host_tier_parked_role_chunks_go_to_disk_for_a_bind_suspended_he
         );
     });
     assert_eq!(pool.host_stats(), (0, 0), "no host tier");
-    assert!(planner.movable_parked_room(head, 3, 2), "the parked chunks are movable");
     planner.poke();
     for _ in 0..400 {
         crate::rt::yield_now().await;
@@ -3761,29 +3765,29 @@ async fn a_parked_process_waiting_to_be_resident_is_restored() {
     );
 }
 
-/// Mac Pro's M5 shape C: a restore short of role room gave up with its
-/// need marked understated, was queued again as its process waited to be
-/// resident, and, the mark still set, skipped the free runs that stood once
-/// every resident had gone: 1861 chunks free, nothing resident, the head
-/// never tried again. A restore that gives up is parked with what it
-/// learned of the room cleared.
+/// Mac Pro's M5 shape C: a restore short of role room left the queue with
+/// its need marked understated, was queued again as its process waited to
+/// be resident, and, the mark still set, skipped the free runs that stood
+/// once every resident had gone. A restore short of room that fits waits on
+/// (no answer of nothing refuses it); one past the whole device pool is
+/// refused and parked with what it learned of the room cleared.
 #[tokio::test(flavor = "current_thread")]
-async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
+async fn a_restore_refused_past_the_pool_forgets_what_it_learned_of_the_room() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
     let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let pid = ProcessId::new_v4();
     planner.register(pid);
     planner.note_admitted(pid);
-    let need = super::proc::PendingBind {
+    let need = |pieces| super::proc::PendingBind {
         run: 3,
-        pieces: 2,
-        pages: 6,
+        pieces,
+        pages: 3 * pieces,
     };
     let key = planner.with_inner(|inner| {
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
-        proc.roles_short = Some(need);
+        proc.roles_short = Some(need(2));
         proc.roles_free_retry = Some((3, 2));
         proc.roles_free_short = Some((3, 2));
         inner.enqueue(
@@ -3793,10 +3797,16 @@ async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
             },
         )
     });
-    // Alone, short, and the policy freed nothing: it gives up.
+    // Alone, short, and the policy freed nothing: two runs of three fit
+    // eight chunks, so it waits on.
     planner.note_short(key, 6 << 20, 0);
     crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
-    assert!(planner.restore_expired(pid).is_some(), "alone and short, it gives up");
+    assert!(planner.restore_never_fits(pid).is_none(), "it fits alone: it waits");
+    assert!(planner.with_inner(|inner| inner.queue.contains_key(&key)), "still queued");
+    // Three runs of three never fit eight chunks: refused, parked.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().roles_short = Some(need(3)));
+    let refused = planner.restore_never_fits(pid).expect("past the pool: refused");
+    assert!(matches!(refused, PlannerError::PastDevice { need: 9, total: 8, .. }), "{refused}");
     planner.with_inner(|inner| {
         let proc = &inner.procs[&pid];
         assert!(proc.parked.is_some(), "parked");
@@ -3961,9 +3971,11 @@ async fn a_bind_suspended_restore_goes_on_runs_beside_its_own_with_no_room_given
 /// room that can move, the restore keeps waiting and the planner moves a
 /// resident for it (the M1 stress: refused at the first wedge, a beam
 /// failed with room the next eviction gave it). With nothing else on the
-/// device to move, it is refused by name.
+/// device to move it still waits (room given back, an arrival's completion
+/// or the policy may come); only a need past the whole pool is refused, by
+/// name.
 #[tokio::test(flavor = "current_thread")]
-async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_alone() {
+async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_pool() {
     // Alone: it raises the policy's global answer, which wakes other tests'
     // gates.
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
@@ -3995,9 +4007,10 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_alone() {
     planner.note_short(key, 3 << 20, 0);
     crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
     assert!(
-        planner.short_expired(key).is_none(),
+        planner.never_fits(key).is_none(),
         "a resident can move: the restore waits on"
     );
+    planner.poke();
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -4009,21 +4022,23 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_alone() {
         "the resident is moved for it"
     );
 
-    // Alone on the device: nothing else to move, refused by name.
+    // Alone on the device, nothing else to move: a need that fits waits on.
     planner.unregister(resident);
     planner.with_inner(|inner| {
         inner.evicting.clear();
     });
     crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
-    let refused = planner
-        .short_expired(key)
-        .expect("alone, it does not fit: refused");
-    assert!(
-        refused
-            .to_string()
-            .contains("does not fit with every other process moved"),
-        "{refused}"
-    );
+    assert!(planner.never_fits(key).is_none(), "alone and fitting: it waits");
+    // Past the whole pool (three runs of three in eight chunks): refused.
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&restoring).unwrap().roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 3,
+            pages: 9,
+        });
+    });
+    let refused = planner.never_fits(key).expect("past the pool: refused");
+    assert!(refused.to_string().contains("past the whole 8-page device pool"), "{refused}");
 }
 
 /// The M1 stress on the funding commit: a restore head held while another
@@ -4077,9 +4092,10 @@ async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
 
 /// A short head with nothing resident and parked state on the device that a
 /// move down a tier would clear for its runs is no refusal: it waits while
-/// the move funds it. A need no move could stand is refused by name.
+/// the move funds it, and so does one no move funds now. Only a need past
+/// the whole pool is refused by name.
 #[tokio::test(flavor = "current_thread")]
-async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past_it() {
+async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past_the_pool() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
     let model = crate::store::registry::register_model(16, &[8], &[4]);
     let pool = Arc::new(BindRoomPool {
@@ -4113,27 +4129,208 @@ async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past
             },
         )
     });
-    assert!(
-        !planner.with_inner(|inner| inner.others_hold_room(Some(head))),
-        "no one else holds room it could move"
-    );
     planner.note_short(key, 3 << 20, 0);
     crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
     assert!(
-        planner.short_expired(key).is_none(),
+        planner.never_fits(key).is_none(),
         "parked state moving down stands its run: it waits"
     );
+    // Nothing below to take the parked state: no move funds it now, and it
+    // waits all the same.
+    pool.disk_free.store(0, Ordering::Relaxed);
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    assert!(planner.never_fits(key).is_none(), "fits alone: it waits");
     planner.with_inner(|inner| inner.procs.get_mut(&head).unwrap().roles_short = Some(need(3)));
     crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
     let refused = planner
-        .short_expired(key)
+        .never_fits(key)
         .expect("three runs of three fit no eight chunks: refused");
     assert!(
-        refused
-            .to_string()
-            .contains("does not fit with every other process moved"),
+        refused.to_string().contains("even with every other process moved"),
         "{refused}"
     );
+}
+
+/// The ruling "wait with no deadline": twelve requests whose first frames
+/// together ask three times the pool, all at once, beside a policy that
+/// answers every shortfall with nothing freed (Mac's budgeted mix: 64
+/// requests each refused at its first frame, "device memory short ... for
+/// 246µs"). Every one is served as those before it complete; none is
+/// refused.
+#[tokio::test(flavor = "current_thread")]
+async fn requests_past_the_pool_together_are_all_served_none_refused() {
+    use crate::policy::pressure::{Tier, answered_nothing};
+    // Alone: it raises the policy's global answer.
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    const REQUESTS: usize = 12;
+    const PAGES: u32 = 4;
+    let pool = Arc::new(RacePool::new(16));
+    pool.free.lock().extend((0..16).map(PhysicalKvPageId));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let mut tasks = Vec::new();
+    for _ in 0..REQUESTS {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let p = planner.clone();
+        tasks.push(crate::rt::spawn(async move {
+            let demand = Demand {
+                kv_pages: PAGES,
+                rs: RsUnits::default(),
+            };
+            let served = match p.acquire(pid, pid, demand).await {
+                Ok(Acquired::Granted(grant)) => {
+                    // Its fires run, then it completes: its pages go back.
+                    for _ in 0..3 {
+                        crate::rt::yield_now().await;
+                    }
+                    drop(grant);
+                    Ok(())
+                }
+                Ok(_) => Err("a resident request was not granted".to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            p.unregister(pid);
+            p.pages_freed();
+            served
+        }));
+    }
+    for _ in 0..5000 {
+        if tasks.iter().all(|task| task.is_finished()) {
+            break;
+        }
+        answered_nothing(Tier::Device);
+        crate::rt::yield_now().await;
+    }
+    let done = tasks.iter().filter(|task| task.is_finished()).count();
+    assert_eq!(done, REQUESTS, "{done} of {REQUESTS} ended");
+    for task in tasks {
+        task.await.expect("the task").expect("served, never refused");
+    }
+    assert_eq!(pool.free.lock().len(), 16, "every page back");
+}
+
+/// Only a need that could never fit alone is refused, by name and at once:
+/// a first frame past the whole pool, a bind whose runs are past it, and a
+/// restore whose kv and runs together are past it. A need of the whole
+/// pool is no refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
+    use futures::FutureExt;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::new(16));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let demand = |kv_pages| Demand {
+        kv_pages,
+        rs: RsUnits::default(),
+    };
+    let refused = planner
+        .acquire(pid, pid, demand(17))
+        .now_or_never()
+        .expect("refused at once, no wait");
+    assert!(
+        matches!(refused, Err(PlannerError::Impossible { need: 17, total: 16 })),
+        "{:?}",
+        refused.err()
+    );
+    pool.free.lock().extend((0..16).map(PhysicalKvPageId));
+    assert!(
+        matches!(
+            planner.acquire(pid, pid, demand(16)).now_or_never(),
+            Some(Ok(Acquired::Granted(_)))
+        ),
+        "the whole pool fits alone: it is served"
+    );
+
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let refused = planner
+        .wait_bind_room(pid, 3, 3)
+        .now_or_never()
+        .expect("refused at once, no wait");
+    match refused {
+        Err(error @ PlannerError::PastDevice { need: 9, total: 8, runs: Some((3, 3)) }) => {
+            assert!(error.to_string().contains("3 runs of 3 adjacent chunks"), "{error}");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert!(
+        planner.wait_bind_room(pid, 4, 2).now_or_never().is_none(),
+        "two runs of four fit eight chunks: it waits"
+    );
+    let other = ProcessId::new_v4();
+    planner.register(other);
+    planner.note_admitted(other);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&other).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 2,
+            pages: 6,
+        });
+        inner.enqueue(
+            other,
+            WaitKind::Restore {
+                demand: demand(3),
+            },
+        );
+    });
+    let refused = planner
+        .wait_resident(other)
+        .now_or_never()
+        .expect("refused at once, no wait");
+    assert!(
+        matches!(refused, Err(PlannerError::PastDevice { need: 9, total: 8, .. })),
+        "its kv beside its runs is past the pool: {refused:?}"
+    );
+}
+
+/// A head short only by fragmentation (free chunks enough, no run of its
+/// need among them: "0 such runs were free (16 free chunks)") waits however
+/// the policy answers; the chunk map names the resident whose chunks make
+/// its run, the planner moves it, and once its park lands the head is
+/// served.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_short_only_by_fragmentation_waits_and_is_served_once_eviction_makes_a_run() {
+    use crate::policy::pressure::{Tier, answered_nothing};
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Four chunks free, no two adjacent; the resident holds the rest.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    *pool.occupant.lock() = Some(resident);
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..400 {
+        answered_nothing(Tier::Device);
+        crate::rt::yield_now().await;
+    }
+    assert!(!bind.is_finished(), "short by fragmentation only: it waits");
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the resident whose chunks make its run is moved for it"
+    );
+    // Its park lands: its chunks are back, a run with them.
+    *pool.occupant.lock() = None;
+    pool.free.lock().extend([1, 3, 5, 7]);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    let served = tokio::time::timeout(Duration::from_secs(5), bind)
+        .await
+        .expect("the wait ends")
+        .expect("the task");
+    assert!(matches!(served, Ok(BindRoomWait::Served)), "{served:?}");
 }
 
 /// Mac Pro's M5 soak on f9afad90a (4 of 5 over-demand runs stalled,
@@ -4426,10 +4623,15 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
 /// beyond what its refusal saw), or a compaction could stand them, some
 /// plan step made progress (the head sent or served, a compaction asked,
 /// a resident moved); and a quiescent planner stays still (no step
-/// repeats with nothing coming). Failing seeds are printed to replay.
+/// repeats with nothing coming). And at every step, beside policy answers
+/// of nothing freed, no waiter is refused unless its need could never fit
+/// the pool alone (none here can't): no allocation's outcome is an error,
+/// and the head's bind or restore gate ends only served. Failing seeds are
+/// printed to replay.
 #[tokio::test(flavor = "current_thread")]
 async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    // Alone: it raises the policy's global answer.
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -4521,6 +4723,34 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             let p = planner.clone();
             crate::rt::spawn(async move { p.wait_bind_room(head, run, pieces).await })
         });
+        // The restore's gate, as its process waits to be resident.
+        let gate = is_restore.then(|| {
+            let p = planner.clone();
+            crate::rt::spawn(async move { p.wait_resident(head).await })
+        });
+        // No waiter is refused unless its need could never fit the pool
+        // alone (none here: every need is at most six chunks of eight or
+        // more): no bind or gate ends in an error, and no allocation's
+        // outcome is one.
+        let refused = |planner: &Arc<ResidencyPlanner>| -> Option<String> {
+            planner.with_inner(|inner| {
+                inner.queue.values().find_map(|waiter| match &waiter.kind {
+                    // The starvation endgame (a stuck holder restarted or
+                    // failed, no wait's give-up) meets a pool this one
+                    // cannot stand for: it counts free chunks as free pages
+                    // it never hands out (`reserve_device` is `None`).
+                    WaitKind::Allocation {
+                        outcome: Some(Err(PlannerError::Starved { .. })),
+                        ..
+                    } => None,
+                    WaitKind::Allocation {
+                        outcome: Some(Err(error)),
+                        ..
+                    } => Some(format!("an allocation refused: {error}")),
+                    _ => None,
+                })
+            })
+        };
         let progress = |planner: &Arc<ResidencyPlanner>, pool: &BindRoomPool| {
             planner.stats.restores.load(Ordering::Relaxed)
                 + planner.stats.evictions_started.load(Ordering::Relaxed)
@@ -4613,6 +4843,28 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             for _ in 0..200 {
                 crate::rt::yield_now().await;
             }
+            if let Some(why) = refused(&planner) {
+                failures.push(format!(
+                    "seed {seed} step {step}: {why}\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Policy answers of nothing freed refuse no one either.
+            crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+            crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Host);
+            for _ in 0..20 {
+                crate::rt::yield_now().await;
+            }
+            if gate.as_ref().is_some_and(|gate| gate.is_finished())
+                && planner.stats.restores.load(Ordering::Relaxed) == 0
+            {
+                failures.push(format!(
+                    "seed {seed} step {step}: the restore's gate ended unserved\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
             let served_bind = bind.as_ref().is_some_and(|bind| bind.is_finished());
             let made = progress(&planner, &pool) + u64::from(served_bind);
             let head_served = planner.stats.restores.load(Ordering::Relaxed) > 0 || served_bind;
@@ -4668,8 +4920,24 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 break;
             }
         }
+        // A bind or gate that ended did so served, never refused.
         if let Some(bind) = bind {
-            bind.abort();
+            if bind.is_finished() {
+                if let Ok(Err(error)) = bind.await {
+                    failures.push(format!("seed {seed}: the head's bind was refused: {error}"));
+                }
+            } else {
+                bind.abort();
+            }
+        }
+        if let Some(gate) = gate {
+            if gate.is_finished() {
+                if let Ok(Err(error)) = gate.await {
+                    failures.push(format!("seed {seed}: the head's restore was refused: {error}"));
+                }
+            } else {
+                gate.abort();
+            }
         }
         if failures.len() > 20 {
             break;

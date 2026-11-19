@@ -2859,8 +2859,9 @@ pub(crate) fn stamp_lane_slots(
     Ok(())
 }
 
-/// Also how long a planner waiter stands short of room only the policy can
-/// make before it fails.
+/// How long a process's fire may go without progress before the planner
+/// counts it lapsed and plans again (its `FIRE_PROGRESS`); no waiter fails
+/// on it.
 pub(crate) const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn seat_lane_slots(

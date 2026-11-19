@@ -236,6 +236,18 @@ impl ResidencyPlanner {
             },
             None => None,
         });
+        // Kv the head lacks, with parked state lying on the device (role
+        // slots its park found no room below for, as on a home with no host
+        // tier): that state moves down a tier first, no one running on it.
+        // Left there, a first frame short of kv waited behind chunks only a
+        // move of parked state could empty.
+        if shape.is_none()
+            && victims.deficit.pages > 0
+            && self.park_down_for_pages(victims.head_pid, victims.deficit.pages)
+        {
+            self.note_short(victims.head, 0, 0);
+            return;
+        }
         let candidates = victims.preferred();
         let residents: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
         // Parked state lying on the device is an occupant too: a chunk it

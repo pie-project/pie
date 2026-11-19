@@ -174,7 +174,7 @@ impl ResidencyPlanner {
     /// The head is short of room only the policy can make, and there is
     /// something the policy could let go: idle cache, a checkpoint, or a
     /// handle at rest on the device. A starved fleet then waits on the
-    /// policy, up to the head's deadline, instead of restarting anyone.
+    /// policy instead of restarting anyone.
     pub(super) fn waits_on_policy(&self) -> bool {
         let Some((head, resting)) = self.with_inner(|inner| {
             let (head, _) = inner.unmet_head()?;
@@ -186,11 +186,11 @@ impl ResidencyPlanner {
         }) else {
             return false;
         };
-        if self.short.lock().since(head.1).is_none() {
+        if !self.short.lock().is_short(head.1) {
             return false;
         }
         // The host is what is short: the policy frees it by letting a set at
-        // rest go, and the head fails at its deadline if none does.
+        // rest go, and the head waits until one does.
         if self.short.lock().host_short(head.1) {
             return true;
         }
@@ -249,68 +249,37 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The error waiter `key` fails with when it has stood short of what
-    /// only the policy can free past the seat deadline, rather than wait on.
-    pub(super) fn short_expired(self: &Arc<Self>, key: EntryKey) -> Option<super::PlannerError> {
-        let (waited, host, answered) = {
-            let short = self.short.lock();
-            (
-                short.since(key.1)?.elapsed(),
-                short.host_short(key.1),
-                short.answered_nothing(key.1),
-            )
-        };
-        // The event, not a clock: the policy answered its pressure and
-        // freed nothing.
-        if !answered {
-            return None;
-        }
-        // Short of device room while processes still run, it is behind
-        // them, not starved: their completions give the room back, so its
-        // deadline runs again from now, and only a fleet standing still (or
-        // a host short of room) fails it. Failed so, a gpt-oss prompt behind
-        // 24 running 31k-token passes was refused room their completions
-        // would have given it.
-        if !host && !self.is_wedged() {
-            self.short.lock().restart(key.1);
-            return None;
-        }
-        // The fleet stands still and the policy freed nothing: over-demand
-        // is served, slower, never failed. While another process holds room
-        // that can move, the planner moves it by its victim choice (the
-        // policy's, where one is attached) and the wait goes on; only a
-        // need that does not fit with every other process moved fails, by
-        // name. Failed at the first wedge, a restore or an allocation was
-        // refused on the M1 stress room that the next eviction gave it.
-        // Parked state lying on the device moves down a tier for it too
-        // ([`Self::movable_parked_room`]): a head short of runs of whole
-        // chunks those moves would stand is no refusal either.
-        let (others, runs) = self.with_inner(|inner| {
-            let waiter = inner.queue.get(&key).map(|waiter| waiter.pid);
-            let runs = inner.queue.get(&key).and_then(|waiter| match waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => Some((waiter.pid, run, pieces)),
-                _ => inner.procs.get(&waiter.pid).and_then(|proc| {
+    /// The error waiter `key` is refused with where its need could never
+    /// fit the device pool, even with nothing else resident: its kv pages
+    /// and the pages that free the runs of whole chunks it asks (a bind's,
+    /// or a restore's for its roles or the bind that suspended it), together
+    /// past the pool's total ([`super::PlannerError::PastDevice`]). `None`
+    /// for every other need, however short and for however long: it waits
+    /// (its owner parked) while the planner suspends and evicts by its
+    /// victim choice and the chunk map, and room given back, an eviction
+    /// landed or a completion wakes it. Over-demand is served slower, never
+    /// failed; no clock and no answer of the policy refuses a need that fits.
+    pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
+        let (_, total) = self.port.device_stats();
+        let (need, runs) = self.with_inner(|inner| {
+            let waiter = inner.queue.get(&key)?;
+            let runs = match waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some((run, pieces)),
+                WaitKind::Restore { .. } => inner.procs.get(&waiter.pid).and_then(|proc| {
                     proc.roles_short
-                        .or(proc.bind_room)
-                        .map(|need| (waiter.pid, need.run, need.pieces))
+                        .into_iter()
+                        .chain(proc.bind_room)
+                        .max_by_key(|need| need.pages)
+                        .map(|need| (need.run, need.pieces))
                 }),
-            });
-            (inner.others_hold_room(waiter), runs)
-        });
-        let parked_moves = runs
-            .is_some_and(|(head, run, pieces)| self.movable_parked_room(head, run, pieces));
-        if !host && (others || parked_moves) {
-            self.short.lock().restart(key.1);
-            self.poke();
-            return None;
-        }
-        let short = self.short.lock();
-        let (tier, bytes) = short.worst(key.1)?;
-        Some(super::PlannerError::Short {
-            tier,
-            bytes,
-            waited,
-        })
+                WaitKind::Allocation { .. } => None,
+            };
+            Some((
+                waiter.kv_need().saturating_add(inner.room_pages(waiter)),
+                runs,
+            ))
+        })?;
+        (need > total).then_some(super::PlannerError::PastDevice { need, total, runs })
     }
 
     /// With `PoolFacts::seat_to_end`, a process starts only while the pools
@@ -479,23 +448,29 @@ impl ResidencyPlanner {
         }
     }
 
-    /// Whether `pieces` runs of `run` adjacent chunks stand on the device
-    /// once the parked state lying there, `head`'s own left out, has moved
-    /// down a tier: free chunks, and chunks only such state holds, with
-    /// room below to take it (the host's, or the disk's that host kv going
-    /// on down makes for it). What a "does not fit even with everything
-    /// else moved" verdict counts as movable beside the residents
-    /// ([`super::pool::ChunkMap::merge`] the two maps for runs both empty):
-    /// a head is refused only where this is false too.
-    pub fn movable_parked_room(&self, head: ProcessId, run: u32, pieces: u32) -> bool {
-        match self.port.parked_occupants(head).cheapest_runs(run, pieces) {
-            Some(pids) if pids.is_empty() => true,
-            Some(_) => {
-                self.port.suspend_capable()
-                    && !self.park_down_failed.load(Ordering::Acquire)
-                    && (self.port.host_stats().0 > 0 || self.port.disk_stats().0 > 0)
-            }
-            None => false,
+    /// Moves the parked state lying on the device down a tier for `head`
+    /// short of `pages` kv pages ([`Self::park_down`]): the occupants of
+    /// the cheapest chunks that, emptied, hold them, as many of those as
+    /// stand (a part funds a part; residents move for the rest). No one
+    /// runs on parked state, so it goes before any resident does, as for a
+    /// head short of runs. Whether a move is on its way.
+    pub(super) fn park_down_for_pages(self: &Arc<Self>, head: ProcessId, pages: u32) -> bool {
+        let per_chunk = self.port.chunks_as_pages(1);
+        if pages == 0 || per_chunk == 0 {
+            return false;
+        }
+        let mut map = self.port.parked_occupants(head);
+        let emptiable = map.held.iter().filter(|chunk| chunk.emptiable()).count() as u32;
+        let chunks = pages.div_ceil(per_chunk).min(emptiable);
+        if chunks == 0 {
+            return false;
+        }
+        // Chunks free already gave the head what they hold (it absorbed the
+        // free pages first): only emptied ones are new room.
+        map.free.clear();
+        match map.cheapest_runs(1, chunks) {
+            Some(pids) if !pids.is_empty() => self.park_down(head, pids),
+            _ => false,
         }
     }
 

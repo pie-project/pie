@@ -471,19 +471,6 @@ impl Inner {
         }
     }
 
-    /// Whether a process other than `waiter` holds device room the planner
-    /// can still move: resident (a victim), or on its way in or out.
-    pub(super) fn others_hold_room(&self, waiter: Option<ProcessId>) -> bool {
-        self.procs.iter().any(|(pid, proc)| {
-            Some(*pid) != waiter
-                && match proc.state {
-                    Residency::Resident => proc.admitted,
-                    Residency::Evicting | Residency::Restoring => true,
-                    Residency::Evicted => false,
-                }
-        })
-    }
-
     /// Nothing in flight can free room: no fire submitted and not landed,
     /// no eviction, restore or kill under way. What the others wait on
     /// (grants, binds, gates, anything not yet named) does not matter:

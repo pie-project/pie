@@ -79,13 +79,15 @@ pub enum PlannerError {
         held: RsUnits,
         total: RsUnits,
     },
-    /// Parked short of room only the policy can make (`tier-pressure`), and
-    /// none came by the seat deadline: no discard, no new retention keys,
-    /// no growth.
-    Short {
-        tier: crate::policy::pressure::Tier,
-        bytes: u64,
-        waited: std::time::Duration,
+    /// A waiter whose need could never fit the device pool, even with
+    /// nothing else resident: its kv pages and the pages that free the runs
+    /// of whole chunks it asks (`runs`, as `(run, pieces)`), together past
+    /// the pool's `total` pages. Refused by name at once; every need short
+    /// of this waits, however long, while the planner makes room.
+    PastDevice {
+        need: u32,
+        total: u32,
+        runs: Option<(u32, u32)>,
     },
     Cancelled,
 }
@@ -159,27 +161,20 @@ impl std::fmt::Display for PlannerError {
                 "recurrent pools exhausted by this process alone: it holds {held} and asks \
                  {need} more of {total}, and no move of others can cover it"
             ),
-            PlannerError::Short {
-                tier: crate::policy::pressure::Tier::Host,
-                bytes,
-                waited,
-            } => write!(
-                f,
-                "quota: the host tier is full ([engine.memory] budget_host): short by {bytes} \
-                 bytes for {waited:?} of room to park state, and no policy let a set at rest \
-                 go; close a set at rest or raise budget_host"
-            ),
-            PlannerError::Short {
-                tier,
-                bytes,
-                waited,
-            } => write!(
-                f,
-                "{} memory short by {bytes} bytes for {waited:?}: it does not fit with every \
-                 other process moved off the device, the runtime drops no state on its own, \
-                 and no policy discard, retention change or memory growth made room",
-                tier.name()
-            ),
+            PlannerError::PastDevice { need, total, runs } => {
+                write!(
+                    f,
+                    "device memory can never hold this need: {need} pages"
+                )?;
+                if let Some((run, pieces)) = runs {
+                    write!(f, " (its kv, and {pieces} runs of {run} adjacent chunks)")?;
+                }
+                write!(
+                    f,
+                    " past the whole {total}-page device pool, even with every other process \
+                     moved off it — raise [engine.memory] budget_device or ask for less"
+                )
+            }
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
     }
