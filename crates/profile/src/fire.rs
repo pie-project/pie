@@ -400,7 +400,7 @@ mod tests {
             ]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
             hbm_gbps: Some(654.4),
-            cached_gbps: None,
+            cached_gbps: Some(28800.0),
             elementwise_gbps: Some(450.0),
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
@@ -412,6 +412,7 @@ mod tests {
         assert_eq!(
             rates.only(&KEYS[..6]).missing(&KEYS),
             [
+                "scan_gelems",
                 "few_row_tflops",
                 "workgroups_per_core",
                 "tile_tflops_by_rows",
@@ -423,7 +424,7 @@ mod tests {
             "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
-             elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
+             cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
         );
     }

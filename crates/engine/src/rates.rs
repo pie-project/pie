@@ -1370,7 +1370,7 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
             hbm_gbps: Some(700.0),
-            cached_gbps: None,
+            cached_gbps: Some(20000.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
@@ -1877,7 +1877,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.contains(
-                "measured no [\"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
             ),
             "{err}"
         );
@@ -1945,7 +1945,6 @@ mod tests {
         );
         let nan = profile::fire::Rates {
             hbm_gbps: Some(f64::NAN),
-            cached_gbps: None,
             ..all()
         };
         assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
