@@ -146,7 +146,9 @@ pub struct Plane {
     /// shared by every bind after: a round that binds the program afresh
     /// makes none.
     #[cfg(feature = "vulkan")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
+    /// Each program's stages' step uniforms at each extents it binds at:
+    /// a node's area lies where those extents lay it.
+    step_args: BTreeMap<(ProgramId, [u32; 5]), Vec<crate::guest::session::StepArgs>>,
 
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
@@ -186,7 +188,7 @@ impl Plane {
         })?;
         self.forms.forget(id);
         #[cfg(feature = "vulkan")]
-        self.step_args.remove(&id);
+        self.step_args.retain(|(program, _), _| *program != id);
         Ok(())
     }
 
@@ -1182,16 +1184,32 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
+        let key = (
+            binding.program,
+            [
+                extents.row_count,
+                extents.token_count,
+                extents.sampled_rows,
+                extents.query_len,
+                extents.key_len,
+            ],
+        );
+        let args = match self.step_args.get(&key) {
             Some(args) => args.clone(),
             None => {
-                let args = compiled
-                    .all()
+                let args = plan
+                    .package
+                    .plans
                     .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
+                    .zip(compiled.all())
+                    .map(|(stage, lowered)| {
+                        let tables = eta_exec::tables::stage_tables(stage, &extents)?;
+                        crate::guest::session::StepArgs::of(device, lowered, &tables.areas)
+                            .map_err(|why| why.to_string())
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()
                     .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
+                self.step_args.insert(key, args.clone());
                 args
             }
         };

@@ -24,13 +24,15 @@ pub fn step_stride(align: u64) -> u64 {
     u64::from(wgsl::STEP_BYTES).max(align).next_power_of_two()
 }
 
-/// A stage's step uniforms, `stride` apart, in dispatch order.
+/// A stage's step uniforms, `stride` apart, in dispatch order, each with
+/// its node's area of `areas` (`StageTables::areas`).
 #[must_use]
-pub fn step_uniforms(steps: &[wgsl::Step], stride: u64) -> Vec<u8> {
+pub fn step_uniforms(steps: &[wgsl::Step], areas: &[u32], stride: u64) -> Vec<u8> {
     let stride = usize::try_from(stride).expect("a step stride fits the host");
     let mut bytes = vec![0u8; steps.len().max(1) * stride];
     for (at, step) in steps.iter().enumerate() {
-        let uniform = step.uniform().bytes();
+        let area = areas.get(step.node as usize).copied().unwrap_or(0);
+        let uniform = step.uniform(area).bytes();
         bytes[at * stride..at * stride + uniform.len()].copy_from_slice(&uniform);
     }
     bytes

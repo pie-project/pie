@@ -198,6 +198,9 @@ pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
 pub struct StageTables {
     pub descriptors: Vec<ValueDesc>,
     pub offsets: Vec<u64>,
+    /// Each op's temporary area's first word in the heap, 0 where it keeps
+    /// none: what its steps' uniforms carry (`StepUniform::area`).
+    pub areas: Vec<u32>,
     pub scratch: u64,
     pub tables: [Vec<u8>; 4],
 }
@@ -258,6 +261,10 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
         .chain(&areas)
         .map(|&at| word("value offset", at))
         .collect::<Result<_, _>>()?;
+    let area_words: Vec<u32> = areas
+        .iter()
+        .map(|&at| word("area word", at / 4))
+        .collect::<Result<_, _>>()?;
     // The heap the stage binds, which its runtime bounds every access by.
     let heap = scratch.total.max(256);
     let config = Cfg {
@@ -276,6 +283,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             sized(config.to_le_bytes(), 3)?,
         ],
         offsets: scratch.values,
+        areas: area_words,
         scratch: heap,
     })
 }

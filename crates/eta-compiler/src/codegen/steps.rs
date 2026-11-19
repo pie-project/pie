@@ -24,10 +24,11 @@ pub const SORT_ROUNDS: u32 = 28;
 /// The bytes of a step's uniform ([`StepUniform`]), a uniform's sixteen.
 pub const STEP_BYTES: u32 = 16;
 
-/// Where a step's uniform holds its node, rung and selector.
+/// Where a step's uniform holds its node, rung, selector and area.
 pub const NODE_AT: u32 = 0;
 pub const RUNG_AT: u32 = 4;
 pub const SELECTOR_AT: u32 = 8;
+pub const AREA_AT: u32 = 12;
 
 /// What a step's call reads: the node it runs (its op's params), the rung
 /// of the node's ladder (a reduce's level, a sort's round, a select's
@@ -39,12 +40,16 @@ pub struct StepUniform {
     pub node: u32,
     pub rung: u32,
     pub selector: u32,
+    /// The word its node's temporary area begins at in the stage's heap, as
+    /// a bind lays it (`eta_exec::tables::StageTables::areas`); 0 where the
+    /// node keeps none.
+    pub area: u32,
 }
 
 impl StepUniform {
-    /// The uniform's bytes: node, rung, selector, little-endian u32s at
-    /// [`NODE_AT`], [`RUNG_AT`] and [`SELECTOR_AT`], padded to
-    /// [`STEP_BYTES`].
+    /// The uniform's bytes: node, rung, selector and area, little-endian
+    /// u32s at [`NODE_AT`], [`RUNG_AT`], [`SELECTOR_AT`] and [`AREA_AT`],
+    /// [`STEP_BYTES`] in all.
     #[must_use]
     pub fn bytes(self) -> [u8; STEP_BYTES as usize] {
         let mut out = [0u8; STEP_BYTES as usize];
@@ -52,6 +57,7 @@ impl StepUniform {
             (NODE_AT, self.node),
             (RUNG_AT, self.rung),
             (SELECTOR_AT, self.selector),
+            (AREA_AT, self.area),
         ] {
             let at = at as usize;
             out[at..at + 4].copy_from_slice(&word.to_le_bytes());
@@ -484,14 +490,17 @@ mod tests {
             node: 7,
             rung: 3,
             selector: 2,
+            area: 9,
         }
         .bytes();
         let word = |at: u32| {
             let at = at as usize;
             u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
         };
-        assert_eq!((word(NODE_AT), word(RUNG_AT), word(SELECTOR_AT)), (7, 3, 2));
-        assert_eq!(word(12), 0, "the pad is zero");
+        assert_eq!(
+            (word(NODE_AT), word(RUNG_AT), word(SELECTOR_AT), word(AREA_AT)),
+            (7, 3, 2, 9)
+        );
     }
 
     #[test]

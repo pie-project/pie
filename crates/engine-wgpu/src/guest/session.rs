@@ -109,7 +109,7 @@ pub fn instance_table_sizes(
         .zip(code)
         .flat_map(|(plan, lowered)| {
             let mut stage = eta_exec::tables::table_sizes(plan).to_vec();
-            stage.push(step_uniforms(&lowered.steps, stride).len() as u64);
+            stage.push(step_uniforms(&lowered.steps, &[], stride).len() as u64);
             stage
         })
         .collect();
@@ -483,7 +483,7 @@ impl Session {
             .zip(code)
             .flat_map(|(stage, lowered)| {
                 let mut tables = stage.tables.to_vec();
-                tables.push(step_uniforms(&lowered.steps, stride));
+                tables.push(step_uniforms(&lowered.steps, &stage.areas, stride));
                 tables
             })
             .collect();

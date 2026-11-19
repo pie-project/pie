@@ -1196,7 +1196,8 @@ fn staging_fits(core: &Core, resolved: &[StageTables]) -> Result<()> {
 }
 
 /// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
-/// program's steps fix, so every bind of the program shares one.
+/// program's steps and the areas its tables lay at a bind's extents fix,
+/// so every bind of the program at those extents shares one.
 #[derive(Clone)]
 pub struct StepArgs {
     buffer: Buffer,
@@ -1204,9 +1205,13 @@ pub struct StepArgs {
 }
 
 impl StepArgs {
-    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
+    pub fn of(
+        device: &Context,
+        lowered: &engine_gpu::guest::Lowered,
+        areas: &[u32],
+    ) -> Result<StepArgs> {
         let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
-        let uniforms = step_uniforms(&lowered.steps, stride);
+        let uniforms = step_uniforms(&lowered.steps, areas, stride);
         let mut buffer = Buffer::with(
             device,
             uniforms.len() as u64,

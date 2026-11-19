@@ -365,11 +365,14 @@ pub struct Step {
 impl Step {
     /// What the step's uniform holds.
     #[must_use]
-    pub fn uniform(&self) -> StepUniform {
+    /// The step's uniform, its node's temporary area at word `area` of the
+    /// stage's heap as the bind lays it.
+    pub fn uniform(&self, area: u32) -> StepUniform {
         StepUniform {
             node: self.node,
             rung: self.rung,
             selector: self.selector,
+            area,
         }
     }
 }
@@ -394,7 +397,10 @@ pub struct Stepwise {
 /// stage's one area at `cfg.temporary`.
 /// 5: a reshape that covers its source is read as its source whatever the
 /// stage's channel slots number, and launches nothing.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 5;
+/// 6: a step finds its node's area in its uniform (`pie_step.area`), not
+/// by a load from the offsets table; a module that spells its steps reads
+/// the table (`node_area`).
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -404,6 +410,7 @@ pub const STEP_BINDING: u32 = 6;
 const NODE: &str = "pie_step.node";
 const RUNG: &str = "pie_step.rung";
 const SELECTOR: &str = "pie_step.selector";
+const AREA: &str = "pie_step.area";
 
 /// The ops this backend steps: every one it emits but a boundary op.
 fn stepped(tag: u8) -> bool {
@@ -486,7 +493,8 @@ fn call_text(call: Call) -> String {
             | Call::PivotPack { guarded: true }
     );
     // A call that may keep something in a temporary area finds its node's
-    // first (`node_area`); a plain op's named call keeps none.
+    // first in the step's uniform, as uniform as the node; a plain op's
+    // named call keeps none.
     let plain = named
         && matches!(
             call,
@@ -512,7 +520,7 @@ fn call_text(call: Call) -> String {
     let area = if plain {
         String::new()
     } else {
-        alloc::format!("  tmp_base = node_area({p});\n")
+        alloc::format!("  tmp_base = {AREA};\n")
     };
     if guarded {
         // The ladder runs only for a row the select handed over.
@@ -539,9 +547,9 @@ pub fn step_module(entry: &str, call: &str) -> String {
     let mut source = String::with_capacity(RUNTIME.len() + 1024);
     source.push_str(RUNTIME);
     source.push('\n');
-    // The words at `steps::NODE_AT`, `RUNG_AT` and `SELECTOR_AT`.
+    // The words at `steps::NODE_AT`, `RUNG_AT`, `SELECTOR_AT` and `AREA_AT`.
     source.push_str(
-        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n}\n",
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n}\n",
     );
     let _ = writeln!(
         source,
@@ -558,7 +566,8 @@ pub fn step_module(entry: &str, call: &str) -> String {
 #[must_use]
 pub fn spelled(call: &str, step: &Step) -> String {
     let flag = if step.selector != 0 { "true" } else { "false" };
-    call.replace(NODE, &alloc::format!("{}u", step.node))
+    call.replace(AREA, &alloc::format!("node_area({}u)", step.node))
+        .replace(NODE, &alloc::format!("{}u", step.node))
         .replace(&alloc::format!("{SELECTOR} != 0u"), flag)
         .replace(SELECTOR, &alloc::format!("{}u", step.selector))
         .replace(RUNG, &alloc::format!("{}u", step.rung))
