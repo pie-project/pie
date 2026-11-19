@@ -4574,3 +4574,162 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
         assert!(sent(&planner), "room given since: sent once more");
     }
 }
+
+/// The planner's liveness, as a property over seeded random states (the
+/// soaks' "free chunks and no run" stalls): a pool of random size and
+/// fragmentation, disk-only or with a host tier; a head that is a restore
+/// short of runs (plain, or understated at some count of runs) or a bind
+/// waiting for room; residents waiting on grants or idle; a compaction
+/// possible or not. At quiescence: where the head could be served from the
+/// map as it stands (its runs stand, and an understated restore's stand
+/// beyond what its refusal saw), or a compaction could stand them, some
+/// plan step made progress (the head sent or served, a compaction asked,
+/// a resident moved); and a quiescent planner stays still (no step
+/// repeats with nothing coming). Failing seeds are printed to replay.
+#[tokio::test(flavor = "current_thread")]
+async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let mut failures = Vec::new();
+    for seed in 0..2000u64 {
+        let mut rng = Rng(seed);
+        let total = 8 + rng.below(17) as u32;
+        let host = if rng.below(2) == 0 { 0 } else { 64 };
+        let pool = Arc::new(BindRoomPool {
+            model,
+            ..BindRoomPool::new(total, 0..0, host)
+        });
+        pool.disk_free.store(64, Ordering::Relaxed);
+        let free: Vec<u32> = (0..total).filter(|_| rng.below(100) < 45).collect();
+        pool.free.lock().extend(free);
+        pool.compactable
+            .store(rng.below(2) == 0, Ordering::Release);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        let run = 1 + rng.below(3) as u32;
+        let pieces = 1 + rng.below(2) as u32;
+        let runs_now = pool.guest_free_runs(run);
+        let is_restore = rng.below(3) != 0;
+        // An understated restore: refused while some count of runs stood,
+        // at, below or past what stands now.
+        let understated_at = (is_restore && rng.below(2) == 0)
+            .then(|| (runs_now + rng.below(3) as u32).saturating_sub(1).max(pieces));
+        let residents: Vec<ProcessId> = (0..rng.below(4)).map(|_| ProcessId::new_v4()).collect();
+        for &pid in &residents {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        let grants = rng.below(2) == 0;
+        planner.with_inner(|inner| {
+            if is_restore {
+                let proc = inner.procs.get_mut(&head).unwrap();
+                proc.state = Residency::Evicted;
+                proc.roles_short = Some(super::proc::PendingBind {
+                    run,
+                    pieces,
+                    pages: run * pieces,
+                });
+                if let Some(at) = understated_at {
+                    proc.roles_free_short = Some((run, pieces));
+                    proc.roles_free_short_at = at;
+                }
+                inner.enqueue(
+                    head,
+                    WaitKind::Restore {
+                        demand: Demand::default(),
+                    },
+                );
+            }
+            for &pid in &residents {
+                if grants {
+                    inner.enqueue(
+                        pid,
+                        WaitKind::Allocation {
+                            demand: Demand {
+                                kv_pages: 1,
+                                rs: RsUnits::default(),
+                            },
+                            notify: Arc::new(Notify::new()),
+                            outcome: None,
+                            yielded: false,
+                            rise: false,
+                        },
+                    );
+                } else {
+                    inner.procs.get_mut(&pid).unwrap().idle = true;
+                }
+            }
+        });
+        let bind = (!is_restore).then(|| {
+            let p = planner.clone();
+            crate::rt::spawn(async move { p.wait_bind_room(head, run, pieces).await })
+        });
+        let progress = |planner: &Arc<ResidencyPlanner>, pool: &BindRoomPool| {
+            planner.stats.restores.load(Ordering::Relaxed)
+                + planner.stats.evictions_started.load(Ordering::Relaxed)
+                + u64::from(pool.compactions.load(Ordering::Relaxed))
+                + u64::from(
+                    planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some()),
+                )
+        };
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+        let served_bind = bind.as_ref().is_some_and(|bind| bind.is_finished());
+        let made = progress(&planner, &pool) + u64::from(served_bind);
+        let stands = pool.guest_room_free(run, pieces);
+        let servable = stands
+            && understated_at.is_none_or(|at| pool.guest_free_runs(run) > at);
+        let compactable = !stands && pool.compactable.load(Ordering::Acquire);
+        if (servable || compactable) && made == 0 {
+            failures.push(format!(
+                "seed {seed}: total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
+                 understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
+                 servable={servable} compactable={compactable}: no progress",
+                residents.len()
+            ));
+        }
+        // Quiescent: nothing more happens without an event.
+        let before = (
+            progress(&planner, &pool),
+            planner.stats.compaction_waits.load(Ordering::Relaxed),
+            planner.stats.grow_waits.load(Ordering::Relaxed),
+        );
+        for _ in 0..100 {
+            crate::rt::yield_now().await;
+        }
+        let after = (
+            progress(&planner, &pool),
+            planner.stats.compaction_waits.load(Ordering::Relaxed),
+            planner.stats.grow_waits.load(Ordering::Relaxed),
+        );
+        if before != after {
+            failures.push(format!(
+                "seed {seed}: a quiescent planner kept stepping: {before:?} -> {after:?}"
+            ));
+        }
+        if let Some(bind) = bind {
+            bind.abort();
+        }
+        if failures.len() > 20 {
+            break;
+        }
+    }
+    assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
+}
