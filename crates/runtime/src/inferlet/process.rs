@@ -251,7 +251,25 @@ pub(crate) async fn said<F: std::future::Future>(
             return output;
         }
         crate::scheduler::worker::notify_owner_blocked(pid);
+        // However the wait ends (done, or dropped), the owner is unblocked
+        // before control goes back to its guest.
+        struct Unblock(ProcessId);
+        impl Drop for Unblock {
+            fn drop(&mut self) {
+                crate::scheduler::worker::notify_owner_unblocked(self.0);
+            }
+        }
+        let _unblock = Unblock(pid);
+        return said_waiting(stage, pid, step).await;
     }
+    said_waiting(stage, pid, step).await
+}
+
+async fn said_waiting<F: std::future::Future>(
+    stage: &'static str,
+    pid: ProcessId,
+    mut step: std::pin::Pin<&mut F>,
+) -> F::Output {
     let started = Instant::now();
     let mut episode = WaitEpisode::default();
     loop {
