@@ -487,3 +487,20 @@ Streamed PLE rows (per-fire row indices, no cut) could roll as adapter banks do.
 
 Host RAM is attacked by shrinking the ladder instead: logprobs sharing the forward's
 programs, and prefill buckets chosen from measured costs.
+
+## F36. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+
+A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
+column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
+plus `B` pages one fire may hand out and `B F` pages freed in the `F`
+frames in flight, terms every group carries whatever its length. At short
+lengths they are most of the reserve: 64 tokens, B = 4, F = 2 reserves up
+to 33 pages against the earlier shared pool's 18, and the 9 GiB-capped
+200-beam + 300-decode gate on MI300X ran 25-28 s against the tip's 21-22 s
+(uncapped 16 s both: speed parity, a capacity cost). Measure whether the
+`B` handed and `B F` pending terms can come from one pool-wide reserve
+sized by the fires in flight across groups (a fire hands out at most `B`
+pages per group it runs, and frees wait `F` fires whichever group freed
+them) without weakening the per-step guarantee that a fire never opens a
+column it cannot back: the capped gate's walls against the tip, the pages
+the planner counts per group, and the refusals under over-demand.

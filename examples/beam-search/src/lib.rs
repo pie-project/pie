@@ -157,6 +157,9 @@ async fn main(input: Input) -> Result<String> {
     let mut greedy_mismatches = usize::from(first.first() != greedy.first());
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
 
+    // Why the search stopped short of `max_tokens`, where it did: its beams'
+    // pool outgrew the kv pool (refused by name; the columns before stand).
+    let mut stopped: Option<String> = None;
     if decodes > 0 {
         let scores = Channel::from(&final_scores[..]);
         let toks = Channel::from(&first[..]);
@@ -258,11 +261,19 @@ async fn main(input: Input) -> Result<String> {
                 step += 1;
             }
         } else {
-            run_ahead(&pipeline, &fwd, decodes, async || {
-                let picked = out
-                    .take_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("@{step}"))?;
+            let searched = run_ahead(&pipeline, &fwd, decodes, async || {
+                let picked = match out.take_host::<Vec<i32>>().await {
+                    Ok(picked) => picked,
+                    // The beams' pool outgrew what the kv pool can hold for
+                    // this process (a refusal by name: its growth could never
+                    // fit, or the pool has nothing left beside what it holds):
+                    // the columns searched so far are the output.
+                    Err(e) if outgrown(&format!("{e}")) => {
+                        stopped = Some(format!("@{step}: {e}"));
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Err(e) => return Err(format!("@{step}: {e}").into()),
+                };
                 let parents = out_par
                     .take_host::<Vec<u32>>()
                     .await
@@ -281,7 +292,15 @@ async fn main(input: Input) -> Result<String> {
                 step += 1;
                 Ok(ControlFlow::Continue(()))
             })
-            .await?;
+            .await;
+            if let Err(e) = searched {
+                let why = format!("{e}");
+                if outgrown(&why) {
+                    stopped.get_or_insert_with(|| format!("@{step}: {why}"));
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
     pipeline.close();
@@ -323,9 +342,18 @@ async fn main(input: Input) -> Result<String> {
         String::new()
     };
     Ok(format!(
-        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}{verified}",
-        final_scores[best_lane]
+        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}{verified}{}",
+        final_scores[best_lane],
+        stopped.map_or(String::new(), |why| format!(" stopped {why}"))
     ))
+}
+
+/// Whether a fire's refusal says the beams' pool outgrew what the kv pool
+/// can hold for this process (by name): its growth could never fit, or the
+/// pool has nothing left beside what it holds. The columns searched before
+/// stand as the output.
+fn outgrown(why: &str) -> bool {
+    why.contains("outgrows the kv pool") || why.contains("this process alone holds what the pool holds")
 }
 
 /// The summed log-probability of `hypothesis` after `prompt`, teacher-forced

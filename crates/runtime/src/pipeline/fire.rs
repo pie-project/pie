@@ -2876,6 +2876,24 @@ fn stamp_lane_reserve(
     Ok(())
 }
 
+/// The named refusal of a beam group's growth that could never fit alone:
+/// its set would need `end` pages (its frozen ones and its pool's `named`
+/// for this fire's column) and the kv pool holds `capacity` with nothing
+/// else resident. Anything smaller waits like any reservation. The search's
+/// earlier columns stay valid output (`BEAM-PAGE-LISTS.md` §3).
+pub(crate) const BEAM_POOL_OUTGROWN: &str = "outgrows the kv pool";
+
+fn beam_pool_fits(lane: usize, end: u64, named: u64, capacity: u32) -> Result<(), String> {
+    if end > u64::from(capacity) {
+        return Err(format!(
+            "pipeline: lane {lane}'s beams' pool {BEAM_POOL_OUTGROWN}: its next column needs \
+             {named} pool page(s), {end} with its frozen ones, and the kv pool holds \
+             {capacity} with nothing else resident; the search's earlier columns are its output"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `fwd`'s program states each beam's parent (its lanes hold their
 /// own page lists of their set's reserve).
 fn binds_pages<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
@@ -3707,6 +3725,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let named = beams * (column + 2) + beams * frames + 1;
                 let end = f0 + named;
                 let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
+                let capacity = crate::store::registry::with_kv_lock(
+                    &stores.kv,
+                    "host-other",
+                    |kv| kv.capacity_pages(),
+                );
+                if let Err(refusal) = beam_pool_fits(lane, end, named, capacity) {
+                    return Ok(Err(refusal));
+                }
                 if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
                     &pass_lanes.kv[lane],
                     end_slot,
@@ -3720,7 +3746,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
                     cursor.reserved = cursor.reserved.max(end_slot);
                 }
-                reserves.push((f0..end).collect());
+                // Only the pages the column adds are backed here: the pool's
+                // pages are the group's alone and the device keeps what they
+                // hold, so a page an earlier fire still in flight writes is
+                // not copied before this one writes it.
+                let mapped = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                    kv.mapped_len(pass_lanes.kv[lane].id)
+                })
+                .map_err(|error| anyhow::anyhow!("pipeline: KV rows: {error}"))?;
+                reserves.push((mapped.max(f0)..end).collect());
             }
             Some(reserves)
         } else {
@@ -7041,6 +7075,14 @@ pub(crate) mod fold_tests {
 
     fn all() -> geometry::Fold {
         geometry::Fold::Host(vec![u32::MAX])
+    }
+
+    #[test]
+    fn a_beam_pool_that_could_never_fit_alone_is_refused_by_name() {
+        assert_eq!(super::beam_pool_fits(0, 40, 37, 40), Ok(()));
+        let refusal = super::beam_pool_fits(2, 41, 38, 40).unwrap_err();
+        assert!(refusal.contains(super::BEAM_POOL_OUTGROWN), "{refusal}");
+        assert!(refusal.contains("lane 2"), "{refusal}");
     }
 
     fn request(lanes: usize) -> crate::engine::FireRequest {
