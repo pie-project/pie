@@ -62,6 +62,19 @@ macro_rules! gdn_scan_points {
             }
         }
 
+        fn gdn_replay_step_point(lanes: u32, vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (lanes, vrows, per) {
+                $(($l, $v, $p) => Some((
+                    concat!("gated_delta_replay_step_bfloat16_l_", $l, "_v_", $v, "_p_", $p),
+                    concat!(
+                        "PIE_STAMP_gdn_replay_step(\"gated_delta_replay_step_bfloat16_l_", $l, "_v_",
+                        $v, "_p_", $p, "\", ", $l, ", ", $v, ", ", $p, ")"
+                    ),
+                )),)+
+                _ => None,
+            }
+        }
+
         fn gdn_scan_committed_point(lanes: u32, vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
             match (lanes, vrows, per) {
                 $(($l, $v, $p) => Some((
@@ -1414,6 +1427,83 @@ fn gated_delta_verify_at(
     )
 }
 
+/// The decode step over each lane's carried rows: [`gated_delta_verify`]'s
+/// statement, walked as [`gated_delta`]'s step walks its row, each lane's
+/// state in registers, read once and landed once at its commit. A decode
+/// fire's lanes carry at most the run-ahead window's rows, so the step's
+/// geometry, which the device's tuning picked for the bank's read and
+/// write, holds them; the verify scan's staging serves a window of rows.
+/// `None` when the step's geometry is not stamped for these heads: the
+/// caller walks the verify scan.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_replay_step(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
+    paged: Option<Paged>,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+) -> Option<Result<(), Error>> {
+    const OP: &str = "ssm.gated_delta_committed";
+    if qkv.dtype != Dtype::Bf16 || gates.ba.dtype != qkv.dtype || gates.ba.width != 2 * v_heads {
+        return None;
+    }
+    let shape = Delta {
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+    };
+    if k_heads == 0 || v_heads == 0 || !v_heads.is_multiple_of(k_heads) {
+        return None;
+    }
+    let lanes = committed_lanes(OP, indptr).ok()?;
+    let (point, stamp, grid) = gdn_scan_launch_at(
+        &shape,
+        lanes,
+        lanes_rows(tuning.gdn_scan()),
+        gdn_replay_step_point,
+    )?;
+    Some((|| {
+        let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
+        ctx.fire(
+            Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                gates.ba.arg(),
+                gates.a_log.arg(),
+                gates.dt_bias.arg(),
+                state.state.arg_mut(),
+                y.arg_mut(),
+                gates.gates.arg_mut(),
+                stated(OP, k_heads)?.arg(),
+                stated(OP, v_heads)?.arg(),
+                stated(OP, k_dim)?.arg(),
+                stated(OP, v_dim)?.arg(),
+                slab,
+                pages,
+                page_tokens,
+                page_bytes,
+                row_bytes,
+                is_paged,
+                state.segments.arg(),
+            ],
+        )
+    })())
+}
+
 /// The rows of a lane one threadgroup of the verify conv runs side by side,
 /// and the threads of four channels beside them.
 const CONV_VERIFY_ROWS: u32 = 4;
@@ -1440,6 +1530,52 @@ pub fn causal_conv1d_verify_fits(channels: u32, conv_width: u32, dilation: u32) 
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_verify(
     ctx: &Ctx<'_>,
+    x: Tensor,
+    paged: Option<Paged>,
+    indptr: Tensor,
+    committed: &Committed,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    land: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    causal_conv1d_verify_rows(
+        ctx, CONV_VERIFY_ROWS, x, paged, indptr, committed, weight, state, conv_width, dilation,
+        y, land, snapshots,
+    )
+}
+
+/// [`causal_conv1d_verify`] for a decode fire's step: one thread of a
+/// lane's four channels walks its carried rows and its own, where a verify
+/// window spreads its dozen rows over [`CONV_VERIFY_ROWS`] threads.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_replay_step(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    paged: Option<Paged>,
+    indptr: Tensor,
+    committed: &Committed,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    land: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    causal_conv1d_verify_rows(
+        ctx, 1, x, paged, indptr, committed, weight, state, conv_width, dilation, y, land,
+        snapshots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_conv1d_verify_rows(
+    ctx: &Ctx<'_>,
+    rows: u32,
     x: Tensor,
     paged: Option<Paged>,
     indptr: Tensor,
@@ -1479,8 +1615,8 @@ pub fn causal_conv1d_verify(
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
     ctx.fire(
         Fire::at("ssm/conv1d.metal", entry).apply(Grid::of(
-            [channels / 4, CONV_VERIFY_ROWS, lanes],
-            [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
+            [channels / 4, rows, lanes],
+            [CONV_VERIFY_CHANNELS, rows, 1],
         )),
         &[
             x.arg(),

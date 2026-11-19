@@ -459,16 +459,20 @@ template <typename T>
     const device ulong* map        [[buffer(22)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
-    uint3 shape [[threads_per_threadgroup]]) {
+    uint3 shape [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
   const int c = int(pos.x) * 4;
   const int first = int(at.y);
   const int rows = int(shape.y);
   const int r = int(pos.z);
   const bool live = c < channels;
-  int begin = indptr[r];
-  for (int j = 0; j < r; ++j) {
-    begin += replay[lane0 + j];
+  // The rows the lanes before this one carry, summed across the
+  // simdgroup (every thread of it serves lane `r`): a thread a lane.
+  int carried = 0;
+  for (int j = int(simd_lane); j < r; j += 32) {
+    carried += replay[lane0 + j];
   }
+  const int begin = indptr[r] + simd_sum(carried);
   const int rep = replay[lane0 + r];
   const int span = (indptr[r + 1] - indptr[r]) + rep;
   const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
@@ -589,6 +593,6 @@ template <typename T>
       const constant int&, const constant int&, const device int*,      \
       const constant int&, device uchar*, const device int*,            \
       const constant uint&, const constant uint&, const constant uint&, \
-      const constant int&, const device ulong*, uint3, uint3, uint3);
+      const constant int&, const device ulong*, uint3, uint3, uint3, uint);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)

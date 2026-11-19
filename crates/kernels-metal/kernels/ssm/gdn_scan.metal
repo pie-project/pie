@@ -36,17 +36,14 @@ inline float gdn_packed_dot(
   return (p.x + p.y) + (p.z + p.w);
 }
 
-// Row `at`'s inputs to a scan: its query and key, each l2-normed over the
-// head, the query scaled, its value rows, its decay and its beta.
-template <typename T, int LANES, int VROWS, int PER>
-inline void gdn_scan_row(
+// Row `at`'s query and key, each l2-normed over the head, the query
+// scaled, and its value rows.
+template <typename T, int LANES, int VROWS, int PER, bool WANT_Q = true>
+inline void gdn_scan_qkv(
     const device T* qkv,
-    const device float* gates,
     thread float (&q)[PER],
     thread float (&k)[PER],
     thread float (&vals)[VROWS],
-    thread float& decay,
-    thread float& beta,
     int at,
     int lane,
     int dv_base,
@@ -82,6 +79,19 @@ inline void gdn_scan_row(
     }
     qs = gdn_packed_dot(q, q);
     ks = gdn_packed_dot(k, k);
+  } else if constexpr (PER == 4) {
+    // The lane's four keys in one load each, summed in the loop's order.
+    const float4 kv = float4(*reinterpret_cast<const device vec<T,4>*>(qkv + kbase + 4*lane));
+    float4 qv = 0.0f;
+    if constexpr (WANT_Q) {
+      qv = float4(*reinterpret_cast<const device vec<T,4>*>(qkv + qbase + 4*lane));
+    }
+    for (int i = 0; i < 4; ++i) {
+      q[i] = qv[i];
+      k[i] = kv[i];
+      qs += qv[i] * qv[i];
+      ks += kv[i] * kv[i];
+    }
   } else {
     for (int i = 0; i < PER; ++i) {
       const int d = PER * lane + i;
@@ -93,16 +103,50 @@ inline void gdn_scan_row(
       ks += kv * kv;
     }
   }
-  const float qinv = metal::rsqrt(gdn_row_sum<LANES>(qs) + 1e-6f) * scale;
   const float kinv = metal::rsqrt(gdn_row_sum<LANES>(ks) + 1e-6f);
+  if constexpr (WANT_Q) {
+    const float qinv = metal::rsqrt(gdn_row_sum<LANES>(qs) + 1e-6f) * scale;
+    for (int i = 0; i < PER; ++i) {
+      q[i] *= qinv;
+    }
+  }
   for (int i = 0; i < PER; ++i) {
-    q[i] *= qinv;
     k[i] *= kinv;
   }
   const size_t vbase = row + 2 * keys + size_t(hv) * size_t(dv);
-  for (int v = 0; v < VROWS; ++v) {
-    vals[v] = float(qkv[vbase + size_t(dv_base + v)]);
+  if constexpr (VROWS == 4) {
+    const float4 vv = float4(*reinterpret_cast<const device vec<T,4>*>(qkv + vbase + size_t(dv_base)));
+    for (int v = 0; v < 4; ++v) {
+      vals[v] = vv[v];
+    }
+  } else {
+    for (int v = 0; v < VROWS; ++v) {
+      vals[v] = float(qkv[vbase + size_t(dv_base + v)]);
+    }
   }
+}
+
+// Row `at`'s inputs to a scan: [`gdn_scan_qkv`]'s, its decay and its beta.
+template <typename T, int LANES, int VROWS, int PER>
+inline void gdn_scan_row(
+    const device T* qkv,
+    const device float* gates,
+    thread float (&q)[PER],
+    thread float (&k)[PER],
+    thread float (&vals)[VROWS],
+    thread float& decay,
+    thread float& beta,
+    int at,
+    int lane,
+    int dv_base,
+    int hv,
+    int hk,
+    int k_heads,
+    int v_heads,
+    int dk,
+    int dv) {
+  gdn_scan_qkv<T, LANES, VROWS, PER>(qkv, q, k, vals, at, lane, dv_base, hv, hk, k_heads,
+                                     v_heads, dk, dv);
   const size_t fused = size_t(at) * 2 * size_t(v_heads) + size_t(hv);
   decay = metal::exp(gates[fused]);
   beta = gates[fused + size_t(v_heads)];
@@ -774,3 +818,177 @@ template <typename T, int LANES, int SG, int VROWS>
 PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)
 PIE_GDN_VERIFY(32, 8, 4)
+
+// The decode step over a lane's carried rows: a lane's `replay` rows (the
+// buffered rows past its committed state, accepted or not) fold in before
+// its own row, each in registers as `gated_delta_scan_step` steps its one
+// row, and the state lands at `commit` rows, never past it. The bank is
+// read once and written once, as the step's; the carried rows cost their
+// inputs and their steps. A carried row only folds in: its readout was
+// landed the fire that first ran it. The gates are `gdn_verify_gates`':
+// the carried rows' from the lane's buffer through `paged`, the own row's
+// from `ba`, landed in `gates` and in the buffer for the next fire. The
+// arithmetic is `gdn_scan_token`'s, row for row, so the bits are the
+// step's and the committed scan's.
+template <typename T, int LANES, int VROWS, int PER>
+[[kernel]] void gated_delta_replay_step(
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    const constant int& k_dim   [[buffer(14)]],
+    const constant int& v_dim   [[buffer(15)]],
+    device uchar* slab          [[buffer(16)]],
+    const device int* page_table [[buffer(17)]],
+    const constant uint& page_tokens [[buffer(18)]],
+    const constant uint& page_bytes [[buffer(19)]],
+    const constant uint& row_bytes [[buffer(20)]],
+    const constant int& paged   [[buffer(21)]],
+    const device ulong* map     [[buffer(22)]],
+    uint3 pos [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+  const int lane = int(pos.x) % LANES;
+  const int dv_base = int(pos.y) * VROWS;
+  const int hv = int(pos.z) % v_heads;
+  const int r = int(pos.z) / v_heads;
+
+  // The rows the lanes before this one carry, summed across the
+  // simdgroup (every thread of it serves lane `r`): a thread a lane.
+  int carried = 0;
+  for (int j = int(simd_lane); j < r; j += 32) {
+    carried += replay[lane0 + j];
+  }
+  const int begin = indptr[r] + simd_sum(carried);
+  const int rep = replay[lane0 + r];
+  const int span = (indptr[r + 1] - indptr[r]) + rep;
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (span <= 0 || ids[0] < 0) {
+    return;
+  }
+  const int own = indptr[r] - rep;
+  const int keep = min(commit[lane0 + r], span);
+  const device int* pages =
+      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
+  const int dk = k_dim;
+  const int dv = v_dim;
+  const int hk = hv / (v_heads / k_heads);
+  // Thread j of the simdgroup derives row j's gates (of each 32 rows) and
+  // the rows take them by shuffle; the head's first simdgroup lands them.
+  const bool lands = simd_shuffle(int(pos.y), 0) == 0;
+  float2 mine = 0.0f;
+
+  device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, dk, dv);
+  float st[VROWS][PER];
+  gdn_load<VROWS, PER>(st, cells, lane, dk);
+  // Row t + 1's inputs load while row t steps, so a walk of a few rows
+  // waits on one row's loads, not on each in turn.
+  // A carried row lands no readout, so its query is never read.
+  float q[PER], k[PER], vals[VROWS];
+  if (rep > 0) {
+    gdn_scan_qkv<T, LANES, VROWS, PER, false>(qkv, q, k, vals, begin, lane, dv_base, hv, hk,
+                                              k_heads, v_heads, dk, dv);
+  } else {
+    gdn_scan_qkv<T, LANES, VROWS, PER>(qkv, q, k, vals, begin, lane, dv_base, hv, hk, k_heads,
+                                       v_heads, dk, dv);
+  }
+  for (int t = 0; t < span; ++t) {
+    const bool more = t + 1 < span;
+    if (t % 32 == 0) {
+      const int j = t + int(simd_lane);
+      if (j < span) {
+        mine = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, j, begin, own, rep, lands,
+                                   slab, pages, page_tokens, page_bytes, row_bytes);
+        if (lands && j >= rep) {
+          const size_t at = size_t(own + j) * 2 * size_t(v_heads) + size_t(hv);
+          gates[at] = mine.x;
+          gates[at + size_t(v_heads)] = mine.y;
+        }
+      }
+    }
+    const float2 g = float2(simd_shuffle(mine.x, ushort(t % 32)), simd_shuffle(mine.y, ushort(t % 32)));
+    float nq[PER], nk[PER], nvals[VROWS];
+    if (more && t + 1 < rep) {
+      gdn_scan_qkv<T, LANES, VROWS, PER, false>(qkv, nq, nk, nvals, begin + t + 1, lane, dv_base,
+                                                hv, hk, k_heads, v_heads, dk, dv);
+    } else if (more) {
+      gdn_scan_qkv<T, LANES, VROWS, PER>(qkv, nq, nk, nvals, begin + t + 1, lane, dv_base, hv,
+                                         hk, k_heads, v_heads, dk, dv);
+    }
+    const float decay = metal::exp(g.x);
+    const float beta = g.y;
+    float mem[VROWS];
+    gdn_scan_memory<LANES, VROWS, PER>(st, k, decay, mem);
+    // At 32 lanes the value rows' trees share their first shuffles, each
+    // sum the tree's operand for operand (`gdn_rows_sum`).
+    constexpr bool TRANSPOSED = LANES == 32 && VROWS > 1;
+    if constexpr (TRANSPOSED) {
+      const float sum = gdn_rows_sum<VROWS>(mem, simd_lane);
+      for (int v = 0; v < VROWS; ++v) {
+        mem[v] = simd_shuffle(sum, gdn_rows_lane<VROWS>(v));
+      }
+    } else {
+      for (int v = 0; v < VROWS; ++v) {
+        mem[v] = gdn_row_sum<LANES>(mem[v]);
+      }
+    }
+    if (t < rep) {
+      for (int v = 0; v < VROWS; ++v) {
+        const float delta = (vals[v] - mem[v]) * beta;
+        for (int i = 0; i < PER; ++i) {
+          st[v][i] += k[i] * delta;
+        }
+      }
+    } else {
+      float out[VROWS];
+      gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
+      const size_t row_out = (size_t(own + t) * size_t(v_heads) + size_t(hv)) * size_t(dv);
+      if constexpr (TRANSPOSED) {
+        const float sum = gdn_rows_sum<VROWS>(out, simd_lane);
+        if (simd_lane < uint(VROWS)) {
+          y[row_out + size_t(dv_base + gdn_rows_index<VROWS>(simd_lane))] = sum;
+        }
+      } else {
+        for (int v = 0; v < VROWS; ++v) {
+          out[v] = gdn_row_sum<LANES>(out[v]);
+          if (lane == 0) {
+            y[row_out + size_t(dv_base + v)] = out[v];
+          }
+        }
+      }
+    }
+    if (t + 1 == keep) {
+      gdn_store<VROWS, PER>(cells, st, lane, dk);
+    }
+    if (more) {
+      for (int i = 0; i < PER; ++i) {
+        q[i] = nq[i];
+        k[i] = nk[i];
+      }
+      for (int v = 0; v < VROWS; ++v) {
+        vals[v] = nvals[v];
+      }
+    }
+  }
+}
+
+#define PIE_STAMP_gdn_replay_step(entry, lanes, vrows, per)                    \
+  template [[host_name(entry)]]                                                \
+  [[kernel]] void gated_delta_replay_step<bfloat, lanes, vrows, per>(          \
+      const device bfloat*, const device int*, const device int*,              \
+      const device int*, const device int*, const constant int&,               \
+      const device bfloat*, const device float*, const device bfloat*,         \
+      device float*, device float*, device float*,                             \
+      const constant int&, const constant int&, const constant int&,           \
+      const constant int&, device uchar*, const device int*,                   \
+      const constant uint&, const constant uint&, const constant uint&,        \
+      const constant int&, const device ulong*, uint3, uint);

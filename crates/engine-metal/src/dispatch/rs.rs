@@ -299,7 +299,12 @@ impl Run<'_> {
                 Some(_) => self.tensor(conv.x),
                 None => self.rs_extend(OP, seat, conv.x)?,
             };
-            ssm::causal_conv1d_verify(
+            let walk = if conv.step {
+                ssm::causal_conv1d_replay_step
+            } else {
+                ssm::causal_conv1d_verify
+            };
+            walk(
                 self.ctx(),
                 source,
                 paged,

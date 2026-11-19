@@ -734,3 +734,179 @@ fn holds_the_contract(mut shell: Shell) {
         }
     }
 }
+
+/// Timing, not a gate (run by hand): Qwen3.5-0.8B's shapes over a
+/// synthetic checkpoint, one lane decoding a row a fire while it replays
+/// `L` buffered rows (the lagged fold's lag), against a plain decode.
+#[test]
+#[ignore = "a bench: cargo test ... -- --ignored a_replaying_decode_costs --nocapture"]
+fn a_replaying_decode_costs() {
+    if !engine_metal::device::present() {
+        return;
+    }
+    let fixture: &'static _ = Box::leak(Box::new(
+        super::a_scattered_pool_serves_the_same_logits::fixture_of("qwen35-d0.8b", None),
+    ));
+    let shell = load(fixture.trace.clone(), &fixture.contract, &fixture.container);
+    let mut shell = serving(shell, fixture.trace.clone());
+    const N: u32 = 16;
+    const FIRES: usize = 40;
+    let prompt: Vec<u32> = (0..N).map(|at| (7 + at * 37) % 256).collect();
+    let next = [42u32];
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let time = |shell: &mut Shell, slot: u32, verb: &RsVerb| -> f64 {
+        let mut took = Vec::with_capacity(FIRES);
+        for at in 0..FIRES + 5 {
+            let t0 = std::time::Instant::now();
+            shell
+                .fire_seated(&[seated_at(slot, &next, verb, RsReset::Held, N)])
+                .expect("the decode runs");
+            if at >= 5 {
+                took.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        median(took)
+    };
+    // Today's decode: the prompt folded, each fire folding its own row.
+    shell.open(0).expect("slot 0 opens");
+    shell
+        .fire_seated(&[seated(0, &prompt, &RsVerb::Fold, RsReset::Fresh)])
+        .expect("the prompt folds");
+    let plain = time(&mut shell, 0, &RsVerb::Fold);
+    eprintln!("plain decode (Fold): {plain:.3} ms a fire");
+    for (slot, lag) in [(1u32, 0u32), (2, 1), (3, 2)] {
+        shell.open(slot).expect("the slot opens");
+        // The prompt folded but its last `lag` rows, which stay buffered.
+        shell
+            .fire_seated(&[seated(slot, &prompt, &buffer_over(N, 0, N - lag), RsReset::Fresh)])
+            .expect("the prompt buffers");
+        // Each decode replays the `lag` rows past the folded length and
+        // folds nothing, so every fire replays the same rows.
+        let verb = buffer_over(N + 1, N - lag, 0);
+        let took = time(&mut shell, slot, &verb);
+        eprintln!(
+            "replaying decode, lag {lag}: {took:.3} ms a fire ({:+.1}% on plain)",
+            (took / plain - 1.0) * 100.0
+        );
+    }
+}
+
+/// [`a_replaying_decode_costs`] at 16 and 64 lanes a fire.
+#[test]
+#[ignore = "a bench: cargo test ... -- --ignored a_replaying_wide_decode_costs --nocapture"]
+fn a_replaying_wide_decode_costs() {
+    if !engine_metal::device::present() {
+        return;
+    }
+    let fixture: &'static _ = Box::leak(Box::new(
+        super::a_scattered_pool_serves_the_same_logits::fixture_of("qwen35-d0.8b", None),
+    ));
+    const SLOTS: u32 = 64;
+    let trace = fixture.trace.clone();
+    let shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, PAGE, 128, SLOTS),
+        voxels: None,
+        trace: trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(64, 1024),
+        patches: None,
+        profile: None,
+        page_size: PAGE,
+        context: 128,
+        slots: SLOTS,
+        runahead: engine::runahead::Runahead::F1,
+        allowance: engine::Allowance::WHOLE,
+        profiles: None,
+        residency: engine_metal::ResidencyPlan::default(),
+        top: engine_metal::Top::EveryRung,
+    })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
+    .expect("the shell loads");
+    let mut shell = serving(shell, trace);
+    // Enough segments for 64 lanes' states and buffers at once (the
+    // state pool asked 313 chunks for them).
+    let facts = shell.pool_chunk_facts();
+    shell
+        .commit_segments(352u32.div_ceil(facts.segment_chunks.max(1)).min(facts.total_chunks.div_ceil(facts.segment_chunks.max(1))))
+        .expect("the pool commits");
+    const N: u32 = 16;
+    const FIRES: usize = 20;
+    let prompt: Vec<u32> = (0..N).map(|at| (7 + at * 37) % 256).collect();
+    let next = [42u32];
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    for lanes in [16u32, 32] {
+        let mut plain = 0.0;
+        for lag in [None, Some(0u32), Some(1), Some(2)] {
+            // The same slots each time: a fresh prompt resets each one.
+            let slots: Vec<u32> = (0..lanes).collect();
+            let verbs: Vec<RsVerb> = slots
+                .iter()
+                .map(|_| match lag {
+                    None => RsVerb::Fold,
+                    Some(lag) => buffer_over(N + 1, N - lag, 0),
+                })
+                .collect();
+            for &s in &slots {
+                let _ = shell.open(s);
+                let prefill = match lag {
+                    None => RsVerb::Fold,
+                    Some(lag) => buffer_over(N, 0, N - lag),
+                };
+                shell
+                    .fire_seated(&[seated(s, &prompt, &prefill, RsReset::Fresh)])
+                    .expect("the prompt lands");
+            }
+            let mut took = Vec::with_capacity(FIRES);
+            for at in 0..FIRES + 3 {
+                let lanes_now: Vec<Seated<'_>> = slots
+                    .iter()
+                    .zip(&verbs)
+                    .map(|(&s, verb)| seated_at(s, &next, verb, RsReset::Held, N))
+                    .collect();
+                let t0 = std::time::Instant::now();
+                shell.fire_seated(&lanes_now).expect("the decode runs");
+                if at >= 3 {
+                    took.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            let ms = median(took);
+            // One fire under the kernel profile: where its time goes.
+            {
+                let lanes_now: Vec<Seated<'_>> = slots
+                    .iter()
+                    .zip(&verbs)
+                    .map(|(&s, verb)| seated_at(s, &next, verb, RsReset::Held, N))
+                    .collect();
+                engine_metal::encode::reset_kernel_profile();
+                engine_metal::encode::profile_kernels(true);
+                shell.fire_seated(&lanes_now).expect("the profiled decode runs");
+                engine_metal::encode::profile_kernels(false);
+                let mut rows = engine_metal::encode::kernel_profile();
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = rows.iter().map(|r| r.1).sum();
+                eprintln!("  profile c{lanes} lag {lag:?}: {:.3} ms on the device", total as f64 / 1e6);
+                for (name, ns, n) in rows.iter().take(9) {
+                    eprintln!("    {:8.3} ms {n:5}x {name}", *ns as f64 / 1e6);
+                }
+                engine_metal::encode::reset_kernel_profile();
+            }
+            match lag {
+                None => {
+                    plain = ms;
+                    eprintln!("c{lanes} plain decode (Fold): {ms:.3} ms a fire");
+                }
+                Some(lag) => eprintln!(
+                    "c{lanes} replaying decode, lag {lag}: {ms:.3} ms a fire ({:+.1}% on plain)",
+                    (ms / plain - 1.0) * 100.0
+                ),
+            }
+        }
+    }
+}

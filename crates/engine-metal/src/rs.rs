@@ -641,6 +641,9 @@ pub struct Convolved {
     pub state: ValueId,
     pub conv_width: u32,
     pub dilation: u32,
+    /// A decode fire's step (one row a lane): its lanes' carried rows walk
+    /// as the step walks its row.
+    pub step: bool,
 }
 
 impl Seat {

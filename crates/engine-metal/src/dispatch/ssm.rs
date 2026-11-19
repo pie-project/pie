@@ -118,6 +118,7 @@ impl Run<'_> {
                     state: *state,
                     conv_width: *conv_width,
                     dilation: *dilation,
+                    step: matches!(op, Ssm::CausalConv1d { .. }),
                 };
                 self.rs_convolve(&seat, &conv, *y).map(|_| ())
             }
@@ -171,17 +172,41 @@ impl Run<'_> {
                         Some(_) => self.tensor(ba),
                         None => self.rs_extend(OP, &seat, ba)?,
                     };
+                    let gates = ssm::VerifyGates {
+                        ba,
+                        dt_bias,
+                        a_log,
+                        gates: self.tensor(*gates),
+                    };
+                    let snapshots = self.rs_snapshots(*state);
+                    // A decode fire's step (one row a lane) walks its lanes'
+                    // carried rows as the step walks its row.
+                    if matches!(op, Ssm::GatedDelta { .. })
+                        && snapshots.is_none()
+                        && let Some(stepped) = ssm::gated_delta_replay_step(
+                            self.ctx(),
+                            self.tuning(),
+                            ext_qkv,
+                            self.qo_indptr(),
+                            &self.rs_committed(&seat, *state),
+                            &gates,
+                            paged,
+                            &self.recurrent(*state),
+                            *k_heads,
+                            *v_heads,
+                            *k_dim,
+                            *v_dim,
+                            self.tensor(*y),
+                        )
+                    {
+                        return stepped;
+                    }
                     return ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
                         self.qo_indptr(),
                         &self.rs_committed(&seat, *state),
-                        &ssm::VerifyGates {
-                            ba,
-                            dt_bias,
-                            a_log,
-                            gates: self.tensor(*gates),
-                        },
+                        &gates,
                         paged,
                         &self.recurrent(*state),
                         *k_heads,
@@ -189,7 +214,7 @@ impl Run<'_> {
                         *k_dim,
                         *v_dim,
                         self.tensor(*y),
-                        self.rs_snapshots(*state),
+                        snapshots,
                     );
                 }
                 // Heads the verify scan does not stage take the gate prep
