@@ -329,6 +329,9 @@ pub struct Shell {
     /// The last staged fire's capturing lanes' rows ([`Shell::score_rows`]).
     last_capture: CaptureRows,
     arms: Arms,
+    /// Readout seats, one a frame in flight: a step takes one only when it
+    /// reads rows back (`readbacks`).
+    readout_seats: Arms,
     airborne: Airborne,
     inflight: VecDeque<Flight>,
     grafted: Option<Pending>,
@@ -947,7 +950,10 @@ impl PreparedLoad<'_> {
             &tuning,
         )?;
         let page_tables = rows.tables.len();
+        // A step in flight takes an arm (its staged inputs); a step that
+        // reads rows back also takes a readout seat, one a frame in flight.
         let arms = boot.runahead.frames().max(1);
+        let readout_seats = boot.runahead.frames().max(1);
         let gathers = fallback::gathers(&boot.trace, &compiled, crate::window::CARRIES);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
@@ -1100,7 +1106,7 @@ impl PreparedLoad<'_> {
             .iter()
             .map(|(tokens, _)| {
                 let bytes = u64::from(rung_budget(*tokens).max_lanes) * readout_row_bytes;
-                (0..arms)
+                (0..readout_seats)
                     .map(|_| {
                         Ok(crate::inputs::Region::unplaced(
                             bytes,
@@ -1181,7 +1187,10 @@ impl PreparedLoad<'_> {
         let fire_bytes = compiled.arena.bytes
             + crate::arena::room(rs_room.last().copied().unwrap_or(0))
             + scratch.bytes()
-            + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
+            + io
+                .last()
+                .copied()
+                .map_or(0, |io| crate::arena::staged_room(io, arms as u64, readout_seats as u64))
             + ane_fire;
         // What every other process's GPU memory takes of the working set
         // they share with this one: none of the load's capacity.
@@ -1203,6 +1212,7 @@ impl PreparedLoad<'_> {
             &io,
             &rs_room,
             arms as u64,
+            readout_seats as u64,
             rows.chunk_bytes,
         );
         // The top rung (`crate::top`): of the rungs the requested fire size
@@ -1482,6 +1492,7 @@ impl PreparedLoad<'_> {
             io,
             rs_room,
             arms as u64,
+            readout_seats as u64,
         );
         // The runtime holds, from the start, the widest rung whose activation
         // the smallest rung's chunks hold (`SlotPool::rung` over this `act`),
@@ -1516,9 +1527,12 @@ impl PreparedLoad<'_> {
         // Every rung's staged regions laid in the span; the floor's hosted,
         // where frames stage until the runtime raises.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
-            for (arm, (inputs, readout)) in inputs.iter_mut().zip(readout.iter_mut()).enumerate() {
-                let ((inputs_at, _), (readout_at, _)) = arena.regions(index, arm as u64);
+            for (arm, inputs) in inputs.iter_mut().enumerate() {
+                let (inputs_at, _) = arena.inputs_region(index, arm as u64);
                 inputs.store_mut().place(arena.store().clone(), inputs_at);
+            }
+            for (seat, readout) in readout.iter_mut().enumerate() {
+                let (readout_at, _) = arena.readout_region(index, seat as u64);
                 readout.place(arena.store().clone(), readout_at);
             }
         }
@@ -1627,6 +1641,7 @@ impl PreparedLoad<'_> {
             outputs,
             grid_chains,
             arms: Arms::of(arms),
+            readout_seats: Arms::of(readout_seats),
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
             grafted: None,
@@ -3369,6 +3384,9 @@ impl Shell {
         });
         if let Err(fault) = waited {
             self.arms.give(flight.arm);
+            if let Some(seat) = flight.seat {
+                self.readout_seats.give(seat);
+            }
             // Nothing the buffer ran committed: each attached instance's
             // pass is let go, so the instance stands where it stood before
             // the fire and its next fire stages afresh (an airborne pass
@@ -3440,12 +3458,18 @@ impl Shell {
                 continue;
             };
             let mut raw = vec![0u8; *width as usize * *element as usize];
-            self.readout[self.arena.current()][flight.arm]
+            let seat = flight.seat.ok_or_else(|| Fault::Unbound {
+                what: format!("step {}'s readout seat, which it reads rows back from", flight.seq),
+            })?;
+            self.readout[self.arena.current()][seat]
                 .read(lane as u64 * self.readout_row_bytes, &mut raw)?;
             rows[lane] = (name.clone(), widen(&raw, *element as usize));
         }
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
+        if let Some(seat) = flight.seat {
+            self.readout_seats.give(seat);
+        }
         if !self.forgotten.remove(&flight.seq) {
             self.landed.insert(flight.seq, rows);
         }
@@ -5612,6 +5636,24 @@ impl Shell {
     /// Copies each token row a pass in flight put into the fire's token
     /// seat, on the device, ahead of the forward: the queue runs it after
     /// that pass, so the cell holds its token by then.
+    /// A free readout seat, the oldest steps holding one harvested until
+    /// one is.
+    fn readout_seat(&mut self) -> Result<usize> {
+        loop {
+            if let Some(seat) = self.readout_seats.free() {
+                return Ok(seat);
+            }
+            if self.inflight.is_empty() {
+                return Err(Fault::Ceiling {
+                    what: "readout seats",
+                    need: self.readout_seats.depth() as u64 + 1,
+                    have: self.readout_seats.depth() as u64,
+                });
+            }
+            self.harvest_one()?;
+        }
+    }
+
     fn feed_tokens(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         if p.token_feeds.is_empty() {
             return Ok(());
@@ -5980,6 +6022,7 @@ pub struct Enqueued<'a> {
     pending: Pending,
     seq: u64,
     arm: usize,
+    seat: Option<usize>,
     lanes: usize,
     launches: u32,
     /// Each attached instance and the step's lanes it is attached at.
@@ -6027,6 +6070,7 @@ fn fire_trace(line: impl FnOnce() -> String) {
 struct Flight {
     seq: u64,
     arm: usize,
+    seat: Option<usize>,
     lanes: usize,
     pending: Pending,
     /// Each attached instance and the step's lanes it is attached at.
@@ -6109,8 +6153,15 @@ impl engine::frame::Shell for Shell {
         let mut frame = walked.frame;
 
         let mut readbacks = vec![None; prepared.lanes.len()];
-        if self.host_rows || self.rows_wanted {
-            let seat = &self.readout[self.arena.current()][prepared.arm];
+        // A step that reads rows back holds a readout seat, one a frame in
+        // flight, until its harvest: taken here, where its rows are staged.
+        let seat = if self.host_rows || self.rows_wanted {
+            Some(self.readout_seat()?)
+        } else {
+            None
+        };
+        if let Some(seat) = seat {
+            let seat = &self.readout[self.arena.current()][seat];
             for row in prepared.composition.lanes() {
                 let Some((name, offset, width, element)) = self.readback_row(&prepared, row)?
                 else {
@@ -6232,6 +6283,7 @@ impl engine::frame::Shell for Shell {
             pending,
             seq,
             arm: prepared.arm,
+            seat,
             lanes: prepared.lanes.len(),
             launches: walked.launches,
             attached,
@@ -6249,6 +6301,7 @@ impl engine::frame::Shell for Shell {
             pending,
             seq,
             arm,
+            seat,
             lanes,
             launches,
             attached,
@@ -6257,10 +6310,14 @@ impl engine::frame::Shell for Shell {
             step: _,
         } = enqueued;
         self.arms.take(arm);
+        if let Some(seat) = seat {
+            self.readout_seats.take(seat);
+        }
         fire_trace(|| format!("enqueue seq={seq} rows={lanes}"));
         self.inflight.push_back(Flight {
             seq,
             arm,
+            seat,
             lanes,
             pending,
             attached,

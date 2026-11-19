@@ -37,6 +37,8 @@ pub struct Arena {
     io: Vec<(u64, u64)>,
     /// The frames in flight.
     arms: u64,
+    /// Readout seats: one a frame in flight.
+    seats: u64,
     /// The rung the runtime set: whose regions frames stage in now.
     current: usize,
     /// Each rung's rs scratch, under its staged regions and over its
@@ -58,6 +60,14 @@ pub fn io_room((inputs, readout): (u64, u64)) -> u64 {
     room(inputs) + room(readout)
 }
 
+/// A rung's staged regions: `arms` steps' inputs (one a step in flight)
+/// and `seats` readouts (one a frame in flight; a step takes one only when
+/// it reads rows back).
+#[must_use]
+pub fn staged_room((inputs, readout): (u64, u64), arms: u64, seats: u64) -> u64 {
+    arms * room(inputs) + seats * room(readout)
+}
+
 /// The span's chunks of `chunk_bytes` each rung takes: the `scratch` plane,
 /// `arms` frames' staged regions `io`, its rs scratch `rs` and its carve,
 /// `(tokens, chunks)` ascending.
@@ -68,6 +78,7 @@ pub fn act_chunks(
     io: &[(u64, u64)],
     rs: &[u64],
     arms: u64,
+    seats: u64,
     chunk_bytes: u64,
 ) -> Vec<(u32, u32)> {
     rungs
@@ -75,7 +86,7 @@ pub fn act_chunks(
         .zip(io)
         .zip(rs)
         .map(|(((tokens, map), &io), &rs)| {
-            let bytes = room(scratch) + arms * io_room(io) + room(rs) + room(map.bytes);
+            let bytes = room(scratch) + staged_room(io, arms, seats) + room(rs) + room(map.bytes);
             (
                 *tokens,
                 u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX),
@@ -99,6 +110,7 @@ impl Arena {
         io: Vec<(u64, u64)>,
         rs: Vec<u64>,
         arms: u64,
+        seats: u64,
     ) -> Arena {
         Arena {
             store,
@@ -107,6 +119,7 @@ impl Arena {
             rungs,
             io,
             arms: arms.max(1),
+            seats: seats.max(1),
             current: 0,
             rs,
         }
@@ -165,7 +178,10 @@ impl Arena {
 
     /// The staged regions' bytes at rung `index`, every frame's.
     fn io_total(&self, index: usize) -> u64 {
-        self.arms * self.io.get(index).copied().map_or(0, io_room)
+        self.io
+            .get(index)
+            .copied()
+            .map_or(0, |io| staged_room(io, self.arms, self.seats))
     }
 
     /// What lies over rung `index`'s carve under the plane: its staged
@@ -185,14 +201,23 @@ impl Arena {
         )
     }
 
-    /// Where frame `arm`'s staged inputs and readout lie at rung `index` in
-    /// the span's buffer, and their bytes: `((inputs, bytes), (readout,
-    /// bytes))`.
+    /// Where step arm `arm`'s staged inputs lie at rung `index` in the
+    /// span's buffer, and their bytes: every arm's inputs first, then the
+    /// readout seats.
     #[must_use]
-    pub fn regions(&self, index: usize, arm: u64) -> ((u64, u64), (u64, u64)) {
+    pub fn inputs_region(&self, index: usize, arm: u64) -> (u64, u64) {
+        let (inputs, _) = self.io.get(index).copied().unwrap_or((0, 0));
+        (self.scratch_at() - self.io_total(index) + arm * room(inputs), inputs)
+    }
+
+    /// Where readout seat `seat` lies at rung `index`, and its bytes.
+    #[must_use]
+    pub fn readout_region(&self, index: usize, seat: u64) -> (u64, u64) {
         let (inputs, readout) = self.io.get(index).copied().unwrap_or((0, 0));
-        let at = self.scratch_at() - self.io_total(index) + arm * io_room((inputs, readout));
-        ((at, inputs), (at + room(inputs), readout))
+        (
+            self.scratch_at() - self.io_total(index) + self.arms * room(inputs) + seat * room(readout),
+            readout,
+        )
     }
 
     /// Where the kernel scratch plane starts in the span's buffer.
