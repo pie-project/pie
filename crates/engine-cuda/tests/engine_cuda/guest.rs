@@ -159,7 +159,7 @@ impl Guest {
         pair: (engine::ProgramId, impl std::fmt::Debug),
         state: &GuestState,
     ) -> (ScratchPlace, ScratchPlace) {
-        let scratch = self.take_state(state.per_instance, state);
+        let scratch = self.take_state(state.instance_bytes(), state);
         let pair = format!("{pair:?}");
         if let Some((_, place)) = self.pairs.iter().find(|(held, _)| *held == pair) {
             return (scratch, place.clone());
@@ -212,7 +212,7 @@ impl Guest {
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
         let state = engine
-            .guest_state(binding.program, &binding.extents)
+            .guest_state(binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
         let (scratch, pair) = self.places((binding.program, binding.extents), &state);
         engine
