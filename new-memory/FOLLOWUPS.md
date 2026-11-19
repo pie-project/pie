@@ -680,3 +680,49 @@ Draft of the upstream request (text only; filing it is the user's call):
 > - if the program binary itself must stay host-resident (for instruction overlays or a
 >   reload into HBM), a way to share or page it rather than hold a private copy per
 >   executable.
+
+## F38. ROCm 1-lane greedy moves +0.6% when gemv.hip's code object changes, its 1-row kernels unchanged
+
+The turned norm fold (the norm prologue in `skinnyt_bf16`) leaves every 1-row kernel
+untouched, yet 1-lane greedy on MI300X (qwen3-0.6b) is 0.6% slower. Over 10 ABAB runs of
+1,536 tokens the wall is 2.122 vs 2.107 s, and the step cost (32 → 544 tokens) is 1.345 vs
+1.338 ms. c64, 4-parallel, beam-4 and prefill are flat or faster.
+
+Bisect:
+
+| build | g1 ms/step, 32 → 544 |
+|---|---|
+| tip before the fold | 1.334 – 1.338 |
+| the fold's kernels with the old routing (the fold never taken) | 1.343 – 1.344 |
+| the same, the skinny kernel's prologue the tip's verbatim | 1.344 – 1.345 |
+| the fold | 1.343 – 1.348 |
+
+The 1-row decode runs only `skinny_bf16` instantiations. Their summed device time per step
+is equal within 2 µs (rocprofv3, 1,024 tokens), and their registers, LDS and occupancy
+match (no scratch). What moved is the module the kernels share, so the suspicion is code
+placement (instruction-cache or alignment), not the kernels' work.
+
+Next:
+- dump the code object's kernel offsets on both builds; place or align the hot skinny entry
+  points and see whether the 7 µs follows;
+- if it does, a stable placement for the decode kernels, rather than chasing each module
+  edit.
+
+## F39. ROCm `kernel.gemm.turn_min_n` (2048) stands in for the turned kernel's narrow-bank idle
+
+The turned kernel (`skinnyt_bf16`) walks one 16-row tile a block, so a bank of n rows is
+n / 16 blocks. Below 2048 rows the route keeps the skinny kernel, and that constant is
+the narrow-bank idle, not a measured choice.
+
+Removing it costs MI300X 4-parallel decode +28 µs a step (qwen3-0.6b: 1.475 → 1.510 ms;
+beam-4 2.155 → 2.188). o-proj (1024 x 2048) moves to the turned kernel: 64 blocks on 304
+compute units, two serial 256-element slices a wavefront. It takes 7.2 µs a call against the
+skinny kernel's 6.2 (rocprofv3 device durations).
+
+Stream-timed microbenchmarks said the opposite: turn ahead from 128 columns up, cold weights
+too. Their back-to-back launches were capped by the dispatch rate (about 5 µs) and hid kernel
+duration. Kernel choices are compared on device durations.
+
+What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
+that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
+slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
