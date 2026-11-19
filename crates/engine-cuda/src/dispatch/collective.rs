@@ -19,8 +19,22 @@ fn backend(op: &'static str, detail: impl ToString) -> Error {
 }
 
 impl Run<'_> {
+    /// Whether `id` is a capturing lane's row (`Dim::Capturing`), which no
+    /// arena value holds.
+    fn capture_row(&self, id: poem_ir::ValueId) -> bool {
+        matches!(
+            &self.values()[id.0 as usize].ty,
+            poem_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&poem_ir::Dim::Capturing)
+        )
+    }
+
     fn collective(&mut self, op: &Collective) -> Result<(), Error> {
         match op {
+            Collective::AllReduce { buf, .. } if self.capture_row(*buf) => Err(backend(
+                "collective.all_reduce",
+                "the ranks' score rows lie in each capturing lane's reader, not in the arena, \
+                 and this backend has no sum through the row tables yet",
+            )),
             Collective::AllReduce { buf, buf_out: _ } => {
                 collective::all_reduce(self.ctx(), &mut self.tensor(*buf))
             }

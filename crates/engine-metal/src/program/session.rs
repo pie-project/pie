@@ -629,6 +629,28 @@ impl Session {
         self.prepared.get_mut(stage).and_then(Option::as_mut)
     }
 
+    /// What the completion handler of the frame carrying this instance's
+    /// airborne pass reads to tell its verdict without the lane thread:
+    /// each launched stage's status word, and the commit the harvest will
+    /// make. One pass is airborne an instance (`prepare_airborne`), so
+    /// nothing commits between now and that harvest. `None` with nothing
+    /// airborne.
+    #[must_use]
+    pub fn epilogue_check(&self, plan: &ExecPlan) -> Option<EpilogueCheck> {
+        let launched = self.airborne.as_ref()?;
+        let statuses = launched
+            .iter()
+            .filter_map(|&index| {
+                let prepared = self.prepared.get(index).and_then(Option::as_ref)?;
+                Some((index, prepared.status_region()))
+            })
+            .collect();
+        Some(EpilogueCheck {
+            statuses,
+            commit: self.commit_plan(plan, Stage::Epilogue).map(|_| ()),
+        })
+    }
+
     pub fn settle_launched(&mut self, plan: &ExecPlan) -> Result<Fired> {
         let Some(launched) = self.airborne.take() else {
             return Ok(Fired::Committed);
@@ -753,6 +775,30 @@ impl Session {
     }
 
     fn commit(&mut self, plan: &ExecPlan, at: Stage) -> std::result::Result<(), String> {
+        let (next, bumps) = self.commit_plan(plan, at)?;
+        for (channel, took, put) in bumps {
+            let Some(ring) = self.rings.shared(channel) else {
+                continue;
+            };
+            if took {
+                ring.bump_head();
+            }
+            if put {
+                ring.bump_tail();
+            }
+        }
+        self.cursors = next;
+        Ok(())
+    }
+
+    /// What [`Self::commit`] at `at` would set the cursors to and which
+    /// shared rings it would bump, or why it refuses; nothing moves.
+    #[allow(clippy::type_complexity)]
+    fn commit_plan(
+        &self,
+        plan: &ExecPlan,
+        at: Stage,
+    ) -> std::result::Result<(Vec<Cursor>, Vec<(usize, bool, bool)>), String> {
         let now = self.cursors_now();
         let mut next = now.clone();
         let mut bumps: Vec<(usize, bool, bool)> = Vec::new();
@@ -780,19 +826,7 @@ impl Session {
                 bumps.push((channel, took, put));
             }
         }
-        for (channel, took, put) in bumps {
-            let Some(ring) = self.rings.shared(channel) else {
-                continue;
-            };
-            if took {
-                ring.bump_head();
-            }
-            if put {
-                ring.bump_tail();
-            }
-        }
-        self.cursors = next;
-        Ok(())
+        Ok((next, bumps))
     }
 
     fn shape_of(&self, channel: u32) -> Result<ChannelShape> {
@@ -951,5 +985,42 @@ mod tests {
             Verdict::Committed.worse(Verdict::Committed),
             Verdict::Committed
         ));
+    }
+}
+
+/// An airborne pass's verdict as [`Session::verdict`] will reach it at the
+/// harvest, readable from any thread once its frame's buffer completed
+/// ([`Session::epilogue_check`]).
+pub struct EpilogueCheck {
+    statuses: Vec<(usize, held::Held)>,
+    commit: std::result::Result<(), String>,
+}
+
+impl EpilogueCheck {
+    /// `None` where the pass commits; why it doesn't otherwise. Its
+    /// status words are read here, so only once the buffer completed.
+    #[must_use]
+    pub fn fault(&self) -> Option<String> {
+        let mut verdict = Verdict::Committed;
+        for (stage, status) in &self.statuses {
+            let mut bytes = [0u8; eta_exec::STATUS_BYTES];
+            let read = status
+                .read(0, &mut bytes)
+                .ok()
+                .and_then(|()| eta_exec::Status::read(&bytes));
+            let here = match read.and_then(|status| status.state()) {
+                Some(eta_exec::State::Running | eta_exec::State::Committed) => Verdict::Committed,
+                Some(eta_exec::State::Retry) => Verdict::Declined,
+                other => Verdict::Faulted(format!(
+                    "stage {stage}: its status word reads {other:?} (the harvest logs its report)"
+                )),
+            };
+            verdict = verdict.worse(here);
+        }
+        match verdict {
+            Verdict::Faulted(why) => Some(why),
+            Verdict::Declined => Some("the program declined the pass".to_string()),
+            Verdict::Committed => self.commit.as_ref().err().cloned(),
+        }
     }
 }

@@ -351,6 +351,7 @@ fn four_ranks_land_what_one_rank_lands() {
             lanes: 1,
             instance,
             adapter_only: false,
+            scratch: ::engine::ScratchPlace::None,
         });
         instances.push(instance);
     }

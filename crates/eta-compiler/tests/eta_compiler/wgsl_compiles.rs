@@ -38,6 +38,108 @@ fn wgsl_compiles_every_case() {
     a_sort_ladder_compiles();
     the_shader_declares_the_bindings_a_shell_binds();
     a_stepwise_module_compiles();
+    no_step_module_stores_to_its_tables();
+}
+
+/// The tables a step reads at host-written indices with no device check
+/// (the runtime's `d_word`): no store of any step module reaches one, so a
+/// backend may bind them read_write beside the heap (wgpu's usage scope) and
+/// still lose nothing of the read-only binding's guarantee.
+fn no_step_module_stores_to_its_tables() {
+    const TABLES: [&str; 5] = ["descs", "params", "offs", "cfg", "pie_step"];
+    for call in step_calls() {
+        let source = step_module("main", &call);
+        let module = naga::front::wgsl::parse_str(&source).expect("a step module parses");
+        let tables: Vec<naga::Handle<naga::GlobalVariable>> = module
+            .global_variables
+            .iter()
+            .filter(|(_, var)| {
+                var.name
+                    .as_deref()
+                    .is_some_and(|name| TABLES.contains(&name))
+            })
+            .map(|(handle, _)| handle)
+            .collect();
+        assert_eq!(
+            tables.len(),
+            TABLES.len(),
+            "call {call} declares every table"
+        );
+        let functions = module
+            .functions
+            .iter()
+            .map(|(_, function)| function)
+            .chain(module.entry_points.iter().map(|entry| &entry.function));
+        for function in functions {
+            let mut stores = Vec::new();
+            stores_in(&function.body, &mut stores);
+            for pointer in stores {
+                match root_of(&function.expressions, pointer) {
+                    Root::Global(global) => assert!(
+                        !tables.contains(&global),
+                        "call {call} stores to the table `{}`",
+                        module.global_variables[global]
+                            .name
+                            .as_deref()
+                            .unwrap_or("?")
+                    ),
+                    Root::Argument => panic!(
+                        "call {call} stores through a pointer argument, which this test                          cannot follow to its table or not"
+                    ),
+                    Root::Local => {}
+                }
+            }
+        }
+    }
+}
+
+fn stores_in(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Expression>>) {
+    for statement in block.iter() {
+        match statement {
+            naga::Statement::Store { pointer, .. } | naga::Statement::Atomic { pointer, .. } => {
+                out.push(*pointer);
+            }
+            naga::Statement::Block(inner) => stores_in(inner, out),
+            naga::Statement::If { accept, reject, .. } => {
+                stores_in(accept, out);
+                stores_in(reject, out);
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                stores_in(body, out);
+                stores_in(continuing, out);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    stores_in(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+enum Root {
+    Global(naga::Handle<naga::GlobalVariable>),
+    Argument,
+    Local,
+}
+
+fn root_of(
+    expressions: &naga::Arena<naga::Expression>,
+    mut at: naga::Handle<naga::Expression>,
+) -> Root {
+    loop {
+        match expressions[at] {
+            naga::Expression::GlobalVariable(global) => return Root::Global(global),
+            naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
+                at = base;
+            }
+            naga::Expression::FunctionArgument(_) => return Root::Argument,
+            _ => return Root::Local,
+        }
+    }
 }
 
 fn the_runtime_compiles() {

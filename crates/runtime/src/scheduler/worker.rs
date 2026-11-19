@@ -342,6 +342,10 @@ pub(crate) enum PoolOp {
     /// An instance's tables or a ring were unparked into these slots
     /// (`Engine::rebind_slots`), ahead of every fire queued after it.
     Rebind(::engine::Rebind),
+    /// Every copy submitted so far has landed (`Engine::settle_copies`):
+    /// what an aborted move waits for before it gives back slots a copy may
+    /// still be writing.
+    SettleCopies,
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -3100,8 +3104,21 @@ impl BatchScheduler {
                         in_flight_control.settling[index].state =
                             ControlSlotState::Ready(completion);
                     }
-                    Err(_) => {
-                        in_flight_control.settling.remove(index);
+                    // Refused on the lane (or the lane dropped it): what
+                    // waits on the copy is told now, never left waiting on
+                    // a completion that cannot come (a residency move held
+                    // its items moving for good).
+                    Err(error) => {
+                        let pending = in_flight_control.settling.remove(index);
+                        if let Some(tracked) = pending.tracked_completion.as_ref() {
+                            tracked.resolve(&Err(anyhow!("{error}")));
+                        }
+                        if let Some(logical) = pending.logical_completion.as_ref() {
+                            logical.reject_unsubmitted(format!(
+                                "pre-launch {} failed: {error}",
+                                pending.operation
+                            ));
+                        }
                     }
                 }
             }
@@ -3178,6 +3195,22 @@ mod tests {
     struct PanickingEngine;
 
     impl engine::Engine for PanickingEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "panicking"
         }
@@ -3321,6 +3354,46 @@ mod tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 48);
         want.release();
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// A control the lane refuses or drops (a panic on the copy, the
+    /// reply lost) tells what waits on it: a residency move's copy waited
+    /// on a completion that never came, and the move held its items moving
+    /// for good (Mac Pro's M5: every restore of a pair's other holders
+    /// waited on it).
+    #[test]
+    fn a_refused_control_tells_its_tracked_completion() {
+        let tracked = crate::scheduler::ControlCompletion::new();
+        let mut controls = InFlightControls::default();
+        controls.settling.push(PendingControl {
+            state: ControlSlotState::Posted { id: 41 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(tracked.clone()),
+            operation: "tracked roles copy",
+            holds_launches: false,
+            prelaunch: false,
+        });
+        let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
+        BatchScheduler::apply_control_commit(
+            41,
+            LaneCommit::AsyncControl {
+                result: Err("the engine lane dropped this control unanswered".to_string()),
+            },
+            &mut controls,
+            &mut HashMap::new(),
+            &mut FramePolicy::new(1, 1, 1, None),
+            &rollback,
+            0,
+        );
+        assert!(controls.settling.is_empty());
+        let told = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(5), tracked.wait()).await
+        })
+        .expect("told, never left waiting");
+        let error = told.expect_err("told it failed");
+        assert!(error.to_string().contains("unanswered"), "{error}");
     }
 
     #[test]
@@ -3523,6 +3596,22 @@ mod tests {
     }
 
     impl engine::Engine for ExhaustedEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "exhausted"
         }
@@ -3621,6 +3710,22 @@ mod tests {
     }
 
     impl engine::Engine for InlineEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "inline"
         }
@@ -3749,6 +3854,22 @@ mod tests {
     }
 
     impl engine::Engine for LaneFaultEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "lane-fault"
         }
@@ -3847,6 +3968,7 @@ mod tests {
                             lanes: 1,
                             instance: instance(lane),
                             adapter_only: false,
+                            scratch: ::engine::ScratchPlace::None,
                         })
                         .collect(),
                     media: Vec::new(),
@@ -3996,6 +4118,22 @@ mod tests {
     }
 
     impl engine::Engine for LaneRefusalEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "lane-refusal"
         }
@@ -4128,6 +4266,7 @@ mod tests {
                             lanes: 1,
                             instance: ::engine::InstanceId(fires[lane as usize].0),
                             adapter_only: false,
+                            scratch: ::engine::ScratchPlace::None,
                         })
                         .collect(),
                     media: Vec::new(),
@@ -4346,6 +4485,22 @@ mod tests {
     struct HoldingEngine;
 
     impl engine::Engine for HoldingEngine {
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies complete inside the call: their sources are
+        /// read by the time it returns.
+        fn copy_slots_landing(
+            &mut self,
+            copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            self.copy_slots(copy)?;
+            Ok(true)
+        }
+
         fn kind(&self) -> &'static str {
             "holding"
         }
