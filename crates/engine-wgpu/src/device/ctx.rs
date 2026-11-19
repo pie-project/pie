@@ -244,24 +244,30 @@ impl Core {
         }
     }
 
-    /// Stocks a uniform and a scratch chunk for each of `frames` frames in
-    /// flight, at load: a frame takes at most one of each, and gives it back
-    /// when it is dropped.
-    pub(crate) fn stock_rings(&self, frames: usize) {
-        // One buffer of a region a frame, so a bind group made once binds
-        // every frame's scalars, at a dynamic offset into its region.
+    /// Makes the uniform buffer frames write their dispatches' scalars to,
+    /// with the device: one buffer of a region a frame, so a bind group made
+    /// once binds every frame's scalars at a dynamic offset into its region,
+    /// for the most frames in flight any load of this engine takes
+    /// ([`engine::runahead::Runahead::MAX_FRAMES`]) and the one beside them.
+    pub(crate) fn stock_uniforms(&self) {
+        let frames = u64::from(engine::runahead::Runahead::MAX_FRAMES) + 1;
         let buffer = self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK * frames as u64,
+                size: UNIFORM_CHUNK * frames,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             },
             engine_gpu::books::owners::UNIFORMS,
         );
         if self.uniform_buffer.set(buffer).is_ok() {
-            self.return_uniforms((0..frames as u64).map(|at| at * UNIFORM_CHUNK).collect());
+            self.return_uniforms((0..frames).map(|at| at * UNIFORM_CHUNK).collect());
         }
+    }
+
+    /// Stocks a scratch chunk for each of `frames` frames in flight, at load:
+    /// a frame takes at most one, and gives it back when it is dropped.
+    pub(crate) fn stock_rings(&self, frames: usize) {
         let scratch = (0..frames).map(|_| {
             self.held(
                 &wgpu::BufferDescriptor {
@@ -591,6 +597,9 @@ impl Context {
             Memory::Device,
             engine_gpu::books::owners::DUMMY,
         )?;
+        // Every kernel dispatch reads its scalars from this buffer, the
+        // first at the load's rates pass, so it is made with the device.
+        core.stock_uniforms();
         let context = Context {
             max_buffer,
             core,
@@ -752,11 +761,16 @@ impl Context {
     }
 }
 
-/// The uniform buffer's region a frame holds, and the bytes of it written.
+/// The uniform buffer's region a frame holds, the bytes of it taken, and
+/// their image on the host: the frame writes the image through the queue
+/// once before it submits ([`Frame::land_uniforms`]), not a write a dispatch.
 #[derive(Default)]
 pub(crate) struct UniformRegion {
     region: Option<u64>,
     used: u64,
+    image: Vec<u8>,
+    /// The image's bytes already written through the queue.
+    written: u64,
 }
 
 #[derive(Default)]
@@ -874,6 +888,8 @@ impl Frame {
                 let region = core.uniform_chunk()?;
                 ring.region = Some(region);
                 ring.used = 0;
+                ring.image.clear();
+                ring.written = 0;
                 region
             }
         };
@@ -887,6 +903,39 @@ impl Frame {
         }
         ring.used = at + bytes;
         Ok(((**buffer).clone(), region + at))
+    }
+
+    /// Puts `bytes` at byte `at` of the uniform buffer (a slot
+    /// [`Frame::uniform_slot`] gave), in the frame's image of its region.
+    pub(crate) fn write_uniform(&self, at: u64, bytes: &[u8]) -> Result<()> {
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = ring.region.ok_or(Fault::Device {
+            call: "write_uniform",
+            why: "a uniform written before its frame took a region".into(),
+        })?;
+        let from = usize::try_from(at - region).unwrap_or(usize::MAX);
+        let to = from + bytes.len();
+        if ring.image.len() < to {
+            ring.image.resize(to, 0);
+        }
+        ring.image[from..to].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Writes what the frame's image holds past what it wrote, in one write
+    /// through the queue, which lands it before the submission that follows.
+    fn land_uniforms(&self) {
+        let core = &self.inner.core;
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let (Some(region), Some(buffer)) = (ring.region, core.uniform_buffer.get()) else {
+            return;
+        };
+        let from = usize::try_from(ring.written).unwrap_or(usize::MAX);
+        if from < ring.image.len() {
+            core.queue
+                .write_buffer(buffer, region + ring.written, &ring.image[from..]);
+            ring.written = ring.image.len() as u64;
+        }
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -1002,6 +1051,7 @@ impl Frame {
 
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
         let taken = self
             .inner
@@ -1031,6 +1081,7 @@ impl Frame {
         }
         self.open = false;
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
         let taken = self
             .inner

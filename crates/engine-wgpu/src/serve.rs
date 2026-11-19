@@ -148,6 +148,10 @@ impl Serve for Api {
         device.bind_frame()
     }
 
+    fn bound(pipelines: &Pipelines) -> u64 {
+        pipelines.bound()
+    }
+
     fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
         Ok(Shelf {
             mirror: readout

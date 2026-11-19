@@ -458,6 +458,18 @@ impl<B: Serve> Serve for Named<B> {
         )
     }
 
+    const BINDS_AT_LOAD: bool = false;
+
+    fn bind_frame(_device: &Facts) -> Result<NoFrame> {
+        Err(Fault::Unbound {
+            what: "a bind walk on the naming load, which keeps nothing a dispatch binds".into(),
+        })
+    }
+
+    fn bound(_pipelines: &Asked<B>) -> u64 {
+        0
+    }
+
     fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
         Ok(NoFrame)
     }

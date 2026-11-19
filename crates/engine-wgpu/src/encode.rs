@@ -513,19 +513,22 @@ impl Sink<'_> {
                 .bind_group(core, &pipeline, &keyed, uniform_bytes)
         } else {
             // Its scratch views are this frame's: a group of its own.
+            self.pipelines.note_scratch_group();
             crate::device::pipelines::group_of(core, &pipeline, &keyed, uniform_bytes)
         }
         .map_err(|fault| Sink::refuse(fire, fault))?;
         // The scalars in this frame's slot, the group reading them there.
         let mut offsets: Vec<u32> = Vec::with_capacity(1);
         if pipeline.uniform.is_some() {
-            let (buffer, at) = self
+            let (_, at) = self
                 .frame
                 .uniform_slot(uniform_bytes)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
             let mut padded = words.clone();
             padded.resize(uniform_bytes as usize, 0);
-            core.queue.write_buffer(&buffer, at, &padded);
+            self.frame
+                .write_uniform(at, &padded)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
             offsets.push(u32::try_from(at).map_err(|_| {
                 Sink::backend(
                     fire,

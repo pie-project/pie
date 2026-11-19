@@ -300,6 +300,13 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BuiltInFire, 1);
             self.warn_in_fire(kernel);
         }
+        // What a dispatch binds, built on the fire's path: the load's walk
+        // built every one it reached.
+        let bound = self.shell.as_mut().map_or(0, Shell::bound_serving);
+        if bound > 0 {
+            self.live.tally(engine::live::Tally::BoundInFire, bound);
+            self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
+        }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
             self.live.tally(engine::live::Tally::Compiled, recorded);
@@ -793,6 +800,7 @@ where
         }
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
+        shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);

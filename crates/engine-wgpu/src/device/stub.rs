@@ -390,6 +390,11 @@ impl Pipelines {
     }
 
     #[must_use]
+    pub fn bound(&self) -> u64 {
+        0
+    }
+
+    #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
     }

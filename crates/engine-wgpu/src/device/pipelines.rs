@@ -222,6 +222,9 @@ pub struct Pipelines {
     binds: RefCell<BindCache>,
     bind_hits: Cell<u64>,
     bind_misses: Cell<u64>,
+    /// Groups a fire made of its own frame's scratch views, which no cache
+    /// keeps.
+    scratch_groups: Cell<u64>,
 }
 
 static BIND_TRAFFIC: [std::sync::atomic::AtomicU64; 2] = [
@@ -275,6 +278,18 @@ impl Pipelines {
     pub fn hold(device: &Context, file: &'static str, key: &'static str) -> Result<()> {
         let (own, pool) = storage(file, key)?;
         engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
+    }
+
+    /// The bind groups made so far: each cache miss, and each group of a
+    /// fire's scratch views ([`engine_gpu::serve::Serve::bound`]).
+    #[must_use]
+    pub fn bound(&self) -> u64 {
+        self.bind_misses.get() + self.scratch_groups.get()
+    }
+
+    /// Counts a group a fire made of its own frame's scratch views.
+    pub(crate) fn note_scratch_group(&self) {
+        self.scratch_groups.set(self.scratch_groups.get() + 1);
     }
 
     #[must_use]

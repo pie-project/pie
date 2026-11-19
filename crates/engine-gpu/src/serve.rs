@@ -159,17 +159,22 @@ pub trait Serve: Backend {
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
-    /// Whether a load walks every fire shape it serves on the device before
-    /// it serves, bind-only ([`Shell::walk_binds`]): a backend that builds
-    /// what a dispatch binds for each set of views (wgpu's bind groups,
-    /// Vulkan's descriptor sets) builds them all there, none in a fire.
-    const BINDS_AT_LOAD: bool = false;
+    /// Whether the backend builds what a dispatch binds for each set of
+    /// views it binds and keeps it (wgpu's bind groups): its load then
+    /// walks every fire shape it serves on the device, bind-only
+    /// ([`Shell::walk_binds`]), so none is built in a fire. A fact of the
+    /// backend: one that keeps nothing per set of views states false.
+    const BINDS_AT_LOAD: bool;
 
     /// The frame a bind walk walks into: its sink builds and keeps what each
     /// dispatch binds and encodes nothing, and the frame is never submitted.
-    fn bind_frame(device: &Self::Context) -> Result<Self::Frame> {
-        Self::walk_frame(device, false)
-    }
+    /// Called only where [`Self::BINDS_AT_LOAD`] holds.
+    fn bind_frame(device: &Self::Context) -> Result<Self::Frame>;
+
+    /// What a dispatch binds the backend has built and kept so far (its bind
+    /// groups): read at ready and after, those built since are a fire's
+    /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
+    fn bound(pipelines: &Self::Pipelines) -> u64;
 
     /// The backend's state of a fresh load over its `readout` seats.
     fn shelf(
@@ -764,6 +769,10 @@ pub struct Shell<B: Serve> {
     blobs: crate::blob::Store,
 
     held: Vec<u32>,
+
+    /// What a dispatch binds the backend had built at the last count
+    /// ([`Shell::bound_serving`]).
+    bound: u64,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
@@ -1868,6 +1877,7 @@ impl<B: Serve> Shell<B> {
 
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
+            bound: 0,
             rs_layout,
             snaps: None,
             last_capture: None,
@@ -2355,6 +2365,13 @@ impl<B: Serve> Shell<B> {
             return Vec::new();
         }
         B::built_since(&self.pipelines, from)
+    }
+
+    /// What a dispatch binds built since the last count
+    /// ([`Serve::bound`]): after the load's own walk, each one a fire built.
+    pub fn bound_serving(&mut self) -> u64 {
+        let now = B::bound(&self.pipelines);
+        now - std::mem::replace(&mut self.bound, now)
     }
 
     /// The steps walked to be kept since the last count: each is a shape a

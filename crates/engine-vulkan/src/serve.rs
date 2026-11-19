@@ -138,6 +138,18 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
+    const BINDS_AT_LOAD: bool = false;
+
+    fn bind_frame(_device: &Context) -> Result<Frame> {
+        Err(engine_gpu::error::Fault::Unbound {
+            what: "a bind walk on Vulkan, which keeps no descriptor set per set of views".into(),
+        })
+    }
+
+    fn bound(_pipelines: &Pipelines) -> u64 {
+        0
+    }
+
     fn walk_frame(device: &Context, keep: bool) -> Result<Frame> {
         if keep {
             device.frame_kept()
