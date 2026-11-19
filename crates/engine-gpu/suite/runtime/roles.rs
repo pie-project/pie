@@ -131,6 +131,7 @@ impl Bound {
                     lanes: 1,
                     instance: self.instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
@@ -218,7 +219,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 host_kv_budget: Some(64 << 20),
                 ..Residency::default()
             },

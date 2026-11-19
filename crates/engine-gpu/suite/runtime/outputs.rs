@@ -290,7 +290,7 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,
@@ -449,6 +449,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),
@@ -606,6 +607,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

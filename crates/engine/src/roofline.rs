@@ -549,6 +549,8 @@ mod tests {
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
             attn_tflops_by_rows_keys: None,
+            tile_tflops_by_rows: None,
+            vector_tflops_by_rows: None,
         };
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [

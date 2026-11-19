@@ -159,9 +159,12 @@ pub trait Serve: Backend {
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
-    /// The backend's state of a fresh load over its `readout` seats.
+    /// The backend's state of a fresh load over its `readout` seats, with
+    /// whatever device memory it keeps for every fire (made before the pool
+    /// is sized, so the pool is sized past it).
     fn shelf(
         device: &Self::Context,
+        pipelines: &Self::Pipelines,
         readout: &[Self::Buffer],
         weights_stream: bool,
     ) -> Result<Self::Shelf>;
@@ -657,6 +660,9 @@ pub struct Shell<B: Serve> {
     /// The highest tier the device runs.
     tier: kernels_slang::Tier,
 
+    /// The dense matmul's tactic at each rung ([`crate::dense`]).
+    dense: crate::dense::Dense,
+
     pipelines: B::Pipelines,
 
     /// What the load named of its fires before it built or reserved.
@@ -1151,32 +1157,53 @@ impl<B: Serve> Shell<B> {
                 .map_or(state, |budget| budget.min(state))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
         };
-        // The dense tactic at each power of two of rows to the asked top:
-        // a matmul of `m` rows runs the tactic of the widest such row count
-        // at or below it.
-        let gemm_by_rows: std::sync::Arc<Vec<(u32, kernels_slang::linear::gemm::Tactic)>> =
-            std::sync::Arc::new(
-                engine::memory::rungs(1, budgets.tokens.max_tokens.max(1))
-                    .into_iter()
-                    .map(|rows| (rows, tuning.gemm(tier, rows)))
-                    .collect(),
-            );
-        let gemm_at = {
-            let table = std::sync::Arc::clone(&gemm_by_rows);
-            move |rows: u32| {
-                table
-                    .iter()
-                    .rev()
-                    .find(|&&(at, _)| at <= rows)
-                    .or(table.first())
-                    .map(|&(_, tactic)| tactic)
-                    .expect("one row count at least")
+        // The dense tactic to the asked top (rungs: every power of two of
+        // rows, then the top): the vector or the tiled kernels, whichever the
+        // estimate weighs faster, one a rung where fires are recorded a rung
+        // (`crate::dense`), else at each fire's rows.
+        let dense = {
+            let top = budgets.tokens.max_tokens.max(1);
+            let mut rungs = engine::memory::rungs(1, top);
+            if rungs.last() != Some(&top) {
+                rungs.push(top);
             }
+            let counts = counts.as_ref().ok_or_else(|| {
+                Fault::Residency(format!(
+                    "the profile states no `[rates]` {:?}, which the dense matmul's kernel at \
+                     each rung is chosen by",
+                    device_profile.rates().missing(&crate::rates::KEYS)
+                ))
+            })?;
+            let (dense, weighed) = crate::dense::choose(
+                B::TARGET,
+                &rungs,
+                |rows| tuning.gemm(tier, rows),
+                &device_profile.rates(),
+                counts,
+                B::RECORDS,
+            )
+            .map_err(|key| {
+                Fault::Residency(format!(
+                    "the profile states no `[rates] {key}`, which the dense matmul's kernel at \
+                     each rung is chosen by"
+                ))
+            })?;
+            // Said once, by the load that serves: its naming walk weighs the same.
+            if !B::NAMES {
+                for w in &weighed {
+                    if B::RECORDS {
+                        tracing::info!("dense matmul {w}");
+                    } else {
+                        tracing::info!("dense matmul {w}; eager, each fire at its own rows");
+                    }
+                }
+            }
+            std::sync::Arc::new(dense)
         };
         let row_tile: engine::roofline::RowTile = {
-            let tactic_at = gemm_at.clone();
+            let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), n, k).row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;
@@ -1437,7 +1464,7 @@ impl<B: Serve> Shell<B> {
                 let padded = |rows: u32| {
                     kernels_slang::linear::gemm::padded_rows(
                         B::TARGET,
-                        gemm_at(rows),
+                        dense.at(rows),
                         rows,
                         counts.width,
                     )
@@ -1756,13 +1783,39 @@ impl<B: Serve> Shell<B> {
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
+        // Every reservation the load makes beside the pool is made before
+        // the pool is sized, so the pool is sized past them: the weight row
+        // and expert caches, and the backend's own state of the load (its
+        // frame rings, where it keeps them).
+        let row_caches = crate::store::rows::RowCaches::new(
+            &device,
+            &boot.trace,
+            row_shapes,
+            boot.budget.max_tokens,
+            chunk,
+            arms,
+        )?;
+        let expert_caches =
+            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
+        let weights_stream = weights.streams() || weights.gathered().is_some();
+        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream)?;
+
+        // The ledger's capacity is what the device has, measured once the
+        // context, the weights and every load-time reservation beside the
+        // pool are up; what the driver holds by then is its own entry.
+        device.books().outside("driver", device.outside());
+        device.books().settle(chunk, device.capacity());
+
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
         // Every pipeline a fire asks for is built by now: what is left is
-        // past what the driver took for them.
-        let left = device.left();
+        // past what the driver took for them. The ledger holds each class in
+        // whole chunks, so what is left is what it leaves: a pool of the
+        // bytes the device leaves would hold up to a chunk a class past what
+        // the device has.
+        let left = device.left().min(device.books().ledger().room());
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1844,11 +1897,6 @@ impl<B: Serve> Shell<B> {
             "the chunk pool is sized to its budget or what the weights and the working set leave; \
              a fire's activation takes its top chunks"
         );
-        // The ledger's capacity is what the device has, measured once the
-        // context, the weights and every load-time reservation are up;
-        // what the driver holds by then is its own entry.
-        device.books().outside("driver", device.outside());
-        device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
             slots,
@@ -1858,16 +1906,6 @@ impl<B: Serve> Shell<B> {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
-        let row_caches = crate::store::rows::RowCaches::new(
-            &device,
-            &boot.trace,
-            row_shapes,
-            boot.budget.max_tokens,
-            chunk,
-            arms,
-        )?;
-        let expert_caches =
-            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment and the span's stand from the load on;
         // a pool laid whole stands whole.
         let segments = pools.load_segments();
@@ -1885,14 +1923,12 @@ impl<B: Serve> Shell<B> {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
-        let weights_stream = weights.streams() || weights.gathered().is_some();
-        let shelf = B::shelf(&device, &readout, weights_stream)?;
-
         let mut shell = Shell {
             preseated: Vec::new(),
             tuning,
             device,
             tier,
+            dense: std::sync::Arc::unwrap_or_clone(dense),
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -2059,24 +2095,84 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`: on the device in queue order; to or from
-    /// the host chunks or the slot file once every frame has landed.
+    /// See `Engine::copy_slots`: landed when this returns. A move off the
+    /// device, which rides the queue past `copy_slots_landing`, is waited
+    /// out here.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
-        if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+        if !self.copy_slots_landing(copy, Some(Box::new(|| ())))? {
+            self.drain()?;
         }
-        let on_device = B::is_device(copy.src) && B::is_device(copy.dst);
-        if !on_device {
+        Ok(())
+    }
+
+    /// See `Engine::copy_slots_landing`: whether the copy's sources may go
+    /// back when this returns.
+    /// - Within the device, and between the device and mapped host chunks:
+    ///   in queue order, behind every frame submitted before, with no
+    ///   drain. A move off the device answers `false`, and `landed` runs
+    ///   once its frame's fence lands: its device slots, once back, may be
+    ///   written by anything; without a `landed` it is refused before
+    ///   anything is encoded. The rest answer
+    ///   `true`: a later write reaching a device source is a fire or copy on
+    ///   the same queue, or a host write that first settles the queue
+    ///   (`Frame::update`, a record's clear after a drain); one reaching a
+    ///   host source is a move onto it on the queue, or a tier write, which
+    ///   drains.
+    /// - A heap host tier and the slot file: every frame lands first and the
+    ///   copy is waited out (or read on the host) in the call: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<bool> {
+        if copy.slots.is_empty() && copy.runs.is_empty() {
+            return Ok(true);
+        }
+        let (src, dst) = (B::is_device(copy.src), B::is_device(copy.dst));
+        let host = |domain| matches!(domain, engine::transfer::MemoryDomain::HostPinned);
+        let queued = (src && dst)
+            || (self.pools.host_mapped() && ((src && host(copy.dst)) || (host(copy.src) && dst)));
+        let parks = src && !dst;
+        let landed = match landed {
+            Some(landed) => Some(landed),
+            None if queued && parks => {
+                return Err(Fault::Unbound {
+                    what: "a copy on the device with no landing sink installed \
+                           (Engine::on_landed comes before any copy_slots_landing)"
+                        .to_string(),
+                });
+            }
+            None => None,
+        };
+        if !queued {
             self.drain()?;
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&self.device, &mut frame, copy)?;
-        if on_device {
-            self.grafted = Some(frame.commit_async(None)?);
-        } else {
+        if !queued {
             frame.commit()?;
+            return Ok(true);
         }
-        Ok(())
+        match landed.filter(|_| parks) {
+            Some(landed) => {
+                // Told landed whether or not the submission faulted: the
+                // fault reaches the next wait on it (`drain`).
+                let on_done: crate::backend::OnDone = Box::new(move |_refused| landed());
+                self.grafted = Some(frame.commit_async(Some(on_done))?);
+                Ok(false)
+            }
+            None => {
+                self.grafted = Some(frame.commit_async(None)?);
+                Ok(true)
+            }
+        }
+    }
+
+    /// See `Engine::settle_copies`: every frame and copy in flight lands,
+    /// a slot file read's copy onto the device too.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        self.drain()?;
+        self.pools.settle_spill()
     }
 
     /// See `Engine::read_tier_slots`: every frame and copy lands first.
@@ -2953,6 +3049,12 @@ impl<B: Serve> Shell<B> {
             .iter()
             .map(|plane| plane.output.clone())
             .collect()
+    }
+
+    /// The pixel planes the load reads out.
+    #[must_use]
+    pub fn pixel_planes(&self) -> usize {
+        self.pixels.len()
     }
 
     /// Pixel plane `plane`'s output name.
@@ -4586,6 +4688,7 @@ impl<B: Serve> Shell<B> {
                 self.weights.hashes(),
                 &self.tuning,
                 self.tier,
+                &self.dense,
                 self.weights.gathered(),
                 self.weights.host(),
             )

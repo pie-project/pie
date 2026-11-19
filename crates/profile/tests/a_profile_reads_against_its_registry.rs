@@ -955,6 +955,8 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             workgroups_per_core: None,
             submit_worst_ratio: None,
             attn_tflops_by_rows_keys: None,
+            tile_tflops_by_rows: None,
+            vector_tflops_by_rows: None,
         }
     );
 

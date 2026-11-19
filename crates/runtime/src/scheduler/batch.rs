@@ -427,6 +427,7 @@ pub(crate) fn build_frame_submission(
                 lanes,
                 instance,
                 adapter_only,
+                scratch: ::engine::ScratchPlace::None,
             });
         }
         steps.push(StepFire {
@@ -657,6 +658,39 @@ mod tests {
                 && refused.contains("128 rows the engine's readout store holds"),
             "refused by name: {refused}"
         );
+    }
+
+    /// Prompts reading every row of themselves (prompt logprobs) beside
+    /// decodes, against a 128-row readout store: every fire's sequence
+    /// readouts are cut to the store, every lane served. The engine lays a
+    /// fire with such a lane at the store's rows (XLA's warm ladder), so a
+    /// fire past it is unreachable from serving, and one prompt alone past
+    /// it is refused by name (`a_float_pass_past_the_readout_store_fires_whole`).
+    #[test]
+    fn prompts_reading_every_row_are_cut_to_the_readout_store() {
+        let store = ::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        };
+        let limits = reading(&store);
+        let logprobs = |instance: u64| {
+            let mut lane = crate::engine::fire::lane_of(0, (0..40).collect(), 0, vec![1]);
+            lane.readout = ::engine::Readout::Rows((0..40).collect());
+            pending(FireRequest::one(lane), InstanceId(instance))
+        };
+        let mut requests: Vec<Box<PendingRequest>> = (0..6).map(logprobs).collect();
+        requests.extend((10..20).map(|i| pending(decode(1, 1), InstanceId(i))));
+        let (readouts, lanes) = read_out(requests, limits);
+        assert!(
+            readouts.iter().all(|&rows| rows <= 128),
+            "every fire reads out no more than the store holds: {readouts:?}"
+        );
+        assert!(
+            readouts.len() > 1,
+            "the prompts are cut across fires: {readouts:?}"
+        );
+        assert_eq!(lanes, 16, "every lane is served");
+        assert_eq!(readouts.iter().sum::<usize>(), 6 * 40 + 10);
     }
 
     /// Two unframed float requests whose rows together pass the readout

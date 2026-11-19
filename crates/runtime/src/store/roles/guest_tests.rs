@@ -181,7 +181,9 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                per_instance,
+                resident: per_instance,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair,
                 run: 1,
             },
@@ -193,6 +195,22 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-guests"
     }
@@ -231,6 +249,7 @@ impl Engine for GuestEngine {
         &self,
         _program: ProgramId,
         _extents: &BindExtents,
+        _class: eta_ir::registry::GeometryClass,
     ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }
@@ -1818,6 +1837,60 @@ fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
 
+/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// parked guest's freed run filled by another bind, then its restore. The
+/// unpark is short and waits, naming the runs of chunks it needs (what the
+/// planner funds, `RolesError::unpark_runs`), never refused; once room
+/// comes it lands.
+#[test]
+fn a_restore_short_of_its_run_waits_with_its_need_and_lands_once_room_comes() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    let (parked, _) = bound[0];
+    park(&roles, parked);
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the freed run is taken");
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+
+    let error = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect_err("short of its run");
+    assert!(matches!(error, RolesError::UnparkShort(_)), "it waits: {error}");
+    assert_eq!(error.unpark_runs(), Some((4, 1)), "its need, named: {error}");
+
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room came")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// A Channel item that must lie in one run, short of it at a restore,
+/// waits too, its need one whole chunk (any free chunk holds the run).
+#[test]
+fn a_restore_short_of_a_channel_run_waits_for_one_chunk() {
+    let short = RolesError::UnparkShort(Box::new(RolesError::NoRun {
+        role: SlotRole::Channel,
+        slots: 2,
+    }));
+    assert_eq!(short.unpark_runs(), Some((1, 1)));
+    assert!(RolesError::NoRun { role: SlotRole::Channel, slots: 2 }.unpark_runs().is_none(), "only a waiting unpark names one");
+}
+
 /// A frame naming the last instance of a pair is on its way through the
 /// engine when that instance closes: the pair's state (its batch tables,
 /// which every grouped fire of its instances reads) and the instance's own
@@ -1851,4 +1924,112 @@ fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
         "as the frame lands: the pair's two chunks, and the one its instance's scratch run lay in"
     );
     assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+}
+
+/// A pair moving with another process's instances holds a restore back
+/// (`RolesError::PairParked`) until that move ends; an aborted move ends it
+/// as a committed one does, and what waits on it is told (a bind's or a
+/// restore's room watch). Told only at a commit, a move that failed left
+/// them waiting for good. And a pair whose holders all closed (a failed
+/// process's close included) is freed, nothing left of it on the device.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_pair_move_wakes_its_waiters_and_a_pair_of_closed_holders_is_freed() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 1);
+    // The second parks: its pair moves with it.
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(2))
+        .expect("the second and the pair park");
+    // The first's restore meanwhile: its pair is moving.
+    let watch = roles.lock().unwrap().room_watch();
+    assert!(matches!(
+        roles.lock().unwrap().prepare_unpark(holder(1)),
+        Err(RolesError::PairParked(_))
+    ));
+    let woken = tokio::spawn(watch.freed());
+    tokio::task::yield_now().await;
+    assert!(!woken.is_finished(), "the move is under way");
+    roles.lock().unwrap().abort(moving);
+    tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+        .await
+        .expect("an aborted move tells its waiters")
+        .unwrap();
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .expect("the pair stands still now")
+        .expect("it unparks");
+    roles.lock().unwrap().commit(back);
+
+    // Both holders close (a failed process's close included): nothing of
+    // them or their pair is left.
+    roles.lock().unwrap().close_instance(first);
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(held(&device), before, "the pair freed with its last holder");
+}
+
+/// Over-demand with a pair four processes share, every one parked: the
+/// first restore brings the pair back with it, and while those copies are
+/// on their way each other holder's restore finds the pair moving
+/// (`pair_moving` names the instances it moves with) and waits once on
+/// the move's end, told by the commit; then each comes back, the pair
+/// where the first's brought it, and every holder closes leaving nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let ids: Vec<InstanceId> = (1..=4).map(|by| bind(&roles, &mut engine, by).unwrap()).collect();
+    for by in 1..=4 {
+        park(&roles, by);
+    }
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("the first brings the pair back");
+    let mut waits = 0;
+    let mut watches = Vec::new();
+    for by in 2..=4 {
+        let watch = roles.lock().unwrap().room_watch();
+        let unparked = roles.lock().unwrap().prepare_unpark(holder(by));
+        match unparked {
+            Err(RolesError::PairParked(pair)) => {
+                let named = roles.lock().unwrap().pair_moving(pair).expect("moving");
+                assert_eq!(named.len(), 4, "the instances it moves with: {named:?}");
+                waits += 1;
+                watches.push(tokio::spawn(watch.freed()));
+            }
+            other => panic!("the pair is moving: {other:?}"),
+        }
+    }
+    assert_eq!(waits, 3, "one wait each");
+    roles.lock().unwrap().commit(moving);
+    for watch in watches {
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+            .await
+            .expect("the move's end tells each")
+            .unwrap();
+    }
+    for by in 2..=4 {
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("the pair stands still")
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+    }
+    for id in ids {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(held(&device), before);
 }

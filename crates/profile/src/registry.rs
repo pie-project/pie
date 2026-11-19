@@ -1121,13 +1121,20 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
-                "gemm_tflops_by_rows" => {
-                    rates.gemm_tflops_by_rows = self.width_curves(v, "gemm_tflops_by_rows");
+                key @ "gemm_tflops_by_rows" => {
+                    rates.gemm_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
-                crate::fire::ATTN_BY_ROWS_KEYS => {
-                    rates.attn_tflops_by_rows_keys =
-                        self.width_curves(v, crate::fire::ATTN_BY_ROWS_KEYS);
+                key @ "tile_tflops_by_rows" => {
+                    rates.tile_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ "vector_tflops_by_rows" => {
+                    rates.vector_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ crate::fire::ATTN_BY_ROWS_KEYS => {
+                    rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
                     continue;
                 }
                 key @ "attn_tflops_by_keys" => {
@@ -1163,8 +1170,8 @@ impl<'a> Walk<'a> {
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
-                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not \
-                             `{other}`"
+                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `submit_worst_ratio` \
+                             and `attn_tflops_by_rows_keys`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1185,16 +1192,14 @@ impl<'a> Walk<'a> {
         rates
     }
 
-    /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
-    /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
-    /// width.
-    /// `rates.<key>`: `[outer, [[x, rate], ...]]` pairs, ascending in
-    /// `outer`, each curve as [`Self::curve`] reads it (the matmul's by its
-    /// width, the prefixed attention's by its rows).
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,
+    /// `vector_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
+    /// pairs, a whole positive outer key (a width, a row tile, rows) and a
+    /// curve of `[x, TFLOP/s]` each, strictly ascending in the outer key.
     fn width_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
-        key: &'static str,
+        key: &str,
     ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
         let (outer, inner) = if key == crate::fire::ATTN_BY_ROWS_KEYS {
             ("rows", "keys")

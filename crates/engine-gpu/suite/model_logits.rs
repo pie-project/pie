@@ -292,9 +292,12 @@ pub fn load_paged(fixture: &Fixture, page: u32, context: u32, chunk: Option<u64>
 
 /// Held over a load: a driver reports what it holds a process, so a load
 /// prices what its pipelines take while no other test's load allocates.
+/// Taken after the test's share of the device (`gpu::share`), which a test
+/// holding this never waits on.
 static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn loading() -> std::sync::MutexGuard<'static, ()> {
+    crate::gpu::share();
     LOADING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -402,37 +405,27 @@ fn boot<'a>(
     }
 }
 
-/// `residency` with the device's budget a quarter of what it has where it
-/// states none; `None` where no device comes up.
+/// `residency` with the device's budget the test's share of the device
+/// (`gpu::share`) where it states none; `None` where no device comes up.
 fn allowed(
     device: &DeviceBoot,
     residency: engine::load::Residency,
 ) -> Option<engine::load::Residency> {
     // The device is shared: a driver that fails to come up is asked again
-    // before the test is skipped. A load takes what the harness states a
-    // test's load takes; where that is the whole device, at most a quarter of
-    // what the device is measured to have, as tests load at once.
+    // before the test is skipped.
     let mut tries = 0;
-    let quarter = loop {
-        match Context::bind(device, backend::ALLOWANCE) {
-            Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
-            Err(why) => {
-                tries += 1;
-                if tries == 5 {
-                    eprintln!("skipping: no {} device ({why})", backend::NAME);
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+    while let Err(why) = Context::bind(device, backend::ALLOWANCE) {
+        tries += 1;
+        if tries == 5 {
+            eprintln!("skipping: no {} device ({why})", backend::NAME);
+            return None;
         }
-    };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let share = crate::gpu::share();
     Some(engine::load::Residency {
         device: engine::Allowance {
-            budget: residency
-                .device
-                .budget
-                .or(backend::ALLOWANCE.budget)
-                .or(Some(quarter)),
+            budget: residency.device.budget.or(share.budget),
         },
         ..residency
     })
@@ -852,15 +845,24 @@ fn every_rung_of_a_miniature_with_unservable_classes_names_what_the_largest_name
 }
 
 /// A fire whose lanes mix classes so that a region's mask comes in runs: a
-/// plain prompt and a prompt under an adapter, which run the prompt's
-/// attention, with a plain decode between them in the class order. Where
-/// the load copies windows the region's rows are copied into one (its
-/// attention reads the fire's masks, which the copy carries), launching as
-/// the plain prompts do; else it launches a run at a time. Either way the
-/// fire asks for no pipeline the load did not build and encodes no more
-/// dispatches than the load named.
+/// prompt and a decode under an adapter, which run the adapter's region,
+/// with a plain decode between them in the class order. Where the load
+/// copies windows the region's rows are copied into one (its attention
+/// reads the fire's masks, which the copy carries), launching as the same
+/// fire without the plain decode does; else it launches a run at a time.
+/// Either way the fire asks for no pipeline the load did not build and
+/// encodes no more dispatches than the load named.
+///
+/// The lanes are the order's, read off the compiled model, not assumed:
+/// since the mask is per-lane data (5b538b76d, 20a6c0cdf) a lane's mask is
+/// no class bit, so the seriated order lays every prompt class before every
+/// decode class, and a plain prompt beside an adapted one (this test's fire
+/// before the fold) cuts no region.
 #[test]
 fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
+    use poem_exec::fire::fallback;
+    use poem_ir::{ClassSet, RowAxis};
+
     let fixture = fixture("qwen3-micro-text", None);
     let Some(mut shell) = load(&fixture, CONTEXT) else {
         return;
@@ -870,15 +872,57 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     let tokens: Vec<u32> = (0..CONTEXT).map(|at| (at * 37 + 11) % 256).collect();
     const ROWS: usize = 8;
     let plain = |rows: usize| word(&fixture.trace, rows as u32);
-    let adapted = fixture
-        .trace
-        .facts
-        .word(&Request::new(ROWS as u32, false).adapted(true));
+    let adapted = |rows: usize| {
+        fixture
+            .trace
+            .facts
+            .word(&Request::new(rows as u32, false).adapted(true))
+    };
     assert_ne!(
-        adapted,
+        adapted(ROWS),
         plain(ROWS),
         "the fixture tells an adapted lane apart"
     );
+
+    // The adapted prompt, the plain decode and the adapted decode lie in
+    // that turn of the class order, and a region holds both adapted lanes'
+    // classes and not the plain decode's: the fire cuts it.
+    {
+        let compiled = shell.compiled_model();
+        let axis = RowAxis::Tokens;
+        let classes = compiled.classes.classes.len();
+        let class = |word: u64| {
+            compiled
+                .classes
+                .classes
+                .iter()
+                .position(|class| class.words.contains(&word))
+                .unwrap_or_else(|| panic!("no class holds word {word:#x}"))
+        };
+        let order = compiled
+            .order_for(axis)
+            .map(|order| order.class_order(&ClassSet::of(0..classes)))
+            .unwrap_or_default();
+        let turn = |word: u64| {
+            order
+                .iter()
+                .position(|&at| usize::from(at) == class(word))
+                .expect("the order holds every class")
+        };
+        let (a, b, c) = (adapted(ROWS), plain(1), adapted(1));
+        assert!(
+            turn(a) < turn(b) && turn(b) < turn(c),
+            "the class order {order:?} does not lay the plain decode between the adapted lanes"
+        );
+        let cut = compiled.template().iter().enumerate().any(|(at, region)| {
+            compiled.axis_of(at) == axis
+                && !fallback::promised(compiled, axis, region)
+                && region.mask.contains(class(a))
+                && region.mask.contains(class(c))
+                && !region.mask.contains(class(b))
+        });
+        assert!(cut, "no region holds the adapted lanes and not the plain decode");
+    }
 
     // Three plain prompts seat their rows: no region is cut.
     let seated: Vec<Seated<'_>> = (0..3)
@@ -894,11 +938,9 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     shell
         .fire_seated(&seated)
         .expect("three plain prompts fire");
-    let (_, whole) = shell.walked_serving();
+    shell.walked_serving();
     shell.recorded_serving();
 
-    // A new plain prompt, a decode of the second seat, and a new prompt
-    // under an adapter.
     let lane = |slot: u32, held: u32, word: u64, rows: usize| Seated {
         held: Some(held),
         ..Seated::of(Lane {
@@ -907,16 +949,29 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
             tokens: &tokens[..rows],
         })
     };
-    let seated = [
-        lane(0, 0, plain(ROWS), ROWS),
-        lane(1, ROWS as u32, plain(1), 1),
+    fn under(seated: Seated<'_>) -> Seated<'_> {
         Seated {
             adapter: Some(0),
-            ..lane(2, 0, adapted, ROWS)
-        },
+            ..seated
+        }
+    }
+    // A new prompt under an adapter and a decode of the third seat under
+    // it: the adapter's region in one run.
+    let whole = [
+        under(lane(0, 0, adapted(ROWS), ROWS)),
+        under(lane(2, ROWS as u32, adapted(1), 1)),
+    ];
+    shell.fire_seated(&whole).expect("the adapted fire fires");
+    let (_, whole) = shell.walked_serving();
+
+    // The same with a plain decode of the second seat between them.
+    let seated = [
+        under(lane(0, 0, adapted(ROWS), ROWS)),
+        lane(1, ROWS as u32, plain(1), 1),
+        under(lane(2, ROWS as u32 + 1, adapted(1), 1)),
     ];
     let got = shell.fire_seated(&seated).expect("the mixed fire fires");
-    assert!(got[..2].iter().all(|row| row.iter().all(|v| v.is_finite())));
+    assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
     let (dispatches, launches) = shell.walked_serving();
     if shell.copies() {
         assert_eq!(
@@ -926,7 +981,7 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     } else {
         assert!(
             launches > whole,
-            "the mixed fire cut no region: {launches} launches, {whole} of the plain prompts"
+            "the mixed fire cut no region: {launches} launches, {whole} without the plain decode"
         );
     }
     assert_eq!(
@@ -1141,6 +1196,12 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
         Some(64 << 10),
         engine::load::Residency {
             host_kv_budget: Some(256 << 20),
+            // State well within the kernels' index of the pool (8 GiB of
+            // 64 KiB chunks), whatever the device has: a pool whose state
+            // reaches it states every rung at the span's chunks and lends
+            // none (`store::pool::sized`), so a share of a large device
+            // would leave no narrow rung to test.
+            device_kv_budget: Some(256 << 20),
             ..engine::load::Residency::default()
         },
     ) else {
@@ -1244,6 +1305,116 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
         "a two-lane fire wrote lent span chunks {lent:?} (rung chunks {narrow} of {widest}, \
          total {total})"
     );
+}
+
+/// A park to the host tier is told landed only once it has read its device
+/// slots (or has read them when it returns): what the runtime gives those
+/// slots to next (any shape, written by anything, not a fire alone) cannot
+/// reach the parked bytes. The slots are overwritten from the host the
+/// moment the park is told landed, outside any frame, and the host tier
+/// still holds what they held.
+#[test]
+fn a_park_is_told_landed_once_it_has_read_its_slots() {
+    use engine::chunk::{SlotCopy, SlotKind};
+    use engine::transfer::MemoryDomain;
+    use engine_gpu::backend::Buffer as _;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        Some(64 << 10),
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    let host = MemoryDomain::HostPinned;
+    let facts = shell.pool_chunk_facts();
+    shell
+        .commit_segments(facts.segments.max.min(4))
+        .expect("the segments commit");
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.id == LIST && matches!(shape.kind, SlotKind::List { .. }))
+        .expect("a kv list");
+    let per = list.slots_per_chunk;
+    let n = per.min(4);
+    // Device slots of chunk 1 (chunk 0 is the null chunk).
+    let slots: Vec<u32> = (per..per + n).collect();
+    let (seed, parked, back): (Vec<u32>, Vec<u32>, Vec<u32>) = (
+        (0..n).collect(),
+        (n..2 * n).collect(),
+        (2 * n..3 * n).collect(),
+    );
+    let pattern: Vec<u8> = (0..u64::from(n) * list.slot_bytes)
+        .map(|at| (at * 13 + 7) as u8 ^ (at >> 9) as u8)
+        .collect();
+    let pairs = |from: &[u32], to: &[u32]| from.iter().copied().zip(to.iter().copied()).collect();
+    let copy = |src, dst, slots| SlotCopy {
+        shape: LIST,
+        src,
+        dst,
+        slots,
+        runs: Vec::new(),
+    };
+    shell
+        .write_tier_slots(&[(LIST, seed.clone())], &pattern)
+        .expect("the host slots take the pattern");
+    for round in 0..8u8 {
+        shell
+            .copy_slots(&copy(host, device, pairs(&seed, &slots)))
+            .expect("the slots land on the device");
+        // On the queue past the call where the host chunks are mapped, told
+        // landed from its fence; else waited out in the call.
+        let (told, landed) = std::sync::mpsc::channel();
+        let now = shell
+            .copy_slots_landing(
+                &copy(device, host, pairs(&slots, &parked)),
+                Some(Box::new(move || {
+                    let _ = told.send(());
+                })),
+            )
+            .expect("the slots park");
+        if !now {
+            landed
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the park is told landed");
+        }
+        // The slots go to their next owner, which writes them at once.
+        for &slot in &slots {
+            let (buffer, at) = shell
+                .pools()
+                .slot_place(LIST, slot)
+                .expect("a device slot's place");
+            buffer
+                .write_shared(at, &vec![0x5a ^ round; list.slot_bytes as usize])
+                .expect("the next owner writes the slot");
+        }
+        let held = shell
+            .read_tier_slots(&[(LIST, parked.clone())])
+            .expect("the parked slots read");
+        assert!(
+            held == pattern,
+            "round {round}: the host tier holds what the slots held when the park landed"
+        );
+        // The overwrite reached the device slots.
+        shell
+            .copy_slots(&copy(device, host, pairs(&slots, &back)))
+            .expect("the overwritten slots read back");
+        let theirs = shell
+            .read_tier_slots(&[(LIST, back.clone())])
+            .expect("the overwritten slots read");
+        assert!(
+            theirs.iter().all(|&byte| byte == 0x5a ^ round),
+            "round {round}: the next owner's bytes are on the device"
+        );
+    }
+    shell.settle_copies().expect("every copy settles");
 }
 
 /// A masked fire after a partial fold: a lane's mask speaks of the keys from
@@ -1663,8 +1834,9 @@ fn serve_refs(
 /// A model served out of the chunk pool lands the same logits, bit for bit,
 /// wherever its slots sit: in the seats' own runs, or scattered over chunks
 /// the runtime names by slot refs in a segment of their own, those chunks
-/// evacuated mid-decode below it and that segment given back, the decode
-/// running on through the moved chunks.
+/// evacuated mid-decode below it and that segment given back (where the
+/// pool grows; a pool laid whole at its load keeps it), the decode running
+/// on through the moved chunks.
 fn scattered(model: &str) -> Vec<Vec<f32>> {
     scattered_at(model, None)
 }
@@ -1735,7 +1907,14 @@ fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
             shell
                 .release_segments(kept)
                 .expect("the top segments go back");
-            assert_eq!(shell.pool_chunk_facts().segments.committed, kept);
+            // A pool laid whole at its load (`Growth::Fixed`, as wgpu lays
+            // it) stands whole: it gives no segment back.
+            let stands = if facts.segments.growth == engine::chunk::Growth::Fixed {
+                facts.segments.max
+            } else {
+                kept
+            };
+            assert_eq!(shell.pool_chunk_facts().segments.committed, stands);
         },
     );
     same(

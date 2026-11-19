@@ -55,6 +55,9 @@ pub struct Metal {
     adapters: BTreeMap<InstanceId, u32>,
     /// What the load armed and what its fires tallied (`engine::live`).
     live: engine::live::Live,
+    /// Where a tier copy still landing is told landed
+    /// (`Engine::copy_slots_landing`).
+    landed: Option<engine::LandingSink>,
 }
 
 impl Metal {
@@ -86,6 +89,7 @@ impl Metal {
             pending: None,
             adapters: BTreeMap::new(),
             live: engine::live::Live::armed(),
+            landed: None,
         }
     }
 
@@ -795,6 +799,34 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    /// Waits on the last copy's command buffer: every copy submitted so far
+    /// has read its sources and written its destinations.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.settle_copies().map_err(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// A copy on the device rides a command buffer that may still be
+    /// reading its sources when the call returns: told landed from that
+    /// buffer's completion. A move to or from the host tier or the slot
+    /// files is a host copy done inside the call: its sources are read.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self.landed.clone();
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
@@ -964,6 +996,15 @@ impl Engine for Metal {
         Ok(())
     }
 
+    /// Commits the epilogues of every landed step (their sink was told from
+    /// the completion handler) before the runtime takes their channels.
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.reap().map_err(fault)?;
+        }
+        Ok(())
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
         if let Some(shell) = self.shell.as_mut() {
@@ -1056,6 +1097,8 @@ impl Engine for Metal {
         &self,
         program: ProgramId,
         at: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         self.loaded()?
             .guest_state(program, &extents(at))
@@ -1185,7 +1228,15 @@ impl Engine for Metal {
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
+        self.loaded_mut()?
+            .program_instance_taking(instance, channel)
+            .map_err(fault)?
+            .ok_or(Error::Closed {
+                what: "instance",
+                id: instance.0,
+            })?
+            .take(channel)
+            .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -1422,6 +1473,8 @@ impl Metal {
                     pages: pages_of[at].as_deref().unwrap_or(&[]),
                     held: pages_of[at].is_some().then_some(lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),

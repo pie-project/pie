@@ -23,6 +23,10 @@
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
 //! few_row_tflops = 4.2     # bf16 matmul TFLOP/s at 4-256 rows, as served
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
+//! # each tiled kernel's TFLOP/s by rows below its full fill, keyed by its row tile
+//! tile_tflops_by_rows = [[32, [[8, 1.0], [256, 9.0]]], [256, [[8, 0.2], [256, 12.0]]]]
+//! # each vector kernel's TFLOP/s by rows, keyed by the rows a workgroup carries
+//! vector_tflops_by_rows = [[1, [[1, 0.3], [256, 2.0]]], [16, [[1, 0.1], [256, 6.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -59,7 +63,8 @@ pub struct Rates {
     /// Dense bf16 matmul TFLOP/s (two flops a multiply-add) at decode-shaped
     /// rows, 4 to 256 (below the first row count `gemm_tflops_by_rows`
     /// times), on the kernel serving picks at those rows (on the slang
-    /// backends the plain tiled `linear_gemm_tiled_bf16`): the rate its
+    /// backends the vector kernels, which a rung takes where the estimate
+    /// weighs them faster): the rate its
     /// compute runs at once its weight reads no longer bound it, its flops
     /// counted over the rows its kernel's tile pads to. A matmul of that few
     /// rows costs `launch_ns + max(bytes / hbm_gbps, padded flops /
@@ -98,10 +103,23 @@ pub struct Rates {
     /// it runs. Measured, and read, only where the platform states a bound
     /// on one submission (`engine_gpu::submit`); not one of [`KEYS`].
     pub attn_tflops_by_rows_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    /// Each tiled matmul kernel's bf16 TFLOP/s by rows below the matmul
+    /// curve's, its flops counted at the rows it lands (not its tile's):
+    /// `(row tile, [(rows, TFLOP/s)])`, ascending in row tile, keyed by the
+    /// rows one tile of the kernel computes (the slang backends' tiles).
+    /// What a matmul of few rows costs on each tiled kernel, so a choice
+    /// between them and the vector kernels weighs measured costs at partial
+    /// fill. Measured.
+    pub tile_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    /// Each vector matmul kernel's bf16 TFLOP/s by rows, its flops at the
+    /// rows it lands over its time (its weight passes in it): `(rows a
+    /// workgroup carries, [(rows, TFLOP/s)])`, ascending in the rows a
+    /// workgroup carries (the slang backends' vector kernels). Measured.
+    pub vector_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 10] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -110,6 +128,8 @@ pub const KEYS: [&str; 8] = [
     "scan_gelems",
     "few_row_tflops",
     "workgroups_per_core",
+    "tile_tflops_by_rows",
+    "vector_tflops_by_rows",
 ];
 
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
@@ -138,6 +158,8 @@ impl Rates {
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
                 .or(below.attn_tflops_by_rows_keys),
+            tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
+            vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
         }
     }
 
@@ -174,6 +196,14 @@ impl Rates {
                 .attn_tflops_by_rows_keys
                 .clone()
                 .filter(|_| has(ATTN_BY_ROWS_KEYS)),
+            tile_tflops_by_rows: self
+                .tile_tflops_by_rows
+                .clone()
+                .filter(|_| has("tile_tflops_by_rows")),
+            vector_tflops_by_rows: self
+                .vector_tflops_by_rows
+                .clone()
+                .filter(|_| has("vector_tflops_by_rows")),
         }
     }
 
@@ -193,6 +223,8 @@ impl Rates {
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
+            "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
+            "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -211,9 +243,9 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
-        let curves = |key: &str, by: &Option<Vec<(u32, Vec<(u32, f64)>)>>, out: &mut String| {
-            if let Some(widths) = by {
-                let curves: Vec<String> = widths
+        let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
+            if let Some(keyed) = v {
+                let curves: Vec<String> = keyed
                     .iter()
                     .map(|(w, c)| {
                         let points: Vec<String> =
@@ -224,7 +256,7 @@ impl Rates {
                 let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
             }
         };
-        curves("gemm_tflops_by_rows", &self.gemm_tflops_by_rows, &mut out);
+        keyed(&mut out, "gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
         let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
             if let Some(points) = v {
                 let points: Vec<String> = points
@@ -246,7 +278,13 @@ impl Rates {
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
         float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
-        curves(ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys, &mut out);
+        keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
+        keyed(
+            &mut out,
+            "vector_tflops_by_rows",
+            &self.vector_tflops_by_rows,
+        );
+        keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         out
     }
 }
@@ -399,11 +437,18 @@ mod tests {
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
             attn_tflops_by_rows_keys: None,
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
             rates.only(&KEYS[..6]).missing(&KEYS),
-            ["few_row_tflops", "workgroups_per_core"]
+            [
+                "few_row_tflops",
+                "workgroups_per_core",
+                "tile_tflops_by_rows",
+                "vector_tflops_by_rows"
+            ]
         );
         assert_eq!(
             rates.toml(),
@@ -411,7 +456,7 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\n"
+             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
         );
     }
 

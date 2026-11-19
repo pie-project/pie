@@ -295,19 +295,48 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::UNIFORMS,
-        )
+    /// Stocks a uniform and a scratch chunk for each of `frames` frames in
+    /// flight, at load: a frame takes at most one of each, and gives it back
+    /// when it is dropped.
+    pub(crate) fn stock_rings(&self, frames: usize) {
+        let uniforms = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie uniforms"),
+                    size: UNIFORM_CHUNK,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::UNIFORMS,
+            )
+        });
+        self.return_uniforms(uniforms.collect());
+        let scratch = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie scratch"),
+                    size: self.pooled_scratch(),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::FRAME_SCRATCH,
+            )
+        });
+        self.return_scratch(scratch.collect());
+    }
+
+    pub(crate) fn uniform_chunk(&self) -> Result<Held> {
+        self.uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a uniform chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
@@ -317,41 +346,33 @@ impl Core {
             .extend(chunks);
     }
 
-    /// A scratch chunk that holds `bytes`, refused by name past the most
-    /// one reservation takes.
+    /// A scratch chunk for a frame, stocked at load: one holds at most
+    /// [`Core::pooled_scratch`] bytes, refused by name past it.
     pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
-        if bytes > self.bound {
+        let pooled = self.pooled_scratch();
+        if bytes > pooled {
             return Err(Fault::Ceiling {
                 what: "bytes of one scratch reservation",
                 need: bytes,
-                have: self.bound,
+                have: pooled,
             });
         }
-        let pooled = self.pooled_scratch();
-        if bytes <= pooled
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return Ok(chunk);
-        }
-        Ok(self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie scratch"),
-                size: bytes.max(pooled),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::FRAME_SCRATCH,
-        ))
+        self.scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a scratch chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
-        self.scratch.lock().expect("scratch lock poisoned").extend(
-            chunks
-                .into_iter()
-                .filter(|c| c.size() == self.pooled_scratch()),
-        );
+        self.scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .extend(chunks);
     }
 
     /// The size of a scratch chunk the ring keeps between frames: no larger
@@ -883,18 +904,25 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.uniform_chunk()?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        if at + bytes > UNIFORM_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes of uniforms one frame writes (its chunk)",
+                need: at + bytes,
+                have: UNIFORM_CHUNK,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -926,11 +954,18 @@ impl Frame {
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
-        if ring.chunks.is_empty() || at + bytes > room {
+        if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
             return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if at + bytes > room {
+            return Err(Fault::Ceiling {
+                what: "bytes one frame stages through scratch (its chunk)",
+                need: at + bytes,
+                have: room,
+            });
         }
         ring.used = at + bytes;
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
@@ -1236,6 +1271,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::TEST).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
@@ -1264,7 +1300,7 @@ mod tests {
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
         let bound = device.core.bound;
         assert!(device.max_buffer() <= bound);
-        let past = |fault: Fault, named: &str| match fault {
+        let past = |fault: Fault, named: &str, bound: u64| match fault {
             Fault::Ceiling { what, need, have } => {
                 assert_eq!(what, named);
                 assert!(need > bound, "{need}");
@@ -1273,17 +1309,26 @@ mod tests {
             other => panic!("refused as {other}, not by the bound"),
         };
         let owner = engine_gpu::books::owners::TEST;
-        let held = device.core.books.device();
+        let before = device.core.books.device();
         past(
             Buffer::zeroed(&device, bound + 4, owner)
                 .err()
                 .expect("refused"),
             "bytes of one device reservation",
+            bound,
         );
+        assert_eq!(device.core.books.device(), before, "nothing was reserved");
+        // Scratch is stocked at load in chunks no larger than one
+        // reservation, and a frame takes no more than its chunk.
+        device.core.stock_rings(1);
+        let pooled = device.core.pooled_scratch();
+        assert!(pooled <= bound);
+        let held = device.core.books.device();
         let frame = device.frame().unwrap();
         past(
-            frame.scratch_slot(bound + 256).err().expect("refused"),
+            frame.scratch_slot(pooled + 256).err().expect("refused"),
             "bytes of one scratch reservation",
+            pooled,
         );
         assert_eq!(device.core.books.device(), held, "nothing was reserved");
         frame.commit().unwrap();

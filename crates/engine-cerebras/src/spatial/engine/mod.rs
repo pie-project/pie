@@ -296,9 +296,25 @@ impl Engine for Spatial {
         })
     }
 
+    /// The wafer program copies no slot between tiers: nothing to wait for.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
     /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
     /// runtime moves its kv through `copy_kv`; there is no shared pool and
     /// no host or disk tier to move slots between.
+    /// Refused as [`Engine::copy_slots`] is: the wafer program moves no
+    /// slot between tiers.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let _ = copy;
         Err(Error::Unsupported {

@@ -142,7 +142,25 @@ impl Serve for Api {
         device.frame()
     }
 
-    fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
+    fn shelf(
+        device: &Context,
+        pipelines: &Pipelines,
+        readout: &[Buffer],
+        _weights_stream: bool,
+    ) -> Result<Shelf> {
+        // A frame takes a uniform and a scratch chunk from the rings and a
+        // bind group's uniforms from the pipelines' arena: the rings are
+        // stocked for each frame in flight (an arm a readout seat) and the
+        // one a settle or a walk holds beside them, and the arena's first
+        // chunk is made, here at the load, before the pool is sized past
+        // them. A shell fires frames with or without a guest program.
+        #[cfg(feature = "wgpu")]
+        {
+            device.core().stock_rings(readout.len() + 1);
+            pipelines.stock_arena(device.core());
+        }
+        #[cfg(not(feature = "wgpu"))]
+        let _ = (device, pipelines);
         Ok(Shelf {
             mirror: readout
                 .iter()
@@ -156,7 +174,7 @@ impl Serve for Api {
                 })
                 .collect::<Result<Vec<_>>>()?,
             mailbox: std::sync::Arc::default(),
-            worker: crate::landing::Worker::default(),
+            worker: crate::landing::Worker::new(),
         })
     }
 

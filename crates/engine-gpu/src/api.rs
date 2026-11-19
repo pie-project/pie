@@ -219,6 +219,23 @@ pub fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Rang
     attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
+/// Why an attachment whose program's `embed_indptr` port describes
+/// `described` lanes is refused, where that is more than it spans: its
+/// ports would state the next request's tokens and mask. `None`: they
+/// describe its own lanes.
+#[must_use]
+pub fn overreach(attachment: &engine::fire::Attachment, described: usize) -> Option<String> {
+    let lanes = attachment_lanes(attachment);
+    (described > lanes.len()).then(|| {
+        format!(
+            "instance {} is attached over lanes {}..{} and its `embed_indptr` port describes \
+             {described} lane(s): a program's ports state its own lanes' geometry, never the \
+             next request's",
+            attachment.instance, lanes.start, lanes.end
+        )
+    })
+}
+
 /// The runtime's engine over a backend's device: one shell, its program
 /// plane, and the frame in flight.
 pub struct Gpu<B: Host> {
@@ -230,6 +247,8 @@ pub struct Gpu<B: Host> {
     next_frame: u64,
 
     pub sink: Option<engine::CompletionSink>,
+    /// Where a move off the device still on the queue is told landed.
+    landed: Option<engine::LandingSink>,
 
     pending: Option<(FrameId, Vec<PendingStep>)>,
 
@@ -318,6 +337,7 @@ impl<B: Host> Gpu<B> {
             next_fire: 1,
             next_frame: 1,
             sink: None,
+            landed: None,
             pending: None,
             programs: B::Programs::default(),
             adapters: BTreeMap::new(),
@@ -522,6 +542,10 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         device: shell.device(),
         pools: shell.pools(),
         align: B::table_align(shell.device()),
+        seats: shell.readout.iter().chain(&shell.pixel_out).collect(),
+        max_lanes: shell.budget().max_lanes,
+        planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
+            .unwrap_or(u32::MAX),
     }
 }
 
@@ -977,6 +1001,8 @@ where
         &self,
         program: ProgramId,
         extents: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         let Some(shell) = self.shell.as_ref() else {
             return Ok(engine::GuestState::default());
@@ -1014,6 +1040,37 @@ where
         self.programs
             .rebind_slots(shell.pools(), &rebind)
             .map_err(refusal)
+    }
+
+    /// Returns once every copy submitted so far has landed: every frame
+    /// and device copy in flight, and a slot file read's copy onto the
+    /// device (`Shell::settle_copies`). Off the hot path: an aborted move
+    /// waits on it.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_copies().map_err(fault)
+    }
+
+    /// `false` only for a move off the device into mapped host chunks: it
+    /// rides the queue past the call, and its device slots, once back, may
+    /// be written by anything; told landed from its frame's fence. Every
+    /// other copy's sources may go back at once (`Shell::copy_slots_landing`
+    /// states why for each kind).
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self
+            .landed
+            .clone()
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed)
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -1642,7 +1699,17 @@ impl<B: Host> Gpu<B> {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
-        for lane in &submission.lanes {
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            // This load places every row itself (no `slots` port): a lane
+            // whose table is a working set's whole, for its program to
+            // place rows through, would land them in pages not its own.
+            if lane.list == engine::fire::ListKind::Translation {
+                return Err(Error::lane(
+                    u32::try_from(at).unwrap_or(u32::MAX),
+                    "its kv table is a translation its program places rows through, and this \
+                     load resolves no `slots` port: it places no row a program states",
+                ));
+            }
             pages_of.push(
                 lane.tables
                     .iter()
@@ -1869,6 +1936,7 @@ mod tests {
                 lanes: 2,
                 instance: InstanceId(100 + u64::from(at)),
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             })
             .collect();
         let mut ran = Vec::new();

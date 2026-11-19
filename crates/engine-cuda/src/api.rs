@@ -69,6 +69,8 @@ pub struct Cuda {
     closing: std::collections::BTreeSet<ChannelId>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
+    /// Where a tier copy still landing on the swap stream is told landed.
+    landed: Option<engine::LandingSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
@@ -98,6 +100,7 @@ impl Cuda {
             closing: std::collections::BTreeSet::new(),
             sink: None,
             tap_sink: None,
+            landed: None,
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
@@ -319,6 +322,23 @@ fn fault(fault: Fault) -> Error {
     if let Some(lane) = fault.lane() {
         return Error::lane(lane, fault);
     }
+    // A program overreaching its attachment refuses every lane it spans.
+    if let Fault::Overreach {
+        instance, lanes, ..
+    } = &fault
+    {
+        let reason = fault.to_string();
+        return Error::Lanes(
+            lanes
+                .clone()
+                .map(|lane| engine::LaneFault {
+                    lane,
+                    instance: Some(*instance),
+                    reason: reason.clone(),
+                })
+                .collect(),
+        );
+    }
     match fault {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
             Error::Device(fault.to_string())
@@ -347,7 +367,10 @@ fn fault(fault: Fault) -> Error {
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
         | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::KvWrite { .. }
+        | Fault::Overreach { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -960,6 +983,8 @@ impl Engine for Cuda {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.shell.as_ref() {
             Some(shell) => shell
@@ -1037,6 +1062,45 @@ impl Engine for Cuda {
                 Ok(())
             }
         }
+    }
+
+    /// Waits, on the host, for every move between the device and the host
+    /// tier still landing; every other copy lands inside the call or in the
+    /// main stream's order, which a later fire or move stands behind.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_moves().map_err(fault)
+    }
+
+    /// A move from the device to the host tier rides the swap stream and is
+    /// still reading its device slots when the call returns: told landed
+    /// once the stream has run it, by a waiter on an event recorded behind
+    /// it (`serve::landing`), which enqueues nothing a later move would wait
+    /// on. Every other copy's sources are free at once: a move from the host
+    /// reads host slots, which the next move into them (on the same swap
+    /// stream) or a host write (behind every move still landing) reaches
+    /// only after it; the slot file's moves read inside the call; a move
+    /// within the device runs on the main stream, ahead of everything after.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        let host = |domain| matches!(domain, MemoryDomain::HostPinned);
+        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let parked = device(copy.src) && host(copy.dst);
+        let Some(sink) = self.landed.clone().filter(|_| parked) else {
+            return Ok(true);
+        };
+        let told = self
+            .loaded_mut()?
+            .tell_swaps_landed(Box::new(move || sink(token)))
+            .map_err(fault)?;
+        Ok(!told)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -1736,12 +1800,15 @@ impl Cuda {
                         .filter(|_| !placed[at])
                         .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     kv_less: lane.kv_less,
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
                         &[]
                     },
+                    write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),

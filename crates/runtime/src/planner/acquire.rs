@@ -47,6 +47,14 @@ impl ResidencyPlanner {
     /// The grant `demand` takes without parking, if the pools hand it out
     /// now; see `acquire`.
     pub fn grant_now(self: &Arc<Self>, pid: ProcessId, demand: Demand) -> Option<AllocationGrant> {
+        // A fire of a process that is not resident (evicting, evicted,
+        // restoring) is granted nothing, not even an empty grant: its
+        // instance's slots may be on their way off the device, or given to
+        // another owner. It yields and waits for its restore (`acquire`).
+        if self.nonresident.load(Ordering::Acquire) != 0 && !self.is_resident(pid) {
+            tracing::debug!(%pid, "planner: no grant for a fire of a process that is not resident");
+            return None;
+        }
         if demand.is_zero() {
             if self.waiters.load(Ordering::Acquire) != 0
                 || self.nonresident.load(Ordering::Acquire) != 0
@@ -295,25 +303,55 @@ impl ResidencyPlanner {
 
     /// Sleeps until what a non-resident process waits on changes: its own
     /// residency (`signal`, told as it is evicted, restored, rolled back or
-    /// gone), or the policy answering pressure with nothing freed, the
-    /// event its short restore gives up on ([`Self::restore_expired`]).
-    /// No clock: a planner poke for another process, or the shortfall
-    /// standing, does not wake it. (On a 100 ms re-report it woke each
-    /// waiter ten times a second while it stayed evicted.)
-    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
+    /// gone), or the policy answering pressure with nothing freed where
+    /// that answer is the event its own short restore gives up on
+    /// (`answered_mine`, [`Self::restore_expired`]). No clock: a planner
+    /// poke for another process, the shortfall standing, or the policy
+    /// answering a shortfall that is not its restore's (any planner's,
+    /// any tier's: the answer is process-wide) does not wake it. (On a
+    /// 100 ms re-report it woke each waiter ten times a second while it
+    /// stayed evicted; on every answer of nothing it woke every evicted
+    /// gate, a restore queued or not.)
+    async fn await_residency_change(
+        signal: &Notify,
+        settled: impl Fn() -> bool,
+        answered_mine: impl Fn() -> bool,
+    ) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let answered = crate::policy::pressure::answered();
-        tokio::pin!(answered);
-        answered.as_mut().enable();
-        if settled() {
-            return;
+        loop {
+            let answered = crate::policy::pressure::answered();
+            tokio::pin!(answered);
+            answered.as_mut().enable();
+            if settled() || answered_mine() {
+                return;
+            }
+            tokio::select! {
+                () = &mut notified => return,
+                () = &mut answered => {}
+            }
         }
-        tokio::select! {
-            () = &mut notified => {}
-            () = &mut answered => {}
-        }
+    }
+
+    /// Whether `pid`'s queued restore is short and the policy has since
+    /// answered a tier it is short on with nothing freed: the answer
+    /// [`Self::restore_expired`] acts on. An answer counted before the
+    /// restore became short is not its (the shortfall reads the count as
+    /// it is noted), so no answer is missed for a restore queued later.
+    fn restore_answered(&self, pid: ProcessId) -> bool {
+        let Some(key) = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .find(|(_, waiter)| {
+                    waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
+                })
+                .map(|(key, _)| *key)
+        }) else {
+            return false;
+        };
+        self.short.lock().answered_nothing(key.1)
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -376,6 +414,37 @@ impl ResidencyPlanner {
             .is_none_or(|proc| proc.state == Residency::Resident)
     }
 
+    /// Registers kv working set `ws` of process `pid` in `residency`,
+    /// under the lock the planner moves `pid` off Resident under: the set
+    /// either stands before an eviction's Resident → Evicting, and so is in
+    /// that eviction's snapshot (fenced and quiesced with it), or comes
+    /// after it and is born fenced, its fires waiting for the restore
+    /// ([`Self::report_restored`] unfences it). The snapshot is complete by
+    /// construction. A beam fork made mid-eviction was neither: its fires
+    /// ran on the instance being parked, read mid-copy and reissued.
+    pub(crate) fn register_kv_working_set(
+        &self,
+        pid: ProcessId,
+        residency: &std::sync::Mutex<crate::inferlet::process::residency::ProcessResidency>,
+        ws: &crate::store::kv::working_set::KvWorkingSet,
+    ) {
+        let inner = self.lock_inner();
+        let resident = inner
+            .procs
+            .get(&pid)
+            .is_none_or(|proc| proc.state == Residency::Resident);
+        let handle = ws.suspend_handle();
+        if !resident {
+            handle.fence();
+        }
+        residency
+            .lock()
+            .unwrap()
+            .kv_working_sets
+            .insert((ws.model, ws.engine, ws.id), handle);
+        drop(inner);
+    }
+
     pub fn residency_flag(&self, pid: ProcessId) -> Option<Arc<AtomicBool>> {
         self.lock_inner()
             .procs
@@ -386,22 +455,42 @@ impl ResidencyPlanner {
     pub async fn wait_resident(self: &Arc<Self>, pid: ProcessId) -> Result<(), PlannerError> {
         let mut left_pipeline = false;
         loop {
-            let signal = {
-                let inner = self.lock_inner();
-                let Some(proc) = inner.procs.get(&pid) else {
+            let (signal, asked) = {
+                let mut inner = self.lock_inner();
+                let Some(proc) = inner.procs.get_mut(&pid) else {
                     return Err(PlannerError::Cancelled);
                 };
                 if proc.state == Residency::Resident {
                     return Ok(());
                 }
-                proc.signal.clone()
+                // Parked owing its restore (a short one gave up, or it went
+                // idle): a process waiting to be resident asks for it again.
+                // Left parked, nothing queues it, and the wait never ends
+                // (the M1 / M5 stress: the earliest admitted sat evicted
+                // with no restore queued once the rest drained).
+                let demand = (proc.state == Residency::Evicted)
+                    .then(|| proc.parked.take())
+                    .flatten();
+                let signal = proc.signal.clone();
+                if let Some(demand) = demand {
+                    inner.enqueue(pid, WaitKind::Restore { demand });
+                }
+                (signal, demand.is_some())
             };
+            if asked {
+                self.poke();
+            }
             if !left_pipeline {
                 left_pipeline = true;
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            Self::await_residency_change(&signal, || self.is_resident(pid)).await;
+            Self::await_residency_change(
+                &signal,
+                || self.is_resident(pid),
+                || self.restore_answered(pid),
+            )
+            .await;
             if let Some(error) = self.restore_expired(pid) {
                 tracing::warn!(%pid, %error, "planner: a short restore gives up");
                 return Err(error);
@@ -413,7 +502,7 @@ impl ResidencyPlanner {
     /// seat deadline, as a parked allocation is: it leaves the queue owing
     /// what it did (parked, as a holder's set is), and its error says what
     /// was short. `None` while it may still wait.
-    fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
+    pub(super) fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
         let key = self.with_inner(|inner| {
             inner
                 .queue
@@ -433,6 +522,16 @@ impl ResidencyPlanner {
                 && proc.state == Residency::Evicted
             {
                 proc.parked = Some(demand);
+                // What its restore learned of the room is the room's then:
+                // queued again ([`Self::wait_resident`]) it starts from
+                // the room as it stands. Kept, a need marked understated
+                // skipped the free runs that stood once every resident had
+                // gone, and the restore waited on evictions that could not
+                // come (Mac Pro's M5 shape C: 1861 chunks free, nothing
+                // resident, the head never tried again).
+                proc.roles_short = None;
+                proc.roles_free_retry = None;
+                proc.roles_free_short = None;
                 return true;
             }
             false

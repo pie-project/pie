@@ -162,7 +162,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,
@@ -289,6 +289,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

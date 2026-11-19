@@ -146,7 +146,12 @@ impl Serve for Api {
         }
     }
 
-    fn shelf(_device: &Context, _readout: &[Buffer], weights_stream: bool) -> Result<Shelf> {
+    fn shelf(
+        _device: &Context,
+        _pipelines: &Pipelines,
+        _readout: &[Buffer],
+        weights_stream: bool,
+    ) -> Result<Shelf> {
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).

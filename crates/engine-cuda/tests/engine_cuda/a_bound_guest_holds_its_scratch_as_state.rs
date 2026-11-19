@@ -218,7 +218,7 @@ fn a_bound_guest_holds_its_scratch_as_state() {
     let state = shell
         .guest_state(program, extents)
         .expect("the program's guest state");
-    assert!(state.per_instance > 0, "{state:?}");
+    assert!(state.instance_bytes() > 0, "{state:?}");
     assert!(state.per_pair > 0, "{state:?}");
 
     let rungs = shell.chunk_facts().expect("the chunk facts").act_chunks;
@@ -466,4 +466,149 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
             .close_program_instance(instance)
             .expect("the instance closes");
     }
+}
+
+/// A guest's state changes owner clean: instance A runs over its scratch,
+/// which holds A's bytes as it closes; its scratch is handed on to instance
+/// B, and B's scratch reads zero, never A's bytes. The pair's slots given
+/// back, written by another owner and taken again read zero at the new
+/// taking; an unpark's fresh room reads zero though garbage lay there.
+#[test]
+fn a_guests_state_reads_zero_when_its_slots_change_owner() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-state-owner", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4251).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![7]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let span_of = |shell: &Shell, place: &engine::ScratchPlace, bytes: u64| {
+        let engine::ScratchPlace::Run { first, slots } = place else {
+            panic!("a small guest's state lies in a run of Instance slots: {place:?}");
+        };
+        let refs: Vec<u32> = (*first..first + slots).collect();
+        shell
+            .guest_span(engine::chunk::SlotRole::Instance, &refs, bytes)
+            .expect("a guest item's span")
+    };
+    let foreign = |shell: &Shell, place: &engine::ScratchPlace, bytes: u64| {
+        let bytes = vec![0xA5u8; usize::try_from(bytes).expect("bytes")];
+        engine_cuda::device::alloc::stage_raw(shell.stream(), span_of(shell, place, bytes.len() as u64), &bytes)
+            .expect("another owner writes the slots");
+    };
+    let zero = |shell: &mut Shell, place: &engine::ScratchPlace, bytes: u64| {
+        shell.drain().expect("the device drains");
+        let mut out = vec![0x5Au8; usize::try_from(bytes).expect("bytes")];
+        engine_cuda::device::alloc::copy_d2h(span_of(shell, place, bytes), &mut out)
+            .expect("the room reads");
+        out.iter().all(|&byte| byte == 0)
+    };
+    let bind = |shell: &mut Shell,
+                guest: &mut crate::guest::Guest,
+                scratch: &engine::ScratchPlace,
+                pair: &engine::ScratchPlace,
+                generation: u64| {
+        let slots = guest.slots(
+            &shell.program_facts(program).expect("the program's facts"),
+            |_| false,
+        );
+        let id = shell
+            .bind_program(
+                program,
+                &[],
+                extents,
+                GeometryClass::Host,
+                PortMask::NONE,
+                &[None],
+                &[engine::ChannelId(1)],
+                engine_cuda::program::Slots {
+                    instance: slots.0.clone(),
+                    rings: slots.1.clone(),
+                    scratch: scratch.clone(),
+                    pair: pair.clone(),
+                    pair_generation: generation,
+                },
+            )
+            .expect("the instance binds");
+        (id, slots)
+    };
+    let attach = |instance| {
+        [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }]
+    };
+
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let (a, _) = bind(&mut shell, &mut guest, &scratch, &pair, 1);
+    fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    // Whatever A's launches left, A's bytes are in its scratch as it closes.
+    foreign(&shell, &scratch, state.instance_bytes());
+    shell.close_program_instance(a).expect("A closes");
+    // The pair's slots went back with A's close and another owner wrote them.
+    foreign(&shell, &pair, state.per_pair);
+
+    let (b, b_slots) = bind(&mut shell, &mut guest, &scratch, &pair, 2);
+    assert!(
+        zero(&mut shell, &scratch, state.instance_bytes()),
+        "B's scratch holds none of A's bytes"
+    );
+    assert!(
+        zero(&mut shell, &pair, state.per_pair),
+        "the pair's new taking holds none of the other owner's bytes"
+    );
+    fire(&mut shell, word, &tokens, &attach(b));
+    shell.drain().expect("the device drains");
+
+    // An unpark: fresh room holding garbage reads zero once B is there.
+    let (fresh, fresh_pair) = guest.places((program, "unparked"), &state);
+    foreign(&shell, &fresh, state.instance_bytes());
+    foreign(&shell, &fresh_pair, state.per_pair);
+    // Its items stay where they lie; its state moves.
+    shell
+        .rebind_program(
+            b,
+            engine_cuda::program::Slots {
+                instance: b_slots.0,
+                rings: b_slots.1,
+                scratch: fresh.clone(),
+                pair: fresh_pair.clone(),
+                pair_generation: 3,
+            },
+        )
+        .expect("the unpark rebinds");
+    assert!(
+        zero(&mut shell, &fresh, state.instance_bytes()),
+        "the unparked scratch holds none of the room's last bytes"
+    );
+    assert!(
+        zero(&mut shell, &fresh_pair, state.per_pair),
+        "the unparked pair holds none of the room's last bytes"
+    );
+    fire(&mut shell, word, &tokens, &attach(b));
+    shell.drain().expect("the device drains");
+    shell.close_program_instance(b).expect("B closes");
 }

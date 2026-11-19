@@ -592,6 +592,18 @@ pub fn slot_entries(units: &[u32]) -> Result<Vec<i32>> {
 }
 
 impl<B: Backend> Pools<B> {
+    /// The bytes of one chunk of the pool.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.pool.chunk_bytes()
+    }
+
+    /// The buffers of the pool's backed segments, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.pool.segment_buffers()
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
     /// and `host_chunks` host chunks beside it, its top chunks the
     /// activation span of `act_chunks`' rungs; nothing committed yet.
@@ -1583,6 +1595,23 @@ impl<B: Backend> Pools<B> {
             self.disk = Spill::open(device, dir, "r0.kv", page, budget)?;
         }
         Ok(self.disk_pages())
+    }
+
+    /// Whether the host chunks are device-mapped memory a frame copies
+    /// to and from (else a heap the host copies through, in the call).
+    #[must_use]
+    pub fn host_mapped(&self) -> bool {
+        matches!(self.host, HostChunks::Mapped(_))
+    }
+
+    /// Waits out a slot file read's copy onto the device still in flight.
+    pub fn settle_spill(&mut self) -> Result<()> {
+        match &mut self.disk {
+            Some(Spill::Mapped { landing, .. }) => {
+                landing.take().map_or(Ok(()), |landing| landing.wait())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn unseat_disk(&mut self) {

@@ -45,6 +45,10 @@ impl ResidencyPlanner {
             inner.procs.get_mut(&pid).is_some_and(|proc| {
                 proc.fires += 1;
                 proc.fired_at = crate::rt::Instant::now();
+                // Firing: a bind it was restored for went through.
+                if inner.bind_restoring == Some(pid) {
+                    inner.bind_restoring = None;
+                }
                 proc.fire_lapsed = false;
                 true
             })
