@@ -918,6 +918,56 @@ fn beam_bf16(beams: u32) -> Suite {
     }
 }
 
+/// `gumbel_argmax` over a bf16 row at a temperature, over `rows` rows of
+/// Qwen3's vocabulary: every lane kept, or a top-k (40) and top-p (0.9) keep
+/// mask of the row's softmax; the key advances fire to fire. Each perturbed
+/// lane is made in f32 in the reduction, as the interpreter makes it.
+fn bf16_draw(rows: u32, truncated: bool) -> Suite {
+    let vocab = QWEN_VOCAB;
+    let temperature = 0.7f32;
+    let rng = named("rng", Channel::from([0x51edu32, 3]));
+    let tok_out = named("tok_out", Channel::new([rows], dtype::i32).capacity(4));
+    let mut b = builder(vocab, rows);
+    b.stage(Stage::Epilogue, move || {
+        let r = rng.take();
+        let logits = cast(
+            reshape(intrinsics::output(0, "logits"), [rows, vocab]),
+            dtype::bf16,
+        );
+        let token = if truncated {
+            let probs = softmax(&logits / temperature);
+            let keep = and(
+                pivot_threshold(&probs, rank_le(40u32)),
+                pivot_threshold(&probs, cummass_le(0.9f32)),
+            );
+            gumbel_argmax(&logits, keep, temperature, &r)
+        } else {
+            gumbel_argmax(&logits, true, temperature, &r)
+        };
+        tok_out.put(reshape(cast(token, dtype::i32), [rows]));
+        rng.put(&r + iota(2));
+    });
+    tok_out.note_host_take();
+    let mut seeds = port_seeds(rows);
+    seeds.push(("rng", Value::U32(vec![0x51ed, 3])));
+    Suite {
+        names: take_names(),
+        name: format!(
+            "bf16 gumbel_argmax ({rows} row(s), {})",
+            if truncated {
+                "top-k + top-p"
+            } else {
+                "every lane"
+            }
+        ),
+        traced: b.build().expect("the bf16 draw traces"),
+        rows,
+        vocab,
+        seeds,
+        outputs: vec![("tok_out", Dtype::I32, Check::Exact)],
+    }
+}
+
 /// Every suite whose vocabulary-sized values are bf16.
 fn bf16_suites() -> Vec<Suite> {
     let penalized = eta_dsl::sampler::Shape {
@@ -929,7 +979,14 @@ fn bf16_suites() -> Vec<Suite> {
         presence: true,
         ..eta_dsl::sampler::Shape::GREEDY
     };
-    let mut suites = vec![bf16_battery(1), bf16_battery(3)];
+    let mut suites = vec![
+        bf16_battery(1),
+        bf16_battery(3),
+        bf16_draw(1, false),
+        bf16_draw(1, true),
+        bf16_draw(3, false),
+        bf16_draw(3, true),
+    ];
     suites.extend(
         eta_dsl::sampler::STANDARD
             .iter()

@@ -195,14 +195,53 @@ pub(crate) fn analyze_direct_argmax(
     for &node in &region.nodes {
         let node = node.index();
         let reduction = &ops[node];
-        if reduction.tag != tags::REDUCE_ARGMAX || reduction.args.is_empty() {
+        let draw = reduction.tag == tags::GUMBEL_ARGMAX;
+        if !(reduction.tag == tags::REDUCE_ARGMAX || draw && reduction.args.len() == 4)
+            || reduction.args.is_empty()
+        {
             continue;
         }
         let mut value = reduction.args[0];
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
         let mut gumbel: Option<(u32, Option<u32>, u32, u32)> = None;
-        if single_consumer(value, node as u32)
+        let bf16_value = |v: u32| stage.normalized.value_types[v as usize].dtype == Dtype::Bf16;
+        // The draw's operands: the logits it perturbs, the value whose
+        // descriptor gives its noise lanes' row, its rng state, the nodes it
+        // takes in, the node that reads the logits, and the rounding so far.
+        let mut operands: Option<(u32, u32, u32, Vec<u32>, u32, u32)> = None;
+        if draw {
+            // A gumbel_argmax that keeps every lane at a divisor of one: the
+            // fused draw's own form (its lanes are f32, never rounded).
+            let (logits, keep, divisor, state) = (
+                reduction.args[0],
+                reduction.args[1],
+                reduction.args[2],
+                reduction.args[3],
+            );
+            let constant = |v: u32, kept: &dyn Fn(&OpView) -> bool| {
+                producers[v as usize] != u32::MAX && {
+                    let op = &ops[producers[v as usize] as usize];
+                    op.tag == tags::CONST && kept(op)
+                }
+            };
+            let every_lane = constant(keep, &|op| {
+                op.lit_dtype == eta_ir::types::wire_dtype(Dtype::Bool) && op.lit_bits != 0
+            });
+            let unit = constant(divisor, &|op| {
+                op.lit_dtype == eta_ir::types::wire_dtype(Dtype::F32)
+                    && op.lit_bits == 1.0f32.to_bits()
+            });
+            if every_lane && unit {
+                // A constant the draw alone reads is taken in with it.
+                let head = [keep, divisor]
+                    .into_iter()
+                    .filter(|&v| single_consumer(v, node as u32))
+                    .map(|v| producers[v as usize])
+                    .collect();
+                operands = Some((logits, logits, state, head, node as u32, 0));
+            }
+        } else if single_consumer(value, node as u32)
             && ops[producers[value as usize] as usize].tag == tags::ADD
         {
             let add = producers[value as usize];
@@ -221,62 +260,65 @@ pub(crate) fn analyze_direct_argmax(
                 } else {
                     (add_op.args[0], None)
                 };
-                let bf16_value =
-                    |v: u32| stage.normalized.value_types[v as usize].dtype == Dtype::Bf16;
                 if let Some(noise) = noise {
-                    let mut rounding = 0u32;
-                    if bf16_value(value) {
-                        rounding |= GUMBEL_ROUND_PERTURBED;
-                    }
+                    let rounding = if bf16_value(value) {
+                        GUMBEL_ROUND_PERTURBED
+                    } else {
+                        0
+                    };
                     let rng = producers[noise as usize];
                     let state = ops[rng as usize].args[0];
-                    let mut head = vec![add, rng];
-                    let mut divisor = None;
-                    let mut source = logits;
-                    let mut consumer = add;
-                    if single_consumer(logits, add) {
-                        let scale = producers[logits as usize];
-                        let scale_op = &ops[scale as usize];
-                        if scale_op.tag == tags::DIV
-                            && scale_op.args.len() == 2
-                            && one_element(scale_op.args[1])
-                        {
-                            divisor = Some(scale_op.args[1]);
-                            source = scale_op.args[0];
-                            consumer = scale;
-                            head.push(scale);
-                            if bf16_value(logits) {
-                                rounding |= GUMBEL_ROUND_SCALED;
-                            }
-                        }
-                    }
-                    // The model's row cast to bf16 on its way in.
-                    if single_consumer(source, consumer) {
-                        let cast = producers[source as usize];
-                        let cast_op = &ops[cast as usize];
-                        if cast_op.tag == tags::CAST
-                            && bf16_value(source)
-                            && cast_op.args.len() == 1
-                            && stage.normalized.value_types[cast_op.args[0] as usize].dtype
-                                == Dtype::F32
-                        {
-                            rounding |= GUMBEL_ROUND_LOGITS;
-                            head.push(cast);
-                            consumer = cast;
-                            source = cast_op.args[0];
-                        }
-                    }
-                    // A bf16 row nothing here casts is another op's: its
-                    // own bytes, which the fused draw does not read.
-                    let model_row = !bf16_value(source);
-                    if model_row && single_consumer(source, consumer) {
-                        gumbel = Some((state, divisor, noise, rounding));
-                        chain.extend(head);
-                        value = source;
-                        expected_consumer = consumer;
+                    operands = Some((logits, noise, state, vec![add, rng], add, rounding));
+                }
+            }
+        }
+        if let Some((logits, noise, state, mut head, mut consumer, mut rounding)) = operands {
+            let mut divisor = None;
+            let mut source = logits;
+            if single_consumer(logits, consumer) {
+                let scale = producers[logits as usize];
+                let scale_op = &ops[scale as usize];
+                if scale_op.tag == tags::DIV
+                    && scale_op.args.len() == 2
+                    && one_element(scale_op.args[1])
+                {
+                    divisor = Some(scale_op.args[1]);
+                    source = scale_op.args[0];
+                    consumer = scale;
+                    head.push(scale);
+                    if bf16_value(logits) {
+                        rounding |= GUMBEL_ROUND_SCALED;
                     }
                 }
             }
+            // The model's row cast to bf16 on its way in.
+            if single_consumer(source, consumer) {
+                let cast = producers[source as usize];
+                let cast_op = &ops[cast as usize];
+                if cast_op.tag == tags::CAST
+                    && bf16_value(source)
+                    && cast_op.args.len() == 1
+                    && stage.normalized.value_types[cast_op.args[0] as usize].dtype == Dtype::F32
+                {
+                    rounding |= GUMBEL_ROUND_LOGITS;
+                    head.push(cast);
+                    consumer = cast;
+                    source = cast_op.args[0];
+                }
+            }
+            // A bf16 row nothing here casts is another op's: its own bytes,
+            // which the fused draw does not read.
+            let model_row = !bf16_value(source);
+            if model_row && single_consumer(source, consumer) {
+                gumbel = Some((state, divisor, noise, rounding));
+                chain.extend(head);
+                value = source;
+                expected_consumer = consumer;
+            }
+        }
+        // A draw the fused form does not take runs as its own op.
+        if draw && gumbel.is_none() {
+            continue;
         }
         while (value as usize) < producers.len()
             && producers[value as usize] != u32::MAX
@@ -463,7 +505,7 @@ pub(super) fn is_view(stage: &CompiledStage, region: &Region, op: &OpView, base:
 /// Whether `node` is an argmax `region`'s kernel scans from the model's
 /// row, its operand's bytes in scratch unread.
 pub(super) fn scans_model_row(direct: &ArgmaxScan, ops: &[OpView], node: usize) -> bool {
-    ops[node].tag == tags::REDUCE_ARGMAX
+    matches!(ops[node].tag, tags::REDUCE_ARGMAX | tags::GUMBEL_ARGMAX)
         && (direct.gumbel[node].is_some() || direct.intrinsic[node] != u16::MAX)
 }
 
@@ -661,6 +703,10 @@ pub fn emit_fused_region(
             rounding: chain.rounding,
         });
 
+        let state = (op.tag == tags::GUMBEL_ARGMAX)
+            .then(|| op.args.get(3).map(|&v| (resolve(v), aliases.resolve(v))))
+            .flatten();
+
         source.push_str("  {\n");
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");
         source.push_str("    p.rng_seed = 0u;\n");
@@ -706,6 +752,7 @@ pub fn emit_fused_region(
             &direct.intrinsic,
             &slots,
             gumbel.as_ref(),
+            state,
             dialect.cut_mark,
         );
 
@@ -782,6 +829,7 @@ fn emit_body(
     direct_intrinsic: &[u16],
     slots: &Slots,
     gumbel: Option<&GumbelSlots>,
+    state: Option<(String, u32)>,
     cut_mark: &str,
 ) {
     let Slots { a0, a1, a2, o0, o1 } = slots;
@@ -852,7 +900,7 @@ fn emit_body(
         } else {
             fallback(source);
         }
-    } else if tag == tags::REDUCE_ARGMAX {
+    } else if tag == tags::REDUCE_ARGMAX || (tag == tags::GUMBEL_ARGMAX && gumbel.is_some()) {
         if let Some(chain) = gumbel {
             let _ = writeln!(
                 source,
@@ -933,6 +981,14 @@ fn emit_body(
                 "    ptir_fast_argmax({a0}, {o0}, descriptors[p.a0]);"
             );
         }
+    } else if tag == tags::GUMBEL_ARGMAX {
+        // The fourth operand, the rng state, rides in `imm` (`OpParams`);
+        // the noise lanes run on from this block's row.
+        let (state, state_desc) = state.expect("a gumbel_argmax names its state");
+        let _ = writeln!(
+            source,
+            "    ptir_gumbel_argmax({a0}, {a1}, {a2}, {state}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2], descriptors[{state_desc}u], lane_row * descriptors[p.a0].len);"
+        );
     } else if matches!(tag, tags::GATHER | tags::GATHER_ROW) {
         let _ = writeln!(
             source,

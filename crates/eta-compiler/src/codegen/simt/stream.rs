@@ -148,7 +148,10 @@ impl<'a> Streams<'a> {
     /// Whether `node` is an argmax that scans the model's row where it lies
     /// (the fused emitter's direct or Gumbel scan), its operand unread.
     fn scans_model_row(&self, node: usize) -> bool {
-        self.ops[node].tag == tags::REDUCE_ARGMAX && self.direct_intrinsic[node] != u16::MAX
+        matches!(
+            self.ops[node].tag,
+            tags::REDUCE_ARGMAX | tags::GUMBEL_ARGMAX
+        ) && self.direct_intrinsic[node] != u16::MAX
     }
 
     fn topk_reads_direct(&self, node: usize, value: u32) -> bool {
@@ -441,6 +444,28 @@ impl<'a> Streams<'a> {
                     Role::Reduce
                 })
             }
+            tags::GUMBEL_ARGMAX => {
+                // logits / divisor + gumbel(state, i), -inf where keep is
+                // false: an argmax whose lanes the stream makes in f32. The
+                // fused draw takes one that reads the model's row itself.
+                if self.direct_intrinsic[node] != u16::MAX
+                    || op.args.len() != 4
+                    || !eta_ir::types::is_float(self.dtype(op.args[0]))
+                    || self.dtype(op.args[1]) != Dtype::Bool
+                    || !eta_ir::types::is_float(self.dtype(op.args[2]))
+                    || self.dtype(op.args[3]) != Dtype::U32
+                    || self.class(op.args[2]) != RowClass::Scalar
+                    || self.class(out) != RowClass::Scalar
+                {
+                    return None;
+                }
+                let mut w = *width;
+                if !full(op.args[0], &mut w) || !indexed(op.args[1], &mut w) {
+                    return None;
+                }
+                *width = w;
+                Some(Role::Argmax)
+            }
             tags::PIVOT_THRESHOLD => {
                 if op.pred_tag != eta_ir::wire::predicate_tags::PROB_GE
                     || op.args.len() != 1
@@ -561,7 +586,11 @@ impl<'a> Streams<'a> {
         let reduction = |tag: u8| {
             matches!(
                 tag,
-                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
+                tags::REDUCE_SUM
+                    | tags::REDUCE_MAX
+                    | tags::REDUCE_MIN
+                    | tags::REDUCE_ARGMAX
+                    | tags::GUMBEL_ARGMAX
             )
         };
         let channel = |tag: u8| matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT);
@@ -952,6 +981,38 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     pass.registers.push((out, Dtype::F32));
 }
 
+/// Lane `i` of a gumbel_argmax `node`, as a register: `logits[i] /
+/// divisor + gumbel(state, i)`, `-inf` where keep is false, in the f32
+/// operations of `reduce_argmax(select(keep, logits / divisor, -inf) +
+/// rng_keyed(state))` (eta_ir::types), the noise lane running on from this
+/// block's row as a keyed draw's does.
+fn gumbel_lane(streams: &Streams<'_>, node: usize, pass: &mut Pass<'_>) -> String {
+    let op = &streams.ops[node];
+    let (logits, state) = (op.args[0], op.args[3]);
+    let sp = (pass.pointer)(state);
+    let _ = writeln!(
+        pass.prologue,
+        "    const m1_u64 seed{node} = ptir_rng_state_seed({sp}, descriptors[{state}u]);"
+    );
+    let _ = writeln!(
+        pass.prologue,
+        "    const m1_u32 noise{node} = lane_row * descriptors[{logits}u].len;"
+    );
+    let x = read(streams, logits, Dtype::F32, pass);
+    let keep = read(streams, op.args[1], Dtype::Bool, pass);
+    let divisor = read(streams, op.args[2], Dtype::F32, pass);
+    pass.body.both(&format!(
+        "      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + noise{node});"
+    ));
+    pass.body.both(&format!(
+        "      const float n{node} = -logf(-logf(u{node}));"
+    ));
+    pass.body.both(&format!(
+        "      const float g{node} = {keep} ? {x} / {divisor} + n{node} : m1_neg_inf();"
+    ));
+    format!("g{node}")
+}
+
 /// `node`'s value as its register holds it: a `bf16` result rounded once,
 /// as its store rounds it, so a reader in the stream sees the stored value.
 fn typed_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
@@ -1273,7 +1334,11 @@ pub(super) fn emit_stream(
                 let _ = writeln!(epilogue, "    }}");
             }
             Role::Argmax => {
-                let x = read(streams, op.args[0], Dtype::F32, &mut pass);
+                let x = if tag == tags::GUMBEL_ARGMAX {
+                    gumbel_lane(streams, node, &mut pass)
+                } else {
+                    read(streams, op.args[0], Dtype::F32, &mut pass)
+                };
                 argmaxes += 1;
                 let _ = writeln!(
                     pass.prologue,

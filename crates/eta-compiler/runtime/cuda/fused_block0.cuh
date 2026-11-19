@@ -1953,6 +1953,63 @@ __device__ __forceinline__ void ptir_fast_argmax(
   }
 }
 
+// gumbel_argmax (tag 0x34): lane `i` of a row is `logits[i] / divisor +
+// gumbel(state, i)`, -inf where `keep` is false, made in f32 with the f32
+// operations of `reduce_argmax(select(keep, logits / divisor, -inf) +
+// rng_keyed(state))` and never stored (eta_ir::types: a draw is never a bf16
+// row). The noise is lane `noise_index` of the keyed draw.
+__device__ __forceinline__ float ptir_gumbel_lane(
+    const m1_u8* logits, m1_u32 logits_dtype, const m1_u8* keep,
+    const M1ValueDesc& keep_desc, float divisor, m1_u64 seed, m1_u32 at,
+    m1_u32 noise_index) {
+  if (!m1_load_b(keep, m1_pick(keep_desc.len, at), keep_desc.dtype)) return m1_neg_inf();
+  const float uniform = ptir_rng_hash_uniform(seed, noise_index);
+  const float noise = -logf(-logf(uniform));
+  return m1_load_f(logits, at, logits_dtype) / divisor + noise;
+}
+
+// Each row's gumbel_argmax, one block over the row: the index of its largest
+// lane, ties to the least index, NaN never (as `reduce_argmax`).
+__device__ __forceinline__ void ptir_gumbel_argmax(
+    const m1_u8* logits,
+    const m1_u8* keep,
+    const m1_u8* divisor,
+    const m1_u8* state,
+    m1_u8* output,
+    const M1ValueDesc logits_desc,
+    const M1ValueDesc keep_desc,
+    const M1ValueDesc divisor_desc,
+    const M1ValueDesc state_desc,
+    m1_u32 noise_base) {
+  __shared__ M1ArgmaxCandidate candidates[32];
+  int* result = reinterpret_cast<int*>(output);
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 warp = threadIdx.x >> 5u;
+  const m1_u32 warps = blockDim.x >> 5u;
+  const m1_u64 seed = ptir_rng_state_seed(state, state_desc);
+  const float divide_by = m1_load_f(divisor, 0u, divisor_desc.dtype);
+  for (m1_u32 row = 0; row < logits_desc.rows; ++row) {
+    const m1_u32 base = row * logits_desc.last;
+    M1ArgmaxCandidate candidate{m1_neg_inf(), 0u, 0u, 0u};
+    for (m1_u32 index = threadIdx.x; index < logits_desc.last; index += blockDim.x) {
+      const float value = ptir_gumbel_lane(
+          logits, logits_desc.dtype, keep, keep_desc, divide_by, seed, base + index,
+          noise_base + base + index);
+      const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
+      candidate = m1_argmax_combine(candidate, next);
+    }
+    candidate = m1_argmax_warp_reduce(candidate, lane);
+    if (lane == 0u) candidates[warp] = candidate;
+    __syncthreads();
+    if (warp == 0u) {
+      candidate = lane < warps ? candidates[lane] : M1ArgmaxCandidate{m1_neg_inf(), 0u, 0u, 0u};
+      candidate = m1_argmax_warp_reduce(candidate, lane);
+      if (lane == 0u) result[row] = (int)candidate.index;
+    }
+    __syncthreads();
+  }
+}
+
 __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
     const m1_u8* input,
     m1_u8* output,

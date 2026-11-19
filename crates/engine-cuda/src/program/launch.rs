@@ -2178,20 +2178,20 @@ mod tests {
         }
     }
 
-    /// Each standard decode fire's scratch, its own and as laid: the model's
-    /// output row read in place, the vocabulary-sized values bf16.
+    /// Each standard decode fire's scratch, its own and as laid, as
+    /// `eta_dsl::sampler` builds it, the model's output row read in place.
     const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
         ("standard greedy", 3_689_472, 1_536),
-        ("standard gumbel-max", 5_209_088, 1_792),
-        ("standard top-p", 6_577_920, 1_141_504),
-        ("standard top-k + top-p", 6_882_560, 1_294_080),
-        ("standard top logprobs", 4_910_080, 686_336),
-        ("standard penalized top-p", 12_050_176, 2_358_272),
+        ("standard gumbel-max", 5_512_960, 1_792),
+        ("standard top-p", 9_312_768, 1_368_832),
+        ("standard top-k + top-p", 9_617_408, 2_205_696),
+        ("standard top logprobs", 6_732_544, 1_293_568),
+        ("standard penalized top-p", 20_254_720, 2_584_576),
     ];
 
-    /// What each laid out with f32 intermediates (the output row copied
-    /// into scratch, top-p on the f32 lane sampler): no fire lays out more
-    /// now.
+    /// What each laid out with f32 intermediates and the output row copied
+    /// into scratch (top-p on the f32 lane sampler): no fire lays out more,
+    /// whichever dtype the sampler's intermediates take.
     const STANDARD_F32_LAID: [u64; 6] = [1_536, 1_792, 1_368_832, 2_813_440, 1_901_312, 2_585_600];
 
     /// No generated kernel of the programs inferlets ship names the bytes
