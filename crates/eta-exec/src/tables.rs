@@ -12,10 +12,7 @@ use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
-use crate::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, TemporaryNeed, TemporaryRefused,
-    ValueDesc, describe, lay_out, stage_temporaries,
-};
+use crate::{Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out};
 
 pub const DESC_WORDS: usize = 9;
 
@@ -62,6 +59,9 @@ impl Cfg {
 pub struct Stepping {
     /// The nodes the WGSL launches ([`wgsl::launched_nodes`]).
     pub launched: Vec<u32>,
+    /// Each launched node's tag and first argument, what it keeps in the
+    /// temporary area is stated over ([`wgsl::temporary_bytes`]).
+    pub runs: Vec<(u8, Option<u32>)>,
     /// The other nodes: boundary ops and reshapes their source covers.
     pub idle: Vec<u32>,
     /// What the host may write before the first launch: an output's, a
@@ -103,28 +103,47 @@ impl Stepping {
             .into_iter()
             .map(|(result, _)| result)
             .collect();
+        stepping.runs = launched
+            .iter()
+            .filter_map(|&node| plan.ops.get(node as usize))
+            .map(|op| (op.tag, op.args.first().copied()))
+            .collect();
         stepping.launched = launched;
         stepping
     }
 
-    /// The launches `descriptors` are laid over: below the temporary area
-    /// the one-row select's state, in it the widest of what a launch that
-    /// sorts or reduces a whole value takes and what each region's emitter
-    /// publishes it takes (`needs`, [`stage_temporaries`]).
-    pub fn launches(
-        &self,
-        descriptors: &[ValueDesc],
-        needs: &[TemporaryNeed],
-    ) -> Result<Launches<'_>, TemporaryRefused> {
-        Ok(Launches {
+    /// The launches `descriptors` are laid over: the temporary area the
+    /// most a launched node keeps there ([`wgsl::temporary_bytes`] of its
+    /// first argument), and below it the one-row select's state where a
+    /// node runs the select ([`wgsl::selects`]), none where none does.
+    #[must_use]
+    pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
+        let temporary = self
+            .runs
+            .iter()
+            .map(|&(tag, argument)| {
+                argument
+                    .and_then(|argument| descriptors.get(argument as usize))
+                    .map_or(0, |argument| {
+                        wgsl::temporary_bytes(
+                            tag,
+                            u64::from(argument.len),
+                            u64::from(argument.rows),
+                        )
+                    })
+            })
+            .max()
+            .unwrap_or(0);
+        let selects = self.runs.iter().any(|&(tag, _)| wgsl::selects(tag));
+        Launches {
             each: self.launched.iter().map(Launch::of_node).collect(),
             idle: self.idle.clone(),
             staged: self.staged.clone(),
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
-            reserve: SELECT_RESERVE,
-            temporary: stage_temporaries(descriptors, needs)?,
-        })
+            reserve: if selects { SELECT_RESERVE } else { 0 },
+            temporary,
+        }
     }
 }
 
@@ -180,9 +199,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stepping = Stepping::of(plan);
-    let launches = stepping
-        .launches(&descriptors, wgsl::TEMPORARY_NEEDS)
-        .map_err(|why| format!("a guest pass's temporaries are refused: {why}"))?;
+    let launches = stepping.launches(&descriptors);
     let mut scratch = lay_out(plan, &descriptors, &launches)
         .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);

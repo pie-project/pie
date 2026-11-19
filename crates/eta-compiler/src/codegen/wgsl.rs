@@ -18,14 +18,33 @@ pub const WORKGROUP: u32 = 256;
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
 pub const SELECT_WORDS: u32 = 10320;
 
-/// What WGSL's kernels take of a lane's temporary area past the
-/// whole-value rule (`eta_exec::stage_temporaries`): nothing, by statement.
-/// Its sorts, reduction levels and pivots run over the whole value in
-/// place, in at most four words an element of it (`sort_cell`, `tmp_v`,
-/// `pivot_*` in the runtime: two buffers of two words), the rule's figure,
-/// and its one-row select keeps its state in the [`SELECT_WORDS`] reserved
-/// below the area, not in it.
-pub const TEMPORARY_NEEDS: &[crate::codegen::temporary::TemporaryNeed] = &[];
+/// The bytes the runtime keeps in a lane's temporary area while it runs a
+/// node of `tag` whose first argument holds `len` elements in `rows` rows,
+/// as its cells lay them: a sort, a top-k or a pivot two buffers of two
+/// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
+/// lie within them), a reduction two buffers of two words a 32-element
+/// group of each row (`tmp_v`), any other node none. Saturates past a
+/// `u64`, which no scratch holds.
+#[must_use]
+pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
+    if is_sort(tag) {
+        len.saturating_mul(16)
+    } else if is_reduce(tag) {
+        let rows = if rows == 0 { 1 } else { rows };
+        rows.saturating_mul((len / rows).div_ceil(32))
+            .saturating_mul(16)
+    } else {
+        0
+    }
+}
+
+/// Whether a node of `tag` runs the one-row select, which keeps its state
+/// in the [`SELECT_WORDS`] just below the temporary area (`sel_at`): a
+/// pivot's select ladder.
+#[must_use]
+pub const fn selects(tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD
+}
 
 const BARRIER: &str = "  storageBarrier();\n";
 
@@ -1010,13 +1029,27 @@ mod stepwise_tests {
         );
     }
 
-    /// The runtime's temporaries are what [`TEMPORARY_NEEDS`] states of
-    /// them: two buffers of two words an element of the value a step runs
-    /// over (four words, the whole-value rule's figure), and the select's
-    /// state below the area.
+    /// The runtime's temporaries are what [`super::temporary_bytes`] states
+    /// of them: a sort's, top-k's or pivot's two buffers of two words an
+    /// element of the value it runs over, a reduction's two buffers of two
+    /// words a 32-element group of a row, and a pivot's select state below
+    /// the area ([`super::selects`]).
     #[test]
-    fn the_runtimes_temporaries_lie_within_the_whole_value_rule() {
-        assert!(super::TEMPORARY_NEEDS.is_empty());
+    fn the_runtimes_temporaries_lie_within_what_each_node_states() {
+        use super::{selects, temporary_bytes};
+        for tag in [tags::SORT_DESC, tags::TOP_K, tags::PIVOT_THRESHOLD] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
+        }
+        for tag in [tags::REDUCE_SUM, tags::REDUCE_MAX, tags::REDUCE_MIN, tags::REDUCE_ARGMAX] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
+        }
+        assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
+        assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
+        assert!(selects(tags::PIVOT_THRESHOLD));
+        assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
             "return cfg.temporary + ((buf * n) + c) * 2u;",
             "return cfg.temporary + (buf * span + row * stride + c) * 2u;",

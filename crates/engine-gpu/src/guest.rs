@@ -442,6 +442,56 @@ mod tests {
             b.build().expect("the sorted epilogue traces")
         }
 
+        /// `beam-search`'s prompt epilogue: the prompt's top `beams` by log
+        /// probability, and its greedy pick beside them.
+        pub fn beam_prefill(vocab: u32, beams: u32) -> Traced {
+            let ids = leak(Channel::new([beams], dtype::i32));
+            let scores = leak(Channel::new([beams], dtype::f32));
+            let greedy = leak(Channel::new([1], dtype::i32));
+            let (mut b, _) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let (s, i) = top_k(log_softmax(&logits), beams);
+                ids.put(cast(&i, dtype::i32));
+                scores.put(&s);
+                greedy.put(reshape(reduce_argmax(&logits), [1]));
+            });
+            ids.note_host_take();
+            scores.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam prefill epilogue traces")
+        }
+
+        /// `beam-search`'s decode epilogue over `beams` rows: each beam's
+        /// score plus its row's log probabilities, the top `beams` of all
+        /// of them, their parents and tokens, and each row's greedy pick.
+        pub fn beam_decode(vocab: u32, beams: u32) -> Traced {
+            let carried = leak(Channel::from(vec![0f32; beams as usize]));
+            let out = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let parents = leak(Channel::new([beams], dtype::u32).capacity(8));
+            let greedy = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            let rows = beams as usize;
+            b.bind_port(Port::EmbedTokens, leak(Channel::from(vec![42i32; rows])));
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [beams, vocab]);
+                let cand = broadcast(reshape(carried.take(), [beams, 1]), [beams, vocab])
+                    + log_softmax(&logits);
+                let (s, i) = top_k(reshape(cand, [beams * vocab]), beams);
+                carried.put(&s);
+                out.put(cast(&i % vocab, dtype::i32));
+                parents.put(&i / vocab);
+                greedy.put(reshape(reduce_argmax(&logits), [beams]));
+            });
+            out.note_host_take();
+            parents.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam decode epilogue traces")
+        }
+
         /// Every program here, by name.
         pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
             vec![
@@ -468,12 +518,29 @@ mod tests {
 
     /// What a stage's scratch is for the programs inferlets ship, at a
     /// vocabulary of 151,936: each value its own bytes, and as laid here.
+    /// `beam-search`'s decode stage fires four rows.
     #[test]
     fn a_shipped_programs_stage_scratch() {
         let vocab = shipped::QWEN_VOCAB;
-        let totals: Vec<(&str, u64, u64)> = shipped::all(vocab)
+        let four = Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        };
+        let mut programs: Vec<(&str, eta_dsl::Traced, Extents)> = shipped::all(vocab)
+            .into_iter()
+            .map(|(name, traced)| (name, traced, Extents::default()))
+            .collect();
+        programs.push((
+            "beam prefill",
+            shipped::beam_prefill(vocab, 4),
+            Extents::default(),
+        ));
+        programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
+        let totals: Vec<(&str, u64, u64)> = programs
             .iter()
-            .map(|(name, traced)| {
+            .map(|(name, traced, extents)| {
                 let package = shipped::package(traced, vocab);
                 let [plan] = &package.plans[..] else {
                     panic!("{name}: one stage");
@@ -481,8 +548,7 @@ mod tests {
                 step_source(0, plan).unwrap_or_else(|why| panic!("{name}: {why}"));
                 scratch_holds_the_hosts_values(&package)
                     .unwrap_or_else(|why| panic!("{name}: {why}"));
-                let tables =
-                    session::stage_tables(plan, &Extents::default()).expect("static shapes");
+                let tables = session::stage_tables(plan, extents).expect("static shapes");
                 let own = eta_exec::layout(&tables.descriptors).expect("fits").total;
                 (*name, own, tables.scratch)
             })
@@ -492,10 +558,12 @@ mod tests {
             [
                 ("top-p", 9_312_512, 5_056_512),
                 ("top-k + top-p", 9_616_896, 5_208_832),
-                ("gumbel-max", 5_512_960, 4_296_448),
-                ("greedy", 3_688_704, 3_688_448),
-                ("top logprobs", 6_728_960, 4_904_192),
-                ("sorted", 8_551_168, 4_903_936),
+                ("gumbel-max", 5_512_960, 1_900_032),
+                ("greedy", 3_688_704, 1_292_032),
+                ("top logprobs", 6_728_960, 4_862_720),
+                ("sorted", 8_551_168, 4_862_464),
+                ("beam prefill", 6_728_960, 5_469_952),
+                ("beam-4 decode", 31_647_232, 21_879_296),
             ]
         );
     }
