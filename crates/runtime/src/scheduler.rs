@@ -221,6 +221,30 @@ pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }
 
+/// Waits until every copy engine `engine_id` was handed has landed: what an
+/// aborted move waits for before it gives back slots a copy may still write.
+pub(crate) async fn settle_copies(engine_id: usize) -> Result<()> {
+    pool(engine_id, worker::PoolOp::SettleCopies).await
+}
+
+/// Gives back an aborted move's slots once every copy it handed the engine
+/// has landed: its copies' completions (which may settle before a copy has
+/// written its destinations), then `settled`, every copy landed. A copy that
+/// did not settle keeps the slots out (`false`): reused under a late write,
+/// they would hold another owner's bytes.
+pub(crate) async fn abort_once_landed(
+    in_flight: Vec<ControlCompletion>,
+    settled: impl std::future::Future<Output = anyhow::Result<()>>,
+    abort: impl FnOnce(),
+) -> std::result::Result<(), String> {
+    for completion in in_flight {
+        let _ = completion.wait().await;
+    }
+    settled.await.map_err(|error| format!("{error:#}"))?;
+    abort();
+    Ok(())
+}
+
 /// Tells engine `engine_id` where moved pool slots lie now, on its lane
 /// ahead of every fire queued after it.
 pub(crate) async fn rebind_slots(engine_id: usize, rebind: ::engine::Rebind) -> Result<()> {
@@ -505,5 +529,54 @@ mod tests {
         assert_ne!(domain, ::engine::MemoryDomain::VulkanDevice(0));
         assert_ne!(domain, ::engine::MemoryDomain::WgpuDevice(0));
         assert_ne!(domain, ::engine::MemoryDomain::MetalPrivate);
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// An aborted move's copy has settled (its completion resolved) but not
+    /// landed: its slots go back only once the engine says every copy has
+    /// landed, never before, and never at all if that fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_aborted_move_gives_back_its_slots_only_once_its_copies_land() {
+        let copy = ControlCompletion::new();
+        copy.resolve(&Ok(()));
+        let (landed, landing) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        let freed = Arc::new(AtomicBool::new(false));
+        let gave = Arc::clone(&freed);
+        let abort = tokio::spawn(abort_once_landed(
+            vec![copy],
+            async move { landing.await.expect("the test settles it") },
+            move || gave.store(true, Ordering::SeqCst),
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !freed.load(Ordering::SeqCst),
+            "a copy that settled but has not landed keeps its slots out"
+        );
+        landed.send(Ok(())).expect("the abort waits on it");
+        abort.await.expect("the abort runs").expect("it settled");
+        assert!(freed.load(Ordering::SeqCst), "landed, the slots go back");
+
+        let copy = ControlCompletion::new();
+        copy.resolve(&Ok(()));
+        let freed = Arc::new(AtomicBool::new(false));
+        let gave = Arc::clone(&freed);
+        let refused = abort_once_landed(
+            vec![copy],
+            async { Err(anyhow::anyhow!("the engine could not settle")) },
+            move || gave.store(true, Ordering::SeqCst),
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(
+            !freed.load(Ordering::SeqCst),
+            "copies that did not settle keep their slots out"
+        );
     }
 }

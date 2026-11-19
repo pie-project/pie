@@ -99,6 +99,11 @@ pub struct Books {
     /// The bytes the device gave this process, as the backend counts them
     /// where it allocates.
     device: AtomicU64,
+    /// The host bytes the backend reserved through the device's driver off
+    /// every device-local heap (pinned, host-visible memory: a guest
+    /// stage's staging), which no device ledger holds: counted here so they
+    /// are refused past the host's room rather than taken unseen.
+    host: AtomicU64,
     /// Whether these bytes are the process's: a device's are, and a naming
     /// load's ([`Books::apart`]) reserve nothing.
     process: bool,
@@ -117,6 +122,7 @@ impl Books {
         Books {
             ledger: Mutex::new(Ledger::new(1, u64::MAX)),
             device: AtomicU64::new(0),
+            host: AtomicU64::new(0),
             process: true,
         }
     }
@@ -157,6 +163,22 @@ impl Books {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_sub(bytes));
         });
+    }
+
+    /// The driver gave `bytes` of host memory off the device's heaps.
+    pub fn host_take(&self, bytes: u64) {
+        self.host.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Host memory of `bytes` off the device's heaps went back.
+    pub fn host_give(&self, bytes: u64) {
+        self.host.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// The host bytes reserved off the device's heaps ([`Books::host_take`]).
+    #[must_use]
+    pub fn host(&self) -> u64 {
+        self.host.load(Ordering::Relaxed)
     }
 
     /// `bytes` of a reservation entered under `from` are `to`'s: the
@@ -222,5 +244,25 @@ impl Books {
             entered: reserved,
             device: self.device(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Books, owners};
+
+    /// Host memory a backend reserved off the device's heaps (a guest
+    /// stage's staging) is counted apart from the device's: it moves the
+    /// host count and leaves the device's books, and their audit, alone.
+    #[test]
+    fn host_memory_off_the_device_is_counted_apart() {
+        let books = Books::apart();
+        books.take(owners::GUEST, 100);
+        books.host_take(4096);
+        books.host_take(64);
+        assert_eq!((books.device(), books.host()), (100, 4160));
+        assert_eq!(books.audit().entered, 100);
+        books.host_give(4096);
+        assert_eq!(books.host(), 64);
     }
 }

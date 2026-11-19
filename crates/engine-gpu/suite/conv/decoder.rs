@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::{self, Boot, Clips, Context, DeviceBoot, Lane, Seated, Shell};
+use crate::backend::{self, Boot, Clips, Context, Lane, Seated, Shell};
 use poem::ops::attn;
 use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, Input, StateRows, Weight, trace_hybrid};
@@ -380,7 +380,7 @@ fn scratch() -> PathBuf {
 
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_input() {
-    let device = DeviceBoot::default();
+    let device = crate::gpu::device_boot();
     if Context::bind(&device, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
@@ -417,7 +417,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         runahead: engine::runahead::Runahead::F1,
         device: &device,
         residency: engine::load::Residency {
-            device: backend::ALLOWANCE,
+            device: crate::gpu::share(),
             ..engine::load::Residency::default()
         },
         handed: None,

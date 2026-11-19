@@ -44,7 +44,7 @@ use profile::fire::Rates;
 
 
 /// The rates this backend's estimate weighs a fire by, of
-/// `profile::fire::KEYS` (all eight): what its load measures where its
+/// `profile::fire::KEYS` (all but the slang backends' `tile_tflops_by_rows` and `vector_tflops_by_rows`): what its load measures where its
 /// chip's profile states none.
 pub const KEYS: [&str; 8] = [
     "launch_ns",
@@ -592,16 +592,10 @@ pub fn at_load(
     max_submit: Option<std::time::Duration>,
 ) -> Result<profile::Profile, String> {
     let name = device.name().to_string();
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &name),
         provenance: provenance(&name),
-        check: &check,
+        registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
     engine::rates::rates_at_load(chip, &KEYS, save, None, max_submit, |_max_submit| {
@@ -783,10 +777,13 @@ pub fn measure(
         gemm_tflops_by_rows: Some(gemm),
         attn_tflops_by_keys: Some(attn),
         hbm_gbps: Some(bytes),
+        cached_gbps: None,
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
         few_row_tflops: few_row,
         workgroups_per_core: per_core,
+        tile_tflops_by_rows: None,
+        vector_tflops_by_rows: None,
     })
 }
 

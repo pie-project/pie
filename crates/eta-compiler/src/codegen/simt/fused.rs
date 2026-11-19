@@ -453,6 +453,33 @@ pub fn emit_fused_region(
     let skipped = direct.skipped;
 
     let mut source = runtime_source(dialect);
+    let stream_kinds = stream_rows(stage, region);
+    let row_parallel = stream_kinds.is_some();
+    let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
+    // Each block narrows the values of its own row. A single-row region's
+    // values already are its one row, at row 0: they keep the dims they
+    // declare, which the ops that are not streams (a transpose, a gather
+    // along axis 0) index by. The table of which values a block narrows is
+    // read by value index, so it lies in constant memory: a kernel-local
+    // array indexed at run time is placed in a thread's private memory,
+    // which a HIP kernel asks the runtime to grow at its first launch.
+    let row_count = row_kinds.len().max(1);
+    if row_parallel {
+        let narrowed = row_geometry(stage, region).is_some();
+        let kinds: Vec<String> = row_kinds
+            .iter()
+            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
+            .collect();
+        let kinds = if kinds.is_empty() {
+            "0u".to_string()
+        } else {
+            kinds.join(", ")
+        };
+        let _ = writeln!(
+            source,
+            "__constant__ m1_u8 ptir_rowkind[{row_count}u] = {{{kinds}}};"
+        );
+    }
     source.push_str(PROLOGUE);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);
@@ -460,25 +487,8 @@ pub fn emit_fused_region(
     source.push_str(PREAMBLE);
     emit_table_staging(&mut source, ops.len(), next_value as usize);
 
-    let stream_kinds = stream_rows(stage, region);
-    let row_parallel = stream_kinds.is_some();
-    let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
     if row_parallel {
-        // Each block narrows the values of its own row. A single-row region's
-        // values already are its one row, at row 0: they keep the dims they
-        // declare, which the ops that are not streams (a transpose, a gather
-        // along axis 0) index by.
-        let narrowed = row_geometry(stage, region).is_some();
-        let kinds: Vec<String> = row_kinds
-            .iter()
-            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
-            .collect();
-        let count = kinds.len().max(1);
-        let _ = writeln!(
-            source,
-            "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};",
-            kinds.join(", ")
-        );
+        let count = row_count;
         let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
         let _ = writeln!(source, "  __shared__ m1_u64 ptir_rowshift[{count}u];");
         let _ = writeln!(
@@ -652,6 +662,7 @@ pub fn emit_fused_region(
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset += lane_row;\n");
+            source.push_str("    p.intrinsic_rows = intrinsic_rows[intrinsic_index];\n");
             slots.a0 =
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
@@ -842,6 +853,7 @@ fn emit_body(
                 "        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
 ",
             );
+            source.push_str("        intrinsic_rows[gumbel_intrinsic_index],\n");
             let _ = writeln!(source, "        {},", chain.state);
             let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
             match (&chain.divisor, chain.divisor_desc) {
@@ -880,7 +892,8 @@ fn emit_body(
             source.push_str("        descriptors[p.a0],\n");
             source.push_str("        intrinsic_modes[direct_intrinsic_index],\n");
             source.push_str("        intrinsic_strides[direct_intrinsic_index],\n");
-            source.push_str("        intrinsic_offsets[direct_intrinsic_index] + lane_row);\n");
+            source.push_str("        intrinsic_offsets[direct_intrinsic_index] + lane_row,\n");
+            source.push_str("        intrinsic_rows[direct_intrinsic_index]);\n");
         } else {
             let _ = writeln!(
                 source,
@@ -900,10 +913,22 @@ fn emit_body(
             );
             source.push_str("    __syncthreads();\n");
         }
-        let _ = writeln!(
-            source,
-            "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
-        );
+        let integer_add = tag == tags::SCATTER_ADD
+            && matches!(
+                stage.normalized.value_types[op.args[0] as usize].dtype,
+                Dtype::I32 | Dtype::U32
+            );
+        if integer_add {
+            let _ = writeln!(
+                source,
+                "    ptir_parallel_scatter_add_int({a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        } else {
+            let _ = writeln!(
+                source,
+                "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        }
     } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
         source.push_str(cut_mark);
         let _ = writeln!(

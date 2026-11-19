@@ -109,6 +109,10 @@ fn heavier_epilogue(rounds: u32) -> eta_ir::container::TraceContainer {
 /// A lane fires on while a program's registration compiles cold on another
 /// thread (`Engine::prepare_program`): its fires keep landing, none waiting
 /// out the compile, and the program registers at the finish.
+///
+/// Known to fail on the RTX Spark (Windows NVIDIA driver): a one-time submit stall early in
+/// the engine's life lands inside the compile window in about half the runs, with no pie lock
+/// involved (`new-memory/FOLLOWUPS.md` F41). The measurement stays strict.
 #[test]
 fn a_cold_registration_compiles_while_a_lane_fires() {
     use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
@@ -146,6 +150,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

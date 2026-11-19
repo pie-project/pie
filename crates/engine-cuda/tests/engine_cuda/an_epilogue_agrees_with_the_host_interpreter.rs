@@ -233,6 +233,7 @@ fn device_outputs(
                 width,
                 width,
                 0,
+                rows,
             )
             .expect("the logits bind");
         buffer

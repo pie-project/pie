@@ -55,16 +55,23 @@ pub struct Metal {
     adapters: BTreeMap<InstanceId, u32>,
     /// What the load armed and what its fires tallied (`engine::live`).
     live: engine::live::Live,
+    /// Where a tier copy still landing is told landed
+    /// (`Engine::copy_slots_landing`).
+    landed: Option<engine::LandingSink>,
 }
 
 impl Metal {
-    /// Fires refused for a pipeline the load did not build, counted as
-    /// `Tally::Compiled` (the load should have prepared them).
+    /// Fires that reached a pipeline the load did not build, counted as
+    /// `Tally::BuiltInFire`: once the load is sealed nothing builds on a
+    /// fire's path here (the pipeline cache refuses the key, and the fire
+    /// with it), so what a backend that builds there would count is these.
+    /// It reads 0 where every pipeline a fire can reach was built before
+    /// ready.
     fn tally_unbuilt(&self) {
         if let Some(shell) = self.shell.as_ref() {
             let missed = shell.take_unbuilt_pipelines();
             if missed > 0 {
-                self.live.tally(engine::live::Tally::Compiled, missed);
+                self.live.tally(engine::live::Tally::BuiltInFire, missed);
             }
         }
     }
@@ -82,6 +89,7 @@ impl Metal {
             pending: None,
             adapters: BTreeMap::new(),
             live: engine::live::Live::armed(),
+            landed: None,
         }
     }
 
@@ -143,6 +151,11 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
 }
 
 fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
         Fault::Refused { bytes } => Error::Exhausted {
@@ -169,9 +182,14 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::GeometryLanes { .. }
+        | Fault::OutputRows { .. } => {
+            Error::Invalid(fault.to_string())
+        }
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
@@ -685,6 +703,9 @@ impl Engine for Metal {
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // Metal states no bound on one submission yet
+            // (`crate::rates::at_load`).
+            guest_cost: engine::GuestCost::default(),
         };
 
         // Every pipeline the load's rungs dispatch is built now, before
@@ -778,6 +799,34 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    /// Waits on the last copy's command buffer: every copy submitted so far
+    /// has read its sources and written its destinations.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.settle_copies().map_err(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// A copy on the device rides a command buffer that may still be
+    /// reading its sources when the call returns: told landed from that
+    /// buffer's completion. A move to or from the host tier or the slot
+    /// files is a host copy done inside the call: its sources are read.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self.landed.clone();
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
@@ -841,6 +890,7 @@ impl Engine for Metal {
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
                 self.expect_fire(next);
@@ -853,6 +903,12 @@ impl Engine for Metal {
                 Ok((ticket, step_pending)) => {
                     steps.push(ticket);
                     pending.push(step_pending);
+                }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
                 }
                 Err(error) => {
                     self.pending = None;
@@ -869,7 +925,7 @@ impl Engine for Metal {
             }
         }
         self.tally_unbuilt();
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
         if !self.settles_asynchronously() {
             self.settle_frame(&mut ticket)?;
@@ -940,6 +996,15 @@ impl Engine for Metal {
         Ok(())
     }
 
+    /// Commits the epilogues of every landed step (their sink was told from
+    /// the completion handler) before the runtime takes their channels.
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.reap().map_err(fault)?;
+        }
+        Ok(())
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
         if let Some(shell) = self.shell.as_mut() {
@@ -952,10 +1017,11 @@ impl Engine for Metal {
         let before = shell.program_compilations();
         let id = shell.register_program(registration).map_err(fault)?;
         // A registration after ready that compiled guest code is one the
-        // load's prewarm did not prepare.
+        // load's prewarm did not prepare: built at its registration, before
+        // its first fire (no fire waits on it).
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
             tracing::warn!(
                 program = registration.program_hash,
                 regions = built,
@@ -997,10 +1063,11 @@ impl Engine for Metal {
         let before = shell.program_compilations();
         let id = shell.finish_program(*registered).map_err(fault)?;
         // The compile's regions count at the finish: a registration after
-        // ready that compiled guest code is one the prewarm did not prepare.
+        // ready that compiled guest code is one the prewarm did not prepare,
+        // built at its registration (no fire waits on it).
         let built = shell.program_compilations() - before;
         if built > 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
             tracing::warn!(
                 program = id.0,
                 regions = built,
@@ -1030,6 +1097,8 @@ impl Engine for Metal {
         &self,
         program: ProgramId,
         at: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         self.loaded()?
             .guest_state(program, &extents(at))
@@ -1106,6 +1175,7 @@ impl Engine for Metal {
                 &binding.ring_slots,
                 &binding.scratch,
                 &binding.pair,
+                binding.pair_generation,
             )
             .map_err(fault)?;
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
@@ -1158,7 +1228,15 @@ impl Engine for Metal {
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
+        self.loaded_mut()?
+            .program_instance_taking(instance, channel)
+            .map_err(fault)?
+            .ok_or(Error::Closed {
+                what: "instance",
+                id: instance.0,
+            })?
+            .take(channel)
+            .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -1395,6 +1473,8 @@ impl Metal {
                     pages: pages_of[at].as_deref().unwrap_or(&[]),
                     held: pages_of[at].is_some().then_some(lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),

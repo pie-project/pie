@@ -3,6 +3,7 @@ mod boot;
 pub(crate) mod btrace;
 pub mod diag;
 mod enqueue;
+mod landing;
 mod lanes;
 mod load;
 mod measured;
@@ -89,7 +90,11 @@ pub struct Shell {
     inputs: Inputs,
     facts: kv::Facts,
     page_tables: usize,
+    /// The classes a lane may state a mask on (`exports::masked_classes`).
     masked: poem_ir::ClassSet,
+    /// The classes whose attention reads the fire's masks: a fire carrying
+    /// one stages every lane's entry, a mask or none.
+    mask_read: poem_ir::ClassSet,
     /// The classes a stated mask reaches as a group's (a ragged attention):
     /// a lane there states one or none.
     group_masked: poem_ir::ClassSet,
@@ -178,10 +183,6 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
-    /// The arming fire's ragged attentions read a group mask: its lanes
-    /// state every row of their group admitted, and its body is the masked
-    /// twin (`record::BodyKey::group_mask`).
-    arm_group_mask: bool,
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),
@@ -224,6 +225,10 @@ pub struct Shell {
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
     /// Last, so it drops after everything else the shell holds.
     _released: Released,
 }
@@ -808,7 +813,7 @@ impl Shell {
         let registered = self.programs.register(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         registered
     }
@@ -834,7 +839,7 @@ impl Shell {
         let prepared = self.programs.prepare(&self.device, registration);
         let late = self.programs.built_late() - before;
         if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         }
         prepared
     }
@@ -880,6 +885,14 @@ impl Shell {
     /// What `program` bound at `extents` holds as state, as the pool lays
     /// it: each instance's lane scratch and its pair's tables
     /// ([`crate::program::Plane::pair_room`]).
+    /// Whether the pair's state is laid again at its next fire
+    /// ([`crate::program::Plane::pair_stale`]). For a test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pair_stale(&self, program: engine::ProgramId, extents: eta_exec::Extents) -> Option<bool> {
+        self.programs.pair_stale(program, extents)
+    }
+
     pub fn guest_state(
         &self,
         program: engine::ProgramId,
@@ -965,9 +978,10 @@ impl Shell {
         id: engine::InstanceId,
         slots: crate::program::Slots,
     ) -> Result<()> {
+        let stream = self.device.stream();
         let pools = &self.pools;
         self.programs
-            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes))
+            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes), stream)
     }
 
     /// Settles the guest batches whose steps have landed: their channels'

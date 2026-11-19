@@ -85,6 +85,39 @@ fn pool_at_256() -> (SharedPool, FakeEngine) {
 
 /// The planner as a raise's funding meets it: an ask parks until the test
 /// has freed the room, then is granted.
+/// A rise that cannot fire narrower (a piece no cut brings under the rung
+/// held, a program's term), with its own process's kv in the span the
+/// lowered rung lent and free chunks below: the rise moves that kv down and
+/// binds at once. The requester's own pages are moved, never waited on,
+/// and no planner is asked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rise_whose_own_kv_lies_in_the_lent_span_moves_it_and_binds() {
+    let (mut pool, engine) = pool_at_256();
+    let list = pool.list().expect("a kv list");
+    let spc = u64::from(list.slots_per_chunk);
+    // Others take every chunk below the span; the requester the lent ones.
+    let span = pool.pool().total_chunks() - pool.pool().act_max();
+    let below = u64::from(span - pool.pool().reserved_chunks()) * spc;
+    let others = pool.take_refs(list.pool, below).expect("below the span");
+    let lent = u64::from(pool.pool().act_max() - pool.pool().act_reserved()) * spc;
+    let _own = pool.take_refs(list.pool, lent).expect("the lent span");
+    assert_eq!(pool.pool().held_in_span(2048), 8);
+    // Others give back as many chunks below as the requester holds above.
+    pool.give_refs(list.pool, &others[..usize::try_from(lent).unwrap()]);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fund_span(&shared, || 2048, &NoPlanner, &Lane(engine.clone())),
+    )
+    .await
+    .expect("no stall")
+    .expect("the rise binds");
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(pool.pool().held_in_span(2048), 0, "its kv moved below");
+}
+
 #[derive(Default)]
 struct Planner {
     asked: AtomicU32,
@@ -156,7 +189,10 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
     assert_eq!(after, before);
     assert_eq!(pool.rung(), 256);
     assert_eq!(pool.span_short(256), 0);
-    assert_eq!(pool.room().act_chunks, 1);
+    // The span is the largest rung's; what the smallest leaves of it is
+    // lent, the zero term taking none of it.
+    let room = pool.room();
+    assert_eq!((room.act_chunks, room.lent_chunks), (12, 11));
     let mut walk = RungWalk::default();
     assert_eq!(
         walk.step(&pool, 256, 256, 256, 1, 1).unwrap(),
@@ -1698,6 +1734,22 @@ impl SetEngine {
 }
 
 impl ::engine::Engine for SetEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-sets"
     }

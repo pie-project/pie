@@ -24,6 +24,7 @@ fn allocation(demand: Demand) -> WaitKind {
         notify: Arc::new(Notify::new()),
         outcome: None,
         yielded: false,
+        rise: false,
     }
 }
 
@@ -372,6 +373,51 @@ fn dry_pool_two_asks(planner: &ResidencyPlanner) -> Vec<EntryKey> {
             })
             .collect()
     })
+}
+
+/// A rise asks for every free page beside the chunks it lacks, and gives
+/// them back at once: past the pool's kv total (the lent span in none of
+/// it), it is no hog, where the same ask of kv is.
+#[test]
+fn a_rise_past_the_kv_total_is_no_hog() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(4))));
+    let (kv, rise) = planner.with_inner(|inner| {
+        let mut park = |rise: bool| {
+            let pid = ProcessId::new_v4();
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+            let WaitKind::Allocation {
+                demand,
+                notify,
+                outcome,
+                yielded,
+                ..
+            } = allocation(Demand {
+                kv_pages: 8,
+                rs: RsUnits::default(),
+            })
+            else {
+                unreachable!()
+            };
+            let key = inner.enqueue(
+                pid,
+                WaitKind::Allocation {
+                    demand,
+                    notify,
+                    outcome,
+                    yielded,
+                    rise,
+                },
+            );
+            (key, pid)
+        };
+        (park(false), park(true))
+    });
+    assert!(!planner.check_hog(rise.0, rise.1), "a rise is no hog");
+    assert!(planner.check_hog(kv.0, kv.1), "the same ask of kv is");
 }
 
 fn unfailed(planner: &ResidencyPlanner, keys: &[EntryKey]) -> usize {
@@ -1763,8 +1809,8 @@ fn growing_window_model() -> usize {
 /// a turn at a time, the engine committing what it is told.
 #[tokio::test(flavor = "current_thread")]
 async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
+    use crate::governor::Yield;
     use crate::governor::run::Steer;
-    use crate::governor::{PoolTarget, Pressure, Tolerance};
     use crate::store::shared::SegmentMove;
 
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -1778,14 +1824,7 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(
         RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     )));
-    let mut steer = Steer::new(
-        &grow,
-        Tolerance {
-            backoff: 0.5,
-            release_idle: true,
-        },
-        512 << 20,
-    );
+    let mut steer = Steer::new(&grow, Yield::new(0.5).unwrap());
     let geom = crate::store::rs::RsGeometry {
         state_size: 0,
         buffer_page_tokens: 16,
@@ -1815,7 +1854,7 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
             break;
         }
         // The governor's tick, then the walk toward its target.
-        steer.turn(&mut grow, Some(Pressure::Calm), &mut |_| {});
+        steer.turn(&mut grow, 0.0, &mut |_| {});
         loop {
             let goal = grow.goal_for_test();
             epoch += 1;
@@ -1838,7 +1877,7 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
     }
     let done = tasks.iter().filter(|task| task.is_finished()).count();
     let mapped = shared.lock().unwrap().mapped_segments();
-    let demand = grow.demand();
+    let demand = shared.lock().unwrap().demand();
     assert_eq!(
         done, PROCESSES,
         "{done} of {PROCESSES} served; mapped {mapped} segments, demand {demand:?}"
@@ -1854,12 +1893,11 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
 /// short of the head is never asked to grow.
 #[tokio::test(flavor = "current_thread")]
 async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
-    use crate::governor::PoolTarget;
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let model = growing_window_model();
     let stores = crate::store::registry::get(model, 0);
     let shared = stores.shared.clone().expect("a shared pool");
-    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
+    let grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(
         RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     )));
@@ -1885,7 +1923,7 @@ async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
     }
     let free = stores.rs.lock().unwrap().free().pages;
     assert!((1..3).contains(&free), "{free} free");
-    let before = grow.demand();
+    let before = shared.lock().unwrap().demand();
     let (pid, ws) = start(&stores);
     let demand = window_demand(&stores, ws, 0, 48);
     let p = planner.clone();
@@ -1894,7 +1932,7 @@ async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
         crate::rt::yield_now().await;
     }
     assert!(!parked.is_finished(), "{free} free, three asked: it parks");
-    let after = grow.demand();
+    let after = shared.lock().unwrap().demand();
     assert_eq!(
         after.wanted - before.wanted,
         3 << 20,
@@ -2222,8 +2260,8 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| false,
         |_, _| false,
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
-        || std::future::ready(()),
         || {},
+        |_| {},
     );
     tokio::pin!(decode);
     assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
@@ -2391,6 +2429,11 @@ struct BindRoomPool {
     host: u32,
     /// The registered model whose kv store its victims' pages lie in.
     model: usize,
+    /// The process whose state holds the chunks, if one does
+    /// ([`PoolPort::chunk_occupants`]): each chunk of the pool, whole.
+    occupant: parking_lot::Mutex<Option<ProcessId>>,
+    /// The pool's count of room given back (`room_gives`).
+    gives: std::sync::atomic::AtomicU64,
 }
 
 impl BindRoomPool {
@@ -2401,6 +2444,8 @@ impl BindRoomPool {
             total,
             host,
             model: 0,
+            occupant: parking_lot::Mutex::new(None),
+            gives: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2469,6 +2514,29 @@ impl PoolPort for BindRoomPool {
     }
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
+    }
+    fn room_gives(&self) -> u64 {
+        self.gives.load(Ordering::Relaxed)
+    }
+    fn chunk_occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
+        let Some(occupant) = *self.occupant.lock() else {
+            return super::pool::ChunkMap::default();
+        };
+        if !pids.contains(&occupant) {
+            return super::pool::ChunkMap::default();
+        }
+        super::pool::ChunkMap {
+            held: (0..self.total)
+                .map(|chunk| super::pool::ChunkHeld {
+                    chunk,
+                    used: 1,
+                    by: vec![(occupant, 1)],
+                })
+                .collect(),
+            free: Vec::new(),
+            headroom: None,
+            segment_chunks: 0,
+        }
     }
     fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
         None
@@ -3206,7 +3274,11 @@ async fn the_cache_bound_is_the_retention_key_not_the_schedule_priority() {
             }),
         );
     });
-    assert_eq!(planner.head_key(), Some(9), "its schedule priority orders service");
+    assert_eq!(
+        planner.head_key(),
+        Some(9),
+        "its schedule priority orders service"
+    );
     assert_eq!(
         planner.head_retention(),
         Some(crate::policy::retention::FLOOR),
@@ -3214,4 +3286,840 @@ async fn the_cache_bound_is_the_retention_key_not_the_schedule_priority() {
     );
     planner.unregister(head);
     install(None);
+}
+
+/// AMD's 500-concurrent wedge, run 2: the planner's head the kv
+/// allocation of a prompt not yet seated, the device full, and every other
+/// process waiting at a bind for room. Seated first, only an idle or held
+/// process yields to such a prompt, and a process waiting at a bind was
+/// neither, so the head found no victim and nothing moved. Waiting at a
+/// bind it makes no progress until room comes, so it yields as an idle one
+/// does; past its wait it no longer does.
+#[test]
+fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = Arc::new(
+        ResidencyPlanner::new(Arc::new(RacePool::new(0)) as Arc<dyn PoolPort>).seated_first(true),
+    );
+    let (waiting, prompt) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [waiting, prompt] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&waiting).unwrap().seated = true;
+        inner.enqueue(
+            prompt,
+            allocation(Demand {
+                kv_pages: 16,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members = |planner: &Arc<ResidencyPlanner>| {
+        planner
+            .victim_set()
+            .map(|set| {
+                set.members
+                    .iter()
+                    .map(|victim| victim.pid)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        members(&planner).is_empty(),
+        "a seated lane mid-decode does not yield"
+    );
+    planner.set_bind_waiting(waiting, true);
+    assert_eq!(
+        members(&planner),
+        vec![waiting],
+        "waiting at a bind, it yields"
+    );
+    planner.set_bind_waiting(waiting, false);
+    assert!(
+        members(&planner).is_empty(),
+        "past its wait, it no longer does"
+    );
+}
+
+/// AMD's 500-concurrent wedge: a bind short of room waited for the fleet
+/// to stall before the planner moved anyone for it, as a restore does, and
+/// with the other processes decoding it never stalled: no eviction was
+/// planned for the bind, ever. A bind is new demand: with a process still
+/// decoding (the fleet not stalled), the planner evicts the occupants of
+/// the chunks the bind could take, here the idle process holding them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, holder, decoding) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    for pid in [binder, holder, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&holder).unwrap().idle = true);
+    *pool.occupant.lock() = Some(holder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        !planner.with_inner(|inner| inner.fleet_stalled())
+            || planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "a process decodes beside the bind"
+    );
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the planner moves the chunks' occupant for the bind, the fleet decoding"
+    );
+    waited.abort();
+}
+
+/// AMD's wedge, its second half: once the rung was lowered (its segments
+/// given back) no bind was quoted again for two minutes, the room there
+/// and the head waiting on its own serve. Room that moves now has the
+/// planner quote the waiting head again: a rung change alone, nothing told
+/// the planner, serves the bind in the room it left.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let binder = ProcessId::new_v4();
+    planner.register(binder);
+    planner.note_admitted(binder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waited.is_finished(), "no room, no victim: it waits");
+    // The rung comes down: its chunks are free, and only the rung says so.
+    pool.free.lock().extend(0..8);
+    crate::store::shared::rung_changed(pool.locus().1);
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if waited.is_finished() {
+            break;
+        }
+    }
+    assert!(
+        waited.is_finished(),
+        "quoted again on the rung's move, and served"
+    );
+    waited.await.expect("the wait ends").expect("served");
+}
+
+/// AMD's wedge on c75d39a0b: the chunk branch chose the same process on
+/// every quote, an older one waiting at a bind of its own, and nothing
+/// moved: the victim set took a bind waiter as a victim, but the start of
+/// the moves declined it (ranked ahead of the head, neither idle nor
+/// held). A bind waiter the victim set chose now starts its move.
+#[tokio::test(flavor = "current_thread")]
+async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (holder, binder, decoding) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    // The holder first: older, ranked ahead of the binder.
+    for pid in [holder, binder, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&holder).unwrap();
+        proc.bind_waiting = true;
+        proc.progressed = false;
+    });
+    *pool.occupant.lock() = Some(holder);
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the bind waiter holding the chunks is moved"
+    );
+    waited.abort();
+}
+
+/// An evicted process's gate sleeps until its own residency changes: the
+/// planner poked for others and room freed wake it not once (it holds no
+/// clock: on a 100 ms re-report of a standing shortfall it woke each
+/// waiter ten times a second). Its restore wakes it, once. Every event is
+/// driven here in order on one thread, each followed by yields that would
+/// run a woken gate to its next park before the count is read: no sleep.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (pid, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [pid, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    let parks = |planner: &Arc<ResidencyPlanner>| planner.stats.gate_parks.load(Ordering::Relaxed);
+    let p = planner.clone();
+    let gate = crate::rt::spawn(async move { p.wait_resident(pid).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if parks(&planner) == 1 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 1, "parked");
+    // No drain task armed: each poke plans now, on this thread.
+    for _ in 0..50 {
+        planner.poke();
+        planner.pages_freed();
+        crate::rt::yield_now().await;
+        crate::rt::yield_now().await;
+    }
+    assert!(!gate.is_finished(), "still evicted");
+    assert_eq!(
+        parks(&planner),
+        1,
+        "parked once, woken by nothing of its own"
+    );
+    let signal = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Resident;
+        proc.signal.clone()
+    });
+    signal.notify_waiters();
+    gate.await.expect("the gate ends").expect("resident");
+    assert_eq!(
+        parks(&planner),
+        1,
+        "its restore ends the wait, no park after"
+    );
+}
+
+/// The policy's answer of nothing is process-wide (any planner's, any
+/// tier's), and an evicted gate woke on every one, a restore of its own
+/// queued or not, to find nothing changed and park again. A gate with no
+/// short restore sleeps through such answers; a gate whose queued restore
+/// is short on the tier answered wakes on it, once, and gives up.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
+    use crate::policy::pressure::{Tier, answered_nothing};
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (idle, short) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [idle, short] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+        planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    }
+    let parks = |planner: &Arc<ResidencyPlanner>| planner.stats.gate_parks.load(Ordering::Relaxed);
+
+    // No restore queued: the policy answering anyone's shortfall is not its.
+    let p = planner.clone();
+    let idle_gate = crate::rt::spawn(async move { p.wait_resident(idle).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if parks(&planner) == 1 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 1, "parked");
+    for _ in 0..10 {
+        answered_nothing(Tier::Device);
+        answered_nothing(Tier::Host);
+        crate::rt::yield_now().await;
+        crate::rt::yield_now().await;
+    }
+    assert!(!idle_gate.is_finished(), "still evicted");
+    assert_eq!(
+        parks(&planner),
+        1,
+        "answers that are not its wake it not once"
+    );
+
+    // Control: a restore queued short of host room gives up on the answer.
+    let key = planner.with_inner(|inner| {
+        inner.enqueue(
+            short,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    planner.note_short(key, 0, 1 << 20);
+    let p = planner.clone();
+    let short_gate = crate::rt::spawn(async move { p.wait_resident(short).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if parks(&planner) == 2 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 2, "the short gate parked, once");
+    answered_nothing(Tier::Host);
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if short_gate.is_finished() {
+            break;
+        }
+    }
+    let ended = short_gate.await.expect("the gate ends");
+    assert!(
+        matches!(
+            ended,
+            Err(PlannerError::Short {
+                tier: Tier::Host,
+                ..
+            })
+        ),
+        "its own restore's answer wakes it and it gives up: {ended:?}"
+    );
+    assert!(!idle_gate.is_finished(), "the other gate sleeps through it");
+    assert_eq!(parks(&planner), 2, "neither parked again");
+    idle_gate.abort();
+}
+
+/// Reuse after release, the eviction window (the 1200-beam divergence:
+/// beam_search's verify rescore registers a fresh working set per
+/// hypothesis mid-process and prefills on it). P's set S0 stands when the
+/// planner moves P off Resident; the eviction fences and quiesces it (its
+/// snapshot). A set S1 that P registers after that, before the park, was
+/// born unfenced: its prefill took its lease, got its grant, and ran on
+/// P's instance while the park copied and freed its slots, which another
+/// owner then took and wrote. Now S1 is registered under the lock P left
+/// Resident under: born fenced, its prefill does not fire, and no grant is
+/// given to P, until the restore. The park's copy is P's last completed
+/// state, and no slot goes to another owner under a fire of P's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_set_registered_mid_eviction_prefills_only_after_the_restore() {
+    use crate::inferlet::process::residency::{
+        ProcessResidency, kv_lease_quiescent, kv_suspend_handles, register_residency,
+    };
+    use crate::store::kv::working_set::{FireLeaseError, KvWorkingSet};
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let stores = crate::store::registry::get(model, 0);
+    let fresh =
+        || crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.create_working_set());
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    register_residency(pid, Arc::downgrade(&residency));
+    let s0 = KvWorkingSet::new(model, 0, fresh(), 16);
+    planner.register_kv_working_set(pid, &residency, &s0);
+    drop(s0.fire_lease().expect("resident: S0 fires"));
+
+    // The eviction: off Resident under the planner's lock, then its
+    // snapshot fenced and quiesced.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicting);
+    let snapshot = kv_suspend_handles(pid, model, 0);
+    assert_eq!(snapshot.len(), 1);
+    for handle in &snapshot {
+        handle.fence();
+        handle.quiesce().await;
+    }
+
+    // Between the snapshot and the park, P registers a fresh set for a
+    // rescore, and its prefill asks to fire.
+    let s1 = KvWorkingSet::new(model, 0, fresh(), 16);
+    planner.register_kv_working_set(pid, &residency, &s1);
+    assert!(
+        matches!(s1.fire_lease(), Err(FireLeaseError::Fenced)),
+        "a set registered mid-eviction is born fenced: its prefill does not fire before the restore"
+    );
+    let prefill = Demand {
+        kv_pages: 2,
+        rs: RsUnits::default(),
+    };
+    assert!(
+        planner.grant_now(pid, prefill).is_none(),
+        "no grant for a fire of a process not resident"
+    );
+    assert!(
+        planner.grant_now(pid, Demand::default()).is_none(),
+        "not even an empty one"
+    );
+    // The park runs with no fire of P's in flight on any set it holds:
+    // what it copies is P's last completed state, and the slots it frees
+    // go to another owner under no fire of P's.
+    assert!(kv_lease_quiescent(pid, model, 0));
+
+    // The restore: every set P holds fires again, the rescore's included.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Restoring);
+    planner.report_restored(pid);
+    for set in [&s0, &s1] {
+        drop(set.fire_lease().expect("resident again: it fires"));
+    }
+    assert!(planner.grant_now(pid, Demand::default()).is_some());
+}
+
+/// AMD's stall on adc4c1506 (7+ minutes, `head_kind=restore`,
+/// `restore_roles_short` climbing, 143 processes at a bind): the head
+/// restore had its kv pages and was short only of an Instance run, and it
+/// waited for the fleet to stall, which a fleet of processes waiting at a
+/// bind never did (they were neither idle nor parked in the planner). A
+/// bind waiter makes no progress: such a fleet is stalled, and the restore's
+/// runs are funded as a bind's are, the chunks' occupant (younger, at a
+/// bind) moved for it. (Funding a restore while the fleet decodes thrashed:
+/// 3x the wall on the M1's beam stress, 15,578 role waits.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_at_binds() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restoring, decoding) = (ProcessId::new_v4(), ProcessId::new_v4());
+    // The restoring process first: older, ranked ahead.
+    for pid in [restoring, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        let other = inner.procs.get_mut(&decoding).unwrap();
+        other.progressed = true;
+        other.bind_waiting = true;
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    *pool.occupant.lock() = Some(decoding);
+    assert!(
+        planner.with_inner(|inner| inner.fleet_waits_at_binds()),
+        "the fleet waits at binds"
+    );
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the chunks' occupant is moved for the restore's run"
+    );
+}
+
+/// Mac Pro's M5 livelock (7929eb792, 500 at once): nothing resident, the
+/// head restore short of role slots, and free runs of its need standing,
+/// so the planner sent it again, its unpark came back short (the need
+/// understated what the unpark takes), and so on 20 million times, never
+/// reclaiming the idle cache that held the device. A restore sent again
+/// on free runs of a need and short of that need once more marks it
+/// understated; a different need does not.
+#[test]
+fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let restoring = |planner: &Arc<ResidencyPlanner>, retried: Option<(u32, u32)>| {
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Restoring;
+            proc.roles_free_retry = retried;
+        });
+    };
+    restoring(&planner, Some((2, 1)));
+    planner.requeue_restore_roles(pid, (1, 1));
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
+        None,
+        "a different need: not understated"
+    );
+    restoring(&planner, Some((1, 1)));
+    planner.requeue_restore_roles(pid, (1, 1));
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
+        Some((1, 1)),
+        "short again on free runs of the same need: understated"
+    );
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_free_retry),
+        None
+    );
+}
+
+/// The same livelock, the planner's side: the head restore's need is known
+/// to understate its unpark, and free runs of it stand; with nothing
+/// resident, it is no reason to send the restore again. Room is made for
+/// it: the idle cache holding chunks is reclaimed.
+#[tokio::test(flavor = "current_thread")]
+async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..4, 64));
+    pool.free.lock().extend(4..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let restoring = ProcessId::new_v4();
+    planner.register(restoring);
+    planner.note_admitted(restoring);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+        proc.roles_free_short = Some((1, 1));
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(pool.guest_room_free(1, 1), "free runs of its need stand");
+    assert!(
+        planner.with_inner(|inner| inner.fleet_stalled()),
+        "nothing resident"
+    );
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if pool.cache.lock().is_empty() {
+            break;
+        }
+    }
+    assert!(
+        pool.cache.lock().is_empty(),
+        "the idle cache is reclaimed for it"
+    );
+    assert_eq!(
+        planner.stats.restore_roles_short.load(Ordering::Relaxed),
+        0,
+        "and no restore was sent on the understated need"
+    );
+}
+
+/// The M1 beam-stress freeze: a bind short of room suspended its own
+/// process, whose restore was served straight back into the room its park
+/// gave back, retook its items, and the bind came up short again: suspend,
+/// restore, short, 750 times a second. Runs standing free only by what its
+/// own park gave back are no room for its bind: its restore waits until
+/// room has come free since (the pool's count of room given back moved
+/// past the park's end), reclaiming idle cache meanwhile; once it has, it
+/// is sent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_park() {
+    for moved in [false, true] {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let pool = Arc::new(BindRoomPool::new(8, 0..2, 64));
+        pool.free.lock().extend(4..8);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 1,
+                pieces: 1,
+                pages: 1,
+            });
+            proc.bind_room_after = Some(0);
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        });
+        pool.gives.store(u64::from(moved), Ordering::Relaxed);
+        assert!(pool.guest_room_free(1, 1), "runs stand free");
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+        if moved {
+            assert!(
+                !pool.cache.lock().is_empty(),
+                "room came free since: it is sent, nothing reclaimed"
+            );
+        } else {
+            assert!(
+                pool.cache.lock().is_empty(),
+                "only its own park's room stands: not sent, the idle cache goes for it"
+            );
+        }
+    }
+}
+
+/// The M1 stress on restore-4: ten processes suspended for their binds were
+/// restored together, each took its items back, and every bind came up
+/// short against the others' (suspend, restore, short, 190 times each).
+/// One such restore at a time: with two waiting and room for either, the
+/// planner serves one; the other waits until the first fires (its bind went
+/// through), is parked again, or leaves.
+#[tokio::test(flavor = "current_thread")]
+async fn bind_suspended_restores_come_back_one_at_a_time() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    pool.gives.store(1, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        for pid in [a, b] {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 1,
+                pieces: 1,
+                pages: 1,
+            });
+            proc.bind_room_after = Some(0);
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    let (restoring, queued) = planner.with_inner(|inner| {
+        (
+            inner.bind_restoring,
+            inner
+                .queue
+                .values()
+                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
+                .map(|waiter| waiter.pid)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let first = restoring.expect("one is restored");
+    let other = if first == a { b } else { a };
+    assert_eq!(queued, vec![other], "the other waits");
+    // The first fires: its bind went through, and the other may come back.
+    let fire = planner.fire_in_flight(first);
+    assert_eq!(planner.with_inner(|inner| inner.bind_restoring), None);
+    drop(fire);
+}
+
+/// A short restore that gives up parks its process out of the queue and
+/// answers the wait with the error; the process lives on. The M1 / M5
+/// stress: its next wait to be resident found it parked, queued nothing,
+/// and never ended once the rest drained (evicted = evictions - restores,
+/// queue empty). A process waiting to be resident asks for its restore again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parked_process_waiting_to_be_resident_is_restored() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.parked = Some(Demand::default());
+    });
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        planner.wait_resident(pid),
+    )
+    .await;
+    assert!(
+        matches!(waited, Ok(Ok(()))),
+        "the parked process is restored: {waited:?}"
+    );
+}
+
+/// Mac Pro's M5 shape C: a restore short of role room gave up with its
+/// need marked understated, was queued again as its process waited to be
+/// resident, and, the mark still set, skipped the free runs that stood once
+/// every resident had gone: 1861 chunks free, nothing resident, the head
+/// never tried again. A restore that gives up is parked with what it
+/// learned of the room cleared.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let need = super::proc::PendingBind {
+        run: 3,
+        pieces: 2,
+        pages: 6,
+    };
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(need);
+        proc.roles_free_retry = Some((3, 2));
+        proc.roles_free_short = Some((3, 2));
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    // Alone, short, and the policy freed nothing: it gives up.
+    planner.note_short(key, 6 << 20, 0);
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    assert!(
+        planner.restore_expired(pid).is_some(),
+        "alone and short, it gives up"
+    );
+    planner.with_inner(|inner| {
+        let proc = &inner.procs[&pid];
+        assert!(proc.parked.is_some(), "parked");
+        assert_eq!(proc.roles_short, None, "its role need is the room's then");
+        assert_eq!(proc.roles_free_retry, None);
+        assert_eq!(proc.roles_free_short, None, "no longer marked understated");
+    });
+}
+
+/// Mac Pro's beam mix (no refusals): the head restore was short of two
+/// runs of four chunks for its roles, 440 such runs stood free, and the
+/// serves went flat for 191 s with every thread parked: while the fleet
+/// decoded the restore waited for a completion, never looking at the runs
+/// that stood free, and no event came to look again. Free runs of its need
+/// send it again whatever the fleet does: one plan serves it, with no
+/// further event.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_short_of_runs_goes_again_on_free_runs_while_the_fleet_decodes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restoring, decoding) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [restoring, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&decoding).unwrap().progressed = true;
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 4,
+            pieces: 2,
+            pages: 8,
+        });
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(
+        !planner.with_inner(|inner| inner.fleet_stalled()),
+        "the fleet decodes"
+    );
+    assert!(pool.guest_room_free(4, 2), "its runs stand free");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        planner.stats.restores.load(Ordering::Relaxed),
+        1,
+        "sent again on the free runs, no other event"
+    );
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "no one moved for it"
+    );
+}
+
+/// Mac Pro's beam mix, stall 1: a bind-suspended process was restored
+/// (the one bind-suspended restore at a time), and its bind came up short
+/// again and waited for room. The next bind-suspended restore, the queue's
+/// head, waited on that one's turn, which waited on a bind behind the
+/// head: flat, every thread parked. A restored process whose bind waits
+/// again ends its turn, and the head goes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_go() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restored, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [restored, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.bind_restoring = Some(restored);
+        inner.procs.get_mut(&head).unwrap().bind_room = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+    });
+    planner.set_bind_waiting(restored, true);
+    assert_eq!(
+        planner.with_inner(|inner| inner.bind_restoring),
+        None,
+        "its turn ends as its bind waits again"
+    );
+    planner.set_bind_waiting(restored, false);
+    planner.with_inner(|inner| inner.bind_restoring = Some(restored));
+    planner.set_bind_waiting(head, true);
+    assert_eq!(
+        planner.with_inner(|inner| inner.bind_restoring),
+        Some(restored),
+        "another's bind waiting leaves its turn"
+    );
 }

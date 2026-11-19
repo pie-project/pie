@@ -181,7 +181,9 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                per_instance,
+                resident: per_instance,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair,
                 run: 1,
             },
@@ -193,6 +195,22 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-guests"
     }
@@ -231,6 +249,7 @@ impl Engine for GuestEngine {
         &self,
         _program: ProgramId,
         _extents: &BindExtents,
+        _class: eta_ir::registry::GeometryClass,
     ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }
@@ -648,7 +667,7 @@ fn bind_as(
 }
 
 /// As [`bind_as`], for a bind whose refusal is final: its process gives
-/// up, so it leaves the queue of guest binds waiting for room.
+/// up, so its need is no longer counted.
 fn bind_or_leave(
     roles: &RolesHandle,
     engine: &mut GuestEngine,
@@ -656,7 +675,7 @@ fn bind_or_leave(
     by: u128,
 ) -> anyhow::Result<InstanceId> {
     bind_as(roles, engine, program, by)
-        .inspect_err(|_| roles.lock().unwrap().leave_guest_queue(holder(by)))
+        .inspect_err(|_| roles.lock().unwrap().leave_guest_wait(holder(by)))
 }
 
 /// Each piece of `place`: its chunks' physical ids, and the segment each
@@ -1243,22 +1262,15 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
                             }
                         }
                         Err(error) => {
-                            // Short of room, or behind an earlier bind short
-                            // of it: a wait either way.
+                            // Short of room: a wait.
                             assert!(
-                                matches!(
-                                    short_of_wait(&error),
-                                    Some(RolesError::BindShort(_) | RolesError::GuestQueued { .. })
-                                ) || matches!(
-                                    error.downcast_ref::<RolesError>(),
-                                    Some(RolesError::GuestQueued { .. })
-                                ),
+                                matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
                                 "process {p} refused: {error}"
                             );
                             if roles.lock().unwrap().holds_guest_state(holder(by)) {
                                 // Suspended for room: it waits for its
-                                // restore, not in the queue.
-                                roles.lock().unwrap().leave_guest_queue(holder(by));
+                                // restore, its need not counted.
+                                roles.lock().unwrap().leave_guest_wait(holder(by));
                                 let park = roles
                                     .lock()
                                     .unwrap()
@@ -1425,7 +1437,7 @@ fn a_restore_rebinds_an_instance_with_its_pair_s_place() {
 }
 
 /// Fills the committed room with single-chunk guest states for holders
-/// from 500; the bind refused for want of room leaves the queue it joined.
+/// from 500; the bind refused for want of room no longer counts its need.
 fn fill_with_singles(roles: &RolesHandle) -> Vec<InstanceId> {
     let (singles, mut single) = runs_of(9, 1, 1, 1000);
     let mut ids = Vec::new();
@@ -1433,7 +1445,7 @@ fn fill_with_singles(roles: &RolesHandle) -> Vec<InstanceId> {
         match bind_as(roles, &mut single, singles, 500 + by) {
             Ok(id) => ids.push(id),
             Err(_) => {
-                roles.lock().unwrap().leave_guest_queue(holder(500 + by));
+                roles.lock().unwrap().leave_guest_wait(holder(500 + by));
                 break;
             }
         }
@@ -1456,7 +1468,7 @@ fn free_and_live(device: &Shared) -> (u32, u64) {
 /// behind it taking nothing (the free count does not drift), it binds in
 /// the committed segment, and they follow in arrival order.
 #[tokio::test(flavor = "current_thread")]
-async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smaller_binds_wait() {
+async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_room_leave_it() {
     use crate::governor::PoolTarget;
     const ENGINE: usize = 62;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
@@ -1473,7 +1485,7 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         ),
         "waits on a commit: {error}"
     );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1)], "it heads the queue");
+    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need is counted");
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
     assert_eq!(
@@ -1482,41 +1494,36 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         "the walk commits for it"
     );
 
-    // Smaller guest binds arriving meanwhile wait behind it, taking nothing.
+    // Smaller guest binds short of room meanwhile wait on the commit too,
+    // taking nothing and leaving the long bind's need as it is.
     let (small, mut small_engine) = runs_of(10, 1, 1, 2000);
     for by in 0..5 {
-        let error = bind_as(&roles, &mut small_engine, small, 100 + by).expect_err("behind it");
+        let error = bind_as(&roles, &mut small_engine, small, 100 + by).expect_err("no room");
         assert!(
-            matches!(
-                error.downcast_ref::<RolesError>(),
-                Some(RolesError::GuestQueued { head }) if *head == holder(1)
-            ),
+            matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
             "{error}"
         );
     }
     assert!(small_engine.bindings.is_empty(), "the engine was not asked");
-    assert_eq!(free_and_live(&device), before, "the free count does not drift");
+    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need stands");
 
-    // The commit: the head binds in the fresh segment, two runs of four.
+    // The commit: the long bind binds in the fresh segment, two runs of
+    // four, and its need is no longer counted.
     device.lock().unwrap().committed(2);
-    bind_as(&roles, &mut long_engine, long, 1).expect("the head binds");
+    bind_as(&roles, &mut long_engine, long, 1).expect("it binds");
     let pieces = pieces_of(&device, &long_engine.bindings[0].scratch);
     assert_eq!(pieces.len(), 2);
     assert!(pieces.iter().all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1)));
-    assert_eq!(
-        roles.lock().unwrap().guest_queue(),
-        (0..5).map(|by| holder(100 + by)).collect::<Vec<_>>(),
-        "the binds behind it, in arrival order"
-    );
+    assert_eq!(device.lock().unwrap().guest_head(), None);
 
-    // The next segment: they bind, in order, and the queue empties.
+    // The next segment: the small binds bind.
     device.lock().unwrap().committed(3);
     for by in 0..5 {
-        bind_as(&roles, &mut small_engine, small, 100 + by).expect("in its turn");
+        bind_as(&roles, &mut small_engine, small, 100 + by).expect("room came");
     }
-    assert!(roles.lock().unwrap().guest_queue().is_empty());
     let demand = device.lock().unwrap().pool().demand();
     assert_eq!(demand.wanted, demand.live, "no need is counted short any more");
+    let _ = before;
 }
 
 /// Free chunks enough for the head's slots, but scattered by the binds
@@ -1555,22 +1562,21 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         Some(crate::store::shared::GrowStep::Commit { prefix: 5 }),
         "the walk commits for the head's runs"
     );
-    roles.lock().unwrap().leave_guest_queue(holder(1));
+    roles.lock().unwrap().leave_guest_wait(holder(1));
     assert_eq!(grow.live_step_for_test(), None, "with no head, nothing more");
 }
 
-/// The head's process ends while it waits: dropping its wait leaves the
-/// queue (one place, however the wait ends), the bind behind it is told,
-/// and binds in room that was free all along; a bind of the same process
-/// queued again would find no stale head.
+/// A long bind waits on a commit while one chunk stands free: a small
+/// bind takes it at once, waiting behind nothing (the queue that held it
+/// back is gone). The long bind's process then ends: dropping its wait
+/// counts its need no more (one place, however the wait ends).
 #[tokio::test(flavor = "current_thread")]
-async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
+async fn a_small_bind_takes_free_room_while_a_long_one_waits_and_a_dropped_wait_s_need_is_cleared() {
     const ENGINE: usize = 64;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
     let ids = fill_with_singles(&roles);
     // One single chunk free again: room for a small bind, not the long.
     roles.lock().unwrap().close_instance(ids[0]);
-    let before = free_and_live(&device);
 
     let waits = |by: u128, program: ProgramId, engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>| {
         let device = device.clone();
@@ -1597,75 +1603,505 @@ async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
             |_, _| std::future::pending::<Result<(), String>>(),
             {
                 let roles = roles.clone();
-                move || {
-                    let roles = roles.clone();
-                    async move { super::guest_turn(&roles, holder(by)).await }
-                }
+                move || roles.lock().unwrap().leave_guest_wait(holder(by))
             },
-            {
-                let roles = roles.clone();
-                move || roles.lock().unwrap().leave_guest_queue(holder(by))
-            },
+            |_| {},
         )
     };
     let (long, long_engine) = runs_of(8, 4, 2, 0);
     let (small, small_engine) = runs_of(10, 1, 1, 2000);
     let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
-    let mut head = Box::pin(waits(1, long, std::rc::Rc::new(std::cell::RefCell::new(long_engine))));
-    let next = waits(2, small, small_engine.clone());
-    tokio::pin!(next);
-    assert!(futures::poll!(head.as_mut()).is_pending(), "the head waits on a commit");
-    assert!(futures::poll!(next.as_mut()).is_pending(), "the next waits behind it");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(2)]);
-    assert_eq!(free_and_live(&device), before, "nothing taken");
-
-    // The head's process ends: its wait is dropped.
-    drop(head);
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(2)], "it left, once");
-    next.await.expect("the next binds in the free chunk");
+    let mut long_wait = Box::pin(waits(1, long, std::rc::Rc::new(std::cell::RefCell::new(long_engine))));
+    assert!(futures::poll!(long_wait.as_mut()).is_pending(), "the long bind waits on a commit");
+    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)));
+    waits(2, small, small_engine.clone())
+        .await
+        .expect("the small bind takes the free chunk at once");
     assert_eq!(small_engine.borrow().bindings.len(), 1);
-    assert!(roles.lock().unwrap().guest_queue().is_empty());
+
+    // The long bind's process ends: its wait is dropped.
+    drop(long_wait);
+    assert_eq!(device.lock().unwrap().guest_head(), None, "its need is no longer counted");
     let demand = device.lock().unwrap().pool().demand();
-    assert_eq!(demand.wanted, demand.live, "the head's need is no longer counted");
+    assert_eq!(demand.wanted, demand.live);
 }
 
-/// While the head waits for runs of four, a bind taking whole runs at least
-/// as long breaks none of them into shorter ones: it passes the head,
-/// taking room where there is some, and where there is none it queues
-/// behind it without touching the head's need.
+/// A guest bind's wait under `bind_when_resident` for `by`, binding
+/// `program` on `engine`, the planner's serve played by `serve` (what the
+/// planner would do for it: drop cache or park a resident), counting its
+/// calls in `asked`.
+fn waiting_bind<'a>(
+    roles: &'a RolesHandle,
+    device: &'a Shared,
+    engine_id: usize,
+    by: u128,
+    program: ProgramId,
+    engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>,
+    serve: std::rc::Rc<dyn Fn()>,
+    asked: std::rc::Rc<std::cell::Cell<u32>>,
+) -> impl std::future::Future<Output = anyhow::Result<InstanceId>> + 'a {
+    super::bind_when_resident(
+        holder(by),
+        move || std::future::ready(bind_as(roles, &mut engine.borrow_mut(), program, by)),
+        || std::future::pending::<Result<(), String>>(),
+        move |prefix, run| super::grow_for_guest(device, engine_id, prefix, run),
+        move || Some(roles.lock().unwrap().room_watch()),
+        move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
+        |_, _| false,
+        move |_, _| {
+            asked.set(asked.get() + 1);
+            serve();
+            std::future::ready(Ok::<(), String>(()))
+        },
+        move || roles.lock().unwrap().leave_guest_wait(holder(by)),
+        |_| {},
+    )
+}
+
+/// At the governor's target the walk commits nothing, however many
+/// segments the pool's own limits leave uncommitted: a guest bind short of
+/// runs is short of room the planner makes (BindShort), not a commit's to
+/// wait on (GuestGrow). With the target past what is mapped, it waits on
+/// the commit.
 #[test]
-fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
+fn at_the_target_a_guest_bind_short_of_runs_goes_to_the_planner() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 66;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     fill_with_singles(&roles);
     let (long, mut long_engine) = runs_of(8, 4, 2, 0);
-    bind_as(&roles, &mut long_engine, long, 1).expect_err("the head waits");
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)));
-
-    // As long, no room: it waits behind the head; the head's need stays.
-    let (four, mut four_engine) = runs_of(11, 4, 1, 3000);
-    let error = bind_as(&roles, &mut four_engine, four, 200).expect_err("no room");
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room");
+    assert!(
+        matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
+        "at the target it is the planner's: {error}"
+    );
+    roles.lock().unwrap().leave_guest_wait(holder(1));
+    let _ = grow.retarget(u64::from(u32::MAX));
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room yet");
     assert!(
         matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
-        "it passed the head and found no room: {error}"
+        "past it, a commit's: {error}"
     );
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "the head's need stands");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(200)]);
+}
 
-    // Shorter pieces queue behind it, taking nothing.
-    let (two, mut two_engine) = runs_of(12, 2, 1, 4000);
-    let error = bind_as(&roles, &mut two_engine, two, 300).expect_err("behind the head");
-    assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestQueued { .. })),
-        "{error}"
-    );
+/// GPU's 500-concurrent wedge: the device full at the governor's target, a
+/// guest head short of runs, other guest binds queued behind it. The
+/// planner is asked; its serve (a resident parked) frees the runs; the head
+/// binds; the bind behind it follows. Before, the head waited on a commit
+/// that could not come and no one asked the planner.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_next_bind_follows() {
+    const ENGINE: usize = 67;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let _grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    // A resident the planner may park, holding two runs of four, then
+    // every other committed chunk filled.
+    let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
+    let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
+    fill_with_singles(&roles);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let parked: std::rc::Rc<dyn Fn()> = {
+        let roles = roles.clone();
+        let done = std::cell::Cell::new(false);
+        std::rc::Rc::new(move || {
+            if !done.replace(true) {
+                roles.lock().unwrap().close_instance(victim);
+            }
+        })
+    };
+    let (long, long_engine) = runs_of(8, 4, 1, 0);
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let (small, small_engine) = runs_of(10, 1, 1, 2000);
+    let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
+    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked.clone(), asked.clone());
+    let behind = waiting_bind(&roles, &device, ENGINE, 2, small, small_engine.clone(), parked, asked.clone());
+    tokio::pin!(head);
+    tokio::pin!(behind);
+    let first = futures::poll!(head.as_mut());
+    assert!(asked.get() >= 1, "the planner is asked for the head");
+    assert!(matches!(first, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
+    behind.await.expect("the bind behind it follows");
+    assert_eq!(long_engine.borrow().bindings.len(), 1);
+    assert_eq!(small_engine.borrow().bindings.len(), 1);
+}
 
-    // A commit: the head binds in it, and the queue moves on.
-    device.lock().unwrap().committed(2);
-    bind_as(&roles, &mut long_engine, long, 1).expect("the head binds");
+/// The head waits on a commit the target said could come, and the walk
+/// makes none (its target came down after): the planner, asked beside the
+/// commit, makes the room, and the head binds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_head_waiting_on_a_commit_that_does_not_come_is_served_by_the_planner() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 68;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    let _ = grow.retarget(u64::from(u32::MAX));
+    let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
+    let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
+    fill_with_singles(&roles);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let parked: std::rc::Rc<dyn Fn()> = {
+        let roles = roles.clone();
+        std::rc::Rc::new(move || roles.lock().unwrap().close_instance(victim))
+    };
+    let (long, long_engine) = runs_of(8, 4, 2, 0);
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let prefix = device.lock().unwrap().pool().prefix_segments();
+    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked, asked.clone());
+    tokio::pin!(head);
+    let polled = futures::poll!(head.as_mut());
+    assert!(asked.get() >= 1, "the planner is asked beside the commit");
+    assert!(matches!(polled, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
+    assert_eq!(device.lock().unwrap().pool().prefix_segments(), prefix, "no commit came");
+}
+
+/// The pools of `facts` with no host tier below the device (AMD's repro:
+/// budget_host a few MiB, no host chunks).
+fn pools_no_host(facts: ChunkFacts) -> Pools {
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles = Roles::new(&device, None).expect("the pool states an Instance shape");
+    Pools {
+        device,
+        roles: Arc::new(Mutex::new(roles)),
+    }
+}
+
+/// AMD's freeze, its root: with no host tier a park moved nothing, so a
+/// parked process kept its guest scratch on the device and Instance chunks
+/// filled with idle scratch no kv eviction could free. Scratch is dead
+/// between fires: a park now gives it back whatever lies below (the live
+/// tables stay where they lie), a new bind lands in the room it left, and
+/// the restore takes fresh scratch in its class and is rebound to it
+/// before its next fire.
+#[test]
+fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fresh() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    bind_or_leave(&roles, &mut other_engine, other, 999).expect_err("short of a run");
+
+    // The first process parks, no host tier below: its scratch comes back.
+    let (parked, id) = bound[0];
+    park(&roles, parked);
+    assert!(device.lock().unwrap().pool().free_chunk_runs(4) >= 1, "its run of 4 is free");
+    assert!(!roles.lock().unwrap().holds_guest_state(holder(parked)));
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the new bind lands");
+
+    // The new bind leaves; the parked process restores, taking fresh
+    // scratch in its class, and is told where before its next fire.
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room for it")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(parked));
+    let Some(Rebind::Instance { id: rebound, scratch, .. }) = stale
+        .iter()
+        .find(|rebind| matches!(rebind, Rebind::Instance { .. }))
+        .cloned()
+    else {
+        panic!("its instance is rebound: {stale:?}");
+    };
+    assert_eq!(rebound, id);
+    assert_ne!(scratch, ScratchPlace::None, "fresh scratch, laid");
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// The Instance chunks parking a process empties: per chunk, the slots of
+/// its dead parts (guest scratch) on the device, its live tables never;
+/// after its park, none.
+#[test]
+fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
+    let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 2, 1, 0);
+    bind_as(&roles, &mut engine, program, 1).unwrap();
+    bind_as(&roles, &mut engine, program, 2).unwrap();
+    let slots = roles.lock().unwrap().guest_chunk_slots(&[holder(1)]);
+    let total: u32 = slots.iter().map(|&(_, _, n)| n).sum();
+    assert_eq!(total, 2 * SPC, "its run of two whole chunks");
+    assert!(slots.iter().all(|&(_, by, _)| by == holder(1)));
+    assert_eq!(slots.len(), 2, "two chunks");
+    park(&roles, 1);
+    assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
+}
+
+/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// parked guest's freed run filled by another bind, then its restore. The
+/// unpark is short and waits, naming the runs of chunks it needs (what the
+/// planner funds, `RolesError::unpark_runs`), never refused; once room
+/// comes it lands.
+#[test]
+fn a_restore_short_of_its_run_waits_with_its_need_and_lands_once_room_comes() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    let (parked, _) = bound[0];
+    park(&roles, parked);
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the freed run is taken");
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+
+    let error = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect_err("short of its run");
+    assert!(matches!(error, RolesError::UnparkShort(_)), "it waits: {error}");
+    assert_eq!(error.unpark_runs(), Some((4, 1)), "its need, named: {error}");
+
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room came")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// A Channel item that must lie in one run, short of it at a restore,
+/// waits too, its need one whole chunk (any free chunk holds the run).
+#[test]
+fn a_restore_short_of_a_channel_run_waits_for_one_chunk() {
+    let short = RolesError::UnparkShort(Box::new(RolesError::NoRun {
+        role: SlotRole::Channel,
+        slots: 2,
+    }));
+    assert_eq!(short.unpark_runs(), Some((1, 1)));
+    assert!(RolesError::NoRun { role: SlotRole::Channel, slots: 2 }.unpark_runs().is_none(), "only a waiting unpark names one");
+}
+
+/// A frame naming the last instance of a pair is on its way through the
+/// engine when that instance closes: the pair's state (its batch tables,
+/// which every grouped fire of its instances reads) and the instance's own
+/// slots stay out of the free count until the frame lands, then come free.
+/// Given back at the close, the pair's chunks went to another owner under
+/// the fire (Metal's 0xa0, FUSED_GEOMETRY_MISMATCH).
+#[test]
+fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let pair = super::FireKey {
+        program: PROGRAM,
+        extents: BindExtents::default(),
+    };
+    assert!(!roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+    let free = || device.lock().unwrap().pool().free_chunks();
+    let before = free();
+    let named = roles.lock().unwrap().reading([id]);
+    assert!(named.contains(&Owner::Pair(pair)), "the frame names the pair");
+    roles.lock().unwrap().close_instance(id);
     assert_eq!(
-        device.lock().unwrap().guest_head(),
-        Some((4, 1)),
-        "the next head's need counts at once"
+        free(),
+        before,
+        "the pair's chunks, and its instance's, wait on the frame naming them"
     );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(200), holder(300)]);
+    roles.lock().unwrap().landed(&named);
+    assert_eq!(
+        free(),
+        before + 3,
+        "as the frame lands: the pair's two chunks, and the one its instance's scratch run lay in"
+    );
+    assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+}
+
+/// A pair moving with another process's instances holds a restore back
+/// (`RolesError::PairParked`) until that move ends; an aborted move ends it
+/// as a committed one does, and what waits on it is told (a bind's or a
+/// restore's room watch). Told only at a commit, a move that failed left
+/// them waiting for good. And a pair whose holders all closed (a failed
+/// process's close included) is freed, nothing left of it on the device.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_pair_move_wakes_its_waiters_and_a_pair_of_closed_holders_is_freed() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 1);
+    // The second parks: its pair moves with it.
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(2))
+        .expect("the second and the pair park");
+    // The first's restore meanwhile: its pair is moving.
+    let watch = roles.lock().unwrap().room_watch();
+    assert!(matches!(
+        roles.lock().unwrap().prepare_unpark(holder(1)),
+        Err(RolesError::PairParked(_))
+    ));
+    let woken = tokio::spawn(watch.freed());
+    tokio::task::yield_now().await;
+    assert!(!woken.is_finished(), "the move is under way");
+    roles.lock().unwrap().abort(moving);
+    tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+        .await
+        .expect("an aborted move tells its waiters")
+        .unwrap();
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .expect("the pair stands still now")
+        .expect("it unparks");
+    roles.lock().unwrap().commit(back);
+
+    // Both holders close (a failed process's close included): nothing of
+    // them or their pair is left.
+    roles.lock().unwrap().close_instance(first);
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(held(&device), before, "the pair freed with its last holder");
+}
+
+/// Over-demand with a pair four processes share, every one parked: the
+/// first restore brings the pair back with it, and while those copies are
+/// on their way each other holder's restore finds the pair moving
+/// (`pair_moving` names the instances it moves with) and waits once on
+/// the move's end, told by the commit; then each comes back, the pair
+/// where the first's brought it, and every holder closes leaving nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let ids: Vec<InstanceId> = (1..=4).map(|by| bind(&roles, &mut engine, by).unwrap()).collect();
+    for by in 1..=4 {
+        park(&roles, by);
+    }
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("the first brings the pair back");
+    let mut waits = 0;
+    let mut watches = Vec::new();
+    for by in 2..=4 {
+        let watch = roles.lock().unwrap().room_watch();
+        let unparked = roles.lock().unwrap().prepare_unpark(holder(by));
+        match unparked {
+            Err(RolesError::PairParked(pair)) => {
+                let named = roles.lock().unwrap().pair_moving(pair).expect("moving");
+                assert_eq!(named.len(), 4, "the instances it moves with: {named:?}");
+                waits += 1;
+                watches.push(tokio::spawn(watch.freed()));
+            }
+            other => panic!("the pair is moving: {other:?}"),
+        }
+    }
+    assert_eq!(waits, 3, "one wait each");
+    roles.lock().unwrap().commit(moving);
+    for watch in watches {
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+            .await
+            .expect("the move's end tells each")
+            .unwrap();
+    }
+    for by in 2..=4 {
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("the pair stands still")
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+    }
+    for id in ids {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(held(&device), before);
+}
+
+/// The disk-only home's "KV restore failed: rebind Instance(...): a guest
+/// item of 2508288 bytes takes one run of 613 Instance slot(s) ... and its
+/// binding names []": two processes' instances share a pair; with no tier
+/// below, each parks where it lies, its live parts kept and its scratch
+/// given back ([`Item::shed`]); the pair, all dead, parks once both have.
+/// One process's restore brings the pair back and rebinds its holders on
+/// the device: the other process's instance, still parked where it lies,
+/// was rebound too, its scratch emptied, and named no place. It is rebound
+/// only with its own restore, which takes its scratch back; no rebind ever
+/// names an emptied guest part.
+#[test]
+fn a_restore_of_a_shared_pair_leaves_another_s_instance_parked_where_it_lies_unbound() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles = Arc::new(Mutex::new(
+        Roles::new(&device, None).expect("the pool states an Instance shape"),
+    ));
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let a = bind(&roles, &mut engine, 1).unwrap();
+    let b = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 2);
+    park(&roles, 1);
+    let named_nothing = |rebinds: &[Rebind]| {
+        rebinds.iter().any(|rebind| {
+            matches!(
+                rebind,
+                Rebind::Instance {
+                    scratch: ScratchPlace::Run { slots: 0, .. },
+                    ..
+                } | Rebind::Instance {
+                    pair: ScratchPlace::Run { slots: 0, .. },
+                    ..
+                }
+            ) || matches!(rebind, Rebind::Instance { scratch: ScratchPlace::Chunks { pieces, .. }, .. } if pieces.is_empty())
+        })
+    };
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("process 1's items come back");
+    roles.lock().unwrap().commit(back);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    assert!(
+        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == a)),
+        "its own instance is rebound: {stale:?}"
+    );
+    assert!(
+        !stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        "the other's instance, parked where it lies, is not: {stale:?}"
+    );
+    assert!(!named_nothing(&stale), "no rebind names an emptied part: {stale:?}");
+    for rebind in stale {
+        roles.lock().unwrap().rebound(super::Owner::of(&rebind));
+    }
+    // The other's restore takes its scratch back and rebinds it.
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .expect("process 2's items come back");
+    roles.lock().unwrap().commit(back);
+    let stale = roles.lock().unwrap().stale(holder(2));
+    assert!(
+        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        "rebound with its own restore: {stale:?}"
+    );
+    assert!(!named_nothing(&stale), "with its scratch: {stale:?}");
 }

@@ -63,6 +63,9 @@ pub(crate) struct Half {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     session: crate::guest::session::Session,
+    /// The taking of its pair's slots its session lies in
+    /// (`engine::InstanceBinding::pair_generation`).
+    pair_generation: u64,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -328,11 +331,9 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     library: Option<Arc<crate::guest::session::Library>>,
 
-    /// Each program's stages' step uniforms, made at its first bind and
-    /// shared by every bind after: a round that binds the program afresh
-    /// makes none.
+    /// The pairs whose state lies laid now, cleared at each new taking.
     #[cfg(feature = "wgpu")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
+    takings: engine_gpu::guest::state::Takings,
 
     tally: Arc<Tally>,
 }
@@ -501,6 +502,19 @@ impl Plane {
         let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
+        // The instance's room is fresh, its pair's where none holds that
+        // taking: both are another owner's bytes until cleared.
+        #[cfg(feature = "wgpu")]
+        {
+            let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            if let Err(fault) = session.clear(fresh_pair) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::Program(format!(
+                    "program {} does not bind: its state did not clear: {fault}",
+                    binding.program
+                )));
+            }
+        }
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -516,6 +530,7 @@ impl Plane {
                     plan: Arc::clone(&plan),
                     inst: inst.clone(),
                     session,
+                    pair_generation: binding.pair_generation,
                     poisoned: Arc::clone(&poisoned),
                 })),
                 #[cfg(feature = "wgpu")]
@@ -546,13 +561,19 @@ impl Plane {
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
-        self.instances
-            .remove(&id)
-            .map(|_| ())
-            .ok_or(Refusal::Closed {
-                what: "instance",
-                id: id.0,
-            })
+        let seat = self.instances.remove(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        #[cfg(feature = "wgpu")]
+        {
+            let half = seat.half.lock().expect("half lock poisoned");
+            self.takings
+                .give(half.session.pair_place(), half.pair_generation);
+        }
+        #[cfg(not(feature = "wgpu"))]
+        drop(seat);
+        Ok(())
     }
 
     /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
@@ -950,24 +971,10 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
-            Some(args) => args.clone(),
-            None => {
-                let args = compiled
-                    .all()
-                    .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
-                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
-                args
-            }
-        };
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
+            &plan.package,
             compiled.all(),
-            &args,
             library,
             &extents,
             &crate::guest::session::Tables {
@@ -1001,6 +1008,29 @@ impl Plane {
             // Registration refuses a program with no device form.
             return Ok(ProgramFacts::default());
         }
+        #[cfg(feature = "wgpu")]
+        let sizes = {
+            let compiled = self.forms.get(program).ok_or(Refusal::Closed {
+                what: "program",
+                id: program.0,
+            })?;
+            let stride = engine_gpu::guest::session::step_stride(place.device.table_align());
+            if let Some(library) = &self.library {
+                let room = library.outbox_bytes();
+                let reads = crate::guest::session::stage_read_bytes(&plan.package)
+                    .map_err(|why| Refusal::Program(format!("program {}: {why}", program.0)))?;
+                for (stage, bytes) in reads.into_iter().enumerate() {
+                    if bytes > room {
+                        return Err(Refusal::Program(format!(
+                            "program {} stage {stage} reads back {bytes} bytes (its status and                              puts), past the {room} a guest thread's readback buffer holds",
+                            program.0
+                        )));
+                    }
+                }
+            }
+            crate::guest::session::instance_table_sizes(&plan.package.plans, compiled.all(), stride)
+        };
+        #[cfg(not(feature = "wgpu"))]
         let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
         let instance = engine_gpu::guest::held::table_footprint(
             place.pools,
@@ -1052,6 +1082,7 @@ impl Plane {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => {
                 if !rings.is_empty() {
@@ -1068,13 +1099,22 @@ impl Plane {
                 {
                     seat.gate.settle(*id)?;
                     let mut half = seat.half.lock().expect("half lock poisoned");
+                    let was = (half.session.pair_place().clone(), half.pair_generation);
                     half.session
                         .retarget(pools, instance, scratch, pair)
+                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    // The unpark's room is fresh; the pair's is cleared where
+                    // this is the first instance on its new taking.
+                    self.takings.give(&was.0, was.1);
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    half.pair_generation = *pair_generation;
+                    half.session
+                        .clear(fresh_pair)
                         .map_err(|fault| Refusal::Program(fault.to_string()))?;
                     seat.scores = half.session.scores();
                 }
                 #[cfg(not(feature = "wgpu"))]
-                let _ = (seat, pools, instance, scratch, pair);
+                let _ = (seat, pools, instance, scratch, pair, pair_generation);
                 Ok(())
             }
             Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
@@ -1107,13 +1147,27 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
         {
-            let library = crate::guest::session::Library::build(place.device).map_err(|why| {
-                Refusal::Program(format!("the guest pipelines did not build: {why}"))
-            })?;
+            // A stage's collect reads back through its thread's buffer, a
+            // chunk of the pool each (a program whose stage reads back more
+            // is refused at registration). The buffers, and the widen's
+            // table, are the shelf's: reserved before the pool was sized.
+            let (outboxes, table) = &place.shelf.guest;
+            let library = crate::guest::session::Library::build(
+                place.device,
+                outboxes.clone(),
+                &place.pools.segment_buffers(),
+            )
+            .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));
-            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-                Refusal::Program(format!("the readout widen did not build: {why}"))
-            })?;
+            let widen = crate::guest::widen::Widen::new(
+                place.device,
+                table.clone(),
+                &place.seats,
+                &place.pools.segment_buffers(),
+                u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),
+                u64::from(place.max_lanes) * u64::from(place.planes),
+            )
+            .map_err(|why| Refusal::Program(format!("the readout widen did not build: {why}")))?;
             self.widen = Some(Arc::new(widen));
         }
         // A build with no device builds nothing, and binds no instance.

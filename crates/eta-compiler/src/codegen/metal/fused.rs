@@ -506,6 +506,14 @@ pub(super) fn emit_addressed_gather(
          addressed_seat.storage {storage}) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
+    // Defence in depth: the binder refuses a read past the rows the seat's
+    // lane holds; a read that reaches past them anyway faults here, never
+    // reading another request's rows.
+    let _ = writeln!(
+        source,
+        "    if ((addressed_desc.len + addressed_width - 1u) / addressed_width > addressed_seat.rows) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+    );
     source.push_str(
         "    for (uint i = addressed_begin; i < addressed_desc.len; i += addressed_step) {\n",
     );

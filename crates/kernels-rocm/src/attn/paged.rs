@@ -173,6 +173,21 @@ pub fn decode_max_grid_size(num_kv_heads: u32, num_cus: u32) -> u32 {
     (num_cus.max(1) * BLOCKS_PER_CU / num_kv_heads.max(1)).max(1)
 }
 
+/// `pie::attn::DecodeMask`, field for field: a fire's per-lane masks as a
+/// decode reads them (a lane's boundary word and its plane of bits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeMask {
+    /// The packed bits, request r's plane from byte `indptr[r]`.
+    pub bits: u64,
+    /// i64 byte offsets, a request each.
+    pub indptr: u64,
+    /// u32 words, a request each: its boundary (bit 31 the wide bit).
+    pub origin: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<DecodeMask>() == 24);
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
@@ -185,6 +200,7 @@ pub fn decode(
     o: &Tensor,
     lse: u64,
     rel: Option<Rel>,
+    mask: Option<DecodeMask>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
     head_dim_built(op, shape.head_dim)?;
@@ -268,8 +284,9 @@ pub fn decode(
         };
         (
             format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, true, {pvm}, {fp8}>",
-                shape.head_dim
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, true, {pvm}, {fp8}, {}>",
+                shape.head_dim,
+                mask.is_some()
             ),
             64 * waves,
         )
@@ -277,8 +294,9 @@ pub fn decode(
         let waves = decode_waves(group, shape.head_dim);
         (
             format!(
-                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}>",
-                shape.head_dim
+                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}, {}>",
+                shape.head_dim,
+                mask.is_some()
             ),
             64 * waves,
         )
@@ -289,7 +307,7 @@ pub fn decode(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
             [threads, 1, 1],
         )),
-        &[ArgValue::of(&args)],
+        &[ArgValue::of(&args), ArgValue::of(&mask.unwrap_or_default())],
     )?;
     match split {
         Some(parts) => merge(ctx, op, &parts),

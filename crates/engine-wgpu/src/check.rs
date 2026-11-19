@@ -43,8 +43,14 @@ pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates
     let tuning = crate::tuning::Tuning::new(profile, device.cores())
         .with_workgroup_bytes(device.workgroup_bytes());
     say(&format!("measuring the [rates] of {}", chip.name));
-    let measured =
-        crate::rates::measure_saying(&device, &tuning, None, say).map_err(|e| e.to_string())?;
+    let measured = crate::rates::measure_saying(
+        &device,
+        &tuning,
+        crate::rates::STATED_SUBMIT_BOUND,
+        &profile::fire::Rates::default(),
+        say,
+    )
+    .map_err(|e| e.to_string())?;
     if measured.unsettled {
         say("a rate's frames stopped at the device's bound on one submission before it settled");
     }

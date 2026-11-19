@@ -911,8 +911,11 @@ __global__ __launch_bounds__(256) void moe_swiglu_ordered(const T* __restrict__ 
 // sentinel after the last so a worst-case grid's spare groups end there.
 // One UserArguments record: d[c, n] = b[c, k] · a[n, k]ᵀ (c = 0 with n = 0
 // is the sentinel a worst-case grid's spare groups end at).
+// `ldd`: d's (and c's) leading dimension, `n` where d is the group's own
+// [c, n] plane, wider where it is a column band of a wider one.
 template <class T>
-__device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u32 k, u64 d, u64 a, u64 b) {
+__device__ __forceinline__ void lt_record_ld(u32* __restrict__ rec, u32 n, u32 c, u32 k, u64 d, u64 a, u64 b,
+                                             u32 ldd) {
     u32 w[49];
 #pragma unroll
     for (int i = 0; i < 49; ++i) w[i] = 0;
@@ -929,10 +932,10 @@ __device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u
         w[9] = static_cast<u32>(a >> 32);
         w[10] = static_cast<u32>(b);
         w[11] = static_cast<u32>(b >> 32);
-        w[12] = n;
-        w[13] = n * c;
-        w[14] = n;
-        w[15] = n * c;
+        w[12] = ldd;
+        w[13] = ldd * c;
+        w[14] = ldd;
+        w[15] = ldd * c;
         w[16] = k;
         w[17] = n * k;
         w[18] = k;
@@ -941,6 +944,11 @@ __device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u
     }
 #pragma unroll
     for (int i = 0; i < 49; ++i) rec[i] = w[i];
+}
+
+template <class T>
+__device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u32 k, u64 d, u64 a, u64 b) {
+    lt_record_ld<T>(rec, n, c, k, d, a, b, n);
 }
 
 // An expert's weight is its entry in `expert_table` when given, and
@@ -1008,16 +1016,39 @@ __global__ __launch_bounds__(256) void moe_lt_args(const i32* __restrict__ offse
 // A projection over the live rows of a padded plane (an lm head over a
 // body's readouts): `live` names how many of `rows` are, and launch r of
 // three grouped GEMMs takes them when they number in (bounds[r], bounds[r +
-// 1]], the others none; a record and its sentinel a launch.
+// 1]], the others none; three records a launch.
+//
+// A launch's weight rows are two groups: the whole tiles of its macro tile
+// `tiles[r]` (MT0), then the rows past them, a column band of the same y
+// (ldd n), then the n = 0 sentinel. The grouped kernels drop a partial last
+// MT0 tile once the group's weight rows pass about 2^16 (gfx942, hipBLASLt
+// 1.4: MT 192x32 and 176x256 leave the last 64 / 48 of Qwen3's 151936
+// vocabulary unwritten, MT 256x128 does not), so no group is both.
 template <class T>
 __global__ __launch_bounds__(64) void dense_lt_live_args(const u32* __restrict__ live, u32* __restrict__ args, u64 w,
-                                                         u64 act, u64 y, int n, int k, int rows, int b1, int b2) {
+                                                         u64 act, u64 y, int n, int k, int rows, int b1, int b2,
+                                                         int t0, int t1, int t2) {
     const int m = min(static_cast<int>(*live), rows);
     const int bounds[4] = {0, b1, b2, rows};
-    for (int r = threadIdx.x; r < 6; r += blockDim.x) {
-        const int at = r / 2;
+    const int tiles[3] = {t0, t1, t2};
+    for (int r = threadIdx.x; r < 9; r += blockDim.x) {
+        const int at = r / 3;
+        const int slot = r % 3;
         const u32 c = m > bounds[at] && m <= bounds[at + 1] ? static_cast<u32>(m) : 0u;
-        lt_record<T>(args + r * 49, r % 2 == 0 ? static_cast<u32>(n) : 0u, c, k, y, w, act);
+        const u32 whole = tiles[at] > 0 ? static_cast<u32>(n - n % tiles[at]) : static_cast<u32>(n);
+        const u32 rest = static_cast<u32>(n) - whole;
+        const u64 rest_d = y + static_cast<u64>(whole) * sizeof(T);
+        const u64 rest_a = w + static_cast<u64>(whole) * static_cast<u64>(k) * sizeof(T);
+        u32* rec = args + r * 49;
+        if (c == 0 || slot == 2) {
+            lt_record<T>(rec, 0, 0, 0, 0, 0, 0);
+        } else if (slot == 0 && whole != 0) {
+            lt_record_ld<T>(rec, whole, c, k, y, w, act, static_cast<u32>(n));
+        } else if ((slot == 0 && whole == 0) || (slot == 1 && whole != 0 && rest != 0)) {
+            lt_record_ld<T>(rec, rest, c, k, rest_d, rest_a, act, static_cast<u32>(n));
+        } else {
+            lt_record<T>(rec, 0, 0, 0, 0, 0, 0);
+        }
     }
 }
 

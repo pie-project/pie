@@ -18,6 +18,10 @@ pub(super) enum WaitKind {
         notify: Arc<Notify>,
         outcome: Option<Result<AllocationGrant, PlannerError>>,
         yielded: bool,
+        /// An activation rise's room ([`super::ResidencyPlanner::acquire_rise`]):
+        /// its pages are given back at once, so it holds nothing past its
+        /// grant, and the requester's own pages it moves are no ask of its.
+        rise: bool,
     },
     Restore {
         demand: Demand,

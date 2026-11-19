@@ -81,10 +81,10 @@ class MemoryConfig:
     # Keep the disk tier for the next run (cuda): a restart takes back the
     # sealed pages it holds as cache.
     disk_persistent: Optional[bool] = None
-    # The share of memory kept each congested stretch (1.0: never yield).
-    governor_backoff: Optional[float] = None
-    # Give back memory demand stopped asking for.
-    governor_release_idle: Optional[bool] = None
+    # `yield` in [0, 1]: how much of the device budget goes back to the OS's
+    # memory pressure (device target = floor + (budget - floor) *
+    # (1 - yield * pressure)); 0 holds the whole budget. Written as `yield`.
+    yield_: Optional[float] = field(default=None, metadata={"key": "yield"})
 
     def __post_init__(self) -> None:
         if self.budget_host is None and os.environ.get("PIE_HOST_KV_BUDGET_DEFAULT", "1") == "1":
@@ -244,10 +244,11 @@ def _block(obj) -> dict:
         v = getattr(obj, f.name)
         if v is None:
             continue
-        if f.name.endswith("_mb"):
-            out[f.name[: -len("_mb")]] = _mib(v)
+        key = f.metadata.get("key", f.name)
+        if key.endswith("_mb"):
+            out[key[: -len("_mb")]] = _mib(v)
         else:
-            out[f.name] = v
+            out[key] = v
     return out
 
 

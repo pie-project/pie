@@ -42,7 +42,11 @@ enum Step {
     },
     /// The head is a restore whose role slots found no room, and nothing
     /// else will free any: a resident process is evicted for it.
-    EvictForRoles,
+    /// The head restore's role slots are short of `need`, `(run, pieces)`
+    /// runs of whole chunks.
+    /// Room is made for it only where `fund` (the fleet stalled or
+    /// waiting at binds); free runs of its need send it again either way.
+    EvictForRoles { need: (u32, u32), fund: bool },
     /// The head is a restore of a process a bind short of guest-state
     /// room suspended, its kv gathered: it waits for the room that bind
     /// asks as the bind would ([`Self::BindRoom`]).
@@ -176,7 +180,9 @@ impl ResidencyPlanner {
                         _ => match inner.restore_gate(pid, spare) {
                             RestoreGate::Serve => Step::ServeRestore { key, pid },
                             RestoreGate::Wait => Step::Done,
-                            RestoreGate::Evict => Step::EvictForRoles,
+                            RestoreGate::Evict { need, fund } => {
+                                Step::EvictForRoles { need, fund }
+                            }
                         },
                     },
                 }
@@ -189,15 +195,25 @@ impl ResidencyPlanner {
                         self.serve_bind_room(key);
                         continue;
                     }
-                    // As a restore short of room for its roles: idle cache
-                    // first, one set or a sweep, and it looks again in what
-                    // that left; then, the fleet stalled, a resident is
-                    // parked for it by the planner's victim choice.
+                    // Idle cache first, one set or a sweep, and it looks
+                    // again in what that left; then residents are moved for
+                    // it by the planner's victim choice, as for an
+                    // allocation: a bind is new demand, not a restore, and
+                    // it is funded whether or not the fleet has stalled (a
+                    // fleet that keeps decoding never stalls, and the bind
+                    // waited behind it for good).
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
-                    if !self.with_inner(|inner| inner.fleet_stalled()) {
-                        return false;
+                    // A grow the walk will make holds its runs: it waits on
+                    // that, moving no one. Only where none is coming (the
+                    // governor's target reached) are residents moved.
+                    let need = Demand {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: RsUnits::default(),
+                    };
+                    if self.wait_on_grow(no_grow, need) {
+                        return true;
                     }
                     true
                 }
@@ -206,7 +222,21 @@ impl ResidencyPlanner {
                     // runs stand free past its gathered kv, else idle cache
                     // first, then, the fleet stalled, a resident parked
                     // for it by the planner's victim choice.
-                    if self.port.guest_room_free(need.run, need.pieces) {
+                    // Runs that stand free only by what its own park gave
+                    // back are what its restore retakes: room must have come
+                    // free since ([`super::proc::Proc::bind_room_after`]).
+                    // And one such restore at a time ([`Inner::bind_restoring`]).
+                    let (after, other_restoring) = self.with_inner(|inner| {
+                        let pid = inner.queue.get(&key).map(|waiter| waiter.pid);
+                        (
+                            pid.and_then(|pid| inner.procs.get(&pid))
+                                .and_then(|proc| proc.bind_room_after),
+                            inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid),
+                        )
+                    });
+                    let moved = !other_restoring
+                        && after.is_none_or(|after| self.port.room_gives() > after);
+                    if moved && self.port.guest_room_free(need.run, need.pieces) {
                         room_stood = Some(key);
                         continue;
                     }
@@ -218,7 +248,38 @@ impl ResidencyPlanner {
                     }
                     true
                 }
-                Step::EvictForRoles => {
+                Step::EvictForRoles {
+                    need: (run, pieces),
+                    fund,
+                } => {
+                    // Its runs stand free (a completion or a commit gave
+                    // them back): it goes again, once a need. Short again
+                    // with the same need, the need understates its unpark
+                    // (Mac Pro's M5 livelock: free runs of it stood, every
+                    // unpark came back short, 20M times, and nothing was
+                    // ever reclaimed or moved); then room is made for it.
+                    let understated = self.with_inner(|inner| {
+                        inner.unmet_head().is_some_and(|(_, waiter)| {
+                            inner.procs.get(&waiter.pid).is_some_and(|proc| {
+                                proc.roles_free_short == Some((run, pieces))
+                            })
+                        })
+                    });
+                    if !understated && self.port.guest_room_free(run, pieces) {
+                        self.with_inner(|inner| {
+                            let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
+                            if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {
+                                proc.roles_free_retry = Some((run, pieces));
+                            }
+                            inner.roles_retry_head();
+                        });
+                        continue;
+                    }
+                    // Not funded yet: it waits for a completion (one that
+                    // frees room pokes the plan, which looks again here).
+                    if !fund {
+                        return false;
+                    }
                     // Idle cache holds chunks too: one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
@@ -226,6 +287,18 @@ impl ResidencyPlanner {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
                     }
+                    // A grow the walk will make holds its runs: it waits on
+                    // that, moving no one.
+                    let grow = Demand {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: RsUnits::default(),
+                    };
+                    if self.wait_on_grow(no_grow, grow) {
+                        return true;
+                    }
+                    // Else the occupants of the chunks it could take move
+                    // for it (`plan_eviction`'s chunk branch), under the
+                    // key rule.
                     true
                 }
                 Step::Release(stranded) => {
@@ -410,6 +483,10 @@ impl ResidencyPlanner {
                         }
                         if (inner.accum.len() as u32) < need.kv_pages {
                             return Board::Replan;
+                        }
+                        // Suspended for a bind: the one restored at a time.
+                        if inner.procs.get(&pid).is_some_and(|proc| proc.bind_room.is_some()) {
+                            inner.bind_restoring = Some(pid);
                         }
                         let Some(proc) = inner.procs.get_mut(&pid) else {
                             inner.queue.remove(&key);

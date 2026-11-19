@@ -81,6 +81,8 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads: None,
             window: *window,
         }),
+        // A lane's mask is per-lane data, read in the arm its rows land in
+        // whether it states one or not: it never shapes the reading.
         Attn::Prefill {
             q,
             plan,
@@ -88,7 +90,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: Some(_),
             selection: None,
             bias: None,
             lse: None,
@@ -101,40 +102,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: Some(_),
-            selection: None,
-            bias: None,
-            lse: Some(_),
-            ..
-        } => Some(Reader {
-            q: *q,
-            plan: *plan,
-            cache: *cache,
-            head_dim: *head_dim,
-            kv_heads: Some(*kv_heads),
-            window: *window,
-        }),
-        Attn::Prefill {
-            q,
-            plan,
-            cache,
-            window,
-            head_dim,
-            kv_heads,
-            mask: None,
-            selection: None,
-            bias: None,
-            lse: None,
-            ..
-        }
-        | Attn::Prefill {
-            q,
-            plan,
-            cache,
-            window,
-            head_dim,
-            kv_heads,
-            mask: None,
             selection: None,
             bias: None,
             lse: Some(_),
@@ -147,7 +114,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: None,
             selection: None,
             bias: Some(_),
             lse: None,
@@ -160,7 +126,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: None,
             selection: Some(_),
             bias: None,
             lse: None,

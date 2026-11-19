@@ -801,6 +801,45 @@ struct Place {
     dtype: Dtype,
 }
 
+/// The bytes of the planes a load derives on the device once its weights
+/// land, past sizing: each quantized plane [`Weights::decode_absorbed`]
+/// decodes to bf16 (an absorbed one, or one an f32 activation multiplies),
+/// and each convolution weight [`Weights::relabel_conv_weights`] lays again
+/// taps-major in bf16. The room a load sizes its pool from leaves them out.
+#[must_use]
+pub fn derived_bytes(trace: &Trace) -> u64 {
+    let mut decoded = crate::decoded::absorbed_weights(trace);
+    decoded.extend(crate::decoded::lane_axis_weights(trace));
+    let bf16 = |param: &poem_ir::Param| {
+        let (rows, width) = rectangle(&param.shape);
+        rows.saturating_mul(width).saturating_mul(2)
+    };
+    let decodes: u64 = decoded
+        .into_iter()
+        .filter_map(|at| trace.params.get(at))
+        .filter(|param| {
+            matches!(
+                param.dtype,
+                Dtype::U4g64
+                    | Dtype::U4g32
+                    | Dtype::U4g64tiled
+                    | Dtype::U2g32
+                    | Dtype::U2g64
+                    | Dtype::U2g128
+                    | Dtype::U8g64
+            )
+        })
+        .map(bf16)
+        .sum();
+    let relabels: u64 = trace
+        .params
+        .iter()
+        .filter(|param| matches!(param.layout, poem_ir::ParamLayout::ConvTapsMajor { .. }))
+        .map(bf16)
+        .sum();
+    decodes.saturating_add(relabels)
+}
+
 pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
     trace
         .params

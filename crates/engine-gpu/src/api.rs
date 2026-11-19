@@ -219,6 +219,23 @@ pub fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Rang
     attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
+/// Why an attachment whose program's `embed_indptr` port describes
+/// `described` lanes is refused, where that is more than it spans: its
+/// ports would state the next request's tokens and mask. `None`: they
+/// describe its own lanes.
+#[must_use]
+pub fn overreach(attachment: &engine::fire::Attachment, described: usize) -> Option<String> {
+    let lanes = attachment_lanes(attachment);
+    (described > lanes.len()).then(|| {
+        format!(
+            "instance {} is attached over lanes {}..{} and its `embed_indptr` port describes \
+             {described} lane(s): a program's ports state its own lanes' geometry, never the \
+             next request's",
+            attachment.instance, lanes.start, lanes.end
+        )
+    })
+}
+
 /// The runtime's engine over a backend's device: one shell, its program
 /// plane, and the frame in flight.
 pub struct Gpu<B: Host> {
@@ -230,6 +247,8 @@ pub struct Gpu<B: Host> {
     next_frame: u64,
 
     pub sink: Option<engine::CompletionSink>,
+    /// Where a move off the device still on the queue is told landed.
+    landed: Option<engine::LandingSink>,
 
     pending: Option<(FrameId, Vec<PendingStep>)>,
 
@@ -246,6 +265,9 @@ pub struct Gpu<B: Host> {
     /// The guest pipelines built after the load as of the last count
     /// (`Programs::built_serving`).
     guest_built: u64,
+    /// Whether a build on a serving fire's path was warned of: the first
+    /// is, at warn; the rest are counted, and named at debug.
+    warned_in_fire: bool,
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
@@ -262,20 +284,25 @@ impl<B: Host> Gpu<B> {
             next_fire: 1,
             next_frame: 1,
             sink: None,
+            landed: None,
             pending: None,
             programs: B::Programs::default(),
             adapters: BTreeMap::new(),
             handed: None,
             live: engine::live::Live::armed(),
             guest_built: 0,
+            warned_in_fire: false,
             vocab: None,
         }
     }
 
-    /// Counts the pipelines built after ready, by a frame's fires or a bind:
-    /// the load built every kernel pipeline its walks named and every guest
-    /// step's, so each one built since is one it did not prepare
-    /// ([`engine::live::Tally::BuiltAfterReady`]).
+    /// Counts the pipelines built on a serving fire's path since the last
+    /// count, by its prepare, enqueue or settle: the load built every kernel
+    /// pipeline its walks named and every guest step's, so each one built
+    /// since is one a fire waited on ([`engine::live::Tally::BuiltInFire`]),
+    /// the first warned of. A guest pipeline built at a registration or a
+    /// bind, before any fire of it, is counted there instead
+    /// ([`Self::count_registered`]).
     /// And the steps a backend that keeps recordings walked to keep: a shape
     /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
     /// And the steps walked and kept by no recording: each ran eagerly. On a
@@ -290,26 +317,26 @@ impl<B: Host> Gpu<B> {
             .map_or_else(Vec::new, Shell::built_serving);
         // A kernel is built once, so each is named once.
         for kernel in built {
-            self.live.tally(engine::live::Tally::BuiltAfterReady, 1);
-            tracing::error!(
-                engine = B::KIND,
-                kernel,
-                "a serving fire asked for a pipeline no walk of the load named, and built it"
-            );
+            self.live.tally(engine::live::Tally::BuiltInFire, 1);
+            self.warn_in_fire(kernel);
+        }
+        // What a dispatch binds, built on the fire's path: the load's walk
+        // built every one it reached.
+        let bound = self.shell.as_mut().map_or(0, Shell::bound_serving);
+        if bound > 0 {
+            self.live.tally(engine::live::Tally::BoundInFire, bound);
+            self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
         }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
             self.live.tally(engine::live::Tally::Compiled, recorded);
         }
-        // A guest pipeline a bind built after the load, which built every
-        // one a stage can dispatch.
-        let guest = self.programs.built_serving();
-        if guest > self.guest_built {
-            self.live.tally(
-                engine::live::Tally::BuiltAfterReady,
-                guest - self.guest_built,
-            );
-            self.guest_built = guest;
+        // A guest pipeline built on the fire's own path: a registration or
+        // a bind took its own builds' count where it landed.
+        let guest = self.guest_built_since();
+        if guest > 0 {
+            self.live.tally(engine::live::Tally::BuiltInFire, guest);
+            self.warn_in_fire("a guest step's pipeline");
         }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
@@ -319,6 +346,45 @@ impl<B: Host> Gpu<B> {
                 engine::live::Tally::Eager
             };
             self.live.tally(tally, unkept);
+        }
+    }
+
+    /// The guest pipelines built since the last count, which this one takes.
+    fn guest_built_since(&mut self) -> u64 {
+        let guest = self.programs.built_serving();
+        let since = guest.saturating_sub(self.guest_built);
+        self.guest_built = guest;
+        since
+    }
+
+    /// Counts the guest pipelines a registration or a bind built after the
+    /// load: a program's code built at its own registration, before its
+    /// first fire, which no fire waits on
+    /// ([`engine::live::Tally::BuiltAtRegister`]).
+    fn count_registered(&mut self) {
+        let guest = self.guest_built_since();
+        if guest > 0 {
+            self.live.tally(engine::live::Tally::BuiltAtRegister, guest);
+            tracing::debug!(
+                engine = B::KIND,
+                guest,
+                "a registration built guest pipelines the load did not"
+            );
+        }
+    }
+
+    /// Warns once of a build on a serving fire's path, the graph-capture
+    /// rule's violation; later ones are named at debug, and all counted.
+    fn warn_in_fire(&mut self, what: &str) {
+        if std::mem::replace(&mut self.warned_in_fire, true) {
+            tracing::debug!(engine = B::KIND, what, "a serving fire built a pipeline");
+        } else {
+            tracing::warn!(
+                engine = B::KIND,
+                what,
+                "a serving fire built a pipeline the load did not (counted built_in_fire; \
+                 later ones are counted, named at debug)"
+            );
         }
     }
 
@@ -430,6 +496,11 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         device: shell.device(),
         pools: shell.pools(),
         align: B::table_align(shell.device()),
+        seats: shell.readout.iter().chain(&shell.pixel_out).collect(),
+        max_lanes: shell.budget().max_lanes,
+        planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
+            .unwrap_or(u32::MAX),
+        shelf: &shell.shelf,
     }
 }
 
@@ -464,6 +535,11 @@ pub fn refusal(refusal: Refusal) -> Error {
 
 #[must_use]
 pub fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
 
@@ -489,7 +565,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
 
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
@@ -732,8 +808,19 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        let started = std::time::Instant::now();
+        let walked = shell.walk_binds().map_err(fault)?;
+        if walked > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                walked,
+                ms = started.elapsed().as_millis() as u64,
+                "every fire shape the load serves walked bind-only: what a dispatch binds is built"
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
+        shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -804,6 +891,17 @@ where
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // The platform's stated bound on one submission (KGSL's on
+            // Android, none elsewhere) and the rates this load measured.
+            guest_cost: {
+                let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
+                engine::GuestCost {
+                    submit_bound_ns: crate::rates::STATED_SUBMIT_BOUND
+                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    launch_ns: rates.launch_ns,
+                    elementwise_gbps: rates.elementwise_gbps,
+                }
+            },
         };
 
         self.shell = Some(shell);
@@ -862,6 +960,8 @@ where
         &self,
         program: ProgramId,
         extents: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         let Some(shell) = self.shell.as_ref() else {
             return Ok(engine::GuestState::default());
@@ -899,6 +999,37 @@ where
         self.programs
             .rebind_slots(shell.pools(), &rebind)
             .map_err(refusal)
+    }
+
+    /// Returns once every copy submitted so far has landed: every frame
+    /// and device copy in flight, and a slot file read's copy onto the
+    /// device (`Shell::settle_copies`). Off the hot path: an aborted move
+    /// waits on it.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_copies().map_err(fault)
+    }
+
+    /// `false` only for a move off the device into mapped host chunks: it
+    /// rides the queue past the call, and its device slots, once back, may
+    /// be written by anything; told landed from its frame's fence. Every
+    /// other copy's sources may go back at once (`Shell::copy_slots_landing`
+    /// states why for each kind).
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self
+            .landed
+            .clone()
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed)
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -967,6 +1098,7 @@ where
             "submit"
         );
         let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
                 self.expect_fire(next);
@@ -982,6 +1114,12 @@ where
                     steps.push(ticket);
                     pending.push(step_pending);
                 }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
                 Err(error) => {
                     self.pending = None;
                     self.count_built();
@@ -991,7 +1129,7 @@ where
         }
         B::submitted(self);
         self.count_built();
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
 
         if !self.settles_asynchronously() {
@@ -1002,7 +1140,9 @@ where
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+        let registered = self.programs.register(registration).map_err(refusal);
+        self.count_registered();
+        registered
     }
 
     /// The program adopted and its stages lowered in the returned compile,
@@ -1027,7 +1167,9 @@ where
                 B::KIND
             )));
         };
-        self.programs.finish(*prepared).map_err(refusal)
+        let finished = self.programs.finish(*prepared).map_err(refusal);
+        self.count_registered();
+        finished
     }
 
     fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
@@ -1064,8 +1206,9 @@ where
             .programs
             .bind(binding, place.as_ref(), &layout)
             .map_err(refusal);
-        // What the bind built, counted where it lands, before its first fire.
-        self.count_built();
+        // What the bind built, counted where it lands, before its first
+        // fire: the program's own registration's builds.
+        self.count_registered();
         let bound = bound?;
 
         // A lane that only classes the kernels refuse serve is refused
@@ -1200,6 +1343,8 @@ where
         }
 
         self.pending = Some((ticket.id, pending));
+        // What the settle built, on the fire's path.
+        self.count_built();
         if let Some(error) = refused {
             return Err(error);
         }
@@ -1497,7 +1642,17 @@ impl<B: Host> Gpu<B> {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
-        for lane in &submission.lanes {
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            // This load places every row itself (no `slots` port): a lane
+            // whose table is a working set's whole, for its program to
+            // place rows through, would land them in pages not its own.
+            if lane.list == engine::fire::ListKind::Translation {
+                return Err(Error::lane(
+                    u32::try_from(at).unwrap_or(u32::MAX),
+                    "its kv table is a translation its program places rows through, and this \
+                     load resolves no `slots` port: it places no row a program states",
+                ));
+            }
             pages_of.push(
                 lane.tables
                     .iter()
@@ -1724,6 +1879,7 @@ mod tests {
                 lanes: 2,
                 instance: InstanceId(100 + u64::from(at)),
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             })
             .collect();
         let mut ran = Vec::new();

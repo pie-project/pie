@@ -119,7 +119,7 @@ fn time(heads: [usize; 3], reqs: &[(usize, usize)], arm: Arm) -> f64 {
             )
             .expect("the decode plans");
             plan.stage(&ctx).expect("the plan uploads");
-            Box::new(move || attn::decode(&ctx, qt, &plan, &kvp, None, d, scale, o).unwrap())
+            Box::new(move || attn::decode(&ctx, qt, &plan, &kvp, None, d, scale, o, None).unwrap())
         }
         _ => {
             let masked = matches!(arm, Arm::MaskedDecode | Arm::MaskedPrefill).then_some(mask_ip);

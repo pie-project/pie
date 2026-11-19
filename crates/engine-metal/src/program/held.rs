@@ -5,8 +5,9 @@
 //! slots, a buffer of the engine's own.
 //!
 //! A pooled [`Held`] is one slot ref's bytes, addressed through the pool's
-//! view (a placement-sparse buffer) and written on the host through the heap
-//! under it. Evacuation moves the chunk under a ref and leaves the ref, so a
+//! view (a placement-sparse buffer) and written on the host through the
+//! heaps under it: one host run a heap its bytes cross (a chunk, and a slot
+//! in it, may cross a heap's end). Evacuation moves the chunk under a ref and leaves the ref, so a
 //! region is [`Held::rebind`]-ed after it: its view offset and host
 //! address are those of the chunk the ref sits in now.
 #![allow(unsafe_code)]
@@ -37,13 +38,14 @@ unsafe impl Sync for HostAt {}
 
 #[derive(Debug, Clone)]
 enum Place {
-    /// Bytes `[at, at + bytes)` of slot `slot` of shape `shape`, at view
-    /// offset `offset` and host address `host`.
+    /// Bytes `[at, at + bytes)` of slot `slot` of shape `shape`, written
+    /// on the host through `runs`: `(from, len, address)` from the region's
+    /// first byte, one a placement heap the bytes cross.
     Slot {
         shape: ShapeId,
         slot: u32,
         at: u64,
-        host: HostAt,
+        runs: Vec<(u64, u64, HostAt)>,
     },
 }
 
@@ -60,7 +62,7 @@ pub struct Held {
 impl Held {
     /// Bytes `[at, at + bytes)` of slot ref `slot` of `shape`, zeroed.
     pub fn in_slot(pools: &Pools, shape: ShapeId, slot: u32, at: u64, bytes: u64) -> Result<Held> {
-        let (buffer, offset, host, slot_bytes) = pools.slot_place(shape, slot)?;
+        let slot_bytes = pools.slot_bytes(shape)?;
         if at.checked_add(bytes).is_none_or(|end| end > slot_bytes) {
             return Err(Fault::program(
                 "program::held",
@@ -71,17 +73,16 @@ impl Held {
                 ),
             ));
         }
-        // SAFETY: `at < slot_bytes`, inside the slot's chunk.
-        let host = HostAt(unsafe { host.add(usize_of(at)) });
+        let (buffer, offset, runs) = pools.span_runs(shape, slot, at, bytes)?;
         let mut region = Held {
             buffer,
-            offset: offset + at,
+            offset,
             bytes,
             place: Place::Slot {
                 shape,
                 slot,
                 at,
-                host,
+                runs: host_runs(runs),
             },
         };
         region.zero()?;
@@ -116,19 +117,17 @@ impl Held {
                 ),
             ));
         }
-        let (buffer, offset, host, _) = pools.slot_place(shape, first)?;
-        // SAFETY: `at + bytes` lies inside the run, inside the first slot's
-        // chunk.
-        let host = HostAt(unsafe { host.add(usize_of(at)) });
+        // `at + bytes` lies inside the run, inside the first slot's chunk.
+        let (buffer, offset, runs) = pools.span_runs(shape, first, at, bytes)?;
         let mut region = Held {
             buffer,
-            offset: offset + at,
+            offset,
             bytes,
             place: Place::Slot {
                 shape,
                 slot: first,
                 at,
-                host,
+                runs: host_runs(runs),
             },
         };
         region.zero()?;
@@ -141,13 +140,12 @@ impl Held {
             shape,
             slot,
             at,
-            host,
+            runs,
         } = &mut self.place;
-        let (buffer, offset, base, _) = pools.slot_place(*shape, *slot)?;
+        let (buffer, offset, fresh) = pools.span_runs(*shape, *slot, *at, self.bytes)?;
         self.buffer = buffer;
-        self.offset = offset + *at;
-        // SAFETY: as in `in_slot`.
-        *host = HostAt(unsafe { base.add(usize_of(*at)) });
+        self.offset = offset;
+        *runs = host_runs(fresh);
         Ok(())
     }
 
@@ -212,37 +210,37 @@ impl Held {
     /// writes only bytes no frame in flight reads.
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
         self.check(at, from.len())?;
-        match self.place {
-            Place::Slot { host, .. } => {
-                // SAFETY: `check` keeps the span inside the region, which
-                // lies inside one slot of a mapped heap.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        from.as_ptr(),
-                        host.0.as_ptr().add(usize_of(at)),
-                        from.len(),
-                    );
-                }
-                Ok(())
+        let Place::Slot { runs, .. } = &self.place;
+        for (run, part) in pieces(runs, at, from.len() as u64) {
+            let (from_at, host, len) = part;
+            // SAFETY: `check` keeps the span inside the region, and each
+            // piece inside one host run of a mapped heap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    from.as_ptr().add(usize_of(run)),
+                    host.0.as_ptr().add(usize_of(from_at)),
+                    usize_of(len),
+                );
             }
         }
+        Ok(())
     }
 
     pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
         self.check(at, into.len())?;
-        match self.place {
-            Place::Slot { host, .. } => {
-                // SAFETY: as `write`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        host.0.as_ptr().add(usize_of(at)),
-                        into.as_mut_ptr(),
-                        into.len(),
-                    );
-                }
-                Ok(())
+        let Place::Slot { runs, .. } = &self.place;
+        for (run, part) in pieces(runs, at, into.len() as u64) {
+            let (from_at, host, len) = part;
+            // SAFETY: as `write`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    host.0.as_ptr().add(usize_of(from_at)),
+                    into.as_mut_ptr().add(usize_of(run)),
+                    usize_of(len),
+                );
             }
         }
+        Ok(())
     }
 
     /// Zeroes `len` bytes from `at` on the host; as [`Held::write`].
@@ -269,6 +267,28 @@ impl Held {
 
 fn usize_of(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+fn host_runs(runs: Vec<(u64, u64, NonNull<u8>)>) -> Vec<(u64, u64, HostAt)> {
+    runs.into_iter()
+        .map(|(from, len, address)| (from, len, HostAt(address)))
+        .collect()
+}
+
+/// The pieces of bytes `[at, at + len)` of a region laid in host `runs`
+/// (`(from, len, address)` from its first byte): each as its offset in the
+/// span, and its offset and host run to copy `len` bytes at.
+fn pieces(
+    runs: &[(u64, u64, HostAt)],
+    at: u64,
+    len: u64,
+) -> impl Iterator<Item = (u64, (u64, HostAt, u64))> + '_ {
+    let end = at + len;
+    runs.iter().filter_map(move |&(from, run_len, host)| {
+        let start = at.max(from);
+        let stop = end.min(from + run_len);
+        (start < stop).then(|| (start - at, (start - from, host, stop - start)))
+    })
 }
 
 /// Lays tables out in `Instance` slots of `slot_bytes`: each aligned to
@@ -612,7 +632,31 @@ impl Cells {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack, ring_slots};
+    use super::{HostAt, pack, pieces, ring_slots};
+    use std::ptr::NonNull;
+
+    /// A region whose bytes cross a placement heap's end lies in two host
+    /// runs (slot 65500 of shape 7 on the M1, refused before): a copy over
+    /// the seam is cut in two at it, each piece at its own run's address,
+    /// and one inside a run stays whole.
+    #[test]
+    fn a_copy_over_a_heap_s_end_is_cut_at_it() {
+        let mut first = [0u8; 8];
+        let mut second = [0u8; 8];
+        let runs = vec![
+            (0, 8, HostAt(NonNull::new(first.as_mut_ptr()).unwrap())),
+            (8, 8, HostAt(NonNull::new(second.as_mut_ptr()).unwrap())),
+        ];
+        let cut: Vec<(u64, u64, u64)> = pieces(&runs, 5, 6)
+            .map(|(span, (at, _, len))| (span, at, len))
+            .collect();
+        assert_eq!(cut, vec![(0, 5, 3), (3, 0, 3)], "3 bytes before the seam, 3 after");
+        let whole: Vec<(u64, u64, u64)> = pieces(&runs, 9, 4)
+            .map(|(span, (at, _, len))| (span, at, len))
+            .collect();
+        assert_eq!(whole, vec![(0, 1, 4)], "inside the second run");
+        assert_eq!(pieces(&runs, 16, 0).count(), 0);
+    }
 
     #[test]
     fn tables_pack_aligned_and_never_straddle_a_slot() {

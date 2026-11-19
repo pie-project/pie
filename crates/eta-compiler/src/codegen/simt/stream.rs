@@ -766,6 +766,10 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
         );
         let _ = writeln!(
             p,
+            "    p{node}.intrinsic_rows = intrinsic_rows[intrinsic_index{node}];"
+        );
+        let _ = writeln!(
+            p,
             "    const m1_u8* ibase{node} = reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index{node}]);"
         );
         let _ = writeln!(
@@ -785,16 +789,16 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
             "    const m1_u64 ifirst{node} = (m1_u64)p{node}.intrinsic_row_offset + (m1_u64)p{node}.imm2;"
         );
         pass.body.conds.push(format!(
-            "(iwidth{node} & 3u) == 0u && stream_width <= iwidth{node} && m1_intrinsic_row_vectorable(ibase{node}, ifirst{node}, istride{node}, p{node}.intrinsic_dtype)"
+            "(iwidth{node} & 3u) == 0u && stream_width <= iwidth{node} && m1_intrinsic_row_vectorable(ibase{node}, ifirst{node}, istride{node}, p{node}.intrinsic_dtype, p{node}.intrinsic_rows)"
         ));
     }
     let _ = writeln!(
         pass.body.s,
-        "      const float r{out} = m1_intrinsic_row_load(ibase{node}, ifirst{node} + i / iwidth{node}, i % iwidth{node}, istride{node}, p{node}.intrinsic_dtype);"
+        "      const float r{out} = m1_intrinsic_row_load(ibase{node}, ifirst{node} + i / iwidth{node}, i % iwidth{node}, istride{node}, p{node}.intrinsic_dtype, p{node}.intrinsic_rows);"
     );
     let _ = writeln!(
         pass.body.pre,
-        "        const float4 q_r{out} = m1_intrinsic_row_load4(ibase{node}, ifirst{node}, i4, istride{node}, p{node}.intrinsic_dtype);"
+        "        const float4 q_r{out} = m1_intrinsic_row_load4(ibase{node}, ifirst{node}, i4, istride{node}, p{node}.intrinsic_dtype, p{node}.intrinsic_rows);"
     );
     let _ = writeln!(
         pass.body.v,

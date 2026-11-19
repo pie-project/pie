@@ -43,6 +43,51 @@ enum Route {
 
 /// Whether the diagonal kernels' vector reads take these planes: each one
 /// there, and the weight and the activation 16-byte aligned.
+/// [`act_x_wt`] over rows normed where the skinny or turned kernel stages
+/// them (`super::gemv::skinny_norm_bf16`, `skinnyt_norm`), where the product
+/// takes either; `Ok(false)` otherwise or where the fold does not pay.
+pub(crate) fn act_x_wt_normed(
+    ctx: &Ctx,
+    w: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    norm: super::gemv::SkinnyNorm,
+) -> Result<bool, Error> {
+    if m <= 0 || n <= 0 || k <= 0 {
+        return Ok(false);
+    }
+    match route(ctx, m, n, k, vector_operands(w, norm.x, y)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        _ => Ok(false),
+    }
+}
+
+/// [`act_x_wt_swiglu`] over rows normed where the skinny or turned kernel
+/// stages them, where the gated product takes either; `Ok(false)` otherwise or
+/// where the fold does not pay.
+pub(crate) fn act_x_wt_swiglu_normed(
+    ctx: &Ctx,
+    gate_up: u64,
+    h: u64,
+    m: i32,
+    intermediate: i32,
+    k: i32,
+    norm: super::gemv::SkinnyNorm,
+) -> Result<bool, Error> {
+    if m <= 0 || intermediate <= 0 || k <= 0 {
+        return Ok(false);
+    }
+    let (i, e) = (intermediate, SkinnyEpilogue::Swiglu);
+    match route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, norm.x, h)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, i, k, norm, e),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, gate_up, h, m, i, k, norm, e),
+        _ => Ok(false),
+    }
+}
+
 fn vector_operands(w: u64, act: u64, y: u64) -> bool {
     w != 0 && act != 0 && y != 0 && aligned16(w) && aligned16(act)
 }
@@ -308,7 +353,10 @@ pub(crate) fn act_x_wt_live(
             lib.solutions[at[r]].mt[1].min(m)
         }
     };
-    let args = ctx.scratch(op, "linear.live_args", 6 * USER_ARGS_BYTES)? as u64;
+    // Three records a launch: its whole MT0 tiles, the weight rows past
+    // them, the sentinel (`dense_lt_live_args`).
+    let args = ctx.scratch(op, "linear.live_args", 9 * USER_ARGS_BYTES)? as u64;
+    let tile = |r: usize| lib.solutions[at[r]].mt[0] as i32;
     ctx.fire(
         op,
         Fire::at(kernel(
@@ -327,14 +375,19 @@ pub(crate) fn act_x_wt_live(
             ArgValue::I32(m as i32),
             ArgValue::I32(bound(0) as i32),
             ArgValue::I32(bound(1) as i32),
+            ArgValue::I32(tile(0)),
+            ArgValue::I32(tile(1)),
+            ArgValue::I32(tile(2)),
         ],
     )?;
     for (r, &solution) in at.iter().enumerate() {
-        let grid = lib.solutions[solution].worst_grid(n, bound(r), 1);
-        let record = args + (2 * r * USER_ARGS_BYTES) as u64;
+        // Two groups split the weight rows: the worst grid over both.
+        let grid = lib.solutions[solution].worst_grid(n, bound(r), 2);
+        let record = args + (3 * r * USER_ARGS_BYTES) as u64;
         // SAFETY: the records were written on this stream, naming act, w and
-        // y, live device planes of [m, k], [n, k] and [m, n] bf16.
-        unsafe { lib.launch(solution, 2, record, grid, ctx.stream()) }
+        // y, live device planes of [m, k], [n, k] and [m, n] bf16, and
+        // column bands of w and y inside them.
+        unsafe { lib.launch(solution, 3, record, grid, ctx.stream()) }
             .map_err(|why| refuse(op, why))?;
     }
     Ok(true)

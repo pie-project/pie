@@ -26,9 +26,13 @@ pub struct Cfg {
     pub temporary: u32,
     pub op_count: u32,
     pub lane: u32,
+    /// The words of the stage's heap, past which the runtime refuses any
+    /// access (its `OUT_OF_BOUNDS` fault).
+    pub heap_words: u32,
+    pub pad: [u32; 3],
 }
 
-const _: () = assert!(size_of::<Cfg>() == 16);
+const _: () = assert!(size_of::<Cfg>() == 32);
 
 pub fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
     let mut out = [0u32; DESC_WORDS];
@@ -50,7 +54,16 @@ pub fn words_le(words: &[u32]) -> Vec<u8> {
 impl Cfg {
     #[must_use]
     pub fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
+        words_le(&[
+            self.value_count,
+            self.temporary,
+            self.op_count,
+            self.lane,
+            self.heap_words,
+            self.pad[0],
+            self.pad[1],
+            self.pad[2],
+        ])
     }
 }
 
@@ -188,9 +201,14 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
     alias_reshapes(plan, &mut scratch.values);
 
     let sizes = table_sizes(plan);
-    let sized = |mut bytes: Vec<u8>, at: usize| {
-        bytes.resize(usize::try_from(sizes[at]).unwrap_or(usize::MAX), 0);
-        bytes
+    let sized = |mut bytes: Vec<u8>, at: usize| -> Result<Vec<u8>, String> {
+        let len = usize::try_from(sizes[at])
+            .map_err(|_| format!("a guest stage's table {at} of {} bytes", sizes[at]))?;
+        bytes.resize(len, 0);
+        Ok(bytes)
+    };
+    let word = |what: &str, value: u64| {
+        u32::try_from(value).map_err(|_| format!("a guest stage's {what} ({value}) past a u32"))
     };
     let descs: Vec<u8> = descriptors
         .iter()
@@ -200,28 +218,89 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
     let mut result_base = 0u32;
     for op in &plan.ops {
         params.extend_from_slice(&OpParams::of(op, result_base, plan.output_slots).to_le_bytes());
-        result_base += u32::from(op.result_count);
+        result_base = result_base
+            .checked_add(u32::from(op.result_count))
+            .ok_or_else(|| "a guest stage's result ids past a u32".to_string())?;
     }
     let offsets: Vec<u32> = scratch
         .values
         .iter()
-        .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
-        .collect();
+        .map(|&at| word("value offset", at))
+        .collect::<Result<_, _>>()?;
+    // The heap the stage binds, which its runtime bounds every access by.
+    let heap = scratch.total.max(256);
     let config = Cfg {
-        value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
-        op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
+        value_count: word("value count", plan.value_types.len() as u64)?,
+        temporary: word("temporary words", scratch.temporary / 4)?,
+        op_count: word("op count", plan.ops.len() as u64)?,
         lane: 0,
+        heap_words: word("heap words", heap / 4)?,
+        pad: [0; 3],
     };
     Ok(StageTables {
         descriptors,
         tables: [
-            sized(descs, 0),
-            sized(params, 1),
-            sized(words_le(&offsets), 2),
-            sized(config.to_le_bytes(), 3),
+            sized(descs, 0)?,
+            sized(params, 1)?,
+            sized(words_le(&offsets), 2)?,
+            sized(config.to_le_bytes(), 3)?,
         ],
         offsets: scratch.values,
-        scratch: scratch.total.max(256),
+        scratch: heap,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::types::{Dtype, Shape};
+
+    use super::stage_tables;
+    use crate::Extents;
+
+    /// A stage whose values lie past a u32 word of scratch is refused by the
+    /// layout's bound, by name, before any offset could be written as
+    /// `u32::MAX`; the offset words' own check backs that bound.
+    #[test]
+    fn a_stage_past_a_word_of_scratch_is_refused_by_name() {
+        let wide = Shape::vector(1 << 30);
+        let decl = |host_role| ChannelDecl {
+            shape: wide,
+            dtype: ChanDType::Concrete(Dtype::F32),
+            capacity: 1,
+            host_role,
+            seeded: false,
+        };
+        let container = TraceContainer {
+            channels: vec![decl(HostRole::Writer), decl(HostRole::Reader)],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Neg(0),
+                    Op::Exp(1),
+                    Op::Add(1, 2),
+                    Op::ChanPut { chan: 1, value: 3 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+            .expect("the stage binds");
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        let package = eta_compiler::codegen::launch::build(&bound, &stages);
+        let refused = package
+            .plans
+            .iter()
+            .map(|plan| stage_tables(plan, &Extents::default()))
+            .find_map(Result::err)
+            .expect("a stage past a word of scratch is refused");
+        assert!(
+            refused.starts_with("a guest pass's scratch does not fit: Bound")
+                && refused.contains(&format!("limit: {}", crate::scratch::MAX_BYTES)),
+            "{refused}"
+        );
+    }
 }

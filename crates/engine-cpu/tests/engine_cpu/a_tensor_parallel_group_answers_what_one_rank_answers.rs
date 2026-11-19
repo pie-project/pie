@@ -1,8 +1,9 @@
 //! MiniMax-M2 shrunk to a micro, served by one rank and by `N` simulated
 //! tensor-parallel ranks, each a thread holding its share of every weight the
 //! compiler cuts, their sums and gathers meeting in memory: every rank's
-//! logits are the ones one rank answers, at 2, 4 and 8 ranks, through a
-//! prefill and the decode after it. Its q and k are RMS-normed across all
+//! logits, and its score row by key and by page, are the ones one rank
+//! answers, at 2, 4 and 8 ranks, through a prefill and the decode after it.
+//! Its q and k are RMS-normed across all
 //! their heads, which the ranks split: each norms its share by the row's sum
 //! of squares, its own summed across the ranks (two kv heads, so from 4 ranks
 //! up a pair of ranks holds each kv head alike and the sum counts it twice).
@@ -113,8 +114,9 @@ const CONTEXT: u32 = 64;
 /// The kv page a page's score sums.
 const PAGE: u32 = 16;
 
-/// A step's logits and its attention scores, a layer after another.
-type Read = [Vec<f32>; 2];
+/// A step's logits, its attention scores a key (the layers' sum) and their
+/// sums a page.
+type Read = [Vec<f32>; 3];
 
 fn read(outs: Vec<Output>) -> Read {
     let floats = |name: &str| match outs.iter().find(|out| out.name == name) {
@@ -124,7 +126,11 @@ fn read(outs: Vec<Output>) -> Read {
         }) => v.clone(),
         _ => panic!("the step reads out no `{name}`"),
     };
-    [floats("logits"), floats("attn.scores")]
+    [
+        floats("logits"),
+        floats("attn.scores"),
+        floats("attn.scores.pages"),
+    ]
 }
 
 /// The prefill's and the decode's reads of one forward, `group` its rank.
@@ -170,7 +176,7 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
     let package = micro();
     let whole = lowered(&package, 1);
     let want = steps(&whole, None);
-    for (s, [logits, scores]) in want.iter().enumerate() {
+    for (s, [logits, scores, pages]) in want.iter().enumerate() {
         assert_eq!(logits.len(), 512, "a micro's vocabulary");
         assert!(logits.iter().all(|v| v.is_finite()), "one rank's logits");
         let keys = PROMPT.len() + s;
@@ -182,6 +188,15 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
             (mass - 4.0).abs() < 1e-3 && scores[keys..].iter().all(|&v| v == 0.0),
             "the row is the layers' mass over the keys the lane holds: {mass}"
         );
+        let page = PAGE as usize;
+        assert_eq!(pages.len(), context / page, "one mass a page of the context");
+        for (at, sum) in pages.iter().enumerate() {
+            let want: f32 = scores[at * page..(at + 1) * page].iter().sum();
+            assert!(
+                (sum - want).abs() < 1e-5,
+                "page {at} sums its keys' mass: {sum}, not {want}"
+            );
+        }
     }
     for ranks in [2u32, 4, 8] {
         let split = lowered(&package, ranks);
@@ -205,7 +220,7 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
         let got = group(&split, ranks as usize);
         for (r, got) in got.iter().enumerate() {
             for (s, step) in ["prefill", "decode"].iter().enumerate() {
-                for (k, what) in ["logits", "scores"].iter().enumerate() {
+                for (k, what) in ["logits", "scores", "pages"].iter().enumerate() {
                     let off = apart(&got[s][k], &want[s][k]);
                     assert!(
                         off < 1e-4,

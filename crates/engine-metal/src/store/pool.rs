@@ -1101,6 +1101,15 @@ impl Pool {
     }
 
     /// Zeroes `len` bytes at `offset` on the host; as [`Pool::write`].
+    /// `len` bytes from `offset` of the range zeroed on the device, in
+    /// `frame`: in queue order behind every frame committed before it, so no
+    /// frame in flight is waited on.
+    pub fn zero_in(&self, frame: &mut crate::device::ctx::Frame, offset: u64, len: u64) -> Result<()> {
+        self.walk(offset, len, |part, local, _, take| {
+            frame.fill_zero(part.view.slab(), local, take)
+        })
+    }
+
     pub fn zero(&mut self, offset: u64, len: u64) -> Result<()> {
         self.walk(offset, len, |part, local, _, take| {
             #[cfg(target_vendor = "apple")]

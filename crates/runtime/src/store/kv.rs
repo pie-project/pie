@@ -535,6 +535,31 @@ impl KvStore {
             pages.push((hashes, page_hash));
         }
         self.table.commit_hashes(ws, first, pages)?;
+        if sealed > 0 {
+            // Passes waiting on these pages look again.
+            self.note_cached();
+        }
+        Ok(sealed)
+    }
+
+    /// Seals the pages a pass wrote from `start`, keyed by `slots`, once
+    /// its fires have landed, as far as its rows are frozen: whole, computed
+    /// and keyed, they never change in place, and the passes waiting on them
+    /// map them in now rather than once the pass is finalized. What was
+    /// sealed is a prompt's.
+    pub fn seal_landed(
+        &mut self,
+        ws: WorkingSetId,
+        start: u64,
+        slots: &[Hash256],
+        page_size: u32,
+    ) -> Result<u32, KvStoreError> {
+        let frozen = self.table.folded(ws)?.saturating_sub(start);
+        let slots = &slots[..slots.len().min(frozen as usize)];
+        let sealed = self.seal_rows(ws, start, slots, page_size)?;
+        let end = start + slots.len() as u64;
+        self.table
+            .reach_prompt(ws, end / u64::from(page_size.max(1)))?;
         Ok(sealed)
     }
 
@@ -1910,6 +1935,19 @@ impl KvStore {
         self.note_change(terminal, true);
     }
 
+    /// The device pages of `working_sets` that would leave the device
+    /// with them: resident, read by none of the running working sets
+    /// outside them, pinned by nothing ([`KvPageTable::movable_resident_pages`]).
+    pub fn movable_resident_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Vec<PhysicalKvPageId> {
+        self.table
+            .movable_resident_pages(working_sets)
+            .map(|pages| pages.into_iter().map(|(_, page)| page).collect())
+            .unwrap_or_default()
+    }
+
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {
         self.table
             .owner(ws)
@@ -2044,31 +2082,59 @@ impl KvStore {
         let held = self.table.mapped_len(ws)?;
         let found = run.len();
         let run = &run[..run.len().min(limit as usize)];
-        let run = &run[..self.table.resident_run(run)];
-        // What attaching maps is the trie path to the run's last page; with
-        // several copies of one content (a node start's copies, one moved
-        // below the device), that path may leave the run: only as far as
-        // they agree.
-        let run = match run.last() {
-            Some(last) => {
-                let path = self.table.path_locations(last.node, last.local);
-                let agree = path.iter().zip(run).take_while(|(a, b)| a == b).count();
-                &run[..agree]
-            }
-            None => run,
+        // What attaching maps is the trie path to the run's last page. A run
+        // found across several copies of one content (a node start's copies,
+        // computed by passes that raced) may leave that path, and the path's
+        // page is then another copy: keys name a page's rows and all its
+        // prefix, so the path maps as far as its keys are the run's and its
+        // pages are on the device.
+        let path = run.last().map_or_else(Vec::new, |last| {
+            self.table.path_locations(last.node, last.local)
+        });
+        let keyed = path
+            .iter()
+            .zip(run)
+            .take_while(|(on, at)| {
+                self.table
+                    .page_key_at(on)
+                    .is_some_and(|key| Some(key) == self.table.page_key_at(at))
+            })
+            .count();
+        let path = &path[..self.table.resident_run(&path[..keyed])];
+        // Why the found pages within the limit were not all mapped, for the
+        // pass's log line.
+        let short = |why: &'static str| {
+            tracing::debug!(
+                target: "pie::kv",
+                found,
+                limit,
+                held,
+                mapped = path.len(),
+                why,
+                "attach: found pages not mapped"
+            );
         };
-        tracing::debug!(target: "pie::kv", found, limit, resident = run.len(), held, "attach");
-        let Some(&last) = run.last().filter(|_| run.len() as u64 > held) else {
+        if keyed < run.len() {
+            short("another copy's path leaves the run's keys");
+        } else if path.len() < keyed {
+            short("a page is moving or below the device");
+        }
+        let Some(&last) = path.last().filter(|_| path.len() as u64 > held) else {
             return Ok(0);
         };
-        if self.table.path_prefix_len(last.node, last.local) != run.len() as u64 {
+        if self.table.path_prefix_len(last.node, last.local) != path.len() as u64 {
+            short("the path is a selection that does not start at row 0");
             return Ok(0);
         }
         match self.table.attach(ws, last.node, last.local) {
             Ok(_) => {}
-            Err(KvTableError::BadRange { .. }) => return Ok(0),
+            Err(KvTableError::BadRange { .. }) => {
+                short("the pages the set holds are not the path's");
+                return Ok(0);
+            }
             Err(error) => return Err(error.into()),
         }
+        let run = path;
         let pages = run.len() as u64 - held;
         // What was mapped in is a prompt's.
         self.table.reach_prompt(ws, run.len() as u64)?;

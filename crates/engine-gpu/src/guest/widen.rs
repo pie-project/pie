@@ -45,6 +45,33 @@ pub const STORAGE_SOURCE: &str = widen_source!("var<storage, read>");
 /// as one.
 pub const UNIFORM_SOURCE: &str = widen_source!("var<uniform>");
 
+/// The widen over a table of configs, one row of a pass's outputs each
+/// (`gid.y`): every row read from one source into one destination widens in
+/// one dispatch, the table at the dispatch's offset into its buffer.
+pub const TABLE_SOURCE: &str = r#"
+@group(0) @binding(0) var<storage, read>       src : array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
+
+struct Cfg {
+  src_word : u32,
+  dst_word : u32,
+  lanes    : u32,
+  pad      : u32,
+};
+@group(0) @binding(2) var<storage, read> table : array<Cfg>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let cfg = table[gid.y];
+  let i = gid.x;
+  if (i >= cfg.lanes) { return; }
+  let w = src[cfg.src_word + (i >> 1u)];
+  var half : u32 = w & 0xffffu;
+  if ((i & 1u) == 1u) { half = w >> 16u; }
+  dst[cfg.dst_word + i] = half << 16u;
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Cfg {

@@ -30,6 +30,10 @@ pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
+/// The key a demote's pages are expected under while it moves: they come
+/// back once its copy has landed, and a shortfall read meanwhile counts them
+/// arriving instead of evicting another process for room on its way.
+const DEMOTE: ProcessId = ProcessId::max();
 
 pub struct ResidencyPlanner {
     pub(super) inner: parking_lot::Mutex<Inner>,
@@ -421,6 +425,17 @@ impl ResidencyPlanner {
             self.demoting.store(false, Ordering::Release);
             return false;
         };
+        let pages = txn.page_count() as u32;
+        ptrace!("demote begins pages={}", pages);
+        self.with_inner(|inner| {
+            inner.evicting.insert(
+                DEMOTE,
+                Reclaim {
+                    pages,
+                    rs: RsUnits::default(),
+                },
+            )
+        });
         exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
         true
     }
@@ -547,6 +562,8 @@ impl ResidencyPlanner {
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {
+        ptrace!("demote done moved={}", moved);
+        self.with_inner(|inner| inner.settle_eviction(DEMOTE));
         self.demoting.store(false, Ordering::Release);
         if moved {
             self.re_arm_idle_reclaim();
@@ -1097,6 +1114,34 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Marks `pid` as waiting at a bind for room, or past it
+    /// ([`super::proc::Proc::bind_waiting`]): waiting, it is a victim as an
+    /// idle process is, and the planner looks again for a head it may now
+    /// fund.
+    pub fn set_bind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: bool) {
+        let (changed, released) = self.with_inner(|inner| {
+            let changed = inner.procs.get_mut(&pid).is_some_and(|proc| {
+                let was = proc.bind_waiting;
+                proc.bind_waiting = waiting;
+                was != waiting
+            });
+            // The suspended bind it was restored for waits for room again:
+            // its restore is over, and the next bind-suspended restore may
+            // go. Held for it, every other one waited on a bind that waits
+            // behind them (Mac Pro's beam mix: a restored process short at
+            // its bind again, the queue's head a bind-suspended restore,
+            // flat with every thread parked).
+            let released = waiting && inner.bind_restoring == Some(pid);
+            if released {
+                inner.bind_restoring = None;
+            }
+            (changed, released)
+        });
+        if (changed && waiting) || released {
+            self.poke();
+        }
+    }
+
     /// Marks `pid` as waiting on its client, or as awake again. Waking a
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
@@ -1234,6 +1279,7 @@ impl ResidencyPlanner {
             pieces,
             pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
         };
+
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",
@@ -1533,6 +1579,9 @@ impl ResidencyPlanner {
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             let charged = departed.as_ref().is_some_and(|proc| proc.charged);
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
@@ -1606,6 +1655,23 @@ impl ResidencyPlanner {
         }
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// Whether a process's demand waits for room: a kv allocation, a
+    /// restore or a guest bind, unmet. A rise is ordered among them by its
+    /// own key and is not counted: it is what the room it waits on goes to
+    /// in turn, not what a rung walk gives room back for.
+    #[must_use]
+    pub fn demand_waits(&self) -> bool {
+        self.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.is_unmet()
+                    && !matches!(
+                        waiter.kind,
+                        super::wait::WaitKind::Allocation { rise: true, .. }
+                    )
+            })
+        })
     }
 
     pub fn pages_freed(self: &Arc<Self>) {

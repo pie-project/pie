@@ -334,13 +334,20 @@ async fn acquire_grant<C: FireContext>(
     demand: crate::planner::Demand,
     windowed: bool,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
-    if demand.is_zero() {
-        return Ok(Some(crate::planner::AllocationGrant::empty()));
-    }
     let pid = ctx.process_id();
     let Some(planner) = crate::planner::planner_of(pid) else {
+        if demand.is_zero() {
+            return Ok(Some(crate::planner::AllocationGrant::empty()));
+        }
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
+    // Even an empty grant is the planner's: a process that is not resident
+    // gets none, and its fire waits for its restore.
+    if demand.is_zero()
+        && let Some(grant) = planner.grant_now(pid, demand)
+    {
+        return Ok(Some(grant));
+    }
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
             planner.note_peak(pid, demand);
@@ -868,62 +875,66 @@ const RUNG_WANT_FROM: usize = 16;
 /// once the raise lands.
 const PIECES_AHEAD: usize = 2;
 
-/// A pass's ask for the activation rung funded as a planner waiter: the
-/// room the raise lacks is asked of the planner under the pass's process,
-/// so it is freed as any waiter's pages are (idle cache, processes moved to
-/// the host, the policy's victims); once granted the room is given back and
-/// the rung raised. Runs beside the pass, which keeps firing at the rung it
-/// has, until the raise lands, the pass is through (dropped) or the planner
-/// refuses (`failed`).
+/// A pass's ask for the activation rung, raised from free room: where the
+/// raise lacks chunks that kv holds (the span a lowered rung lent among
+/// them), it asks no planner, since a rise funded as a kv demand would wait
+/// among the waiters it starves, or ahead of them; it says it waits for
+/// room ([`RaiseFunding::waits_for_room`]), the pass fires at the rung held,
+/// and the rise is taken once the pool gives room back (its room signal,
+/// [`crate::store::slots::SlotPool::room_watch`]). Runs beside the pass
+/// until the raise lands or the pass is through (dropped). A piece that
+/// cannot fire narrower asks for its rise itself ([`RungAsk::wait`]).
 struct RaiseFunding {
     stop: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
-    failed: Arc<Mutex<Option<String>>>,
+    /// The rise is short of free room: the pass fires at the rung held.
+    short: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RaiseFunding {
-    fn start(
-        shared: crate::store::shared::Shared,
-        engine: usize,
-        pid: uuid::Uuid,
-        quorum: uuid::Uuid,
-        rows: u32,
-        epoch_now: impl Fn() -> u64 + Send + Sync + 'static,
-    ) -> Self {
+    fn start(shared: crate::store::shared::Shared, engine: usize, rows: u32) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let failed = Arc::new(Mutex::new(None));
+        let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let funding = Self {
             stop: stop.clone(),
             stopped: stopped.clone(),
-            failed: failed.clone(),
+            short: short.clone(),
         };
         crate::rt::spawn(async move {
-            let Some(planner) = crate::planner::planner_of(pid) else {
-                tracing::debug!(%pid, "a raise's funding finds no planner");
-                return;
-            };
             let target = crate::store::shared::cap_for(&shared, rows);
+            let says = |waits: bool| {
+                if short.swap(waits, std::sync::atomic::Ordering::AcqRel) != waits {
+                    // The pass reads it at its next cut.
+                    crate::store::shared::rung_changed(engine);
+                }
+            };
             // A step with nothing to do waits on the rung's next change (a
-            // raise, a copy, the cap, room freed), armed at its top, or the
-            // stop.
+            // raise, a copy, the cap), on room given back where the rise is
+            // short of it, or on the stop; each armed before it looks.
             while !stopped.load(std::sync::atomic::Ordering::Acquire) {
                 let watch = crate::store::shared::rung_watch(engine);
                 tokio::pin!(watch);
                 watch.as_mut().enable();
+                let room = shared.lock().unwrap().pool().room_watch();
                 crate::store::shared::raise_now(&shared, engine, rows);
                 if crate::store::shared::fire_cap(engine) >= target {
+                    says(false);
                     return;
                 }
                 // Quoted at the rung the raise is taken at: the one the
                 // engine holds where that is wider
                 // (`SharedPool::raise_at`).
-                let pages = {
+                let quote = {
                     let pool = shared.lock().unwrap();
                     let goal = pool.rung_for(rows);
-                    pool.raise_at(goal).map(|at| pool.raise_short(at).1)
+                    pool.raise_at(goal).map(|at| {
+                        let (chunks, _) = pool.raise_short(at);
+                        let spc = pool.list().map_or(1, |list| list.slots_per_chunk.max(1));
+                        (chunks, pool.pool().held_in_span(at).saturating_mul(spc))
+                    })
                 };
-                let Some(pages) = pages else {
+                let Some((chunks, held)) = quote else {
                     // The engine holds a rung the guest terms no longer
                     // fit: the walk brings it down first, and tells the
                     // rung.
@@ -934,104 +945,46 @@ impl RaiseFunding {
                     }
                     continue;
                 };
-                if pages == 0 {
+                if chunks == 0 {
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it, and
                     // tells the rung.
+                    says(false);
                     tokio::select! {
                         () = &mut watch => {}
                         () = stop.notified() => return,
                     }
                     continue;
                 }
-                let demand = crate::planner::Demand {
-                    kv_pages: pages,
-                    rs: crate::store::rs::RsUnits::default(),
-                };
-                tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
-                let asked = tokio::select! {
-                    asked = planner.acquire(pid, quorum, demand) => asked,
+                // Short of free room: the chunks the rise lacks are kv's.
+                // The pass fires at the rung held, and the rise is asked
+                // again only once the pool gives room back.
+                if !short.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::debug!(
+                        engine,
+                        rows,
+                        chunks,
+                        held,
+                        "a rise waits for room: {held} pages held by kv"
+                    );
+                }
+                says(true);
+                crate::store::shared::ask_walk(engine);
+                tokio::select! {
+                    () = room.given() => {}
+                    () = &mut watch => {}
                     () = stop.notified() => return,
-                };
-                match asked {
-                    Ok(crate::planner::Acquired::Granted(grant)) => {
-                        // The room is given back and the rung takes it at
-                        // once, the state in its span moved down first,
-                        // before the pass's own pieces open it again.
-                        // Given back first: its pages go back through the
-                        // pool's own lock.
-                        drop(grant);
-                        let mover = crate::store::shared::programs::LaneMover {
-                            engine,
-                            epoch_now: &epoch_now,
-                        };
-                        let taken = crate::store::shared::programs::take_raise(
-                            &shared,
-                            |pool| pool.rung_for(rows),
-                            &mover,
-                        )
-                        .await;
-                        if let Err(error) = taken {
-                            tracing::error!(engine, %error, "a raise's copy was refused");
-                            *failed.lock().unwrap() = Some(error);
-                            crate::store::shared::rung_changed(engine);
-                            return;
-                        }
-                        crate::store::shared::raise_now(&shared, engine, rows);
-                    }
-                    Ok(crate::planner::Acquired::Requote) => {
-                        tracing::debug!(engine, "a raise's room is quoted again");
-                    }
-                    Ok(crate::planner::Acquired::Yield) => {
-                        tracing::debug!(engine, "a raise's process yields");
-                        tokio::select! {
-                            _ = planner.wait_resident(pid) => {}
-                            () = stop.notified() => return,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(engine, %error, "a raise's room is refused");
-                        *failed.lock().unwrap() = Some(error.to_string());
-                        crate::store::shared::rung_changed(engine);
-                        return;
-                    }
                 }
             }
         });
         funding
     }
 
-    fn failed(&self) -> Option<String> {
-        self.failed.lock().unwrap().clone()
+    /// Whether the rise is short of free room: the pass fires at the rung
+    /// held until room is given back.
+    fn waits_for_room(&self) -> bool {
+        self.short.load(std::sync::atomic::Ordering::Acquire)
     }
-}
-
-/// Waits until fires on `engine` may take `width` rows, while `failed`
-/// (the pass's raise funding) has not said the room was refused; at once
-/// where nothing funds a raise (no shared pool: the cap never moves).
-async fn wait_for_rung(
-    engine: usize,
-    width: u32,
-    failed: Option<impl Fn() -> Option<String>>,
-) -> Result<(), String> {
-    let Some(failed) = failed else {
-        return Ok(());
-    };
-    // The cap moving and the funding failing both tell the rung.
-    let mut refused = None;
-    crate::store::shared::rung_wait_until(engine, || {
-        refused = failed();
-        refused.is_some() || crate::store::shared::fire_cap(engine) >= width
-    })
-    .await;
-    if crate::store::shared::fire_cap(engine) >= width {
-        return Ok(());
-    }
-    Err(format!(
-        "pipeline: a fire of {width} rows needs a wider activation rung, and its room was \
-         refused: {}",
-        refused.unwrap_or_default()
-    ))
 }
 
 /// A pass's ask of the activation rung, the one rule for every fire the
@@ -1049,18 +1002,23 @@ async fn wait_for_rung(
 struct RungAsk {
     engine: usize,
     pid: uuid::Uuid,
+    quorum: uuid::Uuid,
+    /// The pool whose rung it asks, and the stores' kv, whose fire epoch a
+    /// rise's copy is carried at.
+    shared: Option<crate::store::shared::Shared>,
+    kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
     /// Held (the walker cuts nothing under it) until dropped.
     want: crate::store::shared::RungWant,
-    /// The room the rung lacks for it, asked of the planner beside the
-    /// pass; `None` where fires may take the rows now.
+    /// The raise the rung lacks for it, taken beside the pass from free
+    /// room; `None` where fires may take the rows now.
     funding: Option<RaiseFunding>,
 }
 
 /// Asks the rung on `engine` for the `rows` a fire of a pass of `own` rows
 /// takes ([`RungAsk`]; `None`: a lone row the cap covers): the rung is
 /// raised at once where nothing moves, a cap the walker lowered behind a
-/// rung still up is lifted back, and what the raise lacks is funded under
-/// the pass's process.
+/// rung still up is lifted back, and what the raise lacks is waited for
+/// beside the pass ([`RaiseFunding`]).
 fn ask_rung(
     stores: &crate::store::registry::Stores,
     engine: usize,
@@ -1078,20 +1036,15 @@ fn ask_rung(
     let want = crate::store::shared::want_rows(engine, rows);
     let funding = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
-        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
-            || {
-                let kv = stores.kv.clone();
-                RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
-                    crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
-                        kv.current_epoch()
-                    })
-                })
-            },
-        )
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
+            .then(|| RaiseFunding::start(shared.clone(), engine, rows))
     });
     Some(RungAsk {
         engine,
         pid,
+        quorum,
+        shared: stores.shared.clone(),
+        kv: stores.kv.clone(),
         want,
         funding,
     })
@@ -1099,27 +1052,62 @@ fn ask_rung(
 
 impl RungAsk {
     /// Returns once fires may take `width` rows, or with what the planner
-    /// refused the raise: a fire wider than the rung waits for the raise
-    /// its pass funds, never on a rung that does not come.
+    /// refused the rise. A piece of the held width returns at once; one
+    /// wider cannot fire narrower (no cut brings it under the rung held),
+    /// so its rise is asked as a keyed demand of its process, as a
+    /// program's fire term is ([`crate::store::shared::programs::fund_span`]),
+    /// served in key order; never on a rung that does not come.
     async fn wait(&self, width: u32) -> Result<(), String> {
+        let engine = self.engine;
+        let (Some(shared), Some(_)) = (self.shared.as_ref(), self.funding.as_ref()) else {
+            // Nothing funds a raise (no shared pool): the cap never moves.
+            return Ok(());
+        };
+        if crate::store::shared::fire_cap(engine) >= width {
+            return Ok(());
+        }
         // Until the raise, the process submits nothing: no frame waits on
         // its lanes (the frame's firing frees what the raise is funded
         // with; the frame is not what funds it).
-        if crate::store::shared::fire_cap(self.engine) < width {
-            crate::scheduler::worker::notify_owner_waits(self.engine, self.pid);
-        }
-        crate::inferlet::process::said(
-            "enqueue: the activation rung",
-            self.pid,
-            wait_for_rung(
-                self.engine,
-                width,
-                self.funding
-                    .as_ref()
-                    .map(|funding| move || funding.failed()),
-            ),
-        )
+        crate::scheduler::worker::notify_owner_waits(engine, self.pid);
+        let funder = crate::store::shared::programs::Planner {
+            pid: self.pid,
+            quorum: self.quorum,
+        };
+        let kv = self.kv.clone();
+        let epoch_now =
+            move || crate::store::registry::with_kv_lock(&kv, "rung-rise", |kv| kv.current_epoch());
+        let mover = crate::store::shared::programs::LaneMover {
+            engine,
+            epoch_now: &epoch_now,
+        };
+        crate::inferlet::process::said("enqueue: the activation rung", self.pid, async {
+            loop {
+                let watch = crate::store::shared::rung_watch(engine);
+                tokio::pin!(watch);
+                watch.as_mut().enable();
+                if crate::store::shared::fire_cap(engine) >= width {
+                    return Ok(());
+                }
+                crate::store::shared::programs::fund_span(shared, || width, &funder, &mover)
+                    .await?;
+                crate::store::shared::raise_now(shared, engine, width);
+                if crate::store::shared::fire_cap(engine) >= width {
+                    return Ok(());
+                }
+                watch.await;
+            }
+        })
         .await
+    }
+
+    /// Whether the rise is short of free room, so the pass fires at the rung
+    /// held: read before each piece is cut and submitted, never learnt by
+    /// a wide fire refused.
+    fn fires_at_held_rung(&self) -> bool {
+        self.funding
+            .as_ref()
+            .is_some_and(RaiseFunding::waits_for_room)
     }
 
     /// The ask stands until `last`, the pass's last fire, settles; its
@@ -1434,6 +1422,71 @@ pub(crate) fn checkpoint_rows(
 
 static SEALED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What a keyed pass claimed to compute, and the rows it computes: passes
+/// whose first pages it claimed wait for its fires to land. Landed whole,
+/// the rows it froze seal there and then, and the waiters map them in;
+/// otherwise (failed, refused, dropped) the claims go unsealed, and a waiter
+/// computes the pages itself. Never waits on anything: it runs where the
+/// pass's last fire resolves, or goes as the pass does.
+struct SealOnLanding {
+    claims: crate::pipeline::coalesce::ClaimGuard,
+    stores: crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    start: u64,
+    slots: Vec<crate::store::kv::hash::Hash256>,
+    page_size: u32,
+    failure: PipelineFailure,
+}
+
+impl SealOnLanding {
+    /// Seals once every one of the pass's `fires` has settled, whatever
+    /// order they land in, if each landed; a hook never run (its fire gone
+    /// unresolved, or the runtime with it) counts as not landed, or drops
+    /// the claims as the last hook goes.
+    fn on_landing(self, fires: &[crate::engine::WorkItemCompletion]) {
+        struct Countdown {
+            left: std::sync::atomic::AtomicUsize,
+            whole: std::sync::atomic::AtomicBool,
+            sealing: Mutex<Option<SealOnLanding>>,
+        }
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let countdown = Arc::new(Countdown {
+            left: std::sync::atomic::AtomicUsize::new(fires.len()),
+            whole: std::sync::atomic::AtomicBool::new(true),
+            sealing: Mutex::new(Some(self)),
+        });
+        for fire in fires {
+            let countdown = Arc::clone(&countdown);
+            fire.on_settled_landed(move |landed| {
+                if !landed {
+                    countdown.whole.store(false, Release);
+                }
+                if countdown.left.fetch_sub(1, AcqRel) == 1
+                    && let Some(sealing) = countdown.sealing.lock().unwrap().take()
+                {
+                    sealing.landed(countdown.whole.load(Acquire));
+                }
+            });
+        }
+    }
+
+    fn landed(self, landed: bool) {
+        if landed && pipeline_failed(&self.failure).is_none() {
+            let sealed =
+                crate::store::registry::with_kv_lock(&self.stores.kv, "host-other", |kv| {
+                    kv.seal_landed(self.ws, self.start, &self.slots, self.page_size)
+                });
+            match sealed {
+                Ok(pages) => {
+                    SEALED_PAGES.fetch_add(u64::from(pages), std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => tracing::debug!(%error, "kv supply: sealing what a pass landed"),
+            }
+        }
+        drop(self.claims);
+    }
+}
+
 struct SupplyCounts {
     passes: std::sync::atomic::AtomicU64,
     tokens: std::sync::atomic::AtomicU64,
@@ -1503,6 +1556,20 @@ fn supply(
                 kv.log_rows(ws, held, tokens_of(held / page + mapped))?;
                 mapped
             }
+            Attach::Kv if !run.is_empty() => {
+                tracing::debug!(
+                    target: "pie::kv",
+                    found = run.len(),
+                    held,
+                    why = if kv.keeps() {
+                        "the set's rows end inside a page or past what it maps"
+                    } else {
+                        "the store keeps nothing"
+                    },
+                    "attach: found pages not mapped"
+                );
+                0
+            }
             _ => 0,
         };
         Ok::<_, crate::store::kv::KvStoreError>(Some((run, keys, mapped, clean)))
@@ -1537,7 +1604,8 @@ fn supply(
         }
     }
     let total = held + rows;
-    let found = (run.len() as u64 * page).min(total - 1);
+    // As far as it could map: whole pages short of the last row's.
+    let found = (run.len() as u64).min(limit) * page;
     let mapped_rows = mapped * page;
     let passes = SUPPLIED.passes.fetch_add(1, Relaxed) + 1;
     let tokens = SUPPLIED.tokens.fetch_add(total, Relaxed) + total;
@@ -1614,8 +1682,10 @@ async fn promote<C: FireContext>(
     };
     let mut guard = PromoteGuard {
         stores: stores.clone(),
+        engine,
         txn: Some(txn),
         in_flight: Vec::new(),
+        submitted: false,
     };
     let (kind, plans) = guard.txn.as_ref().map_or_else(
         || (crate::scheduler::TierKind::Kv, Vec::new()),
@@ -1637,6 +1707,7 @@ async fn promote<C: FireContext>(
         };
         let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
             .map_err(|error| format!("{error:#}"))?;
+        guard.submitted = true;
         guard.in_flight.push(completion.clone());
         completion.wait().await.map_err(|error| error.to_string())?;
     }
@@ -1654,11 +1725,14 @@ async fn promote<C: FireContext>(
 }
 
 /// Dropped before it commits, it gives back what it took once any copy it
-/// started has landed.
+/// started has landed: written its destinations, not only settled.
 struct PromoteGuard {
     stores: crate::store::registry::Stores,
+    engine: usize,
     txn: Option<crate::store::kv::KvResidencyTxn>,
     in_flight: Vec<crate::scheduler::ControlCompletion>,
+    /// A copy of the promote was handed to the engine.
+    submitted: bool,
 }
 
 impl Drop for PromoteGuard {
@@ -1676,15 +1750,30 @@ impl Drop for PromoteGuard {
                 planner.pages_freed();
             }
         };
-        if in_flight.is_empty() || !crate::rt::has_runtime() {
+        if !self.submitted {
             abort();
             return;
         }
+        if !crate::rt::has_runtime() {
+            tracing::error!(
+                "a promote dropped with a copy handed to the engine and no runtime; \
+                 preserving its pages to avoid reuse under the copy"
+            );
+            return;
+        }
+        let engine = self.engine;
         crate::rt::spawn(async move {
-            for completion in in_flight {
-                let _ = completion.wait().await;
+            let settled = crate::scheduler::settle_copies(engine);
+            if let Err(error) =
+                crate::scheduler::abort_once_landed(in_flight, settled, abort).await
+            {
+                tracing::error!(
+                    engine,
+                    %error,
+                    "a promote's copies did not settle; preserving its pages to avoid reuse \
+                     under a copy"
+                );
             }
-            abort();
         });
     }
 }
@@ -2850,6 +2939,32 @@ fn working_set_flat_table(
     .map_err(|error| format!("pipeline: KV page translation: {error}"))
 }
 
+/// The slots lane `lane`'s rows may land at where the device places them,
+/// on a set frozen through `folded` that reserved through `reserved`: past
+/// its frozen prefix, inside what `reserve` granted. The engine is handed
+/// the set's whole page table to read through, and refuses a row its
+/// program places outside these ([`::engine::KvDelta::writable`]).
+fn device_writable(
+    lane: usize,
+    folded: u32,
+    reserved: u32,
+) -> Result<std::ops::Range<u32>, String> {
+    if reserved <= folded {
+        return Err(format!(
+            "pipeline: lane {lane}'s rows land where the device says, inside what \
+             `reserve` granted; its working set reserved {reserved} slot(s) and froze \
+             {folded}. Reserve the slots it may write"
+        ));
+    }
+    Ok(folded..reserved)
+}
+
+/// The pages under `writable`, which the fire makes its set's own (copied
+/// where shared) before it runs.
+fn writable_pages(writable: &std::ops::Range<u32>, page: u64) -> std::ops::Range<u64> {
+    u64::from(writable.start) / page..u64::from(writable.end).div_ceil(page)
+}
+
 fn stamp_lane_translation(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -3064,6 +3179,9 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
             folded_exact,
             tail: now.tail,
             shared: lanes.iter().filter(|&&other| other == rep).count() > 1,
+            readable: now.readable(),
+            readable_known: now.readable_known(),
+            set: kv.get(lane).map_or(0, |ws| set_token(ws.id)),
             spans: now.spans,
         });
         cursors.push(cursor);
@@ -3076,6 +3194,12 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
 }
 
 type CursorCell = std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
+
+/// The token a working set's lanes name it by to the engine
+/// ([`::engine::KvDelta::set`]): never 0, which names no set.
+fn set_token(ws: crate::store::kv::page_table::WorkingSetId) -> u64 {
+    ws.to_bits().wrapping_add(1)
+}
 
 /// A fire on its way moves its working set's cursor, as soon as it is
 /// submitted: a pass that stops short leaves the cursor at the fires that
@@ -3097,6 +3221,24 @@ fn advance_cursor(
     if let Some((start, spans)) = spans {
         cursor.rewrite(start, spans);
     }
+}
+
+/// A fire just submitted lands host-placed rows `start..end` on the set:
+/// a fire staged after it reads them. Should it fail, they may never have
+/// landed, and nothing from `start` on counts as written.
+fn host_wrote(
+    cell: &CursorCell,
+    fire: &crate::engine::completion::WorkItemCompletion,
+    start: u32,
+    end: u32,
+) {
+    cell.lock().unwrap().wrote(end);
+    let cell = std::sync::Arc::downgrade(cell);
+    fire.on_settled_landed(move |ok| {
+        if let (false, Some(cell)) = (ok, cell.upgrade()) {
+            cell.lock().unwrap().unwrote(start);
+        }
+    });
 }
 
 /// The lags of the media runs `lanes` carry that start in `slots`.
@@ -3864,15 +4006,32 @@ pub async fn submit_pass_stamped<C: FireContext>(
             crate::policy::report(crate::policy::Event::Cached(pid, u64::from(supplied)));
         }
         if supplied > 0 {
-            // What was mapped in is skipped: the pass runs from there.
+            // What was mapped in is skipped: the pass runs from there. The
+            // rows mapped in are the set's to read: a prefix it shares.
+            let mapped = full.lanes[0].kv.held.saturating_add(supplied);
+            pass_lanes.cursors[0].lock().unwrap().wrote(mapped);
             let rows = u32::try_from(full.lanes[0].tokens.len()).unwrap_or(u32::MAX);
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
+            for lane in &mut full.lanes {
+                lane.kv.readable = lane.kv.readable.max(mapped);
+            }
             stamp_lane_words(&mut full, &switched, &lanes_of, false, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
         }
         // Where the pass keeps its state: the checkpoint rows it reaches,
         // floored to whole pages it keys, each the end of a fire of its own.
         let held = u64::from(full.lanes[0].kv.held);
+        // The rows it computes from here, sealed for its claims' waiters
+        // once its fires land.
+        let mut sealing = coalesced.take().map(|claims| SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: ws.id,
+            start: held,
+            slots: pass_slots.clone().unwrap_or_default(),
+            page_size,
+            failure: pipeline_failure.clone(),
+        });
         let reach = held + full.lanes[0].tokens.len() as u64;
         // A model whose only state beside its kv is window lists keeps one at
         // the pass's last page boundary unasked: the refs to its lists' last slots are all a
@@ -4059,7 +4218,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 // the raised rung once it lands.
                 // A framed piece waits only on a frame already whole.
                 let ahead = PIECES_AHEAD.max(frame_size);
-                if at >= ahead && wanted > cut_at {
+                // A rise short of free room lands only once kv gives room
+                // back: the pass fires at the rung held, and holds back no
+                // piece for it.
+                let held = rung_ask.as_ref().is_some_and(RungAsk::fires_at_held_rung);
+                if at >= ahead && wanted > cut_at && !held {
                     let behind = submitted[at - ahead].clone();
                     // The piece behind settling or the cap rising, each its
                     // own event.
@@ -4450,6 +4613,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                         lagging_spans(&landings, &matched, lanes, &(start..slots.end)),
                     )),
                 );
+                host_wrote(cell, &completion, start as u32, slots.end as u32);
             }
             unqueued.queue(
                 &pipe_fires,
@@ -4476,9 +4640,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             ask.until_settled(last);
         }
         // The claims on what this pass computes stand until its last piece
-        // settles (its pages sealed); a pass that ends early drops them.
-        if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
-            last.on_settled(move || drop(guard));
+        // settles, its pages sealed if it landed; a pass that ends early
+        // drops them.
+        if let Some(sealing) = sealing.take()
+            && !submitted.is_empty()
+        {
+            sealing.on_landing(&submitted);
         }
         // A set no piece wrote (its lanes carry no rows) ends where they land.
         for (group, (_, lanes)) in groups.iter().enumerate() {
@@ -4490,6 +4657,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let (Some(end), Some(start)) = (end, start) {
                 let cell = &pass_lanes.cursors[lanes[0]];
                 advance_cursor(cell, Some(end), Some((start, Vec::new())));
+                if let Some(last) = submitted.last() {
+                    host_wrote(cell, last, start, end);
+                }
             }
         }
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -5267,6 +5437,7 @@ async fn fire_device_geometry<C: FireContext>(
         .iter()
         .any(|binding| binding.port == Port::Positions);
     let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
+    let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
     for (_, lanes) in &groups {
         let lane = lanes[0];
         let place = &pass_lanes.places[lane];
@@ -5278,17 +5449,12 @@ async fn fire_device_geometry<C: FireContext>(
             )));
         }
         let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
-        if reserved <= place.folded {
-            return Ok(Err(format!(
-                "pipeline: lane {lane}'s rows land where the device says, inside what \
-                 `reserve` granted; its working set reserved {reserved} slot(s) and froze \
-                 {}. Reserve the slots it may write",
-                place.folded
-            )));
-        }
-        let first = u64::from(place.folded) / page;
-        let end = u64::from(reserved).div_ceil(page);
-        write_indexes.push((first..end).collect());
+        let writable = match device_writable(lane, place.folded, reserved) {
+            Ok(writable) => writable,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        write_indexes.push(writable_pages(&writable, page).collect());
+        write_ends.push(writable.end);
     }
 
     let split = ctx
@@ -5572,6 +5738,12 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
+    // The device places the rows, so their engine holds each lane to what
+    // its set wrote ([`::engine::extent`]), from where the host knows it.
+    for (lane, place) in req.lanes.iter_mut().zip(&pass_lanes.places) {
+        lane.kv.readable = place.readable;
+        lane.kv.set = place.set;
+    }
     req.geometry = GeometryClass::DeviceGeometry;
     tracing::debug!(
         geometry = ?req.geometry,
@@ -5589,7 +5761,7 @@ async fn fire_device_geometry<C: FireContext>(
     let plain_decode =
         !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
-    for (((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated) in
+    for ((((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated), &end) in
         group_sets
             .iter()
             .zip(logged)
@@ -5597,11 +5769,15 @@ async fn fire_device_geometry<C: FireContext>(
             .zip(kvtxns)
             .zip(&groups)
             .zip(&stated)
+            .zip(&write_ends)
     {
-        // Each lane's mask speaks of the slots from the set's boundary on.
+        // Each lane's mask speaks of the slots from the set's boundary on,
+        // and its rows land between it and what `reserve` granted: the
+        // slots of the pages the fire made the set's own.
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.kv.folded = u32::try_from(boundary).unwrap_or(u32::MAX);
+                lane.kv.write_end = end;
             }
         }
         let mut tags = Vec::new();
@@ -5892,13 +6068,6 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
-    /// Yields until `task` has run as far as it can without an event.
-    async fn settle_tasks() {
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// A stale grant is quoted again on drift (the demand changed), not by
     /// count, and refused when stale against the demand it was quoted for.
     #[test]
@@ -5924,44 +6093,6 @@ pub(crate) mod lifecycle_tests {
             !requote_on_drift(&mut stale_at, demand(7)),
             "stale against the demand it was quoted for: refused"
         );
-    }
-
-    /// A piece waiting for a wider rung wakes when the cap is lifted, not
-    /// on a clock.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_piece_waiting_on_the_rung_wakes_when_the_cap_lifts() {
-        const ENGINE: usize = 40;
-        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
-        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(|| None)));
-        settle_tasks().await;
-        assert!(!waiting.is_finished(), "cut to 16, it waits");
-        crate::store::shared::set_fire_cap_for_test(ENGINE, 256);
-        settle_tasks().await;
-        assert!(waiting.is_finished(), "the cap lifted: it runs");
-        assert!(waiting.await.unwrap().is_ok());
-        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
-    }
-
-    /// A piece waiting for a wider rung wakes when its raise's funding is
-    /// refused, and says so.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_piece_waiting_on_the_rung_wakes_when_its_funding_is_refused() {
-        const ENGINE: usize = 41;
-        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
-        let refused = Arc::new(Mutex::new(None::<String>));
-        let failed = {
-            let refused = refused.clone();
-            move || refused.lock().unwrap().clone()
-        };
-        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(failed)));
-        settle_tasks().await;
-        assert!(!waiting.is_finished());
-        *refused.lock().unwrap() = Some("no room".into());
-        crate::store::shared::rung_changed(ENGINE);
-        settle_tasks().await;
-        assert!(waiting.is_finished(), "the refusal told the rung: it ends");
-        assert!(waiting.await.unwrap().unwrap_err().contains("no room"));
-        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
     }
 
     pub(crate) fn pending_fire_fixture(
@@ -6437,63 +6568,11 @@ mod static_admission_tests {
 }
 
 /// A piece wider than the rung never waits on a rung that does not come:
-/// it fires once the raise lands, and fails with what the planner said once
-/// the raise's room is refused.
+/// one of the held width fires at once, one wider asks its rise as a keyed
+/// demand, and a pass whose rise is short of free room fires at the rung
+/// held until room is given back.
 #[cfg(test)]
 mod rung_wait_tests {
-    use super::wait_for_rung;
-    use std::sync::{Arc, Mutex};
-
-    /// Engines no other test drives, so the caps set here are theirs alone.
-    const RAISED: usize = 61;
-    const REFUSED: usize = 62;
-    const UNFUNDED: usize = 63;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_wide_piece_fires_once_the_raise_lands() {
-        crate::store::shared::set_fire_cap_for_test(RAISED, 256);
-        let raise = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            crate::store::shared::set_fire_cap_for_test(RAISED, u32::MAX);
-        });
-        let waited = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wait_for_rung(RAISED, 1600, Some(|| None)),
-        )
-        .await;
-        assert_eq!(waited, Ok(Ok(())));
-        raise.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_wide_piece_fails_once_its_room_is_refused() {
-        crate::store::shared::set_fire_cap_for_test(REFUSED, 256);
-        let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let says = refused.clone();
-        let refuse = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            *says.lock().unwrap() = Some("the device is short".into());
-            // As a raise's funding tells the rung when it fails.
-            crate::store::shared::rung_changed(REFUSED);
-        });
-        let waited = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wait_for_rung(REFUSED, 1600, Some(|| refused.lock().unwrap().clone())),
-        )
-        .await
-        .expect("no indefinite wait");
-        assert!(waited.unwrap_err().contains("the device is short"));
-        refuse.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_piece_nothing_funds_does_not_wait() {
-        crate::store::shared::set_fire_cap_for_test(UNFUNDED, 256);
-        let unfunded: Option<fn() -> Option<String>> = None;
-        assert_eq!(wait_for_rung(UNFUNDED, 1600, unfunded).await, Ok(()));
-        assert_eq!(wait_for_rung(UNFUNDED, 200, Some(|| None)).await, Ok(()));
-    }
-
     /// The MTP k=4 stall: a device-carried decode's fires of two rows sat
     /// queued behind a rung the walker had lowered to one row, since the
     /// scheduler's lane count asks one row a lane and nothing asked for
@@ -6563,10 +6642,10 @@ mod rung_wait_tests {
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
         ask.until_settled(&fire);
 
-        // The pool idles past the walker's patience with the fire queued:
-        // fires are cut to what is asked, never under the staged fire.
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        // A waiter is short of a slot with the fire queued: fires are cut
+        // to what is asked, never under the staged fire.
+        shared.lock().unwrap().pool_mut().wait(1, 0, 1);
+        for _ in 0..6 {
             grow.walk_rung().await;
             assert!(
                 crate::store::shared::fire_cap(ENGINE) >= 2,
@@ -6587,11 +6666,147 @@ mod rung_wait_tests {
         tokio::task::yield_now().await;
         assert!(fire.is_settled());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        for _ in 0..6 {
             grow.walk_rung().await;
         }
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+    }
+
+    /// The 500-concurrent wedge (MI300X, Qwen3-0.6B, an empty host tier):
+    /// the walk lowered the rung to one row and the span it lent filled
+    /// with kv, admitted against a device total that counted the lent
+    /// chunks as kv's; a wide pass then asked the rung back, and its raise
+    /// waited in the planner's queue as a kv demand among the waiters it
+    /// would starve, with nothing left to discard. The total counts no
+    /// lent chunk now, and a rise short of free room asks no planner: the
+    /// pass fires at the rung held, decided before it is submitted, and
+    /// the rung rises on the pool's room signal once kv gives chunks back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rise_short_of_lent_room_fires_at_the_held_rung_and_rises_once_kv_frees() {
+        const ENGINE: usize = 71;
+        // 16 chunks, the null chunk, the largest rung's activation 8 (8..16),
+        // the smallest's 2 (14..16): a lowered rung lends 8..14.
+        let stores = super::unfolded_tests::pool_with_rungs(vec![(1, 2), (512, 8)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        let pid = uuid::Uuid::new_v4();
+        let list = {
+            let mut pool = shared.lock().unwrap();
+            pool.steers(ENGINE);
+            pool.lower_rung(1).expect("nothing lies in the span");
+            pool.list().expect("a kv list").pool
+        };
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 1);
+
+        // One count of the kv pages, the lent chunks in none: what the
+        // facts state (16 chunks less the null one and the largest rung's
+        // 8, a page a chunk) is what the planner's total reports.
+        let room = shared.lock().unwrap().room();
+        assert_eq!(room.list_slots, 16 - 1 - 8, "{room:?}");
+        assert_eq!(room.lent_chunks, 6, "{room:?}");
+
+        // kv takes every free slot, the lent chunks among them.
+        let held = {
+            let mut pool = shared.lock().unwrap();
+            let free = pool.pool().available(list);
+            assert_eq!(free, 16 - 1 - 2, "a grant may use the lent chunks");
+            pool.take_refs(list, free).expect("free slots")
+        };
+
+        // A wide pass asks the rung back. The room is all kv's, so its
+        // rise waits for room, and the pass is cut at the rung held before
+        // anything is submitted: a piece of the held width fires at once.
+        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 512, 512).expect("a wide ask");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::store::shared::rung_wait_until(ENGINE, || ask.fires_at_held_rung()),
+        )
+        .await
+        .expect("the rise says it waits for room");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(1)).await,
+            Ok(Ok(())),
+            "a piece of the held width never waits on the rise"
+        );
+
+        // kv gives its chunks back: the rung rises on the room signal.
+        shared.lock().unwrap().give_refs(list, &held);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::store::shared::rung_wait_until(ENGINE, || {
+                crate::store::shared::fire_cap(ENGINE) >= 512
+            }),
+        )
+        .await
+        .expect("the rung rises once kv frees");
+        assert!(!ask.fires_at_held_rung());
+        drop(ask);
+    }
+
+    /// The stack wedge through the planner (MI300X, 500 at once): the rung
+    /// rose for a pass while nothing waited; a guest bind short of a run of
+    /// chunks then waits in the planner's queue. The walk comes down at once
+    /// to the live lane's rung, its give-back tells the planner, which
+    /// serves the bind from the span given back; the rung rises for the
+    /// pass again only once no process demand waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bind_waiting_in_the_planner_takes_the_span_back_and_the_rung_rises_after() {
+        const ENGINE: usize = 73;
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        // 16 chunks, the null chunk, the largest rung's activation 8, the
+        // smallest's 2: the pool starts at the largest.
+        let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        let list = shared.lock().unwrap().list().expect("a kv list").pool;
+        let planner = crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+            crate::planner::RegistryPool::new(model, 0, false),
+        ));
+        crate::planner::init_planner(model, ENGINE, planner);
+        let planner = crate::planner::planner_for(model, ENGINE).expect("installed");
+        let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
+            .with_live_lanes(|| 1);
+        // kv takes every chunk below the span; a pass asks the largest rung.
+        let _kv = {
+            let mut pool = shared.lock().unwrap();
+            let free = pool.pool().available(list);
+            pool.take_refs(list, free).expect("free slots")
+        };
+        let want = crate::store::shared::want_rows(ENGINE, 512);
+        grow.walk_rung().await;
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
+
+        // A bind short of a run of two chunks waits in the planner's queue.
+        let pid = uuid::Uuid::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let bind = {
+            let planner = planner.clone();
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 2, 1).await })
+        };
+        while !planner.demand_waits() {
+            tokio::task::yield_now().await;
+        }
+
+        // The walk comes down to the live lane's rung at once, past the
+        // pass's ask, and the planner serves the bind from the span.
+        grow.walk_rung().await;
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+        crate::store::shared::grant_rung(ENGINE, 1);
+        grow.walk_rung().await;
+        grow.walk_rung().await;
+        assert_eq!(shared.lock().unwrap().pool().act_reserved(), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), bind)
+            .await
+            .expect("the bind is served from the span given back")
+            .expect("its task ends")
+            .expect("served");
+        assert!(!planner.demand_waits());
+
+        // Nothing waits: the rung rises for the pass again.
+        grow.walk_rung().await;
+        assert_eq!(shared.lock().unwrap().rung(), 512);
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
+        drop(want);
     }
 }
 
@@ -6916,6 +7131,9 @@ pub(crate) mod fold_tests {
                         folded_exact: exact,
                         tail: now.tail,
                         shared: false,
+                        readable: now.readable(),
+                        readable_known: now.readable_known(),
+                        set: 1,
                         spans: now.spans,
                     }
                 })
@@ -7786,9 +8004,26 @@ pub(crate) mod fold_tests {
         Vec<crate::store::kv::hash::Hash256>,
         Vec<crate::store::kv::hash::Hash256>,
     ) {
+        let ws = stores.kv.lock().create_working_set();
+        let slots = written(stores, ws, tokens);
+        let mut kv = stores.kv.lock();
+        kv.seal_rows(ws, 0, &slots, 16).unwrap();
+        let keys = kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
+        let epoch = kv.current_epoch();
+        kv.release_working_set(ws, epoch);
+        kv.retire_idle();
+        (slots, keys)
+    }
+
+    /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass
+    /// whose fires have not landed yet; their rows' hashes.
+    fn written(
+        stores: &Stores,
+        ws: WorkingSetId,
+        tokens: &[u32],
+    ) -> Vec<crate::store::kv::hash::Hash256> {
         let mut kv = stores.kv.lock();
         kv.set_keeps(true);
-        let ws = kv.create_working_set();
         let pages = (tokens.len() as u64).div_ceil(16);
         kv.reserve(ws, pages).unwrap();
         let indexes: Vec<u64> = (0..pages).collect();
@@ -7805,13 +8040,238 @@ pub(crate) mod fold_tests {
             .collect();
         let seq = kv.publish_prepared(prepared, &commits).unwrap();
         kv.settle(seq);
+        kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap()
+    }
+
+    /// A keyed pass over `tokens` on a fresh set of `stores`: the set, and
+    /// its rows' hashes.
+    fn keyed_pass(
+        stores: &Stores,
+        tokens: &[u32],
+    ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
+        let mut kv = stores.kv.lock();
+        let ws = kv.create_working_set();
         let slots = kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap();
-        let keys = kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
-        kv.seal_rows(ws, 0, &slots, 16).unwrap();
-        let epoch = kv.current_epoch();
-        kv.release_working_set(ws, epoch);
-        kv.retire_idle();
-        (slots, keys)
+        (ws, slots)
+    }
+
+    /// Passes over `prompt(2..5)` that arrive while a first pass over
+    /// `prompt(1)` claims the pages they share, each waiting.
+    fn waiting_on(
+        stores: &Stores,
+        prompt: impl Fn(u32) -> Vec<u32>,
+    ) -> Vec<(
+        WorkingSetId,
+        Vec<u32>,
+        tokio::task::JoinHandle<Option<crate::pipeline::coalesce::ClaimGuard>>,
+    )> {
+        (2..5)
+            .map(|tail| {
+                let tokens = prompt(tail);
+                let (ws, slots) = keyed_pass(stores, &tokens);
+                let stores = stores.clone();
+                let waiting = tokio::spawn(async move {
+                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots).await
+                });
+                (ws, tokens, waiting)
+            })
+            .collect()
+    }
+
+    async fn settle_tasks() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Passes over one prompt that arrive while the first computes it wait
+    /// on its fires' landing, which seals what it froze: they map in all of
+    /// it, short only of their last row's page. One over another prompt
+    /// waits on nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn passes_of_one_prefix_map_what_the_first_lands() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let prompt = |tail: u32| -> Vec<u32> { (0..64).map(|t| 1300 + t).chain([tail]).collect() };
+        let (first, slots) = keyed_pass(&stores, &prompt(1));
+        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            .await
+            .expect("the first claims the pages it computes");
+        let waiters = waiting_on(&stores, prompt);
+        let other: Vec<u32> = (0..65).map(|t| 1500 + t).collect();
+        let (ws, other_slots) = keyed_pass(&stores, &other);
+        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots).await;
+        assert!(
+            own.is_some(),
+            "another prompt claims its own, waiting on nothing"
+        );
+        settle_tasks().await;
+        assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+        // The first's fires are written and frozen; then they land.
+        written(&stores, first, &prompt(1));
+        stores.kv.lock().freeze(first, 65).unwrap();
+        settle_tasks().await;
+        assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+        let sealing = SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: first,
+            start: 0,
+            slots,
+            page_size: 16,
+            failure: PipelineFailure::default(),
+        };
+        sealing.landed(true);
+        for (ws, tokens, waiting) in waiters {
+            assert!(waiting.await.unwrap().is_none(), "all sealed: none claimed");
+            let slots = stores
+                .kv
+                .lock()
+                .slot_hashes(ws, 0, &tokens, 16)
+                .unwrap()
+                .unwrap();
+            let supplied = supply(&stores, ws, &rows(0, &tokens), &slots, Attach::Kv, 65, 16);
+            assert_eq!(supplied.rows, 64, "all four sealed pages mapped in");
+        }
+    }
+
+    /// A pass cut into fires that land out of order (the last first) seals
+    /// once all of them have landed, and its waiters map it all in; one
+    /// whose fire failed seals nothing, however the others landed, and a
+    /// waiter computes the pages.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_whose_fires_land_out_of_order_seals_once_all_have() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        for (case, failed) in [(0u32, None), (1, Some(0usize))] {
+            let prompt = move |tail: u32| -> Vec<u32> {
+                (0..64)
+                    .map(|t| 2100 + case * 100 + t)
+                    .chain([tail])
+                    .collect()
+            };
+            let (first, slots) = keyed_pass(&stores, &prompt(1));
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+                .await
+                .unwrap();
+            let waiters = waiting_on(&stores, prompt);
+            written(&stores, first, &prompt(1));
+            stores.kv.lock().freeze(first, 65).unwrap();
+            let fires: Vec<_> = (0..3)
+                .map(|at| crate::engine::WorkItemCompletion::new(900 + at, 0))
+                .collect();
+            SealOnLanding {
+                claims,
+                stores: stores.clone(),
+                ws: first,
+                start: 0,
+                slots,
+                page_size: 16,
+                failure: PipelineFailure::default(),
+            }
+            .on_landing(&fires);
+            let cached = || {
+                let (probe, probe_slots) = keyed_pass(&stores, &prompt(9));
+                let keys = crate::store::kv::KvStore::fresh_page_keys(&probe_slots, 16);
+                let found = stores.kv.lock().cached_run(&keys).len();
+                stores.kv.lock().release_working_set(probe, 0);
+                found
+            };
+            for at in [2, 0] {
+                resolve_test_completion(&fires[at], failed == Some(at));
+                settle_tasks().await;
+                assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+                assert_eq!(cached(), 0, "case {case}: not all landed, nothing sealed");
+            }
+            resolve_test_completion(&fires[1], false);
+            settle_tasks().await;
+            if failed.is_none() {
+                for (ws, tokens, waiting) in waiters {
+                    assert!(waiting.await.unwrap().is_none());
+                    let slots = stores
+                        .kv
+                        .lock()
+                        .slot_hashes(ws, 0, &tokens, 16)
+                        .unwrap()
+                        .unwrap();
+                    let supplied =
+                        supply(&stores, ws, &rows(0, &tokens), &slots, Attach::Kv, 65, 16);
+                    assert_eq!(supplied.rows, 64, "all four sealed pages mapped in");
+                }
+            } else {
+                assert_eq!(cached(), 0, "a fire failed: nothing sealed");
+                let finished: Vec<_> = waiters
+                    .into_iter()
+                    .filter(|(_, _, waiting)| waiting.is_finished())
+                    .collect();
+                assert_eq!(finished.len(), 1, "one waiter claims the pages");
+                for (_, _, waiting) in finished {
+                    assert!(waiting.await.unwrap().is_some());
+                }
+            }
+        }
+    }
+
+    /// A pass that does not land what it claimed (it failed, was refused or
+    /// dropped), or landed it unfrozen, seals none of it and lets its
+    /// waiters go: one claims the pages and computes them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_on_a_pass_that_seals_nothing_compute_its_pages() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        for (case, landed, frozen) in [(0, false, 65), (1, true, 0), (2, true, 10)] {
+            let prompt = move |tail: u32| -> Vec<u32> {
+                (0..64)
+                    .map(|t| 1700 + case * 100 + t)
+                    .chain([tail])
+                    .collect()
+            };
+            let (first, slots) = keyed_pass(&stores, &prompt(1));
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+                .await
+                .unwrap();
+            let waiters = waiting_on(&stores, prompt);
+            written(&stores, first, &prompt(1));
+            stores.kv.lock().freeze(first, frozen).unwrap();
+            settle_tasks().await;
+            assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+            let sealing = SealOnLanding {
+                claims,
+                stores: stores.clone(),
+                ws: first,
+                start: 0,
+                slots,
+                page_size: 16,
+                failure: PipelineFailure::default(),
+            };
+            sealing.landed(landed);
+            // One claims the pages and the rest wait on it; here it seals
+            // nothing either, and the next goes on.
+            let (mut pending, mut computing) = (waiters, 0);
+            while !pending.is_empty() {
+                settle_tasks().await;
+                let (done, rest): (Vec<_>, Vec<_>) = pending
+                    .into_iter()
+                    .partition(|(_, _, waiting)| waiting.is_finished());
+                assert!(!done.is_empty(), "case {case}: a waiter goes on");
+                for (_, _, waiting) in done {
+                    computing += usize::from(waiting.await.unwrap().is_some());
+                }
+                pending = rest;
+            }
+            assert!(computing >= 1, "case {case}: a waiter computes the pages");
+            let (probe, probe_slots) = keyed_pass(&stores, &prompt(9));
+            let keys = crate::store::kv::KvStore::fresh_page_keys(&probe_slots, 16);
+            assert_eq!(
+                stores.kv.lock().cached_run(&keys).len(),
+                0,
+                "case {case}: nothing sealed"
+            );
+            stores.kv.lock().release_working_set(probe, 0);
+        }
     }
 
     /// A keyed pass of 64 rows whose first 48 the cache holds maps them in
@@ -9402,6 +9862,13 @@ mod unfolded_tests {
     /// That pool with activation rungs `act_chunks` (tokens, chunks), its
     /// span backed from the load: it starts at the largest.
     pub(super) fn pool_with_rungs(act_chunks: Vec<(u32, u32)>) -> crate::store::registry::Stores {
+        pool_with_rungs_of(act_chunks).1
+    }
+
+    /// [`pool_with_rungs`], with the model it is registered as.
+    pub(super) fn pool_with_rungs_of(
+        act_chunks: Vec<(u32, u32)>,
+    ) -> (usize, crate::store::registry::Stores) {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -9454,7 +9921,7 @@ mod unfolded_tests {
                 tiers: crate::store::shared::Tiers::default(),
             }],
         );
-        crate::store::registry::get(model, 0)
+        (model, crate::store::registry::get(model, 0))
     }
 
     fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
@@ -9513,6 +9980,11 @@ mod unfolded_tests {
                     tail: None,
                     shared: false,
                     spans: Vec::new(),
+                    // The device places the rows: its engine holds the lane
+                    // to what the set wrote.
+                    readable: 0,
+                    readable_known: false,
+                    set: 1,
                 }],
                 cursors: vec![Arc::new(Mutex::new(Cursor {
                     reserved: 14,
@@ -9660,6 +10132,11 @@ mod unfolded_tests {
                     tail: None,
                     shared: false,
                     spans: Vec::new(),
+                    // The device places the rows: its engine holds the lane
+                    // to what the set wrote.
+                    readable: 0,
+                    readable_known: false,
+                    set: 1,
                 }],
                 cursors: vec![cell],
                 kv: Vec::new(),
@@ -9744,5 +10221,43 @@ mod mask_cut_tests {
         // One behind what the lane states moves nothing.
         restate_boundary(&mut lane, 3);
         assert_eq!(lane.kv.folded, 14);
+    }
+}
+
+#[cfg(test)]
+mod writable_tests {
+    use super::*;
+
+    /// A lane whose rows the device places may write from its set's frozen
+    /// prefix to what it reserved, and the pages the fire makes its set's
+    /// own are the ones under those slots: none of the frozen pages below,
+    /// none of the mapped pages past.
+    #[test]
+    fn a_device_placed_lane_writes_only_the_pages_made_its_own() {
+        let writable = device_writable(2, 6, 13).expect("a set that reserved past its prefix");
+        assert_eq!(writable, 6..13);
+        assert_eq!(
+            writable_pages(&writable, 4),
+            1..4,
+            "the page holding slot 6 through 12"
+        );
+        let lane = ::engine::KvDelta {
+            folded: 6,
+            write_end: writable.end,
+            ..::engine::KvDelta::default()
+        };
+        assert_eq!(
+            ::engine::fire::misplaced_write(lane.writable(), &[6, 12]),
+            None
+        );
+        let below = ::engine::fire::misplaced_write(lane.writable(), &[6, 5]).expect("below");
+        assert!(below.contains("kv slot 5"), "{below}");
+        assert!(::engine::fire::misplaced_write(lane.writable(), &[13]).is_some());
+
+        let refused = device_writable(2, 8, 8).expect_err("nothing reserved past the prefix");
+        assert!(
+            refused.contains("lane 2") && refused.contains("froze 8"),
+            "{refused}"
+        );
     }
 }

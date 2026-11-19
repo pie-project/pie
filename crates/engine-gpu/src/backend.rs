@@ -42,6 +42,12 @@ pub trait Backend:
     /// The storage target a checkpoint lands for.
     const STORAGE: checkpoint::types::BackendKind;
 
+    /// Whether the state pool's segments commit and release while serving.
+    /// One that does not lays its whole pool at load and states it
+    /// `Growth::Fixed`: no `yield` applies to it, and the runtime never
+    /// moves it.
+    const RESIZES_POOL: bool = true;
+
     /// Whether a load lands the checkpoint's bytes in what it reserves.
     /// One that reserves nothing takes where each plane lies and which the
     /// checkpoint publishes from the load plan, and reads no byte.
@@ -219,7 +225,9 @@ pub trait Tactics: std::fmt::Debug {
 
     fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
 
-    /// The dense matmul tactic for a fire of `rows` activation rows.
+    /// The tiled dense matmul tactic at `rows` activation rows; whether a
+    /// rung takes the vector kernels instead is the load's choice
+    /// ([`crate::dense`]).
     fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
 
     /// Every dense matmul tactic some fire of 1 to `capacity` rows takes:

@@ -974,13 +974,27 @@ pub struct MemoryConfig {
     /// restart takes those pages back as cache. Off by default; cuda only,
     /// and not for a model with recurrent state or a window.
     pub disk_persistent: bool,
-    /// The share of its memory this process keeps each time the system
-    /// around it stays congested: `1.0` never yields (a dedicated machine),
-    /// `0.7` yields at once.
-    pub governor_backoff: f64,
-    /// Gives back, a little at a time, the memory demand stopped asking
-    /// for, whether or not anything else wants it.
-    pub governor_release_idle: bool,
+    /// How much of the device budget this load gives back to the system's
+    /// memory pressure, in `[0, 1]`: the device target is
+    /// `floor + (budget - floor) * (1 - yield * pressure)`, with pressure
+    /// the OS's own reading in `0..1` (Linux and Android PSI, macOS's
+    /// available memory). `0` (a dedicated machine) holds the whole budget
+    /// and reads nothing; above 0, a load on a system whose pressure cannot
+    /// be read is refused by name. The floor is what the load promised: one
+    /// lane at the full `max_context`, the reserved chunks, the activation
+    /// span and the dense weights, so a long `max_context` raises the floor
+    /// and with it lowers how far yield can press. Once pressure goes, the
+    /// pool grows back only on demand, up to the target: nothing is
+    /// allocated for nobody. At `1` the pool trims under moderate pressure
+    /// too, by design; `0`, the default, never trims.
+    ///
+    /// Idle cache is not timed out by the runtime: with no worker policy
+    /// installed it stays until a demand needs its room, and is then
+    /// reclaimed in retention-key, then least-recently-used, order. How
+    /// long it is kept past that is the policy's to state, with its
+    /// retention keys.
+    #[serde(rename = "yield")]
+    pub yield_share: f64,
 }
 
 impl Default for MemoryConfig {
@@ -992,8 +1006,7 @@ impl Default for MemoryConfig {
             budget_disk: None,
             disk_path: None,
             disk_persistent: false,
-            governor_backoff: 1.0,
-            governor_release_idle: false,
+            yield_share: 0.0,
         }
     }
 }
@@ -1021,23 +1034,18 @@ impl MemoryConfig {
         }
     }
 
-    /// How this process yields memory to the system around it.
-    #[must_use]
-    pub const fn tolerance(&self) -> runtime::governor::Tolerance {
-        runtime::governor::Tolerance {
-            backoff: self.governor_backoff,
-            release_idle: self.governor_release_idle,
-        }
+    /// How much of the device budget this load gives back to the system's
+    /// memory pressure.
+    ///
+    /// # Errors
+    ///
+    /// `yield` is outside `[0, 1]`, refused by name.
+    pub fn yields(&self) -> Result<runtime::governor::Yield> {
+        Ok(runtime::governor::Yield::new(self.yield_share)?)
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.governor_backoff.is_finite()
-                && self.governor_backoff > 0.0
-                && self.governor_backoff <= 1.0,
-            "engine.memory.governor_backoff must be in (0.0, 1.0]: the share kept each \
-             congested stretch, 1.0 to never yield"
-        );
+        self.yields()?;
         ensure!(
             self.kv_device_tokens != Some(0),
             "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
@@ -1227,7 +1235,7 @@ device = ["metal:0"]
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
-        the_memory_keys_are_eight_and_prefixed();
+        the_memory_keys_are_seven_and_prefixed();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
         activation_dtype_is_an_unknown_key();
     }
@@ -1236,8 +1244,8 @@ device = ["metal:0"]
         let cfg = Config::parse(MINIMAL_METAL).unwrap();
         assert_eq!(cfg.engine.memory, MemoryConfig::default());
         assert_eq!(
-            cfg.engine.memory.tolerance(),
-            runtime::governor::Tolerance::DEDICATED
+            cfg.engine.memory.yields().unwrap(),
+            runtime::governor::Yield::NONE
         );
         let residency = cfg.engine.memory.residency();
         assert_eq!(residency.device, engine::Allowance::WHOLE);
@@ -1245,7 +1253,7 @@ device = ["metal:0"]
 
         let shared = format!(
             "{MINIMAL_METAL}\n[engine.memory]\nbudget_device = \"20GiB\"\n\
-             budget_host = \"8GiB\"\ngovernor_backoff = 0.8\ngovernor_release_idle = true\n"
+             budget_host = \"8GiB\"\nyield = 0.5\n"
         );
         let cfg = Config::parse(&shared).unwrap();
         assert_eq!(
@@ -1254,16 +1262,26 @@ device = ["metal:0"]
             "budget_device caps the device"
         );
         assert_eq!(cfg.engine.memory.residency().host_kv_budget, Some(8 << 30));
-        let tolerance = cfg.engine.memory.tolerance();
-        assert!(tolerance.yields() && tolerance.release_idle);
+        assert_eq!(cfg.engine.memory.yields().unwrap().share(), 0.5);
 
-        for bad in [
-            "governor_backoff = 0.0",
-            "governor_backoff = 1.5",
-            "budget_device = 0",
-        ] {
+        for bad in ["yield = -0.1", "yield = 1.5", "yield = nan"] {
             let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
-            assert!(Config::parse(&toml).is_err(), "{bad} should be refused");
+            let refused = Config::parse(&toml).expect_err(bad);
+            assert!(
+                format!("{refused:#}").contains("engine.memory.yield"),
+                "{bad}: {refused:#}"
+            );
+        }
+        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_device = 0\n");
+        assert!(Config::parse(&zero).is_err(), "a zero budget is refused");
+        // The knobs `yield` replaced are no key at all.
+        for old in ["governor_backoff = 0.8", "governor_release_idle = true"] {
+            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{old}\n");
+            let refused = Config::parse(&toml).expect_err(old);
+            assert!(
+                format!("{refused:#}").contains("unknown key"),
+                "{old}: {refused:#}"
+            );
         }
 
         // The kv tokens reach the cuda engine's load; another engine, which
@@ -1284,7 +1302,7 @@ device = ["metal:0"]
         assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
-    fn the_memory_keys_are_eight_and_prefixed() {
+    fn the_memory_keys_are_seven_and_prefixed() {
         let keys: Vec<String> = schema::fields(EngineKind::Cuda)
             .into_iter()
             .map(|field| field.key)
@@ -1299,8 +1317,7 @@ device = ["metal:0"]
                 "engine.memory.budget_disk",
                 "engine.memory.disk_path",
                 "engine.memory.disk_persistent",
-                "engine.memory.governor_backoff",
-                "engine.memory.governor_release_idle",
+                "engine.memory.yield",
             ]
         );
     }

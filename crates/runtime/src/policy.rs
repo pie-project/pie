@@ -62,7 +62,6 @@ pub struct Arrival {
 /// A resting handle, for the worker policy to read.
 #[derive(Debug, Clone)]
 pub(crate) struct Resting {
-    pub client: crate::server::ClientId,
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,

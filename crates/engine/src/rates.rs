@@ -29,6 +29,12 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
+//! - `tile_tflops_by_rows`: each tiled matmul kernel the backend can take
+//!   at decode-shaped and short prompt rows, below the matmul curve's first,
+//!   its flops at the rows it lands over its time (slang backends).
+//! - `vector_tflops_by_rows`: each vector matmul kernel (keyed by the rows a
+//!   workgroup carries) at 1 to 256 rows, its flops over its time, its
+//!   weight passes in it (slang backends).
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
@@ -303,6 +309,20 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         for (w, curve) in widths {
             if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
                 return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(tiles) = &rates.tile_tflops_by_rows {
+        for (tile, curve) in tiles {
+            if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (a {tile}-row tile)")));
+            }
+        }
+    }
+    if let Some(vectors) = &rates.vector_tflops_by_rows {
+        for (rows, curve) in vectors {
+            if let Some((key, at)) = point("vector_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} ({rows} rows a workgroup)")));
             }
         }
     }
@@ -968,25 +988,26 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
 pub struct SaveTo<'a> {
     pub path: std::path::PathBuf,
     pub provenance: (&'static str, String),
-    pub check: &'a dyn Fn(&str) -> Result<(), String>,
+    /// The backend's registry: what the saved file is read against, and
+    /// what of it a load no longer reads ([`profile::Registry::prune`]).
+    pub registry: &'a profile::Registry,
 }
 
 /// The user's file of a device, `existing` (none where there is none yet),
-/// with `measured` (only the keys a load measured) added to its `[rates]`
-/// and `provenance` set in its `[provenance]`: nothing else of the file
-/// changes, and nothing of the profile it resolved to is copied into it.
+/// with its `[rates]` table written whole: the rates the file's own table
+/// states where it reads (every key one this pie reads), under `measured`
+/// (only the keys a load measured); a table stating a key this pie does not
+/// read (a schema it outlived) is replaced, none of it kept. `provenance`
+/// is set in its `[provenance]`; nothing else of the file changes, and
+/// nothing of the profile it resolved to is copied into it. The user's file
+/// is the loads' own measured output: no key is spliced into a table it
+/// might already hold.
 #[must_use]
 pub fn saved_text(
     existing: Option<&str>,
     measured: &profile::fire::Rates,
     provenance: &(&'static str, String),
 ) -> String {
-    let keys: Vec<String> = measured
-        .toml()
-        .lines()
-        .skip(1)
-        .map(str::to_string)
-        .collect();
     let entry = format!("{} = {}", provenance.0, provenance.1);
     let mut lines: Vec<String> = existing
         .unwrap_or("api = 1\n")
@@ -1007,15 +1028,36 @@ pub fn saved_text(
         }
         end
     };
-    match header(&lines, "rates") {
+    // The old table out, whole, the new one in its place; what of the old
+    // reads stays under the measured.
+    let at = header(&lines, "rates");
+    let mut kept = profile::fire::Rates::default();
+    if let Some(at) = at {
+        let end = table_end(&lines, at);
+        let table = format!("api = 1\n{}\n", lines[at..end].join("\n"));
+        if let Ok(file) = profile::Registry::new("rates", &[], &[]).parse(
+            &table,
+            "the user's [rates]",
+            profile::Strict::User,
+        ) {
+            kept = file.tuned.rates;
+        }
+        lines.drain(at..end);
+    }
+    let table: Vec<String> = measured
+        .clone()
+        .over(kept)
+        .toml()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    match at {
         Some(at) => {
-            let end = table_end(&lines, at);
-            lines.splice(end..end, keys);
+            lines.splice(at..at, table);
         }
         None => {
             lines.push(String::new());
-            lines.push("[rates]".to_string());
-            lines.extend(keys);
+            lines.extend(table);
         }
     }
     match header(&lines, "provenance") {
@@ -1067,6 +1109,15 @@ pub fn rates_at_load(
     max_submit: Option<std::time::Duration>,
     measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
+    // A checked-in file this device takes states a rate this pie does not
+    // read: it was refused whole, and the load is refused by it.
+    if let Some(stale) = &chip.tuned().refused {
+        return Err(format!(
+            "{stale}: a checked-in profile states a rate this pie does not read, and is refused \
+             whole; [rates] holds {:?}",
+            profile::fire::KEYS
+        ));
+    }
     let stated = chip.rates();
     if stated.complete(keys) {
         return Ok(chip);
@@ -1103,13 +1154,26 @@ pub fn rates_at_load(
             rates.missing(keys)
         ));
     }
-    // The user's file gains what this load measured, the keys no layer
-    // stated, and how: nothing else.
+    // The user's file is this load's own output: it keeps every section and
+    // key this pie still reads (a person's own decisions), drops each it no
+    // longer reads (said, by name), gains what this load measured and how.
     let saved_to = match save {
         Some(save) => {
-            let existing = std::fs::read_to_string(&save.path).ok();
+            let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
+                let (kept, dropped) = save.registry.prune(&text);
+                for key in dropped {
+                    eprintln!(
+                        "user profile {}: dropped `{key}`, no longer read",
+                        save.path.display()
+                    );
+                }
+                kept
+            });
             let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
-            (save.check)(&text).map_err(|why| {
+            let check = save
+                .registry
+                .parse(&text, "the measured rates", profile::Strict::User);
+            check.map_err(|why| {
                 format!(
                     "{}: the measured rates would not read back: {why}",
                     save.path.display()
@@ -1306,10 +1370,13 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
             hbm_gbps: Some(700.0),
+            cached_gbps: Some(20000.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
         }
     }
 
@@ -1317,7 +1384,7 @@ mod tests {
     fn a_load_without_the_constants_measures_saves_and_says_so() {
         let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
-        let check = |_: &str| Ok(());
+        let registry = profile::Registry::new("toy", &[], &[]);
         // A checked-in launch, nothing else: the rest measured, the launch
         // kept, each submission under the budget asked.
         let stated = profile::fire::Rates {
@@ -1331,7 +1398,7 @@ mod tests {
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             Some(std::time::Duration::from_millis(5)),
@@ -1388,19 +1455,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
         let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         assert!(!first.rates().complete(&profile::fire::KEYS));
-        let check = |text: &str| {
-            registry
-                .parse(text, "saved", profile::Strict::User)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
         let measured = rates_at_load(
             first,
             &profile::fire::KEYS,
             Some(SaveTo {
                 path: SHELF.user_path(&dir, "Card X"),
                 provenance: provenance("toy", "a test"),
-                check: &check,
+                registry: &registry,
             }),
             None,
             None,
@@ -1430,10 +1491,84 @@ mod tests {
         assert!(!second.tuned().measured_this_load);
     }
 
+    /// A saved profile lacking one key a newer pie reads: the load asks for
+    /// that key alone and the file keeps every other rate as it was.
+    #[test]
+    fn a_profile_lacking_one_key_gains_it_and_keeps_the_rest() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-one-key-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        let save = || SaveTo {
+            path: path.clone(),
+            provenance: provenance("toy", "a test"),
+            registry: &registry,
+        };
+        let older = profile::fire::Rates {
+            few_row_tflops: None,
+            ..all()
+        };
+        // An older pie, which read every key but this one, saved the file.
+        let older_keys: Vec<&'static str> = profile::fire::KEYS
+            .iter()
+            .copied()
+            .filter(|&key| key != "few_row_tflops")
+            .collect();
+        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        rates_at_load(first, &older_keys, Some(save()), None, None, |_| {
+            Ok(Measured {
+                rates: older.clone(),
+                unsettled: false,
+            })
+        })
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert_eq!(
+            second.rates().missing(&profile::fire::KEYS),
+            ["few_row_tflops"]
+        );
+        let lacked = second.rates().missing(&profile::fire::KEYS);
+        let loaded = rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            Some(save()),
+            None,
+            None,
+            |_| {
+                // A backend times only what the profile lacks.
+                Ok(Measured {
+                    rates: all().only(&lacked),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded.rates(), all());
+        let rates_of = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|line| *line != "[rates]")
+                .take_while(|line| !line.starts_with("[provenance]"))
+                .filter(|line| !line.starts_with("few_row_tflops"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(rates_of(&before), rates_of(&after));
+        assert!(after.contains("few_row_tflops = 4.0"), "{after}");
+    }
+
     #[test]
     fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
         let measured = profile::fire::Rates {
             hbm_gbps: Some(700.0),
+            cached_gbps: None,
             ..profile::fire::Rates::default()
         };
         let how = ("rates", "\"measured at load\"".to_string());
@@ -1442,20 +1577,126 @@ mod tests {
             saved_text(None, &measured, &how),
             "api = 1\n\n[rates]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
-        // A user's file: its decisions kept, its [rates] gaining the key,
-        // its provenance's rates entry replaced, the rest left.
+        // A user's file: its decisions kept, its [rates] written whole (the
+        // key it stated kept under the measured one), its provenance's rates
+        // entry replaced, the rest left.
         let existing = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"old\"\n";
         assert_eq!(
             saved_text(Some(existing), &measured, &how),
             "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
         );
-        // A rate stated as array rows: the key lands after its last row.
+        // A rate stated as array rows: the table read whole and rewritten.
         let rows =
             "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\n";
         assert_eq!(
             saved_text(Some(rows), &measured, &how),
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+            "api = 1\n\n[rates]\nattn_tflops_by_keys = [[512, 4.0], [1024, 5.0]]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
+        // A table of a schema this pie outlived (Nov 16's keys): replaced
+        // whole, none of it kept, so no key is written twice.
+        let old = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 1.0\nlaunch_ns = 900\n\n[provenance]\nrates = \"old\"\n";
+        let all = profile::fire::Rates {
+            launch_ns: Some(1200),
+            ..measured.clone()
+        };
+        assert_eq!(
+            saved_text(Some(old), &all, &how),
+            "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 1200\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+        );
+    }
+
+    /// The Spark's user file of Nov 16 (the old schema's [rates] keys and a
+    /// decision this pie removed) is refused at resolve, so the load
+    /// measures every key; the file is rewritten as the load's own output
+    /// (the removed decision dropped and said, the old table replaced
+    /// whole, what reads kept), and the next boot reads it clean and
+    /// measures nothing.
+    #[test]
+    fn an_old_schema_user_file_is_measured_rewritten_whole_and_read_next() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-old-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "api = 1\n\n[engine]\ngraphs = \"on\"\n\n[rates]\n\
+             bf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 650.0\n\
+             launch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"Nov 16\"\n",
+        )
+        .unwrap();
+        let (first, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert!(!report.rejected.is_empty(), "the old file is refused");
+        assert!(!first.rates().complete(&profile::fire::KEYS));
+        let measured = rates_at_load(
+            first,
+            &profile::fire::KEYS,
+            Some(SaveTo {
+                path: path.clone(),
+                provenance: provenance("toy", "a test"),
+                registry: &registry,
+            }),
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: all(),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        assert!(measured.tuned().measured_this_load);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("launch_ns").count(), 1, "{text}");
+        assert!(!text.contains("bytes_per_ns"), "{text}");
+        // The decision this pie no longer reads dropped; what reads kept.
+        assert!(!text.contains("graphs"), "{text}");
+        assert!(text.contains("source = \"me\""), "{text}");
+        let (second, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert_eq!(second.rates(), all());
+        rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            None,
+            None,
+            None,
+            |_| -> Result<_, String> { panic!("measured what the first load saved") },
+        )
+        .unwrap();
+    }
+
+    /// A checked-in file stating a rate this pie does not read is refused
+    /// whole, and the load is refused by its name and the key.
+    #[test]
+    fn a_checked_in_file_with_a_stale_rate_refuses_the_load_by_name() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[(
+                "derived/card-x.toml",
+                "api = 1\n[target]\ndevice = \"Card X\"\n[rates]\nbytes_per_ns = 650.0\n",
+            )],
+            derived: Some(|_, _| "api = 1\n".to_string()),
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let (chip, _) = SHELF.resolve(&registry, "Card X", &facts, None);
+        let err = rates_at_load(chip, &profile::fire::KEYS, None, None, None, |_| {
+            Ok(Measured {
+                rates: all(),
+                unsettled: false,
+            })
+        })
+        .unwrap_err();
+        assert!(err.contains("derived/card-x.toml"), "{err}");
+        assert!(err.contains("`[rates] bytes_per_ns`"), "{err}");
     }
 
     /// A cold frame before the clock settles moves nothing: the 840's walk
@@ -1635,7 +1876,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("measured no [\"few_row_tflops\", \"workgroups_per_core\"]"),
+            err.contains(
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+            ),
             "{err}"
         );
     }
@@ -1644,7 +1887,7 @@ mod tests {
     fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
         let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
-        let check = |_: &str| Ok(());
+        let registry = profile::Registry::new("toy", &[], &[]);
         for (zero, says) in [
             (
                 profile::fire::Rates {
@@ -1671,7 +1914,7 @@ mod tests {
             let save = SaveTo {
                 path: path.clone(),
                 provenance: ("rates", "\"measured at load\"".to_string()),
-                check: &check,
+                registry: &registry,
             };
             let err = rates_at_load(
                 chip(profile::fire::Rates::default()),
@@ -1961,10 +2204,13 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
             hbm_gbps: Some(800.0),
+            cached_gbps: None,
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: None,
+            vector_tflops_by_rows: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

@@ -106,9 +106,15 @@ Cerebras and CPU do not fit the table. Cerebras: every wafer array is static and
 
 ## 5. Knobs, constants and heuristics that size device memory
 
-Config keys still live: `device_memory_share`, `device_kv_budget`, `host_kv_budget`, `disk_kv_budget`, `max_context`, `max_forward_tokens`, `max_forward_requests`, `bodies_mem`, `working_set_percent` (50), `window_spare`, `gemm_workspace_mb`, `[xla] headroom / seat_tokens / prewarm`, `[wgpu] device_memory`, `[cerebras.wafer] preset`.
+Config keys still live (crates/worker/src/config.rs `MemoryConfig`, config/backend.rs): `[engine] max_context`; `[engine.memory] budget_device`, `kv_device_tokens`, `budget_host`, `budget_disk`, `disk_path`, `disk_persistent`, `yield`; `[xla] device_headroom`, `seat_tokens`. The keys this list named earlier (`device_memory_share`, `device_kv_budget`, `host_kv_budget`, `disk_kv_budget`, `max_forward_tokens`, `max_forward_requests`, `bodies_mem`, `working_set_percent`, `window_spare`, `gemm_workspace_mb`, `[wgpu] device_memory`, `[xla] headroom / prewarm`) are gone and refused as unknown fields; `host_kv_budget` / `disk_kv_budget` survive only as the engines' internal names for `budget_host` / `budget_disk`.
 
 Rules: halve forward tokens until the arena fits (floor 1024 on CUDA, 512 on Metal); one sequence takes at most half the room; bodies get a quarter with a 512 MiB floor and a 1/20 stretch; fp8 shadow only under free/8; XLA prescale and tied copy only when weights are under 5/8 of HBM; voxel fit uses half the remainder (Vulkan/wgpu, XLA); safety floor `min(128 MiB, total/10)`; XLA headroom HBM/16.
+
+Chosen numbers still in XLA's sizing path (TPU's audit at 7c114fc69; on TPU's list, after its (d) items and the mask-fold port):
+- `[xla] device_headroom` defaults to `chip::Tpu::headroom()` = HBM / 16 (engine-xla chip.rs:121), the room left for XLA's own temporaries, subtracted in pool sizing (serve.rs `room_at` / `device_cap`). To derive: the largest temporary any program of the load states (PJRT compiled memory stats): compile the widest fires first (top prefill rung, widest mixed, widest decode), size the pool with their largest `temp_bytes`, check every ladder program, and refuse by name at load one that needs more. Gate: a pool-pages A/B on Qwen3-0.6B / 8B.
+- `hbm / 8 · 5`: the "weights under 5/8 of HBM" gate for tied-gemm copies and mxfp4 prescale.
+- `FILL_PAGES`: the page ceiling on a device that states no memory.
+- `[xla] seat_tokens` is not one: its default is the context (derived), and a stated value is an operator statement rounded to a power of two; it is deleted under F2.
 
 Fixed sizes: activation rungs 256 / 1024 / 4096; chunk 16 MiB (CUDA, ROCm, XLA target) or 4 MiB (Vulkan/wgpu); segments 64 MiB (Metal), 1 GiB (CUDA), a quarter of the pool (Vulkan/wgpu); default state slots 256; attention workspace grant at least 64 MiB float + 1 MiB int; slab grain 8 MiB / 256 KiB; hipBLASLt workspace 128 MiB; rocBLAS grouped cap 512 MiB; staged experts cap 1.5 GiB; recycle shelf 8 GiB; device heap 256 MiB chunks; Vulkan staging 256 MiB; upload batches 64 MiB; guest scratch cap 4 GiB; ring cap 64; rs replay 16; rs snapshots 4.
 

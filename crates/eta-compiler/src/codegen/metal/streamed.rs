@@ -48,32 +48,70 @@ pub const fn step_value(step: u32) -> u32 {
 pub const STEP_NODES: u32 = 0xF1;
 /// The low byte of a step table word naming one node of the step before it.
 pub const STEP_NODE: u32 = 0xF0;
+/// The low byte of a step table word `(node << 8) | STEP_VIEW`, after every
+/// step's nodes: a node no step computes, a view of its source's bytes that
+/// every reader resolves through, so its result takes no bytes of its own.
+pub const STEP_VIEW: u32 = 0xF2;
+/// The low byte of a step table word `(node << 8) | STEP_FOLD`, among a
+/// step's node words: a node the step stands for, computed in another form
+/// inside it (a log-softmax's centred row in the sum's load) and its result
+/// never written. It is not one of the step's nodes: its results take no
+/// bytes, and what it reads is held to the step ([`StepNodes::folded`]).
+pub const STEP_FOLD: u32 = 0xF3;
+
+/// What a streamed kernel publishes beside its dispatch words: the nodes
+/// each step computes, in step order, and the nodes it computes in none
+/// because they are views of their sources ([`STEP_VIEW`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepNodes {
+    pub steps: Vec<Vec<u32>>,
+    pub views: Vec<u32>,
+    /// The nodes published as folded ([`STEP_FOLD`]), each with the step
+    /// that stands for it: in no step's list, its results take no bytes,
+    /// and what it reads is held through that step.
+    pub folded: Vec<(u32, u32)>,
+}
 
 /// A streamed region's step table split into its dispatch words and, where
-/// the emitter published them, the nodes each step computes (`None` for a
-/// table with no node lists, or one that names a step out of order).
+/// the emitter published them, the nodes each step computes and the views
+/// none does (`None` for a table with no node lists, or one that names a
+/// step out of order).
 #[must_use]
-pub fn step_node_table(table: &[u32]) -> (&[u32], Option<Vec<Vec<u32>>>) {
+pub fn step_node_table(table: &[u32]) -> (&[u32], Option<StepNodes>) {
     let split = table
         .iter()
-        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE))
+        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE | STEP_VIEW | STEP_FOLD))
         .unwrap_or(table.len());
     let (steps, trailer) = table.split_at(split);
     if trailer.is_empty() {
         return (steps, None);
     }
-    let mut nodes: Vec<Vec<u32>> = Vec::with_capacity(steps.len());
+    let mut published = StepNodes {
+        steps: Vec::with_capacity(steps.len()),
+        views: Vec::new(),
+        folded: Vec::new(),
+    };
     for &word in trailer {
+        let nodes = &mut published.steps;
         match word & 0xFF {
-            STEP_NODES if (word >> 8) as usize == nodes.len() => nodes.push(Vec::new()),
-            STEP_NODE if !nodes.is_empty() => nodes.last_mut().expect("opened").push(word >> 8),
+            STEP_NODES if published.views.is_empty() && (word >> 8) as usize == nodes.len() => {
+                nodes.push(Vec::new());
+            }
+            STEP_NODE if published.views.is_empty() && !nodes.is_empty() => {
+                nodes.last_mut().expect("opened").push(word >> 8);
+            }
+            STEP_FOLD if published.views.is_empty() && !nodes.is_empty() => {
+                let step = u32::try_from(nodes.len() - 1).unwrap_or(u32::MAX);
+                published.folded.push((step, word >> 8));
+            }
+            STEP_VIEW => published.views.push(word >> 8),
             _ => return (steps, None),
         }
     }
-    if nodes.len() != steps.len() {
+    if published.steps.len() != steps.len() {
         return (steps, None);
     }
-    (steps, Some(nodes))
+    (steps, Some(published))
 }
 
 #[must_use]
@@ -1035,6 +1073,34 @@ pub fn emit_streamed_region(
             elided_gather.insert(producer);
         }
     }
+    let region_nodes: Vec<usize> = region.nodes.iter().map(|n| n.index()).collect();
+    let log_softmax = match_log_softmax(
+        &region_nodes,
+        &ops,
+        &bases,
+        &alias,
+        &consumers,
+        &escapes,
+        // Any float the guest wire carries: the fold loads through the
+        // runtime's dtype-aware reads and stores as every streamed op does.
+        |v| {
+            value_types.get(v as usize).is_some_and(|ty| {
+                matches!(ty.dtype, eta_ir::Dtype::F32 | eta_ir::Dtype::F16 | eta_ir::Dtype::Bf16)
+                    && eta_ir::types::to_wire(ty.dtype).is_some()
+            })
+        },
+        |v| length_key(value_types, v),
+    );
+    let folded: BTreeSet<usize> = log_softmax
+        .iter()
+        .flat_map(|chain| {
+            let mut nodes: Vec<usize> = chain.into_sum.iter().chain(chain.into_out.iter()).copied().collect();
+            if let Some(added) = chain.added {
+                nodes.extend([chain.out, added.broadcast]);
+            }
+            nodes
+        })
+        .collect();
     let value_ptr = |value: u32| format!("scratch + offsets[{value}]");
     let argmax_over_f32 = |op: &OpView| -> bool {
         op.args
@@ -1052,7 +1118,74 @@ pub fn emit_streamed_region(
             return Err(EmitError::RegionNodeOutOfRange(RegionForm::GroupedFused));
         };
         let base = bases[node];
-        if elided_gather.contains(&node) || is_view_reshape(node) {
+        if elided_gather.contains(&node) || is_view_reshape(node) || folded.contains(&node) {
+            continue;
+        }
+        if let Some(chain) = log_softmax.iter().find(|chain| chain.sum == node || chain.planned_at() == node) {
+            let node_u32 = u32::try_from(node)
+                .map_err(|_| EmitError::RegionNodeOutOfRange(RegionForm::GroupedFused))?;
+            let (x, m, s) = (value_ptr(chain.x), value_ptr(chain.m), value_ptr(chain.s));
+            let row_desc = format!("descriptors[lane_params[{}].a0]", chain.max);
+            if chain.sum == node {
+                // sum(exp(x - max[row])) from x itself: its level-0 load
+                // centres and exponentiates, so neither is written.
+                planned.push((
+                    node_u32,
+                    Plan::Reduce {
+                        tag: tags::REDUCE_SUM,
+                        dtype: 0,
+                        input: chain.x,
+                        result: chain.s,
+                        len: key_of(chain.x),
+                        split: false,
+                        two_level: format!(
+                            "    m4_reduce_two_levels({}u, {x}, {s}, temporary, {row_desc}, step.level, m4_group.x, m3_tid, m3_threads, m3_tgbuf, m4_simd_lane, m4_simd_id, {m}, descriptors[{}].dtype);\n",
+                            tags::REDUCE_SUM,
+                            chain.m
+                        ),
+                    },
+                ));
+            } else {
+                // (x - max[row]) - log(sum[row]), plus a row's added value
+                // where the chain ends in one: the chain's own order, in one
+                // pass over x.
+                let y = value_ptr(bases[node]);
+                let out = bases[node];
+                let (added_decl, added) = match chain.added {
+                    Some(added) => (
+                        format!(
+                            " const device uchar* la = {}; const M1ValueDesc la_from = descriptors[{}]; const M1ValueDesc la_to = descriptors[{}];",
+                            value_ptr(added.row),
+                            added.row,
+                            added.spread
+                        ),
+                        if added.left {
+                            ("m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype) + (", ")")
+                        } else {
+                            ("(", ") + m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype)")
+                        },
+                    ),
+                    None => (String::new(), ("", "")),
+                };
+                let (open_add, close_add) = added;
+                let mut reads = vec![chain.x, chain.m, chain.s];
+                reads.extend(chain.added.map(|added| added.row));
+                planned.push((
+                    node_u32,
+                    Plan::Generic {
+                        text: format!(
+                            "    {{ const device uchar* lx = {x}; const device uchar* lm = {m}; const device uchar* ls = {s};{added_decl} device uchar* ly = {y};\n      const uint lxd = descriptors[{xv}].dtype, lmd = descriptors[{mv}].dtype, lsd = descriptors[{sv}].dtype;\n      const uint m4_n_{node} = descriptors[{out}].len; const uint m4_last_{node} = {row_desc}.last;\n      uint lrow = 0xFFFFFFFFu; float lmax = 0.0f, llog = 0.0f;\n      for (uint i = m4_gtid; i < m4_n_{node}; i += m4_gthreads) {{ const uint row = i / m4_last_{node}; if (row != lrow) {{ lrow = row; lmax = m1_load_f(lm, row, lmd); llog = precise::log(m1_load_f(ls, row, lsd)); }} m1_store_f(ly, i, {open_add}(m1_load_f(lx, i, lxd) - lmax) - llog{close_add}); }} }}\n",
+                            xv = chain.x,
+                            mv = chain.m,
+                            sv = chain.s
+                        ),
+                        reads,
+                        writes: out,
+                        len: key_of(out),
+                        cross: true,
+                    },
+                ));
+            }
             continue;
         }
         let node_u32 = u32::try_from(node)
@@ -1505,10 +1638,37 @@ pub fn emit_streamed_region(
     source.push_str(&sched.cases);
     source.push_str("  default: return;\n  }\n}\n");
     let mut table = sched.steps;
+    // A chain's folded nodes are published in the step that stands for
+    // them: the sum's for its centred row, the output pass's for the rest.
+    let mut folded_in: Vec<Vec<u32>> = vec![Vec::new(); sched.step_nodes.len()];
+    for chain in &log_softmax {
+        // The output pass reads x and the max too: the centring and the
+        // broadcast max hold them there, as in the sum's step.
+        let mut into_out: Vec<usize> = chain.into_out.to_vec();
+        into_out.extend([chain.into_sum[0], chain.into_sum[1]]);
+        if let Some(added) = chain.added {
+            into_out.extend([chain.out, added.broadcast]);
+        }
+        for (stand_in, folded) in [(chain.sum, chain.into_sum.to_vec()), (chain.planned_at(), into_out)] {
+            let stand_in = stand_in as u32;
+            if let Some(step) = sched.step_nodes.iter().position(|nodes| nodes.contains(&stand_in)) {
+                folded_in[step].extend(folded.iter().map(|&node| node as u32));
+            }
+        }
+    }
     for (step, nodes) in sched.step_nodes.iter().enumerate() {
         table.push((u32::try_from(step).unwrap_or(u32::MAX) << 8) | STEP_NODES);
         table.extend(nodes.iter().map(|&node| (node << 8) | STEP_NODE));
+        table.extend(folded_in[step].iter().map(|&node| (node << 8) | STEP_FOLD));
     }
+    table.extend(
+        region
+            .nodes
+            .iter()
+            .map(|node| node.index())
+            .filter(|&node| is_view_reshape(node))
+            .map(|node| ((node as u32) << 8) | STEP_VIEW),
+    );
     Ok((source, table))
 }
 
@@ -1569,4 +1729,146 @@ mod tests {
         assert_eq!(typed_from_bits(0, "r", 3), "(((r) != 0u) ? 1.0f : 0.0f)");
         assert_eq!(typed_from_bits(0, "r", 1), "float(int(r))");
     }
+}
+
+/// A row-wise log-softmax in a region's nodes:
+/// `y = (x - b(max(x))) - b(log(sum(exp(x - b(max(x))))))`, `b` a
+/// broadcast along the row, every value between `x` and `y` read only
+/// inside the chain and staying in the region.
+struct LogSoftmax {
+    max: usize,
+    sum: usize,
+    out: usize,
+    x: u32,
+    m: u32,
+    s: u32,
+    /// The broadcast max, the centred row and its exponentials: the sum's
+    /// level-0 load stands for them (published folded in its step).
+    into_sum: [usize; 3],
+    /// The log and its broadcast: the output pass stands for them.
+    into_out: [usize; 2],
+    /// Where the chain's only reader adds a row's value broadcast along
+    /// the row (beam's scores): the output pass adds it, and the chain's
+    /// own output and that broadcast are written by none.
+    added: Option<Added>,
+}
+
+#[derive(Clone, Copy)]
+struct Added {
+    /// The add, whose value the output pass writes.
+    node: usize,
+    broadcast: usize,
+    /// The broadcast's value, written by none: its descriptor maps an
+    /// output element to `row`'s.
+    spread: u32,
+    /// The value broadcast.
+    row: u32,
+    /// The row's value is the add's left operand.
+    left: bool,
+}
+
+impl LogSoftmax {
+    /// The node the output pass is planned at.
+    fn planned_at(&self) -> usize {
+        self.added.map_or(self.out, |added| added.node)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_log_softmax(
+    nodes: &[usize],
+    ops: &[OpView],
+    bases: &[u32],
+    alias: &AliasTable,
+    consumers: &BTreeMap<u32, usize>,
+    escapes: &BTreeSet<u32>,
+    f32_value: impl Fn(u32) -> bool,
+    key: impl Fn(u32) -> Vec<Dimension>,
+) -> Vec<LogSoftmax> {
+    let producer = |value: u32| -> Option<usize> {
+        nodes
+            .iter()
+            .copied()
+            .find(|&n| bases.get(n).is_some_and(|&b| alias.resolve(b) == value))
+    };
+    let op_of = |node: usize, tag: u8, arity: usize| -> Option<Vec<u32>> {
+        let op = ops.get(node)?;
+        (op.tag == tag && op.args.len() == arity && op.results == 1)
+            .then(|| op.args.iter().map(|&a| alias.resolve(a)).collect())
+    };
+    let private = |value: u32, uses: usize| {
+        consumers.get(&value).copied().unwrap_or(0) == uses && !escapes.contains(&value)
+    };
+    let mut found = Vec::new();
+    for out in nodes.iter().copied() {
+        let matched = (|| {
+            let [c, bl] = op_of(out, tags::SUB, 2)?[..] else { return None };
+            let n_c = producer(c)?;
+            let [x, bm] = op_of(n_c, tags::SUB, 2)?[..] else { return None };
+            let n_bm = producer(bm)?;
+            let [m] = op_of(n_bm, tags::BROADCAST, 1)?[..] else { return None };
+            let n_max = producer(m)?;
+            let [mx] = op_of(n_max, tags::REDUCE_MAX, 1)?[..] else { return None };
+            let n_bl = producer(bl)?;
+            let [l] = op_of(n_bl, tags::BROADCAST, 1)?[..] else { return None };
+            let n_l = producer(l)?;
+            let [s] = op_of(n_l, tags::LOG, 1)?[..] else { return None };
+            let n_s = producer(s)?;
+            let [e] = op_of(n_s, tags::REDUCE_SUM, 1)?[..] else { return None };
+            let n_e = producer(e)?;
+            let [ce] = op_of(n_e, tags::EXP, 1)?[..] else { return None };
+            let y = alias.resolve(*bases.get(out)?);
+            let rows = key(x);
+            let (_, row_key) = rows.split_last()?;
+            // Rows of an f32 matrix; max and sum one a row.
+            let row_wise = rows.len() > 1
+                && [x, c, e, y].iter().all(|&v| f32_value(v) && key(v) == rows)
+                && [m, s].iter().all(|&v| f32_value(v) && key(v) == row_key);
+            (mx == x
+                && ce == c
+                && row_wise
+                && private(m, 1)
+                && private(bm, 1)
+                && private(c, 2)
+                && private(e, 1)
+                && private(s, 1)
+                && private(l, 1)
+                && private(bl, 1))
+            .then_some(LogSoftmax {
+                max: n_max,
+                sum: n_s,
+                out,
+                x,
+                m,
+                s,
+                into_sum: [n_bm, n_c, n_e],
+                into_out: [n_l, n_bl],
+                added: None,
+            })
+        })()
+        .map(|mut chain| {
+            chain.added = (|| {
+                let y = alias.resolve(*bases.get(out)?);
+                if !private(y, 1) {
+                    return None;
+                }
+                let node = nodes.iter().copied().find(|&n| {
+                    op_of(n, tags::ADD, 2).is_some_and(|args| args.contains(&y))
+                })?;
+                let args = op_of(node, tags::ADD, 2)?;
+                let left = args[1] == y;
+                let other = if left { args[0] } else { args[1] };
+                let broadcast = producer(other)?;
+                let [row] = op_of(broadcast, tags::BROADCAST, 1)?[..] else { return None };
+                let sum_out = alias.resolve(*bases.get(node)?);
+                // The added value is read through the broadcast's own index
+                // map, so its rows need not be the chain's as written.
+                (private(other, 1) && f32_value(row) && f32_value(sum_out))
+                    .then_some(Added { node, broadcast, spread: other, row, left })
+            })();
+            chain
+        });
+        found.extend(matched);
+    }
+    found
 }

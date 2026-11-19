@@ -37,11 +37,11 @@ impl Raw {
     pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
-        if size > core.limits.max_buffer_size {
+        if size > core.bound {
             return Err(Fault::Ceiling {
                 what: "bytes of one device reservation",
                 need: size,
-                have: core.limits.max_buffer_size,
+                have: core.bound,
             });
         }
         let mappable = kind == Memory::Readback;

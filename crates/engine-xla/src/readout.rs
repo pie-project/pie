@@ -203,10 +203,12 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
-    /// The plane lane `lane` reads output `name` from, and its seat there
-    /// (coalescing consecutive lanes whose rows form one contiguous run).
+    /// The plane lane `lane` reads output `name` from, and its seat there,
+    /// coalescing the lanes after it, short of `end`, whose rows continue
+    /// one contiguous run: an attachment's own lanes, never the next
+    /// request's.
     #[must_use]
-    pub fn bound(&self, lane: usize, name: &str) -> Option<(usize, Seat)> {
+    pub fn bound(&self, lane: usize, end: usize, name: &str) -> Option<(usize, Seat)> {
         let seats = self.seats.get(lane)?;
         let (at, first_seat) = self
             .planes
@@ -215,7 +217,7 @@ impl Kept {
             .enumerate()
             .find_map(|(at, (plane, seat))| (plane.name == name).then_some((at, (*seat)?)))?;
         let mut count = first_seat.count;
-        for next_seats in &self.seats[lane + 1..] {
+        for next_seats in self.seats.iter().take(end).skip(lane + 1) {
             let Some(next) = next_seats.get(at).copied().flatten() else {
                 break;
             };
@@ -231,18 +233,6 @@ impl Kept {
                 count,
             },
         ))
-    }
-
-    /// Lane `lane`'s rows of output `name` on the host, every layer's.
-    pub fn lane_value(&self, lane: usize, name: &str) -> Result<Option<Value>, String> {
-        let Some((at, seat)) = self.bound(lane, name) else {
-            let pixels =
-                (self.pixels.1.get(lane)).filter(|v| !v.is_empty() && self.pixels.0 == name);
-            return Ok(pixels.map(|values| Value::F32(values.clone())));
-        };
-        self.planes[at]
-            .rows_of(seat.first..seat.first + seat.count)
-            .map(Some)
     }
 
     /// Lane `lane`'s read-back rows on the host: the output they are of, how

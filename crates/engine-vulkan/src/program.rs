@@ -29,6 +29,10 @@ struct Instance {
 
     #[cfg(feature = "vulkan")]
     session: crate::guest::session::Session,
+    /// The taking of its pair's slots its session lies in
+    /// (`engine::InstanceBinding::pair_generation`).
+    #[cfg(feature = "vulkan")]
+    pair_generation: u64,
 
     /// The channels whose device cells this instance holds itself (none
     /// registered covers them), in its `ring_slots`.
@@ -142,14 +146,12 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     library: Option<Arc<crate::guest::session::Library>>,
 
-    /// Each program's stages' step uniforms, made at its first bind and
-    /// shared by every bind after: a round that binds the program afresh
-    /// makes none.
-    #[cfg(feature = "vulkan")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
-
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
+
+    /// The pairs whose state lies laid now, cleared at each new taking.
+    #[cfg(feature = "vulkan")]
+    takings: engine_gpu::guest::state::Takings,
 
     /// Passes run on the device.
     tally: u64,
@@ -185,8 +187,6 @@ impl Plane {
             id: id.0,
         })?;
         self.forms.forget(id);
-        #[cfg(feature = "vulkan")]
-        self.step_args.remove(&id);
         Ok(())
     }
 
@@ -326,6 +326,19 @@ impl Plane {
         let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
+        // The instance's room is fresh, its pair's where none holds that
+        // taking: both are another owner's bytes until cleared.
+        #[cfg(feature = "vulkan")]
+        {
+            let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            if let Err(fault) = session.clear(fresh_pair) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::Program(format!(
+                    "program {} does not bind: its state did not clear: {fault}",
+                    binding.program
+                )));
+            }
+        }
         // The device cells of the channels this instance holds itself.
         #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
         let mut own_cells = Vec::new();
@@ -367,6 +380,8 @@ impl Plane {
                 geometry: binding.geometry,
                 #[cfg(feature = "vulkan")]
                 session,
+                #[cfg(feature = "vulkan")]
+                pair_generation: binding.pair_generation,
                 own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
@@ -397,6 +412,8 @@ impl Plane {
         // back to the runtime.
         #[cfg(feature = "vulkan")]
         {
+            self.takings
+                .give(seat.session.pair_place(), seat.pair_generation);
             let mut kept = self.kept.lock().expect("kept cells lock poisoned");
             for channel in &seat.own_cells {
                 kept.remove(channel);
@@ -506,15 +523,23 @@ impl Plane {
                     rings,
                     scratch,
                     pair,
+                    pair_generation,
                     ..
                 } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",
                         id: id.0,
                     })?;
+                    let was = (seat.session.pair_place().clone(), seat.pair_generation);
                     seat.session
                         .retarget(pools, instance, scratch, pair)
                         .map_err(program)?;
+                    // The unpark's room is fresh; the pair's is cleared where
+                    // this is the first instance on its new taking.
+                    self.takings.give(&was.0, was.1);
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    seat.pair_generation = *pair_generation;
+                    seat.session.clear(fresh_pair).map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
                         let channel = seat.ids.get(ring.channel as usize).ok_or_else(|| {
@@ -1182,24 +1207,10 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
-            Some(args) => args.clone(),
-            None => {
-                let args = compiled
-                    .all()
-                    .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
-                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
-                args
-            }
-        };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
             compiled.all(),
-            &args,
             &extents,
             &library,
             Arc::clone(&self.kept),

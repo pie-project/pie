@@ -1090,15 +1090,20 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     // 64/128/256/512 run the wavefront entry, 96 the block entry; the
-    // wavefront entry also into e4m3 pages.
-    for (d, rotary, hnd, fp8) in [
-        (128u32, 128u32, false, false),
-        (64, 32, true, false),
-        (256, 256, false, false),
-        (512, 128, true, false),
-        (96, 64, true, false),
-        (128, 128, false, true),
-        (64, 32, true, true),
+    // wavefront entry also into e4m3 pages. v normed (Gemma's) or as it is
+    // (Qwen's weighted q and k).
+    for (d, rotary, hnd, fp8, v_norm) in [
+        (128u32, 128u32, false, false, true),
+        (64, 32, true, false, true),
+        (256, 256, false, false, true),
+        (512, 128, true, false, true),
+        (96, 64, true, false, true),
+        (128, 128, false, true, true),
+        (64, 32, true, true, true),
+        (128, 128, false, false, false),
+        (128, 128, true, false, false),
+        (96, 64, true, false, false),
+        (128, 128, false, true, false),
     ] {
         let (hq, hk, ps, rows) = (4u32, 2u32, 8u32, 5u32);
         let width = (hq + 2 * hk) * d;
@@ -1146,7 +1151,7 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                 Some(gpu.column(&positions)),
                 Some(gpu.tensor(&qw, 1, d, Dtype::Bf16)),
                 Some(gpu.tensor(&kw, 1, d, Dtype::Bf16)),
-                true,
+                v_norm,
                 eps,
                 &pool,
                 gpu.column(&w_page),
@@ -1248,7 +1253,9 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     let at = kv_at(w_page[r] as usize, w_off[r] as usize, h);
                     let ks = &src[(hq as usize + h) * d_..(hq as usize + h + 1) * d_];
                     let vs = &src[((hq + hk) as usize + h) * d_..((hq + hk) as usize + h + 1) * d_];
-                    let tag = format!("fused d{d} hnd={hnd} win={win:?} row {r} kv head {h}");
+                    let tag = format!(
+                        "fused d{d} hnd={hnd} v_norm={v_norm} win={win:?} row {r} kv head {h}"
+                    );
                     kv_close(
                         &format!("{tag} fp8={fp8} k"),
                         &k[at..at + d_],
@@ -1259,7 +1266,7 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     kv_close(
                         &format!("{tag} fp8={fp8} v"),
                         &v[at..at + d_],
-                        &normed(vs, None),
+                        &if v_norm { normed(vs, None) } else { vs.to_vec() },
                         1.0,
                         1e-2,
                     );

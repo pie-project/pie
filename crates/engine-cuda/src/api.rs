@@ -61,8 +61,16 @@ pub struct Cuda {
     next_fire: u64,
     next_frame: u64,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
+    /// The channels each live instance was bound on (`binding.channels`).
+    attached: BTreeMap<InstanceId, Vec<ChannelId>>,
+    /// Channels closed while an instance was still bound on them: kept
+    /// registered, slots and all, so a rebind of their ring is served,
+    /// until the last of those instances closes ([`Engine::close_channel`]).
+    closing: std::collections::BTreeSet<ChannelId>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
+    /// Where a tier copy still landing on the swap stream is told landed.
+    landed: Option<engine::LandingSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
@@ -88,8 +96,11 @@ impl Cuda {
             next_fire: 1,
             next_frame: 1,
             channels: BTreeMap::new(),
+            attached: BTreeMap::new(),
+            closing: std::collections::BTreeSet::new(),
             sink: None,
             tap_sink: None,
+            landed: None,
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
@@ -153,6 +164,20 @@ impl Cuda {
             endpoint.rebase(at);
         }
         Ok(())
+    }
+
+    /// Whether a live instance is bound on channel `id`.
+    fn bound_on(&self, id: ChannelId) -> bool {
+        self.attached
+            .values()
+            .any(|channels| channels.contains(&id))
+    }
+
+    /// Whether channel `id` is registered on this engine: open, or closed
+    /// with an instance still bound on it.
+    #[must_use]
+    pub fn has_channel(&self, id: ChannelId) -> bool {
+        self.channels.contains_key(&id)
     }
 
     pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
@@ -292,6 +317,28 @@ impl Cuda {
 }
 
 fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
+    // A program overreaching its attachment refuses every lane it spans.
+    if let Fault::Overreach {
+        instance, lanes, ..
+    } = &fault
+    {
+        let reason = fault.to_string();
+        return Error::Lanes(
+            lanes
+                .clone()
+                .map(|lane| engine::LaneFault {
+                    lane,
+                    instance: Some(*instance),
+                    reason: reason.clone(),
+                })
+                .collect(),
+        );
+    }
     match fault {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
             Error::Device(fault.to_string())
@@ -319,8 +366,11 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::KvWrite { .. }
+        | Fault::Overreach { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -842,6 +892,9 @@ impl Engine for Cuda {
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // CUDA states no bound on one submission (no watchdog on a
+            // compute device).
+            guest_cost: engine::GuestCost::default(),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -930,6 +983,8 @@ impl Engine for Cuda {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.shell.as_ref() {
             Some(shell) => shell
@@ -976,6 +1031,7 @@ impl Engine for Cuda {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => self
                 .loaded_mut()?
@@ -986,6 +1042,7 @@ impl Engine for Cuda {
                         rings,
                         scratch,
                         pair,
+                        pair_generation,
                     },
                 )
                 .map_err(fault),
@@ -1005,6 +1062,45 @@ impl Engine for Cuda {
                 Ok(())
             }
         }
+    }
+
+    /// Waits, on the host, for every move between the device and the host
+    /// tier still landing; every other copy lands inside the call or in the
+    /// main stream's order, which a later fire or move stands behind.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_moves().map_err(fault)
+    }
+
+    /// A move from the device to the host tier rides the swap stream and is
+    /// still reading its device slots when the call returns: told landed
+    /// once the stream has run it, by a waiter on an event recorded behind
+    /// it (`serve::landing`), which enqueues nothing a later move would wait
+    /// on. Every other copy's sources are free at once: a move from the host
+    /// reads host slots, which the next move into them (on the same swap
+    /// stream) or a host write (behind every move still landing) reaches
+    /// only after it; the slot file's moves read inside the call; a move
+    /// within the device runs on the main stream, ahead of everything after.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        let host = |domain| matches!(domain, MemoryDomain::HostPinned);
+        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let parked = device(copy.src) && host(copy.dst);
+        let Some(sink) = self.landed.clone().filter(|_| parked) else {
+            return Ok(true);
+        };
+        let told = self
+            .loaded_mut()?
+            .tell_swaps_landed(Box::new(move || sink(token)))
+            .map_err(fault)?;
+        Ok(!told)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -1255,6 +1351,12 @@ impl Engine for Cuda {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
+        if let Some(id) = binding.channels.iter().find(|id| self.closing.contains(id)) {
+            return Err(Error::Program(format!(
+                "channel {id} is closed: it is kept only for the instances already bound \
+                 on it, and a new instance cannot bind on it"
+            )));
+        }
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -1280,6 +1382,7 @@ impl Engine for Cuda {
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
                     pair: binding.pair.clone(),
+                    pair_generation: binding.pair_generation,
                 },
             )
             .map_err(fault)?;
@@ -1293,6 +1396,9 @@ impl Engine for Cuda {
         };
         if let Some(bound) = bound {
             self.adapters.insert(id, bound);
+        }
+        if !binding.channels.is_empty() {
+            self.attached.insert(id, binding.channels.clone());
         }
         Ok(BoundInstance {
             id,
@@ -1311,11 +1417,27 @@ impl Engine for Cuda {
         // CUDA lays its guests' tables in their pairs' state, which the
         // runtime holds: it keeps none standing.
         shell.close_program_instance(id).map_err(fault)?;
+        // A closed channel this was the last instance on is released now.
+        for channel in self.attached.remove(&id).unwrap_or_default() {
+            if self.closing.contains(&channel) && !self.bound_on(channel) {
+                self.closing.remove(&channel);
+                self.channels.remove(&channel);
+            }
+        }
         Ok(0)
     }
 
+    /// Closes channel `id`. With an instance still bound on it, the channel
+    /// is only marked closing: its registration and slots stay, and a
+    /// rebind of its ring is served, until the last such instance closes
+    /// ([`Engine::close_channel`]).
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.channels.remove(&id);
+        if self.bound_on(id) {
+            self.closing.insert(id);
+        } else {
+            self.closing.remove(&id);
+            self.channels.remove(&id);
+        }
         Ok(())
     }
 
@@ -1437,6 +1559,7 @@ impl Cuda {
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settled = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             let at = engine::StepDone {
                 frame: id,
@@ -1453,16 +1576,43 @@ impl Cuda {
                         shell.trace().facts.plain(word) && !shell.wide(word)
                     })
                 });
-            if let Some((head, _)) = &split
-                && let Err(error) = self.fire_step(head, at, false)
-            {
-                self.pending = None;
-                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                return Err(attributed(error, airborne));
-            }
+            let fired = match &split {
+                // The head's lanes are the step's cut ones, in order.
+                Some((head, _)) => self.fire_step(head, at, false).map(drop).map_err(|error| {
+                    let cut = self
+                        .replay
+                        .map(|replay| {
+                            replay.cut_lanes(step, |word| {
+                                self.shell.as_ref().is_some_and(|shell| {
+                                    shell.trace().facts.plain(word) && !shell.wide(word)
+                                })
+                            })
+                        })
+                        .unwrap_or_default();
+                    of_lanes(error, &cut)
+                }),
+                None => Ok(()),
+            };
             let step = split.as_ref().map_or(step, |(_, tail)| tail);
-            let (ticket, step_settled) = match self.fire_step(step, at, true) {
+            let headed = split.is_some();
+            let fired = fired.and_then(|()| {
+                self.fire_step(step, at, true).map_err(|error| match error {
+                    // Its head's encoder rows ran: the step is not untouched,
+                    // so its lanes' refusal refuses the frame.
+                    Error::Lanes(_) if headed => Error::Invalid(format!(
+                        "{error}, after the step's encoder-only head fired"
+                    )),
+                    other => other,
+                })
+            });
+            let (ticket, step_settled) = match fired {
                 Ok(both) => both,
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
                 Err(error) => {
                     self.pending = None;
                     let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
@@ -1473,7 +1623,7 @@ impl Cuda {
             settled.push(step_settled);
         }
         self.pending = Some((id, settled));
-        Ok(FrameTicket { id, steps })
+        Ok(FrameTicket::of(id, steps, refused))
     }
 
     /// `submission` fired; its completion told the sink where `announce`.
@@ -1515,7 +1665,7 @@ impl Cuda {
                 continue;
             }
             words[at] = shell.adapted_word(words[at]).ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::lane(u32::try_from(at).unwrap_or(u32::MAX), format!(
                     "lane {at} is attached to an instance that bound an adapter, and \
                      this load's model text has no corrected class for its fact word \
                      {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
@@ -1650,12 +1800,15 @@ impl Cuda {
                         .filter(|_| !placed[at])
                         .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     kv_less: lane.kv_less,
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
                         &[]
                     },
+                    write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
@@ -1815,6 +1968,23 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
              opened"
         }
         _ => "`copy_kv` between the domains named, neither of which is this load's own device",
+    }
+}
+
+/// A refusal of a split step's head, its lanes named by the step's lanes
+/// `cut` (the head's lane `i` is the step's lane `cut[i]`).
+fn of_lanes(error: Error, cut: &[u32]) -> Error {
+    match error {
+        Error::Lanes(lanes) => Error::Lanes(
+            lanes
+                .into_iter()
+                .map(|mut fault| {
+                    fault.lane = cut.get(fault.lane as usize).copied().unwrap_or(fault.lane);
+                    fault
+                })
+                .collect(),
+        ),
+        other => other,
     }
 }
 

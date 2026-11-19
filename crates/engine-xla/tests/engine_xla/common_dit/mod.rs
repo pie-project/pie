@@ -713,6 +713,7 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
+                pair_generation: 0,
             })
             .expect("the instance binds")
             .id
@@ -862,11 +863,18 @@ pub fn lanes_read(
 }
 
 pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
+    attach_over(lane, 1, instance)
+}
+
+/// `instance` attached over the fire's lanes `lane..lane + lanes`: the
+/// rows it may read are theirs.
+pub fn attach_over(lane: u32, lanes: u32, instance: InstanceId) -> Attachment {
     Attachment {
         lane,
-        lanes: 1,
+        lanes,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

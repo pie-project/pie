@@ -82,7 +82,13 @@ impl<B: Backend> Run<'_, B> {
                 return;
             };
 
-            if matches!(decl.def, Def::Cache(_)) || matches!(decl.ty, Ty::Struct(_)) {
+            // The mask plane is no row's: the window carries its rows'
+            // entries into it (`window::Gathered::mask_words`).
+            if matches!(
+                decl.def,
+                Def::Cache(_) | Def::Input(poem_ir::RuntimeInput::Mask)
+            ) || matches!(decl.ty, Ty::Struct(_))
+            {
                 return;
             }
             let Ty::Tensor { shape, .. } = &decl.ty else {

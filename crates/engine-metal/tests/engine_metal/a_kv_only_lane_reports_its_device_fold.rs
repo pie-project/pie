@@ -42,7 +42,7 @@ fn const_port(port: Port, words: &[u32]) -> PortBinding {
 
 /// One lane of `ROWS` tokens; with `fold`, a `fold` port stating `FOLD` for
 /// it. The epilogue puts the logits' argmax in a ring.
-fn program(vocab: u32, tokens: &[u32], fold: bool) -> ProgramRegistration {
+pub(super) fn program(vocab: u32, tokens: &[u32], fold: bool) -> ProgramRegistration {
     let logits = OutputDecl {
         name: "logits".into(),
         axis: Axis::Row,
@@ -105,9 +105,15 @@ fn program(vocab: u32, tokens: &[u32], fold: bool) -> ProgramRegistration {
     }
 }
 
-/// Fires one reporting kv-only lane under a program (with or without its
-/// `fold` port) and returns what the completion sink heard.
-fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) -> engine::StepOutcome {
+/// Registers the program (with or without its `fold` port) and binds a
+/// device-geometry instance of it at `slot`'s places.
+pub(super) fn bind_reporting(
+    shell: &mut Shell,
+    vocab: u32,
+    tokens: &[u32],
+    fold: bool,
+    slot: u32,
+) -> engine::InstanceId {
     let program = shell
         .register_program(&program(vocab, tokens, fold))
         .expect("the program registers");
@@ -141,7 +147,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
         ..eta_exec::Extents::default()
     };
     let (scratch, pair) = crate::guest_places(shell, program, &extents, slot);
-    let id = shell
+    shell
         .bind_program(
             program,
             &[],
@@ -153,8 +159,15 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
             &rings,
             &scratch,
             &pair,
+            0,
         )
-        .expect("the device-geometry instance binds");
+        .expect("the device-geometry instance binds")
+}
+
+/// Fires one reporting kv-only lane under a program (with or without its
+/// `fold` port) and returns what the completion sink heard.
+fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) -> engine::StepOutcome {
+    let id = bind_reporting(shell, vocab, tokens, fold, slot);
     shell.open(slot).expect("the slot opens");
     let heard: Arc<Mutex<Vec<engine::StepOutcome>>> = Arc::default();
     let sink: engine::CompletionSink = {

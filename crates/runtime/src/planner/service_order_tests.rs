@@ -37,6 +37,23 @@ fn park_allocation(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey
             notify: Arc::new(Notify::new()),
             outcome: None,
             yielded: false,
+            rise: false,
+        },
+    )
+}
+
+fn park_rise(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey {
+    inner.enqueue(
+        pid,
+        WaitKind::Allocation {
+            demand: Demand {
+                kv_pages,
+                rs: RsUnits::default(),
+            },
+            notify: Arc::new(Notify::new()),
+            outcome: None,
+            yielded: false,
+            rise: true,
         },
     )
 }
@@ -55,12 +72,13 @@ fn park_restore(inner: &mut Inner, pid: ProcessId, kv_pages: u32) -> EntryKey {
 
 #[test]
 fn planner_every_case() {
-    a_restore_yields_the_head_to_a_younger_allocation();
+    an_early_evictee_is_restored_before_a_later_arrival_is_admitted();
     a_restore_takes_the_head_once_the_fleet_has_stalled();
     a_restore_holds_the_head_when_no_allocation_is_unmet();
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters();
     victims_go_youngest_resident_first_under_the_policys_keys();
 }
 
@@ -106,11 +124,44 @@ fn victims_go_youngest_resident_first_under_the_policys_keys() {
     );
 }
 
+/// A rise that cannot fire narrower is a keyed demand of its process: beside
+/// a kv waiter, the older process's ask is served first, whichever it is;
+/// no rise queues anonymously ahead of, or behind, the waiters it starves.
+fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_rise(&mut inner, pids[1], 8);
+    park_allocation(&mut inner, pids[0], 4);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older kv waiter before the younger rise");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: false, .. }
+    ));
+
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_allocation(&mut inner, pids[1], 4);
+    park_rise(&mut inner, pids[0], 8);
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 1, "the older rise before the younger kv waiter");
+    assert!(matches!(
+        waiter.kind,
+        WaitKind::Allocation { rise: true, .. }
+    ));
+}
+
 /// A restore whose role slots found no room is queued again, a waiter: it
 /// is not served on spare pages alone (the room it lacks is not pages),
-/// goes again on a completion's credit, and, the fleet stalled with
-/// nothing completing, has a resident evicted for it. Without the flag the
-/// same spare pages serve it.
+/// goes again on a completion's credit, waits while the fleet decodes (a
+/// completion frees room soon; funding it then thrashed, 3x the wall on the
+/// M1's beam stress), and has room made for its runs (`Evict`, its need
+/// named) once the fleet is stalled, a fleet of processes waiting at binds
+/// included (AMD's 7-minute stall).
 fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     let (mut inner, pids) = fleet(&[
         (1, Residency::Evicted, true),
@@ -122,12 +173,20 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         RestoreGate::Serve,
         "control"
     );
-    inner.procs.get_mut(&pids[0]).unwrap().roles_short = true;
+    inner.procs.get_mut(&pids[0]).unwrap().roles_short = Some(super::proc::PendingBind {
+        run: 3,
+        pieces: 1,
+        pages: 3,
+    });
     assert!(!inner.fleet_stalled());
     assert_eq!(
         inner.restore_gate(pids[0], 64),
-        RestoreGate::Wait,
-        "spare pages are no room"
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: false
+        },
+        "spare pages are no room; the fleet decodes: it goes again only on \
+         free runs of its need, nothing moved for it"
     );
     inner.completion_credit = 1;
     assert_eq!(
@@ -136,24 +195,54 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         "a completion's credit"
     );
     assert_eq!(inner.completion_credit, 0);
-    // The resident waits on an allocation too: nothing will complete, so
-    // it is evicted for the restore.
-    park_allocation(&mut inner, pids[1], 1);
-    assert!(inner.fleet_stalled());
-    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict);
+    // The resident waits at a bind for room: it makes no progress, so the
+    // fleet is stalled and the restore's runs are funded.
+    inner.procs.get_mut(&pids[1]).unwrap().bind_waiting = true;
+    assert!(inner.fleet_waits_at_binds(), "the fleet waits at binds");
+    assert_eq!(
+        inner.restore_gate(pids[0], 0),
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: true
+        }
+    );
 }
 
-fn a_restore_yields_the_head_to_a_younger_allocation() {
+/// Mac Pro's M5 ramp (500 at once): processes evicted in the first minute
+/// waited behind every later arrival and were restored only at the end, or
+/// never. An older restore heads ahead of a younger admission (a prompt
+/// not yet seated), the fleet decoding or not; a seated process's own
+/// growth keeps its turn, or the decoders whose completions free the
+/// restore's room would wait on it.
+fn an_early_evictee_is_restored_before_a_later_arrival_is_admitted() {
     let (mut inner, pids) = fleet(&[
         (1, Residency::Evicted, true),
         (2, Residency::Resident, true),
         (3, Residency::Resident, true),
     ]);
+    // pids[1] decodes, seated; pids[2] is a later arrival, not yet seated.
+    inner.procs.get_mut(&pids[1]).unwrap().seated = true;
     park_restore(&mut inner, pids[0], 18);
     park_allocation(&mut inner, pids[2], 1);
-
+    assert!(!inner.fleet_stalled(), "the fleet decodes");
     let (key, waiter) = inner.unmet_head().expect("a head");
-    assert_eq!(key.0.seq, 3, "the younger allocation must take the head");
+    assert_eq!(key.0.seq, 1, "the early evictee comes back first");
+    assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+
+    // The seated decoder asking for its next page keeps its turn.
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Evicted, true),
+        (2, Residency::Resident, true),
+    ]);
+    let decoder = inner.procs.get_mut(&pids[1]).unwrap();
+    decoder.seated = true;
+    // On its way: a fire of its own in flight.
+    decoder.fires = 1;
+    park_restore(&mut inner, pids[0], 18);
+    park_allocation(&mut inner, pids[1], 1);
+    assert!(!inner.fleet_stalled(), "it decodes");
+    let (key, waiter) = inner.unmet_head().expect("a head");
+    assert_eq!(key.0.seq, 2, "a seated decoder's growth keeps its turn");
     assert!(matches!(waiter.kind, WaitKind::Allocation { .. }));
 }
 
@@ -213,6 +302,11 @@ fn returning_host_room_resumes_the_yield() {
         (2, Residency::Resident, true),
         (3, Residency::Resident, true),
     ]);
+    // pids[2] decodes, seated, a fire in flight: its growth is what the
+    // older restore yields to (a new admission would wait behind it).
+    let decoder = inner.procs.get_mut(&pids[2]).unwrap();
+    decoder.seated = true;
+    decoder.fires = 1;
     park_restore(&mut inner, pids[0], 18);
     park_allocation(&mut inner, pids[2], 1);
     inner.host_swap_blocked.insert(pids[1]);

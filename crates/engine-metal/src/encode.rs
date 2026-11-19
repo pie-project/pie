@@ -77,7 +77,7 @@ pub fn profile_kernels(on: bool) {
 }
 
 #[cfg(target_vendor = "apple")]
-fn profiling() -> bool {
+pub(crate) fn profiling() -> bool {
     crate::diag::on().kernel_profile.on() || PROFILE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -117,7 +117,7 @@ fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-fn record_kernel(name: &str, seconds: f64) {
+pub(crate) fn record_kernel(name: &str, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
     let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     let row = table.entry(name.to_string()).or_insert((0, 0));

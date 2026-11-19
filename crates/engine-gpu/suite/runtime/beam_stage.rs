@@ -154,6 +154,7 @@ fn fired(
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );
@@ -218,7 +219,7 @@ fn fired(
 
 #[test]
 fn a_beam_step_answers_what_the_interpreter_answers() {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
@@ -254,7 +255,7 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,

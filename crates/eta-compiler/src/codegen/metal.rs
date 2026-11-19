@@ -22,15 +22,15 @@ pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;
 pub use singleton::emit_singleton_region;
 pub use streamed::{
-    STEP_NODE, STEP_NODES, StepKind, emit_streamed_region, is_streamed_select,
-    reduce_dispatch_levels, reduce_levels, step_kind, step_node_table, step_value,
-    streamed_step, streamed_temporary_need,
+    STEP_NODE, STEP_NODES, STEP_VIEW, StepKind, StepNodes, emit_streamed_region,
+    is_streamed_select, reduce_dispatch_levels, reduce_levels, step_kind, step_node_table,
+    step_value, streamed_step, streamed_temporary_need,
 };
 pub use streamed_topk::{TOPK_ROW_BYTES, emit_streamed_topk, streamed_topk_temporary_need};
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 66;
+pub const METAL_M1_EMITTER_VERSION: u16 = 72;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

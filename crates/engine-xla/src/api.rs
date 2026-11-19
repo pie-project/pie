@@ -122,6 +122,10 @@ pub struct Xla {
     /// finds the parent's; a device slot copy carries it; leaving the
     /// device with one unsettled is the runtime's to wait out.
     rs_ahead: BTreeMap<u64, u32>,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
     /// What the engine counts while it serves, read by the runtime: a
     /// program a fire waited on (Compiled), a frame or registration
     /// refused (Refused). Never Fallback: a guest runs on the device or is
@@ -159,6 +163,7 @@ impl Xla {
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
             rs_ahead: BTreeMap::new(),
+            written: engine::extent::Written::default(),
             pending: None,
             latches: Vec::new(),
             live: engine::live::Live::armed(),
@@ -224,6 +229,11 @@ fn port_error(error: engine::ports::PortError) -> Error {
 }
 
 pub(crate) fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } | Fault::NoDevice { .. } => {
             Error::Device(fault.to_string())
@@ -250,7 +260,7 @@ pub(crate) fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. }
         | Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }
@@ -372,6 +382,7 @@ impl Xla {
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settles = Vec::with_capacity(frame.steps.len());
         let mut latches = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             let at = engine::StepDone {
                 frame: id,
@@ -386,12 +397,27 @@ impl Xla {
             // position behind: what it noted of where its folds would leave
             // their states goes with it (its latched report is never told).
             let ahead = self.rs_ahead.clone();
+            // Nor any set's written end.
+            let written = self.written.clone();
             let fired = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
                 self.fire_snapshotting(step, &latch)
             } else {
                 self.fire_step(step, &latch)
             };
-            let (ticket, settle) = fired.inspect_err(|_| self.rs_ahead = ahead)?;
+            let (ticket, settle) = match fired.inspect_err(|_| {
+                self.rs_ahead = ahead;
+                self.written = written;
+            }) {
+                Ok(both) => both,
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`); its latch is
+                // never told.
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             // The submitter's hold: the step is done once its passes land.
             latch.release(Ok(()));
             steps.push(ticket);
@@ -399,7 +425,7 @@ impl Xla {
             latches.push(latch);
         }
         self.latches = latches;
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, settles));
         tracing::debug!(frame = id.0, "xla submitted");
         if !self.settles_asynchronously() {
@@ -567,6 +593,8 @@ impl Engine for Xla {
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
             classes: shell.classes(),
+            // XLA states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
@@ -647,6 +675,7 @@ impl Engine for Xla {
             .programs
             .register(registration, device)
             .map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -679,6 +708,7 @@ impl Engine for Xla {
         };
         let Compiled { pending, staged } = *compiled;
         let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -1010,6 +1040,25 @@ impl Engine for Xla {
         Ok(self.loaded_mut()?.weight_uses())
     }
 
+    /// Its copies land inside the call (see [`Engine::copy_slots_landing`]):
+    /// nothing to wait for.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
+    /// Lands inside the call: a move between tiers reads its source slots
+    /// into host memory before it writes anywhere, and a move within the
+    /// device runs as a pool program, ordered ahead of every program (a
+    /// fire, a bind's seeds, a channel's cells) enqueued after it.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
@@ -1122,9 +1171,23 @@ struct DeviceLane {
     /// slot numbering: its stated slots' highest, else what it held and its
     /// rows (`engine::KvWrites::end`).
     end: Option<u32>,
+    /// The slots its rows land at, in its set's own numbering, where its
+    /// program states them.
+    slots: Option<Vec<u32>>,
 }
 
 impl Xla {
+    /// Drops from the device's cache the compiled stages the guest stage
+    /// cache evicted, so their memory is freed with them.
+    fn forget_evicted(&mut self) {
+        let evicted = self.programs.take_evicted();
+        if let Some(shell) = &self.shell {
+            for key in &evicted {
+                shell.device().forget_key(key);
+            }
+        }
+    }
+
     /// Resolves every lane an instance bound in `DeviceGeometry` describes
     /// on its descriptor ports: its tokens, positions, KV extent, the slots
     /// its rows land in (whose page table and write descriptor come from
@@ -1165,6 +1228,15 @@ impl Xla {
                 .map(|lane| lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            let owned = attached.lanes.max(1) as usize;
+            if carried > owned {
+                return Err(program(format!(
+                    "instance {} is attached over {owned} lane(s) at lane {first} and its \
+                     `embed_indptr` port describes {carried}: a program's ports state its own \
+                     lanes' geometry, never the next request's",
+                    attached.instance
+                )));
+            }
             if first + carried > lanes.len() {
                 return Err(program(format!(
                     "instance {} is attached at lane {first} and its `embed_indptr` port \
@@ -1226,6 +1298,13 @@ impl Xla {
                                 .map(|&page| windows.get(page as usize).copied().unwrap_or(0))
                                 .collect::<Vec<u32>>()
                         });
+                        // A row lands only in what the lane may write: below
+                        // its floor is a frozen prefix other sets read, and
+                        // past its reservation is not its own.
+                        if let Some(why) = engine::fire::misplaced_write(lane.kv.writable(), slots)
+                        {
+                            return Err(Error::lane(source as u32, why));
+                        }
                         let writes = (
                             slots
                                 .iter()
@@ -1297,6 +1376,7 @@ impl Xla {
                     mask,
                     window,
                     end,
+                    slots: slots.map(<[u32]>::to_vec),
                 });
             }
         }
@@ -1309,13 +1389,13 @@ impl Xla {
         submission: &engine::fire::Step,
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<()> {
-        let prologues: Vec<(InstanceId, u32)> = submission
+        let prologues: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| {
                 !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
             })
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         if prologues.is_empty() {
             return Ok(());
@@ -1519,6 +1599,59 @@ impl Xla {
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let device = self.device_lanes(submission)?;
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written (`engine::extent`).
+        let kv_shape = self.shell.as_ref().and_then(|shell| shell.pools().kv_shape());
+        let mut extents = engine::extent::FireExtents::default();
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.kv_less {
+                continue;
+            }
+            let set = (lane.kv.set, lane.kv.readable);
+            match device[at].as_ref() {
+                Some(DeviceLane {
+                    have: Some(have),
+                    slots,
+                    tokens,
+                    ..
+                }) => {
+                    let reach = have.saturating_add(tokens.len() as u32);
+                    match slots {
+                        Some(slots) => extents.lane(
+                            &self.written,
+                            at,
+                            lane.slot,
+                            set,
+                            slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                            reach,
+                        ),
+                        None => extents.lane(
+                            &self.written,
+                            at,
+                            lane.slot,
+                            set,
+                            std::iter::once(*have..reach),
+                            reach,
+                        ),
+                    }
+                }
+                Some(_) => {}
+                None if holds_kv(lane, kv_shape) => {
+                    let reach = lane.kv.held.saturating_add(lane.rows());
+                    extents.lane(
+                        &self.written,
+                        at,
+                        lane.slot,
+                        set,
+                        std::iter::once(lane.kv.held..reach),
+                        reach,
+                    );
+                }
+                None => {}
+            }
+        }
+        extents.check().map_err(Error::Program)?;
+        self.written.commit(extents);
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
         let mut resolved_masks: Vec<Option<engine::fire::Masking>> =
             vec![None; submission.lanes.len()];
@@ -1836,11 +1969,11 @@ impl Xla {
             }
         }
 
-        let attached: Vec<(InstanceId, u32)> = submission
+        let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| !attachment.adapter_only)
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {

@@ -45,6 +45,9 @@ pub enum Attn {
     /// selection (`selection`, its run of blocks as `selected` lays them out)
     /// reads only those blocks; a relative bias (`bias`, as `rel` scales it)
     /// adds each key's learned offset; `lse` writes the rows' log-sum-exp.
+    /// `mask` is the fire's [`crate::RuntimeInput::Mask`]: per-lane data,
+    /// each lane's mask or its word stating none, read as
+    /// [`Attn::Prefill`]'s is.
     Decode {
         #[input]
         q: ValueId,
@@ -52,6 +55,8 @@ pub enum Attn {
         plan: ValueId,
         #[input(CACHE)]
         cache: ValueId,
+        #[input]
+        mask: Option<ValueId>,
         #[input(I32)]
         selection: Option<ValueId>,
         #[input(F32)]
@@ -66,7 +71,9 @@ pub enum Attn {
         #[output(F32)]
         lse: Option<ValueId>,
     },
-    /// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`. A
+    /// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`
+    /// (the fire's [`crate::RuntimeInput::Mask`], per-lane data: a lane stating no mask reads
+    /// every key its bounds give, in the same body as a lane stating one). A
     /// selection, a relative bias and `lse` as [`Attn::Decode`]'s; `floor`,
     /// each row's least window position (i32 a row, from
     /// `attn.replay_floor`), below which the window reads no key.

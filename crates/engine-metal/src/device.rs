@@ -11,6 +11,8 @@ pub mod sparse;
 
 pub use alloc::Buffer;
 pub use ctx::{Context, CoresFrom, Pending, present, reservations};
+#[cfg(feature = "fault-injection")]
+pub use ctx::fail_next_frame;
 pub use elastic::Arena as ElasticArena;
 #[cfg(target_vendor = "apple")]
 pub use elastic::Elastic;

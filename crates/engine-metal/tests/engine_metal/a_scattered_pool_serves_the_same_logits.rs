@@ -323,6 +323,16 @@ pub(super) fn load_with(fixture: &Fixture, context: u32) -> Shell {
 /// The shell, its pool's recipe aiming its chunk near `chunk` bytes where
 /// stated.
 pub(super) fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
+    load_ahead(fixture, context, chunk, engine::runahead::Runahead::F1)
+}
+
+/// [`load_near`] keeping `runahead`'s frames in flight.
+pub(super) fn load_ahead(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    runahead: engine::runahead::Runahead,
+) -> Shell {
     let residency = engine_metal::ResidencyPlan::default();
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -337,7 +347,7 @@ pub(super) fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> 
         slots: SEATS,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
+        runahead,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,

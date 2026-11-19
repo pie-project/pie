@@ -64,6 +64,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
+            Fused::ResidualAddRmsnormMatmul { .. } => self.norm_matmul(op),
+            Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. } => self.norm_mlp(op),
             // Kernels this backend does not ship as one: never formed for it,
             // and run as the primitives they stand for where a trace states
             // them.
@@ -535,7 +537,7 @@ impl Run<'_> {
                 | Attn::Prefill {
                     o,
                     lse: Some(lse),
-                    mask: None,
+                    mask: _,
                     selection: None,
                     bias: None,
                     ..

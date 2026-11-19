@@ -66,6 +66,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn max_buffer(&self) -> u64 {
         match self.never {}
     }
@@ -130,6 +135,10 @@ impl Context {
     }
 
     pub fn frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn bind_frame(&self) -> Result<Frame> {
         match self.never {}
     }
 }
@@ -378,6 +387,11 @@ impl Pipelines {
     #[must_use]
     pub fn new() -> Pipelines {
         Pipelines::default()
+    }
+
+    #[must_use]
+    pub fn bound(&self) -> u64 {
+        0
     }
 
     #[must_use]

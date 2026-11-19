@@ -20,6 +20,13 @@ pub(super) const RESERVE_SHARE: u32 = 32;
 
 #[derive(Default)]
 pub(super) struct Inner {
+    /// The process suspended for a bind whose restore was served and that
+    /// has not fired since: one at a time. Restored together, each took its
+    /// items back and every bind came up short against the others' (the M1
+    /// stress: ten processes suspended, restored and short in turn, 190
+    /// times each); restored alone, a bind competes only with the
+    /// residents.
+    pub(super) bind_restoring: Option<ProcessId>,
     pub(super) next_seq: u64,
     next_id: u64,
     pub(super) procs: HashMap<ProcessId, Proc>,
@@ -63,11 +70,13 @@ impl Inner {
     /// of a process such a bind suspended ([`super::proc::Proc::bind_room`]).
     pub(super) fn room_pages(&self, waiter: &super::wait::Waiter) -> u32 {
         let pending = match waiter.kind {
-            WaitKind::Restore { .. } => self
-                .procs
-                .get(&waiter.pid)
-                .and_then(|proc| proc.bind_room)
-                .map_or(0, |need| need.pages),
+            // A bind its suspension waits for, or role slots its last
+            // unpark was short of: pages that, moved out, free their chunks.
+            WaitKind::Restore { .. } => self.procs.get(&waiter.pid).map_or(0, |proc| {
+                let bind = proc.bind_room.map_or(0, |need| need.pages);
+                let roles = proc.roles_short.map_or(0, |need| need.pages);
+                bind.max(roles)
+            }),
             _ => 0,
         };
         waiter.room_pages().max(pending)
@@ -297,7 +306,20 @@ impl Inner {
         }
         let head = match (allocation, oldest_restore) {
             (Some(allocation), Some(restore)) => {
-                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
+                // An older restore comes back ahead of new work: the
+                // admission of a prompt not yet seated waits behind it
+                // (Mac Pro's M5: processes evicted in the ramp waited
+                // behind every later arrival, then froze the tail). A seated
+                // process's own growth keeps its turn, or the decoders whose
+                // completions free the restore's room would wait on it.
+                let admits_new = self
+                    .queue
+                    .get(&allocation)
+                    .and_then(|waiter| self.procs.get(&waiter.pid))
+                    .is_some_and(|proc| !proc.seated);
+                if restore < allocation
+                    && (admits_new || self.fleet_stalled() || self.eviction_unfundable())
+                {
                     restore
                 } else {
                     allocation
@@ -419,20 +441,29 @@ impl Inner {
     /// each resident lane's next one: suspended processes come back as
     /// soon as room appears, every one it holds at once, not one a
     /// completion. One whose role slots found no room last time
-    /// ([`super::proc::Proc::roles_short`]) goes again only once a
-    /// completion frees some, or, the fleet stalled, an eviction makes it.
+    /// ([`super::proc::Proc::roles_short`]) waits while the fleet decodes
+    /// (a completion frees room; funding it then thrashed), and once the
+    /// fleet is stalled (a fleet waiting at binds included) has room made
+    /// for its runs: idle cache, a coming grow, then the occupants of the
+    /// chunks it could take.
     pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
-        let roles_short = self.procs.get(&pid).is_some_and(|proc| proc.roles_short);
+        let roles_short = self.procs.get(&pid).and_then(|proc| proc.roles_short);
         if self.completion_credit > 0 {
             self.completion_credit -= 1;
             return RestoreGate::Serve;
         }
         let stalled = self.fleet_stalled();
-        if roles_short {
-            return if stalled {
-                RestoreGate::Evict
-            } else {
-                RestoreGate::Wait
+        // Short of runs for its roles: it goes again on runs that stand
+        // free whatever the fleet does (the plan looks, outside this lock);
+        // room is made for it by moving others only once the fleet is
+        // stalled or waits at binds. Waiting for a completion while its
+        // runs stood free, it waited on an event that need not come (Mac
+        // Pro's beam mix: 2 runs of 4 short, 440 such runs free, flat for
+        // 191 s with every thread parked).
+        if let Some(need) = roles_short {
+            return RestoreGate::Evict {
+                need: (need.run, need.pieces),
+                fund: stalled || self.fleet_waits_at_binds(),
             };
         }
         if spare < self.growth_reserve() && !stalled {
@@ -449,8 +480,30 @@ impl Inner {
         };
         let pid = waiter.pid;
         if let Some(proc) = self.procs.get_mut(&pid) {
-            proc.roles_short = false;
+            proc.roles_short = None;
         }
+    }
+
+    /// No resident process makes progress save through room: each is
+    /// stalled as [`Self::fleet_stalled`] counts it, or waits at a bind for
+    /// room (AMD's 7-minute stall: 143 processes at a bind, the restore
+    /// head short of role slots never funded). Read only where a restore
+    /// short of role slots asks whether to wait for a completion: a bind
+    /// waiter is no wedge for the starvation verdict, which may still
+    /// move it.
+    pub(super) fn fleet_waits_at_binds(&self) -> bool {
+        self.evicting.is_empty()
+            && self.procs.values().any(|proc| proc.bind_waiting)
+            && self.procs.iter().all(|(pid, proc)| match proc.state {
+                Residency::Resident => {
+                    !proc.admitted
+                        || proc.idle
+                        || proc.bind_waiting
+                        || (self.queue.values().any(|waiter| waiter.pid == *pid) && !proc.firing())
+                }
+                Residency::Evicting | Residency::Restoring => false,
+                Residency::Evicted => true,
+            })
     }
 
     pub(super) fn fleet_stalled(&self) -> bool {
@@ -485,9 +538,10 @@ impl Inner {
 pub(super) enum RestoreGate {
     Serve,
     Wait,
-    /// Its role slots wait on room nothing else will free: a resident
-    /// process is evicted for it.
-    Evict,
+    /// Its role slots are short of `need`, `(run, pieces)` runs of whole
+    /// chunks: it goes again where they stand free, and (`fund`) room is
+    /// made for it ([`Step::EvictForRoles`](super::plan)).
+    Evict { need: (u32, u32), fund: bool },
 }
 
 /// Off the device, a handle at rest aside: it cannot fire until restored.

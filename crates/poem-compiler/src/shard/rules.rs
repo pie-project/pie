@@ -291,10 +291,10 @@ pub(super) fn rule(op: &Operation) -> Rule {
     if let Operation::Attn(Attn::ScoreCapture { .. }) = op {
         return Rule::Scores;
     }
-    // A page's sum of a key row a rank holds a term of is that page's term.
-    if let Operation::Attn(Attn::ScorePages { .. }) = op {
-        return Rule::Linear { follow: &["keys"] };
-    }
+    // A page's sum reads its key row whole: the row is reduced once, for
+    // `attn.scores` and the page sums alike, and each rank sums its pages.
+    // (No `Linear` rule: that would leave the pages a second partial sum to
+    // reduce.)
     let name = op.name();
     match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {

@@ -377,7 +377,10 @@ impl Sink<'_> {
                                 .read(at, &mut bytes[..len as usize])
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
                             let staged_len = bytes.len() as u64;
-                            let (chunk, slot) = self.frame.scratch_slot(staged_len);
+                            let (chunk, slot) = self
+                                .frame
+                                .scratch_slot(staged_len)
+                                .map_err(|fault| Sink::refuse(fire, fault))?;
                             core.queue.write_buffer(&chunk, slot, &bytes);
                             scratch_views += 1;
                             STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -388,7 +391,10 @@ impl Sink<'_> {
                     let len = remaining
                         .next_multiple_of(4)
                         .min(binding.buffer().slab().size.saturating_sub(at) & !3);
-                    let (chunk, slot) = self.frame.scratch_slot(len);
+                    let (chunk, slot) = self
+                        .frame
+                        .scratch_slot(len)
+                        .map_err(|fault| Sink::refuse(fire, fault))?;
                     self.frame
                         .encode(|encoder| {
                             encoder.copy_buffer_to_buffer(&source, at, &chunk, slot, len);
@@ -478,48 +484,45 @@ impl Sink<'_> {
             .map(|(buffer, offset, size, _)| (buffer.clone(), *offset, *size))
             .collect();
         let uniform_bytes = u64::from(pipeline.push_bytes.max(rounded).max(16));
+        if self.frame.bind_only {
+            // A load's bind walk: the group a dispatch over these views binds
+            // is built and kept; nothing is encoded. A fire whose views go
+            // through scratch binds a group of its own frame's either way.
+            if scratch_views == 0 {
+                self.pipelines
+                    .bind_group(core, &pipeline, &keyed, uniform_bytes)
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
+            }
+            return Ok(());
+        }
         let group = if scratch_views == 0 {
             self.pipelines
-                .bind_group(core, &pipeline, &keyed, &words, uniform_bytes)
+                .bind_group(core, &pipeline, &keyed, uniform_bytes)
         } else {
-            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(declared + 1);
-            for (at, (buffer, offset, size, _)) in views.iter().enumerate().take(declared) {
-                if !pipeline.used[at] {
-                    continue;
-                }
-                entries.push(wgpu::BindGroupEntry {
-                    binding: at as u32,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer,
-                        offset: *offset,
-                        size: std::num::NonZeroU64::new(*size),
-                    }),
-                });
-            }
-            let uniform;
-            if let Some(binding) = pipeline.uniform {
-                let (chunk, at) = self.frame.uniform_slot(uniform_bytes);
-                let mut padded = words.clone();
-                padded.resize(uniform_bytes as usize, 0);
-                core.queue.write_buffer(&chunk, at, &padded);
-                uniform = (chunk, at, uniform_bytes);
-                entries.push(wgpu::BindGroupEntry {
-                    binding,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &uniform.0,
-                        offset: uniform.1,
-                        size: std::num::NonZeroU64::new(uniform.2),
-                    }),
-                });
-            }
-            core.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(name),
-                layout: &pipeline.layout,
-                entries: &entries,
-            })
-        };
-        core.take_error("create_bind_group")
-            .map_err(|fault| Sink::refuse(fire, fault))?;
+            // Its scratch views are this frame's: a group of its own.
+            self.pipelines.note_scratch_group();
+            crate::device::pipelines::group_of(core, &pipeline, &keyed, uniform_bytes)
+        }
+        .map_err(|fault| Sink::refuse(fire, fault))?;
+        // The scalars in this frame's slot, the group reading them there.
+        let mut offsets: Vec<u32> = Vec::with_capacity(1);
+        if pipeline.uniform.is_some() {
+            let (_, at) = self
+                .frame
+                .uniform_slot(uniform_bytes)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            let mut padded = words.clone();
+            padded.resize(uniform_bytes as usize, 0);
+            self.frame
+                .write_uniform(at, &padded)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            offsets.push(u32::try_from(at).map_err(|_| {
+                Sink::backend(
+                    fire,
+                    format!("a uniform slot at byte {at} is past a u32 offset"),
+                )
+            })?);
+        }
 
         let key = label(name, fire, args);
         if let Some((set, at)) = timing().then(|| self.frame.timestamp_slot(&key)).flatten() {
@@ -534,13 +537,13 @@ impl Sink<'_> {
                         }),
                     });
                     pass.set_pipeline(&pipeline.pipeline);
-                    pass.set_bind_group(0, &group, &[]);
+                    pass.set_bind_group(0, &group, &offsets);
                     pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
                 })
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch(name, &pipeline.pipeline, &group, groups)
+                .dispatch_at(name, &pipeline.pipeline, &group, &offsets, groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         if !staged.is_empty() {

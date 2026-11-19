@@ -166,15 +166,19 @@ fn fa2_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
     rel: Option<RelBias>,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
     fa2_decode_with(
-        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, rel, None,
+        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, rel, None, mask,
     )
     .map(|_| ())
 }
 
 /// [`fa2_decode`], handing the split's fold `sinks` to land in the same
 /// pass; `Ok(true)` where it did, `Ok(false)` where the caller owes them.
+/// With `mask` (the fire's mask bits, the plan binding each request's
+/// offset and word), each request reads its own mask or, stating none,
+/// every key.
 #[allow(clippy::too_many_arguments)]
 fn fa2_decode_with(
     ctx: &Ctx,
@@ -189,6 +193,7 @@ fn fa2_decode_with(
     lse: Option<&mut Tensor>,
     rel: Option<RelBias>,
     sinks: Option<Tensor>,
+    mask: Option<Tensor>,
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
@@ -226,8 +231,23 @@ fn fa2_decode_with(
         lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
         bufs.lse = lse.ptr;
     }
-    let (params, split) =
+    let (mut params, split) =
         make_decode_params(plan, &bufs, window_left, NO_SOFT_CAP, sm_scale, false);
+    if let Some(bits) = mask {
+        debug_assert_eq!(bits.dtype, Dtype::U8, "`{op}` reads packed u8 mask bits");
+        let (Some(indptr), Some(origin)) = (plan.mask_indptr, plan.mask_origin) else {
+            return Err(refuse(
+                op,
+                "no mask offsets ride this decode plan; the engine binds them at plan build",
+            ));
+        };
+        if rel.is_some() {
+            return Err(refuse(op, "the relative-bias decode arm reads no mask"));
+        }
+        params.maybe_custom_mask = bits.ptr;
+        params.maybe_mask_indptr = indptr.ptr;
+        params.maybe_mask_origin = origin.ptr;
+    }
     let point = |arm| fa2::DecodePoint {
         head_dim: plan.shape.head_dim,
         group_size: plan.shape.group_size(),
@@ -258,7 +278,12 @@ fn fa2_decode_with(
             }
         }
         None => {
-            let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
+            let arm = match mask {
+                Some(_) => {
+                    fa2::decode_masked_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP)
+                }
+                None => fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP),
+            };
             fa2::decode(ctx, op, point(arm), &params)?;
         }
         Some(rel) => {
@@ -402,9 +427,10 @@ fn fa2_prefill_with(
             params.maybe_mask_origin = origin.ptr;
         }
     }
-    // Unsplit rows land their sinks in the kernel's epilogue (no sink pass after).
-    let sunk = sinks
-        .filter(|s| s.dtype == o.dtype && !plan.info.split_kv && mask.is_none() && rel.is_none());
+    // Unsplit rows land their sinks in the kernel's epilogue (no sink pass
+    // after), the masked arm's as the plain one's: a lane stating no mask
+    // answers there what it answers in the plain arm.
+    let sunk = sinks.filter(|s| s.dtype == o.dtype && !plan.info.split_kv && rel.is_none());
     if let Some(s) = sunk {
         params.maybe_sinks = s.ptr;
     }
@@ -490,11 +516,12 @@ pub fn decode(
     head_dim: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
-        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, mask,
     )
 }
 
@@ -509,6 +536,7 @@ pub fn decode_lse(
     sm_scale: f32,
     o: &mut Tensor,
     lse: &mut Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
@@ -524,6 +552,7 @@ pub fn decode_lse(
         o,
         Some(lse),
         None,
+        mask,
     )
 }
 
@@ -560,6 +589,7 @@ pub fn decode_lse_sink(
     o: &mut Tensor,
     lse: &mut Tensor,
     sinks: Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "fused.lse_sink";
     plan.accepts(OP, head_dim, window)?;
@@ -576,6 +606,7 @@ pub fn decode_lse_sink(
         Some(&mut *lse),
         None,
         Some(sinks),
+        mask,
     )?;
     if landed {
         return Ok(());
@@ -597,9 +628,14 @@ pub fn prefill_lse_sink(
     o: &mut Tensor,
     lse: &mut Tensor,
     sinks: Tensor,
+    mask: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "fused.lse_sink";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
+    let mask = match mask {
+        Some(bits) => Some((bits, mask_offsets(OP, plan)?)),
+        None => None,
+    };
     let landed = fa2_prefill_with(
         ctx,
         OP,
@@ -611,7 +647,7 @@ pub fn prefill_lse_sink(
         sm_scale,
         o,
         Some(&mut *lse),
-        None,
+        mask,
         None,
         Some(sinks),
     )?;
@@ -652,6 +688,16 @@ pub fn prefill_lse(
     )
 }
 
+/// The plan's table of each request's byte offset into the fire's masks.
+fn mask_offsets(op: &'static str, plan: &PrefillPlan) -> Result<Tensor, Error> {
+    plan.mask_indptr.ok_or_else(|| {
+        refuse(
+            op,
+            "no mask span table rides this prefill plan; the engine binds one at plan build",
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx,
@@ -667,12 +713,7 @@ pub fn masked(
     const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
-    let Some(mask_indptr) = plan.mask_indptr else {
-        return Err(refuse(
-            OP,
-            "no mask span table rides this prefill plan; the engine binds one at plan build",
-        ));
-    };
+    let mask_indptr = mask_offsets(OP, plan)?;
     fa2_prefill(
         ctx,
         OP,
@@ -705,12 +746,7 @@ pub fn masked_lse(
     const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
-    let Some(mask_indptr) = plan.mask_indptr else {
-        return Err(refuse(
-            OP,
-            "no mask span table rides this prefill plan; the engine binds one at plan build",
-        ));
-    };
+    let mask_indptr = mask_offsets(OP, plan)?;
     fa2_prefill(
         ctx,
         OP,
@@ -790,6 +826,7 @@ pub fn decode_rel(
         o,
         None,
         Some(rel),
+        None,
     )
 }
 

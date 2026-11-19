@@ -300,12 +300,14 @@ impl ResidencyPlanner {
                     demand,
                     outcome: None,
                     yielded: false,
+                    rise,
                     ..
                 } = &waiter.kind
                 else {
                     continue;
                 };
-                if demand.is_zero() {
+                // A rise's pages are given back at once: no ask it holds.
+                if demand.is_zero() || *rise {
                     continue;
                 }
                 match asking.iter_mut().find(|(pid, ..)| *pid == waiter.pid) {
@@ -398,13 +400,17 @@ impl ResidencyPlanner {
                 demand,
                 notify,
                 outcome,
+                rise,
                 ..
             } = &mut waiter.kind
             else {
                 return None;
             };
             let need = demand.kv_pages;
-            if outcome.is_some() || need.saturating_add(held) <= total {
+            // A rise moves the requester's own pages, holding none past its
+            // grant: what one process holds the load seats beside the
+            // largest rung, so a rise is no hog.
+            if outcome.is_some() || *rise || need.saturating_add(held) <= total {
                 return None;
             }
             *outcome = Some(Err(PlannerError::Hog { need, held, total }));

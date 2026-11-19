@@ -45,6 +45,14 @@ pub struct GatheredTable {
     pub kv_len: Tensor,
 }
 
+/// What a copied window carries beside its bf16 and f32 token rows
+/// (`dispatch::copy`): each gathered row's mask word and mask row, and the
+/// integer token rows a region only reads (its row gather moves i32).
+pub const CARRIES: fallback::Carries = fallback::Carries {
+    masks: true,
+    read_ints: true,
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Copies<'a> {
     pub bucket: u32,
@@ -237,7 +245,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && fallback::copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask, CARRIES)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;

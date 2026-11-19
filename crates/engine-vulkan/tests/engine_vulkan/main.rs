@@ -77,6 +77,7 @@ mod gather;
 mod gpu;
 #[path = "../../../engine-gpu/suite/linear/mod.rs"]
 mod linear;
+mod replay;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]

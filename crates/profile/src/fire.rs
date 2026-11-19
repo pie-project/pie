@@ -23,6 +23,10 @@
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
 //! few_row_tflops = 4.2     # bf16 matmul TFLOP/s at 4-256 rows, as served
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
+//! # each tiled kernel's TFLOP/s by rows below its full fill, keyed by its row tile
+//! tile_tflops_by_rows = [[32, [[8, 1.0], [256, 9.0]]], [256, [[8, 0.2], [256, 12.0]]]]
+//! # each vector kernel's TFLOP/s by rows, keyed by the rows a workgroup carries
+//! vector_tflops_by_rows = [[1, [[1, 0.3], [256, 2.0]]], [16, [[1, 0.1], [256, 6.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -50,6 +54,10 @@ pub struct Rates {
     pub attn_tflops_by_keys: Option<Vec<(u32, f64)>>,
     /// Device memory GB/s, achieved by a streaming copy (read plus write).
     pub hbm_gbps: Option<f64>,
+    /// GB/s of reads the last-level caches serve: every workgroup reading a
+    /// small set the others read too, as a normed skinny product's
+    /// workgroups read its rows (what such a fold's redundant reads cost).
+    pub cached_gbps: Option<f64>,
     /// GB/s the per-row ops (a norm, the gated activation) achieve as a
     /// fire runs them.
     pub elementwise_gbps: Option<f64>,
@@ -59,7 +67,8 @@ pub struct Rates {
     /// Dense bf16 matmul TFLOP/s (two flops a multiply-add) at decode-shaped
     /// rows, 4 to 256 (below the first row count `gemm_tflops_by_rows`
     /// times), on the kernel serving picks at those rows (on the slang
-    /// backends the plain tiled `linear_gemm_tiled_bf16`): the rate its
+    /// backends the vector kernels, which a rung takes where the estimate
+    /// weighs them faster): the rate its
     /// compute runs at once its weight reads no longer bound it, its flops
     /// counted over the rows its kernel's tile pads to. A matmul of that few
     /// rows costs `launch_ns + max(bytes / hbm_gbps, padded flops /
@@ -79,18 +88,34 @@ pub struct Rates {
     /// `S = W · t / t_full`, over the cores. A real number of workgroups a
     /// unit.
     pub workgroups_per_core: Option<f64>,
+    /// Each tiled matmul kernel's bf16 TFLOP/s by rows below the matmul
+    /// curve's, its flops counted at the rows it lands (not its tile's):
+    /// `(row tile, [(rows, TFLOP/s)])`, ascending in row tile, keyed by the
+    /// rows one tile of the kernel computes (the slang backends' tiles).
+    /// What a matmul of few rows costs on each tiled kernel, so a choice
+    /// between them and the vector kernels weighs measured costs at partial
+    /// fill. Measured.
+    pub tile_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    /// Each vector matmul kernel's bf16 TFLOP/s by rows, its flops at the
+    /// rows it lands over its time (its weight passes in it): `(rows a
+    /// workgroup carries, [(rows, TFLOP/s)])`, ascending in the rows a
+    /// workgroup carries (the slang backends' vector kernels). Measured.
+    pub vector_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 11] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
+    "cached_gbps",
     "elementwise_gbps",
     "scan_gelems",
     "few_row_tflops",
     "workgroups_per_core",
+    "tile_tflops_by_rows",
+    "vector_tflops_by_rows",
 ];
 
 impl Rates {
@@ -102,10 +127,13 @@ impl Rates {
             gemm_tflops_by_rows: self.gemm_tflops_by_rows.or(below.gemm_tflops_by_rows),
             attn_tflops_by_keys: self.attn_tflops_by_keys.or(below.attn_tflops_by_keys),
             hbm_gbps: self.hbm_gbps.or(below.hbm_gbps),
+            cached_gbps: self.cached_gbps.or(below.cached_gbps),
             elementwise_gbps: self.elementwise_gbps.or(below.elementwise_gbps),
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
+            tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
+            vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
         }
     }
 
@@ -129,12 +157,21 @@ impl Rates {
                 .clone()
                 .filter(|_| has("attn_tflops_by_keys")),
             hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
+            cached_gbps: self.cached_gbps.filter(|_| has("cached_gbps")),
             elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
             scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
             few_row_tflops: self.few_row_tflops.filter(|_| has("few_row_tflops")),
             workgroups_per_core: self
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
+            tile_tflops_by_rows: self
+                .tile_tflops_by_rows
+                .clone()
+                .filter(|_| has("tile_tflops_by_rows")),
+            vector_tflops_by_rows: self
+                .vector_tflops_by_rows
+                .clone()
+                .filter(|_| has("vector_tflops_by_rows")),
         }
     }
 
@@ -148,10 +185,13 @@ impl Rates {
             "gemm_tflops_by_rows" => self.gemm_tflops_by_rows.is_none(),
             "attn_tflops_by_keys" => self.attn_tflops_by_keys.is_none(),
             "hbm_gbps" => self.hbm_gbps.is_none(),
+            "cached_gbps" => self.cached_gbps.is_none(),
             "elementwise_gbps" => self.elementwise_gbps.is_none(),
             "scan_gelems" => self.scan_gelems.is_none(),
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
+            "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
+            "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -170,17 +210,20 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
-        if let Some(widths) = &self.gemm_tflops_by_rows {
-            let curves: Vec<String> = widths
-                .iter()
-                .map(|(w, c)| {
-                    let points: Vec<String> =
-                        c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
-                    format!("  [{w}, [{}]],\n", points.join(", "))
-                })
-                .collect();
-            let _ = writeln!(out, "gemm_tflops_by_rows = [\n{}]", curves.concat());
-        }
+        let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
+            if let Some(keyed) = v {
+                let curves: Vec<String> = keyed
+                    .iter()
+                    .map(|(w, c)| {
+                        let points: Vec<String> =
+                            c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
+                        format!("  [{w}, [{}]],\n", points.join(", "))
+                    })
+                    .collect();
+                let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
+            }
+        };
+        keyed(&mut out, "gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
         let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
             if let Some(points) = v {
                 let points: Vec<String> = points
@@ -197,10 +240,17 @@ impl Rates {
             }
         };
         float("hbm_gbps", self.hbm_gbps);
+        float("cached_gbps", self.cached_gbps);
         float("elementwise_gbps", self.elementwise_gbps);
         float("scan_gelems", self.scan_gelems);
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
+        keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
+        keyed(
+            &mut out,
+            "vector_tflops_by_rows",
+            &self.vector_tflops_by_rows,
+        );
         out
     }
 }
@@ -269,6 +319,10 @@ pub struct Tuned {
     /// one submission (`max_submit_ms`) before it settled
     /// (`engine::rates::timed_frames`).
     pub frame_cut: bool,
+    /// A checked-in layer this device takes that states a `[rates]` key
+    /// this pie does not read (`<file>: <key>`): the layer was refused, and
+    /// a load refuses by it rather than run without the file.
+    pub refused: Option<String>,
 }
 
 impl Tuned {
@@ -278,6 +332,7 @@ impl Tuned {
         self.measured_this_load |= upper.measured_this_load;
         self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
         self.frame_cut |= upper.frame_cut;
+        self.refused = upper.refused.clone().or(self.refused.take());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -301,21 +356,25 @@ mod tests {
             rates: Rates {
                 gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(2.0),
+                cached_gbps: None,
                 ..Rates::default()
             },
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
+            refused: None,
         };
         let up = Tuned {
             rates: Rates {
                 hbm_gbps: Some(3.0),
+                cached_gbps: None,
                 launch_ns: Some(7),
                 ..Rates::default()
             },
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
+            refused: None,
         };
         low.lay(&up);
         assert_eq!(
@@ -323,6 +382,7 @@ mod tests {
             Rates {
                 gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(3.0),
+                cached_gbps: None,
                 launch_ns: Some(7),
                 ..Rates::default()
             }
@@ -340,23 +400,32 @@ mod tests {
             ]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
             hbm_gbps: Some(654.4),
+            cached_gbps: Some(28800.0),
             elementwise_gbps: Some(450.0),
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
             rates.only(&KEYS[..6]).missing(&KEYS),
-            ["few_row_tflops", "workgroups_per_core"]
+            [
+                "scan_gelems",
+                "few_row_tflops",
+                "workgroups_per_core",
+                "tile_tflops_by_rows",
+                "vector_tflops_by_rows"
+            ]
         );
         assert_eq!(
             rates.toml(),
             "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
-             elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\n"
+             cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
+             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
         );
     }
 

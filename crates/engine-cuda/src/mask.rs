@@ -27,9 +27,12 @@ pub struct Staged {
     pub origins: Vec<u32>,
 }
 
-/// The most a boundary can be in a lane's word.
+/// The most a boundary can be in a lane's word, past every key a lane holds.
 const ORIGIN_MAX: u32 = u32::MAX >> 1;
 const WIDE: u32 = 1 << 31;
+/// The word of a lane stating no mask: its boundary past every key, so its
+/// rows read no bit.
+pub const NONE: u32 = ORIGIN_MAX;
 
 /// The offset a lane's mask ends at, as the kernels read it: 64-bit, so
 /// any fire's masks have one.
@@ -45,7 +48,7 @@ fn mask_offset(bytes: usize, lane: usize) -> Result<i64> {
 fn word(origin: u64, wide: bool, lane: usize) -> Result<u32> {
     let origin = u32::try_from(origin)
         .ok()
-        .filter(|&origin| origin <= ORIGIN_MAX)
+        .filter(|&origin| origin < ORIGIN_MAX)
         .ok_or_else(|| {
             Fault::program(
                 "mask",
@@ -58,8 +61,11 @@ fn word(origin: u64, wide: bool, lane: usize) -> Result<u32> {
     Ok(origin | if wide { WIDE } else { 0 })
 }
 
-pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
+/// A fire's masks, where some lane's class reads them (`reads`) or a lane
+/// attends both ways: every lane states its entry, a lane with no mask the
+/// word [`NONE`].
+pub fn stage(lanes: &[LaneMask<'_>], reads: bool) -> Result<Option<Staged>> {
+    if !reads && lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
         return Ok(None);
     }
     let mut bits: Vec<u8> = Vec::new();
@@ -73,12 +79,9 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         // then its own rows.
         let extent = buffer + u64::from(lane.rows);
         match lane.mask {
-            // A lane with no mask in a masked fire reads every key it holds
-            // under the causal bound: all of them committed, as far as the
-            // kernel asks.
-            None if !lane.wide => {
-                origins.push(word(u64::from(lane.have) + u64::from(lane.rows), false, at)?);
-            }
+            // A lane with no mask reads every key it holds under the causal
+            // bound: all of them committed, whatever it holds.
+            None if !lane.wide => origins.push(NONE),
             None => {
                 origins.push(word(u64::from(folded), true, at)?);
                 let cells = u64::from(lane.rows) * extent;
@@ -210,10 +213,10 @@ mod tests {
                 rows: 1,
                 wide: false,
             },
-        ])
+        ], true)
         .unwrap()
         .unwrap();
-        assert_eq!(staged.origins, vec![10, 6], "the boundary; all six committed");
+        assert_eq!(staged.origins, vec![10, NONE], "the boundary; none stated");
         assert_eq!(staged.indptr, vec![0, 1, 1], "eight bits, and none for the plain lane");
         for q in 0..2u64 {
             for c in 0..4u64 {
@@ -227,7 +230,7 @@ mod tests {
             folded: 10,
             rows: 2,
             wide: true,
-        }])
+        }], true)
         .unwrap()
         .unwrap();
         assert_eq!(wide.origins, vec![10 | WIDE]);
@@ -238,7 +241,7 @@ mod tests {
             folded: 10,
             rows: 2,
             wide: false,
-        }]);
+        }], true);
         assert!(
             matches!(refused, Err(Fault::Mask { stated: 3, extent: 4, .. })),
             "{refused:?}"
@@ -253,7 +256,7 @@ mod tests {
             folded: 0,
             rows: 3,
             wide: false,
-        }])
+        }], true)
         .expect("the mask covers the lane's extent")
         .expect("a masked fire stages bits");
         for q in 0..3u64 {
@@ -279,7 +282,7 @@ mod tests {
             folded: 0,
             rows: N as u32,
             wide: false,
-        }])
+        }], true)
         .expect("every row covers the lane's extent")
         .expect("a masked fire stages bits");
         assert_eq!(staged.indptr, vec![0, 5], "36 cells is five bytes");
@@ -302,7 +305,7 @@ mod tests {
             folded: 0,
             rows: 1,
             wide: false,
-        }]);
+        }], true);
         assert!(
             matches!(
                 refused,
@@ -333,7 +336,7 @@ mod tests {
                 rows: 3,
                 wide: true,
             },
-        ])
+        ], true)
         .expect("both lanes cover their extent")
         .expect("a wide fire stages bits");
         for q in 0..3u64 {

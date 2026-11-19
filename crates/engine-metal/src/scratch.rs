@@ -359,7 +359,13 @@ impl Scratch {
             .max(register.map_or(0, |r| r.grids.at + r.grids.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
-        let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
+        // A copy carries each gathered row's mask word and mask row where a
+        // fire can stage masks (`dispatch::copy`): a row of every key, a
+        // whole number of words (`mask::stage`).
+        let mask_row = stages_masks(trace).then(|| {
+            (u64::from(paging.pages_per_slot) * u64::from(paging.page_size)).next_multiple_of(4)
+        });
+        let copy = copy_ceiling(trace, compiled, budget, mask_row).map(|bytes| CopyRoom {
             at: union.next_multiple_of(ALIGN),
             bytes,
         });
@@ -613,7 +619,29 @@ impl Scratch {
     }
 }
 
-fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Option<u64> {
+/// Whether a fire on `trace` can stage masks (`mask::stage`): an attention
+/// reads the fire's masks, or attends both ways.
+fn stages_masks(trace: &Trace) -> bool {
+    trace.nodes.iter().any(|node| {
+        matches!(
+            &node.op,
+            Operation::Attn(
+                poem_ir::Attn::Prefill { mask: Some(_), .. }
+                    | poem_ir::Attn::Prefill { causal: false, .. }
+                    | poem_ir::Attn::Decode { mask: Some(_), .. }
+            )
+        )
+    })
+}
+
+/// The copy role's bytes: the largest copied region's token rows, and, where
+/// `mask_row` is stated, each row's mask row of that many bytes and its word.
+fn copy_ceiling(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    budget: &Budget,
+    mask_row: Option<u64>,
+) -> Option<u64> {
     let lanes = u64::from(budget.max_lanes);
     let mut most = 0u64;
     for region in compiled.template() {
@@ -634,7 +662,7 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                     .then_some(budget.max_tokens)
             });
         let Some(rows) = rows else { continue };
-        if !fallback::copyable_mask(trace, compiled, &region.mask) {
+        if !fallback::copyable_mask(trace, compiled, &region.mask, crate::window::CARRIES) {
             continue;
         }
         let Some((ins, outs)) = fallback::operands(&trace.nodes, region) else {
@@ -665,6 +693,10 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
             seen.push(rect.offset);
             let row = u64::from(rect.width) * rect.dtype.bytes_ceil();
             at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * row;
+        }
+        if let Some(mask_row) = mask_row {
+            at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * mask_row;
+            at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * 4;
         }
         most = most.max(at);
     }

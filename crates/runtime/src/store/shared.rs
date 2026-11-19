@@ -62,7 +62,7 @@ use super::slots::{
     Demand, Holder, RungEvacuation, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
     SlotShape,
 };
-use crate::governor::{Demand as Asked, Growth};
+use crate::governor::Growth;
 
 /// The pool behind an engine's stores, shared by every store and the
 /// governor; each call takes the lock for itself, innermost of every store
@@ -319,9 +319,16 @@ pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
 /// is cut at the raised width from its first piece. A cap the walker
 /// lowered behind a rung still up is lifted back to it.
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
+    // Read before the pool's lock: the planner reads the pool under its own.
+    let waits = planner_demand_waits(0, engine);
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
     let goal = pool.rung_for(rows);
+    // A throughput raise is ordered after every process demand waiting for
+    // room: while one waits it takes no room ([`SharedPool::demand_waits`]).
+    if pool.demand_waits(waits) && pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
+        return;
+    }
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -360,6 +367,15 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         set_fire_cap(engine, cap);
     }
     drop(pool);
+}
+
+/// Whether a process's demand waits for room on the planner of `model`'s
+/// `engine` (a kv allocation, a restore or a guest bind short of room; a
+/// rise is ordered among them by its own key, not counted). Read before
+/// the pool's lock is taken: the planner reads the pool under its own.
+#[must_use]
+pub fn planner_demand_waits(model: usize, engine: usize) -> bool {
+    crate::planner::planner_for(model, engine).is_some_and(|planner| planner.demand_waits())
 }
 
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
@@ -523,11 +539,17 @@ pub struct PoolRoom {
     pub chunk_bytes: u64,
     pub total_chunks: u32,
     pub reserved_chunks: u32,
-    /// The activation set aside under the smallest rung.
+    /// The activation's span: the largest rung's, which a rise takes back
+    /// whatever a lowered rung lent of it.
     pub act_chunks: u32,
+    /// The span's chunks the smallest rung lends to state where they can
+    /// be backed: room a grant may use while the rung is down, never room
+    /// the pool promises, since a rise takes them back.
+    pub lent_chunks: u32,
     /// The chunks the weights' pinned slots take.
     pub weight_chunks: u32,
-    /// What is left for kv and state: no move frees more.
+    /// What is left for kv and state below the span: no move frees more,
+    /// and no rung takes it.
     pub state_chunks: u32,
     /// `state_chunks` as kv list slots (pages).
     pub list_slots: u32,
@@ -666,9 +688,13 @@ pub enum SegmentMove {
     /// Back segments `0..prefix` (`commit_segments(prefix)`); the pool hands
     /// out their chunks once the engine has, [`SharedPool::committed`].
     Commit { prefix: u32 },
-    /// Copy `evacuation` (applied in the pool already), ahead of the next
-    /// fire; [`SharedPool::moved`] once the engine has it.
-    Evacuate { evacuation: EngineEvacuation },
+    /// Copy `evacuation` (`applied` in the pool already), ahead of the
+    /// next fire; [`SharedPool::evacuated`] once the engine took it,
+    /// [`SharedPool::evacuation_refused`] where it refused it.
+    Evacuate {
+        evacuation: EngineEvacuation,
+        applied: Evacuation,
+    },
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
@@ -740,6 +766,8 @@ pub struct SharedPool {
     records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
+    /// That longest context, in tokens.
+    max_context: u32,
     /// A raise is applied here and its chunks' copy is not yet the
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
@@ -769,6 +797,9 @@ pub struct SharedPool {
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
     /// while their slot count is short.
     guest_head: Option<(u32, u32)>,
+    /// The governor's segment target the walk steers this pool to, shared
+    /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
+    walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
     /// The engine whose rung gate this pool publishes the rung it holds
@@ -1013,6 +1044,7 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
+            max_context,
             copying: None,
             raise_from: None,
             told: 0,
@@ -1020,6 +1052,7 @@ impl SharedPool {
             lowering: None,
             span_commit_blocked: false,
             guest_head: None,
+            walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
         };
@@ -1189,29 +1222,28 @@ impl SharedPool {
                 u32::try_from(slots.div_ceil(u64::from(spc.max(1)))).unwrap_or(u32::MAX)
             })
             .sum();
-        let act_chunks = pool.act_chunks(0);
         // What state can ever be backed in, not the range: below the span,
         // the chunks under what the engine binds that lie in segments the
-        // pool may map ([`Self::backable_below_span`]); in the span, what
-        // the smallest rung leaves, where it is backed while the engine
-        // holds anything back.
+        // pool may map ([`Self::backable_below_span`]). The kv facts count
+        // the same (`ChunkFacts::kv_device_pages`): what the smallest rung
+        // leaves of the span, where it is backed, is lent, and a rise takes
+        // it back.
         let span_backable = !pool.span_on_demand() || pool.ceiling() >= pool.total_chunks();
-        let lent = if span_backable {
-            pool.act_max()
+        let lent_chunks = if span_backable {
+            pool.act_max().saturating_sub(pool.act_chunks(0))
         } else {
-            act_chunks
+            0
         };
         let state_chunks = self
             .backable_below_span()
-            .saturating_add(lent)
             .saturating_sub(pool.reserved_chunks())
-            .saturating_sub(act_chunks)
             .saturating_sub(weight_chunks);
         PoolRoom {
             chunk_bytes: pool.chunk_bytes(),
             total_chunks: pool.total_chunks(),
             reserved_chunks: pool.reserved_chunks(),
-            act_chunks,
+            act_chunks: pool.act_max(),
+            lent_chunks,
             weight_chunks,
             state_chunks,
             list_slots: self.list.map_or(0, |list| {
@@ -2052,6 +2084,16 @@ impl SharedPool {
         self.pool.segments().mapped_segments()
     }
 
+    /// Mapped segments an evacuation drained, waiting on the fire that
+    /// carries its copy to retire.
+    #[must_use]
+    pub fn draining_segments(&self) -> u32 {
+        let segments = self.pool.segments();
+        (0..segments.count())
+            .filter(|&s| matches!(segments.state(s), SegmentState::Draining { .. }))
+            .count() as u32
+    }
+
     /// The next step toward `target` mapped segments, the top span counted;
     /// `None` once there. A grow commits the lowest uncommitted segment, the
     /// commit ahead of need included; a shrink evacuates the highest
@@ -2099,6 +2141,7 @@ impl SharedPool {
                 self.apply_evacuation(&evacuation, epoch);
                 Some(SegmentMove::Evacuate {
                     evacuation: engine_moves(&evacuation.moves),
+                    applied: evacuation,
                 })
             }
             SegmentState::Uncommitted => None,
@@ -2181,11 +2224,22 @@ impl SharedPool {
 
     /// The engine took the evacuation [`Self::next_move`] planned, with
     /// fires through `current` (the kv store's per-fire epoch, CONTRACT-BC
-    /// 17) handed out by then. Any of those may run ahead of the copy and
-    /// read the old location; the first fire after them runs after it. The
-    /// segment drains until that one, `current + 1`, retires.
+    /// 17) handed out by then. Any of those may still read the old
+    /// location; every fire after reads the new one. The copy itself the
+    /// engine waits out before it gives the segment back
+    /// (`Engine::release_segments`), so the segment drains once the fires
+    /// through `current` retire, with no fire to wait for after them: on
+    /// an idle pool, at once.
     pub fn evacuated(&mut self, current: u64) {
-        self.pool.fence_drains(current.saturating_add(1));
+        self.pool.drains_through(current);
+    }
+
+    /// The engine refused `evacuation` ([`Self::next_move`]'s, applied in
+    /// the pool already) before its copy: its table never changed, so the
+    /// pool's goes back to it. Every moved chunk lies where it lay, and the
+    /// segment is committed and mapped again; nothing of it is released.
+    pub fn evacuation_refused(&mut self, evacuation: &Evacuation) {
+        self.pool.undo_evacuation(evacuation);
     }
 
     fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {
@@ -2207,10 +2261,41 @@ impl SharedPool {
         self.guest_head = need;
     }
 
+    /// The walk's target, shared ([`Self::commit_can_come`]).
+    pub fn walked_to(&mut self, target: Arc<std::sync::atomic::AtomicU32>) {
+        self.walk_target = Some(target);
+    }
+
+    /// Whether the walk would commit a segment now: its goal (a pinned
+    /// count, else the governor's target) is past what is mapped. At the
+    /// target nothing commits, however many segments the pool's own
+    /// limits leave uncommitted. Without a walk (a pool none steers), as
+    /// the pool's limits say.
+    #[must_use]
+    pub fn commit_can_come(&self) -> bool {
+        let Some(target) = &self.walk_target else {
+            return true;
+        };
+        let goal = target::pinned_segments()
+            .unwrap_or_else(|| target.load(std::sync::atomic::Ordering::Acquire));
+        goal > self.mapped_segments()
+    }
+
     /// The head guest bind's need, `(run, pieces)`, where one waits.
     #[must_use]
     pub fn guest_head(&self) -> Option<(u32, u32)> {
         self.guest_head
+    }
+
+    /// Whether a process's demand waits for room on this pool: a guest
+    /// bind's head here, or (`planner`, read before this pool's lock,
+    /// [`planner_demand_waits`]) a kv allocation or restore. A throughput
+    /// raise (one only cuttable passes want) takes no room while one does,
+    /// and the rung walk lowers toward the narrowest rung the admitted work
+    /// needs, giving room back.
+    #[must_use]
+    pub fn demand_waits(&self, planner: bool) -> bool {
+        planner || self.guest_head.is_some()
     }
 
     /// Whether a refused `commit_span` waits for room to be freed.
@@ -2252,10 +2337,10 @@ impl SharedPool {
     /// What is asked of the pool, in bytes: the slots held and wanted, the
     /// reserved chunks, and the top span, committed from the load.
     #[must_use]
-    pub fn demand(&self) -> Asked {
+    pub fn demand(&self) -> Demand {
         let Demand { live, wanted } = self.pool.demand();
         let fixed = self.fixed_bytes();
-        Asked {
+        Demand {
             wanted: wanted + fixed,
             live: live + fixed,
         }
@@ -2266,6 +2351,44 @@ impl SharedPool {
     fn fixed_bytes(&self) -> u64 {
         let act = self.pool.act_max().max(self.pool.act_reserved());
         u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()
+    }
+
+    /// The bytes of the fewest segments this pool can map, as its layout
+    /// has them: every segment holding a reserved chunk (no evacuation
+    /// moves them) and every segment under the activation span's chunks,
+    /// the largest rung's as [`Self::floor`] counts it. However much is
+    /// shed, no shrink maps fewer.
+    #[must_use]
+    pub fn least_mapped_bytes(&self) -> u64 {
+        let segments = self.pool.segments();
+        let total = self.pool.total_chunks();
+        let act = self.pool.act_max().max(self.pool.act_reserved()).min(total);
+        let reserved = self.pool.reserved_chunks().min(total);
+        let mut least = std::collections::BTreeSet::new();
+        if reserved > 0 {
+            least.extend(0..=segments.of(reserved - 1));
+        }
+        if act > 0 {
+            least.extend(segments.of(total - act)..=segments.of(total - 1));
+        }
+        least
+            .into_iter()
+            .map(|segment| u64::from(segments.len(segment)) * self.pool.chunk_bytes())
+            .sum()
+    }
+
+    /// What [`Self::floor`] is made of, for the load log.
+    #[must_use]
+    pub fn floor_parts(&self) -> FloorParts {
+        let chunk = self.pool.chunk_bytes();
+        let act = self.pool.act_max().max(self.pool.act_reserved());
+        FloorParts {
+            lane_bytes: u64::from(self.least_chunks) * chunk,
+            max_context: self.max_context,
+            reserved_bytes: u64::from(self.pool.reserved_chunks()) * chunk,
+            act_bytes: u64::from(act) * chunk,
+            least_mapped_bytes: self.least_mapped_bytes(),
+        }
     }
 
     /// Bytes below which one lane cannot run: one working set at the longest
@@ -2294,11 +2417,21 @@ impl SharedPool {
     pub fn growth(&self) -> Growth {
         match self.growth {
             SegmentGrowth::Fixed => Growth::Fixed,
-            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic {
-                least_cut: self.segment_bytes(),
-            },
+            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic,
         }
     }
+}
+
+/// The parts of a shared pool's floor: one lane's state at the longest
+/// context, the reserved chunks and the activation span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorParts {
+    pub lane_bytes: u64,
+    pub max_context: u32,
+    pub reserved_bytes: u64,
+    pub act_bytes: u64,
+    /// The fewest segments the pool can map ([`SharedPool::least_mapped_bytes`]).
+    pub least_mapped_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

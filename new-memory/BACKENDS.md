@@ -13,10 +13,10 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ M53 (rs tail fork, engine) | ✅ M53 | 🟡 M63 | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 M63 (one list, T_w = page) | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · ✅ runtime boot (IT r5, 18 pieces) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | ✅ M48 (4 pieces bitwise) | ✅ M48 | 🟡 M63 | 🟡 host sim |
-| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | 🔴 design only | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50 + quantized M72 | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | 🔴 design only | — weights on host |
+| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | ✅ v6e, bitwise vs the base build whatever lies resident (gemma4-e4b-mini-l1, `streamed_weights.rs`) | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50 + quantized M72 | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | ✅ v6e dense bf16, bitwise vs the base build (qwen3-30b-a3b-mini, `streamed_weights.rs`); quantized banks not streamed | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · ✅ e2e M52 | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | ✅ M53 offload (dense, hybrid, window) | ✅ M53 | 🟡 M63 (CUDA PJRT bitwise; TPU by team) | 🟡 M44 (host sim) |
-| Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | 🔴 XLA | — |
+| Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | ✅ v6e (GDN + conv, qwen35-tiny: each snapshot = the cut pass, bit for bit, `snapshots.rs`) | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 XLA/TPU serving correctness (TPU session): gated delta: served tokens equal the CUDA reference (Qwen3.5-0.8B, 64
@@ -31,8 +31,8 @@ slots its lanes name into fire-sized planes under local ids and writes back what
 unchanged. Segments are host allocations (commit / release / evacuate are real). Weights are whole on the host
 (uploaded per fire, or kept by a resident fabric server): there is no partial device copy to stream into, so no
 weight shapes are stated and `weight_residency` / `weight_uses` take and report nothing. Host/disk tiers
-(contract 22): host chunks are seated only where `host_kv_budget` is stated (the pool is host DRAM already),
-allocated on first write, any shape; the kv slot file (`r0.kv`, kept with `disk_kv_persistent`) holds kv list
+(contract 22): host chunks are seated only where `[engine.memory] budget_host` is stated (the pool is host DRAM already),
+allocated on first write, any shape; the kv slot file (`r0.kv`, kept with `[engine.memory] disk_persistent`) holds kv list
 slots; `copy_slots` moves device <-> host <-> disk; the legacy `copy_kv` / `copy_state` refuse every host move
 (this engine never served them). No hardware here: lib tests and a host simulation of staging and parking
 against in-place slots; nothing ran on a CS system or the simulator.

@@ -2,20 +2,29 @@
 //! and `Channel` slots taken where the engine's facts say, so a test binds
 //! instances and registers channels as a served one is.
 
+#[cfg(feature = "device")]
 use engine::Engine;
+#[cfg(feature = "device")]
+use engine::GuestState;
+use engine::ScratchPlace;
+#[cfg(feature = "device")]
 use engine::channel::{ChannelId, ChannelRegistration};
+#[cfg(feature = "device")]
 use engine::chunk::{ChunkFacts, SlotRole};
-use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
-use engine::{GuestState, ScratchPlace};
+use engine::program::RingSlots;
+#[cfg(feature = "device")]
+use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts};
 
 /// Slots of one role's shape, handed out from one chunk upward.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "device")]
 struct Shape {
     per_chunk: u32,
     slot_bytes: u64,
     next: u32,
 }
 
+#[cfg(feature = "device")]
 impl Shape {
     fn of(facts: &ChunkFacts, role: SlotRole, chunk: u32) -> Shape {
         let shape = facts
@@ -45,6 +54,7 @@ impl Shape {
 /// The two guest shapes, each in a chunk of its own, and the chunks past
 /// them, whole, for the guest state that lies in runs of chunks.
 #[derive(Debug, Clone)]
+#[cfg(feature = "device")]
 pub struct Guest {
     instance: Shape,
     channel: Shape,
@@ -57,6 +67,7 @@ pub struct Guest {
     pairs: Vec<(String, ScratchPlace)>,
 }
 
+#[cfg(feature = "device")]
 impl Guest {
     /// The guest chunks of a pool whose first `committed` chunks are backed.
     pub fn of(facts: &ChunkFacts, committed: u32) -> Guest {
@@ -87,6 +98,21 @@ impl Guest {
             .commit_segments(segments)
             .expect("the first segment commits");
         Guest::of(facts, segments * facts.segment_chunks)
+    }
+
+    /// Fresh `Channel` slots for a ring of `registration`, where the runtime
+    /// would copy it back to on a restore.
+    pub fn ring(&mut self, engine: &dyn Engine, registration: &ChannelRegistration) -> Vec<u32> {
+        engine
+            .ring_facts(registration)
+            .expect("the channel's ring facts")
+            .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint))
+    }
+
+    /// Fresh `Channel` slots for an item of `footprint`: a ring a test
+    /// opens itself, as the runtime registers one.
+    pub fn channel(&mut self, footprint: &Footprint) -> Vec<u32> {
+        self.channel.take(footprint)
     }
 
     /// Registers `registration` over the channel slots its ring facts state.
@@ -133,7 +159,7 @@ impl Guest {
         pair: (engine::ProgramId, impl std::fmt::Debug),
         state: &GuestState,
     ) -> (ScratchPlace, ScratchPlace) {
-        let scratch = self.take_state(state.per_instance, state);
+        let scratch = self.take_state(state.instance_bytes(), state);
         let pair = format!("{pair:?}");
         if let Some((_, place)) = self.pairs.iter().find(|(held, _)| *held == pair) {
             return (scratch, place.clone());
@@ -186,7 +212,7 @@ impl Guest {
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
         let state = engine
-            .guest_state(binding.program, &binding.extents)
+            .guest_state(binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
         let (scratch, pair) = self.places((binding.program, binding.extents), &state);
         engine
@@ -223,6 +249,7 @@ pub fn alone_slots(
             .collect(),
         scratch: ScratchPlace::None,
         pair: ScratchPlace::None,
+        pair_generation: 0,
     }
 }
 

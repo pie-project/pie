@@ -336,7 +336,10 @@ impl Device {
             && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
         {
             // Serving fires run programs the warm ladder prepared: one built
-            // now is a fire the ladder missed.
+            // now is a fire the ladder missed, built on the fire's path.
+            if let Some(live) = self.live.get() {
+                live.tally(engine::live::Tally::BuiltInFire, 1);
+            }
             let n = self
                 .misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -411,6 +414,14 @@ impl Device {
                     what: "compile",
                     why: e.to_string(),
                 })?;
+                // A registration's program (prepared after the seal) built
+                // rather than loaded: allowed, counted.
+                if serving.is_none()
+                    && self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(live) = self.live.get()
+                {
+                    live.tally(engine::live::Tally::BuiltAtRegister, 1);
+                }
                 tracing::info!(
                     bytes = text.len(),
                     ms = started.elapsed().as_millis() as u64,
@@ -423,7 +434,16 @@ impl Device {
                     // Room for it, made only of programs this load holds no
                     // claim on; the load's own set is never evicted.
                     self.make_room(dir, bytes.len() as u64)?;
-                    let tmp = file.with_extension("tmp");
+                    // A name of this write's own: two registrations of one
+                    // program compile it side by side and each lands its
+                    // copy, the second rename replacing the first.
+                    static WRITES: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let tmp = file.with_extension(format!(
+                        "tmp.{}.{}",
+                        std::process::id(),
+                        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
                     std::fs::write(&tmp, &bytes)
                         .and_then(|()| std::fs::rename(&tmp, file))
                         .map_err(|why| Fault::Unbound {
@@ -556,8 +576,21 @@ impl Device {
         self.cache.lock().expect("cache lock poisoned").remove(&key);
     }
 
+    /// [`Device::forget`] by the cache key of a program's text (the blake3
+    /// of it): a stage the guest stage cache evicted.
+    pub fn forget_key(&self, key: &[u8; 32]) {
+        self.cache.lock().expect("cache lock poisoned").remove(key);
+    }
+
     /// Marks the warm ladder done: every program wanted from now on is
     /// counted (and logged) as a miss.
+    /// Whether the load sealed its programs: a serving fire's program built
+    /// since is a ladder miss.
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn seal(&self) {
         if let Some(dir) = &self.disk {
             let held = self.set.lock().expect("cache set lock poisoned").len();

@@ -40,6 +40,17 @@
 //! total_chunks, segment_chunks, committed segments, the reserved chunk
 //! count, shapes, act_chunks), and [`Evacuation`] carries E1's
 //! `moves: Vec<(logical, new_physical)>` plus the old position.
+//!
+//! Placement by class: a chunk holds one class while it is open, set as it
+//! opens ([`ChunkMeta::class`]). Single slots ([`SlotPool::acquire`]) lie
+//! only in single-slot chunks; a run of `n` adjacent slots
+//! ([`SlotPool::acquire_run`]) only among runs of exactly `n`, its class the
+//! run's own length, with no table of classes; a chunk taken whole
+//! ([`SlotPool::acquire_chunk_runs`]) holds nothing else. A run's hole is
+//! then one the next run of its length takes exactly, no single slot ever
+//! breaks a run's room, and a chunk whose items all leave is free whole
+//! again for any class. Its cost is at most one partly filled chunk per
+//! class in use.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -324,12 +335,24 @@ struct ChunkMeta {
     frame: u32,
     /// Slots held or waiting on an epoch.
     used: u32,
+    /// What the chunk holds while open ([`SINGLE`], a run length, or
+    /// [`WHOLE`]): set as it opens, fixed until it is free again.
+    class: u32,
 }
+
+/// The class of a chunk of single slots ([`SlotPool::acquire`]): a run of
+/// one is a single slot too.
+pub const SINGLE: u32 = 1;
+
+/// The class of a chunk taken whole ([`SlotPool::acquire_chunk_runs`]):
+/// no single slot or run is placed in it.
+pub const WHOLE: u32 = u32::MAX;
 
 const FREE_CHUNK: ChunkMeta = ChunkMeta {
     shape: NO_SHAPE,
     frame: NONE,
     used: 0,
+    class: SINGLE,
 };
 
 /// One shape's slot arena: each open chunk owns a frame of
@@ -344,10 +367,12 @@ struct ShapeState {
     refs: Vec<SlotRefs>,
     spare: Vec<u32>,
     frames: u32,
-    /// Partly filled chunks, fullest first, then lowest physical address:
+    /// Partly filled chunks by class ([`ChunkMeta::class`]), each class's
+    /// fullest first, then lowest physical address:
     /// `(Reverse(used), physical, logical)`.
-    partial: BTreeSet<(Reverse<u32>, u32, u32)>,
-    /// Free slots in `partial`.
+    partial: BTreeMap<u32, BTreeSet<(Reverse<u32>, u32, u32)>>,
+    /// Free slots in single-slot chunks' `partial`: what a take of single
+    /// slots finds without opening a chunk.
     partial_free: u64,
     /// Slots some working set or snapshot holds.
     live: u64,
@@ -366,7 +391,7 @@ impl ShapeState {
             refs: Vec::new(),
             spare: Vec::new(),
             frames: 0,
-            partial: BTreeSet::new(),
+            partial: BTreeMap::new(),
             partial_free: 0,
             live: 0,
             cached: 0,
@@ -427,18 +452,39 @@ impl ShapeState {
         &mut self.refs[at]
     }
 
-    /// Moves a chunk's place among the partly filled as its count goes from
-    /// `was` to `now`.
-    fn reposition(&mut self, physical: u32, logical: u32, was: u32, now: u32) {
+    /// Moves a chunk's place among its class's partly filled as its count
+    /// goes from `was` to `now`.
+    fn reposition(&mut self, physical: u32, logical: u32, class: u32, was: u32, now: u32) {
         let spc = self.spc();
         if was > 0 && was < spc {
-            self.partial.remove(&(Reverse(was), physical, logical));
-            self.partial_free -= u64::from(spc - was);
+            let emptied = self.partial.get_mut(&class).is_some_and(|chunks| {
+                chunks.remove(&(Reverse(was), physical, logical));
+                chunks.is_empty()
+            });
+            if emptied {
+                self.partial.remove(&class);
+            }
+            if class == SINGLE {
+                self.partial_free -= u64::from(spc - was);
+            }
         }
         if now > 0 && now < spc {
-            self.partial.insert((Reverse(now), physical, logical));
-            self.partial_free += u64::from(spc - now);
+            self.partial
+                .entry(class)
+                .or_default()
+                .insert((Reverse(now), physical, logical));
+            if class == SINGLE {
+                self.partial_free += u64::from(spc - now);
+            }
         }
+    }
+
+    /// The fullest partly filled chunk of `class`, its logical id.
+    fn fullest(&self, class: u32) -> Option<u32> {
+        self.partial
+            .get(&class)
+            .and_then(|chunks| chunks.first())
+            .map(|&(_, _, logical)| logical)
     }
 
     /// Counts a slot's move between live, cached-only and unheld.
@@ -514,6 +560,47 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
+    /// Told each time a chunk comes free for state ([`Self::room_watch`]).
+    given: std::sync::Arc<RoomGiven>,
+}
+
+/// Room given back: a chunk opened for state, by a slot's release, a fence
+/// retired, a lower or a commit. A count of the gives, and their event.
+#[derive(Debug, Default)]
+pub struct RoomGiven {
+    gives: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl RoomGiven {
+    fn give(&self) {
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+/// A watch on room given back from when it was taken ([`SlotPool::room_watch`]).
+#[derive(Debug, Clone)]
+pub struct RoomWatch {
+    given: std::sync::Arc<RoomGiven>,
+    seen: u64,
+}
+
+impl RoomWatch {
+    /// Ends once a chunk has come free since the watch was taken: at once
+    /// where one already has.
+    pub async fn given(self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.given.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.given.gives.load(Ordering::Acquire) != self.seen {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SlotPool {
@@ -577,6 +664,7 @@ impl SlotPool {
             holders: HashMap::new(),
             waiters: HashMap::new(),
             runs: HashMap::new(),
+            given: std::sync::Arc::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -627,10 +715,38 @@ impl SlotPool {
     /// Brings `chunk`'s place in [`Self::open`] up to date.
     fn reopen(&mut self, chunk: u32) {
         if self.openable(chunk) {
-            self.open.set(chunk);
+            if !self.open.get(chunk) {
+                self.open.set(chunk);
+                self.given.give();
+            }
         } else {
             self.open.clear(chunk);
         }
+    }
+
+    /// How many times room was given back (a chunk opened for state) since
+    /// the pool was made.
+    #[must_use]
+    pub fn room_gives(&self) -> u64 {
+        self.given.gives.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A watch on room given back from now on: what a rise short of free
+    /// room waits on.
+    #[must_use]
+    pub fn room_watch(&self) -> RoomWatch {
+        RoomWatch {
+            seen: self.given.gives.load(std::sync::atomic::Ordering::Acquire),
+            given: std::sync::Arc::clone(&self.given),
+        }
+    }
+
+    /// The span's chunks under `rung`'s activation that hold state: what a
+    /// rise to `rung` must move out ([`Self::plan_rung`]).
+    #[must_use]
+    pub fn held_in_span(&self, rung: u32) -> u32 {
+        let limit = self.total - self.act_chunks(rung);
+        u32::try_from(self.held_in(limit, self.state_limit()).len()).unwrap_or(u32::MAX)
     }
 
     // ---- accounting ----
@@ -1030,12 +1146,9 @@ impl SlotPool {
         let state = &mut self.shapes[meta.shape as usize];
         let spc = state.spc();
         if meta.used > 0 && meta.used < spc {
-            state
-                .partial
-                .remove(&(Reverse(meta.used), step.from, step.logical));
-            state
-                .partial
-                .insert((Reverse(meta.used), step.to, step.logical));
+            let chunks = state.partial.entry(meta.class).or_default();
+            chunks.remove(&(Reverse(meta.used), step.from, step.logical));
+            chunks.insert((Reverse(meta.used), step.to, step.logical));
         }
         self.reopen(step.from);
     }
@@ -1075,6 +1188,26 @@ impl SlotPool {
     pub fn physical(&self, chunk: u32) -> Option<u32> {
         (chunk < self.reserved || self.chunks[chunk as usize].shape != NO_SHAPE)
             .then(|| self.logical_to_physical[chunk as usize])
+    }
+
+    /// The slots chunk `chunk` (logical) holds or keeps for an epoch: 0 for
+    /// a free chunk.
+    #[must_use]
+    pub fn chunk_used(&self, chunk: u32) -> u32 {
+        self.chunks.get(chunk as usize).map_or(0, |meta| meta.used)
+    }
+
+    /// The physical chunks state may open now ([`Self::free_chunks`]'s).
+    #[must_use]
+    pub fn open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.total).collect()
+    }
+
+    /// The open chunks a guest's state may take ([`Self::chunk_runs_for`]'s):
+    /// below the activation the rung lends and the ceiling.
+    #[must_use]
+    pub fn state_open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.state_limit().min(self.ceiling)).collect()
     }
 
     /// The logical -> physical table the engine keeps: a permutation, free
@@ -1323,9 +1456,9 @@ impl SlotPool {
         }
         let mut taken = Vec::with_capacity(n as usize);
         while (taken.len() as u64) < n {
-            let chunk = match self.shapes[shape as usize].partial.first() {
-                Some(&(_, _, logical)) => logical,
-                None => self.open_chunk(shape),
+            let chunk = match self.shapes[shape as usize].fullest(SINGLE) {
+                Some(logical) => logical,
+                None => self.open_chunk(shape, SINGLE),
             };
             self.fill(chunk, holder.is_live(), n - taken.len() as u64, &mut taken);
         }
@@ -1367,13 +1500,18 @@ impl SlotPool {
             return Ok(Vec::new());
         }
         let n = n as u32;
-        let found = state.partial.iter().find_map(|&(_, _, logical)| {
-            let frame = self.chunks[logical as usize].frame;
-            state.free_run(frame, n).map(|first| (logical, first))
+        // A run lies only among runs of its own length: a run's hole left
+        // behind is one the next run of that length takes exactly, and a
+        // chunk whose runs all leave is free whole again.
+        let found = state.partial.get(&n).and_then(|chunks| {
+            chunks.iter().find_map(|&(_, _, logical)| {
+                let frame = self.chunks[logical as usize].frame;
+                state.free_run(frame, n).map(|first| (logical, first))
+            })
         });
         let (chunk, first) = match found {
             Some(found) => found,
-            None if self.free_chunks() > 0 => (self.open_chunk(shape), 0),
+            None if self.free_chunks() > 0 => (self.open_chunk(shape, n), 0),
             None => {
                 return Err(SlotError::Short {
                     shape,
@@ -1496,7 +1634,7 @@ impl SlotPool {
         for &first in &firsts[..pieces as usize] {
             let head = self.physical_to_logical[first as usize];
             for physical in first..first + run {
-                let chunk = self.open_at(physical, shape);
+                let chunk = self.open_at(physical, shape, WHOLE);
                 self.fill(chunk, live, u64::from(spc), &mut taken);
             }
             if run > 1 {
@@ -1554,7 +1692,7 @@ impl SlotPool {
         let mut taken = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         for chunk in range {
             let physical = self.logical_to_physical[chunk as usize];
-            let opened = self.open_at(physical, shape);
+            let opened = self.open_at(physical, shape, SINGLE);
             debug_assert_eq!(opened, chunk);
             self.fill(chunk, holder.is_live(), n - taken.len() as u64, &mut taken);
         }
@@ -1750,6 +1888,22 @@ impl SlotPool {
         }
     }
 
+    /// Per class of `shape` ([`ChunkMeta::class`]), its partly filled
+    /// chunks and their free slots: what segregating by class holds back.
+    pub fn partial_classes(&self, shape: ShapeId) -> Vec<(u32, usize, u64)> {
+        let Some(state) = self.shapes.get(shape as usize) else {
+            return Vec::new();
+        };
+        state
+            .partial
+            .iter()
+            .map(|(&class, chunks)| {
+                let free = chunks.iter().map(|&(std::cmp::Reverse(used), _, _)| u64::from(state.spc() - used)).sum();
+                (class, chunks.len(), free)
+            })
+            .collect()
+    }
+
     /// Slots let go and waiting on a fire.
     pub fn pending_slots(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
@@ -1766,13 +1920,14 @@ impl SlotPool {
 
     /// Opens the lowest free committed chunk for `shape`. The caller has
     /// checked the room.
-    fn open_chunk(&mut self, shape: ShapeId) -> u32 {
+    fn open_chunk(&mut self, shape: ShapeId, class: u32) -> u32 {
         let physical = self.open.first().expect("room was checked");
-        self.open_at(physical, shape)
+        self.open_at(physical, shape, class)
     }
 
-    /// Opens free physical chunk `physical` for `shape`; its logical id.
-    fn open_at(&mut self, physical: u32, shape: ShapeId) -> u32 {
+    /// Opens free physical chunk `physical` for `shape`, to hold `class`
+    /// ([`ChunkMeta::class`]); its logical id.
+    fn open_at(&mut self, physical: u32, shape: ShapeId, class: u32) -> u32 {
         self.open.clear(physical);
         self.free.clear(physical);
         let logical = self.physical_to_logical[physical as usize];
@@ -1784,6 +1939,7 @@ impl SlotPool {
             shape,
             frame,
             used: 0,
+            class,
         };
         logical
     }
@@ -1817,7 +1973,7 @@ impl SlotPool {
             }
         }
         let now = meta.used + got;
-        state.reposition(physical, chunk, meta.used, now);
+        state.reposition(physical, chunk, meta.class, meta.used, now);
         self.chunks[chunk as usize].used = now;
     }
 
@@ -1844,7 +2000,7 @@ impl SlotPool {
             taken.push(Slot { chunk, index });
         }
         let now = meta.used + n;
-        state.reposition(physical, chunk, meta.used, now);
+        state.reposition(physical, chunk, meta.class, meta.used, now);
         self.chunks[chunk as usize].used = now;
     }
 
@@ -1857,7 +2013,7 @@ impl SlotPool {
         debug_assert_eq!(state.free[at] & bit, 0, "{slot:?} freed twice");
         state.free[at] |= bit;
         let now = meta.used - 1;
-        state.reposition(physical, slot.chunk, meta.used, now);
+        state.reposition(physical, slot.chunk, meta.class, meta.used, now);
         self.chunks[slot.chunk as usize].used = now;
         if now == 0 {
             state.spare.push(meta.frame);
@@ -2108,13 +2264,51 @@ impl SlotPool {
         Ok(())
     }
 
-    /// Every draining segment waits on the fire at `epoch` too, where it
-    /// waited on an earlier one: the fire known, once the engine took the
-    /// evacuation, to come after its copy.
-    pub fn fence_drains(&mut self, epoch: u64) {
+    /// Takes back `evacuation`, applied with [`Self::apply_evacuation`] and
+    /// refused by the engine before its copy: each moved chunk goes back to
+    /// where it lay (the engine's table never changed), held still or let
+    /// go since, and the segment is committed again, its free chunks open.
+    pub fn undo_evacuation(&mut self, evacuation: &Evacuation) {
+        let segment = evacuation.segment;
+        if !matches!(
+            self.segments.state(segment),
+            SegmentState::Draining { .. }
+        ) {
+            return;
+        }
+        self.segments.set_state(segment, SegmentState::Committed);
+        for step in evacuation.moves.iter().rev() {
+            if self.logical_to_physical[step.logical as usize] != step.to {
+                continue;
+            }
+            let back = ChunkMove {
+                logical: step.logical,
+                from: step.to,
+                to: step.from,
+            };
+            if self.chunks[step.logical as usize].shape == NO_SHAPE {
+                // Let go since: two free chunks change places.
+                let displaced = self.physical_to_logical[back.to as usize];
+                self.logical_to_physical[back.logical as usize] = back.to;
+                self.logical_to_physical[displaced as usize] = back.from;
+                self.physical_to_logical[back.to as usize] = back.logical;
+                self.physical_to_logical[back.from as usize] = displaced;
+            } else {
+                self.move_chunk(back);
+            }
+        }
+        for chunk in self.segments.range(segment) {
+            self.reopen(chunk);
+        }
+    }
+
+    /// The draining segment planned to wait past `epoch` waits on it
+    /// instead: the engine took its copy with the fires through `epoch`
+    /// handed out, the last that may read its chunks.
+    pub fn drains_through(&mut self, epoch: u64) {
         for segment in 0..self.segments.count() {
             if let SegmentState::Draining { until } = self.segments.state(segment)
-                && until < epoch
+                && until > epoch
             {
                 self.segments
                     .set_state(segment, SegmentState::Draining { until: epoch });
@@ -2245,9 +2439,8 @@ impl SlotPool {
             assert_eq!(free + meta.used, state.spc());
             let partial = meta.used < state.spc();
             assert_eq!(
-                state
-                    .partial
-                    .contains(&(Reverse(meta.used), physical, logical)),
+                state.partial.get(&meta.class).is_some_and(|chunks| chunks
+                    .contains(&(Reverse(meta.used), physical, logical))),
                 partial
             );
             assert!(
@@ -2275,10 +2468,16 @@ impl SlotPool {
             let mut live = 0;
             let mut cached = 0;
             let mut partial_free = 0;
-            for &(Reverse(used), physical, logical) in &state.partial {
-                assert_eq!(self.logical_to_physical[logical as usize], physical);
-                assert_eq!(self.chunks[logical as usize].used, used);
-                partial_free += u64::from(state.spc() - used);
+            for (&class, chunks) in &state.partial {
+                assert!(!chunks.is_empty(), "an empty class is no entry");
+                for &(Reverse(used), physical, logical) in chunks {
+                    assert_eq!(self.logical_to_physical[logical as usize], physical);
+                    assert_eq!(self.chunks[logical as usize].used, used);
+                    assert_eq!(self.chunks[logical as usize].class, class);
+                    if class == SINGLE {
+                        partial_free += u64::from(state.spc() - used);
+                    }
+                }
             }
             assert_eq!(partial_free, state.partial_free);
             for logical in 0..self.total {
@@ -2653,5 +2852,72 @@ mod tests {
             pool.plan_evacuation(2).is_none(),
             "2..4 and 6..8 free, four chunks, and no run of 3 in a lower segment"
         );
+    }
+
+    /// The run-class pool these tests take from: 1024-slot chunks of one
+    /// fixed shape, eleven of them free for state (the null chunk and the
+    /// top segment's activation aside).
+    fn run_pool() -> SlotPool {
+        SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
+    }
+
+    /// A freed run's hole is one the next run of its length takes exactly:
+    /// runs lie only among runs of their own length, single slots never
+    /// among them.
+    #[test]
+    fn a_freed_run_is_reused_exactly_by_the_next_run_of_its_length() {
+        let mut pool = run_pool();
+        let holder = Holder::WorkingSet(1);
+        let a = pool.acquire_run(holder, 0, 483).unwrap();
+        let singles = pool.acquire(holder, 0, 10).unwrap();
+        let b = pool.acquire_run(holder, 0, 483).unwrap();
+        assert_eq!(a[0].chunk, b[0].chunk, "two runs of one length share a chunk");
+        assert!(singles.iter().all(|slot| slot.chunk != a[0].chunk), "no single among runs");
+        pool.release(holder, &a, 0);
+        let again = pool.acquire_run(holder, 0, 483).unwrap();
+        assert_eq!(again, a, "the next run of its length takes the hole exactly");
+        pool.check();
+    }
+
+    /// A chunk whose runs all leave is free whole again, for any class.
+    #[test]
+    fn a_chunk_whose_runs_all_leave_is_whole_again() {
+        let mut pool = run_pool();
+        let holder = Holder::WorkingSet(1);
+        let free = pool.free_chunks();
+        let a = pool.acquire_run(holder, 0, 483).unwrap();
+        let b = pool.acquire_run(holder, 0, 483).unwrap();
+        assert_eq!(pool.free_chunks(), free - 1, "both in one chunk");
+        pool.release(holder, &a, 0);
+        pool.release(holder, &b, 0);
+        assert_eq!(pool.free_chunks(), free, "the chunk is whole again");
+        let other = pool.acquire_run(holder, 0, 700).unwrap();
+        assert_eq!(pool.free_chunks(), free - 1, "a run of another length opens it");
+        assert_eq!(other.len(), 700);
+        pool.check();
+    }
+
+    /// AMD's 500-concurrent shape: single slots scattered beside guest
+    /// state's runs left no chunk holding a run of 483 free, though slots
+    /// were free in plenty. Single slots now never take a run chunk's
+    /// tail: with every other chunk filled by single slots and holes
+    /// scattered among them, the next run of 483 still lies in its own
+    /// class's chunk. Before, the single slots filled the fullest chunk
+    /// first, the run's, and the run was short.
+    #[test]
+    fn single_slots_never_fill_a_run_chunk_s_tail() {
+        let mut pool = run_pool();
+        let holder = Holder::WorkingSet(1);
+        let first = pool.acquire_run(holder, 0, 483).unwrap();
+        let room = u64::from(pool.free_chunks()) * 1024;
+        let singles = pool.acquire(holder, 0, room).unwrap();
+        assert!(singles.iter().all(|slot| slot.chunk != first[0].chunk));
+        assert_eq!(pool.free_chunks(), 0, "every chunk taken");
+        // Holes scattered among the single slots: no run of 483 there.
+        let scattered: Vec<Slot> = singles.iter().step_by(2).copied().collect();
+        pool.release(holder, &scattered, 0);
+        let second = pool.acquire_run(holder, 0, 483).expect("the run's own chunk holds it");
+        assert_eq!(second[0].chunk, first[0].chunk);
+        pool.check();
     }
 }

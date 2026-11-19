@@ -64,17 +64,23 @@ struct DefaultAttention : AttentionVariantBase {
     mask_origin = 0;
     mask_wide = true;
     if constexpr (use_custom_mask) {
-      if constexpr (has_maybe_mask_indptr_v<Params>) {
-        custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
-      } else {
-        custom_mask_ptr = params.maybe_custom_mask;
-      }
       if constexpr (has_maybe_mask_origin_v<Params>) {
         if (params.maybe_mask_origin != nullptr) {
           const uint32_t word = params.maybe_mask_origin[batch_idx];
           mask_origin = word & 0x7fffffffu;
           mask_wide = (word >> 31) != 0;
         }
+      }
+      if constexpr (has_maybe_mask_indptr_v<Params>) {
+        // PIE: a negative offset states no mask (a group none of whose
+        // rows states one): its boundary is past every key.
+        const int64_t at = params.maybe_mask_indptr[batch_idx];
+        custom_mask_ptr = params.maybe_custom_mask + (at < 0 ? 0 : at);
+        if (at < 0) {
+          mask_origin = 0x7fffffffu;
+        }
+      } else {
+        custom_mask_ptr = params.maybe_custom_mask;
       }
     }
     window_left = (params.window_left >= 0) ? params.window_left : kv_len;

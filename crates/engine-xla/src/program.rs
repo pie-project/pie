@@ -648,6 +648,12 @@ impl Plane {
         Ok(id)
     }
 
+    /// The device cache keys of the compiled stages the stage cache evicted
+    /// since the last call ([`crate::guest::run::Stages::yield_room`]).
+    pub fn take_evicted(&mut self) -> Vec<[u8; 32]> {
+        self.stages.take_evicted()
+    }
+
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
@@ -1326,7 +1332,7 @@ impl Plane {
     }
 
     /// Runs the guest passes of a fire's `attachments` (instance, first
-    /// lane): on the device, reading `kept` where it lies, for every
+    /// lane, lanes): on the device, reading `kept` where it lies, for every
     /// instance whose program lowered and whose outputs bind there —
     /// instances of one program as one batched executable per stage — and
     /// in the interpreter, over the rows downloaded from `kept`, for the
@@ -1334,7 +1340,7 @@ impl Plane {
     pub fn fire_guests(
         &mut self,
         device: &crate::device::Device,
-        attachments: &[(InstanceId, u32)],
+        attachments: &[(InstanceId, u32, u32)],
         kept: Option<&crate::readout::Kept>,
         pool: &mut Option<crate::pjrt::Buffer>,
         at: Stage,
@@ -1358,7 +1364,7 @@ impl Plane {
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,
-        attachments: &[(InstanceId, u32)],
+        attachments: &[(InstanceId, u32, u32)],
         kept: Option<&crate::readout::Kept>,
         pool: &mut Option<crate::pjrt::Buffer>,
         latch: Option<&Arc<Latch>>,
@@ -1366,9 +1372,9 @@ impl Plane {
     ) -> Result<(Vec<bool>, Vec<(InstanceId, String)>), Refusal> {
         use crate::guest::run::{Member, OnDevice, bound, step_group, step_group_deferred};
         self.flights.wait_all();
-        let members: Vec<InstanceId> = attachments.iter().map(|&(id, _)| id).collect();
+        let members: Vec<InstanceId> = attachments.iter().map(|&(id, _, _)| id).collect();
         self.flush_sharers(&members, pool.as_ref())?;
-        for &(instance, _) in attachments {
+        for &(instance, _, _) in attachments {
             if let Some(seat) = self.instances.get_mut(&instance)
                 && seat.poisoned.load(Ordering::Acquire)
             {
@@ -1377,8 +1383,10 @@ impl Plane {
         }
         // Where each attachment runs.
         let mut plans: Vec<Option<Placed>> = Vec::with_capacity(attachments.len());
+        // Per attachment, why its outputs were refused a binding.
+        let mut refused: Vec<Option<String>> = vec![None; attachments.len()];
         let mut carried_of: BTreeMap<[u8; 32], Vec<u32>> = BTreeMap::new();
-        for &(instance, lane) in attachments {
+        for (at, &(instance, lane, lanes)) in attachments.iter().enumerate() {
             let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
                 what: "instance",
                 id: instance.0,
@@ -1387,7 +1395,14 @@ impl Plane {
             if let Some(c) = self.forms.get(seat.program) {
                 carried_of.insert(c.key, c.pooled());
             }
-            plans.push(match (form, bound(&seat.plan, kept, lane)) {
+            let bound = match bound(&seat.plan, kept, lane, lanes) {
+                Ok(bound) => bound,
+                Err(why) => {
+                    refused[at] = Some(format!("instance {instance} at lane {lane}: {why}"));
+                    None
+                }
+            };
+            plans.push(match (form, bound) {
                 (Some(key), Some(bound)) => Some((Arc::clone(&seat.plan), key, bound)),
                 _ => None,
             });
@@ -1395,7 +1410,7 @@ impl Plane {
         // Instances that share a ring step in attachment order, one by one.
         let mut rings = std::collections::HashSet::new();
         let mut shared = false;
-        for &(instance, _) in attachments {
+        for &(instance, _, _) in attachments {
             if let Some(seat) = self.instances.get(&instance) {
                 for ring in &seat.inst.channels {
                     shared |= !rings.insert(Arc::as_ptr(ring) as usize);
@@ -1419,7 +1434,7 @@ impl Plane {
         if shared {
             // These step one by one on the host's rings: their cells come
             // back from the pool first.
-            for &(instance, _) in attachments {
+            for &(instance, _, _) in attachments {
                 if let Some(held) = self.instances.get_mut(&instance)
                     && let Err(why) = cells_to_host(held, pool.as_ref())
                 {
@@ -1427,7 +1442,7 @@ impl Plane {
                     note(StepOutcome::Faulted(why), instance, held.program);
                 }
             }
-            for (at, &(instance, _)) in attachments.iter().enumerate() {
+            for (at, &(instance, _, _)) in attachments.iter().enumerate() {
                 let Some((plan, key, bound)) = plans[at].clone() else {
                     continue;
                 };
@@ -1563,8 +1578,10 @@ impl Plane {
         // return on the device (`Stages::compile_all`), and every program
         // with a stage that does not lower: an attachment that did not run
         // is a fault, not a pass for another path.
-        for (at, &(instance, lane)) in attachments.iter().enumerate() {
-            if !ran[at] {
+        for (at, &(instance, lane, _)) in attachments.iter().enumerate() {
+            if let Some(why) = refused[at].take() {
+                faults.push((instance, why));
+            } else if !ran[at] {
                 faults.push((
                     instance,
                     format!(

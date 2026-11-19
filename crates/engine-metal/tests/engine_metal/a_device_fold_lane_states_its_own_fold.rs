@@ -51,12 +51,22 @@ fn lanes_with_fold(vocab: u32, tokens: &[u32], lanes: u32, fold: &[u32]) -> Prog
     };
     let mut ports = vec![
         const_port(Port::EmbedTokens, tokens),
+        // Its tokens split evenly over the lanes it describes: `ROWS` a
+        // lane where it carries each lane's own.
         const_port(
             Port::EmbedIndptr,
-            &(0..=lanes).map(|lane| lane * ROWS).collect::<Vec<_>>(),
+            &(0..=lanes)
+                .map(|lane| lane * tokens.len() as u32 / lanes)
+                .collect::<Vec<_>>(),
         ),
         const_port(Port::Fold, fold),
     ];
+    // Describing more lanes than it carries tokens for, it writes their kv
+    // slots too: what a guest needs to reach another lane's slots.
+    if tokens.len() as u32 != lanes * ROWS {
+        let slots: Vec<u32> = (0..tokens.len() as u32).collect();
+        ports.push(const_port(Port::Slots, &slots));
+    }
     ports.sort_by_key(|binding| binding.port);
     let container = TraceContainer {
         names: vec!["logits".to_string()],
@@ -105,13 +115,17 @@ fn lanes_with_fold(vocab: u32, tokens: &[u32], lanes: u32, fold: &[u32]) -> Prog
 }
 
 fn buffering(shell: &Shell) -> RsVerb {
+    buffering_with(shell, FoldLen::Device)
+}
+
+fn buffering_with(shell: &Shell, fold: FoldLen) -> RsVerb {
     let layout = shell.pool_layout();
     let pages = ROWS.div_ceil(layout.rs_tokens.max(1)) + 1;
     RsVerb::Buffer {
         pages: (0..pages).collect(),
         base: 0,
         folded: 0,
-        fold: FoldLen::Device,
+        fold,
         lineage: engine::fire::Lineage::Set,
     }
 }
@@ -128,6 +142,12 @@ fn refusal(why: impl std::fmt::Display) -> String {
 /// Fires `lanes` device-fold lanes under one attached program whose
 /// `fold` port carries `fold`.
 fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
+    fire_attached_at(lanes, lanes, fold)
+}
+
+/// Fires `lanes` device-fold lanes, the program describing them all
+/// through its ports and attached at the first `owned` of them.
+fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
     let fixture = fixture_of("qwen35-tiny", None);
     let mut shell = load_with(&fixture, 1024);
     assert!(shell.serves_rs_verbs(), "a hybrid model buffers recurrent rows");
@@ -146,8 +166,11 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
         }])
         .expect("a plain fire lands")[0]
         .len() as u32;
+    // It carries the tokens of the lanes it is attached at, split over the
+    // lanes it describes.
+    let carried = &tokens[..(owned * ROWS) as usize];
     let program = shell
-        .register_program(&lanes_with_fold(vocab, &tokens, lanes, fold))
+        .register_program(&lanes_with_fold(vocab, carried, lanes, fold))
         .expect("the program registers");
     let facts = shell.program_facts(program).expect("the program's facts");
     let layout = shell.pool_layout();
@@ -191,9 +214,19 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
             &rings,
             &scratch,
             &pair,
+            0,
         )
         .expect("the device-geometry instance binds");
-    let verbs: Vec<RsVerb> = (0..lanes).map(|_| buffering(&shell)).collect();
+    // A lane past the attachment is a plain request's: its fold is its own.
+    let verbs: Vec<RsVerb> = (0..lanes)
+        .map(|lane| {
+            if lane < owned {
+                buffering(&shell)
+            } else {
+                buffering_with(&shell, FoldLen::Host(0))
+            }
+        })
+        .collect();
     for slot in 0..lanes {
         shell.open(slot).expect("the lane's slot opens");
     }
@@ -216,13 +249,31 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
             &seated,
             &[Attached {
                 lane: 0,
-                lanes,
+                lanes: owned,
                 instance: id,
                 adapter_only: false,
             }],
         )
         .err()
         .map(|refused| refused.to_string())
+}
+
+/// A program attached at one lane whose `embed_indptr` port describes two
+/// would set the second lane's positions and kv slots, another request's
+/// (TPU found it on XLA): refused by name, its own lane alone.
+#[test]
+fn geometry_ports_describing_lanes_past_the_attachment_are_refused() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let refused = fire_attached_at(2, 1, &[3])
+        .expect("ports describing a lane the attachment does not own are refused");
+    assert!(
+        refused.contains("attached at lane 0 is refused")
+            && refused.contains("describes 2 lane(s) and its attachment owns 1"),
+        "the refusal names the instance's lane and the lanes it described: {refused}"
+    );
 }
 
 #[test]

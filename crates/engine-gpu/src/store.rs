@@ -592,6 +592,18 @@ pub fn slot_entries(units: &[u32]) -> Result<Vec<i32>> {
 }
 
 impl<B: Backend> Pools<B> {
+    /// The bytes of one chunk of the pool.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.pool.chunk_bytes()
+    }
+
+    /// The buffers of the pool's backed segments, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.pool.segment_buffers()
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
     /// and `host_chunks` host chunks beside it, its top chunks the
     /// activation span of `act_chunks`' rungs; nothing committed yet.
@@ -812,6 +824,29 @@ impl<B: Backend> Pools<B> {
                 .collect();
         }
         refs.iter().map(|&r| self.units(LIST, r)).collect()
+    }
+
+    /// What a lane of a bind-only fire names by ref: `pages` slot refs of
+    /// the list shape and a record (a slot ref of the fixed shape a piece),
+    /// each in the first chunk past the null chunk. The fire reads and writes
+    /// none of them; the pool takes them as any lane's (none of a shape the
+    /// pool holds not).
+    pub fn walk_refs(&self, pages: u32) -> Result<(Vec<u32>, Vec<u32>)> {
+        let first = |id: ShapeId, count: u32| -> Result<Vec<u32>> {
+            let per_chunk = self.shape(id)?.per_chunk.max(1);
+            Ok((0..count).map(|at| per_chunk + at % per_chunk).collect())
+        };
+        let pages = if self.layout.list.is_some() {
+            first(LIST, pages)?
+        } else {
+            Vec::new()
+        };
+        let record = if self.has_state() {
+            first(FIXED, self.pieces())?
+        } else {
+            vec![0; self.pieces() as usize]
+        };
+        Ok((pages, record))
     }
 
     /// The physical page explicit write descriptor page `page` names.
@@ -1585,6 +1620,23 @@ impl<B: Backend> Pools<B> {
         Ok(self.disk_pages())
     }
 
+    /// Whether the host chunks are device-mapped memory a frame copies
+    /// to and from (else a heap the host copies through, in the call).
+    #[must_use]
+    pub fn host_mapped(&self) -> bool {
+        matches!(self.host, HostChunks::Mapped(_))
+    }
+
+    /// Waits out a slot file read's copy onto the device still in flight.
+    pub fn settle_spill(&mut self) -> Result<()> {
+        match &mut self.disk {
+            Some(Spill::Mapped { landing, .. }) => {
+                landing.take().map_or(Ok(()), |landing| landing.wait())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn unseat_disk(&mut self) {
         self.disk = None;
     }
@@ -1633,6 +1685,18 @@ impl<B: Backend> Pools<B> {
     /// Backs the pool's first `segments` segments.
     pub fn commit_segments(&mut self, device: &B::Context, segments: u32) -> Result<()> {
         self.pool.commit_segments(device, segments)
+    }
+
+    /// The segments a load backs: the null chunk's and the span's where
+    /// the pool resizes, every one where it is laid whole
+    /// ([`Backend::RESIZES_POOL`]).
+    #[must_use]
+    pub fn load_segments(&self) -> u32 {
+        if B::RESIZES_POOL {
+            1
+        } else {
+            self.pool.segments()
+        }
     }
 
     /// The segments the seat runs lie in: what a caller firing directly

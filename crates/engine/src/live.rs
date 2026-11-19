@@ -53,22 +53,37 @@ pub enum Tally {
     /// ([`crate::chunk::ChunkFacts::eager_rungs`]): it ran uncaptured, as
     /// stated.
     Eager,
-    /// A pipeline, module or program built after ready: one a serving
-    /// fire, a registration or a bind reached that the load did not build,
-    /// whatever the backend (a kernel pipeline, a guest step's pipeline, a
-    /// guest region's module). The rule is that every one serving can
-    /// reach is built before ready, so this reads 0.
-    BuiltAfterReady,
+    /// A guest program's code built at its registration after ready, the
+    /// load's prewarm not having built it: a program the runtime's
+    /// standard samplers do not register, built before its first fire. No
+    /// fire waits on it, so it breaks no rule; read beside
+    /// [`Tally::BuiltInFire`], and never gated on.
+    BuiltAtRegister,
+    /// A pipeline, module or program built after ready on a fire's path:
+    /// one a serving fire or a bind reached that the load did not build,
+    /// whatever the backend (a kernel pipeline, a JIT instantiation, a
+    /// guest step's pipeline). The rule is that every one a fire can reach
+    /// is built before ready, so this reads 0; what gates or warns reads
+    /// this one. A backend that does not yet tell a registration's builds
+    /// apart counts them here too.
+    BuiltInFire,
+    /// What a dispatch binds (a bind group, a descriptor set) built after
+    /// ready on a fire's path: one a backend that builds them per set of
+    /// views made for a fire the load's bind walk did not reach. The rule
+    /// is that the load builds every one a fire can bind, so this reads 0.
+    BoundInFire,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 6] = [
+    pub const ALL: [Tally; 8] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
-        Tally::BuiltAfterReady,
+        Tally::BuiltAtRegister,
+        Tally::BuiltInFire,
+        Tally::BoundInFire,
     ];
 
     /// Its name in the model status.
@@ -80,7 +95,9 @@ impl Tally {
             Tally::Unrecorded => "unrecorded",
             Tally::Refused => "refused",
             Tally::Eager => "eager",
-            Tally::BuiltAfterReady => "built_after_ready",
+            Tally::BuiltAtRegister => "built_at_register",
+            Tally::BuiltInFire => "built_in_fire",
+            Tally::BoundInFire => "bound_in_fire",
         }
     }
 }
@@ -133,6 +150,13 @@ mod tests {
             read.tallied(Tally::Unrecorded),
             0,
             "an eager fire is no bug"
+        );
+        live.tally(Tally::BuiltAtRegister, 2);
+        assert_eq!(read.tallied(Tally::BuiltAtRegister), 2);
+        assert_eq!(
+            read.tallied(Tally::BuiltInFire),
+            0,
+            "a registration's build is no fire's"
         );
     }
 }

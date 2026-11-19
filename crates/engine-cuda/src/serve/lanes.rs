@@ -18,8 +18,15 @@ pub struct Seated<'a> {
     /// The set's committed boundary (`KvDelta::folded`): the lane's mask
     /// speaks of the keys from it on.
     pub folded: u32,
+    /// The set's written end the runtime states, and the set
+    /// (`KvDelta::readable`, `KvDelta::set`): what its rows may read.
+    pub readable: u32,
+    pub set: u64,
     pub kv_less: bool,
     pub translation: &'a [u32],
+    /// One past the last slot a row the lane's program places may land at
+    /// (`KvDelta::write_end`); its rows land in `[folded, write_end)`.
+    pub write_end: u32,
     pub window: &'a [u32],
     /// The lane's slot refs of the window lists past the first, narrowest
     /// first: a list each, where lanes name slot refs.
@@ -51,8 +58,11 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             folded: 0,
+            readable: 0,
+            set: 0,
             kv_less: false,
             translation: &[],
+            write_end: 0,
             window: &[],
             more_windows: &[],
             mask: None,

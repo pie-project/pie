@@ -78,6 +78,7 @@ fn a_bound_guest_leaves_the_span_as_it_was() {
                     &rings,
                     &scratch,
                     &pair,
+                    0,
                 )
                 .expect("the reader binds"),
         );

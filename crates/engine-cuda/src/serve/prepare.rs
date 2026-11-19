@@ -43,9 +43,14 @@ impl FrameShell for Shell {
         // A step refused here fires nothing: what its lanes' device-counted
         // folds left ahead goes back to where the step found it.
         let ahead = self.rs_ahead.clone();
+        // Nor does it carry any set's written end.
+        let written = self.written.clone();
+        let built = kernels_cuda::tally::counts().built;
         let prepared = self.prepare_step(step);
+        self.count_built_in_fire(built);
         if prepared.is_err() {
             self.rs_ahead = ahead;
+            self.written = written;
         }
         prepared
     }
@@ -59,7 +64,10 @@ impl FrameShell for Shell {
             .slot
             .take()
             .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
-        match self.enqueue_on(&mut p, &slot) {
+        let built = kernels_cuda::tally::counts().built;
+        let enqueued = self.enqueue_on(&mut p, &slot);
+        self.count_built_in_fire(built);
+        match enqueued {
             Ok((launches, readback)) => {
                 p.slot = Some(slot);
                 Ok(Enqueued {
@@ -81,6 +89,31 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         self.settle_step(enqueued, None)
+    }
+}
+
+impl Shell {
+    /// Counts what this thread built since `before` (the kernels' tally) as
+    /// built on a serving fire's path: an instantiation no walk of the load
+    /// resolved (`engine::live::Tally::BuiltInFire`). An arming fire, and
+    /// any before the load sealed its bodies, builds as the load does.
+    pub(super) fn count_built_in_fire(&mut self, before: u64) {
+        if self.arming || !self.cache.bodies_sealed() {
+            return;
+        }
+        let built = kernels_cuda::tally::counts().built - before;
+        if built == 0 {
+            return;
+        }
+        self.live.tally(engine::live::Tally::BuiltInFire, built);
+        let total = self.live.tallied(engine::live::Tally::BuiltInFire);
+        if total.is_power_of_two() || built >= total {
+            eprintln!(
+                "engine-cuda: WARNING: a serving fire built {built} kernel instantiation(s) no \
+                 walk of the load resolved; {total} so far (Tally::BuiltInFire). Every one a \
+                 fire can reach is built before ready"
+            );
+        }
     }
 }
 
@@ -455,6 +488,16 @@ impl Shell {
                 .map(|seated| seated.lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            // The ports state this attachment's lanes alone: one describing
+            // more would set the next lanes' positions and slots.
+            let owned = attached.lanes.max(1);
+            if carried > owned as usize {
+                return Err(Fault::Overreach {
+                    instance: attached.instance,
+                    lanes: attached.lane..attached.lane.saturating_add(owned),
+                    carried,
+                });
+            }
             if first + carried > lanes.len() {
                 return Err(Fault::program(
                     "serve::prepare",
@@ -480,9 +523,6 @@ impl Shell {
                     ));
                 }
                 envelope_of[first + lane] = Some((held, lane));
-            }
-            if first < lanes.len() {
-                token_src_of[first] = src;
             }
             resolved.push(envelope);
         }
@@ -536,6 +576,15 @@ impl Shell {
                             .map(|&page| window.get(page as usize).copied().unwrap_or(0))
                             .collect(),
                     );
+                }
+                // The table is the working set's whole, to read through: a
+                // row lands only in the slots the lane may write.
+                let writable = lanes[source].folded..lanes[source].write_end;
+                if let Some(why) = engine::fire::misplaced_write(writable, slots) {
+                    return Err(Fault::KvWrite {
+                        lane: source as u32,
+                        why,
+                    });
                 }
                 device_writes[source] = Some((
                     slots
@@ -778,14 +827,8 @@ impl Shell {
             }
             (groups, packings)
         };
-        let group_masks = self.group_masks_of(
-            lanes,
-            &composition,
-            &group_of_lane,
-            &packings,
-            &clips_of,
-            arming && self.arm_group_mask,
-        )?;
+        let group_masks =
+            self.group_masks_of(lanes, &composition, &group_of_lane, &packings, &clips_of)?;
 
         let mut merge_lands: Vec<MergeLand> = Vec::new();
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
@@ -1031,6 +1074,9 @@ impl Shell {
         let mut more_windows: Vec<&[&[u32]]> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
+        // Whether some lane's class reads the fire's masks: then every lane
+        // states its entry, a mask or none.
+        let mut reads_masks = false;
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -1067,6 +1113,8 @@ impl Shell {
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
         let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
+        // What each lane writes and reads of its set (`engine::extent`).
+        let mut extents = engine::extent::FireExtents::default();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -1197,18 +1245,19 @@ impl Shell {
                 pending_mask_injects.push((masks.len(), src, extent));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
+            reads_masks |= self.mask_read.contains(row.class as usize);
             let reads_group_mask = self.group_masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() && self.group_masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            // A masked kv prefill's class is the masked word's, and only
-            // its; a group's mask is the lane's to state on any class that
-            // reads one.
-            if masking.is_some() != runs_masked_arm && !(reads_group_mask && !runs_masked_arm) {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is
+            // refused; a group's mask is the lane's to state on any class
+            // that reads one.
+            if masking.is_some() && !runs_masked_arm && !reads_group_mask {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
             masks.push(crate::mask::LaneMask {
@@ -1421,7 +1470,35 @@ impl Shell {
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
+            if !seated.kv_less {
+                let reach = have.saturating_add(row.rows);
+                let set = (seated.set, seated.readable);
+                match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+                    Some(Some(slots)) => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                        reach,
+                    ),
+                    _ => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        std::iter::once(have..reach),
+                        reach,
+                    ),
+                }
+            }
         }
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written.
+        extents
+            .check()
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        self.written.commit(extents);
 
         let mut mrope_positions = if !self.mrope_seat {
             Vec::new()
@@ -1729,12 +1806,26 @@ impl Shell {
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
         )
-        .with_rs(rs_body)
-        .with_group_mask(!group_masks.is_empty());
+        .with_rs(rs_body);
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
-                !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
+                !self.wide.contains(*class as usize)
             });
+        let staged = crate::mask::stage(&masks, reads_masks)
+            .map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
+            Some(staged) => pending_mask_injects
+                .iter()
+                .map(|&(at, src, bits)| crate::inputs::MaskInject {
+                    dst_off: staged.indptr[at] as u64,
+                    src,
+                    bits,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        super::btrace::mark("mask");
+
         let class_tables = [
             composition.table(poem_ir::RowAxis::Tokens),
             composition.table(poem_ir::RowAxis::Patches),
@@ -1763,6 +1854,9 @@ impl Shell {
                         bucket,
                         enabled: copies_here,
                         page_tables: &device_geometries,
+                        mask: staged
+                            .as_ref()
+                            .map(|staged| (&staged.indptr[..], &staged.origins[..])),
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1789,19 +1883,6 @@ impl Shell {
         };
         super::btrace::mark("windows_of");
 
-        let staged = crate::mask::stage(&masks)?;
-        let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
-            Some(staged) => pending_mask_injects
-                .iter()
-                .map(|&(at, src, bits)| crate::inputs::MaskInject {
-                    dst_off: staged.indptr[at] as u64,
-                    src,
-                    bits,
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        super::btrace::mark("mask");
 
         let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
         // The widened table, as `segmentation` holds it: what a body was
@@ -2124,10 +2205,11 @@ impl Shell {
     /// A fire's group masks, one a packing an attention stating a mask
     /// reads, in the load's order (`Shell::stated_feeds`;
     /// `Inputs::stage_group_masks` stages the `i`th in the `i`th stretch),
-    /// or none where no lane states one and `every` is not asked: a fire
-    /// with a mask reads one in every ragged attention (a body is captured
-    /// reading them all), its lanes stating none admitting every row of
-    /// their group. An arming fire asks `every` for a masked twin.
+    /// where some lane's class reads them (`group_masked`): the masks are
+    /// data its one body reads, every ragged attention's. A group no lane of
+    /// which states a mask has the offset -1, which the kernel reads as
+    /// "none" (every row of the group admitted, no bit read); a lane stating
+    /// none in a group beside one stating a mask admits every row.
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],
@@ -2135,7 +2217,6 @@ impl Shell {
         group_of_lane: &[i32],
         packings: &[poem_exec::fire::Packed],
         clips_of: &[Option<crate::voxels::Clips<'_>>],
-        every: bool,
     ) -> Result<
         Vec<(
             poem_ir::Selection,
@@ -2158,7 +2239,11 @@ impl Shell {
                     })
             })
             .collect();
-        if !every && stated.iter().all(Option::is_none) {
+        let reads = composition
+            .lanes()
+            .iter()
+            .any(|row| self.group_masked.contains(row.class as usize));
+        if !reads && stated.iter().all(Option::is_none) {
             return Ok(Vec::new());
         }
         if self.stated_feeds.is_empty() {
@@ -2168,6 +2253,20 @@ impl Shell {
                  attention: only a group-packed `attention.ragged` its text spells \
                  `stated_group_mask()` reads one",
             ));
+        }
+        // No lane states one: every group's offset says "none".
+        let unmasked = || poem_exec::fire::GroupMask {
+            bits: Vec::new(),
+            indptr: std::iter::repeat_n(-1, poem_exec::fire::groups_of(group_of_lane) as usize)
+                .chain([0])
+                .collect(),
+        };
+        if stated.iter().all(Option::is_none) {
+            return Ok(self
+                .stated_feeds
+                .iter()
+                .map(|&(q, kv)| (q, kv, unmasked()))
+                .collect());
         }
         let patch = self
             .voxels
@@ -2217,10 +2316,7 @@ impl Shell {
                 &guests,
             )
             .map_err(poem_exec::Error::Fire)?
-            .unwrap_or_else(|| poem_exec::fire::GroupMask {
-                bits: Vec::new(),
-                indptr: vec![0],
-            });
+            .unwrap_or_else(unmasked);
             staged.push((q, kv, mask));
         }
         Ok(staged)

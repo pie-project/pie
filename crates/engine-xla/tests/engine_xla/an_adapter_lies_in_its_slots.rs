@@ -192,6 +192,7 @@ impl Rig {
                     lanes: 1,
                     instance,
                     adapter_only: true,
+                    scratch: ::engine::ScratchPlace::None,
                 });
             }
         }
@@ -410,6 +411,7 @@ fn an_adapter_lies_in_its_slots() {
                 adapter: moved.clone(),
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
+                pair_generation: 0,
             })
             .expect("the holder is rebound");
     }

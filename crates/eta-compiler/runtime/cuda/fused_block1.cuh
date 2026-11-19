@@ -14,6 +14,7 @@
     const m1_u32* intrinsic_widths,
     const m1_u32* intrinsic_strides,
     const m1_u32* intrinsic_offsets,
+    const m1_u32* intrinsic_rows,
     m1_u32 rows_per_lane,
     m1_u32 temporary_stride,
     m1_u8* lane_arenas) {

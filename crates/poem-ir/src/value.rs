@@ -254,7 +254,12 @@ pub enum RuntimeInput {
     Tokens,
     Positions,
     MropePositions,
-    /// Each lane's mask bits over the All axis.
+    /// Each lane's attention mask, as per-lane data: every lane of a fire
+    /// has an entry, its mask's bits over its keys past its committed
+    /// boundary or a word stating it has none (it reads every key its own
+    /// bounds give). Whether a lane states a mask is never part of its
+    /// class: one body serves masked and unmasked lanes, each reading its
+    /// own entry. The layout of the entries is the backend's.
     Mask,
     Geometry {
         kind: GeomKind,

@@ -29,11 +29,24 @@ tracing = "0.1"
 
 naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
 
-# Native builds exist only for the gate tests, on wgpu's Vulkan backend.
+# Native builds run on wgpu's Vulkan backend off Apple and DX12 on Windows;
+# each backend's native handles state the device memory. macOS has no wgpu
+# backend: on wgpu's Metal backend a large first submission never completes,
+# so a load there is refused by name.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
+    "dx12",
+], optional = true }
+
+# wgpu's Vulkan backend, off Apple.
+[target.'cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["std"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Graphics_Dxgi",
 ], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -45,6 +58,7 @@ wgpu = { version = "30", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+engine-wgpu = { path = ".", features = ["test-limits"] }
 # The CPU oracle the score capture is held against.
 engine-cpu = { path = "../engine-cpu" }
 poem = { package = "pie-poem", path = "../poem" }
@@ -52,9 +66,13 @@ ztensor = { workspace = true }
 
 [features]
 default = []
+# A test's device that binds less (`DeviceBoot::max_buffer`): test builds only.
+test-limits = []
 wgpu = [
     "dep:wgpu",
     "dep:naga",
+    "dep:ash",
+    "dep:windows",
     "kernels-slang/wgsl",
     "kernels-slang/probe",
 ]

@@ -251,7 +251,7 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 /// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
 pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -290,7 +290,7 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,
@@ -386,6 +386,7 @@ fn bound_with(
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );
@@ -448,6 +449,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),
@@ -490,7 +492,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     }
     eprintln!("ids {ids:?} and both stacked layers read back");
     assert_eq!(
-        engine.live().tallied(engine::live::Tally::BuiltAfterReady),
+        engine.live().tallied(engine::live::Tally::BuiltInFire),
         0,
         "a fire a guest reads built a pipeline the load did not"
     );
@@ -559,12 +561,13 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
 /// What the engine tallies of a serving fire (`engine::live::Tally`): a
 /// guest program registered and bound after the load, and its fire, build
 /// no pipeline, since the load built every guest step's and every kernel
-/// its walks named, so `BuiltAfterReady` reads 0; where the backend records,
+/// its walks named, so `BuiltInFire` reads 0; where the backend records,
 /// the first fire records and the second replays, and neither counts
 /// `Unrecorded`; where it keeps no recording, each fire walks eagerly and
 /// counts `Eager`. The negative controls: a kernel pipeline the load did not
-/// build, built after it, is counted `BuiltAfterReady` by the next fire, and
-/// so is a guest step's pipeline a bind builds after the load.
+/// build, built after it, is counted `BuiltInFire` by the next fire; a
+/// guest step's pipeline a bind builds after the load, before any fire of
+/// it, is counted `BuiltAtRegister` and not `BuiltInFire`.
 #[test]
 fn a_pipeline_built_after_the_load_is_counted() {
     use engine::live::Tally;
@@ -582,7 +585,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
         return;
     };
     let live = engine.live();
-    let built = |live: &engine::live::Live| live.tallied(Tally::BuiltAfterReady);
+    let built = |live: &engine::live::Live| live.tallied(Tally::BuiltInFire);
     let fire = |engine: &mut backend::Engine| {
         let lane = Lane {
             slot: 0,
@@ -604,6 +607,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
@@ -688,9 +692,14 @@ fn a_pipeline_built_after_the_load_is_counted() {
         return;
     };
     assert_eq!(
-        engine.live().tallied(Tally::BuiltAfterReady),
+        engine.live().tallied(Tally::BuiltAtRegister),
         1,
-        "a bind that built a guest step's pipeline after the load is counted"
+        "a bind that built a guest step's pipeline after the load counts it at its registration"
+    );
+    assert_eq!(
+        engine.live().tallied(Tally::BuiltInFire),
+        0,
+        "a guest step's pipeline built at its bind, before any fire of it, is no fire's build"
     );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);

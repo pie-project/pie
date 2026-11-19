@@ -219,11 +219,14 @@ fn paged_attention_answers_the_reference() {
             let own = gpu.up_i32(&batch.owner);
             let sel = gpu.up_i32(&selection);
             let mut mask = vec![0u8; rows * MASK_STRIDE];
-            let mut words = vec![0u32; rows];
+            // Two words a row: its boundary (none past every key) and where
+            // its columns start in the plane.
+            let mut words = [sdpa::MASK_NONE, 0].repeat(rows);
             for (r, m) in batch.masks.iter().enumerate() {
                 if let Some((origin, m)) = m {
                     mask[r * MASK_STRIDE..][..MASK_STRIDE].copy_from_slice(m);
-                    words[r] = 1 | ((*origin as u32) << 2);
+                    words[2 * r] = *origin as u32;
+                    words[2 * r + 1] = (r * MASK_STRIDE) as u32;
                 }
             }
             let pack = |b: &[u8]| -> Vec<u32> {
@@ -242,9 +245,8 @@ fn paged_attention_answers_the_reference() {
             let tables = sdpa::Tables {
                 positions: t(pos, rows, 1, Dtype::I32),
                 request_of_token: t(own, rows, 1, Dtype::I32),
-                mask: t(mb, rows, MASK_STRIDE, Dtype::U8),
-                mask_enabled: t(eb, rows, 1, Dtype::U32),
-                mask_stride: MASK_STRIDE as u32,
+                mask: t(mb, 1, rows * MASK_STRIDE, Dtype::U8),
+                mask_words: t(eb, rows, 2, Dtype::U32),
             };
             let n = rows * QH * hd;
             let qt = t(q, rows, QH * hd, Dtype::Bf16);

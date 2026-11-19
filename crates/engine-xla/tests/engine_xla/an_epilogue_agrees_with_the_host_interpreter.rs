@@ -91,16 +91,22 @@ impl Program {
 }
 
 fn plan_of(container: TraceContainer, vocab: u32) -> ExecPlan {
+    plan_over(container, vocab, 1)
+}
+
+/// The program bound over `lanes` lanes, each returning its logits.
+fn plan_over(container: TraceContainer, vocab: u32, lanes: usize) -> ExecPlan {
+    let logits = eta_ir::registry::OutputDecl {
+        name: "logits".to_string(),
+        axis: eta_ir::registry::Axis::Row,
+        width: vocab,
+        dtype: eta_ir::types::Dtype::F32,
+        layers: 0,
+        readout: true,
+    };
     let bound = eta_ir::validate::bind(
         container,
-        vec![vec![eta_ir::registry::OutputDecl {
-            name: "logits".to_string(),
-            axis: eta_ir::registry::Axis::Row,
-            width: vocab,
-            dtype: eta_ir::types::Dtype::F32,
-            layers: 0,
-            readout: true,
-        }]],
+        vec![vec![logits]; lanes],
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -208,9 +214,12 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
     }
 }
 
-/// Where the program reads its outputs for the fire's lane `lane`.
+/// Where the program reads its outputs for the fire's lane `lane`,
+/// attached over that one lane.
 fn bound(plan: &ExecPlan, kept: &Kept, lane: usize) -> Vec<Bound> {
-    engine_xla::guest::run::bound(plan, Some(kept), lane as u32).expect("the lane binds")
+    engine_xla::guest::run::bound(plan, Some(kept), lane as u32, 1)
+        .expect("the program reads its own lane")
+        .expect("the lane binds")
 }
 
 /// The device's answer for one lane reading its outputs where `bound` says.
@@ -1046,6 +1055,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_sampler_agrees(device, &mut stages, VOCAB);
     the_rowwise_sampler_agrees(device, &mut stages);
     a_group_answers_what_each_lane_answers_alone(device, &mut stages);
+    a_guest_reads_no_row_past_its_own_lanes(device, &mut stages);
     carried_cells_answer_what_the_rings_answer(device, &mut stages);
     eprintln!("compiled {} stage program(s)", stages.len());
     // Last: it seals the device.
@@ -1361,6 +1371,92 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         }
         close(&got[6], &want[6], 1e-5, "group probabilities");
     }
+}
+
+/// Each row's largest logit over `rows` rows of the lane `lane` the
+/// program is attached at (`lane` past the first, a lane after it).
+fn row_peaks(rows: u32, lane: u32) -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane,
+        shape: Shape::matrix(rows, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let peak = p.op(Op::ReduceMax(logits));
+    let peak = p.op(Op::Reshape {
+        value: peak,
+        shape: Shape::vector(rows),
+    });
+    let out = p.output(Shape::vector(rows), Dtype::F32, peak);
+    (p.container(), vec![out])
+}
+
+/// A guest reads its own lanes' rows and no other request's: lane 1's row
+/// (a sentinel) lies right after lane 0's, and a program attached at lane 0
+/// alone that reads two rows is refused by name, its channel holding
+/// nothing; attached over both lanes it reads both rows. A program reading
+/// a lane past the ones it is attached over is refused before it binds.
+fn a_guest_reads_no_row_past_its_own_lanes(device: &Device, stages: &mut Stages) {
+    const SENTINEL: f32 = 4321.0;
+    let mut plane = logits_plane(2, VOCAB, 61);
+    plane[VOCAB as usize..].fill(SENTINEL);
+    let kept = kept(device, &plane, 2, vec![(0, 1), (1, 1)]);
+    let (container, outs) = row_peaks(2, 0);
+    let plan = plan_of(container, VOCAB);
+
+    let alone = bound(&plan, &kept, 0);
+    assert_eq!(
+        alone[0].seat,
+        Seat { first: 0, count: 1 },
+        "a lane attached alone is seated on its own row, not its neighbour's"
+    );
+    let mut inst = instance(&plan, &[]);
+    let mut runner = OnDevice::new(device, stages, key_of(&plan), Some(&kept), alone);
+    let outcome = eta_exec::step_with(
+        &mut inst,
+        &plan,
+        &PassInputs::none(),
+        &mut runner,
+        eta_ir::registry::Stage::Epilogue,
+    );
+    match &outcome {
+        StepOutcome::Faulted(why) => assert!(
+            why.contains("reads 2 rows of output `logits` and its lane holds 1"),
+            "refused for reading past its lane: {why}"
+        ),
+        other => panic!("a pass reading its neighbour's row was not refused: {other:?}"),
+    }
+    for &c in &outs {
+        let held = eta_exec::host_take(&inst, &plan, c);
+        assert!(
+            !matches!(&held.1, Some(Value::F32(x)) if x.contains(&SENTINEL)),
+            "the refused pass put its neighbour's row on channel {c}: {held:?}"
+        );
+    }
+
+    // Attached over both lanes, its two rows are its own.
+    let both = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 2)
+        .expect("the program reads its own lanes")
+        .expect("the lanes bind");
+    assert_eq!(both[0].seat, Seat { first: 0, count: 2 });
+    let got = on_device(device, stages, &plan, &[], Some(&kept), both, &outs);
+    let want = host(&plan, &[], &plane, 2, &outs);
+    exact(&got[0], &want[0], "the peaks of the attachment's two rows");
+    assert!(
+        matches!(&got[0], Value::F32(x) if x[1] == SENTINEL),
+        "the second lane's row is the attachment's own: {got:?}"
+    );
+
+    // A program reading its lane 1, attached over lane 0 alone.
+    let (container, _) = row_peaks(1, 1);
+    let plan = plan_over(container, VOCAB, 2);
+    let refused = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 1)
+        .expect_err("a program reading a lane it is not attached over binds nothing");
+    assert!(
+        refused.contains("reads output `logits` of its lane 1, and it is attached over 1 lane(s)"),
+        "refused by name: {refused}"
+    );
 }
 
 /// A sampler that carries its rng state and histogram from pass to pass in

@@ -130,6 +130,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 head_dim,
                 sm_scale,
                 o,
+                mask,
                 selection: None,
                 bias: None,
                 selected: None,
@@ -144,7 +145,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 kv_heads: wide[&plan].0,
                 sm_scale,
                 o,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 floor: None,
@@ -162,6 +163,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 sm_scale,
                 o,
                 lse: Some(lse),
+                mask,
                 selection: None,
                 bias: None,
                 selected: None,
@@ -177,7 +179,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 o,
                 lse: Some(lse),
                 floor: None,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 causal: true,
@@ -220,8 +222,9 @@ mod tests {
                     lse: Some(_),
                     ..
                 } => counts.1 += 1,
+                // The fire's masks are an operand of either arm (per-lane
+                // data, not a class), so a rewritten decode carries them.
                 Attn::Prefill {
-                    mask: None,
                     selection: None,
                     bias: None,
                     lse: Some(_),

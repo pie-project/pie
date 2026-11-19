@@ -91,6 +91,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::rmsnorm_residual_add(),
+            rules::residual_add_rmsnorm_matmul(),
+            rules::residual_add_rmsnorm_matmul_swiglu_matmul(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),
@@ -249,13 +251,20 @@ mod tests {
             matches!(&t.values[v.0 as usize].ty,
                 Ty::Tensor { shape, .. } if matches!(shape.last(), Some(Dim::Const(n)) if n % 8 != 0))
         };
-        for rule in super::retired() {
-            let kernel = rule.kernel();
-            let only = [rule];
-            for row in poem_compiler::catalog::deployments() {
-                let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
-                    continue;
-                };
+        // A row is traced, fused and folded once, each retired rule then
+        // read against both: tracing the catalog once a rule is the cost of
+        // the whole sweep.
+        let retired = super::retired();
+        for row in poem_compiler::catalog::deployments() {
+            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                continue;
+            };
+            let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+            let (anchored, _) = crate::synth::fold_anchors(fused.clone());
+            let (folded, _) =
+                poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+            for rule in &retired {
+                let kernel = rule.kernel();
                 // The sites the rule forms in `t` that it fused (its product
                 // bf16 against a bf16 weight), and of those the ones too
                 // narrow for a row skeleton.
@@ -285,17 +294,13 @@ mod tests {
                     }
                     held
                 };
-                let formed = |t: Trace| {
-                    let before = sites(&t);
-                    let after = sites(&poem_compiler::fuse::fuse(t, only.iter()));
+                let formed = |t: &Trace| {
+                    let before = sites(t);
+                    let after = sites(&poem_compiler::fuse::fuse(t.clone(), [rule]));
                     (after.0 - before.0, after.1 - before.1)
                 };
-                let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
-                let (here, _) = formed(fused.clone());
-                let (anchored, _) = crate::synth::fold_anchors(fused);
-                let (folded, _) =
-                    poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
-                let (left, thin) = formed(folded);
+                let (here, _) = formed(&fused);
+                let (left, thin) = formed(&folded);
                 let held = census.entry(kernel).or_default();
                 held.0 += here;
                 held.1 += usize::from(here > 0);
@@ -323,10 +328,11 @@ mod tests {
     #[test]
     fn every_fused_op_its_rules_form_is_one_dispatch_fires() {
         let mut refused = std::collections::BTreeSet::new();
-        for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
-            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
-                continue;
-            };
+        let platform = poem_ir::Platform::Cuda;
+        let whole = poem_compiler::catalog::deployments()
+            .filter_map(|row| Some((row.name.clone(), row.try_trace(platform).ok()?)));
+        let split = poem_compiler::catalog::traced_splits(platform).map(|(row, t)| (row.name, t));
+        for (name, trace) in whole.chain(split) {
             #[cfg(feature = "rocm")]
             let trace = crate::split_arm::split_into_arms(trace);
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
@@ -334,7 +340,7 @@ mod tests {
                 if let Operation::Fused(op) = &node.op
                     && crate::dispatch::refuses(op)
                 {
-                    refused.insert(format!("{}: {}", row.name, poem_ir::Operands::name(op)));
+                    refused.insert(format!("{name}: {}", poem_ir::Operands::name(op)));
                 }
             }
         }

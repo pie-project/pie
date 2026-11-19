@@ -9,7 +9,7 @@
 
 use crate::common_dit;
 
-use common_dit::{Rig, Weights, assert_close, attach};
+use common_dit::{Rig, Weights, assert_close, attach, attach_over};
 use engine::Engine;
 use engine::fire::{Lane, Readout};
 use eta_ir::container::{
@@ -151,6 +151,18 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// What a device beam's lane may write, as the runtime states it: past the
+/// shared prompt page (its frozen prefix, `folded`) to the end of the one
+/// page the fire makes the set's own, `folded` and the fire's one row
+/// rounded up to the page (`KvDelta::writable`).
+fn device_writes() -> engine::fire::KvDelta {
+    engine::fire::KvDelta {
+        folded: PAGE,
+        write_end: (PAGE + 1).div_ceil(PAGE) * PAGE,
+        ..engine::fire::KvDelta::default()
+    }
+}
+
 /// A lane of `tokens` on `pages` of the kv list `kv` past `held` keys.
 pub(crate) fn host_lane(
     kv: engine::chunk::ShapeId,
@@ -235,6 +247,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("a device-geometry instance binds")
         .id;
@@ -281,10 +294,11 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 };
                 lane.tables.push((kv, vec![shared, device_own[b as usize]]));
                 lane.list = engine::fire::ListKind::Translation;
+                lane.kv = device_writes();
                 lane
             })
             .collect();
-        rig.fire(lanes, vec![attach(0, instance)], Vec::new());
+        rig.fire(lanes, vec![attach_over(0, BEAMS, instance)], Vec::new());
         let got = rig.take(instance, 4);
         assert_eq!(
             got.len(),
@@ -301,6 +315,55 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             );
         }
     }
+
+    // Attached over its first lane alone, the program's ports, which state
+    // two beams, would set the next lane's geometry (its positions and the
+    // slots its rows land in, through that lane's own table): refused by
+    // name, the lane after it being another request's.
+    let held = PAGE + steps.len() as u32;
+    for (chan, cell) in [
+        (0u32, words(&[7, 8])),
+        (1, words(&[held, held])),
+        (2, words(&[held, held])),
+        (3, words(&[held + 1, held + 1])),
+    ] {
+        assert!(
+            rig.engine
+                .publish_channel(instance, chan, &cell)
+                .expect("the cell publishes"),
+            "the ring had room"
+        );
+    }
+    let lanes: Vec<Lane> = (0..BEAMS)
+        .map(|b| {
+            let mut lane = Lane {
+                slot: 3 + b,
+                word: 0,
+                tokens: vec![0],
+                readout: Readout::Last,
+                ..Lane::default()
+            };
+            lane.tables.push((kv, vec![shared, device_own[b as usize]]));
+            lane.list = engine::fire::ListKind::Translation;
+            lane.kv = device_writes();
+            lane
+        })
+        .collect();
+    let refused = rig
+        .engine
+        .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
+            lanes,
+            attachments: vec![attach(0, instance)],
+            media: Vec::new(),
+            voxels: Vec::new(),
+        }))
+        .expect_err("ports stating a lane past the attachment's are refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("attached over 1 lane(s) at lane 0 and its `embed_indptr` port describes 2"),
+        "refused by name: {refused}"
+    );
 }
 
 /// A rope's queries and the keys it was given.
@@ -419,6 +482,7 @@ fn device_fed_tokens_reach_the_next_fire() {
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("the instance binds")
         .id;

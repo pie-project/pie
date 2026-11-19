@@ -594,6 +594,7 @@ impl Rig {
                 adapter_slots: Vec::new(),
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
+                pair_generation: 0,
             },
         );
         LaneHandles {
@@ -662,6 +663,7 @@ pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
         lanes: 1,
         instance: handles.instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

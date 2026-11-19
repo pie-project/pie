@@ -452,8 +452,9 @@ fn unguarded_read(plan: &Trace) -> Option<String> {
         ins.clear();
         node.op.inputs(&mut ins);
         for id in &ins {
+            // (The masks are per-lane data, a lane stating none among them:
+            // any rows read them.)
             let (builtin, what) = match &plan.values[id.0 as usize].def {
-                Def::Input(RuntimeInput::Mask) => (poem_ir::Builtin::Masked, "fact.has(fact.Mask)"),
                 Def::Input(RuntimeInput::AdapterRoutes) => {
                     (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
                 }

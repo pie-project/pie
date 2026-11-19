@@ -502,24 +502,35 @@ impl Rig {
             .expect("the program registers")
     }
 
+    fn registration(id: ChannelId, shape: Vec<u32>, host_role: HostRole) -> ChannelRegistration {
+        ChannelRegistration {
+            id,
+            shape,
+            dtype: ChanDType::Concrete(EtaDtype::F32),
+            host_role,
+            seeded: false,
+            extern_dir: None,
+            capacity: 2,
+            extern_name: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
     pub fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
         let id = ChannelId(self.next_channel);
         self.next_channel += 1;
-        self.guest.register(
-            &mut self.engine,
-            ChannelRegistration {
-                id,
-                shape,
-                dtype: ChanDType::Concrete(EtaDtype::F32),
-                host_role,
-                seeded: false,
-                extern_dir: None,
-                capacity: 2,
-                extern_name: Vec::new(),
-                slots: Vec::new(),
-            },
-        );
+        self.guest
+            .register(&mut self.engine, Self::registration(id, shape, host_role));
         id
+    }
+
+    /// Fresh `Channel` slots for the ring of a channel of `shape` and
+    /// `host_role`: where a restore copies a parked ring back to.
+    pub fn fresh_ring(&mut self, shape: Vec<u32>, host_role: HostRole) -> Vec<u32> {
+        self.guest.ring(
+            &self.engine,
+            &Self::registration(ChannelId(0), shape, host_role),
+        )
     }
 
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
@@ -544,6 +555,7 @@ impl Rig {
                     adapter_slots: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .id
@@ -580,6 +592,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

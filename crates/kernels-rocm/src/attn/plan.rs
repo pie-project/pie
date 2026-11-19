@@ -102,6 +102,12 @@ pub struct DecodePlan {
     pub shape: Shape,
     pub window: Option<u32>,
     pub device: Device,
+    /// The fire's mask offsets (i64, one a request and one past) and words
+    /// (u32 a request), where it staged them: a decode reading a lane's mask
+    /// finds the lane's here. `plan_decode` leaves them `None`; the engine
+    /// sets them.
+    pub mask_indptr: Option<Tensor>,
+    pub mask_origin: Option<Tensor>,
 }
 
 impl DecodePlan {
@@ -350,6 +356,8 @@ pub fn plan_decode(
         shape,
         window,
         device: *device,
+        mask_indptr: None,
+        mask_origin: None,
     })
 }
 
@@ -481,12 +489,23 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
     }
     #[cfg(feature = "rocm")]
     {
-        // SAFETY: `int_ptr` is the plan's device workspace, sized for the plan
-        // the host bytes describe.
+        // The plan's bytes are the caller's, dropped when its run ends: a
+        // copy from them may run after that, since HIP stages a pageable
+        // source only as it reaches it. A pinned slot of the stream's ring
+        // holds them until an event recorded after the copy fires.
+        let from = pinned::stage(op, ctx.stream(), bytes)?;
+        if crate::sizing::active() {
+            // A size-only walk (`crate::sizing`) moves nothing.
+            return pinned::sent(op, ctx.stream());
+        }
+        // SAFETY: `int_ptr` is the plan's device workspace, sized for the
+        // plan the host bytes describe; `from` is a pinned slot holding a
+        // copy of them, which the ring does not reuse until an event
+        // recorded after this copy fires.
         unsafe {
             crate::hip::memcpy_async(
                 int_ptr as usize as *mut core::ffi::c_void,
-                bytes.as_ptr().cast(),
+                from.cast(),
                 bytes.len(),
                 crate::hip::Direction::HostToDevice,
                 ctx.stream(),
@@ -497,7 +516,8 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 op,
                 format!("`hipMemcpyAsync` answered {code} staging the plan"),
             )
-        })
+        })?;
+        pinned::sent(op, ctx.stream())
     }
     #[cfg(not(feature = "rocm"))]
     {
@@ -559,4 +579,151 @@ pub struct MlaPlanInfo {
     pub work_indptr_offset: Option<u32>,
     pub partial_o_offset: Option<u32>,
     pub partial_lse_offset: Option<u32>,
+}
+
+/// The pinned host slots a plan's bytes are staged through, a ring a stream,
+/// each slot guarded by an event recorded after the copy that reads it.
+#[cfg(feature = "rocm")]
+mod pinned {
+    use super::{Error, refuse};
+    use crate::hip::rt;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// Slots before a stage waits for the oldest copy rather than grow.
+    const MOST: usize = 64;
+    /// The least a slot holds, so a batch's plans growing by a few rows
+    /// reuse what warm launches allocated.
+    const LEAST: usize = 64 << 10;
+    /// `hipErrorNotReady`: an event's work is still queued.
+    const NOT_READY: i32 = 600;
+    /// `hipEventDisableTiming`.
+    const DISABLE_TIMING: u32 = 2;
+
+    struct Slot {
+        host: *mut u8,
+        bytes: usize,
+        read: rt::Event,
+    }
+
+    struct Ring {
+        slots: Vec<Slot>,
+        next: usize,
+    }
+
+    // SAFETY: a ring holds page-locked allocations and events, runtime
+    // handles any thread may use; it is reached only under its lock.
+    unsafe impl Send for Ring {}
+
+    /// Every stream's ring, by its device and handle: each its own lock, so
+    /// a stage waiting out its stream's oldest copy holds back no other's.
+    static RINGS: Mutex<BTreeMap<(i32, usize), &'static Mutex<Ring>>> = Mutex::new(BTreeMap::new());
+
+    fn on_ring<R>(
+        op: &'static str,
+        stream: rt::Stream,
+        f: impl FnOnce(&mut Ring) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let device = crate::jit::cache::current_device()
+            .map_err(|fault| refuse(op, format!("staging the plan: {fault}")))?;
+        let ring: &'static Mutex<Ring> = RINGS
+            .lock()
+            .expect("plan rings lock poisoned")
+            .entry((device, stream as usize))
+            .or_insert_with(|| {
+                Box::leak(Box::new(Mutex::new(Ring {
+                    slots: Vec::new(),
+                    next: 0,
+                })))
+            });
+        f(&mut ring.lock().expect("plan ring lock poisoned"))
+    }
+
+    fn check(op: &'static str, what: &str, code: i32) -> Result<(), Error> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(refuse(
+                op,
+                format!("`{what}` answered {code} staging the plan"),
+            ))
+        }
+    }
+
+    /// `bytes` copied into the ring's next slot, waiting out the copy that
+    /// last read it; the slot's address.
+    pub(super) fn stage(
+        op: &'static str,
+        stream: rt::Stream,
+        bytes: &[u8],
+    ) -> Result<*const u8, Error> {
+        on_ring(op, stream, |ring| {
+            let at = ring.next;
+            // The slot at `at` is the oldest a copy read; one still queued
+            // gets a new slot before it, which keeps it the oldest.
+            let queued = at < ring.slots.len() && {
+                // SAFETY: an event this ring created.
+                let code = unsafe { rt::hipEventQuery(ring.slots[at].read) };
+                if code == NOT_READY {
+                    true
+                } else {
+                    check(op, "hipEventQuery", code)?;
+                    false
+                }
+            };
+            if queued && ring.slots.len() >= MOST {
+                // SAFETY: an event this ring created.
+                check(op, "hipEventSynchronize", unsafe {
+                    rt::hipEventSynchronize(ring.slots[at].read)
+                })?;
+            } else if queued || ring.slots.len() <= at {
+                let mut read: rt::Event = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new event.
+                check(op, "hipEventCreateWithFlags", unsafe {
+                    rt::hipEventCreateWithFlags(&raw mut read, DISABLE_TIMING)
+                })?;
+                ring.slots.insert(
+                    at,
+                    Slot {
+                        host: core::ptr::null_mut(),
+                        bytes: 0,
+                        read,
+                    },
+                );
+            }
+            let slot = &mut ring.slots[at];
+            if slot.bytes < bytes.len() {
+                if !slot.host.is_null() {
+                    // SAFETY: a page-locked allocation this slot owns, its
+                    // last copy run (the event above).
+                    unsafe { rt::hipHostFree(slot.host.cast()) };
+                    slot.host = core::ptr::null_mut();
+                    slot.bytes = 0;
+                }
+                let size = bytes.len().next_power_of_two().max(LEAST);
+                let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new page-locked allocation.
+                check(op, "hipHostMalloc", unsafe {
+                    rt::hipHostMalloc(&raw mut host, size, 0)
+                })?;
+                slot.host = host.cast();
+                slot.bytes = size;
+            }
+            // SAFETY: the slot holds at least `bytes.len()` and no copy reads it.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.host, bytes.len()) };
+            Ok(slot.host.cast_const())
+        })
+    }
+
+    /// The slot `stage` handed out is read once `stream` runs to here.
+    pub(super) fn sent(op: &'static str, stream: rt::Stream) -> Result<(), Error> {
+        on_ring(op, stream, |ring| {
+            let at = ring.next;
+            ring.next = (at + 1) % ring.slots.len();
+            // SAFETY: an event this ring created, on the caller's stream.
+            check(op, "hipEventRecord", unsafe {
+                rt::hipEventRecord(ring.slots[at].read, stream)
+            })
+        })
+    }
 }

@@ -63,7 +63,6 @@ pub use poem_exec::feeds::Seat;
 struct SeatAt {
     seat: Seat,
     at: u64,
-    bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,13 +134,13 @@ pub struct Handles {
 
     pub request_of_token: Tensor,
 
+    /// The mask plane, bound whole whatever the fire stages: a recorded
+    /// fire binds it as one with no mask does.
     pub mask: Tensor,
 
-    /// One u32 a row: its enable flag (bits 0-1) and its lane's committed
-    /// boundary (bits 2-31), the key the row's plane column 0 is.
-    pub mask_enabled: Tensor,
-
-    pub mask_stride: u32,
+    /// Two u32 a row (`mask::Staged`'s words): the key the row's columns
+    /// start at, `mask::NONE` where it states no mask, and its byte offset.
+    pub mask_words: Tensor,
 
     pub patches: Option<PatchHandles>,
 
@@ -237,9 +236,14 @@ pub struct PatchFire<'a> {
     pub grids: &'a [i32],
 }
 
-#[derive(Debug)]
-pub struct Inputs<B: Backend> {
-    store: B::Buffer,
+/// Where a fire's inputs lie in an arm's store, and the store's bytes: a
+/// function of the load's fires alone ([`Laid::lay`]), so a load weighs the
+/// store against its largest binding before it lays one.
+#[derive(Debug, Clone)]
+pub struct Laid {
+    /// Each input's room, by where it lies: what a dispatch binds over it,
+    /// whatever rows a fire brings, so one view of it serves every fire.
+    rooms: std::collections::BTreeMap<u64, u64>,
     tokens: u64,
     positions: u64,
     rotations: u64,
@@ -255,9 +259,10 @@ pub struct Inputs<B: Backend> {
     request_of_token: u64,
     mask_planes: u64,
     mask_plane_bytes: u64,
-    mask_enabled: u64,
-
-    mask_stride: u32,
+    mask_words: u64,
+    /// The leading rows whose words state no mask as the store holds them:
+    /// a fire stating none rewrites only past them.
+    words_none: u32,
     page_tables: Vec<TableAt>,
 
     patch: Option<PatchAt>,
@@ -274,11 +279,20 @@ pub struct Inputs<B: Backend> {
     /// The capture table's ints, laid where the trace captures scores:
     /// `TABLE_INTS` for each of a fire's lanes at most.
     capture: Option<(u64, u64)>,
+    /// The store's bytes.
+    total: u64,
+}
+
+#[derive(Debug)]
+pub struct Inputs<B: Backend> {
+    store: B::Buffer,
+    laid: Laid,
     /// Staged apart from the store: their size is the groups', not the load's.
     group_masks: Option<B::Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
     outgrown: Vec<B::Buffer>,
 }
+
 
 #[derive(Debug, Clone, Copy)]
 pub struct GroupMaskHandles {
@@ -288,10 +302,13 @@ pub struct GroupMaskHandles {
     pub indptr: Tensor,
 }
 
-impl<B: Backend> Inputs<B> {
+impl Laid {
+    /// Lays a fire's inputs for fires of `budget`: where each lies in the
+    /// store, and the store's bytes; no one input past `binding`, the most
+    /// one reservation of the device binds.
     #[allow(clippy::too_many_arguments)]
-    pub fn reserve(
-        device: &B::Context,
+    #[must_use]
+    pub fn lay(
         budget: &Budget,
         paging: Paging,
         page_tables: usize,
@@ -305,20 +322,29 @@ impl<B: Backend> Inputs<B> {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
-    ) -> Result<Inputs<B>> {
+        binding: u64,
+    ) -> Laid {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         // A lane's table holds as many pages as its narrowest list takes.
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot.max(table_pages));
 
-        let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+        // A gathered window's rows, positions, rotations and owners an int a
+        // row, its mask entries two.
+        let per_gathered = 6 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
             (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
         let mut at = 0u64;
+        let mut rooms = std::collections::BTreeMap::new();
         let mut take = |bytes: u64| {
             let here = at;
+            // Its room is its bytes in whole words, within the binding the
+            // load weighed it against; an input of no bytes lies where the
+            // next one does, and has its room.
+            let held: &mut u64 = rooms.entry(here).or_default();
+            *held = (*held).max(bytes.next_multiple_of(4));
             at += bytes.next_multiple_of(ALIGN);
             here
         };
@@ -336,11 +362,16 @@ impl<B: Backend> Inputs<B> {
         let request_of_token = take(rows * 4);
 
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
-        let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
-        let mask_plane_bytes = rows * context;
-        let mask_planes = take(mask_plane_bytes);
+        // A row's columns run from its lane's boundary to its own key, at
+        // most the context; the plane is one binding, its offsets u32.
+        let mask_plane_bytes = (rows * context)
+            .min(binding)
+            .min(u64::from(u32::MAX))
+            / 4
+            * 4;
+        let mask_planes = take(mask_plane_bytes.max(4));
 
-        let mask_enabled = take(rows * 4);
+        let mask_words = take(rows * 8);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -378,7 +409,6 @@ impl<B: Backend> Inputs<B> {
                 SeatAt {
                     seat: *seat,
                     at: take(bytes),
-                    bytes,
                 }
             })
             .collect();
@@ -402,9 +432,9 @@ impl<B: Backend> Inputs<B> {
         });
         let total = at;
 
-        let store = B::Buffer::host(device, total, crate::books::owners::INPUTS)?;
-        Ok(Inputs {
-            store,
+        Laid {
+            rooms,
+            total,
             tokens,
             positions,
             rotations,
@@ -419,8 +449,8 @@ impl<B: Backend> Inputs<B> {
             request_of_token,
             mask_planes,
             mask_plane_bytes,
-            mask_enabled,
-            mask_stride,
+            mask_words,
+            words_none: 0,
             page_tables,
             patch,
             mrope,
@@ -431,6 +461,30 @@ impl<B: Backend> Inputs<B> {
             seats,
             voxels,
             capture,
+        }
+    }
+
+    /// The store's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.total
+    }
+
+    /// The room laid at byte `at` of the store, which a view of the input
+    /// there binds.
+    fn room(&self, at: u64) -> Result<u64> {
+        self.rooms.get(&at).copied().ok_or_else(|| Fault::Unbound {
+            what: format!("an input at byte {at} of the store, where none was laid"),
+        })
+    }
+}
+
+impl<B: Backend> Inputs<B> {
+    /// An arm's inputs, its store laid at `laid`.
+    pub fn reserve(device: &B::Context, laid: Laid) -> Result<Inputs<B>> {
+        Ok(Inputs {
+            store: B::Buffer::host(device, laid.total, crate::books::owners::INPUTS)?,
+            laid,
             group_masks: None,
             outgrown: Vec::new(),
         })
@@ -500,6 +554,7 @@ impl<B: Backend> Inputs<B> {
                         buffer,
                         indptr as u64,
                         u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                        mask.indptr.len() as u64 * 4,
                     )?,
                 })
             })
@@ -508,7 +563,7 @@ impl<B: Backend> Inputs<B> {
 
     #[must_use]
     pub fn voxel_payload(&self) -> Option<(&B::Buffer, u64)> {
-        self.voxels.map(|at| (&self.store, at.payload))
+        self.laid.voxels.map(|at| (&self.store, at.payload))
     }
 
     pub fn write_input(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
@@ -522,7 +577,7 @@ impl<B: Backend> Inputs<B> {
 
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<(&B::Buffer, u64)> {
-        self.seats
+        self.laid.seats
             .iter()
             .find(|at| at.seat.id == id)
             .map(|at| (&self.store, at.at))
@@ -530,14 +585,14 @@ impl<B: Backend> Inputs<B> {
 
     #[must_use]
     pub fn patch_element(&self) -> Option<Dtype> {
-        self.patch.map(|at| at.seat.dtype)
+        self.laid.patch.map(|at| at.seat.dtype)
     }
 
     /// The store and the offset of row 0's token id, for a token the device
     /// writes in place of the host.
     #[must_use]
     pub fn token_seat(&self) -> (&B::Buffer, u64) {
-        (&self.store, self.tokens)
+        (&self.store, self.laid.tokens)
     }
 
     #[must_use]
@@ -551,13 +606,16 @@ impl<B: Backend> Inputs<B> {
         fire: &Fire<'_>,
     ) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
-        let lanes = fire.slot_ids.len() as u32 / self.pieces;
+        let lanes = fire.slot_ids.len() as u32 / self.laid.pieces;
 
-        let valid = vec![1u8; rows as usize];
+        // Whole words, its slot laid at `ALIGN`: a sub-word write would have
+        // the device read its last word back first.
+        let mut valid = vec![1u8; rows as usize];
+        valid.resize(valid.len().next_multiple_of(4), 0);
 
-        self.store.write(self.tokens, bytes_of(fire.tokens))?;
-        self.store.write(self.positions, bytes_of(fire.positions))?;
-        self.store.write(self.rotations, bytes_of(fire.rotations))?;
+        self.store.write(self.laid.tokens, bytes_of(fire.tokens))?;
+        self.store.write(self.laid.positions, bytes_of(fire.positions))?;
+        self.store.write(self.laid.rotations, bytes_of(fire.rotations))?;
         if fire.readout_rows.len() > rows as usize {
             return Err(Fault::Ceiling {
                 what: "readout rows in one fire",
@@ -566,25 +624,25 @@ impl<B: Backend> Inputs<B> {
             });
         }
         self.store
-            .write(self.readout_rows, bytes_of(fire.readout_rows))?;
-        if fire.windows.len() as u64 > self.window_ints {
+            .write(self.laid.readout_rows, bytes_of(fire.readout_rows))?;
+        if fire.windows.len() as u64 > self.laid.window_ints {
             return Err(Fault::Ceiling {
                 what: "packed window boundaries",
                 need: fire.windows.len() as u64,
-                have: self.window_ints,
+                have: self.laid.window_ints,
             });
         }
-        self.store.write(self.windows, bytes_of(fire.windows))?;
-        self.store.write(self.row_valid, &valid)?;
-        self.store.write(self.slot_ids, bytes_of(fire.slot_ids))?;
+        self.store.write(self.laid.windows, bytes_of(fire.windows))?;
+        self.store.write(self.laid.row_valid, &valid)?;
+        self.store.write(self.laid.slot_ids, bytes_of(fire.slot_ids))?;
         self.store
-            .write(self.request_of_token, bytes_of(fire.request_of_token))?;
+            .write(self.laid.request_of_token, bytes_of(fire.request_of_token))?;
         self.store
-            .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
+            .write(self.laid.slot_of_row, bytes_of(fire.slot_of_row))?;
         let capture = if fire.capture.is_empty() {
             None
         } else {
-            let Some((at, ints)) = self.capture else {
+            let Some((at, ints)) = self.laid.capture else {
                 return Err(Fault::Unbound {
                     what: "the capture table, which this load laid no room for: its trace \
                            captures no scores"
@@ -604,6 +662,7 @@ impl<B: Backend> Inputs<B> {
                 &self.store,
                 at,
                 u32::try_from(fire.capture.len()).unwrap_or(u32::MAX),
+                self.laid.room(at)?,
             )?)
         };
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
@@ -615,8 +674,8 @@ impl<B: Backend> Inputs<B> {
                         have: u64::from(lanes),
                     });
                 }
-                self.store.write(self.rs_replay, bytes_of(replay))?;
-                self.store.write(self.rs_commit, bytes_of(commit))?;
+                self.store.write(self.laid.rs_replay, bytes_of(replay))?;
+                self.store.write(self.laid.rs_commit, bytes_of(commit))?;
                 true
             }
             _ => false,
@@ -625,39 +684,36 @@ impl<B: Backend> Inputs<B> {
         let adapter_routes = match fire.adapter_routes {
             None => None,
             Some(routes) => {
-                self.store.write(self.adapter_routes, bytes_of(routes))?;
+                self.store.write(self.laid.adapter_routes, bytes_of(routes))?;
                 Some(routes.len() as u32)
             }
         };
 
-        let stride = fire.mask.map_or(0, |staged| staged.stride);
-        if u64::from(stride) > u64::from(self.mask_stride) {
-            return Err(Fault::Ceiling {
-                what: "columns in one mask row",
-                need: u64::from(stride),
-                have: u64::from(self.mask_stride),
-            });
-        }
         match fire.mask {
             None => {
-                self.store
-                    .zero_span(self.mask_enabled, u64::from(rows) * 4)?;
+                if rows > self.laid.words_none {
+                    let from = self.laid.words_none;
+                    let none = crate::mask::none((rows - from) as usize);
+                    self.store
+                        .write(self.laid.mask_words + u64::from(from) * 8, words_of(&none))?;
+                    self.laid.words_none = rows;
+                }
             }
             Some(staged) => {
-                if staged.bytes.len() as u64 > self.mask_plane_bytes {
+                if staged.bytes.len() as u64 > self.laid.mask_plane_bytes {
                     return Err(Fault::Ceiling {
                         what: "mask plane bytes",
                         need: staged.bytes.len() as u64,
-                        have: self.mask_plane_bytes,
+                        have: self.laid.mask_plane_bytes,
                     });
                 }
-                self.store.write(self.mask_planes, &staged.bytes)?;
-                let words: Vec<u8> = staged.words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                self.store.write(self.mask_enabled, &words)?;
+                self.store.write(self.laid.mask_planes, &staged.bytes)?;
+                self.store.write(self.laid.mask_words, words_of(&staged.words))?;
+                self.laid.words_none = 0;
             }
         }
 
-        let patches = match (fire.patches, self.patch) {
+        let patches = match (fire.patches, self.laid.patch) {
             (None, _) => None,
             (Some(_), None) => {
                 return Err(Fault::Ceiling {
@@ -710,7 +766,7 @@ impl<B: Backend> Inputs<B> {
                     .unwrap_or(u32::MAX);
                 Some(PatchHandles {
                     patches: Tensor::new(
-                        handles.bind(&self.store, at.payload, staged.payload.len() as u64)?,
+                        handles.bind(&self.store, at.payload, self.laid.room(at.payload)?)?,
                         rows32,
                         width,
                         seat.dtype,
@@ -720,21 +776,24 @@ impl<B: Backend> Inputs<B> {
                         &self.store,
                         at.segments,
                         staged.segments.len() as u32,
+                        self.laid.room(at.segments)?,
                     )?,
-                    routes: i32s(handles, &self.store, at.routes, staged.routes.len() as u32)?,
+                    routes: i32s(
+                        handles,
+                        &self.store,
+                        at.routes,
+                        staged.routes.len() as u32,
+                        self.laid.room(at.routes)?,
+                    )?,
 
                     positions: Tensor::new(
-                        handles.bind(
-                            &self.store,
-                            at.positions,
-                            staged.positions.len() as u64 * 4,
-                        )?,
+                        handles.bind(&self.store, at.positions, self.laid.room(at.positions)?)?,
                         rows32,
                         AXES as u32,
                         Dtype::I32,
                     ),
                     grids: Tensor::new(
-                        handles.bind(&self.store, at.grids, staged.grids.len() as u64 * 4)?,
+                        handles.bind(&self.store, at.grids, self.laid.room(at.grids)?)?,
                         staged.grids.len() as u32 / AXES as u32,
                         AXES as u32,
                         Dtype::I32,
@@ -743,7 +802,7 @@ impl<B: Backend> Inputs<B> {
             }
         };
 
-        let mrope_positions = match (fire.mrope_positions, self.mrope) {
+        let mrope_positions = match (fire.mrope_positions, self.laid.mrope) {
             (None, _) | (_, None) => None,
             (Some(triples), Some(at)) => {
                 if triples.len() as u64 > u64::from(rows) * AXES {
@@ -755,7 +814,7 @@ impl<B: Backend> Inputs<B> {
                 }
                 self.store.write(at, bytes_of(triples))?;
                 Some(Tensor::new(
-                    handles.bind(&self.store, at, triples.len() as u64 * 4)?,
+                    handles.bind(&self.store, at, self.laid.room(at)?)?,
                     triples.len() as u32 / AXES as u32,
                     AXES as u32,
                     Dtype::I32,
@@ -763,7 +822,7 @@ impl<B: Backend> Inputs<B> {
             }
         };
 
-        let group_of_lane = if self.packings.is_empty() {
+        let group_of_lane = if self.laid.packings.is_empty() {
             None
         } else {
             if fire.group_of_lane.len() as u32 > lanes {
@@ -774,19 +833,25 @@ impl<B: Backend> Inputs<B> {
                 });
             }
             self.store
-                .write(self.group_of_lane, bytes_of(fire.group_of_lane))?;
-            Some(i32s(handles, &self.store, self.group_of_lane, lanes)?)
+                .write(self.laid.group_of_lane, bytes_of(fire.group_of_lane))?;
+            Some(i32s(
+                handles,
+                &self.store,
+                self.laid.group_of_lane,
+                lanes,
+                self.laid.room(self.laid.group_of_lane)?,
+            )?)
         };
-        if fire.packings.len() != self.packings.len() {
+        if fire.packings.len() != self.laid.packings.len() {
             return Err(Fault::Ceiling {
                 what: "packing tables against the selections this load carved",
                 need: fire.packings.len() as u64,
-                have: self.packings.len() as u64,
+                have: self.laid.packings.len() as u64,
             });
         }
-        let mut packings = Vec::with_capacity(self.packings.len());
+        let mut packings = Vec::with_capacity(self.laid.packings.len());
         let mut scratch: Vec<i32> = Vec::new();
-        for (at, staged) in self.packings.iter().zip(fire.packings) {
+        for (at, staged) in self.laid.packings.iter().zip(fire.packings) {
             for (what, have, ceiling) in [
                 (
                     "group indptr entries",
@@ -819,18 +884,36 @@ impl<B: Backend> Inputs<B> {
             rows_table(&mut scratch, staged.permutation, rows);
             self.store.write(at.permutation, bytes_of(&scratch))?;
             packings.push(PackingHandles {
-                group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
-                lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
-                permutation: i32s(handles, &self.store, at.permutation, rows)?,
+                group_indptr: i32s(
+                    handles,
+                    &self.store,
+                    at.group_indptr,
+                    lanes + 1,
+                    self.laid.room(at.group_indptr)?,
+                )?,
+                lane_indptr: i32s(
+                    handles,
+                    &self.store,
+                    at.lane_indptr,
+                    lanes + 1,
+                    self.laid.room(at.lane_indptr)?,
+                )?,
+                permutation: i32s(
+                    handles,
+                    &self.store,
+                    at.permutation,
+                    rows,
+                    self.laid.room(at.permutation)?,
+                )?,
             });
         }
-        let mut inputs = Vec::with_capacity(self.seats.len());
-        for at in &self.seats {
+        let mut inputs = Vec::with_capacity(self.laid.seats.len());
+        for at in &self.laid.seats {
             let carved = if at.seat.per_lane() { lanes } else { rows };
             inputs.push((
                 at.seat.id,
                 Tensor::new(
-                    handles.bind(&self.store, at.at, at.bytes)?,
+                    handles.bind(&self.store, at.at, self.laid.room(at.at)?)?,
                     carved,
                     at.seat.width,
                     at.seat.dtype,
@@ -838,7 +921,7 @@ impl<B: Backend> Inputs<B> {
             ));
         }
 
-        let voxels = match (fire.voxels, self.voxels) {
+        let voxels = match (fire.voxels, self.laid.voxels) {
             (None, _) => None,
             (Some(_), None) => {
                 return Err(Fault::Ceiling {
@@ -889,24 +972,24 @@ impl<B: Backend> Inputs<B> {
                 let clips32 = u32::try_from(clips).unwrap_or(u32::MAX);
                 Some(VoxelHandles {
                     payload: Tensor::new(
-                        handles.bind(
-                            &self.store,
-                            at.payload,
-                            seat.rows * seat.channels * element,
-                        )?,
+                        handles.bind(&self.store, at.payload, self.laid.room(at.payload)?)?,
                         u32::try_from(seat.rows).unwrap_or(u32::MAX),
                         u32::try_from(seat.channels).unwrap_or(u32::MAX),
                         seat.dtype,
                     ),
                     grid: Tensor::new(
-                        handles.bind(&self.store, at.grid, clips * 16)?,
+                        handles.bind(&self.store, at.grid, self.laid.room(at.grid)?)?,
                         clips32,
                         4,
                         Dtype::I32,
                     ),
                     token_grid: if seat.token_patch.is_some() {
                         Some(Tensor::new(
-                            handles.bind(&self.store, at.token_grid, clips * 16)?,
+                            handles.bind(
+                                &self.store,
+                                at.token_grid,
+                                self.laid.room(at.token_grid)?,
+                            )?,
                             clips32,
                             4,
                             Dtype::I32,
@@ -915,7 +998,7 @@ impl<B: Backend> Inputs<B> {
                         None
                     },
                     slots: Tensor::new(
-                        handles.bind(&self.store, at.slots, clips * 4)?,
+                        handles.bind(&self.store, at.slots, self.laid.room(at.slots)?)?,
                         clips32,
                         1,
                         Dtype::I32,
@@ -924,8 +1007,8 @@ impl<B: Backend> Inputs<B> {
             }
         };
 
-        let mut page_tables = Vec::with_capacity(self.page_tables.len());
-        for (at, geometry) in self.page_tables.iter().zip(fire.page_tables) {
+        let mut page_tables = Vec::with_capacity(self.laid.page_tables.len());
+        for (at, geometry) in self.laid.page_tables.iter().zip(fire.page_tables) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
             self.store.write(at.indices, bytes_of(&geometry.indices))?;
             self.store
@@ -936,73 +1019,172 @@ impl<B: Backend> Inputs<B> {
             self.store
                 .write(at.write_offset, bytes_of(&geometry.write_offset))?;
             page_tables.push(TableHandles {
-                indptr: i32s(handles, &self.store, at.indptr, lanes + 1)?,
+                indptr: i32s(
+                    handles,
+                    &self.store,
+                    at.indptr,
+                    lanes + 1,
+                    self.laid.room(at.indptr)?,
+                )?,
                 indices: i32s(
                     handles,
                     &self.store,
                     at.indices,
                     geometry.indices.len() as u32,
+                    self.laid.room(at.indices)?,
                 )?,
-                last_page_len: i32s(handles, &self.store, at.last_page_len, lanes)?,
-                kv_len: i32s(handles, &self.store, at.kv_len, lanes)?,
-                write_page: u32s(handles, &self.store, at.write_page, rows)?,
-                write_offset: u32s(handles, &self.store, at.write_offset, rows)?,
+                last_page_len: i32s(
+                    handles,
+                    &self.store,
+                    at.last_page_len,
+                    lanes,
+                    self.laid.room(at.last_page_len)?,
+                )?,
+                kv_len: i32s(
+                    handles,
+                    &self.store,
+                    at.kv_len,
+                    lanes,
+                    self.laid.room(at.kv_len)?,
+                )?,
+                write_page: u32s(
+                    handles,
+                    &self.store,
+                    at.write_page,
+                    rows,
+                    self.laid.room(at.write_page)?,
+                )?,
+                write_offset: u32s(
+                    handles,
+                    &self.store,
+                    at.write_offset,
+                    rows,
+                    self.laid.room(at.write_offset)?,
+                )?,
             });
         }
 
         Ok(Handles {
-            tokens: i32s(handles, &self.store, self.tokens, rows)?,
-            positions: i32s(handles, &self.store, self.positions, rows)?,
-            rotations: i32s(handles, &self.store, self.rotations, rows)?,
+            tokens: i32s(
+                handles,
+                &self.store,
+                self.laid.tokens,
+                rows,
+                self.laid.room(self.laid.tokens)?,
+            )?,
+            positions: i32s(
+                handles,
+                &self.store,
+                self.laid.positions,
+                rows,
+                self.laid.room(self.laid.positions)?,
+            )?,
+            rotations: i32s(
+                handles,
+                &self.store,
+                self.laid.rotations,
+                rows,
+                self.laid.room(self.laid.rotations)?,
+            )?,
             readout_rows: i32s(
                 handles,
                 &self.store,
-                self.readout_rows,
+                self.laid.readout_rows,
                 fire.readout_rows.len().max(1) as u32,
+                self.laid.room(self.laid.readout_rows)?,
             )?,
 
-            windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
+            windows: handles.bind(
+                &self.store,
+                self.laid.windows,
+                self.laid.room(self.laid.windows)?,
+            )?,
             page_tables,
-            slot_ids: entries(handles, &self.store, self.slot_ids, lanes, self.pieces)?,
-            slot_of_row: entries(handles, &self.store, self.slot_of_row, rows, self.pieces)?,
+            slot_ids: entries(
+                handles,
+                &self.store,
+                self.laid.slot_ids,
+                lanes,
+                self.laid.pieces,
+                self.laid.room(self.laid.slot_ids)?,
+            )?,
+            slot_of_row: entries(
+                handles,
+                &self.store,
+                self.laid.slot_of_row,
+                rows,
+                self.laid.pieces,
+                self.laid.room(self.laid.slot_of_row)?,
+            )?,
             adapter_routes: match adapter_routes {
                 None => None,
-                Some(rows) => Some(i32s(handles, &self.store, self.adapter_routes, rows)?),
+                Some(rows) => Some(i32s(
+                    handles,
+                    &self.store,
+                    self.laid.adapter_routes,
+                    rows,
+                    self.laid.room(self.laid.adapter_routes)?,
+                )?),
             },
             row_valid: Tensor::new(
-                handles.bind(&self.store, self.row_valid, u64::from(rows))?,
+                handles.bind(
+                    &self.store,
+                    self.laid.row_valid,
+                    self.laid.room(self.laid.row_valid)?,
+                )?,
                 rows,
                 1,
                 Dtype::U8,
             ),
-            request_of_token: i32s(handles, &self.store, self.request_of_token, rows)?,
+            request_of_token: i32s(
+                handles,
+                &self.store,
+                self.laid.request_of_token,
+                rows,
+                self.laid.room(self.laid.request_of_token)?,
+            )?,
 
             mask: Tensor::new(
                 handles.bind(
                     &self.store,
-                    self.mask_planes,
-                    u64::from(rows) * u64::from(stride),
+                    self.laid.mask_planes,
+                    self.laid.room(self.laid.mask_planes)?,
                 )?,
-                rows,
-                stride.max(1),
+                1,
+                u32::try_from(self.laid.mask_plane_bytes.max(4)).unwrap_or(u32::MAX),
                 Dtype::U8,
             ),
-            mask_enabled: Tensor::new(
-                handles.bind(&self.store, self.mask_enabled, u64::from(rows) * 4)?,
+            mask_words: Tensor::new(
+                handles.bind(
+                    &self.store,
+                    self.laid.mask_words,
+                    self.laid.room(self.laid.mask_words)?,
+                )?,
                 rows,
-                1,
+                2,
                 Dtype::U32,
             ),
-            mask_stride: stride,
             patches,
             mrope_positions,
             rs_replay: if rs_tables {
-                Some(i32s(handles, &self.store, self.rs_replay, lanes)?)
+                Some(i32s(
+                    handles,
+                    &self.store,
+                    self.laid.rs_replay,
+                    lanes,
+                    self.laid.room(self.laid.rs_replay)?,
+                )?)
             } else {
                 None
             },
             rs_commit: if rs_tables {
-                Some(i32s(handles, &self.store, self.rs_commit, lanes)?)
+                Some(i32s(
+                    handles,
+                    &self.store,
+                    self.laid.rs_commit,
+                    lanes,
+                    self.laid.room(self.laid.rs_commit)?,
+                )?)
             } else {
                 None
             },
@@ -1048,8 +1230,9 @@ fn i32s<B: Backend>(
     store: &B::Buffer,
     at: u64,
     rows: u32,
+    bound: u64,
 ) -> Result<Tensor> {
-    let buf = handles.bind(store, at, u64::from(rows) * 4)?;
+    let buf = handles.bind(store, at, bound)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
 }
 
@@ -1060,8 +1243,9 @@ fn entries<B: Backend>(
     at: u64,
     rows: u32,
     width: u32,
+    bound: u64,
 ) -> Result<Tensor> {
-    let buf = handles.bind(store, at, u64::from(rows) * u64::from(width) * 4)?;
+    let buf = handles.bind(store, at, bound)?;
     Ok(Tensor::new(buf, rows, width, Dtype::I32))
 }
 
@@ -1070,9 +1254,18 @@ fn u32s<B: Backend>(
     store: &B::Buffer,
     at: u64,
     rows: u32,
+    bound: u64,
 ) -> Result<Tensor> {
-    let buf = handles.bind(store, at, u64::from(rows) * 4)?;
+    let buf = handles.bind(store, at, bound)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
+}
+
+fn words_of(values: &[u32]) -> &[u8] {
+    // SAFETY: a `u32` slice is `size_of_val` initialized bytes with no
+    // padding, `u8` has alignment 1, and the result borrows `values`.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {
@@ -1094,4 +1287,54 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
     into.clear();
     into.extend_from_slice(staged);
     into.resize(rows as usize, -1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each input's room, which a view of it binds whatever rows a fire
+    /// brings, holds the input's laid bytes and ends where the next input
+    /// begins, inside the store: a view confines a kernel to its own input
+    /// (a seat a guest fed among them).
+    #[test]
+    fn a_room_ends_where_the_next_input_begins() {
+        let budget = Budget::new(64, 512);
+        let paging = Paging::of(16, 512, 8, 1).expect("the paging lays");
+        let laid = Laid::lay(
+            &budget,
+            paging,
+            2,
+            0,
+            3,
+            1,
+            None,
+            true,
+            &[],
+            2,
+            None,
+            2,
+            true,
+            1 << 30,
+        );
+        let rooms: Vec<(u64, u64)> = laid.rooms.iter().map(|(&at, &room)| (at, room)).collect();
+        assert!(rooms.len() > 20, "the store lays {} inputs", rooms.len());
+        for pair in rooms.windows(2) {
+            let ((at, room), (next, _)) = (pair[0], pair[1]);
+            assert!(
+                at + room <= next,
+                "the room at {at} of {room} bytes reaches the input at {next}"
+            );
+        }
+        let &(at, room) = rooms.last().expect("the store lays inputs");
+        assert!(at + room <= laid.bytes());
+        assert_eq!(
+            laid.room(laid.tokens).expect("tokens are laid"),
+            u64::from(budget.max_tokens) * 4
+        );
+        assert!(
+            laid.room(laid.bytes() + 4).is_err(),
+            "no input lies past the store"
+        );
+    }
 }

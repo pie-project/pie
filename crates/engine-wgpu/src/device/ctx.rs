@@ -158,17 +158,32 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<Held>>,
+    /// The uniform buffer frames write their dispatches' scalars to, made
+    /// at load, a region of it each frame in flight; and the regions free.
+    pub(crate) uniform_buffer: std::sync::OnceLock<Held>,
+    pub(crate) uniforms: Mutex<Vec<u64>>,
     pub(crate) scratch: Mutex<Vec<Held>>,
+    /// The uniform regions and scratch chunks stocked, free or held.
+    uniform_stock: std::sync::atomic::AtomicUsize,
+    scratch_stock: std::sync::atomic::AtomicUsize,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
-    /// `[engine.memory] budget_device`: what the load takes, all of it
-    /// together. The environment reports no memory size, so it is stated.
+    /// What the load takes, all of it together: the device memory read at
+    /// load ([`super::memory::at_load`]), or `[engine.memory]
+    /// budget_device` where stated.
     pub(crate) budget: u64,
+    /// Whether `budget` is the host's room ([`super::memory::Source::HostAvailable`]):
+    /// the device shares the host's memory, so what the host can still give
+    /// is read afresh while serving.
+    pub(crate) shares_host: bool,
+    /// The most bytes one reservation takes on this device
+    /// ([`super::memory::reservation_bound`]): every buffer made is no
+    /// larger, and one past it is refused by name, never made invalid.
+    pub(crate) bound: u64,
 }
 
 impl Core {
@@ -232,52 +247,108 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
-        self.held(
+    /// Makes the uniform buffer frames write their dispatches' scalars to,
+    /// with the device: one buffer of a region a frame, so a bind group made
+    /// once binds every frame's scalars at a dynamic offset into its region,
+    /// for the most frames in flight any load of this engine takes
+    /// ([`engine::runahead::Runahead::MAX_FRAMES`]) and the one beside them.
+    pub(crate) fn stock_uniforms(&self) {
+        let frames = u64::from(engine::runahead::Runahead::MAX_FRAMES) + 1;
+        let buffer = self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
+                size: UNIFORM_CHUNK * frames,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             },
             engine_gpu::books::owners::UNIFORMS,
-        )
+        );
+        if self.uniform_buffer.set(buffer).is_ok() {
+            self.uniform_stock.fetch_add(
+                usize::try_from(frames).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
+            self.return_uniforms((0..frames).map(|at| at * UNIFORM_CHUNK).collect());
+        }
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
+    /// Stocks a scratch chunk for each of `frames` frames in flight, at load:
+    /// a frame takes at most one, and gives it back when it is dropped.
+    pub(crate) fn stock_rings(&self, frames: usize) {
+        let scratch = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie scratch"),
+                    size: self.pooled_scratch(),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::FRAME_SCRATCH,
+            )
+        });
+        self.scratch_stock.fetch_add(frames, Ordering::Relaxed);
+        self.return_scratch(scratch.collect());
+    }
+
+    /// The uniform buffer's region a frame takes, its first byte.
+    pub(crate) fn uniform_chunk(&self) -> Result<u64> {
+        self.uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .pop()
+            .ok_or_else(|| {
+                let stock = self.uniform_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "uniform region",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
+            })
+    }
+
+    pub(crate) fn return_uniforms(&self, chunks: Vec<u64>) {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return chunk;
+    /// A scratch chunk for a frame, stocked at load: one holds at most
+    /// [`Core::pooled_scratch`] bytes, refused by name past it.
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
+        let pooled = self.pooled_scratch();
+        if bytes > pooled {
+            return Err(Fault::Ceiling {
+                what: "bytes of one scratch reservation",
+                need: bytes,
+                have: pooled,
+            });
         }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::FRAME_SCRATCH,
-        )
+        self.scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .pop()
+            .ok_or_else(|| {
+                let stock = self.scratch_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "scratch chunk",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
+            })
     }
 
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+            .extend(chunks);
+    }
+
+    /// The size of a scratch chunk the ring keeps between frames: no larger
+    /// than one reservation takes.
+    fn pooled_scratch(&self) -> u64 {
+        SCRATCH_CHUNK.min(self.bound)
     }
 }
 
@@ -307,6 +378,8 @@ impl Drop for Held {
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
+    /// The most bytes one reservation the load plans takes: the device's
+    /// bound, or a test's cap under it.
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
@@ -443,42 +516,45 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
-/// `allowance.budget`, refused where the operator states none.
-fn stated(allowance: engine::Allowance) -> Result<u64> {
-    allowance.budget.ok_or_else(|| {
-        Fault::Residency(
-            "wgpu: the environment reports no memory size; state \
-             `[engine.memory] budget_device` for what the load may take"
+/// Refuses a load on a target with no native wgpu backend: macOS, as on
+/// wgpu's Metal backend a large first submission never completes.
+fn native() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Err(Fault::NoDevice {
+            detail: "engine type wgpu has no backend on macOS in this build; use type = \"metal\""
                 .to_string(),
-        )
-    })
+        });
+    }
+    Ok(())
 }
 
 impl Context {
-    /// The device `boot` names, of which a load takes `allowance.budget`,
-    /// which must be stated.
+    /// The device `boot` names, of which a load takes what it states it
+    /// has, or `allowance.budget` where stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
-        stated(allowance)?;
+        native()?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes
-    /// `allowance.budget`, which must be stated: WebGPU reports no memory
-    /// size.
+    /// A device the host already holds, of which a load takes what its
+    /// adapter states it has, or `allowance.budget` where stated; refused
+    /// where neither states it.
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
-        let budget = stated(allowance)?;
         let Handed {
             adapter,
             device,
             queue,
         } = handed;
         let info = adapter.get_info();
+        let reading = super::memory::at_load(&adapter, allowance)?;
+        tracing::info!(device = %info.name, "{reading}");
+        let budget = reading.bytes;
         let features = device.features();
         let limits = device.limits();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -495,11 +571,17 @@ impl Context {
             f16: features.contains(wgpu::Features::SHADER_F16),
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
         };
-        // A slab is bound whole, so no larger than one storage binding takes:
-        // past it a fire refuses the view rather than reading a cut slab.
-        let max_buffer = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
+        // A slab is bound whole, so no larger than one storage binding takes
+        // (past it a fire refuses the view rather than reading a cut slab),
+        // nor than one allocation backs: past either, the buffer is made
+        // invalid, so every reservation is refused there by name instead.
+        let bound =
+            super::memory::reservation_bound(&limits, super::memory::allocation_limit(&adapter));
+        let max_buffer = bound;
+        // A test's cap narrows what the load plans by, never what the device
+        // can make.
+        #[cfg(feature = "test-limits")]
+        let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
@@ -511,12 +593,17 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
+            uniform_stock: std::sync::atomic::AtomicUsize::new(0),
+            scratch_stock: std::sync::atomic::AtomicUsize::new(0),
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
+            shares_host: reading.source == super::memory::Source::HostAvailable,
+            bound,
         });
         let dummy = Raw::new(
             &core,
@@ -524,6 +611,9 @@ impl Context {
             Memory::Device,
             engine_gpu::books::owners::DUMMY,
         )?;
+        // Every kernel dispatch reads its scalars from this buffer, the
+        // first at the load's rates pass, so it is made with the device.
+        core.stock_uniforms();
         let context = Context {
             max_buffer,
             core,
@@ -548,10 +638,19 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
-    /// What the device has for this load: the operator's budget.
+    /// What the device has for this load, as read at load.
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.core.budget
+    }
+
+    /// Where the load's memory was read from the host's room, the reader of
+    /// what the host can still give the process.
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core
+            .shares_host
+            .then(engine_gpu::host_memory::room_reader)
     }
 
     /// What the driver holds for this process beside every reservation:
@@ -655,7 +754,7 @@ impl Context {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
                 encoder: Mutex::new(Some(encoder)),
-                uniforms: Mutex::new(UniformRing::default()),
+                uniforms: Mutex::new(UniformRegion::default()),
                 scratch: Mutex::new(UniformRing::default()),
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
@@ -664,8 +763,28 @@ impl Context {
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
+            bind_only: false,
         })
     }
+
+    /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
+    pub fn bind_frame(&self) -> Result<Frame> {
+        let mut frame = self.frame()?;
+        frame.bind_only = true;
+        Ok(frame)
+    }
+}
+
+/// The uniform buffer's region a frame holds, the bytes of it taken, and
+/// their image on the host: the frame writes the image through the queue
+/// once before it submits ([`Frame::land_uniforms`]), not a write a dispatch.
+#[derive(Default)]
+pub(crate) struct UniformRegion {
+    region: Option<u64>,
+    used: u64,
+    image: Vec<u8>,
+    /// The image's bytes already written through the queue.
+    written: u64,
 }
 
 #[derive(Default)]
@@ -677,7 +796,7 @@ pub(crate) struct UniformRing {
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
     encoder: Mutex<Option<wgpu::CommandEncoder>>,
-    uniforms: Mutex<UniformRing>,
+    uniforms: Mutex<UniformRegion>,
     scratch: Mutex<UniformRing>,
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
@@ -695,12 +814,21 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Gives the frame's uniform region and scratch chunk back to the
+    /// load's stock: once it is submitted, or where it is dropped
+    /// unsubmitted.
+    fn release(&self) {
+        let ring = std::mem::take(&mut *self.uniforms.lock().expect("uniforms lock poisoned"));
+        self.core.return_uniforms(ring.region.into_iter().collect());
+        let scratch = std::mem::take(&mut *self.scratch.lock().expect("scratch lock poisoned"));
+        self.core.return_scratch(scratch.chunks);
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
-        let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
-        self.core.return_uniforms(ring.chunks);
-        let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
-        self.core.return_scratch(scratch.chunks);
+        self.release();
     }
 }
 
@@ -708,6 +836,10 @@ pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
     pub(crate) dispatches: std::cell::Cell<u64>,
+    /// A load's bind walk's ([`engine_gpu::serve::Shell::walk_binds`]): its
+    /// sink builds and keeps each dispatch's bind group, encodes nothing, and
+    /// the frame is never submitted.
+    pub(crate) bind_only: bool,
 }
 
 impl Frame {
@@ -715,17 +847,7 @@ impl Frame {
         self.inner.pass.lock().expect("pass lock poisoned").take();
     }
 
-    pub(crate) fn dispatch(
-        &self,
-        label: &'static str,
-        pipeline: &wgpu::ComputePipeline,
-        group: &wgpu::BindGroup,
-        groups: [u32; 3],
-    ) -> Result<()> {
-        self.dispatch_at(label, pipeline, group, &[], groups)
-    }
-
-    /// [`Frame::dispatch`] with `group`'s dynamic offsets.
+    /// Dispatches `pipeline` over `group`, read at its dynamic `offsets`.
     pub(crate) fn dispatch_at(
         &self,
         label: &'static str,
@@ -772,18 +894,70 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    /// `bytes` of this frame's region of the uniform buffer: the buffer and
+    /// the slot's first byte in it.
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
+        let buffer = core.uniform_buffer.get().ok_or(Fault::Device {
+            call: "uniform region",
+            why: "the device made no uniform buffer".into(),
+        })?;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = match ring.region {
+            Some(region) => region,
+            None => {
+                let region = core.uniform_chunk()?;
+                ring.region = Some(region);
+                ring.used = 0;
+                ring.image.clear();
+                ring.written = 0;
+                region
+            }
+        };
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
-            ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+        if at + bytes > UNIFORM_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes of uniforms one frame writes (its region)",
+                need: at + bytes,
+                have: UNIFORM_CHUNK,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((**buffer).clone(), region + at))
+    }
+
+    /// Puts `bytes` at byte `at` of the uniform buffer (a slot
+    /// [`Frame::uniform_slot`] gave), in the frame's image of its region.
+    pub(crate) fn write_uniform(&self, at: u64, bytes: &[u8]) -> Result<()> {
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = ring.region.ok_or(Fault::Device {
+            call: "write_uniform",
+            why: "a uniform written before its frame took a region".into(),
+        })?;
+        let from = usize::try_from(at - region).unwrap_or(usize::MAX);
+        let to = from + bytes.len();
+        if ring.image.len() < to {
+            ring.image.resize(to, 0);
+        }
+        ring.image[from..to].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Writes what the frame's image holds past what it wrote, in one write
+    /// through the queue, which lands it before the submission that follows.
+    fn land_uniforms(&self) {
+        let core = &self.inner.core;
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let (Some(region), Some(buffer)) = (ring.region, core.uniform_buffer.get()) else {
+            return;
+        };
+        let from = usize::try_from(ring.written).unwrap_or(usize::MAX);
+        if from < ring.image.len() {
+            core.queue
+                .write_buffer(buffer, region + ring.written, &ring.image[from..]);
+            ring.written = ring.image.len() as u64;
+        }
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -810,18 +984,26 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if at + bytes > room {
+            return Err(Fault::Ceiling {
+                what: "bytes one frame stages through scratch (its chunk)",
+                need: at + bytes,
+                have: room,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -855,7 +1037,7 @@ impl Frame {
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
         // wgpu refuses a copy whose ends are one buffer: it goes through
         // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
+        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
         self.encode(|encoder| match &stage {
             None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
             Some((scratch, at)) => {
@@ -891,6 +1073,7 @@ impl Frame {
 
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
         let taken = self
             .inner
@@ -920,6 +1103,7 @@ impl Frame {
         }
         self.open = false;
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
         let taken = self
             .inner
@@ -970,6 +1154,20 @@ impl Frame {
         crate::encode::record_read_phase(0, started.ns());
         let index = core.queue.submit(std::iter::once(finished));
         crate::encode::record_submit(started.ns(), 0);
+        // What the frame staged through goes back to the load's stock now,
+        // submitted, not when its work completes: the queue runs what any
+        // frame writes or dispatches after this one's (WebGPU's queue
+        // timeline), so the next frame to take them cannot reach them before
+        // this one's work is done with them. That holds for these two only
+        // because they are device-only: a scratch chunk (STORAGE and copies)
+        // and a uniform region (UNIFORM, written through the queue), neither
+        // mappable, so the host never reads one back. What the host maps or
+        // reads (the readout mirrors, the guest readback buffers, the read
+        // stagings) stays held until its work is done. The stock then covers
+        // the frames a step encodes at once, however many it has in flight:
+        // a step's copies (a same-buffer copy stages through scratch) and
+        // its walk, each submitted before the next is opened.
+        self.inner.release();
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {
             inner.done.store(true, Ordering::Release);
@@ -1060,15 +1258,6 @@ mod tests {
     use crate::device::Buffer;
 
     #[test]
-    fn a_load_without_budget_device_is_refused() {
-        let why = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE)
-            .unwrap_err()
-            .to_string();
-        assert!(why.contains("reports no memory size"), "{why}");
-        assert!(why.contains("[engine.memory] budget_device"), "{why}");
-    }
-
-    #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
         if !present() {
             return;
@@ -1077,6 +1266,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::TEST).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
@@ -1089,5 +1279,54 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// No buffer is made past the device's bound on one reservation: a
+    /// slab or a scratch slot past it is refused by name before anything
+    /// reaches the device, and nothing invalid is made.
+    #[test]
+    fn no_buffer_is_made_past_the_bound_of_one_reservation() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        let bound = device.core.bound;
+        assert!(device.max_buffer() <= bound);
+        let past = |fault: Fault, named: &str, bound: u64| match fault {
+            Fault::Ceiling { what, need, have } => {
+                assert_eq!(what, named);
+                assert!(need > bound, "{need}");
+                assert_eq!(have, bound);
+            }
+            other => panic!("refused as {other}, not by the bound"),
+        };
+        let owner = engine_gpu::books::owners::TEST;
+        let before = device.core.books.device();
+        past(
+            Buffer::zeroed(&device, bound + 4, owner)
+                .err()
+                .expect("refused"),
+            "bytes of one device reservation",
+            bound,
+        );
+        assert_eq!(device.core.books.device(), before, "nothing was reserved");
+        // Scratch is stocked at load in chunks no larger than one
+        // reservation, and a frame takes no more than its chunk.
+        device.core.stock_rings(1);
+        let pooled = device.core.pooled_scratch();
+        assert!(pooled <= bound);
+        let held = device.core.books.device();
+        let frame = device.frame().unwrap();
+        past(
+            frame.scratch_slot(pooled + 256).err().expect("refused"),
+            "bytes of one scratch reservation",
+            pooled,
+        );
+        assert_eq!(device.core.books.device(), held, "nothing was reserved");
+        frame.commit().unwrap();
+        device.core.take_error("the refused buffers").unwrap();
     }
 }

@@ -31,7 +31,7 @@ pub(crate) fn kernel(
             format!("no vector point reads {vecs} rows a workgroup"),
         ));
     }
-    let chunk = if b.bits == 8 { 16 } else { 32 };
+    let chunk = chunk_codes(b.bits, vecs);
     if !b.k.is_multiple_of(chunk) {
         return Err(refuse(
             op,
@@ -67,6 +67,12 @@ pub(crate) fn kernel(
     Ok(Fire::at(QMV, entry)
         .groups([b.n.div_ceil(COLUMNS), b.m.div_ceil(vecs), 1])
         .group([32, 4, 1]))
+}
+
+/// The codes a lane walks the contraction by: a lane holds `vecs` rows of
+/// them as floats, at most 128 (`qmv.slang`'s rule), so eight rows take 16.
+fn chunk_codes(bits: u32, vecs: u32) -> u32 {
+    if vecs == 8 || bits == 8 { 16 } else { 32 }
 }
 
 /// Whether the one-row point serves a bank: it loads 128 bits of codes at

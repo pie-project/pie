@@ -210,6 +210,25 @@ impl Context {
         self.working_set
     }
 
+    /// The GPU memory every other process holds now: the system memory the
+    /// GPU driver has allocated for all of them together (IORegistry,
+    /// `Alloc system memory`) less what this process holds
+    /// ([`Self::allocated`]). The working set Metal recommends is shared
+    /// with it: a load that takes the whole of it beside them is refused for
+    /// memory at the edge. 0 where the registry does not say.
+    #[must_use]
+    pub fn others_allocated(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            super::iokit::gpu_system_allocated()
+                .map_or(0, |system| system.saturating_sub(self.allocated()))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// The bytes this device holds for the process now
     /// (`currentAllocatedSize`): every buffer, heap and the driver's own
     /// allocations on our behalf.
@@ -490,6 +509,24 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn on_commit(&self, then: Box<dyn FnOnce() + Send>) {
         self.committed.borrow_mut().push(then);
+    }
+
+    /// Runs `body`'s encoding in a command buffer of its own (the frame's work
+    /// before it flushed ahead, the frame's after it in the next buffer) and
+    /// waits for it: its device seconds, or `None` where a blit pass is open
+    /// and the frame can't flush. The kernel profile's guest regions.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn timed<R>(&self, body: impl FnOnce() -> Result<R>) -> Result<(R, Option<f64>)> {
+        if !self.flush()? {
+            return Ok((body()?, None));
+        }
+        let out = body()?;
+        if !self.flush()? {
+            return Ok((out, None));
+        }
+        let buffer = self.flushed.borrow().last().cloned().expect("a flush keeps its buffer");
+        buffer.waitUntilCompleted();
+        Ok((out, Some(buffer.GPUEndTime() - buffer.GPUStartTime())))
     }
 
     /// Commits what is encoded so far and opens a fresh buffer on the same
@@ -862,6 +899,8 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             let flushed = std::mem::take(self.flushed.get_mut());
+            #[cfg(feature = "fault-injection")]
+            let injected = FAIL_NEXT.with(|next| next.replace(false));
             if let Some(on_done) = on_done {
                 let heads = Flushed(flushed.clone());
                 let handler = block2::RcBlock::new(
@@ -877,7 +916,10 @@ impl Frame {
                             .iter()
                             .find_map(|head| head.error())
                             .or_else(|| buffer.error());
-                        on_done(refused.map(|error| error.localizedDescription().to_string()));
+                        let refused = refused.map(|error| error.localizedDescription().to_string());
+                        #[cfg(feature = "fault-injection")]
+                        let refused = if injected { Some(INJECTED.to_string()) } else { refused };
+                        on_done(refused);
                     },
                 );
                 // SAFETY: `addCompletedHandler:` copies the block, so the
@@ -892,6 +934,8 @@ impl Frame {
             Ok(Pending {
                 buffer: self.commit_buffer(),
                 flushed,
+                #[cfg(feature = "fault-injection")]
+                injected,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -928,9 +972,33 @@ pub struct Pending {
     /// The heads a flushed frame committed ahead of `buffer`.
     #[cfg(target_vendor = "apple")]
     flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Answers as failed whatever the device did ([`fail_next_frame`]).
+    #[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+    injected: bool,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+const INJECTED: &str = "a failure injected by `fail_next_frame`";
+
+/// Answers the next frame this thread commits with a completion handler
+/// ([`Frame::commit_async`]) as failed, to its handler and to its
+/// [`Pending::wait`], whatever the device did: tests of what a failed
+/// command buffer leaves, which a real device fault can't be made to give.
+///
+/// A test seam only, compiled under the `fault-injection` feature (off by
+/// default; engine-metal's tests turn it on): a served binary has no such
+/// path, and nothing in serving, no config, env var or protocol, reaches
+/// it. Its flag is per thread and inert unless this is called there.
+#[cfg(feature = "fault-injection")]
+pub fn fail_next_frame() {
+    FAIL_NEXT.with(|next| next.set(true));
 }
 
 // SAFETY: what a `Pending` does to its command buffer is `status`, `error`
@@ -983,6 +1051,13 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
+            #[cfg(feature = "fault-injection")]
+            if self.injected {
+                return Err(Fault::Device {
+                    call: "waitUntilCompleted",
+                    why: INJECTED.to_string(),
+                });
+            }
             for buffer in self.flushed.iter().chain([&self.buffer]) {
                 if let Some(error) = buffer.error() {
                     return Err(Fault::Device {

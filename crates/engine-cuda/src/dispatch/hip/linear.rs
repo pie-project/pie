@@ -45,6 +45,152 @@ impl Run<'_> {
         }
     }
 
+    /// A residual norm whose normed rows only the product reads: in one
+    /// launch where the skinny kernel takes the product and the fold pays
+    /// (`linear::gemm::residual_add_rmsnorm_matmul` prices it), else the
+    /// norm (its sum into `y_out`, `y` left as it was) then the product.
+    pub(super) fn norm_matmul(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResidualAddRmsnormMatmul {
+            x,
+            y,
+            y_out,
+            weight,
+            plus_one,
+            eps,
+            out,
+            w,
+            z,
+        } = op
+        else {
+            unreachable!("only the residual norm and product dispatch here")
+        };
+        if self.dense_weight(*w)
+            && linear::gemm::residual_add_rmsnorm_matmul(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                self.tensor(*w),
+                &mut self.tensor(*y_out),
+                &mut self.tensor(*out),
+                &mut self.tensor(*z),
+            )?
+        {
+            return Ok(());
+        }
+        let norm = || {
+            kernels_cuda::elemwise::norm_residual::residual_add_rmsnorm_into(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*y_out),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            )
+        };
+        if self.lane_shaped(*y_out) {
+            self.unseated(norm)?;
+        } else {
+            norm()?;
+        }
+        self.linear(&Linear::Matmul {
+            act: *out,
+            w: *w,
+            y: *z,
+            input_scales: None,
+            scales: None,
+            quant: None,
+            logits: false,
+        })
+    }
+
+    /// A residual norm feeding a dense MLP whole: the norm folded into the
+    /// gate-up product where the skinny kernel takes it and the fold pays
+    /// (`linear::gemm::residual_add_rmsnorm_matmul_swiglu` prices it), then
+    /// the down product; else the norm (its sum into `y_out`) then the MLP
+    /// as `MatmulSwigluMatmul` runs it, a held shared expert's included.
+    pub(super) fn norm_mlp(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResidualAddRmsnormMatmulSwigluMatmul {
+            x,
+            y,
+            y_out,
+            weight,
+            plus_one,
+            eps,
+            out,
+            gate_up,
+            down,
+            intermediate,
+            packed,
+            h,
+            z,
+        } = op
+        else {
+            unreachable!("only the residual norm and dense MLP dispatch here")
+        };
+        let mlp = Fused::MatmulSwigluMatmul {
+            act: *out,
+            gate_up: *gate_up,
+            down: *down,
+            intermediate: *intermediate,
+            packed: *packed,
+            h: *h,
+            y: *z,
+        };
+        let held = crate::run::HeldShared {
+            y: *z,
+            gate_up: *gate_up,
+            down: *down,
+        };
+        if !self.holds_shared(*out, held)
+            && self.dense_weight(*gate_up)
+            && linear::gemm::residual_add_rmsnorm_matmul_swiglu(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                self.tensor(*gate_up),
+                &mut self.tensor(*y_out),
+                &mut self.tensor(*out),
+                &mut self.tensor(*h),
+            )?
+        {
+            return self.linear(&Linear::Matmul {
+                act: *h,
+                w: *down,
+                y: *z,
+                input_scales: None,
+                scales: None,
+                quant: None,
+                logits: false,
+            });
+        }
+        let norm = || {
+            kernels_cuda::elemwise::norm_residual::residual_add_rmsnorm_into(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*y_out),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            )
+        };
+        if self.lane_shaped(*y_out) {
+            self.unseated(norm)?;
+        } else {
+            norm()?;
+        }
+        self.fused_linear(&mlp)
+    }
+
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::MatmulGlu {

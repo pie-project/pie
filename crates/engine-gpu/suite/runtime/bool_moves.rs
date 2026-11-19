@@ -214,6 +214,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );
@@ -261,6 +262,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

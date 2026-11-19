@@ -298,6 +298,33 @@ impl Reader {
     }
 }
 
+/// What the host can still give the process now ([`Room::net`]), for a
+/// device that shares the host's memory: lmkd's line is read once, here,
+/// and each call reads only `/proc/meminfo`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn room_reader() -> engine::HostRoom {
+    match reader() {
+        Ok(reader) => std::sync::Arc::new(move || {
+            reader
+                .read()
+                .map(|room| room.net())
+                .map_err(|fault| fault.to_string())
+        }),
+        Err(fault) => {
+            let why = fault.to_string();
+            std::sync::Arc::new(move || Err(why.clone()))
+        }
+    }
+}
+
+/// A host with no reader of its available memory refuses each reading.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[must_use]
+pub fn room_reader() -> engine::HostRoom {
+    std::sync::Arc::new(|| Err("this host has no reader of its available memory".to_string()))
+}
+
 /// A system property's value, `None` where it is unset.
 #[cfg(target_os = "android")]
 fn property(name: &str) -> Option<String> {

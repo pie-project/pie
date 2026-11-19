@@ -27,6 +27,96 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The boot every suite load takes: the backend's default with a profiles
+/// directory, so a load reads the device's measured `[rates]` (and keeps
+/// what it measures) instead of the checked-in profiles alone, which leave
+/// an unprofiled device (a phone's GPU) with no roofline rates. The
+/// directory is `$PIE_HOME/profiles` where `PIE_HOME` is set, as `pie`'s
+/// own loads use, and otherwise one directory per backend in the temp dir,
+/// shared by every test of the run.
+pub fn device_boot() -> DeviceBoot {
+    let profiles = std::env::var_os("PIE_HOME").map_or_else(
+        || std::env::temp_dir().join(format!("pie-{}-profiles", crate::backend::NAME)),
+        |home| std::path::PathBuf::from(home).join("profiles"),
+    );
+    DeviceBoot {
+        profiles: Some(profiles),
+        ..DeviceBoot::default()
+    }
+}
+
+/// How many parts the harness cuts the device into. A test that loads a
+/// model takes one part, its share ([`share`]), and every load it makes
+/// takes no more than that; one part is left to the kernel tests (a few
+/// small buffers each) and the drivers. So at most `SHARES - 1` tests hold
+/// a model at once, whatever the harness's thread count, and their loads
+/// never collide: each sizes its pool within its share, not within what the
+/// device has left when it loads (which a load beside it then takes).
+pub const SHARES: u64 = 4;
+
+/// The tests holding a share now, and the signal one gave its share back.
+static HOLDERS: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// A test's share, held by its thread until the test ends.
+struct Held;
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        *HOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        FREED.notify_one();
+    }
+}
+
+thread_local! {
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The bytes of one share: a [`SHARES`]th of what the device states it has
+/// to a load that states no budget (read once, as the first share is
+/// taken, before any model stands), no more than the harness states a
+/// test's load takes (`ALLOWANCE`); `None` where neither is stated.
+fn share_bytes() -> Option<u64> {
+    static BYTES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let read = Context::bind(&device_boot(), engine::Allowance::WHOLE)
+            .ok()
+            .map(|device| engine_gpu::backend::Context::capacity(&device) / SHARES);
+        match (read, ALLOWANCE.budget) {
+            (Some(read), Some(stated)) => Some(read.min(stated)),
+            (read, stated) => read.or(stated),
+        }
+    })
+}
+
+/// The device allowance of a load of the calling test: its share of the
+/// device. The test takes its share (waiting while `SHARES - 1` other tests
+/// hold theirs) where it holds none yet, and holds it until it ends; every
+/// load it makes then takes the same share. Take it before
+/// `model_logits::loading`, which a test holding a share waits on.
+pub fn share() -> engine::Allowance {
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            let mut holders = HOLDERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while *holders >= SHARES - 1 {
+                holders = FREED
+                    .wait(holders)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            *holders += 1;
+            *held = Some(Held);
+        }
+    });
+    engine::Allowance {
+        budget: share_bytes(),
+    }
+}
+
 pub struct Gpu {
     pub device: Context,
     handles: Handles,
@@ -36,7 +126,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn open() -> Option<Gpu> {
-        let device = Context::bind(&DeviceBoot::default(), ALLOWANCE).ok()?;
+        let device = Context::bind(&device_boot(), ALLOWANCE).ok()?;
         Some(Gpu {
             device,
             handles: Handles::new(),

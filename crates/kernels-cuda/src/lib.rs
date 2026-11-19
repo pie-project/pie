@@ -16,6 +16,7 @@ pub mod sizing;
 pub mod source;
 pub mod ssm;
 pub mod synth;
+pub mod tally;
 pub mod tensor;
 mod voxels;
 

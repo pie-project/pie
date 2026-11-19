@@ -91,7 +91,7 @@ pub struct InstanceBinding {
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
     /// Where this instance's lanes' scratch lies
-    /// ([`GuestState::per_instance`]).
+    /// ([`GuestState::resident`]).
     #[serde(default)]
     pub scratch: ScratchPlace,
     /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
@@ -99,6 +99,14 @@ pub struct InstanceBinding {
     /// at its last close.
     #[serde(default)]
     pub pair: ScratchPlace,
+    /// Which taking of the pair's slots [`Self::pair`] names: the runtime
+    /// renews it each time the pair's state is given fresh slots (its first
+    /// bind, a return from the host), so slots freed, written by another
+    /// owner and taken again at the same refs read as new. The engine lays
+    /// the pair's state again wherever it differs from the one it laid, and
+    /// not where the same live slots are bound again.
+    #[serde(default)]
+    pub pair_generation: u64,
 }
 
 /// What a guest program bound at given extents holds in the pool, as state
@@ -109,25 +117,60 @@ pub struct InstanceBinding {
 /// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
 /// between fires: a park gives them back and an unpark takes fresh room,
 /// nothing copied, the engine told where ([`Rebind::Instance`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes each bound instance holds for its lanes' scratch.
+    /// Bytes an instance holds from bind to unbind, at rest included: launch tables,
+    /// status words, rings, anything a later fire reads. Placed at bind (today's
+    /// per_instance minus the value scratch).
     #[serde(default)]
-    pub per_instance: u64,
-    /// Bytes the pair holds once while any instance of it is bound.
+    pub resident: u64,
+    /// Bytes ONE fire of the instance needs for its value scratch: dead outside that
+    /// fire, never read by a later one.
+    #[serde(default)]
+    pub scratch: u64,
+    /// Fires of one instance this engine may have in flight at once for the class
+    /// being bound, each needing its own scratch: the arms (>= 1).
+    #[serde(default = "one_arm")]
+    pub scratch_arms: u32,
+    /// The pair's tables, held once while any instance of it is bound (a layout
+    /// cache: stays resident; unchanged).
     #[serde(default)]
     pub per_pair: u64,
-    /// The chunks a piece of either takes where it lies in whole chunks: a
-    /// run of `run` adjacent chunks inside one segment, the least that
+    /// Chunks a piece takes (unchanged; applies to resident and to each scratch arm).
+    /// A run of `run` adjacent chunks inside one segment, the least that
     /// holds the program's widest value (or its temporary area) whole, so
     /// each piece is addressed from its first chunk (0 or 1: a chunk). Its
-    /// bytes past a chunk's are whole runs, `per_instance` and `per_pair`
-    /// a multiple of `run` chunks.
+    /// bytes past a chunk's are whole runs, `resident`, `scratch` and
+    /// `per_pair` a multiple of `run` chunks.
     #[serde(default)]
     pub run: u32,
 }
 
+fn one_arm() -> u32 {
+    1
+}
+
+impl Default for GuestState {
+    fn default() -> Self {
+        Self {
+            resident: 0,
+            scratch: 0,
+            scratch_arms: 1,
+            per_pair: 0,
+            run: 0,
+        }
+    }
+}
+
 impl GuestState {
+    /// Bytes an instance holds with every scratch arm held: [`Self::resident`]
+    /// plus [`Self::scratch`] times [`Self::scratch_arms`] (at least one).
+    #[must_use]
+    pub fn instance_bytes(&self) -> u64 {
+        self.resident
+            .saturating_add(self.scratch.saturating_mul(u64::from(self.scratch_arms.max(1))))
+    }
+
     /// The chunks a piece takes: [`Self::run`], at least one.
     #[must_use]
     pub fn chunks_a_piece(&self) -> u32 {
@@ -387,6 +430,10 @@ pub enum Rebind {
         /// Its pair's, as [`InstanceBinding::pair`].
         #[serde(default)]
         pair: ScratchPlace,
+        /// The taking of the pair's slots it names, as
+        /// [`InstanceBinding::pair_generation`].
+        #[serde(default)]
+        pair_generation: u64,
     },
     /// A registered channel's ring (`Channel` slots, as
     /// [`crate::channel::ChannelRegistration::slots`]).

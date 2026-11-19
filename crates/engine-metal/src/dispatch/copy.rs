@@ -113,6 +113,31 @@ impl Run<'_> {
         for id in outs {
             note(&mut plan, id, true);
         }
+        // The fire's masks are per row: where it stages any, the copy carries
+        // each gathered row's word and mask row, as 4-byte words, which the
+        // window's plans read in place of the fire's (`Run::cut_rows`).
+        let tables = self.fire_tables();
+        if tables.mask_stride > 0 {
+            for (handle, width) in [
+                (tables.mask, tables.mask_stride / 4),
+                (tables.mask_enabled, 1),
+            ] {
+                let wide = Tensor::new(handle.buf, handle.rows, width, poem_ir::Dtype::I32);
+                let Some(key) = self.address(handle.buf) else {
+                    continue;
+                };
+                let offset = align(at);
+                at = offset + u64::from(rows) * row_bytes(wide);
+                plan.slots.push(CopySlot {
+                    key,
+                    offset,
+                    wide,
+                    tight: Tensor::new(crate::device::handles::NIL, rows, width, poem_ir::Dtype::I32),
+                    read: true,
+                    written: false,
+                });
+            }
+        }
         plan.bytes = at;
         plan
     }

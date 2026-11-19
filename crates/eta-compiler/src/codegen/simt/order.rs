@@ -20,6 +20,13 @@ pub const TOP_K_SELECT_MAX: u32 = 1024;
 
 pub const TOP_K_SELECT_POOL: u32 = 4096;
 
+/// The widest select cap whose per-thread list a block keeps in registers
+/// (`BODY_SELECT_REGISTERS`): a thread holds its `cap` least candidates and
+/// the block merges the threads' lists. Sixteen 64-bit entries are the most
+/// a CDNA thread holds with no spill at a block of 1,024 threads (77 VGPRs;
+/// at 32 it spills); past that the radix select (`BODY_SELECT`) runs.
+pub const TOP_K_SELECT_REGISTERS: u32 = 16;
+
 const BODY: &str = r#"
   (void)channels;
   (void)params;
@@ -29,6 +36,7 @@ const BODY: &str = r#"
   (void)intrinsic_widths;
   (void)intrinsic_strides;
   (void)intrinsic_offsets;
+  (void)intrinsic_rows;
   (void)lane_active;
   (void)status;
 
@@ -152,6 +160,7 @@ const BODY_SELECT: &str = r#"
   (void)intrinsic_widths;
   (void)intrinsic_strides;
   (void)intrinsic_offsets;
+  (void)intrinsic_rows;
   (void)temporary;
   (void)kOrderWorkerCap;
   (void)kOrderFullRow;
@@ -172,12 +181,13 @@ const BODY_SELECT: &str = r#"
   const m1_u32 direct_stride = direct_stride_raw == 0u ? order_len : direct_stride_raw;
   const m1_u64 direct_row0 =
       direct ? (m1_u64)intrinsic_offsets[direct_index] + (m1_u64)params[kDirectNode].imm2 : 0u;
+  const m1_u32 direct_rows = direct ? intrinsic_rows[direct_index] : 0u;
   const float direct_divisor = (direct && kDirectDivisor != 0xFFFFFFFFu)
       ? m1_load_f(scratch + offsets[kDirectDivisor], 0u, descriptors[kDirectDivisor].dtype)
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode) / direct_divisor;
+      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u32 sel_hist[256];
@@ -344,6 +354,148 @@ const BODY_SELECT: &str = r#"
   }
 "#;
 
+/// The register select's helpers: a thread's ascending list of its least
+/// candidates (`(key << 32) | index`, all distinct), and the merges of
+/// lists across a 32-lane chunk and a block.
+const SELECT_REGISTER_HELPERS: &str = r#"
+// `e` into the ascending `top`, dropping its greatest: a min/max chain with no
+// branch, so the list stays in registers.
+template <m1_u32 K>
+__device__ __forceinline__ void m1_select_keep(m1_u64 (&top)[K], m1_u64 e) {
+#pragma unroll
+  for (m1_u32 j = 0u; j < K; ++j) {
+    const m1_u64 t = top[j];
+    top[j] = t < e ? t : e;
+    e = t < e ? e : t;
+  }
+}
+// Every lane of the 32-lane chunk ends holding the chunk's K least, ascending:
+// at each step a lane's list meets its partner's, and min(a[j], b[K-1-j]) (a
+// bitonic run holding the pair's K least) is merged in order.
+template <m1_u32 K>
+__device__ __forceinline__ void m1_select_chunk(m1_u64 (&top)[K]) {
+  const m1_u32 lane = threadIdx.x & 31u;
+#pragma unroll
+  for (m1_u32 off = 16u; off > 0u; off >>= 1u) {
+    m1_u64 other[K];
+#pragma unroll
+    for (m1_u32 j = 0u; j < K; ++j) other[j] = m1_chunk_from(top[j], lane ^ off);
+#pragma unroll
+    for (m1_u32 j = 0u; j < K; ++j) {
+      const m1_u64 x = top[j];
+      const m1_u64 y = other[K - 1u - j];
+      top[j] = x < y ? x : y;
+    }
+#pragma unroll
+    for (m1_u32 stride = K / 2u; stride > 0u; stride >>= 1u) {
+#pragma unroll
+      for (m1_u32 j = 0u; j < K; ++j) {
+        if ((j & stride) == 0u) {
+          const m1_u64 x = top[j];
+          const m1_u64 y = top[j + stride];
+          top[j] = x < y ? x : y;
+          top[j + stride] = x < y ? y : x;
+        }
+      }
+    }
+  }
+}
+// The block's `want` least into out[0, want), the rest of out[0, K) past
+// every entry: each chunk merges its lanes', the first chunk the chunks'.
+template <m1_u32 K>
+__device__ __forceinline__ void m1_select_block(
+    m1_u64 (&top)[K], m1_u32 want, m1_u64* out, m1_u64* lists) {
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 chunk = threadIdx.x >> 5u;
+  const m1_u32 chunks = (blockDim.x + 31u) >> 5u;
+  m1_select_chunk<K>(top);
+  if (lane == 0u) {
+#pragma unroll
+    for (m1_u32 j = 0u; j < K; ++j) lists[chunk * K + j] = top[j];
+  }
+  __syncthreads();
+  if (chunk == 0u) {
+#pragma unroll
+    for (m1_u32 j = 0u; j < K; ++j)
+      top[j] = lane < chunks ? lists[lane * K + j] : 0xFFFFFFFFFFFFFFFFull;
+    m1_select_chunk<K>(top);
+    if (lane == 0u) {
+#pragma unroll
+      for (m1_u32 j = 0u; j < K; ++j) out[j] = j < want ? top[j] : 0xFFFFFFFFFFFFFFFFull;
+    }
+  }
+  __syncthreads();
+}
+"#;
+
+/// A select whose cap is at most `TOP_K_SELECT_REGISTERS`: each thread keeps
+/// its least candidates of the row in registers as it reads them, and the
+/// block merges the lists: one read of the row, no histogram passes. The
+/// pick and its order are the radix select's (the least `(key, index)`).
+const BODY_SELECT_REGISTERS: &str = r#"
+  (void)channels;
+  (void)params;
+  (void)pending_flags;
+  (void)intrinsic_bases;
+  (void)intrinsic_modes;
+  (void)intrinsic_widths;
+  (void)intrinsic_strides;
+  (void)intrinsic_offsets;
+  (void)intrinsic_rows;
+  (void)temporary;
+  (void)kOrderWorkerCap;
+  (void)kOrderFullRow;
+  (void)kSelectPool;
+  const M1ValueDesc order_input_desc = descriptors[kInput];
+  const m1_u8* order_input = scratch + offsets[kInput];
+  m1_u8* order_values = scratch + offsets[kValues];
+  m1_u8* order_indices = scratch + offsets[kIndices];
+  const m1_u32 order_len = order_input_desc.last;
+  const m1_u32 order_rows = order_input_desc.rows;
+  const m1_u32 order_width = kWidth;
+  const m1_u32 order_count = order_width < order_len ? order_width : order_len;
+  const bool direct = kDirectIntrinsic != 0xFFFFFFFFu;
+  const m1_u32 direct_index = dispatch_lane * kIntrinsicSlots + (direct ? kDirectIntrinsic : 0u);
+  const m1_u8* direct_base =
+      direct ? reinterpret_cast<const m1_u8*>(intrinsic_bases[direct_index]) : nullptr;
+  const m1_u32 direct_mode = direct ? intrinsic_modes[direct_index] : 0u;
+  const m1_u32 direct_stride_raw = direct ? intrinsic_strides[direct_index] : 0u;
+  const m1_u32 direct_stride = direct_stride_raw == 0u ? order_len : direct_stride_raw;
+  const m1_u64 direct_row0 =
+      direct ? (m1_u64)intrinsic_offsets[direct_index] + (m1_u64)params[kDirectNode].imm2 : 0u;
+  const m1_u32 direct_rows = direct ? intrinsic_rows[direct_index] : 0u;
+  const float direct_divisor = (direct && kDirectDivisor != 0xFFFFFFFFu)
+      ? m1_load_f(scratch + offsets[kDirectDivisor], 0u, descriptors[kDirectDivisor].dtype)
+      : 1.0f;
+  auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
+    if (direct)
+      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+    return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
+  };
+  __shared__ m1_u64 sel_lists[32u * kSelectCap];
+  __shared__ m1_u64 sel_cand[kSelectCap];
+  if (order_count != 0u) {
+    for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
+      m1_u64 sel_top[kSelectCap];
+#pragma unroll
+      for (m1_u32 j = 0u; j < kSelectCap; ++j) sel_top[j] = 0xFFFFFFFFFFFFFFFFull;
+      for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x)
+        m1_select_keep<kSelectCap>(
+            sel_top, ((m1_u64)m1_desc_key(order_value(order_row, i)) << 32) | (m1_u64)i);
+      m1_select_block<kSelectCap>(sel_top, order_count, sel_cand, sel_lists);
+      for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
+        const m1_u32 index = (m1_u32)(sel_cand[at] & 0xFFFFFFFFull);
+        m1_store_f(
+            order_values,
+            order_row * order_width + at,
+            order_value(order_row, index));
+        m1_store_u(order_indices, order_row * order_width + at, index);
+      }
+      __syncthreads();
+    }
+  }
+"#;
+
 pub fn is_order_region(stage: &CompiledStage, region: &Region) -> bool {
     let expected = match region.kind {
         RegionKind::Library(LibraryOp::TopK) => tags::TOP_K,
@@ -389,7 +541,13 @@ pub fn emit_order_region(
         order.imm
     };
 
+    let registers = order.tag == tags::TOP_K
+        && (1..=TOP_K_SELECT_MAX).contains(&width)
+        && width.next_power_of_two().max(2) <= TOP_K_SELECT_REGISTERS;
     let mut source = runtime_source(dialect);
+    if registers {
+        source.push_str(SELECT_REGISTER_HELPERS);
+    }
     source.push_str(PROLOGUE);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);
@@ -439,7 +597,7 @@ pub fn emit_order_region(
             "  constexpr m1_u32 kIntrinsicSlots = {}u;",
             super::fused::output_pitch(stage)
         );
-        source.push_str(BODY_SELECT);
+        source.push_str(if registers { BODY_SELECT_REGISTERS } else { BODY_SELECT });
     } else {
         source.push_str(BODY);
     }

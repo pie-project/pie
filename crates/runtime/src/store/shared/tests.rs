@@ -9,7 +9,8 @@ use ::engine::chunk::{
 use ::engine::fire::Lane;
 
 use super::*;
-use crate::governor::{PATIENCE, Retarget};
+use crate::governor::Retarget;
+use crate::scheduler::worker::PoolOp;
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -264,7 +265,7 @@ fn walk_segments(
                 }
                 pool.committed(prefix);
             }
-            Some(SegmentMove::Evacuate { evacuation }) => {
+            Some(SegmentMove::Evacuate { evacuation, .. }) => {
                 let _ = engine.evacuate(&evacuation);
                 return Retarget::Reached;
             }
@@ -975,10 +976,9 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     // Its last fire settled: the ask is gone, one lane lives, none is short.
     drop(want);
     assert_eq!(wanted_rows(ENGINE), 0);
-    for tick in 0..32 * PATIENCE {
+    for tick in 0..64 {
         grow.walk_rung().await;
         assert_eq!(fire_cap(ENGINE), 2, "no cut at tick {tick}");
-        grow.ticked_for_test();
     }
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
@@ -991,12 +991,12 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     assert_eq!(fire_cap(ENGINE), 2);
 }
 
-/// The lower that frees chunks is still taken once the pool has stood past
-/// what is asked for the governor's patience, the cap down before it: a
-/// taker short of records while the largest rung holds its span is seated
-/// from the span the lower lends.
+/// The lower that frees chunks is taken once a taker is short of them, the
+/// cap down before it: a taker short of records while the largest rung
+/// holds its span is seated from the span the lower lends. Until one is,
+/// the rung stands however long nothing asks its width.
 #[tokio::test(flavor = "current_thread")]
-async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
+async fn a_lower_seats_a_taker_short_of_records() {
     const ENGINE: usize = 9302;
     let mut pool = classed();
     let mut engine = FakeEngine::new();
@@ -1013,14 +1013,19 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
     assert_eq!(fire_cap(ENGINE), u32::MAX);
-    for _ in 0..PATIENCE {
-        grow.ticked_for_test();
+    for _ in 0..64 {
         grow.walk_rung().await;
-        assert_eq!(fire_cap(ENGINE), u32::MAX, "not before the patience");
+        assert_eq!(fire_cap(ENGINE), u32::MAX, "nothing is short yet");
     }
-    grow.ticked_for_test();
+    // The taker parks short of its record, as the planner notes it.
+    {
+        let mut pool = shared.lock().unwrap();
+        let shape = pool.fixed()[0];
+        pool.pool_mut()
+            .wait(1, shape.pool, u64::from(shape.pieces));
+    }
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut");
+    assert_eq!(fire_cap(ENGINE), 1, "a taker is short: fires cut");
     grant_rung(ENGINE, 1);
     grow.walk_rung().await;
     grow.walk_rung().await;
@@ -1029,9 +1034,67 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
     assert!(pool.take_records(1).is_some(), "the taker is seated");
 }
 
+/// The stack wedge (MI300X, 500 at once): the rung rose to the largest
+/// while nothing waited, and took the committable room; guest binds then
+/// waited behind it, and the walk held the throughput rung (and asked to
+/// rise again) while they did. A throughput rung is ordered after every
+/// process demand: while one waits the walk comes down at once to what the
+/// live lanes need, its give-back tells the room signal, a throughput raise
+/// asked meanwhile takes nothing, and the rung rises again only once no
+/// demand waits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_throughput_rung_gives_room_back_to_waiting_binds_and_rises_once_none_waits() {
+    const ENGINE: usize = 9306;
+    let mut pool = classed();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    // A cuttable pass asks the largest rung, fundable: nothing waits.
+    let want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+
+    // A guest bind arrives short of room: the walk gives the span back at
+    // once, past the pass's ask and with no patience.
+    let room = shared.lock().unwrap().pool().room_watch();
+    shared.lock().unwrap().set_guest_head(Some((1, 4)));
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "cut to the live lane's rung");
+    grant_rung(ENGINE, 1);
+    // Behind the retire fence, as every lower.
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        1,
+        "lowered: the span given back"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), room.given())
+        .await
+        .expect("the give-back tells the room signal");
+
+    // While the bind waits, a throughput raise takes nothing.
+    raise_now(&shared, ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
+    assert_eq!(fire_cap(ENGINE), 1);
+
+    // The bind lands: the rung rises again for the pass.
+    shared.lock().unwrap().set_guest_head(None);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    drop(want);
+}
+
 /// A fire term appearing that the rung in hand cannot seat beside cuts
 /// fires at once, under a pass still asking the width and before any tick:
-/// the fit, not the patience, decides it.
+/// the fit decides it, not a waiter short of chunks.
 #[tokio::test(flavor = "current_thread")]
 async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
     const ENGINE: usize = 9303;
@@ -1433,4 +1496,91 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
     };
     crate::pipeline::fire::rs::apply_shared(&mut req, Some(&stateless), None);
     assert_eq!(req.lanes[0].record, ::engine::LaneRecord::Unstated);
+}
+
+/// An evacuation the engine refuses copied nothing, so the pool takes it
+/// back whole: every chunk lies where it lay, in the pool's table as in the
+/// engine's, the segment stays committed and mapped, nothing is released,
+/// and the answer is short of the target, never reached. An evacuation the
+/// engine takes later goes through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_evacuation_is_taken_back_whole_and_a_later_one_goes_through() {
+    use crate::governor::PoolTarget;
+
+    let mut pool = pool();
+    pool.committed(6);
+    let records = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.give_records(&records[..16]);
+    let kept = &records[16..];
+    let placed = |pool: &SharedPool| -> Vec<Vec<u32>> {
+        kept.iter()
+            .map(|&id| {
+                pool.record_slots(id)
+                    .iter()
+                    .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+                    .collect()
+            })
+            .collect()
+    };
+    let before = placed(&pool);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(FakeEngine {
+        prefix: 6,
+        refuse: true,
+        ..FakeEngine::new()
+    }));
+    let lane = engine.clone();
+    let mut grow = SharedGrow::new(0, 9401, shared.clone()).with_lane(move |op| {
+        let mut engine = lane.lock().unwrap();
+        match op {
+            PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+            PoolOp::ReleaseSegments(prefix) => engine.release_segments(prefix),
+            PoolOp::CommitSegments(prefix) => engine.commit_segments(prefix),
+            other => panic!("no {other:?} in this walk"),
+        }
+        .map_err(Into::into)
+    });
+    // Every logical chunk lies where the engine has it.
+    let agree = |shared: &Shared, engine: &FakeEngine| {
+        let pool = shared.lock().unwrap();
+        for (logical, &physical) in pool.pool().chunk_table().iter().enumerate() {
+            assert_eq!(
+                engine.table.physical(logical as u32),
+                Some(physical),
+                "logical chunk {logical}"
+            );
+        }
+        pool.pool().check();
+    };
+
+    assert_eq!(grow.retarget(6), Retarget::Moving { held: 8 });
+    grow.walk().await;
+    {
+        let engine = engine.lock().unwrap();
+        assert!(engine.calls.is_empty(), "nothing copied, nothing released");
+        agree(&shared, &engine);
+    }
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.mapped_segments(), 8);
+        assert_eq!(pool.draining_segments(), 0);
+        assert_eq!(pool.pool().segments().state(5), SegmentState::Committed);
+        assert_eq!(placed(&pool), before, "every record where it was");
+    }
+    assert_eq!(grow.retarget(6), Retarget::NoRoom { held: 8 });
+
+    // The engine takes the next: segment 5 goes, and segment 4 finds no
+    // room left.
+    engine.lock().unwrap().refuse = false;
+    grow.walk().await;
+    {
+        let engine = engine.lock().unwrap();
+        assert!(matches!(engine.calls[0], Call::Evacuate(_)), "{:?}", engine.calls);
+        assert_eq!(engine.calls[1..], [Call::Release(5)]);
+        agree(&shared, &engine);
+    }
+    assert_eq!(shared.lock().unwrap().mapped_segments(), 7);
+    assert_eq!(grow.retarget(6), Retarget::NoRoom { held: 7 });
 }

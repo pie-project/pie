@@ -21,14 +21,19 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 18;
+const FUSED_ARITY: usize = 19;
 
 /// The spans of a stage's cells ([`Prepared::cells`]): five intrinsic
-/// tables, the pending flags, the row tables and the lane scratch table.
-const CELLS: usize = 8;
+/// tables, the pending flags, the row tables, the lane scratch table and
+/// the intrinsics' row bounds.
+const CELLS: usize = 9;
 
 /// The cell that holds the lane scratch table.
 const LANE_SCRATCH_CELL: usize = 7;
+
+/// The cell that holds each intrinsic's row bound: the row its reads stop
+/// short of.
+const INTRINSIC_ROWS_CELL: usize = 8;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
@@ -131,10 +136,14 @@ pub struct CudaOpParams {
     pub bool_storage: u32,
     pub intrinsic_row_stride: u32,
     pub intrinsic_row_offset: u32,
+    /// The row an intrinsic's reads stop short of, set where the kernel
+    /// reads its output (`intrinsic_rows`).
+    pub intrinsic_rows: u32,
+    pub reserved: u32,
     pub rng_seed: u64,
 }
 
-const _: () = assert!(size_of::<CudaOpParams>() == 88);
+const _: () = assert!(size_of::<CudaOpParams>() == 96);
 
 const _: () = {
     assert!(std::mem::offset_of!(CudaOpParams, tag) == 0);
@@ -157,7 +166,8 @@ const _: () = {
     assert!(std::mem::offset_of!(CudaOpParams, bool_storage) == 68);
     assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_stride) == 72);
     assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_offset) == 76);
-    assert!(std::mem::offset_of!(CudaOpParams, rng_seed) == 80);
+    assert!(std::mem::offset_of!(CudaOpParams, intrinsic_rows) == 80);
+    assert!(std::mem::offset_of!(CudaOpParams, rng_seed) == 88);
 };
 
 impl CudaOpParams {
@@ -184,6 +194,8 @@ impl CudaOpParams {
             bool_storage: BOOL_STORAGE_NATIVE_BYTES,
             intrinsic_row_stride: 0,
             intrinsic_row_offset: 0,
+            intrinsic_rows: 0,
+            reserved: 0,
             rng_seed: 0,
         }
     }
@@ -680,6 +692,7 @@ pub struct Prepared {
     intrinsic_widths_host: Vec<u32>,
     intrinsic_strides_host: Vec<u32>,
     intrinsic_offsets_host: Vec<u32>,
+    intrinsic_rows_host: Vec<u32>,
     /// The side-table slots a lane binds ([`eta_ir::op::output_pitch`]).
     pitch: usize,
     /// Each slot's row table: where it starts among a lane's pointers and
@@ -986,6 +999,7 @@ impl Prepared {
             intrinsic_widths_host: Vec::new(),
             intrinsic_strides_host: Vec::new(),
             intrinsic_offsets_host: Vec::new(),
+            intrinsic_rows_host: Vec::new(),
             pitch: plan.output_pitch as usize,
             row_tables,
             row_words,
@@ -1127,6 +1141,7 @@ impl Prepared {
         self.intrinsic_widths_host.resize(words, 0u32);
         self.intrinsic_strides_host.resize(words, 0u32);
         self.intrinsic_offsets_host.resize(words, 0u32);
+        self.intrinsic_rows_host.resize(words, 0u32);
         let rows = self.row_words as usize * lanes as usize;
         self.row_pointers_host.resize(rows, 0u64);
         self.lane_scratch_host.resize(lanes as usize, 0u64);
@@ -1141,6 +1156,7 @@ impl Prepared {
             pending,
             rows * size_of::<u64>(),
             LaneScratch::bytes(lanes) as usize,
+            words * size_of::<u32>(),
         ]
         .into_iter()
         .enumerate()
@@ -1224,6 +1240,7 @@ impl Prepared {
         self.intrinsic_widths_host[row..row + self.pitch].fill(0);
         self.intrinsic_strides_host[row..row + self.pitch].fill(0);
         self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
+        self.intrinsic_rows_host[row..row + self.pitch].fill(0);
         let words = self.row_words as usize;
         self.row_pointers_host[lane as usize * words..(lane as usize + 1) * words].fill(0);
         // The lane's scratch: its instance's own, where it lies now.
@@ -1268,6 +1285,9 @@ impl Prepared {
         image[at[6]..at[6] + rows.len()].copy_from_slice(&rows);
         let bases = slice_bytes(&self.lane_scratch_host);
         image[at[LANE_SCRATCH_CELL]..at[LANE_SCRATCH_CELL] + bases.len()].copy_from_slice(&bases);
+        let bounds = slice_bytes(&self.intrinsic_rows_host);
+        image[at[INTRINSIC_ROWS_CELL]..at[INTRINSIC_ROWS_CELL] + bounds.len()]
+            .copy_from_slice(&bounds);
         crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
@@ -1281,6 +1301,20 @@ impl Prepared {
         u32::try_from(index)
             .ok()?
             .checked_add(self.output_slots.checked_mul(lane)?)
+    }
+
+    /// The rows this stage reads of each output it reads, by name and
+    /// lane: from an op's own first row, the most any op reads.
+    pub fn rows_read(&self) -> impl Iterator<Item = (&str, u32, u32)> + '_ {
+        let slots = self.output_slots.max(1) as usize;
+        self.row_tables
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rows))| *rows > 0)
+            .filter_map(move |(slot, &(_, rows))| {
+                let name = self.names.get(slot % slots)?;
+                Some((name.as_str(), u32::try_from(slot / slots).ok()?, rows))
+            })
     }
 
     /// Whether this stage reads output `name` of `lane`.
@@ -1307,13 +1341,15 @@ impl Prepared {
                 format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
             ));
         };
-        if rows.len() as u64 > u64::from(held) {
+        // Every pointer the table holds is written: the stage reads all
+        // `held` of them, and a seat past those is a row it does not read.
+        let Some(rows) = rows.get(..held as usize) else {
             return Err(Fault::Ceiling {
-                what: "rows a stage's output reads, each its own seat",
-                need: rows.len() as u64,
-                have: u64::from(held),
+                what: "rows seated for a stage's output read a row a lane",
+                need: u64::from(held),
+                have: rows.len() as u64,
             });
-        }
+        };
         if lane >= self.lanes {
             return Err(Fault::program(
                 "program::launch",
@@ -1330,9 +1366,12 @@ impl Prepared {
         } else {
             INTRINSIC_STORAGE_ROW_POINTERS_F32
         };
-        self.bind_intrinsic(lane, slot, table, mode, width, width, 0)
+        self.bind_intrinsic(lane, slot, table, mode, width, width, 0, held)
     }
 
+    /// Binds output slot `slot` of `lane` to `width` wide rows at `base`,
+    /// read from row `row_offset` on and never at row `rows` or past it.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,
@@ -1342,6 +1381,7 @@ impl Prepared {
         width: u32,
         row_stride: u32,
         row_offset: u32,
+        rows: u32,
     ) -> Result<()> {
         let slot = slot as usize;
         if slot >= self.pitch {
@@ -1362,6 +1402,7 @@ impl Prepared {
         self.intrinsic_widths_host[at] = width;
         self.intrinsic_strides_host[at] = row_stride;
         self.intrinsic_offsets_host[at] = row_offset;
+        self.intrinsic_rows_host[at] = rows;
         Ok(())
     }
 
@@ -1393,7 +1434,8 @@ impl Prepared {
             .ptr(self.cell(1))
             .ptr(self.cell(2))
             .ptr(self.cell(3))
-            .ptr(self.cell(4));
+            .ptr(self.cell(4))
+            .ptr(self.cell(INTRINSIC_ROWS_CELL));
         let rows = self
             .region_rows
             .get(region.region_index as usize)
@@ -2023,7 +2065,7 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 1_976_064, 0),
+                ("top-p", 9_312_512, 1_368_576, 0),
                 ("top-k + top-p", 9_616_896, 2_812_672, 76_032),
                 ("gumbel-max", 5_512_960, 1_792, 0),
                 ("greedy", 3_688_704, 768, 0),

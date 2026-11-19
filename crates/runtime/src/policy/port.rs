@@ -97,7 +97,14 @@ pub fn start_default() -> Result<(), LoadError> {
     if EVENTS.get().is_some() {
         return Ok(());
     }
-    spawn(host(), None)
+    spawn(host(), None)?;
+    // How long idle cache stays is a policy's to state, with its retention
+    // keys; with none, the default is said here rather than left implied.
+    tracing::info!(
+        "no worker policy: idle cache has no time-based expiry; it stays until a demand needs its room, \
+         then goes lowest retention key, then least recently used, first"
+    );
+    Ok(())
 }
 
 fn spawn(mut host: Host, loaded: Option<(String, Vec<u8>)>) -> Result<(), LoadError> {
@@ -393,21 +400,7 @@ fn apply<K, V, R: std::hash::Hash + Eq>(
 }
 
 fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
-    let mut port = Port {
-        host,
-        cache: STORES,
-        procs: HashMap::new(),
-        retained: HashMap::new(),
-        handles: HashMap::new(),
-        sessions: HashMap::new(),
-        put: HashSet::new(),
-        pressure: [Reading::default(); 2],
-        pressed: [false; 2],
-        offloaded: HashMap::new(),
-        loaded,
-        version: 0,
-        columns: Columns::default(),
-    };
+    let mut port = Port::new(host, STORES, loaded);
     loop {
         let first = match events.recv_timeout(LOOK) {
             Ok(event) => Some(event),
@@ -422,7 +415,7 @@ fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
                 event => port.apply(event),
             }
         }
-        port.pressure_round();
+        let _ = port.pressure_round(&retention::Installed);
         if port.host.due() {
             port.put_worker();
             port.put_working_sets();
@@ -438,6 +431,24 @@ fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
 }
 
 impl Port {
+    fn new(host: Host, cache: Cache, loaded: Option<(String, Vec<u8>)>) -> Self {
+        Port {
+            host,
+            cache,
+            procs: HashMap::new(),
+            retained: HashMap::new(),
+            handles: HashMap::new(),
+            sessions: HashMap::new(),
+            put: HashSet::new(),
+            pressure: [Reading::default(); 2],
+            pressed: [false; 2],
+            offloaded: HashMap::new(),
+            loaded,
+            version: 0,
+            columns: Columns::default(),
+        }
+    }
+
     fn reload(&mut self, next: Option<(String, Vec<u8>)>) -> Result<(), String> {
         if let Some((name, _)) = &self.loaded {
             self.host.unload(name);
@@ -965,18 +976,18 @@ impl Port {
 
     /// Tiers whose waiters are short: the default responder answers them,
     /// discarding working sets lowest retention key first until what they
-    /// free covers the shortfall (`pressure::choose`). Under PLEX 1.1 no
-    /// policy hears tier pressure: this is the host's own behaviour.
-    fn pressure_round(&mut self) {
+    /// free covers the shortfall, keyed by `keys`. Under PLEX 1.1 no
+    /// policy hears tier pressure: this is the host's own behaviour. The
+    /// working sets it discarded.
+    fn pressure_round(&mut self, keys: &dyn retention::Keys) -> Vec<ProcessId> {
         let pressed: Vec<Tier> = Tier::ALL
             .into_iter()
             .filter(|tier| self.pressed[tier.index()] && self.pressure[tier.index()].short > 0)
             .collect();
         self.pressed = [false; 2];
         if pressed.is_empty() {
-            return;
+            return Vec::new();
         }
-        let keys = retention::Installed;
         let mut discarded: Vec<ProcessId> = Vec::new();
         for tier in pressed {
             let short = self.pressure[tier.index()].short;
@@ -988,9 +999,17 @@ impl Port {
             let rooms = (self.cache.rooms)();
             let below = tier == Tier::Device && rooms[1].1 + rooms[2].1 > 0;
             let mut candidates: Vec<pressure::Candidate> = self
-                .candidates_for(tier, &keys)
+                .candidates_for(tier, keys)
                 .into_iter()
-                .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
+                // The runtime drops no state on its own: only idle cache
+                // (the cached sets of finished processes) goes. A resting
+                // handle is a live process's state its client will resume,
+                // and discarding it fails that client's next call; under
+                // PLEX 1.1 no policy hears tier pressure to choose one.
+                .filter(|c| {
+                    ProcessId::from_str(&c.id)
+                        .is_ok_and(|id| !self.handles.contains_key(&id) && !discarded.contains(&id))
+                })
                 .filter(|c| c.bytes != Some(0) && c.key != pressure::PINNED)
                 .collect();
             candidates
@@ -1010,8 +1029,7 @@ impl Port {
                     continue;
                 };
                 let key = candidate.key;
-                let handle = self.handles.contains_key(&owner);
-                let movable = below && !handle;
+                let movable = below;
                 match take_for(demand, key, movable, || (self.cache.demote)(owner)) {
                     Take::MovedDown => {
                         tracing::info!(
@@ -1032,14 +1050,7 @@ impl Port {
                             up_to = ?demand.up_to,
                             "tier pressure: the default responder discards a working set"
                         );
-                        match self.handles.get(&owner) {
-                            Some(handle) => crate::server::discard_handle(
-                                handle.resting.client,
-                                owner,
-                                "tier pressure: the default responder discarded it".to_string(),
-                            ),
-                            None => (self.cache.discard)(owner),
-                        }
+                        (self.cache.discard)(owner);
                         discarded.push(owner);
                     }
                     Take::Kept => {
@@ -1088,6 +1099,7 @@ impl Port {
                 pressure::answered_nothing(tier);
             }
         }
+        discarded
     }
 
     /// What a working set holds, kv bytes then state bytes, where known.
@@ -1197,6 +1209,7 @@ fn take_for(
 #[cfg(test)]
 mod responder_tests {
     use super::*;
+    use crate::policy::pressure::Band;
 
     /// The 1.1 port's default responder takes for a demand only what its
     /// key lets it, as the 1.0 host's does: within the key, moved down a tier
@@ -1238,5 +1251,282 @@ mod responder_tests {
             take_for(unbounded, 20, false, || unreachable!()),
             Take::Discard
         );
+    }
+
+    /// The idle cache a burst left behind: its owners, how many pages each
+    /// kept, and how long ago each was last used, in ms.
+    static IDLE: std::sync::Mutex<Vec<(ProcessId, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    /// What the stores were told to discard, in order.
+    static SHED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
+    /// The two tests share [`IDLE`] and [`SHED`]: one at a time.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// A kv page, in bytes.
+    const PAGE: u64 = 1 << 20;
+
+    /// Stores holding [`IDLE`], with no tier below the device to move to.
+    const IDLE_CACHE: Cache = Cache {
+        owns: |owner| IDLE.lock().unwrap().iter().any(|(o, _, _)| *o == owner),
+        list: || {
+            let now = crate::rt::Instant::now();
+            let sets = IDLE
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(owner, pages, ago_ms)| CachedWorkingSet {
+                    owner,
+                    entries: 1,
+                    pages,
+                    last_use: now
+                        .checked_sub(Duration::from_millis(ago_ms))
+                        .unwrap_or(now),
+                })
+                .collect();
+            (sets, 16)
+        },
+        discard: |owner| {
+            IDLE.lock().unwrap().retain(|(o, _, _)| *o != owner);
+            SHED.lock().unwrap().push(owner);
+        },
+        demote: |_| false,
+        rooms: || [(100, 40), (0, 0), (0, 0)],
+        resident: |_| Some(true),
+        scale: || {
+            Some(pressure::Scale {
+                kv_page_bytes: PAGE,
+                state_slot_bytes: 0,
+            })
+        },
+    };
+
+    fn idle_port() -> Port {
+        Port::new(host(), IDLE_CACHE, None)
+    }
+
+    fn press(port: &mut Port, short: u64, total: u64) {
+        port.apply(Event::TierPressure(
+            Tier::Device,
+            Reading {
+                band: Band::of(Band::Clear, short, total),
+                short,
+                demand: pressure::Demand::default(),
+            },
+        ));
+    }
+
+    /// Tier pressure never discards a resting handle: it is a live
+    /// process's state its client will resume (Mac Pro's restore-5 runs
+    /// failed requests on "the default responder discards a working set").
+    /// Only idle cache goes, and under PLEX 1.1 no policy hears tier
+    /// pressure to choose a handle instead.
+    #[test]
+    fn the_default_responder_never_discards_a_resting_handle() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut port = idle_port();
+        let (handle, idle) = (ProcessId::new_v4(), ProcessId::new_v4());
+        IDLE.lock().unwrap().clear();
+        IDLE.lock().unwrap().push((idle, 4, 10));
+        SHED.lock().unwrap().clear();
+        port.apply(Event::HandleRested(
+            handle,
+            crate::policy::Resting {
+                tenant: "t".into(),
+                session: None,
+                props: Props::default(),
+                tokens: 4096,
+                folded: 0,
+                slots: 0,
+            },
+        ));
+        assert!(
+            port.candidates_for(Tier::Device, &retention::Installed)
+                .iter()
+                .any(|c| c.id == handle.to_string()),
+            "a resting handle is a working set the port reads"
+        );
+        press(&mut port, 1 << 30, 1 << 31);
+        let discarded = port.pressure_round(&retention::Installed);
+        assert_eq!(discarded, [idle], "idle cache goes");
+        assert!(
+            !discarded.contains(&handle),
+            "the default responder discarded a live process's state"
+        );
+        IDLE.lock().unwrap().clear();
+        SHED.lock().unwrap().clear();
+    }
+
+    /// A pool of chunks of two kv pages each, in segments of four chunks,
+    /// whose pages are the burst's sets' interleaved as concurrent decodes
+    /// lay them: page `i` of every set before page `i + 1` of any. A chunk
+    /// comes free only once both of its pages' sets are gone; an evacuation
+    /// moves whole chunks, so the pool maps no fewer segments than its used
+    /// chunks fill.
+    struct InterleavedPool {
+        /// Per chunk, the owners of its two pages.
+        chunks: Vec<[ProcessId; 2]>,
+        mapped: u64,
+    }
+
+    impl InterleavedPool {
+        const CHUNKS_PER_SEGMENT: u64 = 4;
+
+        fn used_chunks(&self) -> u64 {
+            let idle = IDLE.lock().unwrap();
+            let held = |owner: &ProcessId| idle.iter().any(|(o, _, _)| o == owner);
+            self.chunks
+                .iter()
+                .filter(|pages| pages.iter().any(held))
+                .count() as u64
+        }
+    }
+
+    impl crate::governor::PoolTarget for InterleavedPool {
+        fn segment_bytes(&self) -> u64 {
+            2 * PAGE * Self::CHUNKS_PER_SEGMENT
+        }
+        fn floor(&self) -> u64 {
+            self.segment_bytes()
+        }
+        fn hard_limit(&self) -> u64 {
+            self.chunks.len() as u64 / Self::CHUNKS_PER_SEGMENT * self.segment_bytes()
+        }
+        fn held(&self) -> u64 {
+            self.mapped * self.segment_bytes()
+        }
+        fn growth(&self) -> crate::governor::Growth {
+            crate::governor::Growth::Elastic
+        }
+        fn retarget(&mut self, segments: u64) -> crate::governor::Retarget {
+            let least = self.used_chunks().div_ceil(Self::CHUNKS_PER_SEGMENT);
+            self.mapped = self.mapped.min(segments.max(least));
+            if self.mapped <= segments {
+                crate::governor::Retarget::Reached
+            } else {
+                crate::governor::Retarget::NoRoom { held: self.mapped }
+            }
+        }
+    }
+
+    /// Yield 1 after a burst, no worker policy: the finished processes'
+    /// cached working sets fill the pool, their pages interleaved, and the
+    /// system's pressure brings the target under what the pool maps. The
+    /// governor's tier pressure reaches the port's default responder, which
+    /// discards idle cache lowest retention key first, then least recently
+    /// used; one round's discards free pages inside chunks other sets still
+    /// use and no segment, so the shortfall stands, the governor says it
+    /// again on its next turn, and the responder looks again until the pool
+    /// can give the segments back. A live process's working set is never
+    /// chosen, and idle cache keyed higher goes last.
+    #[test]
+    fn device_pressure_with_no_policy_sheds_idle_cache_until_the_pool_reaches() {
+        use crate::governor::run::Steer;
+        use crate::governor::{PoolTarget, Retarget, Signal, Yield, steered};
+
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        const SETS: usize = 7;
+        const PAGES: usize = 4;
+        let mut port = idle_port();
+        let live = ProcessId::new_v4();
+        port.apply(Event::Arrived(
+            live,
+            crate::policy::Arrival {
+                tenant: "t".into(),
+                session: None,
+                props: Props::default(),
+            },
+        ));
+        let idle: Vec<ProcessId> = (0..SETS).map(|_| ProcessId::new_v4()).collect();
+        // The burst: each set kept four pages; the lower its index, the
+        // longer ago it was last used. The live process's set holds pages
+        // too, last used longest ago of all.
+        {
+            let mut cached = IDLE.lock().unwrap();
+            cached.clear();
+            cached.extend(
+                idle.iter()
+                    .enumerate()
+                    .map(|(at, &owner)| (owner, PAGES as u64, 1000 - 100 * at as u64)),
+            );
+            cached.push((schedule::plex_id(live), PAGES as u64, 5000));
+        }
+        SHED.lock().unwrap().clear();
+        // A policy keyed the oldest set above the others: it goes last.
+        let kept = idle[0];
+        let keys = move |owner: Option<ProcessId>| i64::from(owner == Some(kept)) * 5;
+
+        // Pages laid as the burst decoded them: page `i` of every set, the
+        // live one's included, before page `i + 1` of any, in an order that
+        // pairs the least recently used sets with later ones.
+        let row = [
+            idle[1],
+            idle[3],
+            idle[2],
+            idle[4],
+            idle[5],
+            idle[6],
+            idle[0],
+            schedule::plex_id(live),
+        ];
+        let laid: Vec<ProcessId> = (0..PAGES).flat_map(|_| row).collect();
+        let chunks: Vec<[ProcessId; 2]> = laid.chunks(2).map(|pair| [pair[0], pair[1]]).collect();
+        let mut pool = InterleavedPool {
+            mapped: chunks.len() as u64 / InterleavedPool::CHUNKS_PER_SEGMENT,
+            chunks,
+        };
+        assert_eq!(pool.mapped, 4, "the burst fills the pool");
+        let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap());
+        let total = pool.hard_limit();
+
+        // Pressure 0.6 at yield 1 brings the target to three segments of
+        // the four mapped: 8 MiB short, two sets' worth. The first round
+        // discards the two least recently used, whose pages share every
+        // chunk with sets still kept: no chunk comes free, the pool maps
+        // what it did, and the shortfall stands.
+        let mut rounds = 0;
+        let mut shed_per_round = Vec::new();
+        let answer = loop {
+            rounds += 1;
+            assert!(rounds <= 8, "the pool never reached its target");
+            let mut signals = Vec::new();
+            let turn = steer.turn(&mut pool, 0.6, &mut |signal| signals.push(signal));
+            assert_eq!(turn.segments, 3);
+            if turn.answer == Retarget::Reached {
+                break turn.answer;
+            }
+            assert!(
+                matches!(turn.answer, Retarget::NoRoom { .. }),
+                "{:?}",
+                turn.answer
+            );
+            let [signal @ Signal::TierPressure { .. }] = signals[..] else {
+                panic!("a standing shortfall is said every turn: {signals:?}");
+            };
+            press(&mut port, steered::short_bytes(signal), total);
+            let before = SHED.lock().unwrap().len();
+            let discarded = port.pressure_round(&keys);
+            assert!(!discarded.is_empty(), "idle cache is left to discard");
+            shed_per_round.push(SHED.lock().unwrap().len() - before);
+        };
+        assert_eq!(answer, Retarget::Reached);
+        assert!(pool.mapped <= 3);
+        assert_eq!(
+            shed_per_round,
+            [2, 2],
+            "one round's discards freed no segment, and the responder looked again"
+        );
+
+        // Floor-keyed idle cache least recently used first; the set keyed
+        // above it after every floor-keyed one; the live process's never.
+        let shed = SHED.lock().unwrap().clone();
+        assert_eq!(shed, idle[1..5], "floor-keyed, least recently used first");
+        assert!(
+            !shed.contains(&schedule::plex_id(live)),
+            "a live working set is never chosen"
+        );
+        assert!(
+            !shed.contains(&kept),
+            "keyed above the floor, it outlasts them"
+        );
+        IDLE.lock().unwrap().clear();
+        SHED.lock().unwrap().clear();
     }
 }

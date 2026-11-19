@@ -175,6 +175,7 @@ fn serve(
                 &rings,
                 &scratch,
                 &pair,
+                0,
             )
             .expect("the device-geometry instance binds");
         let lane = Seated {

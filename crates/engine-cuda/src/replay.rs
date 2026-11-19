@@ -63,6 +63,16 @@ impl Replay {
     /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way.
     /// A lane whose list table is a translation (its program places its rows, device
     /// geometry) is never cut.
+    /// The lanes of `step` [`Self::split`] cuts, in order: the split's
+    /// head lane `i` is lane `cut_lanes[i]` of the step.
+    #[must_use]
+    pub fn cut_lanes(self, step: &Step, plain: impl Fn(u64) -> bool) -> Vec<u32> {
+        (0..step.lanes.len())
+            .filter(|&at| self.cuts(step, at, &plain))
+            .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
+            .collect()
+    }
+
     #[must_use]
     pub fn split(self, step: &Step, plain: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;

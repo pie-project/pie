@@ -991,7 +991,6 @@ impl FireCtx<'_> {
                     ceilings,
                     islands: &p.islands,
                     rs: p.rs.body,
-                    group_mask: !p.group_masks.is_empty(),
                 };
 
                 // A serving fire replays a body or is counted: one that
@@ -1227,7 +1226,8 @@ impl FireCtx<'_> {
                         out,
                         &plane_of,
                         &storage_of,
-                        &rows_of(at, out.decl.readout),
+                        &|lane| rows_of(lane, out.decl.readout),
+                        attached.lane as usize + attached.lanes as usize,
                         lane_row[at],
                         first_voxel(index, at),
                     )?;
@@ -1280,7 +1280,10 @@ impl FireCtx<'_> {
     /// Points instance `instance`'s reads of `out` for its lane `k` (the
     /// fire's lane `at`) at where the fire wrote it: a readout output at the
     /// rows the lane reads out, a lane output at the lane's row (a layer
-    /// after another), a row or voxel output from the lane's first.
+    /// after another), a row or voxel output from the lane's first. The seat
+    /// holds the lane's own rows and those of the instance's later lanes
+    /// (up to the fire's lane `end`) that lie right after them: a lane read
+    /// past them reads its next lane's rows, never another instance's.
     #[allow(clippy::too_many_arguments)]
     fn bind_output(
         &mut self,
@@ -1291,7 +1294,8 @@ impl FireCtx<'_> {
         out: &poem_exec::feeds::ClassOutput,
         plane_of: &dyn Fn(poem_ir::ValueId, &str) -> Result<kernels_cuda::Tensor>,
         storage_of: &dyn Fn(Dtype) -> Result<u32>,
-        rows: &[u32],
+        rows_of: &dyn Fn(usize) -> Vec<u32>,
+        end: usize,
         lane_row: u32,
         first_voxel: u32,
     ) -> Result<()> {
@@ -1324,11 +1328,36 @@ impl FireCtx<'_> {
                 width,
                 width,
                 0,
+                1,
             );
         }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;
+        // The fire's rows of lane `lane`: its token rows and its voxels.
+        let lane_rows = |lane: usize| {
+            p.composition
+                .lanes()
+                .iter()
+                .find(|row| row.source as usize == lane)
+                .copied()
+                .unwrap_or_default()
+        };
+        let own = lane_rows(at);
+        // A run of `(first, count)` from lane `at`'s, grown by each later
+        // lane of the instance whose run starts where it ends.
+        let held = |run: &dyn Fn(usize) -> Option<(u32, u32)>| -> u32 {
+            let Some((first, mut count)) = run(at) else {
+                return 0;
+            };
+            for lane in at + 1..end {
+                match run(lane) {
+                    Some((next, more)) if next == first.saturating_add(count) => count += more,
+                    _ => break,
+                }
+            }
+            count
+        };
         match out.decl.axis {
             poem_ir::InputAxis::Lane => {
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
@@ -1360,6 +1389,7 @@ impl FireCtx<'_> {
                     width,
                     stride,
                     0,
+                    u32::try_from(out.values.len()).unwrap_or(u32::MAX),
                 )
             }
             // A row output read whole from the lane's first token row where
@@ -1371,35 +1401,51 @@ impl FireCtx<'_> {
                         .and_then(|seated| seated.readout)
                         .is_none_or(<[u32]>::is_empty) =>
             {
-                let first = p
-                    .composition
-                    .lanes()
-                    .iter()
-                    .find(|row| row.source as usize == at)
-                    .map_or(0, |row| row.row_offset);
-                self.programs
-                    .bind_output(instance, name, k, plane.ptr, storage, width, width, first)
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    plane.ptr,
+                    storage,
+                    width,
+                    width,
+                    own.row_offset,
+                    held(&|lane| {
+                        let row = lane_rows(lane);
+                        Some((row.row_offset, row.rows))
+                    }),
+                )
             }
             // A row output's rows, gathered or the lane's own token rows
             // (`rows`, as its readout names them).
             poem_ir::InputAxis::Row => {
-                let wanted: Vec<u32> = match p.lanes.get(at).and_then(|seated| seated.readout) {
-                    None | Some([]) => rows.last().copied().into_iter().collect(),
-                    Some(stated) => {
-                        if stated.len() > rows.len() {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: stated.len() as u64,
-                                have: rows.len() as u64,
-                            });
+                let wanted_of = |lane: usize| -> Result<Vec<u32>> {
+                    let rows = rows_of(lane);
+                    match p.lanes.get(lane).and_then(|seated| seated.readout) {
+                        None | Some([]) => Ok(rows.last().copied().into_iter().collect()),
+                        Some(stated) => {
+                            if stated.len() > rows.len() {
+                                return Err(Fault::Ceiling {
+                                    what: "rows in the lane a readout names",
+                                    need: stated.len() as u64,
+                                    have: rows.len() as u64,
+                                });
+                            }
+                            Ok(rows[..stated.len()].to_vec())
                         }
-                        rows[..stated.len()].to_vec()
                     }
                 };
-                let consecutive = wanted
-                    .windows(2)
-                    .all(|pair| pair[1] == pair[0].wrapping_add(1));
-                if consecutive {
+                let consecutive = |rows: &[u32]| {
+                    rows.windows(2)
+                        .all(|pair| pair[1] == pair[0].wrapping_add(1))
+                };
+                let wanted = wanted_of(at)?;
+                if consecutive(&wanted) {
+                    let run = |lane: usize| {
+                        let rows = wanted_of(lane).ok()?;
+                        (consecutive(&rows) && !rows.is_empty())
+                            .then(|| (rows[0], u32::try_from(rows.len()).unwrap_or(u32::MAX)))
+                    };
                     return self.programs.bind_output(
                         instance,
                         name,
@@ -1409,6 +1455,7 @@ impl FireCtx<'_> {
                         width,
                         width,
                         wanted.first().copied().unwrap_or(0),
+                        held(&run),
                     );
                 }
                 if plane.dtype != Dtype::Bf16 {
@@ -1439,6 +1486,7 @@ impl FireCtx<'_> {
                     width,
                     width,
                     0,
+                    u32::try_from(wanted.len()).unwrap_or(u32::MAX),
                 )
             }
             poem_ir::InputAxis::Voxel => self.programs.bind_output(
@@ -1450,6 +1498,10 @@ impl FireCtx<'_> {
                 width,
                 width,
                 first_voxel,
+                held(&|lane| {
+                    let row = lane_rows(lane);
+                    Some((row.voxel_offset, row.voxels))
+                }),
             ),
         }
     }

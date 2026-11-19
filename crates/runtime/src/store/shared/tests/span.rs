@@ -9,7 +9,7 @@
 //! activation 52..64.
 
 use super::*;
-use crate::governor::{PATIENCE, PoolTarget};
+use crate::governor::PoolTarget;
 use crate::store::shared::programs::{Mover, carry_raise, take_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
@@ -475,10 +475,11 @@ fn fine_on_demand() -> (SharedPool, FakeEngine) {
 
 /// Mac's footprint at rest: on an on-demand pool with one live lane, a
 /// 5-token pass raises the rung to the smallest that covers it (8), not to
-/// the engine's whole lane count; idle again, the pool comes back down
-/// after the governor's patience, the carve held costing resident memory.
+/// the engine's whole lane count; idle again, the pool stays up while
+/// nothing is short, and comes back down once a waiter needs the chunks the
+/// carve holds.
 #[tokio::test(flavor = "current_thread")]
-async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_after_patience() {
+async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_once_needed() {
     const ENGINE: usize = 54;
     let (mut pool, mut engine) = fine_on_demand();
     pool.set_max_lanes(512);
@@ -521,16 +522,15 @@ async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_aft
     );
     assert_eq!(fire_cap(ENGINE), 8);
 
-    // The pass is through: the pool stays up until the patience is out.
+    // The pass is through: the pool stays up while nothing is short.
     drop(want);
-    for _ in 0..PATIENCE {
-        grow.ticked_for_test();
+    for _ in 0..64 {
         grow.walk_rung().await;
         assert_eq!(fire_cap(ENGINE), 8);
     }
-    grow.ticked_for_test();
+    shared.lock().unwrap().pool_mut().wait(1, 0, 1);
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut back");
+    assert_eq!(fire_cap(ENGINE), 1, "a waiter is short: fires cut back");
     grant_rung(ENGINE, 1);
     grow.walk_rung().await;
     grow.walk_rung().await;
@@ -555,8 +555,9 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 200);
     assert_eq!(fire_cap(ENGINE), u32::MAX);
-    for _ in 0..3 * PATIENCE {
-        grow.ticked_for_test();
+    // A waiter short of a slot: the walk lowers as far as it may.
+    shared.lock().unwrap().pool_mut().wait(1, 0, 1);
+    for _ in 0..6 {
         grant_rung(ENGINE, fire_cap(ENGINE));
         grow.walk_rung().await;
         assert!(fire_cap(ENGINE) >= 200, "a 200-lane decode is never cut");
@@ -566,6 +567,7 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
         256,
         "down to the live lanes' rung"
     );
+    shared.lock().unwrap().pool_mut().unwait(1);
     // The batch of every live lane asks: nothing to raise, nothing held.
     raise_now(&shared, ENGINE, 200);
     assert_eq!(fire_cap(ENGINE), 256);

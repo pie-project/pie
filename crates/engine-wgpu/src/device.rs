@@ -5,6 +5,8 @@ pub mod ctx;
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 pub mod host;
 #[cfg(feature = "wgpu")]
+pub mod memory;
+#[cfg(feature = "wgpu")]
 pub mod pipelines;
 
 #[cfg(feature = "wgpu")]

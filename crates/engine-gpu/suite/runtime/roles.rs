@@ -131,6 +131,7 @@ impl Bound {
                     lanes: 1,
                     instance: self.instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
@@ -167,7 +168,7 @@ impl Bound {
 
 #[test]
 fn an_instance_in_pool_slots_fires_through_moves() {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
@@ -218,7 +219,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 host_kv_budget: Some(64 << 20),
                 ..Residency::default()
             },
@@ -338,6 +339,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &registered,
     );
@@ -460,6 +462,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             adapter: Vec::new(),
             scratch: binding.scratch.clone(),
             pair: binding.pair.clone(),
+            pair_generation: binding.pair_generation,
         })
         .expect("the slots rebind");
     // The stale pass kept its ids where the cell no longer is: `seen` reads
@@ -548,6 +551,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             // chunks hold for it (`guest_state` moves it to fresh room).
             scratch: binding.scratch.clone(),
             pair: binding.pair.clone(),
+            pair_generation: binding.pair_generation,
         })
         .expect("the unparked slots rebind");
     last = before;
@@ -557,7 +561,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         bound
             .engine
             .live()
-            .tallied(engine::live::Tally::BuiltAfterReady),
+            .tallied(engine::live::Tally::BuiltInFire),
         0,
         "a fire through pool slots and their moves built a pipeline the load did not"
     );

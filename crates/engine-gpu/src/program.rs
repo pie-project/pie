@@ -20,6 +20,16 @@ pub struct Place<'a, B: Serve> {
     pub device: &'a B::Context,
     pub pools: &'a Pools<B>,
     pub align: u64,
+    /// The buffers a guest pass reads a fire's outputs from: each arm's
+    /// readout and pixel seats, as the load made them.
+    pub seats: Vec<&'a B::Buffer>,
+    /// The most lanes a fire carries, and the planes it reads out (readout
+    /// and pixel): a pass reads at most one row of each plane per lane.
+    pub max_lanes: u32,
+    pub planes: u32,
+    /// The backend's state of the load, holding what its shelf reserved
+    /// for the plane before the pool was sized.
+    pub shelf: &'a B::Shelf,
 }
 
 #[derive(Debug)]

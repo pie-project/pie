@@ -237,6 +237,7 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
                 rings: slots.1,
                 scratch,
                 pair,
+                pair_generation: 0,
             },
         )
         .expect("the reader binds");

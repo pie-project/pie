@@ -107,6 +107,11 @@ pub struct DecodePlan {
     pub workspace: Workspace,
     pub shape: Shape,
     pub window: Option<u32>,
+    /// Each request's byte offset into the fire's masks and its word, as
+    /// [`PrefillPlan::mask_indptr`] and [`PrefillPlan::mask_origin`]: the
+    /// engine binds them where the decode reads the masks.
+    pub mask_indptr: Option<Tensor>,
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -397,6 +402,8 @@ pub fn plan_decode(
         workspace,
         shape,
         window,
+        mask_indptr: None,
+        mask_origin: None,
         device: *device,
     })
 }

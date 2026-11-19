@@ -38,8 +38,6 @@ pub struct Fire<'a> {
     pub islands: &'a [u8],
     /// [`BodyKey::rs`] as prepared for this fire.
     pub rs: RsBody,
-    /// [`BodyKey::group_mask`] as prepared for this fire.
-    pub group_mask: bool,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -442,13 +440,10 @@ pub struct BodyKey {
     /// a whole one at the same bucket and classes, and a body is only
     /// replayable for the admissibility it was recorded under.
     pub islands: Box<[u8]>,
-    /// How the fire's lanes treat their recurrent rows.
+    /// How the fire's lanes treat their recurrent rows. (A lane's attention
+    /// mask, a group's too, is no part of the key: it is data each fire
+    /// stages and one body reads.)
     pub rs: RsBody,
-    /// Whether the fire's ragged attentions read a group mask: the body's
-    /// kernels are the custom-mask arm, reading the mask staged for each
-    /// fire at the addresses the load laid (`Inputs::stage_group_masks`). A
-    /// body captured without one ignores any mask a fire states.
-    pub group_mask: bool,
 }
 
 impl BodyKey {
@@ -467,7 +462,6 @@ impl BodyKey {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
-            group_mask: false,
         }
     }
 
@@ -486,7 +480,6 @@ impl BodyKey {
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
             islands: Box::default(),
             rs: RsBody::Folds,
-            group_mask: false,
         }
     }
 
@@ -494,14 +487,6 @@ impl BodyKey {
     #[must_use]
     pub fn with_rs(mut self, rs: RsBody) -> BodyKey {
         self.rs = rs;
-        self
-    }
-
-    /// The same key, for a fire whose ragged attentions read a group mask
-    /// or not.
-    #[must_use]
-    pub fn with_group_mask(mut self, group_mask: bool) -> BodyKey {
-        self.group_mask = group_mask;
         self
     }
 
@@ -626,9 +611,6 @@ impl core::fmt::Display for BodyKey {
             RsBody::Folds => {}
             RsBody::Buffers => f.write_str("~rs")?,
             RsBody::Replays => f.write_str("~rsx")?,
-        }
-        if self.group_mask {
-            f.write_str("~gm")?;
         }
         Ok(())
     }
@@ -907,6 +889,13 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// Whether the load's arming sealed the bodies: from then on a fire is
+    /// a serving one.
+    #[must_use]
+    pub fn bodies_sealed(&self) -> bool {
+        self.map.sealed()
+    }
+
     /// Drops every recorded body and what was refused, unsealed: what the
     /// bodies captured (a kernel chosen for where a weight lay) no longer
     /// holds, and the lattice is armed again.
@@ -952,7 +941,6 @@ impl Bodies {
         );
         key.islands = at.islands.into();
         key.rs = at.rs;
-        key.group_mask = at.group_mask;
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
@@ -1570,7 +1558,6 @@ mod tests {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
-            group_mask: false,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1582,7 +1569,6 @@ mod tests {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
-            group_mask: false,
         }
     }
 

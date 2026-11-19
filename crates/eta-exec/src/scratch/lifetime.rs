@@ -12,7 +12,10 @@ use super::{
 };
 use crate::extent::{Extents, Unresolvable, ValueDesc, describe};
 
-/// Nodes of a stage an engine runs together.
+/// Nodes of a stage an engine runs together. A node may lie in several
+/// launches (a reduction whose partial pass and final pass are dispatched
+/// apart): its result is written from the first and holds through the last,
+/// and it reads its arguments through the last.
 #[derive(Clone, Debug)]
 pub struct Launch<'a> {
     /// Its nodes, in the order it runs them.
@@ -97,14 +100,22 @@ pub struct Launches<'a> {
 pub fn value_lifetimes(plan: &LaunchStagePlan, run: &Launches<'_>) -> Option<Vec<Lifetime>> {
     let mut step_of = vec![u32::MAX; plan.ops.len()];
     let mut launch_of = vec![u32::MAX; plan.ops.len()];
+    let mut first_step_of = vec![u32::MAX; plan.ops.len()];
+    let mut first_launch_of = vec![u32::MAX; plan.ops.len()];
     let mut launch_first = Vec::with_capacity(run.each.len());
     let mut launch_last = Vec::with_capacity(run.each.len());
     let mut step = 0u32;
     for (index, launch) in run.each.iter().enumerate() {
         launch_first.push(step);
         for &node in launch.nodes {
-            *step_of.get_mut(node as usize)? = step;
-            *launch_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
+            let index = u32::try_from(index).ok()?;
+            let first = first_step_of.get_mut(node as usize)?;
+            if *first == u32::MAX {
+                *first = step;
+                first_launch_of[node as usize] = index;
+            }
+            step_of[node as usize] = step;
+            launch_of[node as usize] = index;
             if launch.stepwise {
                 step = step.checked_add(1)?;
             }
@@ -202,10 +213,10 @@ pub fn value_lifetimes(plan: &LaunchStagePlan, run: &Launches<'_>) -> Option<Vec
         if launched {
             for result in 0..u32::from(op.result_count) {
                 if let Some(life) = lifetimes.get_mut((result_base + result) as usize) {
-                    life.def = step;
+                    life.def = first_step_of[node];
                     life.last = life.last.max(step);
                     life.reusable = written_in_full;
-                    life.launch_def = launch_of[node];
+                    life.launch_def = first_launch_of[node];
                 }
             }
         }

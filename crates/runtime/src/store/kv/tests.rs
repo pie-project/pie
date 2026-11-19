@@ -78,6 +78,7 @@ fn tests_every_case() {
     a_working_set_that_goes_leaves_its_sealed_prefix();
     a_working_set_maps_in_what_another_sealed();
     a_pass_maps_in_more_after_what_it_mapped_in();
+    a_prefix_computed_twice_maps_whole_from_either_copy();
     a_page_no_one_else_reads_is_written_in_place();
     a_lookup_takes_the_copy_on_the_device();
     what_a_decode_folds_seals();
@@ -94,6 +95,7 @@ fn tests_every_case() {
     on_the_host_the_lower_set_goes_first();
     a_demand_may_always_demote_its_own_cache();
     floor_keyed_idle_cache_is_dropped_not_demoted();
+    a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
@@ -1858,6 +1860,39 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     );
 }
 
+/// How long idle cache is kept is the policy's (KEEP_CACHE moved to PLEX):
+/// a key above the floor keeps it from a reclaim the runtime runs unasked,
+/// and once the policy lowers the key (its keep over, on its alarm) the next
+/// demand reclaims it. With no policy, idle cache has no expiry: it stays
+/// whatever time passes, and only a demand for its room (the planner's
+/// reclaim) takes it, lowest key then least recently used first.
+fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new(8, h(43));
+    let (kept, unkept) = (ProcessId::from_u128(47), ProcessId::from_u128(48));
+    let kept_tokens = kept_and_gone(&mut store, 22, 3, kept);
+    let unkept_tokens = kept_and_gone(&mut store, 23, 3, unkept);
+    // No demand: nothing is reclaimed, however long the cache sits.
+    for _ in 0..1000 {
+        store.retire_idle();
+    }
+    assert_eq!(on_device(&mut store, &kept_tokens), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 3);
+    // The policy keeps one: a demand reclaims only the other.
+    let keep = move |owner: Option<ProcessId>| {
+        if owner == Some(kept) { FLOOR + 1 } else { FLOOR }
+    };
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "unkept: reclaimed");
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the keep is honoured");
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
+    // The keep is over: the policy lowers the key, and the next demand
+    // reclaims it.
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), |_| FLOOR), 3);
+    assert_eq!(on_device(&mut store, &kept_tokens), 0);
+}
+
 /// Idle cache dropped while fires are in flight goes back once the fires
 /// that could read it have retired, not after every fire handed out since:
 /// what a set last read before the fires in flight began is free at once,
@@ -1958,4 +1993,45 @@ fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
         "and the waiter, looked up again, finds none"
     );
     crate::store::waiting::left(waiter);
+}
+
+/// Passes that raced each computed a prompt's first page; a later prompt
+/// computed its second page on one of those copies. Whichever copy of the
+/// first page the lookup takes, the prompt maps whole: the path to its
+/// second page holds the same keys.
+fn a_prefix_computed_twice_maps_whole_from_either_copy() {
+    let mut store = KvStore::new(64, h(27));
+    store.set_keeps(true);
+    let prompt = |tail: u32| -> Vec<u32> {
+        (0..16)
+            .map(|t| 2000 + t)
+            .chain((0..17).map(|t| tail * 100 + t))
+            .collect()
+    };
+    let computed = |store: &mut KvStore, tail: u32| {
+        let ws = store.create_working_set();
+        commit_opaque(store, ws, 3);
+        seal(store, ws, 0, &prompt(tail));
+    };
+    let look = |store: &mut KvStore, tail: u32| {
+        let ws = store.create_working_set();
+        let keys = keys_ahead(store, ws, 0, &prompt(tail));
+        let run = store.cached_run(&keys);
+        let mapped = store.attach_run(ws, &run, 2).unwrap();
+        (ws, run.len(), mapped)
+    };
+    computed(&mut store, 1);
+    computed(&mut store, 2);
+    let (ws, found, mapped) = look(&mut store, 3);
+    assert_eq!((found, mapped), (1, 1), "the shared page, from one copy");
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 16, &prompt(3)[16..]);
+    // Another pass computes the shared page again: the newest copy is the
+    // one a lookup of the first page takes.
+    computed(&mut store, 4);
+    let (ws, found, mapped) = look(&mut store, 3);
+    assert_eq!((found, mapped), (2, 2), "the whole prompt, on its path");
+    let theirs = store.flat_table(ws).unwrap().to_vec();
+    let (again, _, _) = look(&mut store, 3);
+    assert_eq!(store.flat_table(again).unwrap(), theirs.as_slice());
 }

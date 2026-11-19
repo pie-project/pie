@@ -345,8 +345,8 @@ mod tests {
         assert!(by_key("engine.max_context").default.is_none());
         assert!(by_key("engine.memory.budget_device").default.is_none());
         assert_eq!(
-            by_key("engine.memory.governor_backoff").default,
-            Some(toml::Value::Float(1.0))
+            by_key("engine.memory.yield").default,
+            Some(toml::Value::Float(0.0))
         );
         assert_eq!(
             by_key("server.listen").default,

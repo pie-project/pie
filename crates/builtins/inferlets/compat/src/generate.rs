@@ -51,6 +51,7 @@ pub struct Sampling {
     pub top_p: f32,
     /// 0 means off.
     pub top_k: u32,
+    /// Drawn fresh from the host's entropy for every request that names none.
     pub seed: u32,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
@@ -124,7 +125,7 @@ impl Default for Sampling {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
-            seed: 0x51ed,
+            seed: fresh_seed(),
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,
@@ -133,6 +134,22 @@ impl Default for Sampling {
             prompt_logprobs: None,
         }
     }
+}
+
+/// A seed for a request that names none: drawn fresh from the host's
+/// entropy each time, so unseeded requests sample independently and only an
+/// explicit seed reproduces. `RandomState` keys from the OS random source
+/// (WASI `random` in a guest); the counter keeps draws within one instance
+/// distinct.
+fn fresh_seed() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(DRAWN.fetch_add(1, Ordering::Relaxed));
+    let x = hasher.finish();
+    (x as u32) ^ ((x >> 32) as u32)
 }
 
 impl Sampling {
@@ -685,6 +702,24 @@ mod tests {
         let rows = prompt_rows(&[-1.0], &[3.0], &[], &[], 0);
         assert_eq!(rows[0].top, Vec::new());
         assert_eq!(rows[0].rank, Some(3));
+    }
+
+    #[test]
+    fn unseeded_requests_draw_distinct_seeds() {
+        let seeds: std::collections::HashSet<u32> =
+            (0..64).map(|_| Sampling::default().seed).collect();
+        assert!(seeds.len() > 60, "{} distinct of 64", seeds.len());
+    }
+
+    #[test]
+    fn an_explicit_seed_reproduces() {
+        let (mut a, mut b) = (Sampling::default(), Sampling::default());
+        a.set_seed(42);
+        b.set_seed(42);
+        assert_eq!(a.seed, b.seed);
+        a.set_seed(-7);
+        b.set_seed(-7);
+        assert_eq!(a.seed, b.seed);
     }
 
     #[test]

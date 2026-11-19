@@ -17,7 +17,13 @@
 #if !defined(PIE_VROWS)
 #define PIE_VROWS 4u
 #endif
-#if PIE_BITS == 2
+// A lane holds its rows' activations for one chunk, `PIE_VROWS` x
+// `PIE_CHUNK_CODES` floats, and never more than 128 of them: past that the
+// Adreno 840's compiler lands wrong values (eight rows of 32 codes read back
+// half zeros), so eight rows walk 16-code chunks.
+#if PIE_VROWS == 8
+#define PIE_CHUNK_WORDS (uint(PIE_BITS) / 2u)
+#elif PIE_BITS == 2
 #define PIE_CHUNK_WORDS 2u
 #else
 #define PIE_CHUNK_WORDS 4u

@@ -82,14 +82,30 @@ pub enum Fault {
         lane: u32,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
         word: u64,
-        runs_masked_arm: bool,
     },
 
     Adapterless {
         lane: u32,
+    },
+
+    /// A row the lane's program places lands outside the slots the lane may
+    /// write (`engine::fire::misplaced_write`): refused before any of it runs.
+    KvWrite {
+        lane: u32,
+        why: String,
+    },
+
+    /// A device-geometry program's `embed_indptr` port describes more lanes
+    /// than its attachment spans: its ports would state the next lanes'
+    /// positions and slots. Every lane of the attachment is refused, before
+    /// any of it is written.
+    Overreach {
+        instance: engine::InstanceId,
+        lanes: std::ops::Range<u32>,
+        carried: usize,
     },
 
     AdapterWord {
@@ -159,6 +175,41 @@ pub enum Fault {
         key: String,
         why: String,
     },
+}
+
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskUnread { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::KvWrite { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. }
+            | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
+    }
 }
 
 impl fmt::Display for Fault {
@@ -251,28 +302,24 @@ impl fmt::Display for Fault {
                  to reach, nor a ragged attention whose text states a lane's mask \
                  (`stated_group_mask()`)"
             ),
-            Self::MaskWord {
-                lane,
-                word,
-                runs_masked_arm,
-            } => {
-                if *runs_masked_arm {
-                    write!(
-                        f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs \
-                         `attention.masked`, and it carries no mask for that arm to \
-                         read; a fire-wide mask on a per-lane axis is design \u{00A7}0's \
-                         collapse, and this is where it stops"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "lane {lane} carries an explicit attention mask and its word \
-                         {word:#x} puts it in a class that runs the causal arm, so the \
-                         mask would be staged and never read"
-                    )
-                }
-            }
+            Self::MaskUnread { lane, word } => write!(
+                f,
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in, so the mask would be staged and never \
+                 read: here `attn.decode`, a selection's and a bias's arms read no per-lane mask"
+            ),
+            Self::KvWrite { lane, why } => write!(f, "lane {lane} refused: {why}"),
+            Self::Overreach {
+                instance,
+                lanes,
+                carried,
+            } => write!(
+                f,
+                "instance {instance} is attached over lanes {}..{} and its `embed_indptr` port \
+                 describes {carried} lane(s): a program's ports state its own lanes' geometry, \
+                 never the next request's",
+                lanes.start, lanes.end
+            ),
             Self::Adapterless { lane } => write!(
                 f,
                 "lane {lane} routes to an adapter bank and this load's artifact bakes \

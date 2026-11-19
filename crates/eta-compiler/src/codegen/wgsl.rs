@@ -365,10 +365,18 @@ pub struct Stepwise {
 /// 1: every step a call of the closed set, reading its node, rung and
 /// selector from a uniform; before, each stage one module with its nodes
 /// spelled in.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 2;
+/// 3: every heap, descriptor, offset and op-param access is bounded by its
+/// stage's cfg (the heap's words, its values, its ops), indices read from
+/// the heap by their own bounds, and a refused access writes the runtimes'
+/// fault status (state 3, `OUT_OF_BOUNDS`, the index, the limit).
+/// 4: a step reads its tables, status and heap at the bases its record
+/// states, in the two pool segments a backend binds whole (the instance's
+/// slots, its heap), and its config from its config table: one bind group
+/// serves every instance whose slots and heap share two segments.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 4;
 
-/// The binding of the uniform a step module reads its node, rung and
-/// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
+/// The binding of the record a step module reads its node, rung, selector
+/// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
 /// backend binds each step's at its own dynamic offset.
 pub const STEP_BINDING: u32 = 6;
 
@@ -481,9 +489,11 @@ pub fn step_module(entry: &str, call: &str) -> String {
     let mut source = String::with_capacity(RUNTIME.len() + 1024);
     source.push_str(RUNTIME);
     source.push('\n');
-    // The words at `steps::NODE_AT`, `RUNG_AT` and `SELECTOR_AT`.
+    // The words [`StepUniform::bytes`] lays.
     source.push_str(
-        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n}\n",
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n  \
+         status_base : u32,\n  descs_base : u32,\n  params_base : u32,\n  offs_base : u32,\n  \
+         cfg_base : u32,\n  heap_base : u32,\n  pad1 : u32,\n  pad2 : u32,\n}\n",
     );
     let _ = writeln!(
         source,
@@ -519,8 +529,17 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
+    // The step's bases, its heap bound ([`RUNTIME`]'s `hld` / `hst`) and
+    // its temporaries' first word, read once.
+    source.push_str(
+        "  b_status = pie_step.status_base;\n  b_descs = pie_step.descs_base;\n  \
+         b_params = pie_step.params_base;\n  b_offs = pie_step.offs_base;\n  \
+         b_heap = pie_step.heap_base;\n  \
+         lim_heap = tables[pie_step.cfg_base + CFG_HEAP_WORDS];\n  \
+         cfg_temporary = tables[pie_step.cfg_base + CFG_TEMPORARY];\n",
+    );
     source.push_str(call);
-    source.push_str("}\n");
+    source.push_str("  heap_flush();\n}\n");
 }
 
 /// `plan`'s launches as steps of the closed set; a node no call serves is
@@ -1018,17 +1037,17 @@ mod stepwise_tests {
     fn the_runtimes_temporaries_lie_within_the_whole_value_rule() {
         assert!(super::TEMPORARY_NEEDS.is_empty());
         for cell in [
-            "return cfg.temporary + ((buf * n) + c) * 2u;",
-            "return cfg.temporary + (buf * span + row * stride + c) * 2u;",
-            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }",
-            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }",
-            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }",
-            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }",
-            "fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }",
+            "return cfg_temporary + ((buf * n) + c) * 2u;",
+            "return cfg_temporary + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }",
         ] {
             assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
         }
-        let named = RUNTIME.matches("cfg.temporary").count();
+        let named = RUNTIME.matches("return cfg_temporary").count();
         assert_eq!(named, 7, "a temporary cell this statement has not read");
         assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
     }

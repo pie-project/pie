@@ -384,6 +384,8 @@ pub unsafe fn matmul(
         }
     };
     let Some(plan) = plan else {
+        // rocBLAS takes the product hipBLASLt has no algorithm for.
+        crate::tally::declined();
         return Ok(false);
     };
     if s.bias {

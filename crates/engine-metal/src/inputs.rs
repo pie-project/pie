@@ -675,6 +675,12 @@ impl Inputs {
     }
 
     /// The store, laid in the span ([`Region::place`]).
+    /// The token rows' seat: the buffer and its byte offset.
+    #[must_use]
+    pub fn tokens_seat(&self) -> (&Buffer, u64) {
+        (self.store.view(), self.store.at(self.tokens))
+    }
+
     pub fn store_mut(&mut self) -> &mut Region {
         &mut self.store
     }

@@ -60,6 +60,11 @@ pub enum Source {
     /// as the pool lays it (`crate::store::streamed`): a fire copies the
     /// routed experts in no slot from it into staging slots.
     HostBank { param: u32 },
+    /// Entry `index` of a readout program: a plane the fire's forward
+    /// returned beside its own (its final hidden rows), handed to the
+    /// program that reads its readout rows again
+    /// (`crate::rows::readout_slice`).
+    Entry { index: u16 },
 }
 
 impl Source {

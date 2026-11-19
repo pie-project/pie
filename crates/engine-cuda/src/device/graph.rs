@@ -259,6 +259,29 @@ impl Event {
         }
     }
 
+    /// An event a host thread waits on asleep (blocking sync), not spinning a
+    /// core: what a waiter that only ever waits takes.
+    pub fn blocking() -> Result<Event> {
+        #[cfg(feature = "device")]
+        {
+            use crate::device::rt;
+            let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
+            // SAFETY: `raw` is a live out-parameter and this thread bound the
+            // device. Flags: blocking sync (1) and no timing (2).
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaEventCreateWithFlags",
+                    rt::cudaEventCreateWithFlags(&raw mut raw, 3),
+                )?;
+            }
+            Ok(Event { raw: raw.cast() })
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
     pub fn done(&self) -> Result<bool> {
         #[cfg(feature = "device")]
         {

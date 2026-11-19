@@ -4,6 +4,10 @@ use crate::{Guard, Request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Builtin {
+    /// The lane states an attention mask. A model reads it only where its
+    /// own rows differ for such a lane; attention never parts lanes by it
+    /// (`attn.attend` reads each lane's mask as data, [`crate::RuntimeInput::Mask`]),
+    /// so a trace that does not read it gives it no bit and no class.
     Masked,
     Adapted,
     Media,

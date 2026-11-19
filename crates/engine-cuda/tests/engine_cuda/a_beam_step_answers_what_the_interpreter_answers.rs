@@ -7,7 +7,7 @@ use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
-use eta_compiler::contract::{Case, Seat, beam_stage};
+use eta_compiler::contract::{Binding, Case, Seat, beam_stage};
 use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::registry::GeometryClass;
@@ -68,6 +68,10 @@ fn fired(case: &Case, seats: &[Seat]) -> Result<Vec<Vec<u8>>, String> {
                 seat.width,
                 seat.row_stride,
                 seat.row_offset,
+                match case.binding {
+                    Binding::OneLane => case.rows,
+                    Binding::LaneARow => 1,
+                },
             )
             .expect("the logits bind");
     }

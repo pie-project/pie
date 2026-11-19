@@ -21,45 +21,9 @@ pub fn provenance(device: &str) -> (&'static str, String) {
     )
 }
 
-/// The bound the platform states on one GPU submission, which the rates
-/// step holds each of its frames (and its warm-up's cube) within, each at
-/// its estimate times the worst ratio of a frame's time to its estimate
-/// seen (`engine_gpu::rates`). On Android, KGSL's (Qualcomm's msm GPU
-/// driver, `qcom/opensource/graphics-kernel`, branch
-/// gfx-kernel.lnx.16.0.r15-rel, the android16 / 6.12 line):
-///
-/// - The one duration the driver states is `adreno_drawobj_timeout = 2000`
-///   ms (adreno_dispatch.c:51, "Command batch timeout (in milliseconds)"):
-///   the ringbuffer dispatcher's per-submission expiry (adreno_dispatch.c:
-///   2271, `drawqueue->expires = jiffies + msecs_to_jiffies(
-///   adreno_drawobj_timeout)`) and the preemption timer
-///   (adreno_gen8_preempt.c:55). Its fault-detect interval,
-///   `_fault_timer_interval = 200` ms (adreno_dispatch.c:54), only samples
-///   the GPU's progress registers on the ringbuffer dispatcher.
-/// - An Adreno 840 (gen8, `adreno_gpu_core_gen8_*`, adreno-gpulist.h) runs
-///   the hardware scheduler (`adreno_gen8_hwsched_gpudev`), not that
-///   dispatcher: there long-IB detection (`ft_long_ib_detect`, 1 on the
-///   840) enables the GMU firmware's bail-out timer
-///   (adreno_gen8_hwsched_hfi.c:2663-2667, `HFI_FEATURE_BAIL_OUT_TIMER`
-///   sent with data 0: the firmware's own default), whose expiry is the
-///   context fault `GMU_GPU_SW_HANG` (603, adreno_hfi.h: "Fault due to Long
-///   IB timeout"). Its duration lives in the GMU firmware: no kernel
-///   constant, sysfs node or property states it (`KGSL_PROP_IB_TIMEOUT`,
-///   0x21, is gone from msm_kgsl.h), and the 840's sysfs states none.
-/// - The hardware hang interrupt (`ft_hang_intr_status` 1) counts cycles
-///   of no interface progress (`hang_detect_cycles` 0xcfffff,
-///   RBBM_INTERFACE_HANG_INT_CNTL, adreno_gen8.c:1785): a stall, not a
-///   long submission that makes progress.
-///
-/// So the bound stated is `adreno_drawobj_timeout`'s 2 s, the one duration
-/// the driver states; where the GMU's bail-out is shorter, the per-submit
-/// trace (`RUST_LOG=engine_gpu::rates=debug`) shows the estimate and time
-/// of every submission up to the one that faults. None stated elsewhere.
-#[cfg(target_os = "android")]
-pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> =
-    Some(std::time::Duration::from_secs(2));
-#[cfg(not(target_os = "android"))]
-pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> = None;
+/// The bound the platform states on one GPU submission
+/// ([`engine_gpu::rates::STATED_SUBMIT_BOUND`]).
+pub use engine_gpu::rates::STATED_SUBMIT_BOUND;
 
 /// `tuning` with every roofline constant stated
 /// (`engine::rates::rates_at_load`, every engine's rule): as its layers
@@ -73,17 +37,13 @@ pub fn at_load(
     max_submit: Option<std::time::Duration>,
 ) -> Result<crate::tuning::Tuning> {
     let chip = tuning.profile().clone();
+    // What the profile states stands; a load times only what it lacks.
+    let stated = chip.rates();
     let measured = device.chip();
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
         provenance: provenance(&measured.name),
-        check: &check,
+        registry: crate::chip::registry(),
     });
     let chip = engine::rates::rates_at_load(
         chip,
@@ -91,7 +51,7 @@ pub fn at_load(
         save,
         Some(device.left()),
         max_submit,
-        |max_submit| measure(device, &tuning, max_submit).map_err(|e| e.to_string()),
+        |max_submit| measure(device, &tuning, max_submit, &stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
         call: "rates at load",
@@ -100,11 +60,13 @@ pub fn at_load(
     Ok(crate::tuning::Tuning::new(chip, device.limits()))
 }
 
-/// The rates of `device`, under the tactics `tuning` picks.
+/// The rates of `device` that `stated` lacks (every one where it states
+/// none), under the tactics `tuning` picks.
 pub fn measure(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
+    stated: &profile::fire::Rates,
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
@@ -113,7 +75,7 @@ pub fn measure(
         stated = ?STATED_SUBMIT_BOUND.map(|b| b.as_secs_f64() * 1e3),
         "rates: measuring, each submission within the bound"
     );
-    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
 }
 
 /// [`measure`], saying how the warm-up ended.
@@ -134,6 +96,7 @@ pub fn measure_saying(
         tier,
         &timer,
         STATED_SUBMIT_BOUND,
+        &profile::fire::Rates::default(),
         say,
     )
 }

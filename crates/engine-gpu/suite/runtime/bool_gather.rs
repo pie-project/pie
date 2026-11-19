@@ -231,6 +231,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );
@@ -271,6 +272,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),

@@ -920,6 +920,19 @@ fn share(
     let (Some(a), Some(b)) = (placements.get(h.0 as usize), placements.get(s.0 as usize)) else {
         return Err(Error::AliasOutside { holds, shares });
     };
+    // A capturing lane's row written in place (a tensor-parallel group's
+    // sum of the score row each rank holds a term of) stays that row: the
+    // two are one row exactly when they are the same grain (`width`) of the
+    // same dtype. Any other write in place through a value outside the
+    // arena is refused below.
+    if kind == Share::InPlace
+        && let (Placement::Capture { width: aw, dtype: ad }, Placement::Capture { width: bw, dtype: bd }) =
+            (a, b)
+        && (aw, ad) == (bw, bd)
+    {
+        placements[s.0 as usize] = Placement::Alias(h);
+        return Ok(());
+    }
     if !a.is_arena() || !b.is_arena() {
         return match kind {
             Share::InPlace => Err(Error::AliasOutside { holds, shares }),
@@ -1349,6 +1362,70 @@ mod tests {
         the_row_algebra_sizes_every_dim_at_its_ceiling();
         a_symbolic_width_is_refused_and_names_the_value();
         a_merge_of_two_sizes_is_refused_rather_than_carved();
+        a_capture_row_is_written_in_place_only_through_itself();
+    }
+
+    /// A write in place through a capturing lane's row is that row (an
+    /// all-reduce of the score row the ranks each hold a term of), and only
+    /// that: through the other grain's row, through an arena rectangle or
+    /// from one, or through any other value outside the arena, it is
+    /// refused as before.
+    fn a_capture_row_is_written_in_place_only_through_itself() {
+        let keys = Placement::Capture {
+            width: Dim::ContextTimes(1),
+            dtype: Dtype::F32,
+        };
+        let pages = Placement::Capture {
+            width: Dim::ContextPages,
+            dtype: Dtype::F32,
+        };
+        let rect = Placement::Arena {
+            offset: 0,
+            bytes: 64,
+            rows: RowExpr::of(Dim::Lanes),
+            width: 4,
+            dtype: Dtype::F32,
+        };
+        let (v0, v1) = (ValueId(0), ValueId(1));
+
+        let mut same = vec![keys.clone(), keys.clone()];
+        assert_eq!(share(&mut same, Share::InPlace, v0, v1), Ok(()));
+        assert_eq!(same[1], Placement::Alias(v0), "the reduced row is the row");
+
+        let refused = |holds: Placement, shares: Placement| {
+            let mut placements = vec![holds, shares];
+            assert_eq!(
+                share(&mut placements, Share::InPlace, v0, v1),
+                Err(Error::AliasOutside {
+                    holds: v0,
+                    shares: v1
+                }),
+                "{placements:?}"
+            );
+        };
+        refused(keys.clone(), pages.clone());
+        refused(pages, keys.clone());
+        refused(keys.clone(), rect.clone());
+        refused(rect.clone(), keys);
+        refused(rect, Placement::Runtime(poem_ir::RuntimeInput::Tokens));
+        let mut other = vec![
+            Placement::Capture {
+                width: Dim::ContextTimes(1),
+                dtype: Dtype::F32,
+            },
+            Placement::Capture {
+                width: Dim::ContextTimes(1),
+                dtype: Dtype::Bf16,
+            },
+        ];
+        assert_eq!(
+            share(&mut other, Share::InPlace, v0, v1),
+            Err(Error::AliasOutside {
+                holds: v0,
+                shares: v1
+            }),
+            "a row of another dtype is another row"
+        );
     }
 
     fn the_row_algebra_sizes_every_dim_at_its_ceiling() {

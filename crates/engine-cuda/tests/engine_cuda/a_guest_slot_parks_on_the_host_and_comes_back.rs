@@ -334,3 +334,95 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
         );
     }
 }
+
+/// A park rides the swap stream past the call: the shell tells it landed
+/// only once the copy has read its device slots, so what the runtime gives
+/// those slots to next (any shape, written by anything, not a fire alone)
+/// cannot reach the parked bytes. The slots are overwritten the moment the
+/// park is told landed, from the host and on no stream ordered behind it,
+/// and the host tier still holds what they held.
+#[test]
+fn a_park_is_told_landed_once_it_has_read_its_slots() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-tier-landing", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 7718).write(dir.path());
+    let mut shell = shell(trace, &path);
+    shell.take_refs();
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    shell
+        .commit_segments(facts.segments.max.min(4))
+        .expect("the segments commit");
+    let ring =
+        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, Some(crate::POOL), 1)
+            .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+            .expect("the staging ring pins");
+    shell
+        .seat_host_kv(Some(crate::POOL), 1, 256, 1, ring)
+        .expect("the host tier seats");
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    let shape = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == SlotRole::Channel)
+        .expect("the load states the guest shapes")
+        .clone();
+    let mut host = HostRefs::default();
+    let bytes = u64::from(RUN) * shape.slot_bytes;
+    let item = Item {
+        role: SlotRole::Channel,
+        id: shape.id,
+        bytes,
+        device: run(shape.slots_per_chunk, 1, 5),
+        fresh: Vec::new(),
+        seed: host.take_run(&shape),
+        parked: host.take_run(&shape),
+        pattern: (0..bytes).map(|byte| (byte * 13 + 7) as u8 ^ (byte >> 9) as u8).collect(),
+    };
+    shell
+        .write_tier_slots(&[(item.id, item.seed.clone())], &item.pattern)
+        .expect("the host slots are written");
+    shell
+        .copy_tier_slots(item.id, Tier::Host, Tier::Device, &pairs(&item.seed, &item.device))
+        .expect("the slots land on the device");
+
+    for round in 0..8 {
+        shell
+            .copy_tier_slots(item.id, Tier::Device, Tier::Host, &pairs(&item.device, &item.parked))
+            .expect("the slots park");
+        let (told, landed) = std::sync::mpsc::channel();
+        let telling = shell
+            .tell_swaps_landed(Box::new(move || {
+                let _ = told.send(());
+            }))
+            .expect("the shell takes the landing");
+        assert!(telling, "a park on the swap stream is told landed later");
+        landed
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the park is told landed");
+        // The slots go to their next owner, which writes them at once.
+        let at = shell
+            .guest_span(item.role, &item.device, item.bytes)
+            .expect("the run is a guest item's span");
+        engine_cuda::device::alloc::stage_raw(
+            shell.stream(),
+            at,
+            &vec![0x5au8 ^ round as u8; item.pattern.len()],
+        )
+        .expect("the next owner writes the slots");
+        let held = shell
+            .read_tier_slots(&[(item.id, item.parked.clone())])
+            .expect("the parked slots read");
+        assert!(
+            held == item.pattern,
+            "round {round}: the host tier holds what the slots held when the park was told landed"
+        );
+        // Back on the device for the next round's park.
+        shell
+            .copy_tier_slots(item.id, Tier::Host, Tier::Device, &pairs(&item.seed, &item.device))
+            .expect("the slots land on the device");
+    }
+}

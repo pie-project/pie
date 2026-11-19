@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::metal::StepNodes;
 use eta_compiler::codegen::program::KernelKind;
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
@@ -237,10 +238,11 @@ pub struct Region {
     pub steps: Arc<Vec<StreamedStep>>,
     pub form: Form,
     pub module: Arc<Module>,
-    /// A streamed region's nodes as its dispatches compute them, a group a
-    /// run of steps that share a node (`launch::launches`); empty where the
-    /// emitter published no node lists or the region is one dispatch.
-    pub launches: Arc<Vec<Vec<u32>>>,
+    /// A streamed region's nodes as its dispatches compute them, a list a
+    /// step, and the views no step computes (`launch::launches`); empty
+    /// where the emitter published no node lists or left a node out of
+    /// them, and the region is one launch.
+    pub launches: Arc<StepNodes>,
 }
 
 impl Region {
@@ -667,7 +669,7 @@ impl Builder<'_> {
                 steps: Arc::new(Vec::new()),
                 form: Form::Fused,
                 module,
-                launches: Arc::new(Vec::new()),
+                launches: Arc::default(),
             });
         }
         Ok(Stage {
@@ -782,7 +784,7 @@ impl Builder<'_> {
                 Form::Grouped
             },
             module,
-            launches: Arc::new(Vec::new()),
+            launches: Arc::default(),
         }))
     }
 
@@ -809,9 +811,9 @@ impl Builder<'_> {
                 } => (source, entry, steps),
                 _ => return Ok(None),
             };
-        let (table, step_nodes) = eta_compiler::codegen::metal::step_node_table(table);
-        let launches = step_nodes
-            .map(|nodes| launch_groups(&nodes, &plan.fused[region_index as usize].nodes))
+        let (table, published) = eta_compiler::codegen::metal::step_node_table(table);
+        let launches = published
+            .map(|published| step_launches(published, &plan.fused[region_index as usize].nodes))
             .unwrap_or_default();
         let mut steps = Vec::with_capacity(table.len());
         for &word in table {
@@ -879,52 +881,222 @@ impl Builder<'_> {
     }
 }
 
-/// A streamed region's launches from the nodes each of its steps computes:
-/// a run of steps any of whose nodes another step of the run also computes
-/// is one launch (a node's bytes live from its first step to its last).
-/// Empty, and the region one launch, where a node of `region` is in no
-/// step's list: what the emitter did not account for gets no reuse.
-fn launch_groups(step_nodes: &[Vec<u32>], region: &[u32]) -> Vec<Vec<u32>> {
-    let listed = |node: u32| step_nodes.iter().any(|nodes| nodes.contains(&node));
-    if !region.iter().all(|&node| listed(node)) {
-        return Vec::new();
-    }
-    let last_of = |node: u32| {
-        step_nodes
-            .iter()
-            .rposition(|nodes| nodes.contains(&node))
-            .unwrap_or(0)
+/// A streamed region's launches: each step a dispatch of its own, with the
+/// nodes it computes (a node a reduction dispatches in a partial step and
+/// finishes in a later one lies in both, its bytes live from the first to
+/// the last), and the views no step computes. Empty, and the region one
+/// launch, where a node of `region` is neither in a step's list nor a
+/// view: what the emitter did not account for gets no reuse.
+fn step_launches(published: StepNodes, region: &[u32]) -> StepNodes {
+    let accounted = |node: &u32| {
+        published.views.contains(node)
+            || published.folded.iter().any(|&(_, folded)| folded == *node)
+            || published.steps.iter().any(|nodes| nodes.contains(node))
     };
-    let mut groups = Vec::new();
-    let mut step = 0;
-    while step < step_nodes.len() {
-        let mut end = step;
-        let mut at = step;
-        while at <= end {
-            for &node in &step_nodes[at] {
-                end = end.max(last_of(node));
-            }
-            at += 1;
-        }
-        let mut group: Vec<u32> = Vec::new();
-        for nodes in &step_nodes[step..=end] {
-            for &node in nodes {
-                if !group.contains(&node) {
-                    group.push(node);
-                }
-            }
-        }
-        if !group.is_empty() {
-            groups.push(group);
-        }
-        step = end + 1;
+    if region.iter().all(accounted) {
+        published
+    } else {
+        StepNodes::default()
     }
-    groups
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod sampler_scratch {
+        use super::super::super::launch;
+        use super::super::{KernelKind, StepNodes, step_launches};
+        use eta_compiler::codegen::launch::LaunchPackage;
+        use eta_compiler::codegen::program::{Backend as Emitter, emit_program};
+        use eta_compiler::plan::compile_bound;
+        use eta_dsl::Traced;
+        use eta_dsl::prelude::*;
+        use eta_exec::{Emitted, Slot};
+        use eta_exec::{Extents, describe};
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
+
+        const QWEN_VOCAB: u32 = 151_936;
+
+        fn leak(channel: Channel) -> &'static Channel {
+            Box::leak(Box::new(channel))
+        }
+
+        fn logits(vocab: u32) -> Vec<Vec<OutputDecl>> {
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]]
+        }
+
+        fn builder(vocab: u32) -> (Builder<'static>, &'static Channel) {
+            let tok_in = leak(Channel::from([42i32]));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            b.bind_port(Port::EmbedTokens, tok_in);
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from([0u32, 1])));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            (b, tok_in)
+        }
+
+        fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let scaled = logits / temperature;
+                let probs = softmax(&scaled);
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
+                let masked = select(&keep, &scaled, &neg_inf);
+                let r = rng.take();
+                let g = gumbel(&r, [vocab]);
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(reduce_argmax(masked + g), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let scaled = &logits / temperature;
+                let probs = softmax(&scaled);
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A lane's scratch for the samplers inferlets ship, at Qwen3's
+        /// vocabulary: `text-completion-bench`'s top-p draw and `compat`'s
+        /// top-k + top-p. Each streamed step is a launch of its own and a
+        /// view takes its source's bytes, so the values lay in what they
+        /// take alive at once ([`eta_exec::most_alive`]), beside the
+        /// temporary area; the stride is far below each value its own
+        /// bytes, and below what runs of steps sharing a node laid.
+        #[test]
+        fn a_samplers_values_lay_in_what_is_alive_at_once() {
+            // (name, each value its own, runs of steps sharing a node, now,
+            // (the values' bytes laid, what they take alive at once))
+            let want = [
+                (
+                    "top-p",
+                    9_312_512u64,
+                    6_930_688u64,
+                    5_107_968u64,
+                    (2_584_064u64, 2_583_552u64),
+                ),
+                (
+                    "top-k + top-p",
+                    9_616_896,
+                    7_691_264,
+                    5_411_584,
+                    (2_887_680, 2_887_680),
+                ),
+            ];
+            let programs = [top_p(QWEN_VOCAB), top_k_top_p(QWEN_VOCAB)];
+            for ((name, own_was, runs_was, now, laid_alive), traced) in
+                want.into_iter().zip(programs)
+            {
+                let caps = EngineCaps {
+                    lora: true,
+                    attn_page_mask: true,
+                };
+                let bound =
+                    eta_ir::validate::bind(traced.container().clone(), logits(QWEN_VOCAB), caps)
+                        .expect("the program binds");
+                let stages = compile_bound(&bound);
+                let package: LaunchPackage = eta_compiler::codegen::launch::build(&bound, &stages);
+                let kernels = emit_program(Emitter::Metal, &stages, &bound);
+                let index = Emitted::index(&kernels).expect("one kernel a slot");
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                let published: Vec<StepNodes> = (0..plan.fused.len() as u32)
+                    .map(|region| {
+                        let Slot::Kernel { steps, .. } = index.get(KernelKind::Streamed, 0, region)
+                        else {
+                            panic!("{name}: region {region} has a streamed kernel");
+                        };
+                        let (_, published) = eta_compiler::codegen::metal::step_node_table(steps);
+                        let launches = step_launches(
+                            published.expect("node lists"),
+                            &plan.fused[region as usize].nodes,
+                        );
+                        assert!(
+                            !launches.steps.is_empty(),
+                            "{name}: region {region} accounts for every node"
+                        );
+                        launches
+                    })
+                    .collect();
+                let published: Vec<Option<&StepNodes>> = published.iter().map(Some).collect();
+                let descriptors: Vec<_> = plan
+                    .value_types
+                    .iter()
+                    .map(|value| describe(value, &Extents::default()).expect("static"))
+                    .collect();
+                let run = launch::published_launches(plan, &published, &descriptors)
+                    .expect("the temporary area is stated");
+                let lifetimes =
+                    eta_exec::value_lifetimes(plan, &run).expect("every node launched or idle");
+                let laid = launch::lay_out_launches(plan, &run, &descriptors).expect("fits");
+                let values_end = descriptors
+                    .iter()
+                    .zip(&lifetimes)
+                    .zip(&laid.values)
+                    .filter(|((_, life), _)| !life.dead)
+                    .map(|((descriptor, _), &at)| {
+                        at + descriptor
+                            .device_bytes()
+                            .next_multiple_of(eta_exec::SCRATCH_ALIGN)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let alive = eta_exec::most_alive(&descriptors, &lifetimes);
+                eprintln!(
+                    "{name}: {} bytes a lane ({values_end} of values, {alive} alive at once; \
+                     {own_was} each value its own, {runs_was} by runs of steps)",
+                    laid.total
+                );
+                assert_eq!(
+                    eta_exec::layout(&descriptors).expect("fits").total,
+                    own_was,
+                    "{name}"
+                );
+                assert_eq!(
+                    (values_end - eta_exec::SCRATCH_DUMMY_BYTES, alive),
+                    laid_alive,
+                    "{name}: the values lay in what is alive at once, but for what a \
+                     slot's alignment leaves"
+                );
+                assert_eq!(laid.total, now, "{name}");
+                assert!(now < runs_was, "{name}");
+            }
+        }
+    }
 
     #[test]
     fn compile_every_case() {

@@ -28,7 +28,7 @@ use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
 use crate::store::rs::{RsExport, RsGeometry, RsSlotId, WindowState};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Names are file names here, written out in hex.
 pub(crate) const MAX_NAME_BYTES: usize = 100;
 /// Pages read or written at a time: each passes through host slots of the
@@ -169,6 +169,8 @@ struct SavedCursor {
     reserved: u32,
     /// One past the highest slot written ([`Cursor::written`]).
     written: u32,
+    /// One past the slots written without a gap ([`Cursor::readable`]).
+    readable: u32,
     spans: Vec<(u32, u32, u32)>,
 }
 
@@ -852,6 +854,7 @@ async fn finish(
             tail: cursor.tail,
             reserved: cursor.reserved,
             written: cursor.written_end(),
+            readable: cursor.readable(),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -1027,6 +1030,8 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         tail: cursor.tail,
         reserved: cursor.reserved,
         written: cursor.written,
+        readable: cursor.readable,
+        untold: false,
         staged: Vec::new(),
         spans: cursor.spans,
     };

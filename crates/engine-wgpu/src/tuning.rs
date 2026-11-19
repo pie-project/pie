@@ -285,7 +285,11 @@ impl engine_gpu::backend::Tactics for Tuning {
     /// The vector kernel folds by shuffles where the adapter's subgroups
     /// hold a 32-lane strip.
     fn gemm(&self, tier: kernels_slang::Tier, _rows: u32) -> kernels_slang::linear::gemm::Tactic {
-        kernels_slang::linear::gemm::Tactic { tier }
+        kernels_slang::linear::gemm::Tactic {
+            tier,
+            vector: 0,
+            wide: true,
+        }
     }
 
     /// One tactic at every row count.
@@ -294,7 +298,11 @@ impl engine_gpu::backend::Tactics for Tuning {
         tier: kernels_slang::Tier,
         _capacity: u32,
     ) -> Vec<kernels_slang::linear::gemm::Tactic> {
-        vec![kernels_slang::linear::gemm::Tactic { tier }]
+        vec![kernels_slang::linear::gemm::Tactic {
+            tier,
+            vector: 0,
+            wide: true,
+        }]
     }
 
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {

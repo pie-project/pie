@@ -174,6 +174,9 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -307,6 +310,9 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 selection: Some(selection),
@@ -450,6 +456,9 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -593,6 +602,9 @@ impl Run<'_> {
                 crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,

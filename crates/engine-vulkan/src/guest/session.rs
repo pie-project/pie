@@ -12,9 +12,12 @@ use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
 use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
+use engine_gpu::backend::Buffer as _;
+use engine_gpu::guest::claims::{Claims, Run};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, StageTables, groups_for, stage_tables, step_stride, step_uniforms,
+    Bases, HEAP_BINDING, STATUS_BINDING, STEP_BINDING, StageTables, TABLES_BINDING, groups_for,
+    run_bases, stage_tables, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -42,6 +45,8 @@ pub struct Library {
     retired: std::sync::Mutex<Vec<vk::Pipeline>>,
     /// Pipelines built after the load, at a bind.
     serving: std::sync::atomic::AtomicU64,
+    /// Where every live instance's slots and heap lie ([`Claims`]).
+    claims: Claims,
 }
 
 impl Drop for Library {
@@ -138,6 +143,7 @@ impl Library {
             pipelines: std::sync::Mutex::new(pipelines),
             retired: std::sync::Mutex::default(),
             serving: std::sync::atomic::AtomicU64::new(0),
+            claims: Claims::default(),
         })
     }
 
@@ -300,8 +306,8 @@ fn build_call(
 struct Stage {
     /// Its steps' pipelines, in dispatch order.
     steps: Vec<vk::Pipeline>,
-    /// Its steps' uniforms, `stride` apart
-    /// ([`engine_gpu::guest::session::STEP_BINDING`]).
+    /// Its steps' records, `stride` apart ([`STEP_BINDING`]), with the
+    /// instance's bases.
     args: Buffer,
     stride: u64,
 
@@ -311,8 +317,8 @@ struct Stage {
     offsets: Vec<u64>,
 
     descriptors: Vec<ValueDesc>,
-    /// The stage's bind-time tables in the instance's `Instance` slots,
-    /// in `TABLE_BINDINGS` order.
+    /// The stage's bind-time tables in the instance's `Instance` slots, in
+    /// the order they lie: descriptors, op params, offsets, config.
     tables: [Held; 4],
 
     /// Its heap ([`engine_gpu::guest::state`]): the side whose state it
@@ -459,11 +465,13 @@ pub struct Session {
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     /// What the stages' pipelines and layouts belong to.
-    _library: Arc<Library>,
-    /// The `Instance` slots the stages' tables lie in, in binding order,
-    /// and whether they are one run.
+    library: Arc<Library>,
+    /// The `Instance` slots the stages' tables lie in: one run.
     slots: Vec<u32>,
-    run: bool,
+    /// An `Instance` slot's bytes.
+    slot_bytes: u64,
+    /// The name its slots and heap are claimed by ([`Claims`]).
+    claim: u64,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -494,7 +502,6 @@ impl Session {
         device: &Context,
         plans: &[LaunchStagePlan],
         code: &[engine_gpu::guest::Lowered],
-        args: &[StepArgs],
         extents: &Extents,
         library: &Arc<Library>,
         kept: Kept,
@@ -537,20 +544,12 @@ impl Session {
             .iter()
             .flat_map(|stage| stage.tables.iter().cloned())
             .collect();
-        let (placed, run) =
+        staging_fits(&core, &resolved)?;
+        let placed =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
+        let slot_bytes = tables.pools.slot_bytes(INSTANCE)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        if args.len() != plans.len() {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "{} stage plans but {} stages' step uniforms",
-                    plans.len(),
-                    args.len()
-                ),
-            });
-        }
         if layout.stages.len() != plans.len()
             || resolved
                 .iter()
@@ -572,26 +571,23 @@ impl Session {
                 ),
             });
         }
-        for ((((plan, lowered), resolved), args), &heap) in plans
-            .iter()
-            .zip(code)
-            .zip(resolved)
-            .zip(args)
-            .zip(&layout.stages)
+        for (((plan, lowered), resolved), &heap) in
+            plans.iter().zip(code).zip(resolved).zip(&layout.stages)
         {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
+            // Its bases in words of the run its tables binding spans: the same
+            // wherever the run moves, so its records are written once.
+            let (bases, _) = run_bases(&tables, slot_bytes)?;
+            let args = StepArgs::of(device, lowered, bases)?;
             stages.push(build_stage(
-                device, plan, lowered, resolved, tables, library, args, heap,
+                device, plan, lowered, resolved, tables, library, &args, heap,
             )?);
         }
 
         let sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count((BINDINGS - 1) * stages.len() as u32),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(stages.len() as u32),
+                .descriptor_count(3 * stages.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(stages.len() as u32),
@@ -621,9 +617,10 @@ impl Session {
             pool,
             set_layout: library.set_layout,
             layout: library.layout,
-            _library: Arc::clone(library),
+            library: Arc::clone(library),
             slots: tables.slots.to_vec(),
-            run,
+            slot_bytes,
+            claim: library.claims.instance(),
             instance,
             pair,
             scores: layout.scores,
@@ -656,27 +653,45 @@ impl Session {
         self.write_sets()
     }
 
-    /// Points each stage's set at its buffers: the status word, its tables
-    /// where their slots lie now, and its heap. Nothing on the queue uses
-    /// the sets: at construction none has run, and a rebind settles first.
+    /// Points each stage's set at its buffers: the status word, the run of
+    /// slots its tables lie in now, its heap at its exact span, and its
+    /// step's record; and claims the instance's slots and heap
+    /// ([`Claims`]). Nothing on the queue uses the sets: at construction
+    /// none has run, and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
         let d = &self.core.device;
+        let mut runs = Vec::new();
         for (at, stage) in self.stages.iter().enumerate() {
             let (heap, base) = self.heap_at(at)?;
-            let [descs, params, offs, cfg] = &stage.tables;
+            // The run moved with the tables, and their bases in it did not.
+            let (_, (segment, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
+            let run = Run {
+                segment,
+                start,
+                end,
+            };
+            if !runs.contains(&run) {
+                runs.push(run);
+            }
             let whole = |buffer: &Buffer| (buffer.slab().buffer, 0, buffer.bytes());
-            let held = |held: &Held| (held.buffer().slab().buffer, held.offset(), held.bytes());
             let buffers = [
-                (whole(&self.status), vk::DescriptorType::STORAGE_BUFFER),
-                (held(descs), vk::DescriptorType::STORAGE_BUFFER),
-                (held(params), vk::DescriptorType::STORAGE_BUFFER),
-                (held(offs), vk::DescriptorType::STORAGE_BUFFER),
                 (
+                    STATUS_BINDING,
+                    whole(&self.status),
+                    vk::DescriptorType::STORAGE_BUFFER,
+                ),
+                (
+                    TABLES_BINDING,
+                    (stage.tables[0].buffer().slab().buffer, start, end - start),
+                    vk::DescriptorType::STORAGE_BUFFER,
+                ),
+                (
+                    HEAP_BINDING,
                     (heap.slab().buffer, base, stage.heap.2),
                     vk::DescriptorType::STORAGE_BUFFER,
                 ),
-                (held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
                 (
+                    STEP_BINDING,
                     (
                         stage.args.slab().buffer,
                         0,
@@ -687,7 +702,7 @@ impl Session {
             ];
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
-                .map(|&((buffer, offset, range), _)| {
+                .map(|&(_, (buffer, offset, range), _)| {
                     [vk::DescriptorBufferInfo::default()
                         .buffer(buffer)
                         .offset(offset)
@@ -697,11 +712,10 @@ impl Session {
             let writes: Vec<vk::WriteDescriptorSet> = buffers
                 .iter()
                 .zip(&infos)
-                .enumerate()
-                .map(|(binding, ((_, kind), info))| {
+                .map(|((binding, _, kind), info)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(stage.set)
-                        .dst_binding(binding as u32)
+                        .dst_binding(*binding)
                         .descriptor_type(*kind)
                         .buffer_info(info)
                 })
@@ -714,7 +728,16 @@ impl Session {
             // into outlive the call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
         }
-        Ok(())
+        // The instance's own state, its heaps' place; the pair's is every
+        // instance of the pair's, shared by design.
+        if let Some((buffer, at)) = self.instance.span() {
+            runs.push(Run {
+                segment: buffer.slab_id(),
+                start: at,
+                end: at + self.instance.bytes(),
+            });
+        }
+        self.library.claims.claim(self.claim, &runs)
     }
 
     /// Points the stages' sets at the chunks their tables' slots and the
@@ -767,6 +790,22 @@ impl Session {
     /// lie in, in order), whose bytes the runtime copied there, and the
     /// instance's state and its pair's to `scratch` and `pair`, fresh room
     /// whose contents are dead.
+    /// Zeroes the instance's state and, where `pair` (a new taking of the
+    /// pair's slots), the pair's: room another owner left as it stood.
+    pub fn clear(&self, pair: bool) -> Result<()> {
+        self.instance.clear()?;
+        if pair {
+            self.pair.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Where its pair's state lies.
+    #[must_use]
+    pub fn pair_place(&self) -> &engine::program::ScratchPlace {
+        self.pair.place()
+    }
+
     pub fn retarget(
         &mut self,
         pools: &Pools<crate::device::Api>,
@@ -774,19 +813,13 @@ impl Session {
         scratch: &engine::program::ScratchPlace,
         pair: &engine::program::ScratchPlace,
     ) -> Result<()> {
-        if slots.len() != self.slots.len() {
+        if slots.len() != self.slots.len() || !consecutive(slots) {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
-                    "tables in {} instance slot(s) rebound to {slots:?}",
+                    "tables in a run of {} instance slot(s) rebound to {slots:?}",
                     self.slots.len()
                 ),
-            });
-        }
-        if self.run && !consecutive(slots) {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!("tables in one run rebound to {slots:?}, not a run"),
             });
         }
         self.settle()?;
@@ -1148,6 +1181,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.settle();
+        self.library.claims.release(self.claim);
         // SAFETY: `settle` waited every frame this session sent out, so no
         // pending command uses its descriptor sets; destroying the pool frees
         // them with it.
@@ -1158,18 +1192,57 @@ impl Drop for Session {
     }
 }
 
-/// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
-/// program's steps fix, so every bind of the program shares one.
-#[derive(Clone)]
+/// The host memory a session's stages stage through: each stage's
+/// staging and landing, its scratch's bytes each, in pinned host memory
+/// off the device's heaps on a discrete device (where the device's heap
+/// is the host's, the device's books hold them). Refused by name past
+/// what the host has room for now (`MemAvailable` less what lmkd defends
+/// and the floor, where the host states it), beside what the books
+/// already count there ([`engine_gpu::books::Books::host`]).
+fn staging_fits(core: &Core, resolved: &[StageTables]) -> Result<()> {
+    let need = resolved
+        .iter()
+        .try_fold(0u64, |sum, stage| {
+            sum.checked_add(stage.scratch.checked_mul(2)?)
+        })
+        .ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: "a guest session's staging bytes pass a u64".into(),
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let room = engine_gpu::host_memory::room()?.room;
+        if need > room {
+            return Err(Fault::Ceiling {
+                what: "host bytes of a guest session's staging",
+                need,
+                have: room,
+            });
+        }
+    }
+    tracing::debug!(
+        need,
+        held = core.books.host(),
+        "a guest session's staging, in host memory"
+    );
+    Ok(())
+}
+
+/// A stage's step records ([`step_records`]), `stride` apart, with its
+/// instance's `bases` in the run its tables lie in.
 pub struct StepArgs {
     buffer: Buffer,
     stride: u64,
 }
 
 impl StepArgs {
-    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
+    pub fn of(
+        device: &Context,
+        lowered: &engine_gpu::guest::Lowered,
+        bases: Bases,
+    ) -> Result<StepArgs> {
         let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
-        let uniforms = step_uniforms(&lowered.steps, stride);
+        let uniforms = step_records(&lowered.steps, stride, bases);
         let mut buffer = Buffer::with(
             device,
             uniforms.len() as u64,

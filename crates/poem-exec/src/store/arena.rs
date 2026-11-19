@@ -4,7 +4,12 @@ use poem_ir::{Dtype, ValueId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub offset: u64,
+    /// What the fire's rows take.
     pub bytes: u64,
+    /// The value's placement in the map, its capacity there: what a view of
+    /// it binds, so one view serves every fire of the map. No value live
+    /// beside it lies in these bytes ([`ArenaMap::clashes`]).
+    pub room: u64,
     pub rows: u32,
     pub width: u32,
     pub dtype: Dtype,
@@ -31,6 +36,7 @@ pub fn rect(map: &ArenaMap, value: ValueId, rows: poem_compiler::FireRows) -> Op
         bytes: element.map_or(*bytes, |element| {
             rows.saturating_mul(*width).saturating_mul(element)
         }),
+        room: *bytes,
         rows: u32::try_from(rows).unwrap_or(u32::MAX),
         width: u32::try_from(*width).unwrap_or(u32::MAX),
         dtype: *dtype,
@@ -77,6 +83,45 @@ mod tests {
             assert!(map.bytes < compiled.arena.bytes);
             for rect in rects(map, ceiling.tokens, ceiling.lanes).iter().flatten() {
                 assert!(rect.offset + rect.bytes <= map.bytes);
+            }
+        }
+    }
+
+    /// A value's room is its own placement at every rung, lies inside the
+    /// rung's carve, holds what a fire of the rung's rows takes, and no value
+    /// live beside it reaches into it: a view bound at its room confines a
+    /// kernel to the value's own bytes.
+    #[test]
+    fn a_room_is_the_value_s_own_placement_and_no_co_live_value_s() {
+        let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
+            .expect("the catalog ships the smoke's deployment")
+            .trace(Platform::Cuda);
+        let budget = Budget::new(512, 8192);
+        let budgets = poem_compiler::Budgets::of(budget.clone());
+        let compiled =
+            compile(&trace, &budget, &DeviceProfile::default()).expect("the deployment bakes");
+        let ladder =
+            poem_compiler::arena_ladder(&trace, &budgets, &compiled).expect("the rungs carve");
+        for (ceiling, map) in &ladder {
+            assert!(map.clashes(&compiled.concurrency).is_empty());
+            for (at, rect) in rects(map, ceiling.tokens, ceiling.lanes).iter().enumerate() {
+                let Some(rect) = rect else { continue };
+                let root = map.root(ValueId(at as u32));
+                let Some(Placement::Arena { offset, bytes, .. }) =
+                    map.placements.get(root.0 as usize)
+                else {
+                    panic!("value {at} has a rectangle and no arena placement");
+                };
+                assert_eq!((rect.offset, rect.room), (*offset, *bytes));
+                // Inside the rung's carve: below it, the span is lent to state
+                // while the rung serves.
+                assert!(rect.offset + rect.room <= map.bytes);
+                assert!(
+                    rect.bytes <= rect.room,
+                    "value {at}: a fire of the rung's rows takes {} bytes of a room of {}",
+                    rect.bytes,
+                    rect.room
+                );
             }
         }
     }

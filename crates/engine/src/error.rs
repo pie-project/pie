@@ -36,6 +36,21 @@ pub enum Error {
 
     #[error("engine disconnected: {0}")]
     Disconnected(String),
+
+    /// The lanes a step refused for their own sake: a lane's word, mask,
+    /// positions, adapter or payload this load does not serve as stated.
+    /// Nothing of the frame ran; every other lane would have, and the
+    /// runtime fails these lanes' fires alone ([`crate::Engine::submit`]).
+    #[error("{}", refused_lanes(.0))]
+    Lanes(Vec<crate::LaneFault>),
+}
+
+fn refused_lanes(lanes: &[crate::LaneFault]) -> String {
+    let named: Vec<String> = lanes
+        .iter()
+        .map(|fault| format!("lane {} refused: {}", fault.lane, fault.reason))
+        .collect();
+    named.join("; ")
 }
 
 impl Error {
@@ -58,6 +73,24 @@ impl Error {
 
     pub fn load(why: impl fmt::Display) -> Error {
         Error::Load(why.to_string())
+    }
+
+    /// Lane `lane` of its step refused, for `why`, with no other lane named.
+    pub fn lane(lane: u32, why: impl fmt::Display) -> Error {
+        Error::Lanes(vec![crate::LaneFault {
+            lane,
+            instance: None,
+            reason: why.to_string(),
+        }])
+    }
+
+    /// A refusal of the step's lanes `self` is, read at step `step` of a
+    /// frame whose steps before it fired: the frame stops there, answering
+    /// those steps ([`crate::FrameTicket::refused`]), and any other
+    /// refusal, or one at the first step, refuses the frame.
+    #[must_use]
+    pub fn stops_frame_at(&self, step: usize) -> bool {
+        step > 0 && matches!(self, Error::Lanes(_))
     }
 
     #[must_use]

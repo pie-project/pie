@@ -86,6 +86,10 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         }
         widest = widest.max(extent);
     }
+    // A whole number of 4-byte words a row: a copied window gathers the
+    // plane's rows as words (`dispatch::copy`). Columns past a lane's extent
+    // are no key of it, and read as hidden.
+    let widest = widest.next_multiple_of(4);
     let stride = u32::try_from(widest).map_err(|_| Fault::Ceiling {
         what: "columns in one mask row",
         need: widest,
@@ -228,7 +232,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(causal.words, vec![1, 1]);
-        assert_eq!(causal.bytes, vec![1, 1, 0, 1, 1, 1]);
+        // Three columns a row, padded to a whole word (`stage`): the fourth
+        // is no key and reads as hidden.
+        assert_eq!(causal.stride, 4);
+        assert_eq!(causal.bytes, vec![1, 1, 0, 0, 1, 1, 1, 0]);
         let wide = stage(&[LaneMask {
             mask: Some(&all),
             have: 1,
@@ -239,7 +246,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(wide.words, vec![2, 2]);
-        assert_eq!(wide.bytes, vec![1, 1, 1, 1, 1, 1]);
+        assert_eq!(wide.bytes, vec![1, 1, 1, 0, 1, 1, 1, 0]);
         let rows = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![1, 2], 3)]);
         let wide = stage(&[LaneMask {
             mask: Some(&rows),
@@ -250,7 +257,7 @@ mod tests {
         }])
         .unwrap()
         .unwrap();
-        assert_eq!(wide.bytes, vec![1, 1, 1, 0, 1, 1]);
+        assert_eq!(wide.bytes, vec![1, 1, 1, 0, 0, 1, 1, 0]);
     }
 
     fn a_per_row_mask_of_the_wrong_height_is_refused() {

@@ -580,6 +580,11 @@ pub struct Pools {
     tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
     weight_caches: Vec<super::streamed::Cache>,
+    /// An evacuation moved the pool's table and restaging the weight
+    /// caches' tables after it failed: the evacuation stands (the runtime
+    /// counts it done), and every later fire is refused by this fault
+    /// rather than read weights through tables that name moved chunks.
+    weights_stale: Option<String>,
     /// The runtime holds the weight set for the load's life.
     weights_held: bool,
 }
@@ -766,6 +771,7 @@ impl Pools {
             parked: None,
             tier: None,
             weight_caches: Vec::new(),
+            weights_stale: None,
             weights_held: false,
             table_run: (
                 layout.chunk_bytes,
@@ -1166,6 +1172,29 @@ impl Pools {
             });
         };
         Ok((view, at, host, slot_bytes))
+    }
+
+    /// Bytes `[at, at + bytes)` from the start of slot ref `slot` of shape
+    /// `id` (inside its chunk): the buffer they lie in, their byte offset
+    /// there, and their host runs `(from, len, address)`, one a placement
+    /// heap they cross (a chunk, and a slot in it, may cross a heap's end;
+    /// the view holds them in one span either way).
+    pub fn span_runs(
+        &self,
+        id: ShapeId,
+        slot: u32,
+        at: u64,
+        bytes: u64,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>)> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, slot)?;
+        let global = u64::from(chunk) * self.layout.chunk_bytes
+            + u64::from(index) * shape.slot_bytes
+            + at;
+        self.pool.admit(chunk)?;
+        let runs = self.pool.host_runs(global, bytes)?;
+        let (view, offset) = self.pool.view_at(global);
+        Ok((view.clone(), offset, runs))
     }
 
     /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
@@ -1868,6 +1897,21 @@ impl Pools {
 
     /// Zeroes the record whose physical pieces are `record`: a fresh lane's
     /// state.
+    /// A fresh record zeroed on the device in `frame` ([`Self::clear`]'s, in
+    /// queue order): the fire that first reads it zeroes it first, and no
+    /// frame in flight is drained for it.
+    pub fn clear_into(&self, frame: &mut crate::device::ctx::Frame, record: &[u32]) -> Result<()> {
+        if !self.has_state() {
+            return Ok(());
+        }
+        let fixed = *self.shape(FIXED)?;
+        for &piece in record {
+            let at = self.physical_slot_at(&fixed, piece)?;
+            self.pool.zero_in(frame, at, fixed.slot_bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self, record: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
@@ -2191,9 +2235,35 @@ impl Pools {
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table; the weight cache's address
     /// tables follow (no frame is in flight: the caller drained them).
+    /// A refusal from the pool's own evacuate moved nothing (its table is
+    /// swapped only once every copy is encoded): the runtime takes the
+    /// evacuation back. Past it the table has moved, so the evacuation is
+    /// done whatever follows: a weight cache that fails to restage is a
+    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
+    /// would have the runtime roll back a move this engine made.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
-        self.restage_weights()
+        if let Err(fault) = self.restage_weights() {
+            tracing::error!(
+                %fault,
+                "metal: an evacuation moved the pool's chunks and the weight caches' tables could \
+                 not follow; every later fire is refused"
+            );
+            self.weights_stale = Some(fault.to_string());
+        }
+        Ok(())
+    }
+
+    /// Refused once an evacuation left the weight caches' tables naming
+    /// chunks it moved ([`Self::evacuate`]): read before every fire.
+    pub fn weights_ready(&self) -> Result<()> {
+        match &self.weights_stale {
+            None => Ok(()),
+            Some(why) => Err(Fault::Residency(format!(
+                "an evacuation moved the pool's chunks and restaging the weight caches' tables \
+                 after it failed ({why}): their tables name moved chunks, so no fire reads them"
+            ))),
+        }
     }
 
     /// Takes the weight cache's row-streamed tables (`super::rows`).
@@ -2686,4 +2756,80 @@ pub struct GuestPiece {
     /// Its offset in the pool: what its host runs are asked by.
     pub global: u64,
     pub bytes: u64,
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod copy_landing_tests {
+    use super::Pools;
+    use crate::device::Context;
+    use crate::store::layout::CHANNEL;
+    use engine::MemoryDomain;
+    use engine::chunk::SlotCopy;
+
+    const CHUNK: u64 = 16 << 20;
+    const RUN: u32 = 8;
+
+    /// A copy on the device is told landed from its command buffer's
+    /// completion (`Shell::copy_slots_landing`), once it has read its
+    /// source slots: what the runtime gives those slots to next (written by
+    /// anything, from the host and ordered behind nothing) cannot reach the
+    /// copied bytes. Each round the source slots are overwritten the moment
+    /// the copy is told landed, and the destination holds what they held.
+    #[test]
+    fn a_device_copy_is_told_landed_once_it_has_read_its_slots() {
+        let device = Context::bind().expect("a Metal 4 device");
+        let mut pools = Pools::guests_only(&device, CHUNK, 24).expect("a pool");
+        let per = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
+        let bytes = usize::try_from(pools.slot_bytes(CHANNEL).expect("a slot")).expect("a usize");
+        let src: Vec<u32> = (2 * per..2 * per + RUN).collect();
+        let dst: Vec<u32> = (3 * per..3 * per + RUN).collect();
+        let at = |pools: &Pools, slot: u32| pools.slot_offset(CHANNEL, slot).expect("a placed slot");
+        for round in 0..8u8 {
+            let pattern: Vec<u8> = (0..bytes * RUN as usize)
+                .map(|byte| (byte * 13 + 7) as u8 ^ (byte >> 9) as u8 ^ round)
+                .collect();
+            for (k, &slot) in src.iter().enumerate() {
+                let offset = at(&pools, slot);
+                pools
+                    .pool
+                    .write(offset, &pattern[k * bytes..(k + 1) * bytes])
+                    .expect("the source slot is laid");
+            }
+            let copy = SlotCopy {
+                shape: CHANNEL,
+                src: MemoryDomain::MetalShared,
+                dst: MemoryDomain::MetalShared,
+                slots: src.iter().copied().zip(dst.iter().copied()).collect(),
+                runs: Vec::new(),
+            };
+            let mut frame = device.frame().expect("a frame");
+            pools.copy_slots(&mut frame, &copy).expect("the copy encodes");
+            let (told, landed) = std::sync::mpsc::channel();
+            let pending = frame
+                .commit_async(Some(Box::new(move |_| {
+                    let _ = told.send(());
+                })))
+                .expect("the copy commits");
+            landed
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the copy is told landed");
+            // The slots go to their next owner, which writes them at once.
+            for &slot in &src {
+                let offset = at(&pools, slot);
+                pools
+                    .pool
+                    .write(offset, &vec![0x5a ^ round; bytes])
+                    .expect("the next owner writes the slot");
+            }
+            pending.wait().expect("the copy retired");
+            let mut held = vec![0u8; bytes * RUN as usize];
+            for (k, &slot) in dst.iter().enumerate() {
+                pools
+                    .pool
+                    .read(at(&pools, slot), &mut held[k * bytes..(k + 1) * bytes])
+                    .expect("the destination reads");
+            }
+            assert!(held == pattern, "round {round}: the destination holds what the source held");
+        }
+    }
 }

@@ -12,6 +12,12 @@ use engine_gpu::error::Result;
 pub struct Shelf {
     mirror: Vec<Buffer>,
 
+    /// The guest plane's readback buffers, one a thread that runs guest
+    /// passes, a chunk of the pool each, and its readout widen's table:
+    /// reserved before the pool is sized, the plane takes them at its load.
+    #[cfg(feature = "wgpu")]
+    pub(crate) guest: (Vec<Buffer>, Buffer),
+
     mailbox: crate::landing::Mailbox,
 
     worker: crate::landing::Worker,
@@ -35,6 +41,9 @@ impl Serve for Api {
     type Keep = std::convert::Infallible;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
+
+    const MAX_BUFFER_SOURCE: &'static str = "the least of wgpu::Limits::max_buffer_size, \
+        max_storage_buffer_binding_size and, on Vulkan, maxMemoryAllocationSize";
 
     const RECORDS: bool = false;
 
@@ -65,9 +74,14 @@ impl Serve for Api {
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile (a
         // browser masks its adapter, so no profile states its rates, and
-        // keeps them for its load alone). No bound on one submission is
-        // stated on wgpu yet.
-        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
+        // keeps them for its load alone), each submission within the
+        // platform's stated bound on one.
+        let tuning = crate::rates::at_load(
+            &device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::STATED_SUBMIT_BOUND,
+        )?;
         Ok((device, tuning))
     }
 
@@ -134,8 +148,60 @@ impl Serve for Api {
         device.frame()
     }
 
-    fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
+    const BINDS_AT_LOAD: bool = true;
+
+    fn bind_frame(device: &Context) -> Result<Frame> {
+        device.bind_frame()
+    }
+
+    fn bound(pipelines: &Pipelines) -> u64 {
+        pipelines.bound()
+    }
+
+    fn shelf(
+        device: &Context,
+        pipelines: &Pipelines,
+        readout: &[Buffer],
+        _weights_stream: bool,
+        guest: engine_gpu::serve::GuestRoom,
+    ) -> Result<Shelf> {
+        // A frame takes a scratch chunk from the ring: stocked for each frame
+        // in flight (an arm a readout seat) and the one a settle or a walk
+        // holds beside them, here at the load, before the pool is sized past
+        // them. A shell fires frames with or without a guest program. Its
+        // uniforms are the device's, made with it.
+        #[cfg(feature = "wgpu")]
+        device.core().stock_rings(readout.len() + 1);
+        #[cfg(not(feature = "wgpu"))]
+        let _ = (device, guest);
+        let _ = pipelines;
+        #[cfg(feature = "wgpu")]
+        let threads = u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX);
         Ok(Shelf {
+            #[cfg(feature = "wgpu")]
+            guest: (
+                (0..threads)
+                    .map(|_| {
+                        Buffer::with(
+                            device,
+                            guest.chunk_bytes,
+                            crate::device::Memory::Readback,
+                            engine_gpu::books::owners::GUEST,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Buffer::with(
+                    device,
+                    crate::guest::widen::Widen::table_bytes(
+                        device,
+                        guest.seats,
+                        threads,
+                        u64::from(guest.max_lanes) * u64::from(guest.planes),
+                    ),
+                    crate::device::Memory::Device,
+                    engine_gpu::books::owners::GUEST,
+                )?,
+            ),
             mirror: readout
                 .iter()
                 .map(|seat| {
@@ -148,7 +214,7 @@ impl Serve for Api {
                 })
                 .collect::<Result<Vec<_>>>()?,
             mailbox: std::sync::Arc::default(),
-            worker: crate::landing::Worker::default(),
+            worker: crate::landing::Worker::new(),
         })
     }
 

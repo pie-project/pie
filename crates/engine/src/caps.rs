@@ -119,6 +119,31 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub classes: poem_ir::LaneClasses,
+
+    /// What a guest stage's cost is held to on this device
+    /// ([`GuestCost`]): none stated, the default, holds it to nothing.
+    #[serde(default)]
+    pub guest_cost: GuestCost,
+}
+
+/// What bounds a guest stage's time on a device: the bound it states on one
+/// submission, past which the driver faults the submission (and with it
+/// every tenant's fire in it), and the rates its load measured that cost a
+/// stage. The runtime refuses a registration whose stage the rates cost past
+/// the bound (`eta_ir::validate::SubmitBound`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuestCost {
+    /// The device's stated bound on one submission, ns; `None` where it
+    /// states none.
+    #[serde(default)]
+    pub submit_bound_ns: Option<u64>,
+    /// What the load measured one launch takes, ns (`[rates] launch_ns`).
+    #[serde(default)]
+    pub launch_ns: Option<u64>,
+    /// What the load measured an elementwise pass moves, bytes a ns
+    /// (`[rates] elementwise_gbps`).
+    #[serde(default)]
+    pub elementwise_gbps: Option<f64>,
 }
 
 impl Capabilities {

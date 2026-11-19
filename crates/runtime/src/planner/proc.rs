@@ -32,6 +32,11 @@ pub(super) struct Proc {
     pub(super) holder: bool,
     /// Waiting on its client: a victim for anyone, however old it is.
     pub(super) idle: bool,
+    /// Waiting at a bind for room (a commit, room given back, the planner's
+    /// serve, or its turn behind a guest bind's head): it makes no progress
+    /// until room comes, its refused bind holds nothing, and parked it binds
+    /// once restored, so it yields as an idle process does.
+    pub(super) bind_waiting: bool,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
     /// Parked below the floor, it gave its execution seat back: it takes
@@ -62,9 +67,26 @@ pub(super) struct Proc {
     /// Fires settled since it last became resident.
     pub(super) landed: u32,
     /// Its last restore found no device room for its parked role slots
-    /// (instance tables, rings, guest state): it waits, queued, for a
-    /// completion or an eviction to free some, never failed for it.
-    pub(super) roles_short: bool,
+    /// (instance tables, rings, guest state): the runs of whole chunks it
+    /// is short, and the pages that frees. It waits, queued, for a
+    /// completion, a commit or an eviction to free them, never failed for it.
+    pub(super) roles_short: Option<PendingBind>,
+    /// The need its restore last went again on because its runs stood free
+    /// ([`Step::EvictForRoles`](super::plan)): came back short with the
+    /// same need, the need understates what its unpark takes.
+    pub(super) roles_free_retry: Option<(u32, u32)>,
+    /// A need known to understate its unpark: its runs stood free and the
+    /// unpark was short all the same. Free runs of it are no reason to go
+    /// again; room is made for it (idle cache, a grow, the chunks'
+    /// occupants) until its restore lands.
+    pub(super) roles_free_short: Option<(u32, u32)>,
+    /// Suspended by a bind short of room, and parked: the device pool's
+    /// count of room given back when its park ended. Its restore takes its
+    /// own items back, so the room its park gave back is no room for the
+    /// bind; it is served only once room has come free since (the M1
+    /// freeze: suspended, restored straight back into the room it freed,
+    /// short again, 750 times a second).
+    pub(super) bind_room_after: Option<u64>,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside
@@ -127,6 +149,7 @@ impl Proc {
             resident: Arc::new(AtomicBool::new(true)),
             holder: false,
             idle: false,
+            bind_waiting: false,
             parked: None,
             seatless: false,
             reseating: false,
@@ -139,7 +162,10 @@ impl Proc {
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
             landed: 0,
-            roles_short: false,
+            roles_short: None,
+            roles_free_retry: None,
+            roles_free_short: None,
+            bind_room_after: None,
             bind_room: None,
             next_step: 0,
         }

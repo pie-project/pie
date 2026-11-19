@@ -11,23 +11,40 @@ const DT_I32 : u32 = 1u;
 const DT_U32 : u32 = 2u;
 const DT_BOOL : u32 = 3u;
 
-struct Cfg {
+// A stage's config table, by word: its values, its temporary words' first
+// heap word, its ops, its lane, and its heap's words (no access reaches past
+// them).
+const CFG_TEMPORARY : u32 = 1u;
+const CFG_HEAP_WORDS : u32 = 4u;
 
-  value_count : u32,
+// The fault classes this runtime writes (eta-compiler codegen::fault).
+const OUT_OF_BOUNDS : u32 = 0xB5u;
 
-  temporary : u32,
-
-  op_count : u32,
-
-  lane : u32,
-}
-
-@group(0) @binding(0) var<storage, read_write> status  : array<u32>;
-@group(0) @binding(1) var<storage, read>       descs   : array<u32>;
-@group(0) @binding(2) var<storage, read>       params  : array<u32>;
-@group(0) @binding(3) var<storage, read>       offs    : array<u32>;
+// What a stage reads and writes, in two pool segments a backend binds whole:
+// the segment holding the instance's slots (its status word, read as
+// atomics, and its tables: descriptors, offsets, op params and config, each
+// at a base the step's record states) and the segment holding its heap. So
+// one bind group serves every instance whose slots and heap lie in the same
+// two segments, each step dispatched at its record's offset.
+//
+// Isolation, by three facts a bind and this runtime hold together:
+//   1. The only words a step writes are heap[heap_base + w], w checked on
+//      the device against the stage's heap words (hst), and
+//      status[status_base + k] with k a constant (pie_fault). The naga test
+//      of the step modules holds that no other store exists, and none to
+//      the step's record.
+//   2. Every table index starts from words the host wrote and no guest
+//      store reaches (a value id from an op's params, an op from the step's
+//      record, a constant word), checked at registration against the
+//      stage's own counts (engine_gpu's plan_tables_valid), so a table read
+//      stays in the instance's own table.
+//   3. The bases come from the step's record, which the host writes: a bind
+//      refuses a base whose table, status or heap runs outside the
+//      instance's own slots or state, or its segment, and a heap that
+//      overlaps a table where both lie in one segment.
+@group(0) @binding(0) var<storage, read_write> status  : array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read>       tables  : array<u32>;
 @group(0) @binding(4) var<storage, read_write> heap    : array<u32>;
-@group(0) @binding(5) var<uniform>             cfg     : Cfg;
 
 var<private> tid : u32;
 
@@ -39,13 +56,82 @@ var<private> sel_group : u32;
 var<private> sel_groups : u32;
 
 
-fn d_len(v : u32) -> u32 { return descs[v * DESC_WORDS + 0u]; }
-fn d_rows(v : u32) -> u32 { return descs[v * DESC_WORDS + 1u]; }
-fn d_rank(v : u32) -> u32 { return descs[v * DESC_WORDS + 3u]; }
-fn d_dtype(v : u32) -> u32 { return descs[v * DESC_WORDS + 4u]; }
-fn d_dim(v : u32, k : u32) -> u32 { return descs[v * DESC_WORDS + 5u + k]; }
+// The stage's heap bound, read once at the step's entry: every heap access
+// is checked against it (the tables need no device check; see d_word). A heap
+// index is relative to the stage's heap, [0, lim_heap), at its base in the
+// segment the heap binding spans: never checked against the binding's size.
+var<private> lim_heap : u32;
 
-fn base(v : u32) -> u32 { return offs[v] >> 2u; }
+// Where the step's tables, status and heap start, in words of their
+// segments, and its temporary words' first heap word: read once at the
+// step's entry from its record and its config table.
+var<private> b_status : u32;
+var<private> b_descs : u32;
+var<private> b_params : u32;
+var<private> b_offs : u32;
+var<private> b_heap : u32;
+var<private> cfg_temporary : u32;
+
+// A fault in the runtimes' status layout (eta_exec::Status): the state
+// Fault (3), its code, and the index and limit an access was refused at.
+// The first fault of a stage wins: of the threads that fault, the one that
+// swaps the state from unset writes the code, index and limit, so the three
+// are one fault's.
+fn pie_fault(code : u32, at : u32, limit : u32) {
+  if (atomicExchange(&status[b_status], 3u) != 0u) { return; }
+  atomicStore(&status[b_status + 1u], code);
+  atomicStore(&status[b_status + 2u], at);
+  atomicStore(&status[b_status + 3u], limit);
+}
+
+// The heap's words, each access refused past the stage's heap: a read
+// reads zero, a write writes nothing, and the stage faults.
+// The first heap access this invocation refused, written as the step's
+// fault when it ends (heap_flush): a refused read reads zero with no branch,
+// a refused store stores nothing.
+var<private> heap_bad : bool;
+var<private> heap_at : u32;
+
+fn heap_refuse(w : u32, ok : bool) {
+  heap_at = select(heap_at, w, !ok && !heap_bad);
+  heap_bad = heap_bad || !ok;
+}
+
+fn hld(w : u32) -> u32 {
+  let ok = w < lim_heap;
+  heap_refuse(w, ok);
+  return select(0u, heap[b_heap + min(w, lim_heap - 1u)], ok);
+}
+
+fn hst(w : u32, x : u32) {
+  let ok = w < lim_heap;
+  heap_refuse(w, ok);
+  if (ok) { heap[b_heap + w] = x; }
+}
+
+fn heap_flush() {
+  if (heap_bad) { pie_fault(OUT_OF_BOUNDS, heap_at, lim_heap); }
+}
+
+// A value's descriptor word `k`. The descriptors, offsets and op params
+// are read at indices with no device check, by facts 2 and 3 above: every
+// index is host-written and checked at registration against the stage's own
+// counts, each table's base is checked at the bind, and no store of this
+// runtime reaches the tables (it declares them read-only; a backend that
+// binds them read_write beside the status, wgpu, still stores to them
+// nowhere, as the step modules' test holds). Only the heap, whose indices
+// come from guest data, is checked on the device (hld / hst).
+fn d_word(v : u32, k : u32) -> u32 {
+  return tables[b_descs + v * DESC_WORDS + k];
+}
+
+fn d_len(v : u32) -> u32 { return d_word(v, 0u); }
+fn d_rows(v : u32) -> u32 { return d_word(v, 1u); }
+fn d_rank(v : u32) -> u32 { return d_word(v, 3u); }
+fn d_dtype(v : u32) -> u32 { return d_word(v, 4u); }
+fn d_dim(v : u32, k : u32) -> u32 { return d_word(v, 5u + k); }
+
+fn base(v : u32) -> u32 { return tables[b_offs + v] >> 2u; }
 
 fn rows_of(v : u32) -> u32 {
   let rank = d_rank(v);
@@ -56,7 +142,7 @@ fn rows_of(v : u32) -> u32 {
 }
 
 
-fn p_at(p : u32, k : u32) -> u32 { return params[p * PARAM_WORDS + k]; }
+fn p_at(p : u32, k : u32) -> u32 { return tables[b_params + p * PARAM_WORDS + k]; }
 fn p_tag(p : u32) -> u32 { return p_at(p, 0u); }
 fn p_a0(p : u32) -> u32 { return p_at(p, 1u); }
 fn p_a1(p : u32) -> u32 { return p_at(p, 2u); }
@@ -74,10 +160,10 @@ fn p_pred_payload(p : u32) -> u32 { return p_a1(p); }
 fn p_dtype(p : u32) -> u32 { return p_at(p, 14u); }
 
 
-fn ld_raw(v : u32, i : u32) -> u32 { return heap[base(v) + i]; }
+fn ld_raw(v : u32, i : u32) -> u32 { return hld(base(v) + i); }
 
 fn ld_byte(v : u32, i : u32) -> u32 {
-  let w = heap[base(v) + (i >> 2u)];
+  let w = hld(base(v) + (i >> 2u));
   return (w >> ((i & 3u) * 8u)) & 0xFFu;
 }
 
@@ -111,7 +197,7 @@ fn ld_b(v : u32, i : u32) -> bool {
   return ld_raw(v, i) != 0u;
 }
 
-fn st_raw(v : u32, i : u32, w : u32) { heap[base(v) + i] = w; }
+fn st_raw(v : u32, i : u32, w : u32) { hst(base(v) + i, w); }
 fn st_f(v : u32, i : u32, x : f32) { st_raw(v, i, bitcast<u32>(x)); }
 fn st_i(v : u32, i : u32, x : i32) { st_raw(v, i, bitcast<u32>(x)); }
 fn st_u(v : u32, i : u32, x : u32) { st_raw(v, i, x); }
@@ -122,7 +208,7 @@ fn st_b_word(v : u32, w : u32, n : u32, b0 : bool, b1 : bool, b2 : bool, b3 : bo
   if (b1 && (w * 4u + 1u) < n) { packed = packed | 0x0000FF00u; }
   if (b2 && (w * 4u + 2u) < n) { packed = packed | 0x00FF0000u; }
   if (b3 && (w * 4u + 3u) < n) { packed = packed | 0xFF000000u; }
-  heap[base(v) + w] = packed;
+  hst(base(v) + w, packed);
 }
 
 fn st_as_f(v : u32, i : u32, x : f32) {
@@ -488,7 +574,7 @@ const PTIR_REDUCE_LEVELS : u32 = 7u;
 fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
-  return cfg.temporary + (buf * span + row * stride + c) * 2u;
+  return cfg_temporary + (buf * span + row * stride + c) * 2u;
 }
 
 fn red_read_buf(level : u32) -> u32 { return level % 2u; }
@@ -521,8 +607,8 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
           ix[k] = at;
         } else {
           let cell = tmp_v(row, stride, at, red_read_buf(level), rows * stride);
-          vs[k] = bitcast<f32>(heap[cell]);
-          ix[k] = heap[cell + 1u];
+          vs[k] = bitcast<f32>(hld(cell));
+          ix[k] = hld(cell + 1u);
         }
       }
     }
@@ -539,8 +625,8 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
       if (off == 1u) { break; }
     }
     let cell = tmp_v(row, stride, c, red_write_buf(level), rows * stride);
-    heap[cell] = bitcast<u32>(vs[0]);
-    heap[cell + 1u] = ix[0];
+    hst(cell, bitcast<u32>(vs[0]));
+    hst(cell + 1u, ix[0]);
   }
 }
 
@@ -579,8 +665,8 @@ fn op_reduce_finish(p : u32, kind : u32) {
         folded = (folded + 31u) / 32u;
       }
       let cell = tmp_v(row, stride, 0u, red_write_buf(last), rows * stride);
-      v = bitcast<f32>(heap[cell]);
-      idx = heap[cell + 1u];
+      v = bitcast<f32>(hld(cell));
+      idx = hld(cell + 1u);
     }
     if (kind == RED_ARGMAX) { st_i(o, row, bitcast<i32>(idx)); }
     else { st_as_f(o, row, v); }
@@ -1062,7 +1148,7 @@ fn key_less(ah : u32, al : u32, bh : u32, bl : u32) -> bool {
 }
 
 fn sort_cell(buf : u32, n : u32, c : u32) -> u32 {
-  return cfg.temporary + ((buf * n) + c) * 2u;
+  return cfg_temporary + ((buf * n) + c) * 2u;
 }
 
 fn sort_rows_of(p : u32, a : u32) -> u32 {
@@ -1077,9 +1163,9 @@ fn op_sort_seed(p : u32) {
   let len = n / max(rows, 1u);
   for (var i : u32 = tid; i < n; i = i + lanes) {
     let c = sort_cell(0u, n, i);
-    heap[c] = sort_key(ld_f(a, i));
+    hst(c, sort_key(ld_f(a, i)));
 
-    heap[c + 1u] = i - (i / max(len, 1u)) * max(len, 1u);
+    hst(c + 1u, i - (i / max(len, 1u)) * max(len, 1u));
   }
 }
 
@@ -1096,8 +1182,8 @@ fn op_sort_round(p : u32, r : u32) {
     for (var i : u32 = tid; i < n; i = i + lanes) {
       let s = sort_cell(src, n, i);
       let d = sort_cell(dst, n, i);
-      heap[d] = heap[s];
-      heap[d + 1u] = heap[s + 1u];
+      hst(d, hld(s));
+      hst(d + 1u, hld(s + 1u));
     }
     return;
   }
@@ -1110,8 +1196,8 @@ fn op_sort_round(p : u32, r : u32) {
     let mid = min(blk + run, len);
     let end = min(blk + span, len);
     let me = sort_cell(src, n, i);
-    let mh = heap[me];
-    let ml = heap[me + 1u];
+    let mh = hld(me);
+    let ml = hld(me + 1u);
     var lo : u32 = 0u;
     var hi : u32 = 0u;
     var own : u32 = 0u;
@@ -1128,18 +1214,18 @@ fn op_sort_round(p : u32, r : u32) {
       var c : u32 = 0u;
       if (at < mid) { c = sort_cell(src, n, rowb + mid + m); }
       else { c = sort_cell(src, n, rowb + blk + m); }
-      if (key_less(heap[c], heap[c + 1u], mh, ml)) { lo = m + 1u; } else { hi = m; }
+      if (key_less(hld(c), hld(c + 1u), mh, ml)) { lo = m + 1u; } else { hi = m; }
     }
     let d = sort_cell(dst, n, rowb + blk + own + lo);
-    heap[d] = mh;
-    heap[d + 1u] = ml;
+    hst(d, mh);
+    hst(d + 1u, ml);
   }
 }
 
-fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }
-fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }
-fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }
-fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }
+fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }
+fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }
+fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }
+fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }
 
 const PIVOT_UNROLL : u32 = 32u;
 
@@ -1152,10 +1238,11 @@ fn op_sort_pre(p : u32) {
   let len = max(n / max(rows, 1u), 1u);
   for (var c : u32 = tid; c < n; c = c + lanes) {
     let rowb = (c / len) * len;
-    let idx = heap[sort_cell(0u, n, c) + 1u];
-    heap[pivot_val(n, c)] = bitcast<u32>(ld_f(a, rowb + idx));
+    let idx = hld(sort_cell(0u, n, c) + 1u);
+    if (idx >= len) { pie_fault(OUT_OF_BOUNDS, idx, len); continue; }
+    hst(pivot_val(n, c), bitcast<u32>(ld_f(a, rowb + idx)));
 
-    heap[pivot_pos(n, rowb + idx)] = c - rowb;
+    hst(pivot_pos(n, rowb + idx), c - rowb);
   }
 }
 
@@ -1175,8 +1262,8 @@ fn op_pivot_pack(p : u32) {
       var on = false;
       if (i < n) {
         let row = i / len;
-        let t = heap[pivot_pos(n, i)];
-        on = t < heap[pivot_meta(n, row)] && heap[pivot_flag(n, row * len + t)] != 0u;
+        let t = hld(pivot_pos(n, i));
+        on = t < hld(pivot_meta(n, row)) && hld(pivot_flag(n, row * len + t)) != 0u;
       }
       b[k] = on;
     }
@@ -1191,7 +1278,7 @@ fn count_key_below(n : u32, rowb : u32, len : u32, kh : u32) -> u32 {
     if (lo >= hi) { break; }
     let m = lo + (hi - lo) / 2u;
     let c = sort_cell(0u, n, rowb + m);
-    if (heap[c] < kh) { lo = m + 1u; } else { hi = m; }
+    if (hld(c) < kh) { lo = m + 1u; } else { hi = m; }
   }
   return lo;
 }
@@ -1202,7 +1289,8 @@ fn op_sort_desc_finish(p : u32) {
   let o1 = p_o1(p);
   let n = d_len(a);
   for (var t : u32 = tid; t < n; t = t + lanes) {
-    let idx = heap[sort_cell(0u, n, t) + 1u];
+    let idx = hld(sort_cell(0u, n, t) + 1u);
+    if (idx >= n) { pie_fault(OUT_OF_BOUNDS, idx, n); continue; }
     st_as_f(o, t, ld_f(a, idx));
     st_u(o1, t, idx);
   }
@@ -1221,7 +1309,8 @@ fn op_top_k_finish(p : u32) {
   for (var j : u32 = tid; j < total; j = j + lanes) {
     let row = j / max(want, 1u);
     let t = j - row * want;
-    let idx = heap[sort_cell(0u, n, row * len + t) + 1u];
+    let idx = hld(sort_cell(0u, n, row * len + t) + 1u);
+    if (idx >= len) { pie_fault(OUT_OF_BOUNDS, idx, len); continue; }
     st_as_f(o, j, ld_f(a, row * len + idx));
     st_u(o1, j, idx);
   }
@@ -1245,107 +1334,107 @@ fn op_pivot_finish(p : u32) {
       let vals = pivot_val(n, rowb);
       let flags = pivot_flag(n, rowb);
 
-      let last = bitcast<f32>(heap[vals + len - 1u]);
+      let last = bitcast<f32>(hld(vals + len - 1u));
       let monotone = !(last < 0.0) && last == last;
       var excl : f32 = 0.0;
       var t : u32 = 0u;
       loop {
         if (t + PIVOT_UNROLL > len) { break; }
-        let v0 = bitcast<f32>(heap[vals + t + 0u]);
-        let v1 = bitcast<f32>(heap[vals + t + 1u]);
-        let v2 = bitcast<f32>(heap[vals + t + 2u]);
-        let v3 = bitcast<f32>(heap[vals + t + 3u]);
-        let v4 = bitcast<f32>(heap[vals + t + 4u]);
-        let v5 = bitcast<f32>(heap[vals + t + 5u]);
-        let v6 = bitcast<f32>(heap[vals + t + 6u]);
-        let v7 = bitcast<f32>(heap[vals + t + 7u]);
-        let v8 = bitcast<f32>(heap[vals + t + 8u]);
-        let v9 = bitcast<f32>(heap[vals + t + 9u]);
-        let v10 = bitcast<f32>(heap[vals + t + 10u]);
-        let v11 = bitcast<f32>(heap[vals + t + 11u]);
-        let v12 = bitcast<f32>(heap[vals + t + 12u]);
-        let v13 = bitcast<f32>(heap[vals + t + 13u]);
-        let v14 = bitcast<f32>(heap[vals + t + 14u]);
-        let v15 = bitcast<f32>(heap[vals + t + 15u]);
-        let v16 = bitcast<f32>(heap[vals + t + 16u]);
-        let v17 = bitcast<f32>(heap[vals + t + 17u]);
-        let v18 = bitcast<f32>(heap[vals + t + 18u]);
-        let v19 = bitcast<f32>(heap[vals + t + 19u]);
-        let v20 = bitcast<f32>(heap[vals + t + 20u]);
-        let v21 = bitcast<f32>(heap[vals + t + 21u]);
-        let v22 = bitcast<f32>(heap[vals + t + 22u]);
-        let v23 = bitcast<f32>(heap[vals + t + 23u]);
-        let v24 = bitcast<f32>(heap[vals + t + 24u]);
-        let v25 = bitcast<f32>(heap[vals + t + 25u]);
-        let v26 = bitcast<f32>(heap[vals + t + 26u]);
-        let v27 = bitcast<f32>(heap[vals + t + 27u]);
-        let v28 = bitcast<f32>(heap[vals + t + 28u]);
-        let v29 = bitcast<f32>(heap[vals + t + 29u]);
-        let v30 = bitcast<f32>(heap[vals + t + 30u]);
-        let v31 = bitcast<f32>(heap[vals + t + 31u]);
-        heap[flags + t + 0u] = select(0u, 1u, excl < cut);
+        let v0 = bitcast<f32>(hld(vals + t + 0u));
+        let v1 = bitcast<f32>(hld(vals + t + 1u));
+        let v2 = bitcast<f32>(hld(vals + t + 2u));
+        let v3 = bitcast<f32>(hld(vals + t + 3u));
+        let v4 = bitcast<f32>(hld(vals + t + 4u));
+        let v5 = bitcast<f32>(hld(vals + t + 5u));
+        let v6 = bitcast<f32>(hld(vals + t + 6u));
+        let v7 = bitcast<f32>(hld(vals + t + 7u));
+        let v8 = bitcast<f32>(hld(vals + t + 8u));
+        let v9 = bitcast<f32>(hld(vals + t + 9u));
+        let v10 = bitcast<f32>(hld(vals + t + 10u));
+        let v11 = bitcast<f32>(hld(vals + t + 11u));
+        let v12 = bitcast<f32>(hld(vals + t + 12u));
+        let v13 = bitcast<f32>(hld(vals + t + 13u));
+        let v14 = bitcast<f32>(hld(vals + t + 14u));
+        let v15 = bitcast<f32>(hld(vals + t + 15u));
+        let v16 = bitcast<f32>(hld(vals + t + 16u));
+        let v17 = bitcast<f32>(hld(vals + t + 17u));
+        let v18 = bitcast<f32>(hld(vals + t + 18u));
+        let v19 = bitcast<f32>(hld(vals + t + 19u));
+        let v20 = bitcast<f32>(hld(vals + t + 20u));
+        let v21 = bitcast<f32>(hld(vals + t + 21u));
+        let v22 = bitcast<f32>(hld(vals + t + 22u));
+        let v23 = bitcast<f32>(hld(vals + t + 23u));
+        let v24 = bitcast<f32>(hld(vals + t + 24u));
+        let v25 = bitcast<f32>(hld(vals + t + 25u));
+        let v26 = bitcast<f32>(hld(vals + t + 26u));
+        let v27 = bitcast<f32>(hld(vals + t + 27u));
+        let v28 = bitcast<f32>(hld(vals + t + 28u));
+        let v29 = bitcast<f32>(hld(vals + t + 29u));
+        let v30 = bitcast<f32>(hld(vals + t + 30u));
+        let v31 = bitcast<f32>(hld(vals + t + 31u));
+        hst(flags + t + 0u, select(0u, 1u, excl < cut));
         excl = excl + v0;
-        heap[flags + t + 1u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 1u, select(0u, 1u, excl < cut));
         excl = excl + v1;
-        heap[flags + t + 2u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 2u, select(0u, 1u, excl < cut));
         excl = excl + v2;
-        heap[flags + t + 3u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 3u, select(0u, 1u, excl < cut));
         excl = excl + v3;
-        heap[flags + t + 4u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 4u, select(0u, 1u, excl < cut));
         excl = excl + v4;
-        heap[flags + t + 5u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 5u, select(0u, 1u, excl < cut));
         excl = excl + v5;
-        heap[flags + t + 6u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 6u, select(0u, 1u, excl < cut));
         excl = excl + v6;
-        heap[flags + t + 7u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 7u, select(0u, 1u, excl < cut));
         excl = excl + v7;
-        heap[flags + t + 8u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 8u, select(0u, 1u, excl < cut));
         excl = excl + v8;
-        heap[flags + t + 9u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 9u, select(0u, 1u, excl < cut));
         excl = excl + v9;
-        heap[flags + t + 10u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 10u, select(0u, 1u, excl < cut));
         excl = excl + v10;
-        heap[flags + t + 11u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 11u, select(0u, 1u, excl < cut));
         excl = excl + v11;
-        heap[flags + t + 12u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 12u, select(0u, 1u, excl < cut));
         excl = excl + v12;
-        heap[flags + t + 13u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 13u, select(0u, 1u, excl < cut));
         excl = excl + v13;
-        heap[flags + t + 14u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 14u, select(0u, 1u, excl < cut));
         excl = excl + v14;
-        heap[flags + t + 15u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 15u, select(0u, 1u, excl < cut));
         excl = excl + v15;
-        heap[flags + t + 16u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 16u, select(0u, 1u, excl < cut));
         excl = excl + v16;
-        heap[flags + t + 17u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 17u, select(0u, 1u, excl < cut));
         excl = excl + v17;
-        heap[flags + t + 18u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 18u, select(0u, 1u, excl < cut));
         excl = excl + v18;
-        heap[flags + t + 19u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 19u, select(0u, 1u, excl < cut));
         excl = excl + v19;
-        heap[flags + t + 20u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 20u, select(0u, 1u, excl < cut));
         excl = excl + v20;
-        heap[flags + t + 21u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 21u, select(0u, 1u, excl < cut));
         excl = excl + v21;
-        heap[flags + t + 22u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 22u, select(0u, 1u, excl < cut));
         excl = excl + v22;
-        heap[flags + t + 23u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 23u, select(0u, 1u, excl < cut));
         excl = excl + v23;
-        heap[flags + t + 24u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 24u, select(0u, 1u, excl < cut));
         excl = excl + v24;
-        heap[flags + t + 25u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 25u, select(0u, 1u, excl < cut));
         excl = excl + v25;
-        heap[flags + t + 26u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 26u, select(0u, 1u, excl < cut));
         excl = excl + v26;
-        heap[flags + t + 27u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 27u, select(0u, 1u, excl < cut));
         excl = excl + v27;
-        heap[flags + t + 28u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 28u, select(0u, 1u, excl < cut));
         excl = excl + v28;
-        heap[flags + t + 29u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 29u, select(0u, 1u, excl < cut));
         excl = excl + v29;
-        heap[flags + t + 30u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 30u, select(0u, 1u, excl < cut));
         excl = excl + v30;
-        heap[flags + t + 31u] = select(0u, 1u, excl < cut);
+        hst(flags + t + 31u, select(0u, 1u, excl < cut));
         excl = excl + v31;
         t = t + PIVOT_UNROLL;
         if (!(excl < cut) && monotone) { break; }
@@ -1353,13 +1442,13 @@ fn op_pivot_finish(p : u32) {
 
       loop {
         if (t >= len) { break; }
-        heap[flags + t] = select(0u, 1u, excl < cut);
-        excl = excl + bitcast<f32>(heap[vals + t]);
+        hst(flags + t, select(0u, 1u, excl < cut));
+        excl = excl + bitcast<f32>(hld(vals + t));
         t = t + 1u;
         if (!(excl < cut) && monotone) { break; }
       }
 
-      heap[pivot_meta(n, row)] = t;
+      hst(pivot_meta(n, row), t);
     }
     return;
   }
@@ -1427,7 +1516,7 @@ var<workgroup> sel_wg_key : array<u32, 1024>;
 var<workgroup> sel_wg_idx : array<u32, 1024>;
 var<workgroup> sel_wg_skip : u32;
 
-fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }
+fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }
 fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
 fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
 fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }
@@ -1436,15 +1525,15 @@ fn sel_cand_idx(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + SEL_CA
 // Whether this workgroup sits the step out; uniform across it.
 fn sel_skips(only_first : bool) -> bool {
   if (sel_lt == 0u) {
-    let busy = heap[sel_at(SEL_ACTIVE)];
+    let busy = hld(sel_at(SEL_ACTIVE));
     let idle = select(sel_group >= busy, sel_group != 0u, only_first);
-    sel_wg_skip = select(0u, 1u, heap[sel_at(SEL_MODE)] != SEL_RUNS || idle);
+    sel_wg_skip = select(0u, 1u, hld(sel_at(SEL_MODE)) != SEL_RUNS || idle);
   }
   return workgroupUniformLoad(&sel_wg_skip) != 0u;
 }
 
 fn sel_chunk(n : u32) -> vec2<u32> {
-  let busy = heap[sel_at(SEL_ACTIVE)];
+  let busy = hld(sel_at(SEL_ACTIVE));
   let chunk = (n + busy - 1u) / busy;
   let lo = min(sel_group * chunk, n);
   return vec2<u32>(lo, min(lo + chunk, n));
@@ -1452,19 +1541,19 @@ fn sel_chunk(n : u32) -> vec2<u32> {
 
 // The ladder's steps run only for a row the select handed over.
 fn sel_ladder_idle() -> bool {
-  return heap[sel_at(SEL_MODE)] != SEL_LADDER;
+  return hld(sel_at(SEL_MODE)) != SEL_LADDER;
 }
 
 fn sel_init(p : u32) {
   let o = p_o0(p);
   let n = d_len(p_a0(p));
   let words = (n + 3u) / 4u;
-  for (var w : u32 = tid; w < words; w = w + lanes) { heap[base(o) + w] = 0u; }
+  for (var w : u32 = tid; w < words; w = w + lanes) { hst(base(o) + w, 0u); }
   if (tid == 0u) {
-    heap[sel_at(SEL_MODE)] = SEL_RUNS;
-    heap[sel_at(SEL_ACTIVE)] = max(min(SEL_GROUPS, sel_groups), 1u);
-    heap[sel_at(SEL_PREFIX)] = 0u;
-    heap[sel_at(SEL_KEEP)] = SEL_KEEP_CUT;
+    hst(sel_at(SEL_MODE), SEL_RUNS);
+    hst(sel_at(SEL_ACTIVE), max(min(SEL_GROUPS, sel_groups), 1u));
+    hst(sel_at(SEL_PREFIX), 0u);
+    hst(sel_at(SEL_KEEP), SEL_KEEP_CUT);
   }
 }
 
@@ -1473,7 +1562,7 @@ fn sel_hist(p : u32, sweep : u32) {
   let a = p_a0(p);
   let span = sel_chunk(d_len(a));
   let shift = 24u - 8u * sweep;
-  let prefix = heap[sel_at(SEL_PREFIX)];
+  let prefix = hld(sel_at(SEL_PREFIX));
   atomicStore(&sel_wg_hist[sel_lt], 0u);
   workgroupBarrier();
   for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
@@ -1485,18 +1574,18 @@ fn sel_hist(p : u32, sweep : u32) {
     }
   }
   workgroupBarrier();
-  heap[sel_part(sel_group, sel_lt)] = atomicLoad(&sel_wg_hist[sel_lt]);
+  hst(sel_part(sel_group, sel_lt), atomicLoad(&sel_wg_hist[sel_lt]));
 }
 
 fn sel_pick(p : u32, sweep : u32) {
   if (sel_skips(true)) { return; }
-  let busy = heap[sel_at(SEL_ACTIVE)];
+  let busy = hld(sel_at(SEL_ACTIVE));
   var here : u32 = 0u;
-  for (var g : u32 = 0u; g < busy; g = g + 1u) { here = here + heap[sel_part(g, sel_lt)]; }
+  for (var g : u32 = 0u; g < busy; g = g + 1u) { here = here + hld(sel_part(g, sel_lt)); }
   sel_wg_key[sel_lt] = here;
   workgroupBarrier();
   if (sel_lt != 0u) { return; }
-  var remaining = heap[sel_at(SEL_REMAINING)];
+  var remaining = hld(sel_at(SEL_REMAINING));
   if (sweep == 0u) {
     let n = d_len(p_a0(p));
     var count : u32 = 0u;
@@ -1510,29 +1599,29 @@ fn sel_pick(p : u32, sweep : u32) {
     if (p_pred_tag(p) == 0u) {
       let k = ld_i(payload, 0u);
       if (k <= 0) {
-        heap[sel_at(SEL_KEEP)] = SEL_KEEP_NONE;
-        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        hst(sel_at(SEL_KEEP), SEL_KEEP_NONE);
+        hst(sel_at(SEL_MODE), SEL_DECIDED);
         return;
       }
       if (u32(k) >= count) {
-        heap[sel_at(SEL_KEEP)] = SEL_KEEP_ALL;
-        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        hst(sel_at(SEL_KEEP), SEL_KEEP_ALL);
+        hst(sel_at(SEL_MODE), SEL_DECIDED);
         return;
       }
       want = u32(k);
     } else {
       let cut = ld_f(payload, 0u);
       if (!(0.0 < cut)) {
-        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        hst(sel_at(SEL_MODE), SEL_DECIDED);
         return;
       }
       if (negative != 0u || count != n || count == 0u) {
-        heap[sel_at(SEL_MODE)] = SEL_LADDER;
+        hst(sel_at(SEL_MODE), SEL_LADDER);
         return;
       }
       want = min(SEL_CAP, count);
     }
-    heap[sel_at(SEL_WANT)] = want;
+    hst(sel_at(SEL_WANT), want);
     remaining = want;
   }
   let shift = 24u - 8u * sweep;
@@ -1545,10 +1634,10 @@ fn sel_pick(p : u32, sweep : u32) {
     before = before + count;
     digit = digit + 1u;
   }
-  heap[sel_at(SEL_PREFIX)] = heap[sel_at(SEL_PREFIX)] | (digit << shift);
-  heap[sel_at(SEL_REMAINING)] = remaining - before;
+  hst(sel_at(SEL_PREFIX), hld(sel_at(SEL_PREFIX)) | (digit << shift));
+  hst(sel_at(SEL_REMAINING), remaining - before);
   if (sweep == 3u) {
-    heap[sel_at(SEL_TOTAL_LT)] = heap[sel_at(SEL_WANT)] - (remaining - before);
+    hst(sel_at(SEL_TOTAL_LT), hld(sel_at(SEL_WANT)) - (remaining - before));
   }
 }
 
@@ -1556,8 +1645,8 @@ fn sel_rank_mask(p : u32) {
   let a = p_a0(p);
   let o = p_o0(p);
   let n = d_len(a);
-  let keep = heap[sel_at(SEL_KEEP)];
-  let cut = heap[sel_at(SEL_PREFIX)];
+  let keep = hld(sel_at(SEL_KEEP));
+  let cut = hld(sel_at(SEL_PREFIX));
   let words = (n + 3u) / 4u;
   for (var w : u32 = tid; w < words; w = w + lanes) {
     var b : array<bool, 4>;
@@ -1579,7 +1668,7 @@ fn sel_tally(p : u32) {
   if (sel_skips(false)) { return; }
   let a = p_a0(p);
   let span = sel_chunk(d_len(a));
-  let cut = heap[sel_at(SEL_PREFIX)];
+  let cut = hld(sel_at(SEL_PREFIX));
   if (sel_lt < 2u) { atomicStore(&sel_wg_fill[sel_lt], 0u); }
   workgroupBarrier();
   for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
@@ -1588,7 +1677,7 @@ fn sel_tally(p : u32) {
     else if (key == cut) { atomicAdd(&sel_wg_fill[1], 1u); }
   }
   workgroupBarrier();
-  if (sel_lt < 2u) { heap[sel_count(sel_group, sel_lt)] = atomicLoad(&sel_wg_fill[sel_lt]); }
+  if (sel_lt < 2u) { hst(sel_count(sel_group, sel_lt), atomicLoad(&sel_wg_fill[sel_lt])); }
 }
 
 // Writes the candidates out: those below the cut first, then the ties the
@@ -1597,13 +1686,13 @@ fn sel_place(p : u32) {
   if (sel_skips(false)) { return; }
   let a = p_a0(p);
   let span = sel_chunk(d_len(a));
-  let cut = heap[sel_at(SEL_PREFIX)];
-  let below = heap[sel_at(SEL_TOTAL_LT)];
+  let cut = hld(sel_at(SEL_PREFIX));
+  let below = hld(sel_at(SEL_TOTAL_LT));
   var lt_at : u32 = 0u;
   var eq_at : u32 = 0u;
   for (var g : u32 = 0u; g < sel_group; g = g + 1u) {
-    lt_at = lt_at + heap[sel_count(g, 0u)];
-    eq_at = eq_at + heap[sel_count(g, 1u)];
+    lt_at = lt_at + hld(sel_count(g, 0u));
+    eq_at = eq_at + hld(sel_count(g, 1u));
   }
   if (sel_lt < 2u) { atomicStore(&sel_wg_fill[sel_lt], 0u); }
   workgroupBarrier();
@@ -1611,13 +1700,14 @@ fn sel_place(p : u32) {
     let key = sort_key(ld_f(a, i));
     if (key < cut) {
       let slot = lt_at + atomicAdd(&sel_wg_fill[0], 1u);
-      heap[sel_cand_key(slot)] = key;
-      heap[sel_cand_idx(slot)] = i;
+      if (slot >= SEL_CAP) { pie_fault(OUT_OF_BOUNDS, slot, SEL_CAP); continue; }
+      hst(sel_cand_key(slot), key);
+      hst(sel_cand_idx(slot), i);
     } else if (key == cut) {
       let slot = below + eq_at + atomicAdd(&sel_wg_fill[1], 1u);
       if (slot < SEL_CAP) {
-        heap[sel_cand_key(slot)] = key;
-        heap[sel_cand_idx(slot)] = i;
+        hst(sel_cand_key(slot), key);
+        hst(sel_cand_idx(slot), i);
       }
     }
   }
@@ -1625,7 +1715,7 @@ fn sel_place(p : u32) {
 
 fn st_b_on(v : u32, i : u32) {
   let at = base(v) + i / 4u;
-  heap[at] = heap[at] | (0xFFu << (8u * (i % 4u)));
+  hst(at, hld(at) | (0xFFu << (8u * (i % 4u))));
 }
 
 // Sorts the candidates by (key, index) and walks them as the reference does.
@@ -1633,17 +1723,17 @@ fn sel_walk(p : u32) {
   if (sel_skips(true)) { return; }
   let a = p_a0(p);
   let o = p_o0(p);
-  let busy = heap[sel_at(SEL_ACTIVE)];
+  let busy = hld(sel_at(SEL_ACTIVE));
   var ties : u32 = 0u;
-  for (var g : u32 = 0u; g < busy; g = g + 1u) { ties = ties + heap[sel_count(g, 1u)]; }
-  let below = heap[sel_at(SEL_TOTAL_LT)];
+  for (var g : u32 = 0u; g < busy; g = g + 1u) { ties = ties + hld(sel_count(g, 1u)); }
+  let below = hld(sel_at(SEL_TOTAL_LT));
   // Ties past the cap landed in no particular order, so the walk trusts
   // only the keys below the cut then.
   let held = select(below, below + ties, below + ties <= SEL_CAP);
   for (var i : u32 = sel_lt; i < SEL_CAP; i = i + PTIR_WG) {
     if (i < held) {
-      sel_wg_key[i] = heap[sel_cand_key(i)];
-      sel_wg_idx[i] = heap[sel_cand_idx(i)];
+      sel_wg_key[i] = hld(sel_cand_key(i));
+      sel_wg_idx[i] = hld(sel_cand_idx(i));
     } else {
       sel_wg_key[i] = 0xFFFFFFFFu;
       sel_wg_idx[i] = 0xFFFFFFFFu;
@@ -1678,11 +1768,15 @@ fn sel_walk(p : u32) {
   for (var t : u32 = 0u; t < held; t = t + 1u) {
     if (!(excl < cut)) { reached = true; break; }
     let index = sel_wg_idx[t];
+    if (index >= d_len(o) || index >= d_len(a)) {
+      pie_fault(OUT_OF_BOUNDS, index, min(d_len(o), d_len(a)));
+      break;
+    }
     st_b_on(o, index);
     excl = excl + ld_f(a, index);
   }
   let whole = held == d_len(a);
-  heap[sel_at(SEL_MODE)] = select(SEL_LADDER, SEL_DECIDED, reached || !(excl < cut) || whole);
+  hst(sel_at(SEL_MODE), select(SEL_LADDER, SEL_DECIDED, reached || !(excl < cut) || whole));
 }
 
 fn op_matmul(p : u32) {

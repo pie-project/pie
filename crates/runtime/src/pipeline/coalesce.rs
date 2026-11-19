@@ -6,8 +6,8 @@
 //! prompt) launch passes over a shared prefix together. The cache holds what
 //! has sealed, and nothing has yet, so each would prefill all of it. Here a
 //! pass claims the pages it is about to compute, by key, for as long as the
-//! pass runs ([`ClaimGuard`], released when its last piece settles or it
-//! ends early). A later pass whose uncached pages begin with pages another
+//! pass runs ([`ClaimGuard`], released when its last piece settles, after
+//! what it landed and froze is sealed, or when it ends early). A later pass whose uncached pages begin with pages another
 //! has claimed waits on events only: pages joining the cache (the kv store's
 //! `cached`), and claims released ([`RELEASED`]). Once those pages are all
 //! cached it maps them in; once the claims on them are released with some
@@ -40,6 +40,30 @@ fn claimed_run<By: PartialEq>(
     mine.iter()
         .take_while(|key| claims.get(*key).is_some_and(|claim| claim.by != by))
         .count()
+}
+
+/// `None` while others have claimed the first of `rest`; else claims those
+/// of `rest` no one has, and answers them.
+fn claim<By: PartialEq + Copy>(
+    claims: &mut HashMap<Hash256, Claim<By>>,
+    rest: &[Hash256],
+    by: By,
+) -> Option<Vec<Hash256>> {
+    if claimed_run(claims, rest, by) > 0 {
+        return None;
+    }
+    Some(
+        rest.iter()
+            .copied()
+            .filter(|key| {
+                let free = !claims.contains_key(key);
+                if free {
+                    claims.insert(*key, Claim { by });
+                }
+                free
+            })
+            .collect(),
+    )
 }
 
 /// Pages from token 0 cached in any tier, at least the `held` ones.
@@ -95,7 +119,7 @@ pub(crate) async fn before_pass(
     let cached_event = with_kv_lock(&stores.kv, "coalesce", |kv| kv.cached());
     let started = crate::rt::Instant::now();
     let mut waited = false;
-    let have = loop {
+    let mine = loop {
         // Armed before the look: a page cached or a claim released between
         // the look and the wait is not lost.
         let joined = cached_event.notified();
@@ -108,9 +132,10 @@ pub(crate) async fn before_pass(
         if have >= keys.len() {
             return None;
         }
-        let run = claimed_run(&CLAIMS.lock().unwrap(), &keys[have..], ws);
-        if run == 0 {
-            break have;
+        // Looked at and claimed under one lock: passes that arrive together
+        // see each other's claims, and one computes what the others wait on.
+        if let Some(mine) = claim(&mut CLAIMS.lock().unwrap(), &keys[have..], ws) {
+            break mine;
         }
         waited = true;
         tokio::select! {
@@ -125,18 +150,6 @@ pub(crate) async fn before_pass(
             "a pass waited on pages another pass was computing"
         );
     }
-    let mut claims = CLAIMS.lock().unwrap();
-    let mine: Vec<Hash256> = keys[have..]
-        .iter()
-        .copied()
-        .filter(|key| {
-            let free = !claims.contains_key(key);
-            if free {
-                claims.insert(*key, Claim { by: ws });
-            }
-            free
-        })
-        .collect();
     (!mine.is_empty()).then(|| ClaimGuard { by: ws, keys: mine })
 }
 

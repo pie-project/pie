@@ -125,16 +125,120 @@ __device__ __forceinline__ void skinny_put(bf16* out, long long at, float v) {
     }
 }
 
-template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false>
+// The rows a NORM skinny kernel multiplies, normed where it stages them:
+// `h = x + y` (landed in `y_out` by the first block, a plane of its own),
+// then `h · rsqrt(mean(h²) + eps) · w` (w + 1 under `plus_one`; landed in
+// `out` by the first block too, for the rows' other readers), each rounded
+// to bf16 as `ResidualAddRmsnorm` lands them. Every block norms its own
+// copy; none waits on another.
+struct SkinnyNorm {
+    const bf16* x;
+    const bf16* y;
+    const bf16* w;
+    bf16* y_out;
+    bf16* out;
+    float eps;
+    int plus_one;
+};
+
+// Stages `ROWS` rows normed as `SkinnyNorm` says into `dst` (`ROWS * K`
+// bf16, packed): every row in one pass, each summed as
+// `residual_add_rmsnorm`'s packed path sums it, so a product over them lands
+// the unfused path's bits. `t` of `threads` is the calling thread; `sums`
+// is LDS for ROWS x kNormGroups floats (a row's first then holds its inverse
+// root). Ends past a barrier.
+constexpr int kNormBlock = 256, kNormPpt = 4, kNormGroups = kNormBlock / kWave;
+template <int ROWS>
+__device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K, int t, int threads, b128* dst,
+                                                  float* sums) {
+    const int packs = K / 8, l = lane();
+    // Every row in one pass, each summed as `residual_add_rmsnorm` sums
+    // it, so the fold lands the unfused path's bits: a row is
+    // kNormBlock virtual threads (that kernel's block), thread v adding
+    // packs v, v + kNormBlock, ... in order, a wave reduction over 64
+    // consecutive ones, then their kNormBlock / 64 partials in order.
+    // The block's threads walk the (row, virtual thread) items flat, so
+    // all of the rows' loads are in flight at once (a row of a 1,024-wide
+    // model is 128 packs, a fraction of the block).
+    const int pairs = ROWS * packs;
+    const b128* xg = reinterpret_cast<const b128*>(norm.x);
+    const b128* yg = reinterpret_cast<const b128*>(norm.y);
+    const b128* wg = reinterpret_cast<const b128*>(norm.w);
+    b128* og = reinterpret_cast<b128*>(norm.y_out);
+    // Only the first `live` waves of a row's virtual threads hold a pack (a
+    // narrow row: 1,024 wide is 128 packs, two of four); the rest would sum
+    // exact zeros into the partials' tail, which changes no bits, so they
+    // are not walked.
+    const int live = (min(packs, kNormBlock) + kWave - 1) / kWave, span = live * kWave;
+    for (int i = t; i < ROWS * kNormGroups; i += threads)
+        if (i % kNormGroups >= live) sums[i] = 0.f;
+    for (int item = t; item < ROWS * span; item += threads) {
+        const int row = item / span, v = item - row * span;
+        float local = 0.f;
+#pragma unroll
+        for (int p = 0; p < kNormPpt; ++p) {
+            const int i = v + p * kNormBlock;
+            if (i < packs) {
+                const int g = row * packs + i;
+                const b128 xv = xg[g], yv = yg[g];
+                const bf16* xe = reinterpret_cast<const bf16*>(&xv);
+                const bf16* ye = reinterpret_cast<const bf16*>(&yv);
+                b128 hv;
+                bf16* he = reinterpret_cast<bf16*>(&hv);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) he[e] = from_f32<bf16>(to_f32(ye[e]) + to_f32(xe[e]));
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float h = to_f32(he[e]);
+                    local += h * h;
+                }
+                dst[g] = hv;
+                if (blockIdx.x == 0) og[g] = hv;
+            }
+        }
+        const float total = wave_sum(local);
+        if (l == 0) sums[row * kNormGroups + v / kWave] = total;
+    }
+    __syncthreads();
+    if (t < ROWS) {
+        float total = 0.f;
+        for (int w = 0; w < kNormGroups; ++w) total += sums[t * kNormGroups + w];
+        sums[t * kNormGroups] = rsqrtf(total / static_cast<float>(K) + norm.eps);
+    }
+    __syncthreads();
+    for (int g = t; g < pairs; g += threads) {
+        const int row = g / packs, i = g - row * packs;
+        const float inv = sums[row * kNormGroups];
+        b128 hv = dst[g];
+        const b128 wv = wg[i];
+        bf16* he = reinterpret_cast<bf16*>(&hv);
+        const bf16* we = reinterpret_cast<const bf16*>(&wv);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float w = to_f32(we[e]) + (norm.plus_one ? 1.f : 0.f);
+            he[e] = from_f32<bf16>(to_f32(he[e]) * inv * w);
+        }
+        dst[g] = hv;
+        if (blockIdx.x == 0) reinterpret_cast<b128*>(norm.out)[g] = hv;
+    }
+    __syncthreads();
+}
+
+template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false, bool NORM = false>
 __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
-                                                    bf16* __restrict__ out, int N, int K, int waves, float cap) {
+                                                    bf16* __restrict__ out, int N, int K, int waves, float cap,
+                                                    const SkinnyNorm norm) {
     constexpr bool SWIGLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;  // two weight rows a column
     constexpr int WR = SWIGLU ? 2 * YT : YT;  // weight rows a wavefront streams
+    static_assert(!NORM || !ACT_G, "a normed activation stages in LDS");
     extern __shared__ b128 act_s[];
     const int wave = threadIdx.y, l = lane();
     const int packs = K / 8;
     const b128* act_g = reinterpret_cast<const b128*>(act);
-    if constexpr (!ACT_G) {
+    if constexpr (NORM) {
+        __shared__ float sums[ROWS * kNormGroups];
+        skinny_norm_stage<ROWS>(norm, K, wave * kWave + l, blockDim.y * kWave, act_s, sums);
+    } else if constexpr (!ACT_G) {
         for (int i = wave * kWave + l; i < ROWS * packs; i += blockDim.y * kWave) act_s[i] = act_g[i];
         __syncthreads();
     }
@@ -383,10 +487,14 @@ __global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ we
 // its activation slices held in registers for the whole walk and the next
 // tile's weight in flight under this one's products. The slices' sums meet
 // in LDS in wavefront order. Under a GLU a tile is eight gate rows of a
-// packed [gate | up] bank and their eight up rows.
-template <int M, int R, int KS, int EPI = kSkinnyStore>
+// packed [gate | up] bank and their eight up rows. Under NORM the rows are
+// normed first as `SkinnyNorm` says (`act` unread), staged in the turn's LDS
+// with their partial sums (M x K bf16 and M x kNormGroups floats within
+// KS x 8 KB) and the activation slices loaded from there.
+template <int M, int R, int KS, int EPI = kSkinnyStore, bool NORM = false>
 __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
-                                                         bf16* __restrict__ out, int N, int K, float cap) {
+                                                         bf16* __restrict__ out, int N, int K, float cap,
+                                                         const SkinnyNorm norm) {
     constexpr int MB = (M + 15) / 16;
     static_assert(M >= 1 && MB <= 2, "one or two 16-row activation blocks");
     constexpr bool GLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;
@@ -400,20 +508,9 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
     const int slices = K / 256;
     const int tiles = (N + COLS - 1) / COLS;
     b128* mine = turn[wave];
-
-    // This wavefront's activation: rows 16b + r at chunk 4s + q of each slice.
+    // This wavefront's activation: rows 16b + r at chunk 4s + q of each
+    // slice, loaded once the first tile's weight is in flight.
     b128 xv[MB][R][8];
-#pragma unroll
-    for (int b = 0; b < MB; ++b)
-#pragma unroll
-        for (int p = 0; p < R; ++p) {
-            const int sl = wave + KS * p, j = 16 * b + r;
-#pragma unroll
-            for (int s = 0; s < 8; ++s)
-                xv[b][p][s] = j < M && sl < slices
-                                  ? reinterpret_cast<const b128*>(act + static_cast<long long>(j) * K + sl * 256)[4 * s + q]
-                                  : b128{};
-        }
     auto load = [&](skinny_v4 (&wv)[R][8], int tile) {
         const int n0 = tile * COLS;
 #pragma unroll
@@ -486,7 +583,29 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
     skinny_v4 wa[R][8], wb[R][8];
     int tile = blockIdx.x;
     if (tile >= tiles) return;
+    // The first tile's weight is in flight under the rows' staging.
     load(wa, tile);
+    const bf16* rows = act;
+    if constexpr (NORM) {
+        // The rows' partial sums past them in the turn, so the block's LDS
+        // stays the turn's alone (two blocks a compute unit).
+        float* sums = reinterpret_cast<float*>(&turn[0][0]) + M * K / 2;
+        skinny_norm_stage<M>(norm, K, wave * kWave + l, KS * kWave, &turn[0][0], sums);
+        rows = reinterpret_cast<const bf16*>(&turn[0][0]);
+    }
+#pragma unroll
+    for (int b = 0; b < MB; ++b)
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+            const int sl = wave + KS * p, j = 16 * b + r;
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                xv[b][p][s] = j < M && sl < slices
+                                  ? reinterpret_cast<const b128*>(rows + static_cast<long long>(j) * K + sl * 256)[4 * s + q]
+                                  : b128{};
+        }
+    // The turn is the staged rows' until every wavefront holds its slices.
+    if constexpr (NORM) __syncthreads();
     for (;;) {
         const int t1 = tile + gridDim.x;
         if (t1 < tiles) load(wb, t1);
@@ -498,6 +617,23 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
         if (t2 >= tiles) break;
         tile = t2;
     }
+}
+
+// The rates step's probe of the on-chip read rate a normed skinny kernel's
+// prologue meets (engine-cuda `rates`, `[rates] cached_gbps`): every block
+// reads a whole set of `set_packs` packs once, block b the set b % `sets`,
+// the sets together past a compute unit's first-level cache and within the
+// last-level ones, as every block of a skinny product reads its rows.
+__global__ __launch_bounds__(256) void cached_read_probe(const b128* __restrict__ sets_base, int set_packs, int sets,
+                                                         float* __restrict__ sink) {
+    const b128* set = sets_base + static_cast<long long>(blockIdx.x % sets) * set_packs;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < set_packs; i += blockDim.x) {
+        const b128 v = set[i];
+        const float* f = reinterpret_cast<const float*>(&v);
+        acc += f[0] + f[1] + f[2] + f[3];
+    }
+    if (acc == 1234.5f) sink[blockIdx.x] = acc;
 }
 
 }  // namespace pie::linear

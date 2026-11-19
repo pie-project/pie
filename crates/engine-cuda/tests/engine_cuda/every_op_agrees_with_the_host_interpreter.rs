@@ -973,6 +973,7 @@ impl Rig {
                         case.width,
                         case.width,
                         0,
+                        logits.len() as u32 / case.width,
                     )
                     .expect("the logits bind");
                 planes.push(buffer);

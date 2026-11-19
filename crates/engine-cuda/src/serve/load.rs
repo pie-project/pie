@@ -1165,6 +1165,7 @@ impl Shell {
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         one_direction_per_mask(&boot.trace, &compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
+        let mask_read = crate::exports::mask_reading_classes(&boot.trace, &compiled);
         let group_masked = group_masked_classes(&boot.trace, &compiled);
         let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
@@ -1451,7 +1452,7 @@ impl Shell {
             mrope_seat,
             &feeds.seats(),
             feeds.selections.len(),
-            !masked.is_empty() || !wide.is_empty(),
+            !mask_read.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
@@ -1551,6 +1552,7 @@ impl Shell {
             facts,
             page_tables,
             masked,
+            mask_read,
             group_masked,
             stated_feeds,
             wide,
@@ -1605,7 +1607,6 @@ impl Shell {
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
-            arm_group_mask: false,
             arm_deferred: false,
             card: (0, 0),
             held_for_fires: 0,
@@ -1627,6 +1628,7 @@ impl Shell {
             guest_faults: Vec::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
+            written: engine::extent::Written::default(),
             _released: Released,
         };
         if !shell.graphs.records() || !shell.bodies {
@@ -1892,6 +1894,7 @@ impl Shell {
         // The kernels a guest's wave fires are the engine's, not the
         // program's: loaded here, before ready, so no first fire builds them.
         kernels_cuda::runtime::channel::load_wave_kernels()?;
+        kernels_cuda::runtime::channel::load_gather_kernels()?;
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",
