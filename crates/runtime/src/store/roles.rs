@@ -1185,6 +1185,56 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
+    /// What `holder`'s restore would take back, in one line for a stall
+    /// census: each parked item (instance, channel, adapter, pair) with its
+    /// tier, and each part by role and size (scratch runs of whole chunks,
+    /// or a run of slots; dead between fires or live, with its refs), then
+    /// whether `need` runs stand beside the dead parts as the pool stands
+    /// ([`Self::fits_beside_unpark`]: the live parts are not placed there),
+    /// the free runs of `need`'s length, and each role shape's free slots.
+    #[must_use]
+    pub fn unpark_census(&self, holder: Holder, need: Option<(u32, u32)>) -> String {
+        let mut items = Vec::new();
+        for (owner, item) in &self.items {
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
+                || (item.tier == Tier::Device && item.shed);
+            if !parked || !self.unparks_with(*owner, item, holder) {
+                continue;
+            }
+            let parts: Vec<String> = item
+                .parts
+                .iter()
+                .map(|part| {
+                    format!(
+                        "{:?}:{}{}x{}c/{}s/refs{}",
+                        part.role,
+                        if part.dead() { "dead:" } else { "live:" },
+                        part.pieces,
+                        part.chunks,
+                        part.run,
+                        part.refs.len()
+                    )
+                })
+                .collect();
+            items.push(format!("{owner:?}@{:?}{}[{}]", item.tier, if item.shed { "(shed)" } else { "" }, parts.join(",")));
+        }
+        let beside = need.map(|(run, pieces)| self.fits_beside_unpark(holder, run, pieces));
+        let free_runs = need.map(|(run, _)| self.free_runs(run));
+        let shapes: Vec<String> = [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter]
+            .into_iter()
+            .filter_map(|role| {
+                let shape = self.shapes.of(role)?;
+                let pool = self.device.lock().unwrap();
+                Some(format!("{role:?}:free_slots={}", pool.pool().available(shape.pool)))
+            })
+            .collect();
+        format!(
+            "parked=[{}] need={need:?} beside_dead_parts={beside:?} free_runs={free_runs:?} shapes=[{}]",
+            items.join("; "),
+            shapes.join(",")
+        )
+    }
+
     /// The free runs of `run` adjacent `Instance` chunks inside one
     /// segment the device pool holds now: how many more pieces of a guest
     /// state that lies in runs of that length it could place.

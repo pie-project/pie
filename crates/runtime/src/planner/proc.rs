@@ -66,6 +66,9 @@ pub(super) struct Proc {
     /// is short, and the pages that frees. It waits, queued, for a
     /// completion, a commit or an eviction to free them, never failed for it.
     pub(super) roles_short: Option<PendingBind>,
+    /// Why its last unpark came back short, as the roles said it (the
+    /// shape and room short), for a stall's census.
+    pub(super) roles_short_why: Option<String>,
     /// The need its restore last went again on because its runs stood free
     /// ([`Step::EvictForRoles`](super::plan)): came back short with the
     /// same need, the need understates what its unpark takes.
@@ -128,6 +131,7 @@ impl Proc {
             holder: false,
             idle: false,
             bind_waiting: false,
+            roles_short_why: None,
             parked: None,
             seatless: false,
             reseating: false,

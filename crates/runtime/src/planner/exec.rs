@@ -915,8 +915,15 @@ async fn restore(
             // Room the budget holds but nothing has freed yet: the restore
             // waits, queued, as an admission does.
             if let Some(need) = error.unpark_runs() {
-                tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
+                tracing::debug!(
+                    %pid,
+                    %error,
+                    ?error,
+                    ?need,
+                    "planner: a restore waits for room for its roles"
+                );
                 planner.requeue_restore_roles(pid, need);
+                planner.note_roles_short_why(pid, format!("{error:?}"));
                 return;
             }
             // Its pair is on its way back with another process's restore:

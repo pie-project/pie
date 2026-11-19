@@ -213,6 +213,15 @@ impl ResidencyPlanner {
     /// served once a completion frees room or an eviction makes it
     /// ([`super::proc::Proc::roles_short`]). No failure.
     /// `need` is the runs of whole chunks its unpark is short.
+    /// Why `pid`'s last unpark came back short, kept for a stall census.
+    pub(super) fn note_roles_short_why(&self, pid: ProcessId, why: String) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.roles_short_why = Some(why);
+            }
+        });
+    }
+
     pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId, need: (u32, u32)) {
         let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
         self.stats

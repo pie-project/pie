@@ -310,6 +310,13 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = run;
         String::new()
     }
+    /// What `pid`'s restore would take back and where the pool would put
+    /// it ([`crate::store::roles::Roles::unpark_census`]), for `need`;
+    /// empty where the pool keeps no roles.
+    fn unpark_census(&self, pid: ProcessId, need: Option<(u32, u32)>) -> String {
+        let _ = (pid, need);
+        String::new()
+    }
     /// The device pages that, moved out whole, free `chunks` chunks for a
     /// guest's state, as [`Self::rs_as_pages`] for state.
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
@@ -531,6 +538,13 @@ impl PoolPort for RegistryPool {
             Some(roles) => roles.lock().unwrap().fits_beside_unpark(pid, run, pieces),
             None => self.guest_room_free(run, pieces),
         }
+    }
+
+    fn unpark_census(&self, pid: ProcessId, need: Option<(u32, u32)>) -> String {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.roles)
+            .map(|roles| roles.lock().unwrap().unpark_census(pid, need))
+            .unwrap_or_default()
     }
 
     fn chunk_census(&self, run: u32) -> String {

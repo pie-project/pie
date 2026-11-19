@@ -284,9 +284,32 @@ impl ResidencyPlanner {
             // the planner's map and the pool's own count, so a stall names
             // its cause.
             if picks.is_empty() {
+                // A restore head: what was recorded for it (a bind's need
+                // at its suspend, or its last unpark's shortfall) and what
+                // its restore would take back.
+                let (recorded, head) = self.with_inner(|inner| {
+                    let head = inner.queue.get(&victims.head).and_then(|waiter| {
+                        matches!(waiter.kind, WaitKind::Restore { .. }).then_some(waiter.pid)
+                    });
+                    let recorded = head.and_then(|pid| inner.procs.get(&pid)).map(|proc| {
+                        format!(
+                            "bind_room={:?} roles_short={:?} roles_short_why={:?} \
+                             roles_free_short={:?}",
+                            proc.bind_room.map(|need| (need.run, need.pieces)),
+                            proc.roles_short.map(|need| (need.run, need.pieces)),
+                            proc.roles_short_why,
+                            proc.roles_free_short,
+                        )
+                    });
+                    (recorded, head)
+                });
                 tracing::debug!(
                     map = %map.as_ref().map(|map| map.explain(run)).unwrap_or_default(),
                     pool = %self.port.chunk_census(run),
+                    head_recorded = %recorded.unwrap_or_default(),
+                    head_unpark = %head
+                        .map(|pid| self.port.unpark_census(pid, Some((run, pieces))))
+                        .unwrap_or_default(),
                     "planner: no run for the head and no one to move: census"
                 );
             }
