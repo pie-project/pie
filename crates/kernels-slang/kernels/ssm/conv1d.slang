@@ -276,12 +276,14 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint tap0 = c * uint(width);
     uint tap1 = tap0 + uint(width);
     float2 last = float2(bf16_at(weight, tap0 + uint(width - 1)), bf16_at(weight, tap1 + uint(width - 1)));
+    // Each carried row's word is loaded a row ahead of the step reading it.
+    uint ahead = carries > 0 ? pie_pool_get(rs_word(lag[entry + 3u], c)) : word;
     for (int s = 0; s <= carries; s++) {
-        float2 v = fresh;
+        uint held = ahead;
         if (s < carries) {
-            uint held = pie_pool_get(rs_word(lag[entry + 3u + uint(s)], c));
-            v = float2(bf16_to_f32(held & 0xffffu), bf16_to_f32(held >> 16));
+            ahead = s + 1 < carries ? pie_pool_get(rs_word(lag[entry + 4u + uint(s)], c)) : word;
         }
+        float2 v = float2(bf16_to_f32(held & 0xffffu), bf16_to_f32(held >> 16));
         float2 acc = float2(0.0);
         for (int k = 0; k + 1 < width; k++) {
             float2 w = float2(bf16_at(weight, tap0 + uint(k)), bf16_at(weight, tap1 + uint(k)));

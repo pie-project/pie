@@ -32,6 +32,17 @@ mod backend {
     /// What a test's load takes: the whole device.
     pub const ALLOWANCE: engine::Allowance = engine::Allowance::WHOLE;
 
+    /// Times every kernel a frame fires on the device while `on`; each
+    /// kernel's (name, device nanoseconds, fires) since the last reset.
+    pub fn time_kernels(on: bool) {
+        engine_vulkan::encode::reset_kernel_profile();
+        engine_vulkan::encode::profile_kernels(on);
+    }
+
+    pub fn kernel_times() -> Vec<(String, u64, u64)> {
+        engine_vulkan::encode::kernel_profile()
+    }
+
     /// The narrowest subgroup the device runs.
     pub fn subgroup(device: &Context) -> u32 {
         device.chip().subgroup

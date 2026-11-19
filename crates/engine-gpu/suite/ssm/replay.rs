@@ -645,28 +645,42 @@ fn the_replay_kernels_cost_at_serving_shapes() {
         for &mode in &modes {
             pass(&gpu, mode);
         }
+        // Each mode's wall time a pass (encoding, submit and wait), and its
+        // kernels' device time a pass.
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        let mut device: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
         for _ in 0..ROUNDS {
             for (m, &mode) in modes.iter().enumerate() {
+                crate::backend::time_kernels(true);
                 let start = std::time::Instant::now();
                 pass(&gpu, mode);
                 times[m].push(start.elapsed().as_secs_f64() * 1e6 / PASSES as f64);
+                let ns: u64 = crate::backend::kernel_times()
+                    .iter()
+                    .filter(|(name, _, _)| name.contains("ssm"))
+                    .map(|row| row.1)
+                    .sum();
+                crate::backend::time_kernels(false);
+                device[m].push(ns as f64 / 1e3 / PASSES as f64);
             }
         }
-        let median = |v: &mut Vec<f64>| {
+        let median = |v: &[f64]| {
+            let mut v = v.to_vec();
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
-        let base = median(&mut times[0].clone());
+        let (base, base_dev) = (median(&times[0]), median(&device[0]));
         for (m, mode) in modes.iter().enumerate() {
-            let us = median(&mut times[m]);
+            let (us, dev) = (median(&times[m]), median(&device[m]));
             let name = match mode {
                 None => "plain decode".to_string(),
                 Some(l) => format!("replay L={l}"),
             };
             eprintln!(
-                "LAGBENCH {} c{lanes}: {name}: {us:.1} us a step's 18 delta layers ({:+.1}% of plain)",
+                "LAGBENCH {} c{lanes}: {name}: device {dev:.1} us ({:+.1}% of plain), wall {us:.1} us \
+                 ({:+.1}%), a step's 18 delta layers",
                 crate::backend::NAME,
+                (dev / base_dev - 1.0) * 100.0,
                 (us / base - 1.0) * 100.0
             );
         }

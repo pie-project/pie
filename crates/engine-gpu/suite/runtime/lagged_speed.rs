@@ -17,7 +17,7 @@ const CONTEXT: u32 = 1024;
 const PROMPT: usize = 16;
 const STEPS: usize = 32;
 const SETTLE: usize = 3;
-const ROUNDS: usize = 5;
+const ROUNDS: usize = 9;
 
 #[test]
 #[ignore = "a measurement of the lagged decode step"]
@@ -50,14 +50,17 @@ fn the_lagged_decode_step_costs() {
         }
         let mut have = PROMPT as u32;
         let mut folded = PROMPT as u32;
+        // A seat's rs run holds a few pages: the buffer starts where the
+        // last plain fold left the lane, while nothing is buffered.
+        let mut base = PROMPT as u32;
         let mut step = |shell: &mut crate::backend::Shell, lag: u32| {
             let verb = if lag == 0 && folded == have {
                 RsVerb::Fold
             } else {
                 let fold = (have + 1).saturating_sub(lag).saturating_sub(folded);
                 RsVerb::Buffer {
-                    pages: vec![0; (have + 1).div_ceil(per_page) as usize],
-                    base: 0,
+                    pages: vec![0; (have + 1 - base).div_ceil(per_page) as usize],
+                    base,
                     folded,
                     fold: FoldLen::Host(fold),
                     lineage: engine::fire::Lineage::Set,
@@ -86,6 +89,9 @@ fn the_lagged_decode_step_costs() {
                 _ => have + 1,
             };
             have += 1;
+            if folded == have {
+                base = have;
+            }
             took
         };
         let lags = [0u32, 1, 2];
@@ -107,12 +113,17 @@ fn the_lagged_decode_step_costs() {
         let base = median(&times[0]);
         for (at, &lag) in lags.iter().enumerate() {
             let s = median(&times[at]);
+            let least = times[at].iter().copied().fold(f64::INFINITY, f64::min);
+            let least0 = times[0].iter().copied().fold(f64::INFINITY, f64::min);
             eprintln!(
-                "LAGSTEP {} {model} c{lanes}: L={lag}: {:.3} ms a step, {:.1} tok/s ({:+.1}% of L=0); rounds {:?}",
+                "LAGSTEP {} {model} c{lanes}: L={lag}: median {:.3} ms a step, {:.1} tok/s ({:+.1}% of L=0); \
+                 best {:.3} ms ({:+.1}%); rounds {:?}",
                 crate::backend::NAME,
                 s * 1e3,
                 lanes as f64 / s,
                 (s / base - 1.0) * 100.0,
+                least * 1e3,
+                (least / least0 - 1.0) * 100.0,
                 times[at]
                     .iter()
                     .map(|t| format!("{:.3}", t * 1e3))

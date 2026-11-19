@@ -130,11 +130,19 @@ uint state_at(uint at, uint hv, uint head) {
 // `PIE_REPLAY` while `from_carried`, a carried row's.
 #if defined(PIE_REPLAY)
 static bool from_carried = false;
+// Branches, not selects: the flag is uniform, and a select would load
+// from both buffers.
 float qkv_get(uint i) {
-    return from_carried ? bf16_at(carried_qkv, i) : bf16_at(qkv, i);
+    if (from_carried) {
+        return bf16_at(carried_qkv, i);
+    }
+    return bf16_at(qkv, i);
 }
 float gate_get(uint i) {
-    return from_carried ? carried_gates[i] : gates[i];
+    if (from_carried) {
+        return carried_gates[i];
+    }
+    return gates[i];
 }
 #else
 #define qkv_get(i_) bf16_at(qkv, i_)
@@ -264,6 +272,67 @@ void reg_store(uint tid, uint base) {
 }
 #endif
 
+#if defined(PIE_REPLAY) && defined(PIE_DK_REG)
+// What a lane takes of a row (its query and key element, its value element
+// and its head's gates), loaded a row ahead of the step that reads it: a
+// replay's rows are a chain, and the load would otherwise wait on the step
+// before.
+struct Row {
+    float q;
+    float k;
+    float v;
+    float decay;
+    float beta;
+};
+
+// Row `t` of the carried rows (`carried`) or of the fire's own.
+Row row_load(bool carried, uint t, uint tid, uint hv, uint hk) {
+    from_carried = carried;
+    uint dk = uint(params.k_dim);
+    uint dv = uint(params.v_dim);
+    uint keys = uint(params.k_heads) * dk;
+    uint row = t * (2u * keys + uint(params.v_heads) * dv);
+    Row a;
+    a.q = qkv_get(row + hk * dk + tid);
+    a.k = qkv_get(row + keys + hk * dk + tid);
+    a.v = tid < dv ? qkv_get(row + 2u * keys + hv * dv + tid) : 0.0;
+    uint fused = t * 2u * uint(params.v_heads) + hv;
+    a.decay = exp(gate_get(fused));
+    a.beta = gate_get(fused + uint(params.v_heads));
+    return a;
+}
+
+// [`token`] on a row already loaded, its output landed at `out` when
+// `emit`: the same steps in the same order.
+void row_step(Row a, uint tid, bool emit, uint out) {
+    float qtot = pie_workgroup_sum(a.q * a.q, tid);
+    float ktot = pie_workgroup_sum(a.k * a.k, tid);
+    float scale = 1.0 / sqrt(float(params.k_dim));
+    float qinv = rsqrt(qtot + 1e-6) * scale;
+    float kinv = rsqrt(ktot + 1e-6);
+    sq[tid] = a.q * qinv;
+    sk[tid] = a.k * kinv;
+    GroupMemoryBarrierWithGroupSync();
+    if (tid < uint(params.v_dim)) {
+        float kv_mem = 0.0;
+        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
+            st[i] *= a.decay;
+            kv_mem += st[i] * sk[i];
+        }
+        float delta = (a.v - kv_mem) * a.beta;
+        float acc = 0.0;
+        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
+            st[i] += sk[i] * delta;
+            acc += st[i] * sq[i];
+        }
+        if (emit) {
+            y[out + tid] = acc;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+#endif
+
 #if defined(PIE_SNAPS)
 // The next snapshot of lane `snap` from `n` on: its row, 0 past the last.
 int snap_next(int snap, uint n) {
@@ -316,9 +385,15 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint bank = state_at(r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, bank);
+    uint held = lane * params.carry;
+    Row ahead = row_load(carries > 0, carries > 0 ? held : r, tid, hv, hk);
     for (int s = 0; s <= carries; s++) {
-        from_carried = s < carries;
-        token(tid, from_carried ? lane * params.carry + uint(s) : r, hv, hk, 0u);
+        Row now = ahead;
+        if (s < carries) {
+            int t = s + 1;
+            ahead = row_load(t < carries, t < carries ? held + uint(t) : r, tid, hv, hk);
+        }
+        row_step(now, tid, s == carries, (r * uint(params.v_heads) + hv) * dv);
         if (s + 1 == keep) {
             reg_store(tid, bank);
         }

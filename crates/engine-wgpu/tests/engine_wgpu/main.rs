@@ -35,6 +35,17 @@ mod backend {
         budget: Some(8 << 30),
     };
 
+    /// Times every kernel a frame fires on the device while `on`; each
+    /// kernel's (name, device nanoseconds, fires) since the last reset.
+    pub fn time_kernels(on: bool) {
+        engine_wgpu::encode::reset_kernel_profile();
+        engine_wgpu::encode::profile_timing(on);
+    }
+
+    pub fn kernel_times() -> Vec<(String, u64, u64)> {
+        engine_wgpu::encode::kernel_profile()
+    }
+
     /// The narrowest subgroup the adapter runs (0 without subgroups).
     pub fn subgroup(device: &Context) -> u32 {
         device.chip().subgroup_min.unwrap_or(0)
