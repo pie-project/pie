@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
-use engine::chunk::{ChunkFacts, ShapeId, SlotKind};
+use engine::chunk::{ChunkFacts, Growth, ShapeId, SlotKind};
 use engine::fire::{
     Attachment, FoldLen, FrameSubmission, FrameTicket, KvDelta, Lane, Readout, RsReset, RsVerb,
     Step,
@@ -517,12 +517,32 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
         + (SETS * rs_pages).div_ceil(per(RS))
         + (SETS * pieces).div_ceil(per(FIXED));
     let segment = facts.segment_chunks;
-    let first = facts.segments.committed * segment;
-    let commit = facts.segments.committed + need.div_ceil(segment);
+    // Where the pool grows, the test's segments are committed past the
+    // load's. A pool laid whole at its load (`Growth::Fixed`, as wgpu lays
+    // it) has none past them: its chunks lie from the first segment past the
+    // seats' runs, below the activation span's segment (the last).
+    let (first, commit, most) = if facts.segments.growth == Growth::Fixed {
+        let seats = 1 + engine
+            .loaded()
+            .expect("the shell stands")
+            .pool_layout()
+            .seat_chunks();
+        let first = seats.div_ceil(segment) * segment;
+        (
+            first,
+            (first + need).div_ceil(segment),
+            facts.segments.max - 1,
+        )
+    } else {
+        (
+            facts.segments.committed * segment,
+            facts.segments.committed + need.div_ceil(segment),
+            facts.segments.max,
+        )
+    };
     assert!(
-        facts.segments.max >= commit,
-        "the pool spans {commit} segments, it has {}",
-        facts.segments.max
+        most >= commit,
+        "the test's chunks span {commit} segments, the pool has {most} for them"
     );
     engine.commit_segments(commit).expect("the segments commit");
     eprintln!(
