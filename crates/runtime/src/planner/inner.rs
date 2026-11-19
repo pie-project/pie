@@ -20,6 +20,13 @@ pub(super) const RESERVE_SHARE: u32 = 32;
 
 #[derive(Default)]
 pub(super) struct Inner {
+    /// The process suspended for a bind whose restore was served and that
+    /// has not fired since: one at a time. Restored together, each took its
+    /// items back and every bind came up short against the others' (the M1
+    /// stress: ten processes suspended, restored and short in turn, 190
+    /// times each); restored alone, a bind competes only with the
+    /// residents.
+    pub(super) bind_restoring: Option<ProcessId>,
     pub(super) next_seq: u64,
     next_id: u64,
     pub(super) procs: HashMap<ProcessId, Proc>,

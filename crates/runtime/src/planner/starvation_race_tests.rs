@@ -3231,3 +3231,63 @@ async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_p
         }
     }
 }
+
+/// The M1 stress on restore-4: ten processes suspended for their binds were
+/// restored together, each took its items back, and every bind came up
+/// short against the others' (suspend, restore, short, 190 times each).
+/// One such restore at a time: with two waiting and room for either, the
+/// planner serves one; the other waits until the first fires (its bind went
+/// through), is parked again, or leaves.
+#[tokio::test(flavor = "current_thread")]
+async fn bind_suspended_restores_come_back_one_at_a_time() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    pool.gives.store(1, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        for pid in [a, b] {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 1,
+                pieces: 1,
+                pages: 1,
+            });
+            proc.bind_room_after = Some(0);
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    let (restoring, queued) = planner.with_inner(|inner| {
+        (
+            inner.bind_restoring,
+            inner
+                .queue
+                .values()
+                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
+                .map(|waiter| waiter.pid)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let first = restoring.expect("one is restored");
+    let other = if first == a { b } else { a };
+    assert_eq!(queued, vec![other], "the other waits");
+    // The first fires: its bind went through, and the other may come back.
+    let fire = planner.fire_in_flight(first);
+    assert_eq!(planner.with_inner(|inner| inner.bind_restoring), None);
+    drop(fire);
+}
