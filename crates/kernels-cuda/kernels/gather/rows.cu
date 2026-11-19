@@ -270,8 +270,17 @@ __global__ void gather_rows(
     int units)
 {
     const int n = static_cast<int>(blockIdx.x);
-    const U* src = wide + static_cast<long long>(index[n]) * units;
     U* dst = tight + static_cast<long long>(n) * units;
+    // A negative index reads nothing out (a skipped row's readout): its row
+    // is cleared.
+    if (index[n] < 0) {
+        for (int i = static_cast<int>(threadIdx.x); i < units;
+             i += static_cast<int>(blockDim.x)) {
+            dst[i] = U{};
+        }
+        return;
+    }
+    const U* src = wide + static_cast<long long>(index[n]) * units;
     for (int i = static_cast<int>(threadIdx.x); i < units;
          i += static_cast<int>(blockDim.x)) {
         dst[i] = src[i];

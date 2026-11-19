@@ -419,6 +419,97 @@ __global__ void gather_words(
     }
 }
 
+// A lane whose rows land where its program's cells say (a device-geometry
+// lane staged before the fire that computes its cells has run): the host
+// staged its pages up to `bound` and placeholders for the rest, and this
+// places it from the cells in stream order (`place_lanes`).
+struct PlaceRun {
+    // Its slot cell, a u32 a row.
+    const u32* slots;
+    // Its positions cell, a u32 a row; null: a row ropes at its slot.
+    const u32* positions;
+    // Its readable extent; null: one past its last slot.
+    const u32* extent;
+    u32 first_row;
+    u32 rows;
+    // Its lane in the page tables, and where its pages start in the indices.
+    u32 lane;
+    u32 table_at;
+    // The pages staged for it.
+    u32 pages;
+    // No slot below its committed boundary, none at or past `bound`, and no
+    // extent past `bound`: what the host checked when it read the cells.
+    u32 floor;
+    u32 bound;
+    // Its readout row's entry in the readout table; PLACE_NO_READOUT: none.
+    u32 readout;
+};
+
+static_assert(sizeof(PlaceRun) == 56, "PlaceRun: the Rust `channel::PlaceRun` mirrors this layout");
+
+constexpr u32 PLACE_NO_READOUT = 0xffffffffu;
+
+// Places each of `run_count` lanes, a block a run, over one page table: each
+// row's position, write page and offset, the lane's extent and the last
+// page's length that puts it there (at or under zero where the extent ends
+// pages before its staged pages do: a paged reader's length is
+// `(pages - 1) * page_size + last_page_len`). A slot or extent past the
+// lane's bounds writes nothing, reads nothing and states the lane's fault in
+// `faults[run]`. A row whose token is negative (a skip) writes no key, is
+// read by no row of its lane, reads nothing out, and still holds its
+// position.
+__global__ void place_lanes(
+    const PlaceRun* __restrict__ runs,
+    u32 run_count,
+    const i32* __restrict__ tokens,
+    i32* __restrict__ positions,
+    u8* __restrict__ row_valid,
+    i32* __restrict__ readout_rows,
+    const i32* __restrict__ indices,
+    i32* __restrict__ last_page_len,
+    i32* __restrict__ kv_len,
+    i32* __restrict__ write_page,
+    i32* __restrict__ write_offset,
+    u32* __restrict__ faults,
+    u32 page_size)
+{
+    const u32 run = blockIdx.x;
+    if (run >= run_count || threadIdx.x != 0) return;
+    const PlaceRun r = runs[run];
+    u32 reach = 0;
+    bool fault = r.rows == 0;
+    for (u32 row = 0; row < r.rows; ++row) {
+        const u32 slot = r.slots[row];
+        fault = fault || slot < r.floor || slot >= r.bound;
+        reach = max(reach, slot + 1u);
+    }
+    u32 extent = r.extent != nullptr ? r.extent[0] : reach;
+    fault = fault || extent < r.rows || extent > r.bound;
+    for (u32 row = r.rows; row-- > 0;) {
+        const u32 at = r.first_row + row;
+        const u32 slot = r.slots[row];
+        const bool skip = tokens[at] < 0;
+        positions[at] = static_cast<i32>(r.positions != nullptr ? r.positions[row] : slot);
+        if (fault || skip) {
+            row_valid[at] = 0;
+            write_page[at] = 0;
+            write_offset[at] = -1;
+        } else {
+            write_page[at] = indices[r.table_at + slot / page_size];
+            write_offset[at] = static_cast<i32>(slot % page_size);
+        }
+        if (skip && !fault && slot + 1u == extent) extent = slot;
+        if (skip && r.readout != PLACE_NO_READOUT && row + 1u == r.rows) {
+            readout_rows[r.readout] = -1;
+        }
+    }
+    if (fault) extent = 0;
+    kv_len[r.lane] = static_cast<i32>(extent);
+    last_page_len[r.lane] =
+        static_cast<i32>(extent) - static_cast<i32>((r.pages - 1u) * page_size);
+    faults[run] = fault ? 1u : 0u;
+}
+
 // The buffered recurrent rows of a fire, laid as the staged rs tables state
 // them (engine-cuda `inputs`, the rs section): a lane each, where its rows
 // land in its rs buffer pages and which of those pages' rows it replays

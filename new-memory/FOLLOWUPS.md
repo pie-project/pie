@@ -240,3 +240,23 @@ nothing recorded. Depends on device geometry for engine-gpu and the WGSL
 guest bounds checks (per-instance limits) landing first; the bind-group cache
 key including per-step scalars (`pipelines.rs:253`) is in Windows' step 7
 item 5.
+
+## F30. CUDA device-geometry shapes still read on the host (one fire in flight)
+
+A device-geometry pass is placed on the device and staged ahead
+(`engine-cuda serve/prepare.rs` `Shell::placement`, `inputs::place_lanes`)
+when its tokens, slots, positions, extent and mask lie in device-only cells
+and each lane runs one row. These shapes keep the host-read path: the fire
+waits for the one before (`reap_guests_at("prepare")`) and resolves the
+envelope on the host. Each is counted per pass a fire in the model status as
+`engine.devgeo_host_read.<why>` (`engine::live::HostRead`):
+`fold` (a fold port: the fold count is read for the report), `multi_row`
+(a lane of several rows: the causal bound within the lane and the mask's
+row stride come from the device), `rs_buffer` (a buffered recurrence
+replays the slots its mask admits, a host-planned schedule), `report`
+(a lane asks for its written pages / offsets / positions: tap them from
+the placed tables at settle), `window_list` (window tables carved from the
+extent on the host), `media` (M-RoPE positions and patch routes), `tap`,
+`cells` (a geometry port carried by a host-written cell or a constant, or a
+lane stating what the program computes). Each is a step towards the
+runtime's host shadow going away (REDESIGN 2.6 item 6).

@@ -26,7 +26,16 @@ __global__ void embed(const i32* __restrict__ ids, const bf16* __restrict__ tabl
     const long long row = window.plane(n);
     const int h = static_cast<int>(idx % per_row);
     const i32 raw = ids[row];
-    const int id = raw >= 0 && raw < vocab ? raw : 0;
+    // A negative id (a skipped row) reads no embedding: its row is cleared.
+    if (raw < 0) {
+        if constexpr (VEC) {
+            reinterpret_cast<b128*>(y + row * hidden)[h] = b128{};
+        } else {
+            y[row * hidden + h] = from_f32<bf16>(0.f);
+        }
+        return;
+    }
+    const int id = raw < vocab ? raw : 0;
     const bf16* src = ::pie::linear::table_row(table, hidden, rows_table, 1, 0, block_rows, id);
     if (hits != nullptr && h == 0) atomicAdd(&hits[id / block_rows], 1u);
     if constexpr (VEC) {
@@ -233,8 +242,14 @@ __global__ void split_rows(const T* __restrict__ src, T* __restrict__ left, T* _
 template <class U>
 __global__ void gather_rows(const U* __restrict__ wide, U* __restrict__ tight,
                             const i32* __restrict__ index, int units) {
-    const U* src = wide + static_cast<long long>(index[blockIdx.x]) * units;
     U* dst = tight + static_cast<long long>(blockIdx.x) * units;
+    // A negative index reads nothing out (a skipped row's readout): its row
+    // is cleared.
+    if (index[blockIdx.x] < 0) {
+        for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = U{};
+        return;
+    }
+    const U* src = wide + static_cast<long long>(index[blockIdx.x]) * units;
     for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];
 }
 

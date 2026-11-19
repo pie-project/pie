@@ -28,9 +28,18 @@ __global__ void embed(
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const i32 tid_raw = token_ids[plane_row];
-    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
-    const bf16* row = ::pie::linear::table_row(weight, hidden, rows_table, 1, 0, block_rows, tid);
     bf16* out = y + static_cast<long long>(plane_row) * hidden;
+    // A negative id (a skipped row) reads no embedding: its row is cleared.
+    if (tid_raw < 0) {
+        if constexpr (VEC) {
+            reinterpret_cast<float4*>(out)[h] = make_float4(0.f, 0.f, 0.f, 0.f);
+        } else {
+            out[h] = __float2bfloat16(0.f);
+        }
+        return;
+    }
+    const int tid = tid_raw < vocab ? tid_raw : 0;
+    const bf16* row = ::pie::linear::table_row(weight, hidden, rows_table, 1, 0, block_rows, tid);
     if (hits != nullptr && h == 0) atomicAdd(&hits[tid / block_rows], 1u);
 
     if constexpr (VEC) {

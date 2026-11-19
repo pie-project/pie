@@ -376,8 +376,9 @@ impl Session {
 
     /// Fixes, once at bind, which ports this instance resolves under
     /// `class` (the `device` ones of a decode envelope, every one of the
-    /// wide class) and how it reads a decode envelope's mask. A mask the
-    /// device computes is packed on the device, unless the load buffers
+    /// wide class) and how it reads a device-computed mask. A mask the
+    /// device computes is packed on the device, a decode envelope's and a
+    /// device geometry's alike, unless the load buffers
     /// recurrent state (`buffers_rs`): a buffered lane replays the slots its
     /// mask admits, a schedule the host plans, so there the mask is read on
     /// the host after the epilogue that writes it.
@@ -390,7 +391,10 @@ impl Session {
     ) {
         self.device = device;
         self.mask_on_device = !buffers_rs
-            && class == GeometryClass::DecodeEnvelope
+            && matches!(
+                class,
+                GeometryClass::DecodeEnvelope | GeometryClass::DeviceGeometry
+            )
             && engine::ports::engine_resolves(class, device, Port::AttnMask)
             && self.port_device_source(plan, Port::AttnMask).is_some();
     }
@@ -416,7 +420,7 @@ impl Session {
         )
     }
 
-    /// The device cell a decode envelope's attention mask is packed from,
+    /// The device cell an attention mask is packed from,
     /// `(address, bool bytes)`, where it is packed on the device: like its
     /// tokens, a mask the device computes never rides the host.
     #[must_use]

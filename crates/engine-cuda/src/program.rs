@@ -846,6 +846,36 @@ impl Plane {
         bound.session.mask_device_source(&program.plan)
     }
 
+    /// The device cell instance `id` carries `port` in, `(address, bytes)`,
+    /// where only the device writes it ([`Session::port_device_source`]).
+    #[must_use]
+    pub fn port_device_source(
+        &self,
+        id: InstanceId,
+        port: eta_ir::registry::Port,
+    ) -> Option<(u64, u32)> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        bound.session.port_device_source(&program.plan, port)
+    }
+
+    /// Whether instance `id`'s program binds `port`, from a channel or a
+    /// constant.
+    #[must_use]
+    pub fn binds(&self, id: InstanceId, port: eta_ir::registry::Port) -> bool {
+        self.instances
+            .get(&id)
+            .and_then(|bound| self.programs.get(&bound.program_id))
+            .is_some_and(|program| {
+                program
+                    .plan
+                    .package
+                    .ports
+                    .iter()
+                    .any(|binding| binding.port == port)
+            })
+    }
+
     /// Whether instance `id` resolves `port` ([`Session::resolves`]).
     #[must_use]
     pub fn resolves(&self, id: InstanceId, port: eta_ir::registry::Port) -> bool {

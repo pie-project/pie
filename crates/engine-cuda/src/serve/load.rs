@@ -1624,6 +1624,7 @@ impl Shell {
             kv_taps,
             tap_sink: None,
             airborne,
+            late_faults: std::sync::Arc::default(),
             owed: super::Owed::new(),
             guest_faults: Vec::new(),
             spare_events: Vec::new(),

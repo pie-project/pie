@@ -457,6 +457,7 @@ impl FireCtx<'_> {
             &p.lengths,
             &p.token_injects,
             &p.mask_injects,
+            &p.places,
         )?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);

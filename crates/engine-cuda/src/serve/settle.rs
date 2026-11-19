@@ -79,6 +79,16 @@ fn written(reports: Vec<super::KvReport>, tap: Option<&Tap>) -> Vec<engine::KvWr
         .collect()
 }
 
+/// Why a placed lane faulted: a cell put it outside what the host staged it
+/// under (`inputs::place_lanes`).
+fn place_refusal(lane: u32) -> String {
+    format!(
+        "lane {lane}'s rows land where the device says, and its cells put a slot below its \
+         committed boundary, or a slot or extent at or past what its working set reserved; \
+         nothing of it was written"
+    )
+}
+
 fn tap_rows(reports: &[super::KvReport]) -> usize {
     if reports.iter().all(|report| report.tokens.is_some()) {
         return 0;
@@ -124,6 +134,7 @@ impl Shell {
         };
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         let slot = prepared.slot.take();
+        let placed = std::mem::take(&mut prepared.placed);
         drop(prepared);
 
         // The guest passes this step launched that land with it: their
@@ -165,7 +176,12 @@ impl Shell {
             }
         };
 
-        let commits: Vec<u64> = flying.iter().map(|flying| flying.commit).collect();
+        // Each pass's commit word, then each placed lane's fault word.
+        let commits: Vec<u64> = flying
+            .iter()
+            .map(|flying| flying.commit)
+            .chain((0..placed.len()).map(|run| self.inputs.place_fault_at(run)))
+            .collect();
         let at = self.settlement.claim()?;
         let tap = match self.tap_tokens(at, &reports, &commits) {
             Ok(tap) => tap,
@@ -201,6 +217,7 @@ impl Shell {
 
         let recycler = self.settlement.recycler();
         let told = done.clone();
+        let late = self.late_faults.clone();
         let posted = self.device.host_fn(Box::new(move || {
             // Read before the event goes back: its tap is the next step's then.
             let mut outcome = if reports.is_empty() {
@@ -221,6 +238,17 @@ impl Shell {
                             super::enqueue::fault_of(Fired::Declined, flying.instance, flying.at)
                                 .expect("a declined pass faults");
                         outcome.fault_lanes(flying.lanes.clone(), Some(flying.instance), &reason);
+                    }
+                }
+                for (run, &(lane, instance)) in placed.iter().enumerate() {
+                    // SAFETY: as above; the fault words follow the commit words.
+                    let word = unsafe { *host.add(commits_from + flying.len() + run) };
+                    if word != 0 {
+                        let reason = place_refusal(lane);
+                        if done.is_none() {
+                            late.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(reason.clone());
+                        }
+                        outcome.fault_lanes(lane..lane + 1, Some(instance), &reason);
                     }
                 }
             }
@@ -327,6 +355,16 @@ impl Shell {
 
     pub fn read_out_rows(&mut self, settled: &mut Settled, want: &[Readout]) -> Result<()> {
         self.device.synchronize()?;
+        // A placed lane its fire refused, where no sink was told.
+        let late = std::mem::take(
+            &mut *self
+                .late_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some(reason) = late.into_iter().next() {
+            return Err(Fault::program("serve::fire", reason));
+        }
         let stream = self.device.stream();
         let Some(readback) = settled.readback.as_ref() else {
             return Ok(());

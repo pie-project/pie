@@ -432,6 +432,57 @@ pub struct MaskInject {
     pub bits: u32,
 }
 
+/// A lane the device places (`place_lanes`): its cells and bounds, and where
+/// it lies in the fire.
+pub type PlaceRun = kernels_cuda::runtime::channel::PlaceRun;
+
+/// Places each lane of `places` over every page table, in stream order
+/// behind the copies that staged their placeholders: one launch a table
+/// over a staged run table, each run's fault word from `faults`.
+fn place_lanes(
+    device: &crate::device::Context,
+    (store, at): (&mut Buffer, u64),
+    rows: kernels_cuda::runtime::channel::PlaceRows,
+    tables: &[TableHandles],
+    faults: u64,
+    places: &[PlaceRun],
+    page_size: u32,
+) -> Result<()> {
+    if places.is_empty() {
+        return Ok(());
+    }
+    let stream = device.stream();
+    if crate::device::alloc::is_capturing(stream) {
+        return Err(crate::error::Fault::program(
+            "inputs::commit",
+            "a lane the device places is staged inside a stream capture, which would keep \
+             one fire's cells for every replay",
+        ));
+    }
+    let bytes = std::mem::size_of_val(places);
+    // SAFETY: `PlaceRun` is plain `repr(C)` data, read as its bytes.
+    let raw = unsafe { core::slice::from_raw_parts(places.as_ptr().cast::<u8>(), bytes) };
+    store.stage(stream, at, raw)?;
+    for table in tables {
+        kernels_cuda::runtime::channel::place_lanes(
+            device.ctx(),
+            store.ptr() + at,
+            u32::try_from(places.len()).unwrap_or(u32::MAX),
+            rows,
+            kernels_cuda::runtime::channel::PlaceTable {
+                indices: table.indices.ptr,
+                last_page_len: table.last_page_len.ptr,
+                kv_len: table.kv_len.ptr,
+                write_page: table.write_page.ptr,
+                write_offset: table.write_offset.ptr,
+            },
+            faults,
+            page_size,
+        )?;
+    }
+    Ok(())
+}
+
 /// The fewest device-carried token runs one gather launch takes; under it
 /// each is copied on its own.
 const GATHERED_INJECTS: usize = 4;
@@ -600,6 +651,12 @@ pub struct Inputs {
     inject_runs: u64,
     /// The staged run table of [`inject_masks`] in the slab: a run a lane.
     mask_runs: u64,
+    /// The staged run table of [`place_lanes`] in the slab, and each run's
+    /// fault word: a run a lane.
+    place_runs: u64,
+    place_faults: u64,
+    /// The tokens a kv page holds, as the placed lanes' slots address them.
+    page_size: u32,
     /// Where the slab holds the fires' group masks, one stretch a ragged
     /// attention: a body captured over them reads each fire's at the same
     /// addresses.
@@ -693,6 +750,10 @@ impl Inputs {
         // A lane feeds its tokens, and its mask, from the device in one run.
         let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
+        // A lane the device places, a run and a fault word.
+        let place_runs =
+            take(lanes * size_of::<kernels_cuda::runtime::channel::PlaceRun>() as u64);
+        let place_faults = take(lanes * 4);
         let mask_indptr = take((lanes + 1) * 8);
         let mask_origin = take(lanes * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
@@ -846,6 +907,9 @@ impl Inputs {
             max_rows: budget.max_tokens,
             inject_runs,
             mask_runs,
+            place_runs,
+            place_faults,
+            page_size: paging.page_size.max(1),
             group_masks,
             staged_windows: Vec::new(),
             staged_mask_indptr: Vec::new(),
@@ -1269,6 +1333,13 @@ impl Inputs {
         self.store.ptr() + self.tokens
     }
 
+    /// Where run `run` of a fire's placed lanes states its fault
+    /// ([`place_lanes`]): 0 placed, else refused.
+    #[must_use]
+    pub fn place_fault_at(&self, run: usize) -> u64 {
+        self.store.ptr() + self.place_faults + run as u64 * 4
+    }
+
     #[must_use]
     pub fn seat(&self, id: u32, rows: u32) -> Option<Tensor> {
         let at = self.seats.iter().find(|at| at.seat.id == id)?;
@@ -1393,6 +1464,7 @@ impl Inputs {
         staged: &Staged,
         token_injects: &[TokenInject],
         mask_injects: &[MaskInject],
+        placed: &[PlaceRun],
     ) -> Result<Handles> {
         let Staged {
             rows,
@@ -1434,7 +1506,10 @@ impl Inputs {
         let stream = device.stream();
         let capturing = crate::device::alloc::is_capturing(stream);
         // The run tables hold a run a lane.
-        let fed = token_injects.len().max(mask_injects.len()) as u64;
+        let fed = token_injects
+            .len()
+            .max(mask_injects.len())
+            .max(placed.len()) as u64;
         if fed > u64::from(self.max_lanes) {
             return Err(crate::error::Fault::Ceiling {
                 what: "lanes fed from the device in one fire",
@@ -1447,6 +1522,9 @@ impl Inputs {
             staging,
             inject_runs,
             mask_runs,
+            place_runs,
+            place_faults,
+            page_size,
             staged_windows,
             staged_mask_indptr,
             staged_mask_origin,
@@ -1573,6 +1651,21 @@ impl Inputs {
             (&mut *store, *mask_runs),
             base + at_mask,
             mask_injects,
+        )?;
+        // Over the placeholders just staged and the tokens just injected.
+        place_lanes(
+            device,
+            (&mut *store, *place_runs),
+            kernels_cuda::runtime::channel::PlaceRows {
+                tokens: base + at_tokens,
+                positions: base + at_positions,
+                row_valid: base + at_row_valid,
+                readout_rows: base + at_readouts,
+            },
+            &page_tables,
+            base + *place_faults,
+            placed,
+            *page_size,
         )?;
 
         Ok(Handles {

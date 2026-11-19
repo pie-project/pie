@@ -222,6 +222,98 @@ pub fn gather_words(
     )
 }
 
+/// A device-placed lane of [`place_lanes`] (`channel.cu`'s `PlaceRun`):
+/// the cells its rows land by, and the bounds the host staged it under.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaceRun {
+    /// Its slot cell, a u32 a row.
+    pub slots: DevicePtr,
+    /// Its positions cell, a u32 a row; 0: a row ropes at its slot.
+    pub positions: DevicePtr,
+    /// Its readable extent; 0: one past its last slot.
+    pub extent: DevicePtr,
+    pub first_row: u32,
+    pub rows: u32,
+    /// Its lane in the page tables.
+    pub lane: u32,
+    /// Where its pages start in the table's indices.
+    pub table_at: u32,
+    /// The pages staged for it.
+    pub pages: u32,
+    /// No slot below it: the lane's committed boundary.
+    pub floor: u32,
+    /// No slot at or past it, and no extent past it.
+    pub bound: u32,
+    /// Its readout row's entry in the readout table; [`PlaceRun::NO_READOUT`]: none.
+    pub readout: u32,
+}
+
+const _: () = assert!(size_of::<PlaceRun>() == 56);
+
+impl PlaceRun {
+    pub const NO_READOUT: u32 = u32::MAX;
+}
+
+/// One page table's addresses [`place_lanes`] writes a lane's placement into.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaceTable {
+    pub indices: DevicePtr,
+    pub last_page_len: DevicePtr,
+    pub kv_len: DevicePtr,
+    pub write_page: DevicePtr,
+    pub write_offset: DevicePtr,
+}
+
+/// The fire's row tables [`place_lanes`] writes: its tokens (read), its
+/// positions, row validity and readout rows.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaceRows {
+    pub tokens: DevicePtr,
+    pub positions: DevicePtr,
+    pub row_valid: DevicePtr,
+    pub readout_rows: DevicePtr,
+}
+
+/// Places each of `run_count` [`PlaceRun`]s at `runs` over `table`, a block
+/// a run, each run's fault word at `faults`: what the host stages for a lane
+/// whose cells it has not read, in stream order behind the fire that puts
+/// them.
+pub fn place_lanes(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    run_count: u32,
+    rows: PlaceRows,
+    table: PlaceTable,
+    faults: DevicePtr,
+    page_size: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.place_lanes";
+    if run_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::runtime::channel::place_lanes"))
+            .apply(Launch::grid([run_count, 1, 1], [GATHER_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::U32(run_count),
+            ArgValue::Ptr(rows.tokens),
+            ArgValue::Ptr(rows.positions),
+            ArgValue::Ptr(rows.row_valid),
+            ArgValue::Ptr(rows.readout_rows),
+            ArgValue::Ptr(table.indices),
+            ArgValue::Ptr(table.last_page_len),
+            ArgValue::Ptr(table.kv_len),
+            ArgValue::Ptr(table.write_page),
+            ArgValue::Ptr(table.write_offset),
+            ArgValue::Ptr(faults),
+            ArgValue::U32(page_size),
+        ],
+    )
+}
+
 /// Loads the kernels a guest program's wave fires (pull, bump, publish,
 /// settle) on the current device now: every load fires them once a program
 /// binds, and nothing builds after ready.
@@ -236,7 +328,7 @@ pub fn load_wave_kernels() -> Result<(), Error> {
 /// device-carried mask bits, a table of them) on the current device now:
 /// a serving fire fires them, and nothing builds after ready.
 pub fn load_gather_kernels() -> Result<(), Error> {
-    for name in ["gather_words", "gather_bits", "gather_bit_runs"] {
+    for name in ["gather_words", "gather_bits", "gather_bit_runs", "place_lanes"] {
         kernel(FILE, &format!("::pie::runtime::channel::{name}")).load()?;
     }
     Ok(())

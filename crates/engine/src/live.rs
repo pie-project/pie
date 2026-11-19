@@ -26,6 +26,61 @@ pub struct Live(Arc<Record>);
 struct Record {
     /// Counts of [`Tally`] events since load, in its order.
     tallies: [AtomicU64; Tally::ALL.len()],
+    /// Counts of [`HostRead`] passes since load, in its order.
+    host_reads: [AtomicU64; HostRead::ALL.len()],
+}
+
+/// Why a pass bound in the device-geometry class had its cells read on the
+/// host before its fire was staged, so the fire waited for the one before
+/// it (one in flight): a shape the engine does not yet place on the device.
+/// Counted a pass a fire; read by the runtime's model status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRead {
+    /// The program binds a fold port.
+    Fold,
+    /// A lane carries more than one row.
+    MultiRow,
+    /// A lane buffers recurrent rows.
+    RsBuffer,
+    /// A lane asks for a report of what it wrote.
+    Report,
+    /// The load keeps window lists.
+    WindowList,
+    /// The fire carries media.
+    Media,
+    /// A lane taps a layer.
+    Tap,
+    /// A cell the host writes (or a constant) carries a geometry port, or a
+    /// lane states what the program computes.
+    Cells,
+}
+
+impl HostRead {
+    pub const ALL: [HostRead; 8] = [
+        HostRead::Fold,
+        HostRead::MultiRow,
+        HostRead::RsBuffer,
+        HostRead::Report,
+        HostRead::WindowList,
+        HostRead::Media,
+        HostRead::Tap,
+        HostRead::Cells,
+    ];
+
+    /// Its name in the model status.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            HostRead::Fold => "fold",
+            HostRead::MultiRow => "multi_row",
+            HostRead::RsBuffer => "rs_buffer",
+            HostRead::Report => "report",
+            HostRead::WindowList => "window_list",
+            HostRead::Media => "media",
+            HostRead::Tap => "tap",
+            HostRead::Cells => "cells",
+        }
+    }
 }
 
 /// What an engine counts while it serves, each a per-fire event: a way a
@@ -101,6 +156,7 @@ impl Live {
     pub fn armed() -> Live {
         Live(Arc::new(Record {
             tallies: Default::default(),
+            host_reads: Default::default(),
         }))
     }
 
@@ -113,6 +169,17 @@ impl Live {
     #[must_use]
     pub fn tallied(&self, tally: Tally) -> u64 {
         self.0.tallies[tally as usize].load(Ordering::Acquire)
+    }
+
+    /// One more device-geometry pass read on the host, for `why`.
+    pub fn host_read(&self, why: HostRead) {
+        self.0.host_reads[why as usize].fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The device-geometry passes read on the host for `why` since load.
+    #[must_use]
+    pub fn host_reads(&self, why: HostRead) -> u64 {
+        self.0.host_reads[why as usize].load(Ordering::Acquire)
     }
 }
 

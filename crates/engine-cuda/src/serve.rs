@@ -216,6 +216,9 @@ pub struct Shell {
     /// Where taps tell what they read.
     tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
+    /// The faults of placed lanes whose fire told no sink, for the read
+    /// that settles it to answer.
+    late_faults: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     owed: Owed,
     /// The guest passes of the step under way that faulted their lanes.
     guest_faults: Vec<GuestFault>,
@@ -1353,6 +1356,10 @@ pub struct Prepared<'a> {
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
     mask_injects: Vec<crate::inputs::MaskInject>,
+    /// The lanes the device places (`inputs::place_lanes`), a run each, and
+    /// the step lane and pass each run is: a run's fault faults that lane.
+    places: Vec<crate::inputs::PlaceRun>,
+    placed: Vec<(u32, engine::InstanceId)>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
     /// Why not, in a load that records bodies: the key and the reason.

@@ -65,6 +65,16 @@ impl Session {
                             serde_json::Value::from(each),
                         );
                     }
+                    // Device-geometry passes whose cells an engine read on
+                    // the host (fires one in flight), by why.
+                    for why in ::engine::live::HostRead::ALL {
+                        stats.insert(
+                            format!("{}.engine.devgeo_host_read.{}", model_name, why.name()),
+                            serde_json::Value::from(
+                                lives.iter().map(|live| live.host_reads(why)).sum::<u64>(),
+                            ),
+                        );
+                    }
                     // The rungs each engine stated eager at load: where an
                     // `engine.eager` fire is as stated, and no bug.
                     stats.insert(

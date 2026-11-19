@@ -15,6 +15,17 @@ use super::{
 
 const WINDOWS_MEMO: usize = 8;
 
+/// A lane the device places: the cells its row's slot, position and extent
+/// lie in (0: none, its position its slot and its extent one past it), and
+/// the pass they are the cells of.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    slots: u64,
+    positions: u64,
+    extent: u64,
+    instance: engine::InstanceId,
+}
+
 pub(super) struct WindowsMemo {
     tables: [poem_exec::fire::WindowTable; 3],
     indptr_host: Vec<i32>,
@@ -282,6 +293,61 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
 }
 
 impl Shell {
+    /// Whether `attached`, a device-geometry pass over `lanes`, is placed on
+    /// the device (`inputs::place_lanes`), or why its cells are read on the
+    /// host: placed, its tokens, slots, positions, extent and mask all lie
+    /// in cells only the device writes, and each lane runs one row over the
+    /// working set's pages with nothing the host must read back or replay,
+    /// so the host stages bounds and the device the values.
+    fn placement(
+        &self,
+        attached: &super::Attached,
+        lanes: &[super::Seated<'_>],
+        media: bool,
+        tapped: bool,
+    ) -> std::result::Result<(), engine::live::HostRead> {
+        use engine::live::HostRead;
+        use eta_ir::registry::Port;
+        let id = attached.instance;
+        let programs = &self.programs;
+        let on_device = |port: Port| {
+            !programs.binds(id, port) || programs.port_device_source(id, port).is_some()
+        };
+        let fail = |cond: bool, why: HostRead| if cond { Err(why) } else { Ok(()) };
+        fail(programs.binds(id, Port::Fold), HostRead::Fold)?;
+        fail(
+            lanes.iter().any(|seated| seated.lane.tokens.len() != 1),
+            HostRead::MultiRow,
+        )?;
+        fail(
+            lanes.iter().any(|seated| !matches!(seated.rs, RsVerb::Fold)),
+            HostRead::RsBuffer,
+        )?;
+        fail(lanes.iter().any(|seated| seated.reports != 0), HostRead::Report)?;
+        fail(self.pools.has_windowed(), HostRead::WindowList)?;
+        fail(media || self.mrope_seat, HostRead::Media)?;
+        fail(
+            tapped || lanes.iter().any(|seated| seated.tap.is_some()),
+            HostRead::Tap,
+        )?;
+        fail(
+            lanes.is_empty()
+                || self.page_tables == 0
+                || programs.token_device_source(id).is_none()
+                || programs.port_device_source(id, Port::Slots).is_none()
+                || !on_device(Port::Positions)
+                || !on_device(Port::KvLen)
+                || (programs.binds(id, Port::AttnMask) && programs.mask_device_source(id).is_none())
+                || lanes.iter().any(|seated| {
+                    seated.kv_less
+                        || seated.mask.is_some()
+                        || !seated.positions.is_empty()
+                        || seated.translation.is_empty()
+                }),
+            HostRead::Cells,
+        )
+    }
+
     /// Prepares a step: its lanes' pages, records and tables, ahead of its
     /// fire.
     fn prepare_step<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
@@ -336,6 +402,30 @@ impl Shell {
                 .min(lanes.len());
             &lanes[first..end]
         };
+        // A device-geometry pass whose lanes the device places: none of its
+        // cells is read on the host, so it is staged ahead like any other.
+        let placed_passes: Vec<bool> = attachments
+            .iter()
+            .map(|attached| {
+                self.programs.geometry_of(attached.instance)
+                    == Some(eta_ir::registry::GeometryClass::DeviceGeometry)
+                    && match self.placement(attached, span(attached), !media.is_empty(), tapped) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            if !self.arming {
+                                self.live.host_read(why);
+                            }
+                            false
+                        }
+                    }
+            })
+            .collect();
+        let placed_pass = |attached: &super::Attached| {
+            attachments
+                .iter()
+                .position(|other| other == attached)
+                .is_some_and(|at| placed_passes[at])
+        };
         let can_runahead = self.runahead.runs_ahead()
             && attachments.iter().all(|attached| {
                 match self.programs.geometry_of(attached.instance) {
@@ -356,7 +446,7 @@ impl Shell {
                                     )
                             })
                     }
-                    Some(eta_ir::registry::GeometryClass::DeviceGeometry) => false,
+                    Some(eta_ir::registry::GeometryClass::DeviceGeometry) => placed_pass(attached),
                 }
             });
 
@@ -381,6 +471,7 @@ impl Shell {
                 self.programs
                     .geometry_of(attached.instance)
                     .is_some_and(|class| class != eta_ir::registry::GeometryClass::Host)
+                    && !placed_pass(attached)
             })
         {
             self.reap_guests_at("prepare")?;
@@ -398,12 +489,19 @@ impl Shell {
         let mut mask_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         // The lanes whose positions the program computes on the device.
         let mut positions_on_device = vec![false; lanes.len()];
+        // The lanes the device places: each one's cells, where its row's
+        // slot, position and extent lie (`inputs::place_lanes`).
+        let mut place_of: Vec<Option<Placed>> = vec![None; lanes.len()];
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
-            let envelope_class = self.programs.geometry_of(attached.instance)
-                == Some(eta_ir::registry::GeometryClass::DecodeEnvelope);
             let spanned = span(attached);
+            let placed = placed_pass(attached);
+            // A pass the device places carries a lane's cells a row each, as
+            // a decode envelope's tokens are.
+            let envelope_class = placed
+                || self.programs.geometry_of(attached.instance)
+                    == Some(eta_ir::registry::GeometryClass::DecodeEnvelope);
             if self
                 .programs
                 .resolves(attached.instance, eta_ir::registry::Port::Positions)
@@ -465,6 +563,43 @@ impl Shell {
                     mask_src_of[first + lane] = Some((mask_src + u64::from(at * keys), keys));
                     at += seated.lane.tokens.len() as u32;
                 }
+            }
+            if placed {
+                let rows = spanned.len() as u32;
+                let cell = |port: eta_ir::registry::Port, per_lane: bool| -> Result<Vec<u64>> {
+                    let Some((at, native)) = self.programs.port_device_source(attached.instance, port)
+                    else {
+                        return Ok(vec![0; spanned.len()]);
+                    };
+                    if !per_lane && native == 4 {
+                        return Ok(vec![at; spanned.len()]);
+                    }
+                    if native != rows * 4 {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} carries its `{}` port in a {native}-byte cell and \
+                                 its pass's {rows} lane(s) carry a row each; a placed lane reads \
+                                 a word a row",
+                                attached.instance,
+                                port.name()
+                            ),
+                        ));
+                    }
+                    Ok((0..spanned.len() as u64).map(|lane| at + lane * 4).collect())
+                };
+                let slots = cell(eta_ir::registry::Port::Slots, true)?;
+                let positions = cell(eta_ir::registry::Port::Positions, true)?;
+                let extents = cell(eta_ir::registry::Port::KvLen, false)?;
+                for lane in 0..spanned.len() {
+                    place_of[first + lane] = Some(Placed {
+                        slots: slots[lane],
+                        positions: positions[lane],
+                        extent: extents[lane],
+                        instance: attached.instance,
+                    });
+                }
+                continue;
             }
             if can_runahead && envelope_class {
                 if first < lanes.len() {
@@ -1091,6 +1226,8 @@ impl Shell {
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
         let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
+        // The lanes the device places, and the step lane each is.
+        let mut places: Vec<(crate::inputs::PlaceRun, (u32, engine::InstanceId))> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -1099,8 +1236,34 @@ impl Shell {
                 Some((held, at)) => Some(resolved[held].lane(at, source)?),
                 None => None,
             };
+            // A placed lane is staged at its bound: its pages up to what its
+            // working set reserved (and its mask's keys reach), its extent
+            // and slot the device's to say within them.
+            let placing = match place_of[source] {
+                None => None,
+                Some(placed) => {
+                    let reserved = u64::from(page_tokens) * seated.translation.len() as u64;
+                    let keyed = mask_src_of[source]
+                        .map_or(u64::MAX, |(_, keys)| u64::from(seated.folded) + u64::from(keys));
+                    let bound = u32::try_from(reserved.min(keyed)).unwrap_or(u32::MAX);
+                    if bound <= seated.folded || bound < row.rows {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source}'s rows land where the device says, below a bound \
+                                 of {bound} slot(s) (its {} reserved page(s), its mask's keys) \
+                                 over a committed {}: nothing past its frozen prefix to write",
+                                seated.translation.len(),
+                                seated.folded
+                            ),
+                        ));
+                    }
+                    Some((placed, bound, bound.div_ceil(page_tokens)))
+                }
+            };
             let have = match ports.as_ref().filter(|ports| ports.owns_slots()) {
                 _ if seated.kv_less => 0,
+                _ if let Some((_, bound, _)) = placing => bound - row.rows,
                 Some(ports) => {
                     let after = ports.reach(row.rows as usize)?.ok_or_else(|| {
                         Fault::program(
@@ -1151,15 +1314,41 @@ impl Shell {
             if begins {
                 fresh.push(seated.rs_slot.unwrap_or(lane.slot));
             }
+            if let Some((placed, bound, pages)) = placing {
+                places.push((
+                    crate::inputs::PlaceRun {
+                        slots: placed.slots,
+                        positions: placed.positions,
+                        extent: placed.extent,
+                        first_row: row.row_offset,
+                        rows: row.rows,
+                        lane: seats.len() as u32,
+                        // Where its pages start, once every lane's are counted.
+                        table_at: 0,
+                        pages,
+                        floor: seated.folded,
+                        bound,
+                        readout: if readout_count[source] == 1 {
+                            readout_first[source]
+                        } else {
+                            crate::inputs::PlaceRun::NO_READOUT
+                        },
+                    },
+                    (source as u32, placed.instance),
+                ));
+            }
             seats.push(Seat {
                 slot: lane.slot,
                 have,
                 rows: row.rows,
             });
             kv_less_seats.push(seated.kv_less);
-            tables.push(match &device_pages[source] {
-                Some(pages) => std::borrow::Cow::Owned(pages.clone()),
-                None => std::borrow::Cow::Borrowed(seated.pages),
+            tables.push(match (&device_pages[source], placing) {
+                (Some(pages), _) => std::borrow::Cow::Owned(pages.clone()),
+                (None, Some((_, _, pages))) => {
+                    std::borrow::Cow::Borrowed(&seated.translation[..pages as usize])
+                }
+                (None, None) => std::borrow::Cow::Borrowed(seated.pages),
             });
             window_ids.push(match (&device_pages[source], &device_window[source]) {
                 (_, Some(ids)) => std::borrow::Cow::Owned(ids.clone()),
@@ -1654,6 +1843,16 @@ impl Shell {
             })
             .collect::<Result<Vec<_>>>()?;
         super::btrace::mark("page_arith");
+        // A placed lane's pages start where its table's bounds say: every
+        // table is carved over the same seats and pages (none is windowed).
+        if let Some(geometry) = geometries.first() {
+            for (run, _) in &mut places {
+                run.table_at = geometry
+                    .indptr
+                    .get(run.lane as usize)
+                    .map_or(0, |&at| u32::try_from(at).unwrap_or(0));
+            }
+        }
         if writes.iter().any(Option::is_some) {
             let lane_of = |row: usize| {
                 composition
@@ -2093,6 +2292,8 @@ impl Shell {
             lengths: staged_lens,
             token_injects,
             mask_injects,
+            placed: places.iter().map(|&(_, lane)| lane).collect(),
+            places: places.into_iter().map(|(run, _)| run).collect(),
             kv_reports,
             bodied,
             unbodied,
