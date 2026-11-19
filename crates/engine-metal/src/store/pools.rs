@@ -2086,16 +2086,22 @@ impl Pools {
     /// Copies whole slots of `id` (slot refs `ids`) and the slot file's
     /// `slots` the way `to_disk` says. The caller has drained every frame.
     fn spill(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
+        // A parked role's slot no larger than a kv page lies in a slot of
+        // the kv file (CONTRACT-BC 22).
         let (what, bytes) = match id {
             LIST => ("disk kv pages", self.shape(LIST)?.slot_bytes),
             FIXED => ("parked rs rows", self.shape(FIXED)?.slot_bytes),
             other => {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a slot file for slot shape {other}: only kv pages (list) and parked rs \
-                         rows (fixed) go to disk, and a role slot moves to the host tier"
-                    ),
-                });
+                let bytes = self.shape(other)?.slot_bytes;
+                if bytes > self.page_bytes()? {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "slot shape {other} to the slot file: its {bytes}-byte slot is \
+                             larger than the file's kv page"
+                        ),
+                    });
+                }
+                ("disk kv pages", bytes)
             }
         };
         let offsets = ids
@@ -2107,8 +2113,8 @@ impl Pools {
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
         }
         let file = match id {
-            LIST => &mut self.disk,
-            _ => &mut self.parked,
+            FIXED => &mut self.parked,
+            _ => &mut self.disk,
         };
         Spill::room(file.as_ref(), what, slots)?;
         let Some(spill) = file.as_mut() else {

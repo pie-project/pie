@@ -225,22 +225,33 @@ impl ResidencyPlanner {
         let shape = self.with_inner(|inner| match inner.queue.get(&victims.head) {
             Some(waiter) => match &waiter.kind {
                 WaitKind::BindRoom { run, pieces, .. } => Some((*run, *pieces)),
+                // So is the restore of a process a bind short of room
+                // suspended: the room that bind asks.
                 WaitKind::Restore { .. } => inner
                     .procs
                     .get(&waiter.pid)
-                    .and_then(|proc| proc.roles_short)
+                    .and_then(|proc| proc.roles_short.or(proc.bind_room))
                     .map(|need| (need.run, need.pieces)),
                 WaitKind::Allocation { .. } => None,
             },
             None => None,
         });
         let candidates = victims.preferred();
+        let residents: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
+        // Parked state lying on the device is an occupant too: a chunk it
+        // shares with residents empties once both move, it down a tier and
+        // they off the device.
         let map = shape.map(|_| {
-            let pids: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
-            self.port.chunk_occupants(&pids)
+            let mut map = self.port.chunk_occupants(&residents);
+            map.merge(self.port.parked_occupants(victims.head_pid));
+            map
         });
         let (candidates, wanted, occupants) =
             chunk_picks(candidates, victims.deficit, shape, map.as_ref());
+        let (occupants, parked): (Vec<ProcessId>, Vec<ProcessId>) = occupants
+            .into_iter()
+            .partition(|pid| residents.contains(pid));
+        let parking_down = !parked.is_empty() && self.park_down(victims.head_pid, parked);
         let (mut picks, unhostable) =
             self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
         // An occupant with no kv or state to move (only guest scratch,
@@ -268,6 +279,11 @@ impl ResidencyPlanner {
                 }
             });
             self.record_host_swap_exhaustion();
+        }
+        if picks.is_empty() && parking_down {
+            // The parked state's move funds it: nothing for the policy yet.
+            self.note_short(victims.head, 0, 0);
+            return;
         }
         if picks.is_empty() {
             // Nothing the planner may move covers the head: it parks, and

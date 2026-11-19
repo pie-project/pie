@@ -2414,6 +2414,15 @@ struct BindRoomPool {
     occupant: parking_lot::Mutex<Option<ProcessId>>,
     /// The pool's count of room given back (`room_gives`).
     gives: std::sync::atomic::AtomicU64,
+    /// Parked state lying on the device: each chunk it holds whole, and
+    /// the process it parked with ([`PoolPort::parked_occupants`]).
+    parked: parking_lot::Mutex<Vec<(u32, ProcessId)>>,
+    /// Host slots held (of `host`), and disk slots free.
+    host_used: AtomicU32,
+    disk_free: AtomicU32,
+    /// The moves of parked state down a tier, in order: `"spill"` (host kv
+    /// on down to disk) or `"park"` (role slots to the host).
+    moved: parking_lot::Mutex<Vec<&'static str>>,
 }
 
 impl BindRoomPool {
@@ -2426,6 +2435,10 @@ impl BindRoomPool {
             model: 0,
             occupant: parking_lot::Mutex::new(None),
             gives: std::sync::atomic::AtomicU64::new(0),
+            parked: parking_lot::Mutex::new(Vec::new()),
+            host_used: AtomicU32::new(0),
+            disk_free: AtomicU32::new(0),
+            moved: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -2457,13 +2470,73 @@ impl PoolPort for BindRoomPool {
         }
     }
     fn host_stats(&self) -> (u32, u32) {
-        (self.host, self.host)
+        (self.host - self.host_used.load(Ordering::Relaxed), self.host)
     }
     fn disk_stats(&self) -> (u32, u32) {
-        (0, 0)
+        let free = self.disk_free.load(Ordering::Relaxed);
+        (free, free)
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
+    }
+    fn parked_occupants(&self, except: ProcessId) -> super::pool::ChunkMap {
+        super::pool::ChunkMap {
+            held: self
+                .parked
+                .lock()
+                .iter()
+                .filter(|&&(_, pid)| pid != except)
+                .map(|&(chunk, pid)| super::pool::ChunkHeld {
+                    chunk,
+                    used: 1,
+                    by: vec![(pid, 1)],
+                })
+                .collect(),
+            free: self.free.lock().clone(),
+        }
+    }
+    /// One host slot a chunk of parked state: the host full, host kv goes
+    /// to disk for it first, a slot a chunk; with no host tier, the parked
+    /// state goes to disk itself.
+    fn move_parked_down(
+        &self,
+        planner: &Arc<ResidencyPlanner>,
+        pids: &[ProcessId],
+        _order: &[ProcessId],
+    ) -> bool {
+        let chunks: Vec<u32> = self
+            .parked
+            .lock()
+            .iter()
+            .filter(|(_, pid)| pids.contains(pid))
+            .map(|&(chunk, _)| chunk)
+            .collect();
+        if chunks.is_empty() {
+            return false;
+        }
+        let want = chunks.len() as u32;
+        let host_free = self.host - self.host_used.load(Ordering::Relaxed);
+        if self.host == 0 && self.disk_free.load(Ordering::Relaxed) >= want {
+            // No host tier (unified memory): to disk at once.
+            self.disk_free.fetch_sub(want, Ordering::Relaxed);
+            self.parked.lock().retain(|(_, pid)| !pids.contains(pid));
+            self.free.lock().extend(chunks);
+            self.moved.lock().push("disk");
+        } else if self.host > 0 && host_free >= want {
+            self.host_used.fetch_add(want, Ordering::Relaxed);
+            self.parked.lock().retain(|(_, pid)| !pids.contains(pid));
+            self.free.lock().extend(chunks);
+            self.moved.lock().push("park");
+        } else if self.disk_free.load(Ordering::Relaxed) >= want {
+            self.disk_free.fetch_sub(want, Ordering::Relaxed);
+            self.host_used.fetch_sub(want, Ordering::Relaxed);
+            self.moved.lock().push("spill");
+        } else {
+            return false;
+        }
+        let planner = planner.clone();
+        crate::rt::spawn(async move { planner.parked_down_done(true) });
+        true
     }
     fn reclaim_idle(&self) -> u32 {
         let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
@@ -2478,7 +2551,7 @@ impl PoolPort for BindRoomPool {
         (0, 0)
     }
     fn suspend_capable(&self) -> bool {
-        self.host > 0
+        self.host > 0 || self.disk_free.load(Ordering::Relaxed) > 0
     }
     fn locus(&self) -> (usize, usize) {
         (self.model, 0)
@@ -3250,6 +3323,144 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
         planner.stats.restore_roles_short.load(Ordering::Relaxed),
         0,
         "and no restore was sent on the understated need"
+    );
+}
+
+/// Mac Pro's M5 stall (sc/np-stack-restore-5, 500 at once), shape C: the
+/// host full (its kv the parked processes'), every process evicted, the
+/// device nearly free but no run of the head restore's need standing: the
+/// role slots parked processes left on the device (no host room at their
+/// park) sit between the free chunks, and nothing moved them, nor was
+/// anyone resident to evict. Parked state on the device is room a move
+/// makes: host kv goes on down to disk to make host room, the parked role
+/// slots go to the host, and the restore lands in the run that leaves. The
+/// planner counts it movable ([`ResidencyPlanner::movable_parked_room`]).
+#[tokio::test(flavor = "current_thread")]
+async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 4)
+    });
+    // Chunks 2 and 5 hold parked role slots; no three adjacent free.
+    pool.free.lock().extend([0, 1, 3, 4, 6, 7]);
+    pool.host_used.store(4, Ordering::Relaxed);
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, a, b) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.parked.lock().extend([(2, a), (5, b)]);
+    planner.with_inner(|inner| {
+        for pid in [head, a, b] {
+            inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+        }
+        inner.procs.get_mut(&head).unwrap().roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(!pool.guest_room_free(3, 1), "no run of its need stands");
+    assert!(planner.with_inner(|inner| inner.fleet_stalled()), "nothing resident");
+    assert!(
+        planner.movable_parked_room(head, 3, 1),
+        "the parked state counts as movable room"
+    );
+    assert!(
+        !planner.movable_parked_room(head, 3, 3),
+        "three runs of three do not fit eight chunks however much moves"
+    );
+    planner.poke();
+    for _ in 0..400 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        *pool.moved.lock(),
+        vec!["spill", "park"],
+        "host kv to disk first, then the parked role slots to the host"
+    );
+    assert!(pool.guest_room_free(3, 1), "a run of its need stands");
+    assert_eq!(
+        planner.stats.restores.load(Ordering::Relaxed),
+        1,
+        "and the head restore lands"
+    );
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&head].state),
+        Residency::Resident
+    );
+}
+
+/// The M1 stress (unified memory: no host tier): evictions moved only kv
+/// to disk, so every Instance chunk stayed held by parked processes' role
+/// slots, and the bind-suspended head needing two runs of three chunks
+/// found no victim, as no occupant was resident; nothing was in flight and
+/// the fleet stopped. The parked role chunks are movable room: they go
+/// down to disk at once (no host tier to go through), and the head is
+/// restored into the runs that leaves.
+#[tokio::test(flavor = "current_thread")]
+async fn with_no_host_tier_parked_role_chunks_go_to_disk_for_a_bind_suspended_head() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 0)
+    });
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, a, b) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Every chunk held by parked role slots, none free.
+    pool.parked
+        .lock()
+        .extend((0..8).map(|chunk| (chunk, if chunk < 4 { a } else { b })));
+    planner.with_inner(|inner| {
+        for pid in [head, a, b] {
+            inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+        }
+        inner.procs.get_mut(&head).unwrap().bind_room = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 2,
+            pages: 6,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert_eq!(pool.host_stats(), (0, 0), "no host tier");
+    assert!(planner.movable_parked_room(head, 3, 2), "the parked chunks are movable");
+    planner.poke();
+    for _ in 0..400 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(*pool.moved.lock(), vec!["disk"], "to disk at once, never a host tier");
+    assert!(pool.guest_room_free(3, 2), "two runs of three stand");
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&head].state),
+        Residency::Resident,
+        "and the bind-suspended head is restored"
     );
 }
 

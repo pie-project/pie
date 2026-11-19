@@ -112,6 +112,59 @@ pub(super) fn spawn_spill(
     }
 }
 
+/// Parked role slots left on the device go on down a tier, the host or the
+/// disk ([`crate::store::roles::Roles::prepare_park_down`]): their process is
+/// evicted, so no fire reads them; a failure leaves them where they lie.
+pub(super) fn spawn_park_down(planner: Arc<ResidencyPlanner>, txn: RoleMove) {
+    let (model, engine) = planner.locus();
+    // The guard owns the move from here: a task that never runs drops it,
+    // and that gives back what the move took.
+    let guard = MoveGuard::new(
+        model,
+        engine,
+        Move::Suspend {
+            kv: None,
+            rs: None,
+            roles: Some(txn),
+        },
+    );
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let moved = park_down(&planner, guard).await;
+            if let Err(error) = &moved {
+                tracing::warn!(%error, "planner: parked role slots could not move down");
+            }
+            planner.parked_down_done(moved.is_ok());
+        }
+    };
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        "park-down",
+        task,
+        |planner, _| planner.parked_down_done(false),
+    );
+    if !spawned {
+        planner.parked_down_done(false);
+    }
+}
+
+async fn park_down(planner: &ResidencyPlanner, mut guard: MoveGuard) -> Result<(), String> {
+    guard.copy(planner, ProcessId::nil()).await?;
+    let Move::Suspend {
+        roles: Some(txn), ..
+    } = guard.take()
+    else {
+        unreachable!("a park down carries role slots")
+    };
+    let (model, engine) = planner.locus();
+    if let Some(store) = &crate::store::registry::get(model, engine).roles {
+        store.lock().unwrap().commit(txn);
+    }
+    Ok(())
+}
+
 /// Copies a spill's host slots to its disk slots (`copy_slots`, HostPinned
 /// -> LocalDisk) and commits it: answers the pages moved.
 pub(super) async fn spill(
@@ -328,7 +381,11 @@ impl Move {
         for copy in roles.iter().flat_map(RoleMove::copies) {
             copies.push(TierMove {
                 kind: TierKind::RoleSlots(copy.shape),
-                tier: MemoryDomain::HostPinned,
+                tier: if copy.disk {
+                    MemoryDomain::LocalDisk
+                } else {
+                    MemoryDomain::HostPinned
+                },
                 out,
                 device: copy.device.clone(),
                 slots: copy.host.clone(),

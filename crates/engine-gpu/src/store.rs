@@ -1538,8 +1538,10 @@ impl<B: Backend> Pools<B> {
         Ok(())
     }
 
-    /// Copies whole kv list slots (slot refs `ids`) and the slot file's
-    /// `slots` the way `to_disk` says. The caller has drained every frame.
+    /// Copies whole slots of `id` (slot refs `ids`) and the slot file's
+    /// `slots` the way `to_disk` says: kv list slots, or a parked role's
+    /// slots no larger than one, each in a slot of the file (CONTRACT-BC
+    /// 22). The caller has drained every frame.
     fn spill(
         &mut self,
         device: &B::Context,
@@ -1548,16 +1550,19 @@ impl<B: Backend> Pools<B> {
         ids: &[u32],
         slots: &[u32],
     ) -> Result<()> {
-        if id != LIST {
+        let bytes = self.shape(id)?.slot_bytes;
+        if id != LIST && bytes > self.page_bytes() {
             return Err(Fault::Unbound {
-                what: format!("slot shape {id} to the slot file, which holds kv list slots"),
+                what: format!(
+                    "slot shape {id} to the slot file: its {bytes}-byte slot is larger than \
+                     the file's kv list slot"
+                ),
             });
         }
         Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        let bytes = self.page_bytes();
         let places = ids
             .iter()
-            .map(|&slot| self.slot_offset(LIST, slot))
+            .map(|&slot| self.slot_offset(id, slot))
             .collect::<Result<Vec<_>>>()?;
         let Some(mut disk) = self.disk.take() else {
             return Ok(());

@@ -139,6 +139,11 @@ impl ResidencyPlanner {
                 }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
+                // Its parked state is on its way down a tier: restored now,
+                // it would miss the items moving. The landing pokes.
+                if is_restore && inner.parked_moving.contains(&pid) {
+                    return Step::Done;
+                }
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
@@ -208,6 +213,11 @@ impl ResidencyPlanner {
                     if self.wait_on_grow(no_grow, need) {
                         return true;
                     }
+                    // Parked state lying on the device moves down a tier
+                    // before any resident does.
+                    if self.park_down_for(run, pieces) {
+                        return false;
+                    }
                     true
                 }
                 Step::RestoreBindRoom { key, need } => {
@@ -235,6 +245,13 @@ impl ResidencyPlanner {
                     }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
+                    }
+                    // Parked state lying on the device moves down a tier for
+                    // it, no one running on it (the M1 stress: every
+                    // Instance chunk held by parked processes' role slots,
+                    // the bind-suspended head's runs never funded).
+                    if self.park_down_for(need.run, need.pieces) {
+                        return false;
                     }
                     if !self.with_inner(|inner| inner.fleet_stalled()) {
                         return false;
@@ -280,6 +297,14 @@ impl ResidencyPlanner {
                     };
                     if self.wait_on_grow(no_grow, grow) {
                         return true;
+                    }
+                    // Parked state lying on the device (role slots their
+                    // park found no host room for) moves down a tier before
+                    // any resident does: no one runs on it (Mac Pro's M5
+                    // stall: host full, every process evicted, the head's
+                    // runs held by parked role slots, nothing to evict).
+                    if self.park_down_for(run, pieces) {
+                        return false;
                     }
                     // Else the occupants of the chunks it could take move
                     // for it (`plan_eviction`'s chunk branch), under the

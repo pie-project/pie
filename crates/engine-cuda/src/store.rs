@@ -4256,10 +4256,23 @@ impl Pools {
                 )
             })?;
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        if (from == Tier::Disk || to == Tier::Disk) && kind != Kind::List {
+        // The slot file's slots are kv list slots: a parked role's slot no
+        // larger than one lies in one (CONTRACT-BC 22); the host tier's own
+        // slots move to disk as kv list slots only.
+        let list_bytes = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let role = matches!(kind, Kind::Instance | Kind::Channel);
+        if (from == Tier::Disk || to == Tier::Disk)
+            && kind != Kind::List
+            && !(role && bytes <= list_bytes && (from == Tier::Device || to == Tier::Device))
+        {
             return Err(Fault::Unbound {
                 what: format!(
-                    "a {} to or from disk: the slot file holds kv list slots only",
+                    "a {} to or from disk: the slot file holds kv list slots, and a parked \
+                     role's slots no larger than one moved from the device",
                     kind.name()
                 ),
             });
@@ -4333,7 +4346,7 @@ impl Pools {
                     .iter()
                     .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
                     .unzip();
-                self.through_disk(stream, to_disk, &disk, |pools, at| {
+                self.through_disk(stream, to_disk, &disk, bytes, |pools, at| {
                     pools.chunks.span(kind, device[at], 0, bytes)
                 })
             }
@@ -4395,13 +4408,14 @@ impl Pools {
         Ok(())
     }
 
-    /// Moves kv list slots between the slot file's slots `disk` and the
+    /// Moves `bytes` a slot between the slot file's slots `disk` and the
     /// device addresses `at(i)` through the stage, one slot at a time.
     fn through_disk(
         &mut self,
         stream: *mut core::ffi::c_void,
         to_disk: bool,
         disk: &[u32],
+        bytes: u64,
         at: impl Fn(&Self, usize) -> Result<u64>,
     ) -> Result<()> {
         let have = u64::from(self.disk_pages());
@@ -4412,11 +4426,6 @@ impl Pools {
                 have,
             });
         }
-        let bytes = self
-            .chunks
-            .layout()
-            .shape(Kind::List)
-            .map_or(0, |list| list.slot_bytes);
         let Some(mut spill) = self.disk.take() else {
             return Ok(());
         };

@@ -42,6 +42,10 @@ pub(super) struct Inner {
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
+    /// The evicted processes whose parked state is on its way down a tier
+    /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
+    /// lands, so no restore misses an item moving under it.
+    pub(super) parked_moving: HashSet<ProcessId>,
 }
 
 impl Inner {

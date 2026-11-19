@@ -44,6 +44,11 @@ pub struct ResidencyPlanner {
     /// A host -> disk spill failed: the engine moves no slots between
     /// tiers below the device, and none is tried again.
     spill_failed: AtomicBool,
+    /// Parked state is on its way down a tier ([`Self::park_down`]).
+    parking_down: AtomicBool,
+    /// A move of parked state down a tier failed: the engine moves no such
+    /// slots, and none is tried again.
+    park_down_failed: AtomicBool,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -102,6 +107,8 @@ impl ResidencyPlanner {
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
             spill_failed: AtomicBool::new(false),
+            parking_down: AtomicBool::new(false),
+            park_down_failed: AtomicBool::new(false),
             no_grow: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
@@ -407,6 +414,97 @@ impl ResidencyPlanner {
         if moved {
             self.re_arm_idle_reclaim();
         }
+        self.poke();
+    }
+
+    /// Parked state lying on the device (role slots its park found no host
+    /// room for) is room a move makes, as idle cache is: for the head's
+    /// `pieces` runs of `run` adjacent chunks, the parked processes whose
+    /// state alone empties the cheapest such runs, free chunks beside it,
+    /// move it down a tier ([`Self::park_down`]). Whether a move is on its
+    /// way (its landing pokes the planner).
+    pub(super) fn park_down_for(self: &Arc<Self>, run: u32, pieces: u32) -> bool {
+        let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(_, w)| w.pid)) else {
+            return false;
+        };
+        match self.port.parked_occupants(head).cheapest_runs(run, pieces) {
+            Some(pids) if !pids.is_empty() => self.park_down(head, pids),
+            _ => false,
+        }
+    }
+
+    /// Whether `pieces` runs of `run` adjacent chunks stand on the device
+    /// once the parked state lying there, `head`'s own left out, has moved
+    /// down a tier: free chunks, and chunks only such state holds, with
+    /// room below to take it (the host's, or the disk's that host kv going
+    /// on down makes for it). What a "does not fit even with everything
+    /// else moved" verdict counts as movable beside the residents
+    /// ([`super::pool::ChunkMap::merge`] the two maps for runs both empty):
+    /// a head is refused only where this is false too.
+    pub fn movable_parked_room(&self, head: ProcessId, run: u32, pieces: u32) -> bool {
+        match self.port.parked_occupants(head).cheapest_runs(run, pieces) {
+            Some(pids) if pids.is_empty() => true,
+            Some(_) => {
+                self.port.suspend_capable()
+                    && !self.park_down_failed.load(Ordering::Acquire)
+                    && (self.port.host_stats().0 > 0 || self.port.disk_stats().0 > 0)
+            }
+            None => false,
+        }
+    }
+
+    /// Moves the parked state `pids` left on the device down a tier: the
+    /// host where it has room, else host kv goes on down to disk first to
+    /// make it, the evicted processes' in the order they would be evicted
+    /// (lowest first), `head`'s last of all and never its own state: the
+    /// tiers keep the newer above the older, as idle cache's do
+    /// ([`Self::demote_idle`]). Only evicted processes' state moves, and
+    /// none of them is restored until it lands. Whether a move is on its
+    /// way.
+    pub(super) fn park_down(self: &Arc<Self>, head: ProcessId, pids: Vec<ProcessId>) -> bool {
+        if self.park_down_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.parking_down.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let (pids, order) = self.with_inner(|inner| {
+            let evicted = |pid: &ProcessId| {
+                *pid != head
+                    && inner
+                        .procs
+                        .get(pid)
+                        .is_some_and(|proc| proc.state == Residency::Evicted)
+            };
+            let pids: Vec<ProcessId> = pids.into_iter().filter(|pid| evicted(pid)).collect();
+            let mut order: Vec<(std::cmp::Reverse<Rank>, ProcessId)> = inner
+                .procs
+                .iter()
+                .filter(|(pid, _)| evicted(pid))
+                .map(|(pid, proc)| (std::cmp::Reverse(proc.rank()), *pid))
+                .collect();
+            order.sort_unstable();
+            inner.parked_moving.extend(pids.iter().copied());
+            let order: Vec<ProcessId> = order.into_iter().map(|(_, pid)| pid).collect();
+            (pids, order)
+        });
+        if pids.is_empty() || !self.port.move_parked_down(self, &pids, &order) {
+            self.with_inner(|inner| inner.parked_moving.clear());
+            self.parking_down.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// A move of parked state down a tier ended: its processes may be
+    /// restored again, and the plan looks at the room it made. One that
+    /// failed is not tried again: it would fail the same way.
+    pub(super) fn parked_down_done(self: &Arc<Self>, moved: bool) {
+        if !moved {
+            self.park_down_failed.store(true, Ordering::Release);
+        }
+        self.with_inner(|inner| inner.parked_moving.clear());
+        self.parking_down.store(false, Ordering::Release);
         self.poke();
     }
 
