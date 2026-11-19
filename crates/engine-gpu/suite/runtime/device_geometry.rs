@@ -7,7 +7,7 @@
 //! pass puts the next fire's), so a fire staged behind the last resolves
 //! what that pass put once it landed. Each beam's logits, read back through
 //! the guest's `logits` output, answer what the host path answers for the
-//! same beams stated on the lanes, for two decode steps fired back to back
+//! same beams stated on the lanes, for two decode steps fired one after the other
 //! (engine-xla's `a_device_geometry_beam_answers_the_host_path`).
 
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration, ChannelSeed};
-use engine::chunk::{ChunkFacts, ShapeId};
+use engine::chunk::{ChunkFacts, Growth, ShapeId};
 use engine::fire::{
     Attachment, FrameSubmission, KvDelta, Lane, ListKind, Mask, Masking, Readout, Step,
 };
@@ -280,8 +280,9 @@ fn answers_the_host_path(frames: u8) {
             checkpoint: Checkpoint::Path(fixture.container.clone()),
             budgets: Budgets {
                 max_lanes: 4,
-                max_tokens: PAGE,
-                buckets: vec![PAGE],
+                // The overreach step fires a prompt beside a beam lane.
+                max_tokens: 2 * PAGE,
+                buckets: vec![PAGE, 2 * PAGE],
                 max_adapters: 0,
                 page_size: PAGE,
                 max_context: 64,
@@ -320,8 +321,25 @@ fn answers_the_host_path(frames: u8) {
     // then the kv pages.
     let facts = loaded.caps.chunks.clone();
     let segment = facts.segment_chunks;
-    let first = facts.segments.committed * segment;
-    let commit = facts.segments.committed + 3u32.div_ceil(segment);
+    // A pool committed whole at load (wgpu's) takes the test's chunks past
+    // its seats; one that grows commits them past what the load did.
+    let (first, commit) = if facts.segments.growth == Growth::Fixed {
+        let seats = 1 + engine
+            .loaded()
+            .expect("the shell stands")
+            .pool_layout()
+            .seat_chunks();
+        let first = seats.div_ceil(segment) * segment;
+        (first, (first + 3).div_ceil(segment))
+    } else {
+        let first = facts.segments.committed * segment;
+        (first, facts.segments.committed + 3u32.div_ceil(segment))
+    };
+    assert!(
+        commit <= facts.segments.max,
+        "the test's chunks span {commit} segments, the pool has {}",
+        facts.segments.max
+    );
     engine.commit_segments(commit).expect("the segments commit");
     let mut slots = Slots::of(&facts, first, first + 1);
     let mut refs = Refs::of(&facts, LIST, first + 2);
@@ -484,7 +502,7 @@ fn answers_the_host_path(frames: u8) {
         .expect("a device-geometry instance binds")
         .id;
 
-    // Both steps' host cells first, then both fires back to back: the
+    // Both steps' host cells first, then the two fires: the
     // second resolves the positions and slots the first's pass puts.
     for step in 0..STEPS as usize {
         let tokens: Vec<u32> = TOKENS[step].to_vec();
@@ -509,17 +527,20 @@ fn answers_the_host_path(frames: u8) {
                 list: ListKind::Translation,
                 kv: KvDelta {
                     folded: PROMPT,
+                    // The working set's beam cells are the lanes' own.
+                    write_end: PROMPT + CELLS,
                     ..KvDelta::default()
                 },
                 ..Lane::default()
             })
             .collect()
     };
-    let mut tickets: Vec<engine::FrameTicket> = (0..STEPS)
-        .map(|_| rig.submit(device_lanes(), Some(instance)))
-        .collect();
-    for ticket in &mut tickets {
-        rig.engine.settle_frame(ticket).expect("the frame settles");
+    // Each frame's readouts are asked for before the next submits; the
+    // second still resolves what the first's pass puts, landed or on its
+    // way (two frames in flight).
+    for _ in 0..STEPS {
+        let mut ticket = rig.submit(device_lanes(), Some(instance));
+        rig.engine.settle_frame(&mut ticket).expect("the frame settles");
     }
     for (step, want) in want.iter().enumerate() {
         let got = rig.logits(instance);
@@ -592,20 +613,27 @@ fn answers_the_host_path(frames: u8) {
     assert_eq!(lanes, vec![0], "the attachment's lane alone faults: {:?}", outcome.faulted);
     let why = format!("{:?}", outcome.faulted[0]);
     assert!(why.contains("describes 2"), "{why}");
-    let got = &ticket.steps[0]
-        .readouts
-        .last()
-        .expect("the neighbour reads its logits")
-        .values;
-    let apart = got
-        .iter()
-        .zip(&alone[0])
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
-    assert!(
-        got.len() == alone[0].len() && apart <= 1e-3,
-        "the neighbour's logits are {apart} apart from its prompt's alone"
-    );
+    // A step whose guest pass is recorded to land later leaves its rows on
+    // the device (Vulkan, two frames in flight): no readout to compare
+    // there, and the one-frame run compares them.
+    let readouts = &ticket.steps[0].readouts;
+    if readouts.iter().all(|readout| readout.values.is_empty()) {
+        assert!(asynchronous, "a step settled inside submit reads its rows out");
+    } else {
+        let got = &readouts.last().expect("the neighbour reads its logits").values;
+        let apart = got
+            .iter()
+            .zip(&alone[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            got.len() == alone[0].len() && apart <= 1e-3,
+            "the neighbour's logits are {apart} apart from its prompt's alone ({} values \
+             against {})",
+            got.len(),
+            alone[0].len()
+        );
+    }
     eprintln!("{frames} frame(s): an overreaching embed_indptr refused: {why}");
     // The refused lane wrote nothing its working set holds: the device
     // path's set still answers beam 0's first step as the host path did.

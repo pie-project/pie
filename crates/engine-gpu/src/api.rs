@@ -2006,14 +2006,18 @@ impl<B: Host> Gpu<B> {
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for (at, lane) in submission.lanes.iter().enumerate() {
-            // This load places every row itself (no `slots` port): a lane
-            // whose table is a working set's whole, for its program to
-            // place rows through, would land them in pages not its own.
-            if lane.list == engine::fire::ListKind::Translation {
+            // A lane whose table is a working set's whole, for its program
+            // to place rows through, is placed by its device-geometry ports
+            // ([`crate::program::device_lanes`], each row in
+            // `KvDelta::writable`), or refused already and sunk; any other
+            // would land rows in pages not its own.
+            let placed = device[at].as_ref().is_some_and(|placed| placed.have.is_some());
+            let refused = faulted.faulted.iter().any(|fault| fault.lane as usize == at);
+            if lane.list == engine::fire::ListKind::Translation && !placed && !refused {
                 return Err(Error::lane(
                     u32::try_from(at).unwrap_or(u32::MAX),
-                    "its kv table is a translation its program places rows through, and this \
-                     load resolves no `slots` port: it places no row a program states",
+                    "its kv table is a translation its program places rows through, and no \
+                     device-geometry port of an attached instance places its rows",
                 ));
             }
             pages_of.push(

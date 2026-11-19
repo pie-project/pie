@@ -762,18 +762,22 @@ pub fn device_lanes(
         if let Some(have) = have {
             let end = have.saturating_add(rows as u32);
             ports.check_extent(end).map_err(port)?;
-            // Below `folded` is the frozen prefix other working sets read;
-            // past the extent is no key of this lane's.
-            if let Some(&slot) = slots
-                .unwrap_or(&[])
-                .iter()
-                .find(|&&slot| slot < lane.kv.folded || slot >= end)
-            {
+            // Every row lands in what the runtime made the lane's own,
+            // `[folded, write_end)` (`KvDelta::writable`), and within the
+            // extent it states; a lane stating no slots appends the run.
+            let run: Vec<u32> = (have..end).collect();
+            let placed = slots.unwrap_or(&run);
+            let why = engine::fire::misplaced_write(lane.kv.writable(), placed).or_else(|| {
+                placed.iter().find(|&&slot| slot >= end).map(|slot| {
+                    format!(
+                        "its program places a row at kv slot {slot}, past the extent of \
+                         {end} its ports state"
+                    )
+                })
+            });
+            if let Some(why) = why {
                 return Err(Refusal::Program(format!(
-                    "instance {instance}: lane {source} places a row at kv slot {slot}, \
-                     outside the slots it may write ({}..{end}): below is its frozen \
-                     prefix, which other working sets may read, and past is not its own",
-                    lane.kv.folded
+                    "instance {instance}: lane {source}: {why}"
                 )));
             }
         }
@@ -853,6 +857,7 @@ mod tests {
             list: engine::fire::ListKind::Translation,
             kv: engine::fire::KvDelta {
                 folded: 16,
+                write_end: 32,
                 ..engine::fire::KvDelta::default()
             },
             ..engine::fire::Lane::default()
@@ -884,6 +889,12 @@ mod tests {
             .expect_err("two lanes described over one owned")
             .to_string();
         assert!(why.contains("describes 2") && why.contains("lane 3"), "{why}");
+    }
+
+    #[test]
+    fn a_row_placed_past_what_the_lane_may_write_is_refused_by_name() {
+        let why = placed(40).expect_err("slot 40 is past write_end 32").to_string();
+        assert!(why.contains("kv slot 40") && why.contains("16..32"), "{why}");
     }
 
     #[test]
