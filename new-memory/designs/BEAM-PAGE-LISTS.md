@@ -29,8 +29,9 @@ memory, and nothing waits on the host.
 - The lanes' `slots` and `positions` stay host-derivable (a decode
   envelope): every beam writes the same slot `s_t` at fire `t` (its depth)
   and ropes at the same position. No `kv-len`, no `mask`.
-- The set reserves its pool with `working-set.reserve(end)` before the
-  first decode fire: `end = (f0 + Q) * S` (§3).
+- The set reserves its first column's pool with `working-set.reserve(end)`
+  before the first decode fire, and the runtime grows the reservation a
+  column at a time (§3).
 - The parents channel is written by the guest's epilogue and read by the
   next fire (loop-carried, device only: `HostRole::None`). Its initial value
   is ignored (the first fire primes, §5). Engines never read the parents
@@ -63,12 +64,17 @@ memory, and nothing waits on the host.
   The engine states its `F` at bind (its frames in flight); the guest sizes
   with `run_ahead_window()` (the fires its pipeline holds in flight), which
   is never less, and never with a constant.
-- Sizing the guest asks for (`BeamGroup`): `P_used = (folded + steps - 1) /
-  S - f0 + 1`, `Q = B * P_used + B + B * F + (tail > 0 ? 1 : 0)`: each
-  column's pages (a beam's each at most), the most one fire hands out, the
-  pages pending across `F` fires, and the frozen prompt page. A fire that
-  finds fewer free pages than it needs faults the lanes that needed one
-  (`RESERVE_EXHAUSTED`).
+- The pool grows a column at a time (incremental reservation): the guest
+  (`BeamGroup`) reserves what the first column needs, `Q_0 = 2B + B F + 1`
+  pages past `f0`, and before each fire the runtime grows the set's
+  reservation to what that fire's column needs, `Q_t = B (c_t + 2) + B F + 1`
+  (each column's pages, a beam's each at most; the most one fire hands out;
+  the pages pending across `F` fires; the frozen prompt page), waiting like
+  any reservation, and backs exactly that; a fire never opens a column it
+  cannot back. The step hands out the lowest free pages, so every page it
+  names or holds pending lies below `Q_t`. A group whose length could never
+  fit alone is refused by name. A fire that finds fewer free pages than it
+  needs faults the lanes that needed one (`RESERVE_EXHAUSTED`).
 
 ## 4. Resident state (per instance)
 
@@ -76,6 +82,7 @@ memory, and nothing waits on the host.
     free[Q]        bit   page may be handed out
     pending[F][Q]  bit   a ring: slot `t mod F` holds the pages fire `t` freed
     fired          u32   fires run; 0 until the first fire primes
+    pool           u32   the pool's pages at the last fire
 
 Stated in `engine::GuestState::resident`, part of the instance's bytes at
 its bind extents (bind to unbind; `scratch` and `scratch_arms` unchanged):
@@ -105,7 +112,10 @@ pool page, and beams take pages `0 .. B-1`.
 ## 6. Each later fire `t >= 1` (in this order, before the fire appends or reads)
 
 Inputs: the state after fire `t-1`, `parent[B]` (the cell the epilogue of
-fire `t-1` wrote), `s_t` (host-derived; `c = c_t`, `o = o_t`, `cp = c_{t-1}`).
+fire `t-1` wrote), `s_t` (host-derived; `c = c_t`, `o = o_t`, `cp = c_{t-1}`),
+and the pool's pages now `Q`. First, the pages that joined the pool since
+the last fire are free: `free[q] = !(q == 0 && tail > 0)` for
+`pool <= q < Q`; the step ends with `pool = Q`.
 
 **6.1 Check.** For each `b`: `parent[b] < B`, else lane `b` faults
 `PARENT`: it continues itself (`parent[b] := b`, keeping `map[b]`), so its
