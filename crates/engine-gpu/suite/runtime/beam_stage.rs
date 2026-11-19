@@ -219,7 +219,7 @@ fn fired(
 
 #[test]
 fn a_beam_step_answers_what_the_interpreter_answers() {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;

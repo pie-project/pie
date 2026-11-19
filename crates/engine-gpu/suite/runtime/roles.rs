@@ -167,7 +167,7 @@ impl Bound {
 
 #[test]
 fn an_instance_in_pool_slots_fires_through_moves() {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;

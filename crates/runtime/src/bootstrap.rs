@@ -155,6 +155,9 @@ pub struct EngineConfig {
     pub adapter_attachments: bool,
     /// The rows inside a lane whose recurrent state one fire lands.
     pub rs_snapshots: u32,
+    /// What a guest stage's cost is held to
+    /// ([`::engine::Capabilities::guest_cost`]).
+    pub guest_cost: ::engine::GuestCost,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
@@ -162,6 +165,53 @@ pub struct EngineConfig {
     pub inputs: Vec<poem_ir::InputDecl>,
     pub classes: poem_ir::LaneClasses,
     pub engine_backend: crate::engine::EngineBox,
+}
+
+/// The budget a guest program binds within on every engine of the model
+/// ([`model::guest_budget`]): the least room of theirs. A model served by
+/// no engine, or by one stating no state room, binds no guest program, and
+/// is refused by name here rather than refuse each registration.
+fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
+    let budgets = engines
+        .iter()
+        .map(|engine| model::guest_budget(&engine.chunks, &engine.guest_cost))
+        .collect::<std::result::Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    // The least room, and of the bounds stated the tightest, at the
+    // slowest launch and elementwise rate any engine measured: a stage
+    // within it is within every engine's.
+    let submit = budgets
+        .iter()
+        .filter_map(|budget| budget.submit)
+        .reduce(|a, b| eta_ir::validate::SubmitBound {
+            bound_ns: a.bound_ns.min(b.bound_ns),
+            launch_ns: a.launch_ns.max(b.launch_ns),
+            elementwise_bytes_per_ns: a.elementwise_bytes_per_ns.min(b.elementwise_bytes_per_ns),
+        });
+    let budget = budgets
+        .iter()
+        .map(|budget| eta_ir::validate::Budget {
+            submit,
+            ..*budget
+        })
+        .min_by_key(|budget| budget.room_bytes)
+        .ok_or_else(|| anyhow::anyhow!("a model served by no engine has no guest budget"))?;
+    if budget.room_bytes == 0 {
+        anyhow::bail!(
+            "an engine of this model states no state room past what it holds back \
+             ({} state chunks of {} bytes, {} held back); no guest program could bind",
+            engines.iter().map(|e| e.chunks.state_chunks()).min().unwrap_or(0),
+            engines.first().map_or(0, |e| e.chunks.chunk_bytes),
+            engines.first().map_or(0, |e| e.chunks.held_bytes),
+        );
+    }
+    tracing::info!(
+        room_bytes = budget.room_bytes,
+        submit = ?budget.submit,
+        "a guest program's stages bind within an instance's state room and, where \
+         the device states one, its bound on one submission"
+    );
+    Ok(budget)
 }
 
 /// The admission cap: `cap`, held to the `seats` a seated-first kv pool
@@ -355,6 +405,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .map(|d| d.rs_snapshots)
             .min()
             .unwrap_or(0),
+        budget: guest_budget(&engine_configs)?,
     };
     let facts = engine_configs
         .first()

@@ -194,6 +194,65 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
     assert!(ops(&fused).contains(&"elemwise.rope"), "{:?}", ops(&fused));
 }
 
+/// Qwen 3's attention prologue: q and k normed by their weights per head,
+/// v as it is, rotated whole.
+fn qwen_qkv_write(p: &Pattern) {
+    let positions = p.indices("positions");
+    let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
+    let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, 1e-6);
+    let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, 1e-6);
+    let (q, k) = both(elemwise::rope(
+        &q,
+        &positions,
+        64,
+        1_000_000.0,
+        Turn::Full { interleaved: false },
+        Some(&k),
+        None,
+    ));
+    let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+    attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
+    elemwise::silu(&q);
+}
+
+/// Qwen 3's form folds too: the fused write norms no v.
+#[test]
+fn the_weighted_qkv_write_with_v_as_it_is_folds() {
+    let fused = fuse(
+        trace(qwen_qkv_write),
+        &["fused.qkv_fused_qknorm_rope_vnorm_write"],
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.qkv_fused_qknorm_rope_vnorm_write", "elemwise.act"]
+    );
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
+        q_norm_weight: Some(_),
+        k_norm_weight: Some(_),
+        v_norm: false,
+        qk_norm: true,
+        rotary_dim: 64,
+        ..
+    })) = fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the first op is the fused write, weighted, v unnormed");
+    };
+}
+
+/// The padded rule (CUDA's) holds MiMo's forms alone: Qwen's and Gemma's
+/// prologues stay apart under it.
+#[test]
+fn the_padded_qkv_rule_folds_neither_qwens_nor_gemmas_prologue() {
+    let rule = poem_compiler::fuse::rules::qkv_fused_padded();
+    for (what, apart) in [
+        ("qwen", trace(qwen_qkv_write)),
+        ("gemma", trace(|p| qkv_write(p, 1e-6, 1e-6))),
+    ] {
+        let fused = poem_compiler::fuse::fuse(apart.clone(), [&rule]);
+        assert_eq!(ops(&fused), ops(&apart), "{what}: no op folds");
+    }
+}
+
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
 /// global layer's rows unturned.
 #[test]

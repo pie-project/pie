@@ -87,6 +87,24 @@ pub enum Fault {
         word: u64,
     },
 
+    /// The instance attached at `lane` describes, through its geometry
+    /// ports, more lanes than its attachment owns: refused, never setting
+    /// another request's positions or kv slots.
+    GeometryLanes {
+        lane: u32,
+        instance: u64,
+        carried: u32,
+        owned: u32,
+    },
+
+    /// The instance attached at `lane` reads an output's rows past what its
+    /// lanes hold: refused, never launched into another request's rows.
+    OutputRows {
+        lane: u32,
+        instance: u64,
+        why: String,
+    },
+
     Adapterless {
         lane: u32,
     },
@@ -198,6 +216,8 @@ impl Fault {
             | Self::MaskRows { lane, .. }
             | Self::Positions { lane, .. }
             | Self::MaskUnread { lane, .. }
+            | Self::GeometryLanes { lane, .. }
+            | Self::OutputRows { lane, .. }
             | Self::Adapterless { lane, .. }
             | Self::AdapterWord { lane, .. } => Some(*lane),
             Self::Fire(error) => error.lane(),
@@ -308,6 +328,27 @@ impl fmt::Display for Fault {
                 f,
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
+            ),
+            Self::GeometryLanes {
+                lane,
+                instance,
+                carried,
+                owned,
+            } => write!(
+                f,
+                "the instance {instance} attached at lane {lane} is refused: its \
+                 `embed_indptr` port describes {carried} lane(s) and its attachment owns \
+                 {owned}; past them its ports would set another request's positions and kv \
+                 slots"
+            ),
+            Self::OutputRows {
+                lane,
+                instance,
+                why,
+            } => write!(
+                f,
+                "the instance {instance} attached at lane {lane} is refused: {why}; it reads \
+                 only the rows its own lanes hold"
             ),
             Self::MaskUnread { lane, word } => write!(
                 f,
