@@ -1,32 +1,51 @@
 use poem_ir::Platform;
 
-/// The gathers that bring a layer's captured scores back whole, each read
-/// out as `attn.scores`: one per layer whose attention captures them, each
-/// under the scores fact as its capture is, so that a fire of no lane whose
-/// program reads scores runs neither (the walk skips a guarded gather where
-/// no row holds its guard).
-fn score_gathers(trace: &poem_ir::Trace) -> usize {
-    (trace.outputs.iter())
-        .filter(|output| output.name == "attn.scores")
-        .filter(|output| match trace.values[output.value.0 as usize].def {
-            poem_ir::Def::Op(at) => {
-                let node = &trace.nodes[at as usize];
-                let gathers = poem_ir::Operands::name(&node.op) == "collective.all_gather";
-                assert!(
-                    !gathers || trace.facts.implies(&node.guard, poem_ir::Builtin::Scores),
-                    "the gather at node {at} runs under {:?}, not the scores switch",
-                    node.guard
-                );
-                gathers
-            }
-            _ => false,
-        })
-        .count()
+/// The collectives on the score capture: none a layer, and one at the end.
+/// Each rank adds its query heads' share of a key's mass into the row the
+/// layers before it filled, so the row a rank holds is a partial sum all the
+/// way down; the last layer's row is reduced once, under the scores fact as
+/// the captures are (a fire of no lane whose program reads scores runs it
+/// not: the walk skips a guarded collective where no row holds its guard),
+/// and `attn.scores` and the page sums (`attn.scores.pages`) both read that
+/// reduced row. Nothing on the row is gathered.
+fn score_reductions(trace: &poem_ir::Trace) -> usize {
+    use poem_ir::Operands;
+    let made_by = |v: poem_ir::ValueId| match trace.values[v.0 as usize].def {
+        poem_ir::Def::Op(at) => trace.nodes[at as usize].op.name(),
+        _ => "",
+    };
+    let mut reductions = 0;
+    for (at, node) in trace.nodes.iter().enumerate() {
+        let name = node.op.name();
+        if !name.starts_with("collective.") {
+            continue;
+        }
+        let mut ins = Vec::new();
+        node.op.inputs(&mut ins);
+        if !ins
+            .iter()
+            .any(|v| matches!(made_by(*v), "attn.score_capture" | "attn.score_pages"))
+        {
+            continue;
+        }
+        assert_eq!(
+            name, "collective.all_reduce",
+            "node {at} meets the ranks' score row by {name}, not by a sum"
+        );
+        assert!(
+            trace.facts.implies(&node.guard, poem_ir::Builtin::Scores),
+            "the reduction at node {at} runs under {:?}, not the scores switch",
+            node.guard
+        );
+        reductions += 1;
+    }
+    reductions
 }
 
 /// A row-parallel projection leaves each rank a partial sum, which is reduced
 /// once, right after it; the tied table is cut by its rows, its lookup's rows
-/// summed once and its head's logits gathered once, and nothing else is
+/// summed once and its head's logits gathered once; the score row is reduced
+/// once, after the last full layer (`score_reductions`), and nothing else is
 /// added.
 #[test]
 fn a_split_row_reduces_each_projection_once() {
@@ -40,26 +59,28 @@ fn a_split_row_reduces_each_projection_once() {
             .filter(|node| poem_ir::Operands::name(&node.op) == op)
             .count()
     };
+    assert_eq!(score_reductions(&trace), 1, "the score row, once");
     assert_eq!(
         count("collective.all_reduce"),
-        48 + 1,
-        "one per mixer and one per mlp, and the tied table's lookup"
+        48 + 1 + 1,
+        "one per mixer and one per mlp, the tied table's lookup and the score row"
     );
-    let scores = score_gathers(&trace);
     assert_eq!(
         count("collective.all_gather"),
-        1 + scores,
-        "the tied head's logits, once, and each full layer's scores"
+        1,
+        "the tied head's logits, once"
     );
     let whole = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
-    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 2 + scores);
+    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 1 + 1 + 1);
 }
 
 /// A package's inferred cuts split as Megatron does:
 /// each layer's attention and MLP reduced once, after their row-cut
-/// projections, and the vocab-split head gathered once.
+/// projections, and the vocab-split head gathered once. The score row each
+/// layer adds its heads' share into is reduced once, at the end
+/// (`score_reductions`), never a layer.
 #[test]
 fn an_inferred_package_reduces_each_projection_once() {
     let deployment = crate::catalog::deployment("llama31-8b-bf16-kv-bf16-tp2")
@@ -75,24 +96,16 @@ fn an_inferred_package_reduces_each_projection_once() {
     let whole = crate::catalog::deployment("llama31-8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
+    assert_eq!(score_reductions(&trace), 1, "the score row, once");
     assert_eq!(
         count("collective.all_reduce"),
-        2 * LLAMA_8B_LAYERS,
-        "one per attention and one per mlp"
+        2 * LLAMA_8B_LAYERS + 1,
+        "one per attention and one per mlp, and the score row"
     );
-    assert_eq!(
-        score_gathers(&trace),
-        LLAMA_8B_LAYERS,
-        "each layer's scores"
-    );
-    assert_eq!(
-        count("collective.all_gather"),
-        1 + LLAMA_8B_LAYERS,
-        "the logits, once, and each layer's scores"
-    );
+    assert_eq!(count("collective.all_gather"), 1, "the logits, once");
     assert_eq!(
         trace.nodes.len(),
-        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1 + LLAMA_8B_LAYERS
+        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1 + 1
     );
 }
 

@@ -469,6 +469,11 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         device: shell.device(),
         pools: shell.pools(),
         align: B::table_align(shell.device()),
+        seats: shell.readout.iter().chain(&shell.pixel_out).collect(),
+        max_lanes: shell.budget().max_lanes,
+        planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
+            .unwrap_or(u32::MAX),
+        frames: shell.frames_in_flight(),
     }
 }
 
@@ -917,6 +922,8 @@ where
         &self,
         program: ProgramId,
         extents: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         let Some(shell) = self.shell.as_ref() else {
             return Ok(engine::GuestState::default());
@@ -1793,6 +1800,7 @@ mod tests {
                 lanes: 2,
                 instance: InstanceId(100 + u64::from(at)),
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             })
             .collect();
         let mut ran = Vec::new();

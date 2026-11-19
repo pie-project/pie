@@ -592,6 +592,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

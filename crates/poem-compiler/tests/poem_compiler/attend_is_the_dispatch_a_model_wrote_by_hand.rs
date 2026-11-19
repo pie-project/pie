@@ -53,7 +53,7 @@ def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     o = branch(q, [
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale, mask = mask)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale, mask = mask))
-    output("attn.scores", ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048))
+    ops.attn.capture_scores(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32)
     return ops.linear.matmul(o, w.o)
 "#;
 

@@ -1056,6 +1056,8 @@ impl Engine for Metal {
         &self,
         program: ProgramId,
         at: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         self.loaded()?
             .guest_state(program, &extents(at))

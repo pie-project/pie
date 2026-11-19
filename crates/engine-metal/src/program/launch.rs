@@ -167,7 +167,7 @@ use eta_ir::Dtype;
 use eta_ir::op::tags;
 
 use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context};
+use crate::device::Buffer;
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
@@ -2199,27 +2199,23 @@ impl Prepared {
 
     /// Fires `region` in a frame of its own; `zero` (a stage's first
     /// region) first poisons the seated scratch in test builds.
-    pub fn launch_region(
-        &mut self,
-        device: &Context,
-        pipelines: &crate::device::Pipelines,
-        rings: &Rings,
-        region: &Region,
-        zero: bool,
-    ) -> Result<()> {
+    /// `region` encoded into `frame` as a pass of its own after what the
+    /// frame holds (a stage's first poisons its scratch first): in order
+    /// with the regions before it, as a command buffer each was.
+    pub fn encode_region(&mut self, frame: &mut Frame, region: &Region, zero: bool) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            let _ = (pipelines, rings);
-            let mut frame = device.frame()?;
             if zero {
-                self.poison_scratch_on(&mut frame)?;
+                self.poison_scratch_on(frame)?;
             }
-            self.encode_into(&frame, region)?;
-            frame.commit()
+            frame.next_pass()?;
+            self.encode_into(frame, region)?;
+            frame.next_pass()?;
+            Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (device, pipelines, rings, region, zero);
+            let _ = (frame, region, zero);
             Err(Fault::Deviceless)
         }
     }
