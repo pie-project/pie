@@ -1532,19 +1532,24 @@ impl SlotPool {
     /// run's first physical chunk, lowest first, no two sharing a chunk,
     /// and no more than the budget's room holds ([`Self::headroom`]).
     fn chunk_runs_for(&self, run: u32) -> Vec<u32> {
+        self.runs_where(run, self.headroom(), |chunk| self.open.get(chunk))
+    }
+
+    /// [`Self::chunk_runs_for`] over the chunks `free` reads as free and
+    /// `room` chunks of the budget's headroom.
+    fn runs_where(&self, run: u32, room: u32, free: impl Fn(u32) -> bool) -> Vec<u32> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() {
             return Vec::new();
         }
         let limit = self.state_limit().min(self.ceiling);
-        let room = self.headroom();
         let most = (room / run) as usize;
         let mut firsts = Vec::new();
         for segment in 0..self.segments.count() {
             let range = self.segments.range(segment);
             let mut stretch = 0u32;
             for chunk in range.start..range.end.min(limit) {
-                if !self.open.get(chunk) {
+                if !free(chunk) {
                     stretch = 0;
                     continue;
                 }
@@ -1557,6 +1562,43 @@ impl SlotPool {
         }
         firsts.truncate(most);
         firsts
+    }
+
+    /// Whether `pieces` free runs of `run` adjacent chunks would stand
+    /// once `own` has been placed first, read only: `own` the pieces a
+    /// restore's parked guest state retakes, each `(run, pieces)` of whole
+    /// chunks placed as [`Self::acquire_chunk_runs`] would (lowest first),
+    /// and `slot_runs` runs of slots inside one chunk, each counted as
+    /// taking a free chunk of its own (where it would share a partly
+    /// filled one this reads short, never long). Nothing is taken: the
+    /// pool is the same after.
+    #[must_use]
+    pub fn chunk_runs_beside(&self, own: &[(u32, u32)], slot_runs: u32, run: u32, pieces: u32) -> bool {
+        let mut taken: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut room = self.headroom();
+        for &(own_run, own_pieces) in own {
+            let own_run = own_run.max(1);
+            let firsts =
+                self.runs_where(own_run, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk));
+            if firsts.len() < own_pieces as usize {
+                return false;
+            }
+            for &first in &firsts[..own_pieces as usize] {
+                taken.extend(first..first + own_run);
+            }
+            room = room.saturating_sub(own_run * own_pieces);
+        }
+        for _ in 0..slot_runs {
+            let firsts = self.runs_where(1, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk));
+            let Some(&first) = firsts.first() else {
+                return false;
+            };
+            taken.insert(first);
+            room = room.saturating_sub(1);
+        }
+        self.runs_where(run, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk))
+            .len()
+            >= pieces as usize
     }
 
     /// Free runs of `run` adjacent chunks inside one segment live state may

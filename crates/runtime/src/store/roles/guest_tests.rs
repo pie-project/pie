@@ -2035,16 +2035,28 @@ async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() 
 }
 
 /// What a bind-suspended restore asks before it goes: runs for its bind
-/// beside the guest state its unpark retakes first, tried and given back,
-/// nothing kept.
+/// beside where its unpark puts its own guest state back, read from the
+/// pool and nothing taken: the pool is the same after, counts and free
+/// map alike.
 #[test]
-fn room_beside_a_parked_process_s_own_state_is_tried_and_nothing_is_kept() {
+fn room_beside_a_parked_process_s_own_state_is_read_and_the_pool_is_the_same_after() {
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     bind(&roles, &mut engine, 1).unwrap();
     park(&roles, 1);
     let free = roles.lock().unwrap().free_runs(1);
     let held_now = held(&device);
+    let snapshot = |device: &Shared| {
+        let pool = device.lock().unwrap();
+        let pool = pool.pool();
+        (
+            pool.open_chunks(),
+            pool.free_chunks(),
+            pool.room_gives(),
+            (1..=4).map(|run| pool.free_chunk_runs(run)).collect::<Vec<_>>(),
+        )
+    };
+    let before = snapshot(&device);
     assert!(free >= 3, "{free} free chunks");
     // Its scratch retakes two whole chunks (and its pair a run of slots in
     // a chunk): the rest stand beside it.
@@ -2055,4 +2067,5 @@ fn room_beside_a_parked_process_s_own_state_is_tried_and_nothing_is_kept() {
     );
     assert_eq!(held(&device), held_now, "nothing kept");
     assert_eq!(roles.lock().unwrap().free_runs(1), free);
+    assert_eq!(snapshot(&device), before, "the pool is the same after");
 }
