@@ -360,3 +360,33 @@ writes) in series with ~23 ms parked at the guest gate (GPU plus the guest
 pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
 wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
 boundary), not host time.
+
+## F32. A split ROCm decode folding its own partials: no gain, dropped
+
+Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
+matrix-core decode (`kernels-rocm attn/paged.hip` `paged_decode_mfma`) folds
+its split itself instead of a second launch (`merge_partials`). Each work
+item draws its request's ticket for its kv head (`Ctx::tickets`) once its
+partial rows land past the L2 (sc1 stores, `s_waitcnt vmcnt(0)`, a relaxed
+atomic, as `linear/fp8.hip`'s split tiles), and the last to land folds the
+head group's rows (sc1 loads) and puts the ticket back to zero. An
+agent-scope fence in every block instead cost more than the node (greedy
++9%).
+
+Correct (beam gate 0 / 800 over the landing fix; attn_paged 9 / 9 with a
+seat past its bucket's first lane), but no faster on MI300X, Qwen3-0.6B:
+the 1-lane decode body 255 -> 227 nodes, `arm-bench` b1[c1:1] 1459 / 1484
+us a fire against the tip's 1476 / 1481, greedy 2.3 / 2.3 s and c64
+10.5 / 10.3 s on both (B-A-A-B). The serial tail spends what the 28 nodes
+saved (~45 us a step): one block per kv head folds all of its chunks after
+the rest finish, where `merge_partials` spreads rows x heads over the
+device. Folding the group's heads in parallel across waves might reach
+1-2% at best.
+
+The seat's first lane is read from the first work item
+(`request_indices[0]`; `sched_decode.rs` builds the table, every request
+taking one): a work item names its request by its lane, the split's rows by
+their place past the seat. Staged with the table each fire; a kernel
+argument would be baked into a captured body. The bucket's
+`Shape::lane_offset` is not the seat's (`Live::lane_offset`): counting the
+rows from it diverged 12-24% of beams.
