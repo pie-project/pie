@@ -102,6 +102,12 @@ impl<'a> Streams<'a> {
         match self.class(value) {
             RowClass::Scalar => return true,
             RowClass::Full(_) => {}
+            // An output read in place through its views of one row.
+            RowClass::Other if self.output_source(value) == Some(value) => {
+                if self.output_row(value).is_none() {
+                    return false;
+                }
+            }
             RowClass::Other => return false,
         }
         let Some(&node) = self.producers.get(value as usize) else {
@@ -139,9 +145,84 @@ impl<'a> Streams<'a> {
             && self.role(node, &mut None).is_some()
     }
 
+    /// Whether `node` is an argmax that scans the model's row where it lies
+    /// (the fused emitter's direct or Gumbel scan), its operand unread.
+    fn scans_model_row(&self, node: usize) -> bool {
+        self.ops[node].tag == tags::REDUCE_ARGMAX && self.direct_intrinsic[node] != u16::MAX
+    }
+
     fn topk_reads_direct(&self, node: usize, value: u32) -> bool {
         self.direct_topk.get(node).copied().flatten().is_some()
             && self.ops[node].args.first() == Some(&value)
+    }
+
+    /// The model output a value is a view of: `value` itself where an
+    /// output produces it, or the output a reshape of this region reads
+    /// as its source ([`super::fused::is_view`]). A stream reads such a
+    /// value's row in place, in the output's own storage.
+    fn output_source(&self, value: u32) -> Option<u32> {
+        let node = *self.producers.get(value as usize)?;
+        if node == u32::MAX || !self.region.nodes.iter().any(|n| n.index() == node as usize) {
+            return None;
+        }
+        let op = &self.ops[node as usize];
+        match op.tag {
+            tags::OUTPUT => Some(value),
+            tags::RESHAPE
+                if !op.args.is_empty()
+                    && super::fused::is_view(self.stage, self.region, op, value) =>
+            {
+                let source = op.args[0];
+                let producer = *self.producers.get(source as usize)?;
+                (producer != u32::MAX && self.ops[producer as usize].tag == tags::OUTPUT)
+                    .then_some(source)
+            }
+            _ => None,
+        }
+    }
+
+    /// The row width an output is read at in place: its own, where it is a
+    /// row, or that of the views of it this region reads, each a whole row
+    /// of the output's width (so the output is that one row).
+    fn output_row(&self, out: u32) -> Option<Dimension> {
+        if let RowClass::Full(dim) = self.class(out) {
+            return Some(dim);
+        }
+        let ty = &self.stage.normalized.value_types[out as usize];
+        let last = *ty.dims.last()?;
+        let readers = self.readers.get(out as usize)?;
+        let viewed = !readers.is_empty()
+            && readers.iter().all(|&reader| {
+                let view = self.bases[reader];
+                self.ops[reader].tag == tags::RESHAPE
+                    && self.output_source(view) == Some(out)
+                    && self.class(view) == RowClass::Full(last)
+                    && matches!(last, Dimension::Static(_))
+            });
+        viewed.then_some(last)
+    }
+
+    /// The nodes past `value`'s views that read it: a view of an output is
+    /// read where its readers read it.
+    fn readers_through_views(&self, value: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            for &reader in self
+                .readers
+                .get(value as usize)
+                .map_or(&[][..], Vec::as_slice)
+            {
+                let view = self.bases[reader];
+                if self.ops[reader].tag == tags::RESHAPE && self.output_source(view) == Some(value)
+                {
+                    pending.push(view);
+                } else {
+                    out.push(reader);
+                }
+            }
+        }
+        out
     }
 
     fn dtype(&self, value: u32) -> Dtype {
@@ -329,8 +410,12 @@ impl<'a> Streams<'a> {
                     return None;
                 }
                 let mut w = *width;
-                if !full(out, &mut w) {
+                let Some(row) = self.output_row(out) else {
                     return None;
+                };
+                match w {
+                    Some(dim) if dim != row => return None,
+                    _ => w = Some(row),
                 }
                 *width = w;
                 Some(Role::Intrinsic)
@@ -395,7 +480,14 @@ impl<'a> Streams<'a> {
             }
             members.push(Member { node, role });
         }
-        if members.is_empty() {
+        // An output read in place alone holds no row of its own: where it is
+        // read past its views' readers, it is copied as it was.
+        let in_place_alone = members.len() == 1
+            && members[0].role == Role::Intrinsic
+            && !matches!(self.class(self.bases[members[0].node]), RowClass::Full(_));
+        if members.is_empty()
+            || (in_place_alone && self.escapes(self.bases[members[0].node], &members))
+        {
             None
         } else {
             Some(members)
@@ -403,19 +495,49 @@ impl<'a> Streams<'a> {
     }
 
     fn escapes(&self, value: u32, members: &[Member]) -> bool {
-        let outside: Vec<usize> = self
-            .readers
-            .get(value as usize)
-            .map(|list| {
-                list.iter()
-                    .copied()
-                    .filter(|node| !members.iter().any(|m| m.node == *node))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // An output read in place is read through its views; a view a later
+        // region or a sink reads holds its bytes, so the output does.
+        let in_place = self.ops[self.producers[value as usize] as usize].tag == tags::OUTPUT;
+        let readers = if in_place {
+            let mut views = vec![value];
+            let mut at = 0;
+            while at < views.len() {
+                for &reader in self
+                    .readers
+                    .get(views[at] as usize)
+                    .map_or(&[][..], Vec::as_slice)
+                {
+                    let view = self.bases[reader];
+                    if self.ops[reader].tag == tags::RESHAPE
+                        && self.output_source(view) == Some(views[at])
+                    {
+                        views.push(view);
+                    }
+                }
+                at += 1;
+            }
+            if views[1..].iter().any(|&view| {
+                self.region.outputs.contains(&view)
+                    || self.region.sinks.iter().any(|s| s.value == view)
+            }) {
+                return true;
+            }
+            self.readers_through_views(value)
+        } else {
+            self.readers
+                .get(value as usize)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let outside: Vec<usize> = readers
+            .into_iter()
+            .filter(|node| !members.iter().any(|m| m.node == *node))
+            .collect();
         let remat = self.rematerializable(value);
         let served = |node: &usize| {
-            (remat && self.stream_reader(*node)) || self.topk_reads_direct(*node, value)
+            (remat && self.stream_reader(*node))
+                || self.topk_reads_direct(*node, value)
+                || (in_place && self.scans_model_row(*node))
         };
         if outside.iter().any(|node| !served(node)) {
             return true;
@@ -655,6 +777,11 @@ struct Pass<'p> {
 
 fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> String {
     let want = compute(want);
+    // A view of an output is the output's row, read in place.
+    let value = match streams.output_source(value) {
+        Some(source) if streams.rematerializable(source) => source,
+        _ => value,
+    };
     if let Some((_, from)) = pass.registers.iter().find(|(v, _)| *v == value) {
         return convert(&format!("r{value}"), *from, want);
     }
@@ -961,12 +1088,22 @@ pub(super) fn emit_stream(
                     .find(|&a| matches!(streams.class(a), RowClass::Full(_)))
             }
         })
+        .or_else(|| {
+            // An output read in place, one row of its views' width.
+            members
+                .iter()
+                .find(|m| m.role == Role::Intrinsic)
+                .map(|m| bases[m.node])
+        })
         .expect("a stream has a full value");
     // A row a stream reads is a static width: a reduction's slots are laid
     // out from it.
     let stream_width = match streams.class(witness) {
         RowClass::Full(Dimension::Static(width)) => Some(width),
-        _ => None,
+        _ => match streams.output_row(witness) {
+            Some(Dimension::Static(width)) => Some(width),
+            _ => None,
+        },
     };
 
     let mut s = String::new();

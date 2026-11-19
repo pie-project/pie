@@ -63,6 +63,69 @@ fn subject() -> TraceContainer {
 fn bf16_emits_two_byte_storage_every_case() {
     a_bf16_stream_stores_halves_and_computes_in_f32();
     the_runtime_rounds_as_the_ir_does();
+    a_sampler_reads_the_output_row_in_place();
+}
+
+/// A decode lane's sampler shape: the output's one row reshaped to the
+/// vocabulary, cast to bf16, exponentiated and summed. The row is read
+/// where the model left it, never copied into scratch.
+fn a_sampler_reads_the_output_row_in_place() {
+    let ops = vec![
+        Op::Output {
+            index: 0,
+            lane: 0,
+            shape: Shape::matrix(1, VOCAB),
+            dtype: Dtype::F32,
+        }, // 0
+        Op::Reshape {
+            value: 0,
+            shape: Shape::vector(VOCAB),
+        }, // 1 a view of 0
+        Op::Cast {
+            value: 1,
+            dtype: Dtype::Bf16,
+        }, // 2
+        Op::Exp(2),       // 3
+        Op::ReduceSum(3), // 4
+        Op::Reshape {
+            value: 4,
+            shape: Shape::vector(1),
+        }, // 5
+        Op::ChanPut { chan: 0, value: 5 },
+    ];
+    let program = TraceContainer {
+        names: vec!["logits".into()],
+        channels: vec![out(Shape::vector(1), Dtype::F32)],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let bound = Served::of(VOCAB).bind(program).expect("the sampler binds");
+    let stages = compile_bound(&bound);
+    let stage = stages.first().expect("one stage");
+    let mut source = String::new();
+    for (index, region) in stage.fused.regions.iter().enumerate() {
+        source.push_str(&emit_fused_region(&format!("k{index}"), stage, region).expect("emits"));
+    }
+    let kernel = source.rsplit("extern \"C\"").next().unwrap_or("");
+    assert!(
+        kernel.contains("m1_intrinsic_row_load"),
+        "the stream reads the output row"
+    );
+    assert!(
+        !kernel.contains("ptir_parallel_intrinsic("),
+        "the output row is copied into scratch:\n{kernel}"
+    );
+    for value in [0u32, 1, 2, 3] {
+        assert!(
+            !kernel.contains(&format!("offsets[{value}]")),
+            "value {value} touches scratch:\n{kernel}"
+        );
+    }
 }
 
 fn a_bf16_stream_stores_halves_and_computes_in_f32() {

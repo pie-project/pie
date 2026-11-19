@@ -2139,11 +2139,11 @@ mod tests {
             totals,
             [
                 ("top-p", 9_312_512, 1_368_576, 0),
-                ("top-k + top-p", 9_616_896, 2_812_672, 76_032),
+                ("top-k + top-p", 9_616_896, 2_204_928, 76_032),
                 ("gumbel-max", 5_512_960, 1_792, 0),
                 ("greedy", 3_688_704, 768, 0),
-                ("top logprobs", 6_728_960, 1_900_800, 76_032),
-                ("sorted", 8_551_168, 3_040_000, 1_215_488),
+                ("top logprobs", 6_728_960, 1_293_056, 76_032),
+                ("sorted", 8_551_168, 3_039_488, 1_215_488),
             ]
         );
         for ((name, _, now, _), was) in totals.iter().zip(WAS) {
@@ -2173,21 +2173,26 @@ mod tests {
         let got: Vec<(&str, u64, u64)> =
             totals.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
         assert_eq!(got, STANDARD_SCRATCH);
+        for ((name, _, laid), f32_laid) in got.iter().zip(STANDARD_F32_LAID) {
+            assert!(*laid <= f32_laid, "{name}: {laid} bytes laid, {f32_laid} with f32");
+        }
     }
 
-    /// Each standard decode fire's scratch, its own and as laid; with f32
-    /// intermediates they were: greedy 3,689,472 / 1,536; gumbel-max
-    /// 5,512,960 / 1,792; top-p 9,312,768 / 1,368,832 (the f32 lane
-    /// sampler's chain); top-k + top-p 9,617,408 / 2,813,440; top logprobs
-    /// 6,732,544 / 1,901,312; penalized top-p 20,254,720 / 2,585,600.
+    /// Each standard decode fire's scratch, its own and as laid: the model's
+    /// output row read in place, the vocabulary-sized values bf16.
     const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
         ("standard greedy", 3_689_472, 1_536),
         ("standard gumbel-max", 5_209_088, 1_792),
-        ("standard top-p", 6_577_920, 1_749_248),
-        ("standard top-k + top-p", 6_882_560, 1_901_824),
-        ("standard top logprobs", 4_910_080, 1_294_080),
-        ("standard penalized top-p", 12_050_176, 2_966_016),
+        ("standard top-p", 6_577_920, 1_141_504),
+        ("standard top-k + top-p", 6_882_560, 1_294_080),
+        ("standard top logprobs", 4_910_080, 686_336),
+        ("standard penalized top-p", 12_050_176, 2_358_272),
     ];
+
+    /// What each laid out with f32 intermediates (the output row copied
+    /// into scratch, top-p on the f32 lane sampler): no fire lays out more
+    /// now.
+    const STANDARD_F32_LAID: [u64; 6] = [1_536, 1_792, 1_368_832, 2_813_440, 1_901_312, 2_585_600];
 
     /// No generated kernel of the programs inferlets ship names the bytes
     /// of a value its stage states to take none (a generated kernel
