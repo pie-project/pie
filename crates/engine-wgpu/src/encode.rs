@@ -377,7 +377,10 @@ impl Sink<'_> {
                                 .read(at, &mut bytes[..len as usize])
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
                             let staged_len = bytes.len() as u64;
-                            let (chunk, slot) = self.frame.scratch_slot(staged_len);
+                            let (chunk, slot) = self
+                                .frame
+                                .scratch_slot(staged_len)
+                                .map_err(|fault| Sink::refuse(fire, fault))?;
                             core.queue.write_buffer(&chunk, slot, &bytes);
                             scratch_views += 1;
                             STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -388,7 +391,10 @@ impl Sink<'_> {
                     let len = remaining
                         .next_multiple_of(4)
                         .min(binding.buffer().slab().size.saturating_sub(at) & !3);
-                    let (chunk, slot) = self.frame.scratch_slot(len);
+                    let (chunk, slot) = self
+                        .frame
+                        .scratch_slot(len)
+                        .map_err(|fault| Sink::refuse(fire, fault))?;
                     self.frame
                         .encode(|encoder| {
                             encoder.copy_buffer_to_buffer(&source, at, &chunk, slot, len);

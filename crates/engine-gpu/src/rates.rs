@@ -54,6 +54,57 @@ use crate::serve::Serve;
 /// largest buffer the device allocates.
 pub const COPY_BYTES: u64 = 256 << 20;
 
+/// The bound the platform states on one GPU submission, which the rates
+/// step holds each of its frames (and its warm-up's cube) within, each at
+/// its estimate times the worst ratio of a frame's time to its estimate
+/// seen (`engine_gpu::rates`). On Android, KGSL's (Qualcomm's msm GPU
+/// driver, `qcom/opensource/graphics-kernel`, branch
+/// gfx-kernel.lnx.16.0.r15-rel, the android16 / 6.12 line):
+///
+/// - The one duration the driver states is `adreno_drawobj_timeout = 2000`
+///   ms (adreno_dispatch.c:51, "Command batch timeout (in milliseconds)"):
+///   the ringbuffer dispatcher's per-submission expiry (adreno_dispatch.c:
+///   2271, `drawqueue->expires = jiffies + msecs_to_jiffies(
+///   adreno_drawobj_timeout)`) and the preemption timer
+///   (adreno_gen8_preempt.c:55). Its fault-detect interval,
+///   `_fault_timer_interval = 200` ms (adreno_dispatch.c:54), only samples
+///   the GPU's progress registers on the ringbuffer dispatcher.
+/// - An Adreno 840 (gen8, `adreno_gpu_core_gen8_*`, adreno-gpulist.h) runs
+///   the hardware scheduler (`adreno_gen8_hwsched_gpudev`), not that
+///   dispatcher: there long-IB detection (`ft_long_ib_detect`, 1 on the
+///   840) enables the GMU firmware's bail-out timer
+///   (adreno_gen8_hwsched_hfi.c:2663-2667, `HFI_FEATURE_BAIL_OUT_TIMER`
+///   sent with data 0: the firmware's own default), whose expiry is the
+///   context fault `GMU_GPU_SW_HANG` (603, adreno_hfi.h: "Fault due to Long
+///   IB timeout"). Its duration lives in the GMU firmware: no kernel
+///   constant, sysfs node or property states it (`KGSL_PROP_IB_TIMEOUT`,
+///   0x21, is gone from msm_kgsl.h), and the 840's sysfs states none.
+/// - The hardware hang interrupt (`ft_hang_intr_status` 1) counts cycles
+///   of no interface progress (`hang_detect_cycles` 0xcfffff,
+///   RBBM_INTERFACE_HANG_INT_CNTL, adreno_gen8.c:1785): a stall, not a
+///   long submission that makes progress.
+///
+/// So the bound stated on Android is `adreno_drawobj_timeout`'s 2 s, the
+/// one duration the driver states; where the GMU's bail-out is shorter, the per-submit
+/// trace (`RUST_LOG=engine_gpu::rates=debug`) shows the estimate and time
+/// of every submission up to the one that faults. None stated elsewhere.
+///
+/// Every engine that submits through the platform's GPU driver (Vulkan,
+/// wgpu) states this one.
+pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> =
+    stated_submit_bound(cfg!(target_os = "android"));
+
+/// [`STATED_SUBMIT_BOUND`] on a platform that is Android or not: the
+/// driver's 2 s there, none elsewhere.
+#[must_use]
+pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
+    if android {
+        Some(std::time::Duration::from_secs(2))
+    } else {
+        None
+    }
+}
+
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
 /// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
@@ -123,6 +174,11 @@ struct Rig<'a, B: Serve> {
     /// The step whose fire, at one a frame, was past the bound: refused by
     /// name, and the step drops that shape ([`dropped`]).
     past_bound: std::cell::RefCell<Option<String>>,
+    /// The ratio of the slowest fire to the fastest the warm-up's rotations
+    /// measured at its cube: how far this device's clock swings from fire to
+    /// fire, which a settled frame's admission carries as its least worst
+    /// ratio (the Adreno 840 swung ~10% inside one settled step).
+    swing: std::cell::Cell<f64>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -140,6 +196,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             basis: std::cell::Cell::new(0),
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
             past_bound: std::cell::RefCell::new(None),
+            swing: std::cell::Cell::new(1.0),
         }
     }
 
@@ -493,10 +550,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .iter()
         .flat_map(|(_, curve)| curve.iter().map(|&(_, rate)| rate))
         .fold(0.0, f64::max);
-    let mut attn = Vec::new();
+    let mut attn: Vec<(u32, f64)> = Vec::new();
+    // A shape's first fire, estimated by its work at the last shape's rate.
+    let at_rate = |shape: engine::rates::AttnShape, rate: Option<f64>| first_fire_ns(shape, rate, launch);
     for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+        let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
+        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
         rig.release();
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
@@ -512,7 +572,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
     for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+        let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
+        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
         rig.release();
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
@@ -642,12 +703,15 @@ fn warm<B: Serve>(
     })?;
     tracing::debug!(side, walk_worst = worst, "warm-up walk: the cube");
     loop {
-        match warm_at(rig, side, tactic_at, timer)? {
+        match warm_at(rig, side, tactic_at, timer, worst)? {
             Some(warmed) => {
                 // The clock settled (the rotations agreed, `settle`'s rule):
                 // from here every frame's time against its estimate counts.
                 let mut admission = rig.admission.get();
                 admission.settled = true;
+                // The clock's swing the rotations measured: a settled frame
+                // is never admitted nearer the bound than that.
+                admission.worst = admission.worst.max(rig.swing.get());
                 rig.admission.set(admission);
                 return Ok((side, warmed));
             }
@@ -673,6 +737,7 @@ fn warm_at<B: Serve>(
     side: u32,
     tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
+    walk_worst: f64,
 ) -> Result<Option<engine::rates::Warmed>> {
     let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
@@ -696,19 +761,24 @@ fn warm_at<B: Serve>(
     // bound at the last fire's time and the worst ratio the rotations' own
     // frames ran against their estimates (the clock sinking as it warms),
     // all of a rotation's where it states none; 0 where not one fits.
+    // An unsettled clock swings (the Adreno 840's fire ran 182 to 318 ms
+    // within seconds), so a frame is sized from the slowest fire this
+    // rotation has measured, not the last, at the worst ratio the walk
+    // measured a fire's time against its estimate: both measurements, no
+    // chosen margin. Sized from the last fire at a ratio of 1, a frame
+    // estimated at 1824 ms took 2001 ms and the next lost the device.
     let rotations = std::cell::Cell::new(engine::rates::Admission {
         settled: true,
+        worst: walk_worst.max(1.0),
         ..engine::rates::Admission::new(rig.max_submit)
     });
-    let fits = |left: u32| -> u32 {
-        match (rotations.get().bound, rig.per_fire.get()) {
-            (Some(cap), Some(per)) => {
-                ((cap.as_nanos() as f64 / (per.max(1.0) * rotations.get().worst)).floor() as u32)
-                    .min(left)
-            }
-            _ => left,
-        }
+    let slowest = std::cell::Cell::new(rig.per_fire.get());
+    let fastest = std::cell::Cell::new(None::<f64>);
+    let per_fire = || match (slowest.get(), rig.per_fire.get()) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     };
+    let fits = |left: u32| rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left);
     let shrunk = std::cell::Cell::new(false);
     let warmed = engine::rates::warm_up(|| {
         let mut wall = 0u64;
@@ -724,8 +794,14 @@ fn warm_at<B: Serve>(
                     why: format!("warm-up: a {side}^3 fire no longer fits the bound"),
                 });
             }
-            let estimate = rig.per_fire.get().map(|p| p * f64::from(count));
+            let estimate = per_fire().map(|p| p * f64::from(count));
             let took = rig.frame(timer, count, &fire, &nothing)?.1;
+            slowest.set(per_fire());
+            let this = took as f64 / f64::from(count.max(1));
+            fastest.set(Some(fastest.get().map_or(this, |f: f64| f.min(this))));
+            if let (Some(fast), Some(slow)) = (fastest.get(), slowest.get()) {
+                rig.swing.set(rig.swing.get().max(slow / fast.max(1.0)));
+            }
             let mut r = rotations.get();
             r.landed(estimate, took as f64, true);
             rotations.set(r);
@@ -783,6 +859,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     s: engine::rates::AttnShape,
     launch: f64,
+    estimate: Option<f64>,
 ) -> Result<f64> {
     let tactic = tactics.sdpa(tier, s.head_dim);
     // Tiled where a request's rows reach the profile's tile rows, as a
@@ -824,9 +901,12 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
+    // A new shape's first fire is estimated before it is submitted (from
+    // the rate the step's last shape measured, by the work), so one past the
+    // device's bound is refused by name unsubmitted, never run to find out.
     rig.step(
         format!("attention {}x{} d {}", s.rows, s.keys, s.head_dim),
-        None,
+        estimate,
     );
     let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (q, pool) = &sets[next.get() % sets.len()];
@@ -1057,7 +1137,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     launch: f64,
 ) -> Result<f64> {
     let mut rig = Rig::<B>::new(device, None);
-    attention(&mut rig, tactics, tier, timer, shape, launch)
+    attention(&mut rig, tactics, tier, timer, shape, launch, None)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)` under `tactic`: a check
@@ -1077,4 +1157,82 @@ pub fn gemm_rate<B: Serve>(
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)
+}
+
+/// The fires a warm-up rotation's next frame holds of `left`: as many as fit
+/// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)
+/// times `worst` (at least the walk's measured worst ratio); 0 where not one
+/// fits; all of them where no bound is stated or nothing is measured yet.
+fn rotation_fires(
+    bound: Option<std::time::Duration>,
+    per_fire: Option<f64>,
+    worst: f64,
+    left: u32,
+) -> u32 {
+    match (bound, per_fire) {
+        (Some(cap), Some(per)) => {
+            ((cap.as_nanos() as f64 / (per.max(1.0) * worst.max(1.0))).floor() as u32).min(left)
+        }
+        _ => left,
+    }
+}
+
+/// A new attention shape's first fire, estimated before it is submitted: its
+/// work at the rate the step's last shape measured, plus a launch; none
+/// where no shape has been measured yet.
+fn first_fire_ns(shape: engine::rates::AttnShape, rate: Option<f64>, launch: f64) -> Option<f64> {
+    rate.map(|rate| attn_flops(shape) / rate.max(f64::MIN_POSITIVE) + launch)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const BOUND: std::time::Duration = std::time::Duration::from_millis(2000);
+
+    /// The Adreno 840's trace: a fire swinging 182 → 318 ms. Sized from the
+    /// slowest fire at the walk's worst ratio, a frame stays under the bound
+    /// even when every fire runs at the slowest seen; sized from the last
+    /// (fastest) fire at 1, it would not.
+    #[test]
+    fn a_rotation_frame_sized_from_the_slowest_fire_at_the_worst_ratio_stays_under_the_bound() {
+        let (fast, slow, walk_worst) = (182e6, 318e6, 1.57);
+        let fires = rotation_fires(Some(BOUND), Some(slow), walk_worst, 64);
+        assert!(fires >= 1);
+        assert!(f64::from(fires) * slow * walk_worst <= BOUND.as_nanos() as f64);
+        assert!(f64::from(fires) * slow <= BOUND.as_nanos() as f64);
+        // The old sizing: the last fire's time at a ratio of 1.
+        let old = rotation_fires(Some(BOUND), Some(fast), 1.0, 64);
+        assert!(f64::from(old) * slow > BOUND.as_nanos() as f64, "the old sizing passes the bound at the slowest fire");
+    }
+
+    /// Not one fire fits: the rotation stops (the cube halves), never
+    /// submits a frame past the bound.
+    #[test]
+    fn a_fire_past_the_bound_at_the_worst_ratio_fits_none() {
+        assert_eq!(rotation_fires(Some(BOUND), Some(1500e6), 1.4, 8), 0);
+        // No bound stated: the whole rotation.
+        assert_eq!(rotation_fires(None, Some(1500e6), 1.4, 8), 8);
+        // Nothing measured yet: the whole rotation (the walk admitted it).
+        assert_eq!(rotation_fires(Some(BOUND), None, 1.4, 8), 8);
+    }
+
+    /// A new shape's first fire is estimated from the last shape's rate by
+    /// its work: d256 after d64 at the same keys is estimated at about the
+    /// work ratio, so on a device where d64 took 1.29 s the d256 fire is
+    /// estimated past the 2 s bound and is refused before it is submitted.
+    #[test]
+    fn a_new_attention_shape_is_estimated_by_its_work_before_its_first_fire() {
+        let d64 = engine::rates::ATTN_SHAPE.at(8192).with_dim(64);
+        let d256 = engine::rates::ATTN_SHAPE.at(8192).with_dim(256);
+        assert_eq!(first_fire_ns(d256, None, 0.0), None);
+        let took = 1.29e9;
+        let rate = attn_flops(d64) / took;
+        let estimate = first_fire_ns(d256, Some(rate), 0.0).unwrap();
+        let ratio = attn_flops(d256) / attn_flops(d64);
+        assert!((estimate / took - ratio).abs() < 1e-9);
+        let admission = engine::rates::Admission { settled: true, ..engine::rates::Admission::new(Some(BOUND)) };
+        assert!(!admission.fits(Some(estimate)), "the d256 first fire is refused unsubmitted");
+        assert!(admission.fits(Some(took)), "the d64 fire it was estimated from fits");
+    }
 }
