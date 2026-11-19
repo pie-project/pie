@@ -14,6 +14,9 @@ use engine_gpu::error::{Fault, Result};
 pub struct Shelf {
     recorder: crate::record::Recorder,
 
+    /// Each arm's fire block, laid at load for the load's widest fire.
+    arms: Vec<std::sync::Arc<crate::device::ArmBlock>>,
+
     landed_seats: BTreeMap<u64, LandedSeat>,
 
     /// Bumped by every step: a landed seat a later step may have rewritten
@@ -147,11 +150,22 @@ impl Serve for Api {
     }
 
     fn shelf(
-        _device: &Context,
-        _pipelines: &Pipelines,
-        _readout: &[Buffer],
+        device: &Context,
+        pipelines: &Pipelines,
+        readout: &[Buffer],
         weights_stream: bool,
+        fires: engine_gpu::serve::FireBound,
     ) -> Result<Shelf> {
+        // An arm's fire block holds what its widest fire lays: each dispatch's
+        // group counts and its scalars at the uniform alignment, each with
+        // its alignment's slack, and the readout copier's region tables.
+        let (uniform, storage) = device.fire_alignments();
+        let scalars = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+        let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
+        let bytes = u64::from(fires.dispatches.max(1)) * per_dispatch + fires.readout_rows * 16;
+        let arms = (0..readout.len())
+            .map(|_| crate::device::ArmBlock::new(device, bytes))
+            .collect::<Result<Vec<_>>>()?;
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
@@ -161,6 +175,7 @@ impl Serve for Api {
             } else {
                 crate::record::Recorder::new()
             },
+            arms,
             landed_seats: BTreeMap::new(),
             generation: 0,
         })
@@ -215,7 +230,7 @@ impl Serve for Api {
             };
             // The fire's own scalars and group counts, where the recording's
             // commands read them.
-            let filled = recording.kept.refill(&fill.image);
+            let filled = recording.kept.stage(&fill.image);
             // The segments an expert stage cut, each landed before its stage.
             let staged = filled.and_then(|()| {
                 if recording.cuts.is_empty() {
@@ -287,6 +302,10 @@ impl Serve for Api {
         shell
             .device
             .indirect_next(varying.filter(|_| keep.is_some()));
+        // The walk lays in its arm's fire block.
+        shell
+            .device
+            .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
         Ok(Plan::Walk { keep, split })
     }
 
@@ -325,7 +344,9 @@ impl Serve for Api {
                 // Each segment a flush cut must have an expert stage's host
                 // step to replay after it; a flush of anything else would
                 // not repeat, so such a fire is not kept.
+                let image = std::sync::Arc::new(kept.image().sealed());
                 if kept.cuts() != cuts.len() {
+                    kept.stage(&image)?;
                     return kept.replay(Some(on_done));
                 }
                 // A walk whose commands are a held family's but for the fire
@@ -342,7 +363,6 @@ impl Serve for Api {
                     key.finish()
                 };
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
-                let image = std::sync::Arc::new(kept.image().clone());
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
@@ -370,10 +390,11 @@ impl Serve for Api {
                             .recorder
                             .family(family)
                             .expect("the family was held a line ago");
-                        held.recording.kept.refill(&image)?;
+                        held.recording.kept.stage(&image)?;
                         held.recording.kept.replay(Some(on_done))?
                     }
                     Act::Record(varying) => {
+                        kept.stage(&image)?;
                         let pending = kept.replay(Some(on_done))?;
                         tracing::debug!(
                             arm = prepared.arm,
@@ -400,6 +421,7 @@ impl Serve for Api {
                             classes = ?prepared.descriptor.classes,
                             "vulkan walked a fire its family's recording does not serve"
                         );
+                        kept.stage(&image)?;
                         kept.replay(Some(on_done))?
                     }
                 };

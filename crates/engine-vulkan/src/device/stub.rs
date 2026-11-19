@@ -139,6 +139,20 @@ impl Context {
     pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
         match self.never {}
     }
+
+    pub fn arm_next(&self, _arm: Option<std::sync::Arc<ArmBlock>>) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -224,6 +238,29 @@ pub struct Kept {
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Image;
 
+impl Image {
+    #[must_use]
+    pub fn sealed(&self) -> Image {
+        Image
+    }
+}
+
+/// An arm's fire block: none, with no device.
+pub struct ArmBlock {
+    never: std::convert::Infallible,
+}
+
+impl ArmBlock {
+    pub fn new(device: &Context, _bytes: u64) -> Result<std::sync::Arc<ArmBlock>> {
+        match device.never {}
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        match self.never {}
+    }
+}
+
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
@@ -240,7 +277,7 @@ impl Kept {
         match self.never {}
     }
 
-    pub fn refill(&self, _image: &std::sync::Arc<Image>) -> Result<()> {
+    pub fn stage(&self, _image: &Image) -> Result<()> {
         match self.never {}
     }
 
@@ -452,6 +489,11 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
+    }
+
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        0
     }
 
     /// The kernels built after `from`: none, since a device-less build

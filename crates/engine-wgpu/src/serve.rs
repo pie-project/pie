@@ -147,6 +147,7 @@ impl Serve for Api {
         pipelines: &Pipelines,
         readout: &[Buffer],
         _weights_stream: bool,
+        _fires: engine_gpu::serve::FireBound,
     ) -> Result<Shelf> {
         // A frame takes a uniform and a scratch chunk from the rings and a
         // bind group's uniforms from the pipelines' arena: the rings are

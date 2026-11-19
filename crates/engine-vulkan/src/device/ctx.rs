@@ -167,6 +167,10 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// The one thread that waits on every watched submission's fence, in
+    /// the queue's order, started with the device ([`Watch`]).
+    watcher: Mutex<Option<std::sync::mpsc::Sender<Watch>>>,
+
     /// Command buffers whose frame was dropped off the thread that owns
     /// their pool, which a pool's own thread frees: a pool is not shared.
     orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
@@ -445,6 +449,8 @@ pub struct Context {
     /// The dispatches the next frame makes indirect, by their place in its
     /// walk ([`Context::indirect_next`]).
     indirect_next: Mutex<Option<Arc<Vec<bool>>>>,
+    /// The fire block the next frame opened lays in ([`Context::arm_next`]).
+    arm_next: Mutex<Option<Arc<super::block::ArmBlock>>>,
 }
 
 /// The kernel [`Frame::copy_rows`] dispatches.
@@ -1006,6 +1012,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            watcher: Mutex::new(None),
             orphans: Mutex::new(Vec::new()),
             family,
             memory,
@@ -1051,6 +1058,20 @@ impl Context {
             code,
         )?);
         pipeline_cache.built();
+        // The watcher starts with the device: no thread is spawned per
+        // submission, nor after the load.
+        let (watches, watched) = std::sync::mpsc::channel::<Watch>();
+        std::thread::Builder::new()
+            .name("vk-fence-watch".to_string())
+            .spawn(move || {
+                for watch in watched {
+                    watch.run();
+                }
+            })
+            .map_err(|e| Fault::NoDevice {
+                detail: format!("the fence watcher did not start: {e}"),
+            })?;
+        *core.watcher.lock().expect("watcher lock poisoned") = Some(watches);
         Ok(Context {
             core,
             budget,
@@ -1060,6 +1081,7 @@ impl Context {
             device_index: boot.device_index,
             copier,
             indirect_next: Mutex::new(None),
+            arm_next: Mutex::new(None),
         })
     }
 
@@ -1266,6 +1288,34 @@ impl Context {
         *self.indirect_next.lock().expect("indirect lock poisoned") = at;
     }
 
+    /// The offset alignments a fire block lays at: a uniform's and a
+    /// storage view's.
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        let limits = &self.core.limits;
+        (
+            limits.min_uniform_buffer_offset_alignment.max(4),
+            limits.min_storage_buffer_offset_alignment.max(4),
+        )
+    }
+
+    /// The bytes of scalars the readout copier takes.
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
+        self.copier
+            .fire
+            .as_ref()
+            .map_or(0, |fire| fire.bytes)
+            .max(self.copier.push_bytes)
+    }
+
+    /// The fire block the next frame opened lays in: the arm's whose fire
+    /// it walks. A frame opened with none lays its block in chunks of its
+    /// own.
+    pub fn arm_next(&self, arm: Option<Arc<super::block::ArmBlock>>) {
+        *self.arm_next.lock().expect("arm lock poisoned") = arm;
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
     }
@@ -1345,6 +1395,7 @@ impl Context {
                 core: Arc::clone(core),
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
+                heads: Mutex::new(Vec::new()),
                 cmd_pool: pool,
                 fence,
                 pools: Mutex::new(Vec::new()),
@@ -1360,7 +1411,12 @@ impl Context {
             hazards: std::cell::RefCell::new(Hazards::default()),
             retained: std::cell::RefCell::new(std::collections::HashSet::new()),
             dispatches: std::cell::Cell::new(0),
-            block: std::cell::RefCell::new(super::block::FireBlock::default()),
+            block: std::cell::RefCell::new(
+                match self.arm_next.lock().expect("arm lock poisoned").take() {
+                    Some(arm) => super::block::FireBlock::of_arm(arm),
+                    None => super::block::FireBlock::own(),
+                },
+            ),
             copier: Arc::clone(&self.copier),
             indirect: if one_time {
                 None
@@ -1399,6 +1455,8 @@ pub(crate) struct Inner {
     /// expert stage); a replay submits each, waits, and lets its caller do
     /// that host work before the next.
     cuts: Mutex<Vec<vk::CommandBuffer>>,
+    /// Each head ([`Frame::head`]) recorded for the frame's submissions.
+    heads: Mutex<Vec<vk::CommandBuffer>>,
 
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
@@ -1459,6 +1517,9 @@ impl Drop for Inner {
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
+            buffers.extend(std::mem::take(
+                self.heads.get_mut().expect("heads lock poisoned"),
+            ));
             buffers.push(self.cmd());
             if owned {
                 d.free_command_buffers(self.cmd_pool, &buffers);
@@ -1592,6 +1653,105 @@ impl Frame {
             .lay(&self.inner.core, bytes, align)?;
         self.retain(&slab);
         Ok((slab.buffer, (chunk, at)))
+    }
+
+    /// The commands a submission of the frame runs first: the arm's staging
+    /// slice copied into its fire block, then a barrier before every read
+    /// of it (a uniform, an indirect dispatch's counts, a table). `None`
+    /// where the frame laid nothing in an arm's block. The head is recorded
+    /// once and kept with the frame.
+    fn head(&self, one_time: bool) -> Result<Option<vk::CommandBuffer>> {
+        let block = self.block.borrow();
+        let (Some(arm), bytes) = (block.arm(), block.arm_bytes()) else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let core = &self.inner.core;
+        let d = &core.device;
+        // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
+        // owned by this thread (frames record on the thread that opened
+        // them); the head is recorded here alone and freed with the frame.
+        let head = unsafe {
+            d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.inner.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        self.inner
+            .heads
+            .lock()
+            .expect("heads lock poisoned")
+            .push(head);
+        let flags = if one_time {
+            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+        } else {
+            vk::CommandBufferUsageFlags::empty()
+        };
+        // SAFETY: `head` was just allocated and is recorded only here; both
+        // slabs are the arm's, live as long as the arm the frame holds, and
+        // `bytes` lies inside both (`FireBlock::lay` bounds it by the
+        // block's size, which the staging slice shares). The barrier makes
+        // the copy visible to every compute read and indirect fetch after.
+        unsafe {
+            d.begin_command_buffer(head, &vk::CommandBufferBeginInfo::default().flags(flags))
+                .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::UNIFORM_READ
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                )
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(
+                head,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            d.cmd_copy_buffer(
+                head,
+                arm.staging.slab().buffer,
+                arm.block.slab().buffer,
+                &[vk::BufferCopy::default().size(bytes)],
+            );
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::UNIFORM_READ
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                );
+            d.cmd_pipeline_barrier(
+                head,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+            d.end_command_buffer(head)
+                .map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        }
+        Ok(Some(head))
+    }
+
+    /// Writes what the frame laid so far into its arm's staging slice and
+    /// records the head that copies it: what a submission of the frame as it
+    /// walks runs first. The arm's last fire has landed: the arm was taken.
+    fn staged_head(&self) -> Result<Option<vk::CommandBuffer>> {
+        if let Some(arm) = self.block.borrow().arm() {
+            arm.stage(self.block.borrow().image())?;
+        }
+        self.head(true)
     }
 
     /// Folds `what`, a command the frame records, into its hash.
@@ -2085,10 +2245,11 @@ impl Frame {
         // In `flush`, `Frame` is not `Sync`, so `&self` here is the only
         // thread using this frame's `cmd` and fence, and the frame is open:
         // every method that ends it consumes the frame.
+        let head = self.staged_head()?;
         // SAFETY: `cmd` is recording, so it may be ended.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         {
-            let bufs = [cmd];
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
             // SAFETY: `cmd` is executable, the fence is unsignaled (reset after
@@ -2161,9 +2322,10 @@ impl Frame {
     }
 
     fn submit(&mut self) -> Result<()> {
+        let head = self.staged_head()?;
         self.end()?;
         let core = &self.inner.core;
-        let bufs = [self.inner.cmd()];
+        let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([self.inner.cmd()]).collect();
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
@@ -2176,28 +2338,22 @@ impl Frame {
 
     pub fn commit(mut self) -> Result<()> {
         self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()
     }
 
     pub fn commit_timed(mut self) -> Result<f64> {
         let started = std::time::Instant::now();
         self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()?;
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()?;
         Ok(started.elapsed().as_secs_f64())
     }
 
     pub fn into_kept(mut self) -> Result<Kept> {
         use std::hash::Hasher;
         self.end()?;
+        let head = self.head(false)?;
         Ok(Kept {
+            head,
             inner: Arc::clone(&self.inner),
             block: std::mem::take(&mut *self.block.borrow_mut()),
             baked: self.baked.borrow().finish(),
@@ -2212,7 +2368,7 @@ impl Frame {
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
-        Ok(Pending::watched(&self.inner, on_done))
+        Ok(Pending::watched(Pending::of_frame(&self.inner), on_done))
     }
 }
 
@@ -2231,6 +2387,9 @@ impl Drop for Frame {
 
 pub struct Kept {
     inner: Arc<Inner>,
+
+    /// What every submission of it runs first ([`Frame::head`]).
+    head: Option<vk::CommandBuffer>,
 
     block: super::block::FireBlock,
 
@@ -2276,18 +2435,16 @@ impl Kept {
     }
 
     /// Writes `image`, a walk's whose commands hash as this frame's, into
-    /// its fire block, once its last submission has landed.
-    pub fn refill(&self, image: &Arc<super::block::Image>) -> Result<()> {
-        let core = &self.inner.core;
-        if self.inner.submitted.load(Ordering::Acquire) {
-            // SAFETY: the fence is this kept frame's own.
-            unsafe {
-                core.device
-                    .wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS)
-            }
-            .map_err(|e| core.fault("vkWaitForFences", e))?;
+    /// its arm's staging slice, where its next submission's head copies it
+    /// from. The caller holds the arm: its last fire has landed, so nothing
+    /// in flight reads the slice and no wait is owed.
+    pub fn stage(&self, image: &super::block::Image) -> Result<()> {
+        match self.block.arm() {
+            Some(arm) => arm.stage(image),
+            None => Err(Fault::Unbound {
+                what: "an arm's fire block for a kept frame walked without one".to_string(),
+            }),
         }
-        self.block.refill(image)
     }
 
     /// The segments before the last ([`Frame::cuts`] at `into_kept`).
@@ -2323,12 +2480,13 @@ impl Kept {
             .map_err(|e| core.fault("vkResetFences", e))?;
         self.inner.submitted.store(false, Ordering::Release);
         {
-            let bufs = [cmd];
+            let head = self.head.filter(|_| at == 0);
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable (ended when the next segment
-            // began) and not pending; the fence is unsignaled; the queue is
-            // held under its lock.
+            // SAFETY: `cmd` (and the head) are executable (ended when the
+            // next segment began) and not pending; the fence is unsignaled;
+            // the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
@@ -2348,35 +2506,36 @@ impl Kept {
         // In `replay`, the kept `cmd` is executable, ended by `into_kept`; its
         // one caller keeps only frames opened by `frame_kept`, so it was
         // recorded without `ONE_TIME_SUBMIT` (`into_kept` does not check
-        // this). It also relies on one replay at a
-        // time per `Kept`: `Kept` is `Sync` and nothing here stops two threads
-        // from submitting the same buffer and fence at once; the serve loop
-        // replays from one thread only.
-        if self.inner.submitted.load(Ordering::Acquire) {
-            // SAFETY: the fence is this kept frame's own.
-            unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
-                .map_err(|e| core.fault("vkWaitForFences", e))?;
-        }
-        // SAFETY: any previous submission has signaled (waited above), so no
-        // pending submission names the fence.
-        unsafe { d.reset_fences(&[self.inner.fence]) }
-            .map_err(|e| core.fault("vkResetFences", e))?;
+        // this). Each replay takes a fence of its own, so it waits on no
+        // earlier one: the queue orders it behind its arm's last fire, which
+        // had landed before the arm was taken again.
+        let fence = core.lend_fence()?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
-            let bufs = [self.inner.cmd()];
+            let bufs: Vec<vk::CommandBuffer> =
+                self.head.into_iter().chain([self.inner.cmd()]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable and no longer pending, the fence is
-            // unsignaled, and the queue is held under its lock.
-            unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            // SAFETY: the head and `cmd` are executable and recorded without
+            // `ONE_TIME_SUBMIT`, so they may be pending again; `fence` was
+            // just lent unsignaled; the queue is held under its lock.
+            if let Err(e) = unsafe { d.queue_submit(*queue, &submits, fence) } {
+                drop(queue);
+                core.return_fence(fence);
+                return Err(core.fault("vkQueueSubmit", e));
+            }
         }
-        self.inner.submitted.store(true, Ordering::Release);
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
+        let submission = Arc::new(Submission {
+            inner: Arc::clone(&self.inner),
+            fence,
+            lent: true,
+            landed: std::sync::atomic::AtomicBool::new(false),
+        });
         Ok(Pending::watched(
-            &self.inner,
+            submission,
             on_done.map(|f| -> engine_gpu::backend::OnDone { Box::new(move |refused| f(refused)) }),
         ))
     }
@@ -2410,9 +2569,57 @@ impl Landing {
     }
 }
 
-pub struct Pending {
+/// A submission's fence and the frame it ran: a replay's fence is lent from
+/// the device's spares and handed back once the submission landed.
+struct Submission {
     inner: Arc<Inner>,
-    /// Set where a watcher thread is the fence's one waiter.
+    fence: vk::Fence,
+    lent: bool,
+    landed: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        if !self.lent {
+            return;
+        }
+        // A lent fence goes back once nothing waits on it: its wait has
+        // returned (the watcher's, or the caller's), else it is waited on
+        // here (a submission dropped unwaited, as on a refused step).
+        if !self.landed.load(Ordering::Acquire) {
+            let _ = self.inner.block_on_fence(self.fence);
+        }
+        self.inner.core.return_fence(self.fence);
+    }
+}
+
+/// A watched submission: the watcher waits on its fence, runs `on_done`,
+/// then releases every [`Pending::wait`] through `landing`.
+struct Watch {
+    submission: Arc<Submission>,
+    on_done: engine_gpu::backend::OnDone,
+    landing: Arc<Landing>,
+}
+
+impl Watch {
+    fn run(self) {
+        let submission = self.submission;
+        let result = submission.inner.block_on_fence(submission.fence);
+        submission
+            .landed
+            .store(result.is_ok(), Ordering::Release);
+        (self.on_done)(
+            result
+                .err()
+                .map(|e| submission.inner.core.fault("vkWaitForFences", e).to_string()),
+        );
+        self.landing.land(result);
+    }
+}
+
+pub struct Pending {
+    submission: Arc<Submission>,
+    /// Set where the watcher is the fence's one waiter.
     landing: Option<Arc<Landing>>,
 }
 
@@ -2423,60 +2630,91 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
-    #[must_use]
-    pub fn landed(&self) -> bool {
-        // SAFETY: the fence lives as long as `inner`, which `self` holds;
-        // querying a fence needs no external sync.
-        unsafe { self.inner.core.device.get_fence_status(self.inner.fence) }.unwrap_or(true)
+    /// A frame's one submission, on its own fence.
+    fn of_frame(inner: &Arc<Inner>) -> Arc<Submission> {
+        Arc::new(Submission {
+            inner: Arc::clone(inner),
+            fence: inner.fence,
+            lent: false,
+            landed: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
-    /// A pending submission; where `on_done` is given, a watcher thread
-    /// blocks on the fence, runs it, then releases every [`Pending::wait`],
-    /// so the fence has the one waiter.
-    fn watched(inner: &Arc<Inner>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
+    #[must_use]
+    pub fn landed(&self) -> bool {
+        // SAFETY: the fence lives as long as the submission, which `self`
+        // holds; querying a fence needs no external sync.
+        unsafe {
+            self.submission
+                .inner
+                .core
+                .device
+                .get_fence_status(self.submission.fence)
+        }
+        .unwrap_or(true)
+    }
+
+    /// A pending submission; where `on_done` is given, the device's watcher
+    /// thread blocks on the fence, runs it, then releases every
+    /// [`Pending::wait`], so the fence has the one waiter.
+    fn watched(submission: Arc<Submission>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
         let Some(on_done) = on_done else {
             return Pending {
-                inner: Arc::clone(inner),
+                submission,
                 landing: None,
             };
         };
         let landing = Arc::new(Landing::default());
-        let (watched, told) = (Arc::clone(inner), Arc::clone(&landing));
-        std::thread::spawn(move || {
-            let result = watched.block_on_fence();
-            on_done(
-                result
-                    .err()
-                    .map(|e| watched.core.fault("vkWaitForFences", e).to_string()),
-            );
-            told.land(result);
-        });
+        let watch = Watch {
+            submission: Arc::clone(&submission),
+            on_done,
+            landing: Arc::clone(&landing),
+        };
+        let core = &submission.inner.core;
+        let sent = core
+            .watcher
+            .lock()
+            .expect("watcher lock poisoned")
+            .as_ref()
+            .map(|watcher| watcher.send(watch));
+        if let Some(Err(std::sync::mpsc::SendError(watch))) = sent {
+            // The watcher is gone only with the device: wait here instead.
+            watch.run();
+        }
         Pending {
-            inner: Arc::clone(inner),
+            submission,
             landing: Some(landing),
         }
     }
 
     pub fn wait(&self) -> Result<()> {
-        let core = &self.inner.core;
+        let inner = &self.submission.inner;
+        let core = &inner.core;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         match &self.landing {
             Some(landing) => landing.wait(),
-            None => self.inner.block_on_fence(),
+            None => {
+                let result = inner.block_on_fence(self.submission.fence);
+                self.submission
+                    .landed
+                    .store(result.is_ok(), Ordering::Release);
+                result
+            }
         }
         .map_err(|e| core.fault("vkWaitForFences", e))?;
         if let Some(at) = at {
             crate::encode::credit_fence(at.elapsed().as_nanos() as u64);
         }
-        self.inner.harvest_timing();
+        inner.harvest_timing();
         Ok(())
     }
 }
 
 impl Inner {
-    /// Blocks on this frame's fence. Only a frame's one waiter calls this:
-    /// a watcher thread where the frame has one, else [`Pending::wait`].
-    fn block_on_fence(&self) -> std::result::Result<(), vk::Result> {
+    /// Blocks on `fence`, one of this frame's submissions'. Only its one
+    /// waiter calls this: the watcher where it has one, else
+    /// [`Pending::wait`].
+    fn block_on_fence(&self, fence: vk::Fence) -> std::result::Result<(), vk::Result> {
         let waiting = self.waiters.fetch_add(1, Ordering::AcqRel) + 1;
         self.most_waiters.fetch_max(waiting, Ordering::AcqRel);
         // SAFETY: the fence lives as long as `self`; waiting needs no
@@ -2484,7 +2722,7 @@ impl Inner {
         let result = unsafe {
             self.core
                 .device
-                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+                .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
         };
         self.waiters.fetch_sub(1, Ordering::AcqRel);
         result

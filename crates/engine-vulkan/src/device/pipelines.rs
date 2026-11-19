@@ -67,6 +67,23 @@ impl Pipelines {
         self.order.borrow().len() as u64
     }
 
+    /// The most bytes of scalars any built kernel takes.
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        self.built
+            .borrow()
+            .values()
+            .map(|pipeline| {
+                pipeline
+                    .fire
+                    .as_ref()
+                    .map_or(0, |fire| fire.bytes)
+                    .max(pipeline.push_bytes)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The kernels whose pipelines were built after the first `from`, in
     /// the order built.
     #[must_use]

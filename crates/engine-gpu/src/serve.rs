@@ -161,12 +161,13 @@ pub trait Serve: Backend {
 
     /// The backend's state of a fresh load over its `readout` seats, with
     /// whatever device memory it keeps for every fire (made before the pool
-    /// is sized, so the pool is sized past it).
+    /// is sized, so the pool is sized past it), at most `fires` asks.
     fn shelf(
         device: &Self::Context,
         pipelines: &Self::Pipelines,
         readout: &[Self::Buffer],
         weights_stream: bool,
+        fires: FireBound,
     ) -> Result<Self::Shelf>;
 
     /// What a kept step binds moved: the segments, or a layer's stage.
@@ -194,6 +195,15 @@ pub trait Serve: Backend {
 
     /// Harvests the oldest step in flight, waiting for it.
     fn harvest_one(shell: &mut Shell<Self>) -> Result<()>;
+}
+
+/// The most one fire of a load asks of a backend's per-fire memory: its
+/// dispatches (every class mixed, the readout copies among them) and the
+/// rows it reads out, every layer of every plane at the top rung.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FireBound {
+    pub dispatches: u32,
+    pub readout_rows: u64,
 }
 
 /// How a step goes to the device ([`Serve::plan`]).
@@ -1694,7 +1704,15 @@ impl<B: Serve> Shell<B> {
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         let weights_stream = weights.streams() || weights.gathered().is_some();
-        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream)?;
+        let fires = FireBound {
+            dispatches: asks.dispatches + readouts.len() as u32,
+            readout_rows: span.rungs().last().map_or(0, |rung| u64::from(rung.tokens))
+                * readouts
+                    .iter()
+                    .map(|plane| plane.values.len() as u64)
+                    .sum::<u64>(),
+        };
+        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream, fires)?;
 
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation beside the

@@ -467,6 +467,7 @@ impl<B: Serve> Serve for Named<B> {
         _pipelines: &Self::Pipelines,
         _readout: &[NoBuffer],
         _weights_stream: bool,
+        _fires: crate::serve::FireBound,
     ) -> Result<()> {
         Ok(())
     }
