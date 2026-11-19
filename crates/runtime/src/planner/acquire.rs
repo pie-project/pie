@@ -532,6 +532,8 @@ impl ResidencyPlanner {
                 proc.roles_short = None;
                 proc.roles_free_retry = None;
                 proc.roles_free_short = None;
+                proc.roles_short_gives = None;
+                proc.roles_short_mismatch = None;
                 return true;
             }
             false

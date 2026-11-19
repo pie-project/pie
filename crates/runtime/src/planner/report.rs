@@ -153,6 +153,8 @@ impl ResidencyPlanner {
             proc.roles_short = None;
             proc.roles_free_retry = None;
             proc.roles_free_short = None;
+            proc.roles_short_gives = None;
+            proc.roles_short_mismatch = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
             Some(proc.signal.clone())
@@ -234,6 +236,10 @@ impl ResidencyPlanner {
         refused_free_runs: Option<u32>,
     ) {
         let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
+        // The map as the refusal leaves it: its epoch and its runs of the
+        // need's length.
+        let gives = self.port.room_gives();
+        let map_runs = self.port.guest_free_runs(need.0);
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
@@ -249,12 +255,20 @@ impl ResidencyPlanner {
                 // few standing, it is a plain short head, whatever it was
                 // sent on.
                 proc.roles_free_retry = None;
-                match refused_free_runs {
-                    Some(free) if free >= need.1 => {
-                        proc.roles_free_short = Some(need);
-                        proc.roles_free_short_at = free;
+                proc.roles_short_gives = Some(gives);
+                proc.roles_short_mismatch = None;
+                let refused_saw = refused_free_runs.is_some_and(|free| free >= need.1);
+                let map_shows = map_runs >= need.1;
+                if refused_saw || map_shows {
+                    // Short while runs of its need stood, in its own view or
+                    // the map's: the need understates its unpark.
+                    proc.roles_free_short = Some(need);
+                    proc.roles_free_short_at = map_runs.max(refused_free_runs.unwrap_or(0));
+                    if map_shows && !refused_saw {
+                        proc.roles_short_mismatch = Some((map_runs, refused_free_runs));
                     }
-                    _ => proc.roles_free_short = None,
+                } else {
+                    proc.roles_free_short = None;
                 }
             }
         });

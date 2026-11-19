@@ -83,6 +83,15 @@ pub(super) struct Proc {
     /// holds more, it goes again (a change a quiescent pool can show, as
     /// room moves or comes), never twice on the same runs.
     pub(super) roles_free_short_at: u32,
+    /// The pool's count of room given back (the map's epoch) when its last
+    /// unpark was refused: a plain short head goes again only once the map
+    /// has moved past it, never on the same map twice (a refusal the map
+    /// disagrees with re-sent every plan pass was a hot loop).
+    pub(super) roles_short_gives: Option<u64>,
+    /// Refused while the map showed runs of its need standing that its
+    /// unpark did not see: `(map's free runs, the refusal's)`, for the
+    /// census, so the need is fixed rather than the retry.
+    pub(super) roles_short_mismatch: Option<(u32, Option<u32>)>,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside
@@ -152,6 +161,8 @@ impl Proc {
             roles_free_retry: None,
             roles_free_short: None,
             roles_free_short_at: 0,
+            roles_short_gives: None,
+            roles_short_mismatch: None,
             bind_room: None,
         }
     }

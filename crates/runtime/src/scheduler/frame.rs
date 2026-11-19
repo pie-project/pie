@@ -1671,6 +1671,25 @@ mod tests {
                         _ => break,
                     }
                 }
+                // The invariant: a frame whose expected lanes have all
+                // submitted is sealed (nothing ready waits on nothing).
+                let ready: Vec<&LaneState> = policy
+                    .lanes
+                    .values()
+                    .filter(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
+                    .collect();
+                let all_in = policy
+                    .lanes
+                    .values()
+                    .filter(|lane| lane.awaited)
+                    .all(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete));
+                if !ready.is_empty() && all_in && !queued.is_empty() {
+                    failed = Some(format!(
+                        "r{round}: every expected lane submitted and {} complete frames unsealed",
+                        ready.len()
+                    ));
+                    break;
+                }
                 if let Some(id) = parked_fires.iter().find(|id| queued.contains(id)) {
                     failed = Some(format!("r{round}: a parked owner's complete fire {id} not dispatched"));
                     break;

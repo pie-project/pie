@@ -285,11 +285,12 @@ impl ResidencyPlanner {
                     let recorded = head.and_then(|pid| inner.procs.get(&pid)).map(|proc| {
                         format!(
                             "bind_room={:?} roles_short={:?} roles_short_why={:?} \
-                             roles_free_short={:?}",
+                             roles_free_short={:?} map_vs_refusal_runs={:?}",
                             proc.bind_room.map(|need| (need.run, need.pieces)),
                             proc.roles_short.map(|need| (need.run, need.pieces)),
                             proc.roles_short_why,
                             proc.roles_free_short,
+                            proc.roles_short_mismatch,
                         )
                     });
                     (recorded, head)

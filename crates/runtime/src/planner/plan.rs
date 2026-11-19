@@ -323,7 +323,18 @@ impl ResidencyPlanner {
                             })
                         })
                     });
-                    if !understated && self.port.guest_room_free(run, pieces) {
+                    // A plain short head goes again on runs that stand only
+                    // once the map has moved past its refusal: never twice on
+                    // the same map.
+                    let gives_now = self.port.room_gives();
+                    let map_moved = self.with_inner(|inner| {
+                        inner.unmet_head().is_some_and(|(_, waiter)| {
+                            inner.procs.get(&waiter.pid).is_some_and(|proc| {
+                                proc.roles_short_gives.is_none_or(|at| gives_now != at)
+                            })
+                        })
+                    });
+                    if !understated && map_moved && self.port.guest_room_free(run, pieces) {
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
                             if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {

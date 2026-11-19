@@ -4712,3 +4712,94 @@ async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compactio
     assert_eq!(planner.stats.compaction_waits.load(Ordering::Relaxed), 0);
     bind.abort();
 }
+
+/// A restore whose unpark keeps refusing while the map shows runs of its
+/// need standing (the planner's view and the unpark's disagree): re-sent on
+/// every plan pass it was a hot loop. Its refusal, seen against the map,
+/// marks it understated and the census names the mismatch (map's runs
+/// against the refusal's), so the need gets fixed rather than the retry;
+/// it is re-sent at most once per change of the map. A plain short head
+/// (refused with the map short too) goes again once the map has moved past
+/// its refusal, and only then.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_change() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(12, 0..0, 0)
+    });
+    // The map shows two runs of 3 standing.
+    pool.free.lock().extend([0, 1, 2, 6, 7, 8]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let refuse = |planner: &Arc<ResidencyPlanner>, refused: Option<u32>| {
+        planner.with_inner(|inner| {
+            inner.procs.get_mut(&head).unwrap().state = Residency::Restoring;
+        });
+        planner.requeue_restore_roles(head, (3, 1), refused);
+    };
+    // Refused with its own view short (free_runs 0) while the map shows 2.
+    refuse(&planner, Some(0));
+    let (understated, at, mismatch) = planner.with_inner(|inner| {
+        let proc = &inner.procs[&head];
+        (proc.roles_free_short, proc.roles_free_short_at, proc.roles_short_mismatch)
+    });
+    assert_eq!(understated, Some((3, 1)), "refused against runs the map shows: understated");
+    assert_eq!(at, 2);
+    assert_eq!(mismatch, Some((2, Some(0))), "the census names the mismatch");
+    let retried = |planner: &Arc<ResidencyPlanner>| {
+        planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some())
+            || planner.stats.restores.load(Ordering::Relaxed) > 0
+    };
+    // Plan passes on the same map: not re-sent.
+    for _ in 0..5 {
+        planner.poke();
+        for _ in 0..50 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert!(!retried(&planner), "no re-send on the same map");
+    // The map changes (more runs stand): one re-send.
+    pool.free.lock().extend([3, 4, 5]);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if retried(&planner) {
+            break;
+        }
+    }
+    assert!(retried(&planner), "the map moved: sent once more");
+
+    // A plain short head (the map short too at its refusal) waits for the
+    // map to move past its refusal, then goes on the runs that stand.
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(12, 0..0, 0)
+    });
+    pool.free.lock().extend([0, 2, 4]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.register(head);
+    planner.note_admitted(head);
+    refuse(&planner, Some(0));
+    assert_eq!(planner.with_inner(|inner| inner.procs[&head].roles_free_short), None);
+    pool.free.lock().extend([1]);
+    // Runs stand now, but the map's epoch has not moved: not yet.
+    planner.poke();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!retried(&planner), "the same map epoch: not re-sent");
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if retried(&planner) {
+            break;
+        }
+    }
+    assert!(retried(&planner), "the map moved past its refusal: sent");
+}
