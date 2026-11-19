@@ -199,12 +199,17 @@ impl Plane {
     }
 
     /// The value scratch an instance's state holds: its widest launching
-    /// stage's, a frame in flight each, in which it fires every stage,
-    /// alone or as a lane of its pair's batch
-    /// (`engine::GuestState::per_instance`).
+    /// stage's, once, in which it fires every stage, alone or as a lane of
+    /// its pair's batch (`engine::GuestState::per_instance`). Once, not a
+    /// frame in flight each: an instance's next fire is staged only once
+    /// its last has landed (`fence_instances`), so no two of its fires read
+    /// its scratch at once, and a second set held half its state for
+    /// nothing. Its pair's batch tables stay a frame in flight each
+    /// ([`Self::pair_sets`]): consecutive frames fire different instances of
+    /// one pair (one set there let a beam read another beam's cells).
     fn instance_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<u64>> {
         let scratch = Session::scratch_for(&program.compiled, extents)?;
-        Ok(if scratch == 0 { Vec::new() } else { vec![scratch; self.arms] })
+        Ok(if scratch == 0 { Vec::new() } else { vec![scratch] })
     }
 
     /// What an instance of `program_id` at `extents` and its pair hold in
@@ -1191,7 +1196,7 @@ impl Plane {
                         .flatten()
                         .any(|ring| ring.attachments() > 1);
                     let pair = bound.pair;
-                    let own = bound.scratch.get(arm).cloned();
+                    let own = bound.scratch.first().cloned();
                     let Some(prepared) = bound.session.prepared_mut(stage_index) else {
                         continue;
                     };
