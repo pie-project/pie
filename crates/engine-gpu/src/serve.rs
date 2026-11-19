@@ -1555,9 +1555,22 @@ impl<B: Serve> Shell<B> {
                         device_profile.rates().missing(&crate::rates::KEYS)
                     )));
                 };
+                // The margin the rates step measured beside the rates, saved
+                // with them: refused by its key where unstated.
+                let Some(worst) = device_profile.rates().submit_worst_ratio else {
+                    return Err(Fault::Residency(format!(
+                        "the platform states a bound of {} ms on one GPU submission and device \
+                         {}'s profile leaves `[rates] {}` unstated, so nothing holds a serving \
+                         step's estimate to it at a measured margin; `pie tune <backend> --rates` \
+                         measures it",
+                        bound.as_millis(),
+                        device.name(),
+                        profile::fire::SUBMIT_WORST_RATIO
+                    )));
+                };
                 let held = crate::submit::SubmitBound {
                     bound_ns: bound.as_nanos() as f64,
-                    worst: crate::rates::measured_worst().unwrap_or(1.0).max(1.0),
+                    worst: worst.max(1.0),
                     estimate,
                     launches: u32::try_from(compiled.template().len()).unwrap_or(u32::MAX),
                     layers: crate::submit::layers(&boot.trace),
@@ -1567,7 +1580,7 @@ impl<B: Serve> Shell<B> {
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
                     worst = held.worst,
-                    worst_measured = crate::rates::measured_worst().is_some(),
+                    worst_measured_this_load = device_profile.tuned().measured_this_load,
                     layers = held.layers,
                     rungs = ?held.rungs,
                     prefill_rows = ?held.prefill_rows(boot.context),

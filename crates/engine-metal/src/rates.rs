@@ -781,6 +781,7 @@ pub fn measure(
         scan_gelems: Some(scan),
         few_row_tflops: few_row,
         workgroups_per_core: per_core,
+        submit_worst_ratio: None,
     })
 }
 

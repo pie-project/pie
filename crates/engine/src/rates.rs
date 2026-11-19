@@ -319,6 +319,7 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         ("scan_gelems", rates.scan_gelems),
         ("few_row_tflops", rates.few_row_tflops),
         ("workgroups_per_core", rates.workgroups_per_core),
+        (profile::fire::SUBMIT_WORST_RATIO, rates.submit_worst_ratio),
     ] {
         if let Some(v) = v.filter(|&v| bad(v)) {
             return Some((key, format!("as {v}")));
@@ -1354,6 +1355,7 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
         }
     }
 
@@ -2109,6 +2111,7 @@ mod tests {
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

@@ -953,6 +953,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             launch_ns: None,
             few_row_tflops: None,
             workgroups_per_core: None,
+            submit_worst_ratio: None,
         }
     );
 

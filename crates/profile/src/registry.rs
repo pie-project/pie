@@ -1134,6 +1134,7 @@ impl<'a> Walk<'a> {
                 "scan_gelems" => &mut rates.scan_gelems,
                 "few_row_tflops" => &mut rates.few_row_tflops,
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
+                crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1156,7 +1157,8 @@ impl<'a> Walk<'a> {
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
-                             `scan_gelems`, `few_row_tflops` and `workgroups_per_core`, not \
+                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core` and \
+                             `submit_worst_ratio`, not \
                              `{other}`"
                         ),
                     );

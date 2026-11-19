@@ -79,6 +79,14 @@ pub struct Rates {
     /// `S = W · t / t_full`, over the cores. A real number of workgroups a
     /// unit.
     pub workgroups_per_core: Option<f64>,
+    /// The worst ratio of a timed frame's time to the estimate it was
+    /// submitted under that the device's rates step measured, its clock's
+    /// swing from fire to fire at least (`engine::rates::Admission::worst`):
+    /// the margin a serving step's estimate is held to a stated bound on one
+    /// GPU submission at (`engine_gpu::submit`). At least 1. Measured, and
+    /// read, only where the platform states such a bound (Android); not one
+    /// of [`KEYS`], which the estimate weighs a fire by.
+    pub submit_worst_ratio: Option<f64>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
@@ -93,6 +101,11 @@ pub const KEYS: [&str; 8] = [
     "workgroups_per_core",
 ];
 
+/// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
+/// platform that states a bound on one submission measures beside the
+/// estimate's [`KEYS`].
+pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
+
 impl Rates {
     /// `self` laid over `below`: each key `self` states replaces `below`'s.
     #[must_use]
@@ -106,6 +119,7 @@ impl Rates {
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
+            submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
         }
     }
 
@@ -135,6 +149,9 @@ impl Rates {
             workgroups_per_core: self
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
+            submit_worst_ratio: self
+                .submit_worst_ratio
+                .filter(|_| has(SUBMIT_WORST_RATIO)),
         }
     }
 
@@ -152,6 +169,7 @@ impl Rates {
             "scan_gelems" => self.scan_gelems.is_none(),
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
+            SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -201,6 +219,7 @@ impl Rates {
         float("scan_gelems", self.scan_gelems);
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
+        float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
         out
     }
 }
@@ -351,6 +370,7 @@ mod tests {
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
@@ -365,6 +385,28 @@ mod tests {
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\n"
         );
+    }
+
+    /// The margin a load measures under a stated submit bound is saved with
+    /// the rates and read back: a boot on saved rates holds its steps at it.
+    #[test]
+    fn the_submit_margin_is_saved_and_read_back_with_the_rates() {
+        let measured = Rates {
+            launch_ns: Some(904),
+            submit_worst_ratio: Some(1.83),
+            ..Rates::default()
+        };
+        let text = format!("api = 1\n{}", measured.toml());
+        assert!(text.contains("submit_worst_ratio = 1.83\n"), "{text}");
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry.load_user(&text, "test").unwrap().rates();
+        assert_eq!(read.submit_worst_ratio, Some(1.83));
+        assert!(read.missing(&[SUBMIT_WORST_RATIO]).is_empty());
+        assert_eq!(
+            Rates::default().missing(&[SUBMIT_WORST_RATIO]),
+            [SUBMIT_WORST_RATIO]
+        );
+        assert_eq!(measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio, Some(1.83));
     }
 
     #[test]

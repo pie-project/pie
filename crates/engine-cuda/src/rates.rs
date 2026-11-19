@@ -498,6 +498,7 @@ mod on_device {
                 scan_gelems: Some(tenth(scan)),
                 few_row_tflops: Some(tenth(few_row / 1e3)),
                 workgroups_per_core: Some(f64::from(resident)),
+                submit_worst_ratio: None,
             },
             attn_by_dim,
         })
@@ -1063,6 +1064,7 @@ mod ensure_tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
+            submit_worst_ratio: None,
         }
     }
 
