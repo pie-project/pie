@@ -484,6 +484,7 @@ impl Rig {
                 adapter_slots: Vec::new(),
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
+                pair_generation: 0,
             },
         );
         LaneHandles {

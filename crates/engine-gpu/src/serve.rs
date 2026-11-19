@@ -88,6 +88,10 @@ pub trait Serve: Backend {
     /// The target the backend's kernels are instantiated for.
     const TARGET: kernels_slang::Target;
 
+    /// Where the device's largest reservation (`Context::max_buffer`, the
+    /// most one fire binds whole) is stated: the limits the backend reads.
+    const MAX_BUFFER_SOURCE: &'static str;
+
     /// The bytes a guest's launch table is aligned to in its `Instance`
     /// slot: 16 at least, and whatever the device asks of a buffer
     /// binding's offset.
@@ -1022,17 +1026,109 @@ impl<B: Serve> Shell<B> {
         // wider than it has no carve, so the load's fires are cut to it and
         // the model compiled again at it (its own carve is laid again, as
         // it may differ from the rung's laid under the wider top).
+        // What an arm's inputs store seats beside a fire's rows.
+        let patch_seat = boot.patches.as_ref().and_then(|ladder| {
+            boot.trace.values.iter().find_map(|decl| {
+                let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
+                    (&decl.def, &decl.ty)
+                else {
+                    return None;
+                };
+                let width: u64 = shape
+                    .iter()
+                    .skip(1)
+                    .map(|dim| match dim {
+                        poem_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .product();
+                let element = poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
+                Some(crate::inputs::PatchSeat {
+                    rows: u64::from(ladder.max_patches),
+                    row_bytes: width * element,
+                    images: u64::from(ladder.max_images),
+                    dtype: *dtype,
+                })
+            })
+        });
+
+        let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
+        let voxel_seat = budgets.voxels.as_ref().map(|ladder| {
+            let mut channels = 0u64;
+            let mut dtype = None;
+            for decl in &boot.trace.values {
+                let poem_ir::Def::Input(RuntimeInput::Guest {
+                    axis: poem_ir::InputAxis::Voxel,
+                    width,
+                    ..
+                }) = &decl.def
+                else {
+                    continue;
+                };
+                channels = channels.max(u64::from(*width));
+                if let Ty::Tensor { dtype: d, .. } = &decl.ty {
+                    dtype = Some(*d);
+                }
+            }
+            crate::inputs::VoxelSeat {
+                rows: u64::from(ladder.max_voxels),
+                clips: u64::from(ladder.max_clips),
+                channels: channels.max(1),
+                dtype: dtype.unwrap_or(Dtype::Bf16),
+                token_patch: boot.trace.values.iter().find_map(|decl| match decl.def {
+                    poem_ir::Def::Input(RuntimeInput::TokenGrid { p }) => Some(p),
+                    _ => None,
+                }),
+            }
+        });
+        // An arm's inputs store for fires of a budget: where each input lies,
+        // and its bytes.
         let binding = device.max_buffer();
-        // The top asked and its rungs' `(tokens, span bytes)`, once bounded
-        // by the binding.
-        let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        let lay_inputs = |budget: &poem_compiler::Budget,
+                          compiled: &CompiledModel,
+                          feeds: &poem_exec::feeds::Feeds,
+                          capture: bool| {
+            crate::inputs::Laid::lay(
+                budget,
+                asked,
+                rows.tables.len(),
+                table_pages,
+                compiled.classes.classes.len(),
+                fallback::gathers(&boot.trace, compiled, crate::window::CARRIES),
+                patch_seat,
+                states_mrope,
+                &feeds.seats(),
+                feeds.selections.len(),
+                voxel_seat,
+                rows.pieces,
+                capture,
+                binding,
+            )
+        };
+        let arms = u32::try_from(boot.runahead.frames().max(1)).unwrap_or(u32::MAX);
+        // What the device leaves a pool once the weights it holds are laid:
+        // every plane but those the token tables stream, and every plane the
+        // load derives from them past sizing (`weights::derived_bytes`).
+        let pool_left = {
+            let planes = crate::weights::plane_bytes(&boot.trace)?;
+            let held: u64 = planes
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| !streamed.contains(at))
+                .map(|(_, bytes)| *bytes)
+                .sum();
+            device
+                .left()
+                .saturating_sub(held)
+                .saturating_sub(crate::weights::derived_bytes(&boot.trace))
+        };
         // The roofline the device's rates state (`engine::roofline`): where
         // the profile states them all, the top rung is the estimate's pick
         // (`engine::load::choose_tiled`, each plane's rows padded to the row
         // tile of the kernel this backend picks at its shape), among the
-        // rungs to the estimate's fire top (its argmax over the lattice to
-        // the context, `FireEstimate::fire_top`); a fire never runs past the
-        // pick.
+        // feasible rungs to the estimate's fire top (its argmax over the
+        // lattice to the context, `FireEstimate::fire_top`); a fire never
+        // runs past the pick.
         let device_profile = tuning.profile().clone();
         let rated = device_profile.rates().complete(&crate::rates::KEYS);
         let counts = if rated {
@@ -1040,12 +1136,15 @@ impl<B: Serve> Shell<B> {
         } else {
             None
         };
-        let live = counts.as_ref().map_or(0, |counts| {
-            let room = device.left().saturating_sub(counts.weight_bytes);
+        // The live range the ruling weighs a span against: the pool the room
+        // leaves past one working set at the declared context, bound in the
+        // segments the kernels bind.
+        let live = {
+            let state = pool_left.saturating_sub(u64::from(least_chunks) * chunk);
             kv_budget
-                .map_or(room, |budget| budget.min(room))
+                .map_or(state, |budget| budget.min(state))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
-        });
+        };
         // The dense tactic at each power of two of rows to the asked top:
         // a matmul of `m` rows runs the tactic of the widest such row count
         // at or below it.
@@ -1079,7 +1178,9 @@ impl<B: Serve> Shell<B> {
         // or a check's past it.
         let mut laid: Option<u32> = None;
         let mut weighed: Option<engine::load::check::Weighed> = None;
-        let (compiled, mut span) = loop {
+        // The rungs this device cannot lay, and why, said once.
+        let mut said = false;
+        let (compiled, mut span, out, out_width, pixels, readouts) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
             let mut rung_tokens = engine::memory::rungs(1, top);
@@ -1097,15 +1198,231 @@ impl<B: Serve> Shell<B> {
                 least,
                 &tuning,
             )?;
+            // A capturing lane's row is as wide as the load's context, in its
+            // pages: the widths the span lays its rows at.
+            let class_outputs = poem_exec::feeds::class_outputs(
+                &boot.trace,
+                &compiled,
+                asked.context(),
+                asked.page_size,
+            )
+            .map_err(|why| Fault::Unbound { what: why })?;
+            if class_outputs.is_empty() {
+                return Err(Fault::Unbound {
+                    what: "no output, so a fire would compute nothing a reader can take".to_string(),
+                });
+            }
+            let float = |out: &&poem_exec::feeds::ClassOutput| {
+                out.decl.axis != poem_ir::InputAxis::Lane
+                    && out.grid.is_none()
+                    && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
+            };
+            // The host reads back the readout rows most classes write, else the last row output.
+            let out = class_outputs
+                .iter()
+                .filter(float)
+                .filter(|out| out.decl.readout)
+                .max_by_key(|out| out.classes.iter().count())
+                .or_else(|| class_outputs.iter().rfind(float))
+                .map(|out| out.values[0]);
+
+            let (out_width, pixels, readouts) = {
+                let ceiling = FireRows {
+                    tokens: u64::from(boot.budget.max_tokens),
+                    lanes: u64::from(boot.budget.max_lanes),
+                    patches: u64::from(budgets.max_patches()),
+                    images: u64::from(budgets.max_images()),
+                    voxels: u64::from(budgets.max_voxels()),
+                    clips: u64::from(budgets.max_clips()),
+                    readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
+                };
+                let rect_of = |value: ValueId, name: &str| {
+                    poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| {
+                        Fault::Unbound {
+                            what: format!(
+                                "value {}, of output `{name}`, which the carve gave no rectangle",
+                                value.0
+                            ),
+                        }
+                    })
+                };
+                let mut readouts = Vec::new();
+                let mut pixels = Vec::new();
+                for output in &class_outputs {
+                    let name = &output.decl.name;
+                    // A capturing lane's row lies in a pair's score room, no
+                    // arena slot: as wide as the load states it.
+                    if let Some(grain) = crate::arena::grain(&compiled.arena, output.values[0]) {
+                        readouts.push(ReadoutPlane {
+                            values: output.values.clone(),
+                            output: name.clone(),
+                            seam: Kind::Lane,
+                            classes: output.classes.clone(),
+                            width: output.decl.width,
+                            dtype: output.decl.dtype,
+                            voxels: false,
+                            captured: Some(grain),
+                        });
+                        continue;
+                    }
+                    let rect = rect_of(output.values[0], name)?;
+                    if let Some(grid) = output.grid {
+                        if rect.dtype != Dtype::Bf16 {
+                            return Err(Fault::Unbound {
+                                what: format!(
+                                    "output `{name}`, a voxel output with a grid of its own, landed \
+                                     as {:?}, not bf16",
+                                    rect.dtype
+                                ),
+                            });
+                        }
+                        pixels.push((
+                            output.values[0],
+                            name.clone(),
+                            rect.width,
+                            output.classes.clone(),
+                            u64::from(rect.rows) * u64::from(rect.width) * 2,
+                            grid_chain(&boot.trace, grid),
+                        ));
+                        continue;
+                    }
+                    if !matches!(rect.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32) {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "output `{name}` landed as {:?}, which this shell cannot read back",
+                                rect.dtype
+                            ),
+                        });
+                    }
+                    readouts.push(ReadoutPlane {
+                        values: output.values.clone(),
+                        output: name.clone(),
+                        seam: if output.decl.readout {
+                            Kind::Readout
+                        } else if output.decl.axis == poem_ir::InputAxis::Lane {
+                            Kind::Lane
+                        } else {
+                            Kind::Rows
+                        },
+                        classes: output.classes.clone(),
+                        width: rect.width,
+                        dtype: rect.dtype,
+                        voxels: output.decl.axis == poem_ir::InputAxis::Voxel,
+                        captured: None,
+                    });
+                }
+                let out_width = match out {
+                    Some(out) => rect_of(out, "readout")?.width,
+                    None => 0,
+                };
+                (out_width, pixels, readouts)
+            };
+            // Every reservation a rung's fires need in one binding: its span,
+            // and each arm's readout seat, pixel plane and inputs store for
+            // the fires cut to it. Those arms' reservations and the weights
+            // come out of what the device leaves the pool.
+            let pixel_bytes = pixels.iter().map(|plane| plane.4).max().unwrap_or(0);
+            let feeds = poem_exec::feeds::Feeds::of(&boot.trace, &compiled);
+            let reserved = |tokens: u32| {
+                let cut = crate::arena::bounded_budget(&budgets.tokens, tokens);
+                let seat = readout_seat(&readouts, &cut, budgets.max_voxels(), span.capture());
+                let store = lay_inputs(&cut, &compiled, &feeds, span.capture().is_some()).bytes();
+                (seat, store)
+            };
             let spans: Vec<(u32, u64)> = span
                 .rungs()
                 .iter()
-                .map(|rung| (rung.tokens, rung.bytes()))
+                .map(|rung| {
+                    let (seat, store) = reserved(rung.tokens);
+                    (rung.tokens, rung.bytes().max(seat).max(pixel_bytes).max(store))
+                })
                 .collect();
+            // Each rung as the pool weighs it: the span's chunks, the room
+            // the device leaves a load cut to it (what the weights and the
+            // arms' readout seats, pixel planes and inputs stores leave), and
+            // its widest reservation of one binding. A rung is feasible
+            // whose every reservation lies in one binding and whose span and
+            // one working set at the context lie in that room's pool, cut
+            // into segments with the span whole in the last
+            // (`store::pool::infeasible`).
+            let rooms: Vec<crate::store::pool::Rung> = span
+                .act_chunks(chunk)
+                .into_iter()
+                .zip(&spans)
+                .map(|((tokens, act), &(_, widest))| {
+                    let (seat, store) = reserved(tokens);
+                    let arms_bytes = u64::from(arms) * (seat + pixel_bytes + store);
+                    crate::store::pool::Rung {
+                        tokens,
+                        act,
+                        left: pool_left.saturating_sub(arms_bytes),
+                        widest,
+                    }
+                })
+                .collect();
+            let why = |tokens: u32| {
+                rooms
+                    .iter()
+                    .find(|rung| rung.tokens == tokens)
+                    .and_then(|rung| {
+                        crate::store::pool::infeasible(rung, kv_budget, chunk, least_chunks, binding)
+                    })
+            };
+            if !said {
+                said = true;
+                let cannot: Vec<(u32, &str)> = rooms
+                    .iter()
+                    .filter_map(|rung| why(rung.tokens).map(|why| (rung.tokens, why)))
+                    .collect();
+                if !cannot.is_empty() {
+                    tracing::info!(
+                        rungs = ?cannot,
+                        binding_mib = binding >> 20,
+                        binding_source = B::MAX_BUFFER_SOURCE,
+                        room_mib = pool_left >> 20,
+                        working_set_chunks = least_chunks,
+                        chunk,
+                        "rungs this device cannot lay"
+                    );
+                }
+            }
+            // No rung feasible: the load is refused, each rung named with
+            // its span and why, and the least rung's pool in `sized`'s words.
+            if rooms.iter().all(|rung| why(rung.tokens).is_some()) {
+                let no = engine::load::NoRung {
+                    refused: rooms
+                        .iter()
+                        .map(|rung| (rung.tokens, rung.widest, why(rung.tokens).unwrap_or("")))
+                        .collect(),
+                };
+                let least = rooms.first().map(|rung| {
+                    crate::store::pool::sized(
+                        rung.left,
+                        kv_budget,
+                        chunk,
+                        rung.act,
+                        least_chunks,
+                        binding,
+                    )
+                });
+                return Err(Fault::Residency(match least {
+                    Some(Err(short)) => format!(
+                        "{no}; one reservation of this device binds no more than {} MiB ({}); \
+                         the least rung's pool: {short}",
+                        binding >> 20,
+                        B::MAX_BUFFER_SOURCE
+                    ),
+                    _ => format!(
+                        "{no}; one reservation of this device binds no more than {} MiB ({})",
+                        binding >> 20,
+                        B::MAX_BUFFER_SOURCE
+                    ),
+                }));
+            }
             // The pick, once: the fire top (`engine::load::fire_top`), the
-            // ruling over every rung of the lattice a prompt of the context
-            // holds, each weighed as its check fire, each infeasible past one
-            // binding. No fire runs past it; a check's load lays on past it.
+            // ruling over every feasible rung of the lattice a prompt of the
+            // context holds, each weighed as its check fire. No fire runs
+            // past it; a check's load lays on past it.
             if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
                 let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
                 let padded = |rows: u32| {
@@ -1116,10 +1433,17 @@ impl<B: Serve> Shell<B> {
                         counts.width,
                     )
                 };
+                // Each rung's span, the live range's share it takes; its
+                // other reservations bind it only through `why`.
+                let span_bytes: Vec<(u32, u64)> = span
+                    .rungs()
+                    .iter()
+                    .map(|rung| (rung.tokens, rung.bytes()))
+                    .collect();
                 let rungs = crate::top::rung_facts(
-                    &spans,
+                    &span_bytes,
                     budgets.tokens.max_lanes,
-                    binding,
+                    &why,
                     launches,
                     &padded,
                 );
@@ -1134,14 +1458,16 @@ impl<B: Serve> Shell<B> {
                     binding,
                 )?;
                 tracing::info!(
-                    "{}",
+                    "{}; one reservation binds at most {} MiB ({})",
                     crate::top::line_of(
                         &pick,
                         pick.tokens,
                         pick.span_bytes,
                         live,
                         device_profile.tuned()
-                    )
+                    ),
+                    binding >> 20,
+                    B::MAX_BUFFER_SOURCE
                 );
                 let lays = match boot.check {
                     None => pick.tokens,
@@ -1168,42 +1494,40 @@ impl<B: Serve> Shell<B> {
                     });
                 }
             }
-            // The fire bound is the widest rung laid that one binding holds
-            // (the pick's, a check's past it), else the widest one binding
-            // holds.
-            let held: Vec<(u32, u64)> = spans
+            // The fire bound is the widest feasible rung laid (the pick's, a
+            // check's past it), else the widest feasible.
+            let held: Vec<crate::store::pool::Rung> = rooms
                 .iter()
                 .copied()
-                .filter(|&(tokens, _)| laid.is_none_or(|laid| tokens <= laid))
+                .filter(|rung| laid.is_none_or(|laid| rung.tokens <= laid))
                 .collect();
-            let widest = crate::arena::bound_top(&held, binding);
-            // Whether the binding cut it, which the load then says.
-            let binds = held.iter().any(|&(_, bytes)| bytes > binding);
+            let widest = crate::store::pool::widest_rung(
+                &held,
+                kv_budget,
+                chunk,
+                least_chunks,
+                binding,
+            );
             match widest {
                 Some(widest) if widest < top => {
-                    if binds {
-                        unbounded.get_or_insert((top, spans));
-                    }
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
                     boot.budget = budgets.tokens.clone();
                 }
-                // None: not even the least rung lies in one binding, and
-                // the pool refuses the load below.
-                _ => break (compiled, span),
+                Some(_) => break (compiled, span, out, out_width, pixels, readouts),
+                // A check's laid rungs, every one infeasible: the device
+                // cannot lay what the check asks.
+                None => {
+                    return Err(Fault::Residency(format!(
+                        "no rung to {} tokens, which this load's check lays, is feasible on this \
+                         device",
+                        laid.unwrap_or(top)
+                    )));
+                }
             }
         };
         // The widest rung a check's load laid: its top once bounded.
         if let Some(weighed) = weighed.as_mut() {
             weighed.laid = budgets.tokens.max_tokens;
-        }
-        if let Some((asked, spans)) = unbounded {
-            tracing::info!(
-                asked,
-                top = budgets.tokens.max_tokens,
-                spans = ?spans,
-                "the top rung is bounded by this device's largest binding: {} MiB",
-                binding >> 20
-            );
         }
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1214,21 +1538,23 @@ impl<B: Serve> Shell<B> {
 
         let mut masked = poem_ir::ClassSet::default();
         for region in compiled.template() {
+            // The attentions that read the fire's masks, each row its own
+            // entry: a decode or a prefill stating them, whole or over a
+            // selection's blocks (`dispatch::attn`). A lane stating no mask
+            // runs them too, reading every key its bounds give.
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(poem_ir::Operation::Attn(
                         poem_ir::Attn::Prefill {
                             mask: Some(_),
-                            selection: None,
                             bias: None,
-                            lse: None,
+                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
                             ..
-                        } | poem_ir::Attn::Prefill {
+                        } | poem_ir::Attn::Decode {
                             mask: Some(_),
-                            selection: None,
                             bias: None,
-                            lse: Some(_),
+                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
                             ..
                         }
                     ))
@@ -1283,34 +1609,6 @@ impl<B: Serve> Shell<B> {
 
         let arms = boot.runahead.frames().max(1);
 
-        let gathers = fallback::gathers(&boot.trace, &compiled);
-
-        let patch_seat = boot.patches.as_ref().and_then(|ladder| {
-            boot.trace.values.iter().find_map(|decl| {
-                let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
-                    (&decl.def, &decl.ty)
-                else {
-                    return None;
-                };
-                let width: u64 = shape
-                    .iter()
-                    .skip(1)
-                    .map(|dim| match dim {
-                        poem_ir::Dim::Const(n) => *n,
-                        _ => 1,
-                    })
-                    .product();
-                let element = poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
-                Some(crate::inputs::PatchSeat {
-                    rows: u64::from(ladder.max_patches),
-                    row_bytes: width * element,
-                    images: u64::from(ladder.max_images),
-                    dtype: *dtype,
-                })
-            })
-        });
-
-        let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
         let gathers_readout = boot
             .trace
             .values
@@ -1334,174 +1632,11 @@ impl<B: Serve> Shell<B> {
                 ),
             });
         }
-        let voxel_seat = budgets.voxels.as_ref().map(|ladder| {
-            let mut channels = 0u64;
-            let mut dtype = None;
-            for decl in &boot.trace.values {
-                let poem_ir::Def::Input(RuntimeInput::Guest {
-                    axis: poem_ir::InputAxis::Voxel,
-                    width,
-                    ..
-                }) = &decl.def
-                else {
-                    continue;
-                };
-                channels = channels.max(u64::from(*width));
-                if let Ty::Tensor { dtype: d, .. } = &decl.ty {
-                    dtype = Some(*d);
-                }
-            }
-            crate::inputs::VoxelSeat {
-                rows: u64::from(ladder.max_voxels),
-                clips: u64::from(ladder.max_clips),
-                channels: channels.max(1),
-                dtype: dtype.unwrap_or(Dtype::Bf16),
-                token_patch: boot.trace.values.iter().find_map(|decl| match decl.def {
-                    poem_ir::Def::Input(RuntimeInput::TokenGrid { p }) => Some(p),
-                    _ => None,
-                }),
-            }
-        });
+        let laid = lay_inputs(&boot.budget, &compiled, &feeds, span.capture().is_some());
         let inputs = (0..arms)
-            .map(|_| {
-                Inputs::reserve(
-                    &device,
-                    &boot.budget,
-                    asked,
-                    page_tables,
-                    table_pages,
-                    compiled.classes.classes.len(),
-                    gathers,
-                    patch_seat,
-                    states_mrope,
-                    &feeds.seats(),
-                    feeds.selections.len(),
-                    voxel_seat,
-                    rows.pieces,
-                    span.capture().is_some(),
-                )
-            })
+            .map(|_| Inputs::reserve(&device, laid.clone()))
             .collect::<Result<Vec<_>>>()?;
 
-        // A capturing lane's row is as wide as the load's context, in its
-        // pages: the widths the span lays its rows at.
-        let class_outputs = poem_exec::feeds::class_outputs(
-            &boot.trace,
-            &compiled,
-            asked.context(),
-            asked.page_size,
-        )
-        .map_err(|why| Fault::Unbound { what: why })?;
-        if class_outputs.is_empty() {
-            return Err(Fault::Unbound {
-                what: "no output, so a fire would compute nothing a reader can take".to_string(),
-            });
-        }
-        let float = |out: &&poem_exec::feeds::ClassOutput| {
-            out.decl.axis != poem_ir::InputAxis::Lane
-                && out.grid.is_none()
-                && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
-        };
-        // The host reads back the readout rows most classes write, else the last row output.
-        let out = class_outputs
-            .iter()
-            .filter(float)
-            .filter(|out| out.decl.readout)
-            .max_by_key(|out| out.classes.iter().count())
-            .or_else(|| class_outputs.iter().rfind(float))
-            .map(|out| out.values[0]);
-
-        let (out_width, pixels, readouts) = {
-            let ceiling = FireRows {
-                tokens: u64::from(boot.budget.max_tokens),
-                lanes: u64::from(boot.budget.max_lanes),
-                patches: u64::from(budgets.max_patches()),
-                images: u64::from(budgets.max_images()),
-                voxels: u64::from(budgets.max_voxels()),
-                clips: u64::from(budgets.max_clips()),
-                readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
-            };
-            let rect_of = |value: ValueId, name: &str| {
-                poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| {
-                    Fault::Unbound {
-                        what: format!(
-                            "value {}, of output `{name}`, which the carve gave no rectangle",
-                            value.0
-                        ),
-                    }
-                })
-            };
-            let mut readouts = Vec::new();
-            let mut pixels = Vec::new();
-            for output in &class_outputs {
-                let name = &output.decl.name;
-                // A capturing lane's row lies in a pair's score room, no
-                // arena slot: as wide as the load states it.
-                if let Some(grain) = crate::arena::grain(&compiled.arena, output.values[0]) {
-                    readouts.push(ReadoutPlane {
-                        values: output.values.clone(),
-                        output: name.clone(),
-                        seam: Kind::Lane,
-                        classes: output.classes.clone(),
-                        width: output.decl.width,
-                        dtype: output.decl.dtype,
-                        voxels: false,
-                        captured: Some(grain),
-                    });
-                    continue;
-                }
-                let rect = rect_of(output.values[0], name)?;
-                if let Some(grid) = output.grid {
-                    if rect.dtype != Dtype::Bf16 {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "output `{name}`, a voxel output with a grid of its own, landed \
-                                 as {:?}, not bf16",
-                                rect.dtype
-                            ),
-                        });
-                    }
-                    pixels.push((
-                        output.values[0],
-                        name.clone(),
-                        rect.width,
-                        output.classes.clone(),
-                        u64::from(rect.rows) * u64::from(rect.width) * 2,
-                        grid_chain(&boot.trace, grid),
-                    ));
-                    continue;
-                }
-                if !matches!(rect.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32) {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "output `{name}` landed as {:?}, which this shell cannot read back",
-                            rect.dtype
-                        ),
-                    });
-                }
-                readouts.push(ReadoutPlane {
-                    values: output.values.clone(),
-                    output: name.clone(),
-                    seam: if output.decl.readout {
-                        Kind::Readout
-                    } else if output.decl.axis == poem_ir::InputAxis::Lane {
-                        Kind::Lane
-                    } else {
-                        Kind::Rows
-                    },
-                    classes: output.classes.clone(),
-                    width: rect.width,
-                    dtype: rect.dtype,
-                    voxels: output.decl.axis == poem_ir::InputAxis::Voxel,
-                    captured: None,
-                });
-            }
-            let out_width = match out {
-                Some(out) => rect_of(out, "readout")?.width,
-                None => 0,
-            };
-            (out_width, pixels, readouts)
-        };
         // A fire lays its capturing lanes' rows in a reading pair's score
         // room, which the pair's reads state (`Shell::score_room`): a class
         // writes a capturing row only under the switch such a read sets.
@@ -1533,33 +1668,12 @@ impl<B: Serve> Shell<B> {
             None => Vec::new(),
         };
 
-        // Sized for the host's read back and every lane's score rows beside
-        // it; a fire reading more grows its arm's.
-        let scored_rows = span.capture().map_or(0, |rows| {
-            u64::from(boot.budget.max_lanes) * (rows.key_bytes() + rows.page_bytes())
-        });
+        // Sized for what a fire reads out (`readout_seat`); a fire reading
+        // more grows its arm's.
+        let readout_bytes =
+            readout_seat(&readouts, &boot.budget, budgets.max_voxels(), span.capture());
         let readout = (0..arms)
-            .map(|_| {
-                B::Buffer::host(
-                    &device,
-                    readouts
-                        .iter()
-                        .filter(|plane| plane.hosts())
-                        .map(|plane| {
-                            u64::from(match plane.seam {
-                                Kind::Readout => readout_rows(boot.budget.max_lanes),
-                                _ if plane.voxels => budgets.max_voxels(),
-                                _ => boot.budget.max_tokens,
-                            }) * u64::from(plane.width)
-                                * elem(plane.dtype)
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(scored_rows)
-                        .max(1),
-                    crate::books::owners::READOUT,
-                )
-            })
+            .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
@@ -1674,8 +1788,10 @@ impl<B: Serve> Shell<B> {
         )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
-        // The null chunk's segment and the span's stand from the load on.
-        pools.commit_segments(&device, 1)?;
+        // The null chunk's segment and the span's stand from the load on;
+        // a pool laid whole stands whole.
+        let segments = pools.load_segments();
+        pools.commit_segments(&device, segments)?;
         {
             let (buffer, end): (&B::Buffer, u64) =
                 pools.span_place().ok_or_else(|| Fault::Unbound {
@@ -2323,6 +2439,24 @@ impl<B: Serve> Shell<B> {
                     .iter()
                     .position(|plane| Some(plane.values[0]) == self.out)
             })
+    }
+
+    /// The bytes each arm's readout seat was laid at.
+    #[must_use]
+    pub fn readout_bytes(&self) -> u64 {
+        self.readout.first().map_or(0, B::Buffer::bytes)
+    }
+
+    /// The rows one fire reads out at most: the runtime's per-fire ceiling.
+    #[must_use]
+    pub fn readouts_ceiling(&self) -> u64 {
+        poem_compiler::arena::readouts_ceiling(&self.budgets.tokens)
+    }
+
+    /// The bytes the activation span takes: its widest rung's.
+    #[must_use]
+    pub fn span_bytes(&self) -> u64 {
+        self.span.bytes()
     }
 
     pub fn out_width(&self) -> Result<u64> {
@@ -3530,11 +3664,12 @@ impl<B: Serve> Shell<B> {
             if masking.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if masking.is_some() != runs_masked_arm {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is refused.
+            if masking.is_some() && !runs_masked_arm {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
             masks.push(crate::mask::LaneMask {
@@ -3804,6 +3939,7 @@ impl<B: Serve> Shell<B> {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
@@ -3814,18 +3950,18 @@ impl<B: Serve> Shell<B> {
             crate::window::Copies {
                 bucket,
 
-                enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
+                // A mask is per-row data: a copied window carries its rows'.
+                enabled: self.copies,
                 page_tables: &geometries,
                 positions: &positions,
                 rotations: &rotations,
                 request_of_token: &request_of_token,
+                mask_words: staged.as_ref().map_or(&[], |staged| &staged.words),
             },
             &[],
             &[],
         )?;
         let boundaries = windows.packed();
-
-        let staged = crate::mask::stage(&masks)?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();
@@ -4228,8 +4364,7 @@ impl<B: Serve> Shell<B> {
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 mask: bound.mask,
-                mask_enabled: bound.mask_enabled,
-                mask_stride: bound.mask_stride,
+                mask_words: bound.mask_words,
             },
 
             group_of_lane: bound.group_of_lane,
@@ -4521,8 +4656,6 @@ pub struct Landed {
     pub launches: u32,
 }
 
-pub const READOUT_ROWS_PER_LANE: u32 = 8;
-
 /// The output a capturing lane's page row reads out (`poem`'s finish).
 pub const SCORE_PAGES: &str = "attn.scores.pages";
 
@@ -4671,10 +4804,36 @@ fn readout_table<B: Serve>(
     Ok((table, layout))
 }
 
-fn readout_rows(max_lanes: u32) -> u32 {
-    max_lanes
-        .saturating_mul(READOUT_ROWS_PER_LANE)
-        .max(max_lanes)
+/// The bytes an arm's readout seat takes for a fire of `budget`: the host's
+/// read back, at most the fire's readout rows (the runtime's per-fire
+/// ceiling, `poem_compiler::arena::readouts_ceiling`: its lanes' rows and
+/// their drafts) of the widest plane it hosts, or its `voxels` of a voxel
+/// plane, and every lane's score rows beside it.
+fn readout_seat(
+    planes: &[ReadoutPlane],
+    budget: &poem_compiler::Budget,
+    voxels: u32,
+    capture: Option<crate::arena::CaptureRows>,
+) -> u64 {
+    let readouts = poem_compiler::arena::readouts_ceiling(budget);
+    let scored_rows = capture.map_or(0, |rows| {
+        u64::from(budget.max_lanes) * (rows.key_bytes() + rows.page_bytes())
+    });
+    planes
+        .iter()
+        .filter(|plane| plane.hosts())
+        .map(|plane| {
+            let rows = if plane.voxels {
+                u64::from(voxels)
+            } else {
+                readouts
+            };
+            rows * u64::from(plane.width) * elem(plane.dtype)
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(scored_rows)
+        .max(1)
 }
 
 /// Lanes' rows of a guest input's seat (zeros where a lane feeds none),
@@ -5438,10 +5597,10 @@ impl<B: Serve> Shell<Named<B>> {
     /// The fires that cut a mask into runs. A fire's rows go in the class
     /// order, so a mask the order leaves in more than one run is cut by
     /// three lanes in the order's turn, the middle one outside the mask.
-    /// Each such mask gives one with no lane masked, where the shell may
-    /// move the mask's rows together and launch once, and one with a lane
-    /// masked, where it launches a run at a time. Token rows only: a patch
-    /// or voxel mask in runs is a fire the shell refuses.
+    /// Each such mask gives one, where the shell may move the mask's rows
+    /// together and launch once, whether or not its lanes state attention
+    /// masks (per-row data a copied window carries). Token rows only: a
+    /// patch or voxel mask in runs is a fire the shell refuses.
     ///
     /// A mask's three are classes whose fires the kernels admit where there
     /// are such: a class in `refused` only where no other three cut it.
@@ -5465,35 +5624,31 @@ impl<B: Serve> Shell<Named<B>> {
                 continue;
             }
             seen.push(&region.mask);
-            for masked in [false, true] {
-                let three = |admitted: bool| {
-                    for (first, &a) in order.iter().enumerate() {
-                        if !region.mask.contains(a as usize) {
+            let three = |admitted: bool| {
+                for (first, &a) in order.iter().enumerate() {
+                    if !region.mask.contains(a as usize) {
+                        continue;
+                    }
+                    for (between, &b) in order.iter().enumerate().skip(first + 1) {
+                        if region.mask.contains(b as usize) {
                             continue;
                         }
-                        for (between, &b) in order.iter().enumerate().skip(first + 1) {
-                            if region.mask.contains(b as usize) {
-                                continue;
-                            }
-                            for &c in &order[between + 1..] {
-                                let trio = [a as usize, b as usize, c as usize];
-                                if region.mask.contains(c as usize)
-                                    && trio.iter().any(|class| self.masked.contains(*class))
-                                        == masked
-                                    && !(admitted && trio.iter().any(|class| refused[*class]))
-                                {
-                                    return Some(trio);
-                                }
+                        for &c in &order[between + 1..] {
+                            let trio = [a as usize, b as usize, c as usize];
+                            if region.mask.contains(c as usize)
+                                && !(admitted && trio.iter().any(|class| refused[*class]))
+                            {
+                                return Some(trio);
                             }
                         }
                     }
-                    None
-                };
-                if let Some(trio) = three(true).or_else(|| three(false))
-                    && !cuts.contains(&trio)
-                {
-                    cuts.push(trio);
                 }
+                None
+            };
+            if let Some(trio) = three(true).or_else(|| three(false))
+                && !cuts.contains(&trio)
+            {
+                cuts.push(trio);
             }
         }
         cuts
@@ -5555,6 +5710,12 @@ impl<B: Serve> Shell<Named<B>> {
                 payload: &lane.payload,
             })
             .collect();
+        // Its seat-addressed lanes read the seats' runs: back their segments
+        // before staging, as a direct fire does (`Shell::fire_seated`).
+        if seated.iter().any(|lane| !lane.refs) {
+            let seats = self.pools.seat_segments();
+            self.commit_segments(seats)?;
+        }
         let prepared = self.stage(StepView {
             lanes: &seated,
             attachments: &[],

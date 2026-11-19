@@ -991,7 +991,6 @@ impl FireCtx<'_> {
                     ceilings,
                     islands: &p.islands,
                     rs: p.rs.body,
-                    group_mask: !p.group_masks.is_empty(),
                 };
 
                 // A serving fire replays a body or is counted: one that

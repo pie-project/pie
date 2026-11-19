@@ -42,6 +42,12 @@ pub trait Backend:
     /// The storage target a checkpoint lands for.
     const STORAGE: checkpoint::types::BackendKind;
 
+    /// Whether the state pool's segments commit and release while serving.
+    /// One that does not lays its whole pool at load and states it
+    /// `Growth::Fixed`: no `yield` applies to it, and the runtime never
+    /// moves it.
+    const RESIZES_POOL: bool = true;
+
     /// Whether a load lands the checkpoint's bytes in what it reserves.
     /// One that reserves nothing takes where each plane lies and which the
     /// checkpoint publishes from the load plan, and reads no byte.

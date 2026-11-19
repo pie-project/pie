@@ -43,7 +43,7 @@ pub struct StepOutcome {
 /// A lane of a step that faulted: lane `lane` of the step's
 /// [`crate::fire::Step::lanes`], the instance whose pass faulted where one
 /// did, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneFault {
     pub lane: u32,
     pub instance: Option<InstanceId>,
@@ -206,7 +206,7 @@ pub trait Engine: Send {
     /// backend's compiled guest code), without registering any: the
     /// runtime's prewarm of the programs its standard samplers register,
     /// before ready, so a registration of one of them builds nothing
-    /// (`crate::live::Tally::BuiltAfterReady`). The default builds nothing.
+    /// (`crate::live::Tally::BuiltAtRegister`). The default builds nothing.
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
         let _ = registrations;
         Ok(())
@@ -400,6 +400,15 @@ pub trait Engine: Send {
     /// what such a step left. A position an engine keeps by slot
     /// still goes back where a refused step found it: the slot outlives
     /// the set, and its next tenant must not meet it.
+    ///
+    /// A refusal a step's lanes earn for their own sake (a lane's word,
+    /// mask, positions, adapter or payload this load does not serve as
+    /// stated) names those lanes, never the frame: refused at the frame's
+    /// first step it is [`Error::Lanes`], nothing of the frame having run;
+    /// refused at a later step, the frame stops there and answers a ticket
+    /// of the steps before it with the lanes in
+    /// [`FrameTicket::refused`]. The runtime fails those lanes' fires alone
+    /// and submits what is left again.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
     /// Backs the pool's first `segments` segments
@@ -412,7 +421,9 @@ pub trait Engine: Send {
     }
 
     /// Gives back every segment at and past `segments`. The runtime has
-    /// evacuated their chunks and waited out every frame that named them.
+    /// evacuated their chunks and waited out every frame that named them;
+    /// an [`Self::evacuate`] copy that still reads them, the engine waits
+    /// out here.
     fn release_segments(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Err(self.unsupported("release_segments"))
@@ -463,7 +474,10 @@ pub trait Engine: Send {
 
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
-    /// before the next fire; the slot refs the runtime holds stand.
+    /// before the next fire; the slot refs the runtime holds stand. The
+    /// copy has a completion of its own, which [`Self::release_segments`]
+    /// waits on before the evacuated segment goes: the runtime waits on no
+    /// later fire for it, so an idle engine's segment goes too.
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))

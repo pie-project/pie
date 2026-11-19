@@ -194,9 +194,9 @@ fn check_live(
             plan.stage(&ctx).expect("the plan uploads");
             match sinked {
                 true => {
-                    attn::decode_lse_sink(&ctx, qt, &plan, kvp, window, d, scale, o, lse, sink_t)
+                    attn::decode_lse_sink(&ctx, qt, &plan, kvp, window, d, scale, o, lse, sink_t, None)
                 }
-                false => attn::decode_lse(&ctx, qt, &plan, kvp, window, d, scale, o, lse),
+                false => attn::decode_lse(&ctx, qt, &plan, kvp, window, d, scale, o, lse, None),
             }
         } else {
             let (q, k, l) = (&qo, &kv_indptr, &kv_len);
@@ -207,7 +207,7 @@ fn check_live(
             plan.stage(&ctx).expect("the plan uploads");
             let (w, s) = (window, scale);
             match sinked {
-                true => attn::prefill_lse_sink(&ctx, qt, &plan, kvp, w, d, kvh, s, o, lse, sink_t),
+                true => attn::prefill_lse_sink(&ctx, qt, &plan, kvp, w, d, kvh, s, o, lse, sink_t, None),
                 false => attn::prefill_lse(&ctx, qt, &plan, kvp, w, d, kvh, s, o, lse),
             }
         }

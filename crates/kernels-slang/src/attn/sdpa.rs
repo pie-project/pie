@@ -64,15 +64,21 @@ pub struct Split {
 pub struct Tables {
     pub positions: Tensor,
     pub request_of_token: Tensor,
-    /// The packed byte mask, `mask_stride` bytes a row.
+    /// The fire's mask plane, a byte a column, whole: each masked row's
+    /// columns lie where its entry says, so no row of a window cuts it.
     pub mask: Tensor,
-    /// One u32 a row: its enable flag in bits 0-1 (nonzero: the row reads
-    /// its mask) and its lane's committed boundary in bits 2-31, the key its
-    /// plane's column 0 is. Every key below the boundary is read under the
-    /// model's own bounds and no mask bit.
-    pub mask_enabled: Tensor,
-    pub mask_stride: u32,
+    /// Two u32 a row: the key its columns start at (its lane's committed
+    /// boundary; [`MASK_NONE`], past every key, where the row states no
+    /// mask), then the byte its columns start at in the plane. Every key
+    /// below the boundary is read under the model's own bounds and no mask
+    /// byte; a row stating none reads no plane. The masks are data: a fire
+    /// of masked and unmasked rows runs the kernels a fire of either runs.
+    pub mask_words: Tensor,
 }
+
+/// A row's boundary stating no mask: past every key (`sdpa.slang`'s
+/// `MASK_NONE`).
+pub const MASK_NONE: u32 = u32::MAX >> 1;
 
 impl Tables {
     /// `attn.plan_decode` and `attn.plan_prefill`: the fire's tables, refused
@@ -82,7 +88,7 @@ impl Tables {
             ("position table", tables.positions, Dtype::I32),
             ("owning-request table", tables.request_of_token, Dtype::I32),
             ("mask planes", tables.mask, Dtype::U8),
-            ("mask words", tables.mask_enabled, Dtype::U32),
+            ("mask words", tables.mask_words, Dtype::U32),
         ];
         for (what, t, want) in stated {
             if t.dtype != want {
@@ -94,6 +100,16 @@ impl Tables {
                     ),
                 ));
             }
+        }
+        if tables.mask_words.width != 2 {
+            return Err(refuse(
+                op,
+                format!(
+                    "the fire's mask words are {} a row, and a row's entry is two: its \
+                     boundary and its offset",
+                    tables.mask_words.width
+                ),
+            ));
         }
         if tables.positions.rows != tables.request_of_token.rows {
             return Err(refuse(
@@ -200,7 +216,7 @@ fn args(
         pool.page_indices.arg(),
         pool.page_indptr.arg(),
         tables.mask.arg(),
-        tables.mask_enabled.arg(),
+        tables.mask_words.arg(),
     ];
     args.extend_from_slice(extra);
     args.extend(pool.pool.args(false));
@@ -213,7 +229,6 @@ fn args(
         pool.page_size.arg(),
         stated(op, shape.kv_heads)?.arg(),
         sm_scale.arg(),
-        tables.mask_stride.arg(),
         shape.window.arg(),
         stated(op, shape.q_heads)?.arg(),
     ]);
@@ -731,8 +746,7 @@ mod tests {
             positions: tensor(3, staged, 1, Dtype::I32),
             request_of_token: tensor(4, staged, 1, Dtype::I32),
             mask: tensor(5, 1, 1, Dtype::U8),
-            mask_enabled: tensor(6, staged, 1, Dtype::U32),
-            mask_stride: 1,
+            mask_words: tensor(6, staged, 2, Dtype::U32),
         };
         let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);
         let pool = KvPool::planes(

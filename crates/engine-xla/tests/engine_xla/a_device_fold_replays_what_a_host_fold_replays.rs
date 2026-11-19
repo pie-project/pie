@@ -130,6 +130,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
                 query_len: ROWS,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("the fold program binds an instance")
         .id

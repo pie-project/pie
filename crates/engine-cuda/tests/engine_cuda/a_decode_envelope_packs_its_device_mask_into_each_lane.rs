@@ -241,6 +241,7 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
                 rings: slots.1,
                 scratch,
                 pair,
+                pair_generation: 0,
             },
         )
         .expect("the instance binds")

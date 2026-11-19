@@ -20,7 +20,9 @@ constexpr int RAGGED_FULL = 0;
 constexpr int RAGGED_CUSTOM = 1;   // keep bit qo·kv_len + kv of group g's bits, from byte indptr[g]
 constexpr int RAGGED_BIAS = 2;     // logit · scale + bias[head][clamp(kv − qo + max_len − 1)]
 
-// An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`.
+// An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`,
+// a negative offset stating no mask (a group none of whose lanes states one:
+// every pair kept, no bit read).
 struct RaggedMaskArgs {
     const unsigned char* bits;
     const long long* mask_indptr;
@@ -48,7 +50,8 @@ __device__ __forceinline__ bool ragged_keeps(const RaggedMaskArgs& m, int g, int
         const unsigned long long cell =
             static_cast<unsigned long long>(qo) * static_cast<unsigned long long>(kv_len) +
             static_cast<unsigned long long>(kv);
-        return (m.bits[m.mask_indptr[g] + static_cast<long long>(cell >> 3)] >> (cell & 7)) & 1;
+        const long long at = m.mask_indptr[g];
+        return at < 0 || ((m.bits[at + static_cast<long long>(cell >> 3)] >> (cell & 7)) & 1);
     } else {
         return true;
     }

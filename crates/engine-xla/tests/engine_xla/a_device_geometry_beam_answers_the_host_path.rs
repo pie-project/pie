@@ -235,6 +235,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("a device-geometry instance binds")
         .id;
@@ -419,6 +420,7 @@ fn device_fed_tokens_reach_the_next_fire() {
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("the instance binds")
         .id;

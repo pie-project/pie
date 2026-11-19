@@ -534,6 +534,7 @@ impl Spatial {
                         readouts: Vec::new(),
                     })
                     .collect(),
+                refused: Vec::new(),
             });
         }
         let mut steps = Vec::with_capacity(frame.steps.len());
@@ -556,7 +557,7 @@ impl Spatial {
             readouts.push(read);
         }
         self.pending = Some((id, readouts));
-        Ok(FrameTicket { id, steps })
+        Ok(FrameTicket::of(id, steps, None))
     }
 }
 

@@ -24,6 +24,41 @@ impl<B: Backend> Run<'_, B> {
         }
     }
 
+    /// A decode plan's tables reading `mask` (the fire's masks, per-row
+    /// data: each row's entry in the plan's words, a row stating none
+    /// reading no plane) where the op states it.
+    fn decode_tables(
+        &self,
+        op: &'static str,
+        plan: poem_ir::ValueId,
+        mask: Option<poem_ir::ValueId>,
+    ) -> Result<sdpa::Tables, kernels_slang::Error> {
+        let plan = *self.decode_plan(plan);
+        let mask = mask.map(|mask| self.tensor(mask));
+        Self::mask_is_bytes(op, mask)?;
+        Ok(sdpa::Tables {
+            mask: mask.unwrap_or(plan.mask),
+            ..plan
+        })
+    }
+
+    /// Refuses a mask the shader would read as something else.
+    fn mask_is_bytes(
+        op: &'static str,
+        mask: Option<kernels_slang::Tensor>,
+    ) -> Result<(), kernels_slang::Error> {
+        match mask {
+            Some(mask) if mask.dtype != poem_ir::Dtype::U8 => Err(kernels_slang::Error::Backend {
+                op,
+                detail: format!(
+                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
+                    mask.dtype
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses a pool whose row does not hold the stated kv heads.
     fn kv_heads_agree(
         op: &'static str,
@@ -64,17 +99,7 @@ impl<B: Backend> Run<'_, B> {
         let q = self.ragged(q).data;
         let pool = self.pool(cache);
         Self::kv_heads_agree(OP, pool, kv_heads)?;
-        if let Some(mask) = mask
-            && mask.dtype != poem_ir::Dtype::U8
-        {
-            return Err(kernels_slang::Error::Backend {
-                op: OP,
-                detail: format!(
-                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
-                    mask.dtype
-                ),
-            });
-        }
+        Self::mask_is_bytes(OP, mask)?;
         let tactic = self.tuning().sdpa(self.tier(), head_dim);
         let tables = self.prefill_tables(plan, mask);
         let (q, pool, o) = (q, *pool, o);
@@ -111,6 +136,7 @@ impl<B: Backend> Run<'_, B> {
         &self,
         q: poem_ir::ValueId,
         plan: poem_ir::ValueId,
+        mask: Option<poem_ir::ValueId>,
         cache: poem_ir::ValueId,
         window: Option<u32>,
         head_dim: u32,
@@ -122,7 +148,7 @@ impl<B: Backend> Run<'_, B> {
             self.ctx,
             self.tuning().sdpa(self.tier(), head_dim),
             self.tensor(q),
-            self.decode_plan(plan),
+            &self.decode_tables("attn.decode", plan, mask)?,
             self.pool(cache),
             window,
             head_dim,
@@ -315,9 +341,8 @@ impl<B: Backend> Run<'_, B> {
                     sdpa::Tables {
                         positions: self.cut_rows(positions),
                         request_of_token: self.cut_rows(t.request_of_token),
-                        mask: self.cut_rows(t.mask),
-                        mask_enabled: self.cut_rows(t.mask_enabled),
-                        mask_stride: t.mask_stride,
+                        mask: t.mask,
+                        mask_words: self.cut_rows(t.mask_words),
                     },
                 )?;
                 self.put(*plan, StructSlot::Decode(built));
@@ -349,15 +374,15 @@ impl<B: Backend> Run<'_, B> {
                     sdpa::Tables {
                         positions: self.cut_rows(positions),
                         request_of_token: self.cut_rows(t.request_of_token),
-                        mask: self.cut_rows(t.mask),
-                        mask_enabled: self.cut_rows(t.mask_enabled),
-                        mask_stride: t.mask_stride,
+                        mask: t.mask,
+                        mask_words: self.cut_rows(t.mask_words),
                     },
                 )?;
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -370,7 +395,9 @@ impl<B: Backend> Run<'_, B> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => self.decode_attention(*q, *plan, *cache, *window, *head_dim, *sm_scale, *o, None),
+            } => self.decode_attention(
+                *q, *plan, *mask, *cache, *window, *head_dim, *sm_scale, *o, None,
+            ),
 
             Attn::Prefill {
                 q,
@@ -381,10 +408,13 @@ impl<B: Backend> Run<'_, B> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // The fire's masks, per-row data: a row stating none reads
+                // every key its bounds give.
+                mask,
                 selection: None,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor stays 0.
+                floor: _,
                 causal: true,
                 selected: None,
                 rel: None,
@@ -392,7 +422,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.prefill_attention(
                 *q,
                 *plan,
-                None,
+                mask.map(|mask| self.tensor(mask)),
                 *cache,
                 *window,
                 *head_dim,
@@ -410,7 +440,6 @@ impl<B: Backend> Run<'_, B> {
                 ..
             }
             | Attn::Prefill {
-                mask: None,
                 selection: Some(_),
                 bias: None,
                 selected: Some(poem_ir::Blocks { per_head: true, .. }),
@@ -430,6 +459,7 @@ impl<B: Backend> Run<'_, B> {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 selection: Some(selection),
@@ -449,7 +479,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.selected_attention(
                 "attn.decode",
                 self.tensor(*q),
-                self.decode_plan(*plan),
+                &self.decode_tables("attn.decode", *plan, *mask)?,
                 *selection,
                 *cache,
                 *window,
@@ -468,9 +498,10 @@ impl<B: Backend> Run<'_, B> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                mask,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor stays 0.
+                floor: _,
                 causal: true,
                 selected:
                     Some(poem_ir::Blocks {
@@ -482,10 +513,12 @@ impl<B: Backend> Run<'_, B> {
             } => {
                 const OP: &str = "attn.prefill";
                 Self::kv_heads_agree(OP, self.pool(*cache), *kv_heads)?;
+                let mask = mask.map(|mask| self.tensor(mask));
+                Self::mask_is_bytes(OP, mask)?;
                 self.selected_attention(
                     OP,
                     self.ragged(*q).data,
-                    &self.prefill_tables(*plan, None),
+                    &self.prefill_tables(*plan, mask),
                     *selection,
                     *cache,
                     *window,
@@ -591,71 +624,13 @@ impl<B: Backend> Run<'_, B> {
                 ..
             }
             | Attn::Prefill {
-                mask: None,
                 selection: None,
                 bias: Some(_),
                 lse: None,
                 ..
             } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
-            Attn::Prefill {
-                q,
-                plan,
-                mask: Some(mask),
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                causal: _,
-                sm_scale,
-                o,
-                selection: None,
-                bias: None,
-                floor: None,
-                selected: None,
-                rel: None,
-                lse: None,
-            } => self.prefill_attention(
-                *q,
-                *plan,
-                Some(self.cut_rows(self.tensor(*mask))),
-                *cache,
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                self.tensor(*o),
-                None,
-            ),
-            Attn::Prefill {
-                q,
-                plan,
-                mask: Some(mask),
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                causal: _,
-                sm_scale,
-                o,
-                lse: Some(lse),
-                selection: None,
-                bias: None,
-                floor: None,
-                selected: None,
-                rel: None,
-            } => self.prefill_attention(
-                *q,
-                *plan,
-                Some(self.cut_rows(self.tensor(*mask))),
-                *cache,
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                self.tensor(*o),
-                Some(self.tensor(*lse)),
-            ),
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -671,6 +646,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.decode_attention(
                 *q,
                 *plan,
+                *mask,
                 *cache,
                 *window,
                 *head_dim,
@@ -690,7 +666,7 @@ impl<B: Backend> Run<'_, B> {
                 lse: Some(lse),
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 causal: true,
@@ -699,7 +675,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.prefill_attention(
                 *q,
                 *plan,
-                None,
+                mask.map(|mask| self.tensor(mask)),
                 *cache,
                 *window,
                 *head_dim,
