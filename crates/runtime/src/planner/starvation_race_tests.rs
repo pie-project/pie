@@ -3291,3 +3291,33 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
     assert_eq!(planner.with_inner(|inner| inner.bind_restoring), None);
     drop(fire);
 }
+
+/// A short restore that gives up parks its process out of the queue and
+/// answers the wait with the error; the process lives on. The M1 / M5
+/// stress: its next wait to be resident found it parked, queued nothing,
+/// and never ended once the rest drained (evicted = evictions - restores,
+/// queue empty). A process waiting to be resident asks for its restore again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parked_process_waiting_to_be_resident_is_restored() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.parked = Some(Demand::default());
+    });
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        planner.wait_resident(pid),
+    )
+    .await;
+    assert!(
+        matches!(waited, Ok(Ok(()))),
+        "the parked process is restored: {waited:?}"
+    );
+}
