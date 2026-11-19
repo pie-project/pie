@@ -1468,6 +1468,79 @@ mod tests {
         assert!(!second.tuned().measured_this_load);
     }
 
+    /// A saved profile lacking one key a newer pie reads: the load asks for
+    /// that key alone and the file keeps every other rate as it was.
+    #[test]
+    fn a_profile_lacking_one_key_gains_it_and_keeps_the_rest() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-one-key-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        let save = || SaveTo {
+            path: path.clone(),
+            provenance: provenance("toy", "a test"),
+            registry: &registry,
+        };
+        let older = profile::fire::Rates {
+            few_row_tflops: None,
+            ..all()
+        };
+        // An older pie, which read every key but this one, saved the file.
+        let older_keys: Vec<&'static str> = profile::fire::KEYS
+            .iter()
+            .copied()
+            .filter(|&key| key != "few_row_tflops")
+            .collect();
+        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        rates_at_load(first, &older_keys, Some(save()), None, None, |_| {
+            Ok(Measured {
+                rates: older.clone(),
+                unsettled: false,
+            })
+        })
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert_eq!(
+            second.rates().missing(&profile::fire::KEYS),
+            ["few_row_tflops"]
+        );
+        let lacked = second.rates().missing(&profile::fire::KEYS);
+        let loaded = rates_at_load(
+            second,
+            &profile::fire::KEYS,
+            Some(save()),
+            None,
+            None,
+            |_| {
+                // A backend times only what the profile lacks.
+                Ok(Measured {
+                    rates: all().only(&lacked),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded.rates(), all());
+        let rates_of = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|line| *line != "[rates]")
+                .take_while(|line| !line.starts_with("[provenance]"))
+                .filter(|line| !line.starts_with("few_row_tflops"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(rates_of(&before), rates_of(&after));
+        assert!(after.contains("few_row_tflops = 4.0"), "{after}");
+    }
+
     #[test]
     fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
         let measured = profile::fire::Rates {

@@ -103,7 +103,10 @@ fn axes(entry: &str, target: Target, s: Shape) -> [(u32, u32); 3] {
         "linear_gemm_pairs_tiled_bm_16_bf16" => [(s.n, 64), (s.m, 16), one],
         "linear_gemm_pairs_tiled_bf16" => [(s.n, 64), (s.m, 64), one],
         // An invocation a column (y) and row (z), 32 lanes folding k.
-        "linear_gemm_gemv_bf16" | "linear_gemm_pairs_gemv_bf16" => [one, (s.n, 8), (s.m, 1)],
+        "linear_gemm_gemv_bf16" => [one, (s.n, 8), (s.m, 1)],
+        "linear_gemm_pairs_gemv_bf16" => [one, (s.n, 8), (s.m, 4)],
+        "linear_gemm_pairs_gemv_v8_bf16" => [one, (s.n, 8), (s.m, 8)],
+        "linear_gemm_pairs_gemv_v16_bf16" => [one, (s.n, 8), (s.m, 16)],
         "linear_moe_route_sort" | "linear_moe_route_sort_256" => [one, one, one],
         "linear_moe_route_sort_gather" => match target {
             Target::Spirv => [(s.k, 256), (s.padded, 1), one],
@@ -251,6 +254,8 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
         "linear_gemm_register_bn_32_bf16",
         "linear_gemm_tiled_bf16",
         "linear_gemm_pairs_gemv_bf16",
+        "linear_gemm_pairs_gemv_v8_bf16",
+        "linear_gemm_pairs_gemv_v16_bf16",
         "linear_gemm_pairs_tiled_bm_16_bf16",
         "linear_gemm_pairs_tiled_bf16",
     ] {

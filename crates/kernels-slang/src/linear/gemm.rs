@@ -98,8 +98,8 @@ pub enum Kernel {
     Register { cols: u32, per: u32 },
     /// SPIR-V's 32 x 32 tile.
     Tiled,
-    /// WGSL's vector kernel.
-    PairsGemv,
+    /// WGSL's vector kernel, `rows` activation rows a workgroup.
+    PairsGemv { rows: u32 },
     /// WGSL's 16-row tile.
     Pairs16,
     /// WGSL's 64-row tile.
@@ -111,7 +111,7 @@ impl Kernel {
     #[must_use]
     pub fn row_tile(self) -> u32 {
         match self {
-            Kernel::GemvV { .. } | Kernel::Gemv | Kernel::PairsGemv => 1,
+            Kernel::GemvV { .. } | Kernel::Gemv | Kernel::PairsGemv { .. } => 1,
             Kernel::Coopmat | Kernel::Pairs64 => 64,
             Kernel::Register { cols, per } => 256 / (cols / per) * 8,
             Kernel::Tiled => 32,
@@ -125,8 +125,8 @@ impl Kernel {
     #[must_use]
     pub fn rows_a_read(self) -> u32 {
         match self {
-            Kernel::Gemv | Kernel::PairsGemv => 1,
-            Kernel::GemvV { rows } => rows,
+            Kernel::Gemv => 1,
+            Kernel::GemvV { rows } | Kernel::PairsGemv { rows } => rows,
             _ => self.row_tile(),
         }
     }
@@ -151,7 +151,9 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
             }
         }
         Target::Spirv => Kernel::Tiled,
-        Target::Wgsl if tactic.vector > 0 => Kernel::PairsGemv,
+        Target::Wgsl if tactic.vector > 0 => Kernel::PairsGemv {
+            rows: vector_rows(tactic.vector),
+        },
         Target::Wgsl if m < PAIRS_WIDE_ROWS => Kernel::Pairs16,
         Target::Wgsl => Kernel::Pairs64,
     }
@@ -291,13 +293,19 @@ fn kernel(
                 ));
             }
             if tactic.vector > 0 {
-                Fire::at(PAIRS, "linear_gemm_pairs_gemv_bf16")
+                let rows = vector_rows(tactic.vector);
+                let entry = match rows {
+                    4 => "linear_gemm_pairs_gemv_bf16",
+                    8 => "linear_gemm_pairs_gemv_v8_bf16",
+                    _ => "linear_gemm_pairs_gemv_v16_bf16",
+                };
+                Fire::at(PAIRS, entry)
                     .tier(if tactic.tier == Tier::Subgroup {
                         Tier::Subgroup
                     } else {
                         Tier::Baseline
                     })
-                    .groups([1, n.div_ceil(8), m])
+                    .groups([1, n.div_ceil(8), m.div_ceil(rows)])
                     .group([32, 8, 1])
             } else if m < PAIRS_WIDE_ROWS {
                 Fire::at(PAIRS, "linear_gemm_pairs_tiled_bm_16_bf16")
