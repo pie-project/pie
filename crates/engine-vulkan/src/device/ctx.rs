@@ -1843,9 +1843,10 @@ impl Frame {
             return self.copy_regions(source, into, regions);
         }
         let mut table = vec![0u8; most * 16];
-        for (row, &(from, to, len)) in table.chunks_exact_mut(16).zip(regions) {
-            for (word, value) in row.chunks_exact_mut(4).zip([from / 4, to / 4, len / 4]) {
-                word.copy_from_slice(&(value as u32).to_le_bytes());
+        for (row, &(from, to, len)) in table.as_chunks_mut::<16>().0.iter_mut().zip(regions) {
+            let (words, _) = row.as_chunks_mut::<4>();
+            for (word, value) in words.iter_mut().zip([from / 4, to / 4, len / 4]) {
+                *word = (value as u32).to_le_bytes();
             }
         }
         let longest = regions
