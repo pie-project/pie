@@ -862,17 +862,6 @@ fn gemm_form(op: &crate::stream::gemm::GOp) -> Option<&'static crate::kernel::Ge
     k.and_then(|k| k.gemm())
 }
 
-/// The tiled form of the kernel a tiled-regime op is (a group norm's, a voxel attention's).
-fn tiled_form(op: &crate::stream::tiled::TOp) -> Option<&'static crate::kernel::TiledForm> {
-    use crate::stream::tiled::TOp;
-    let k = match op {
-        TOp::Norm { .. } => crate::kernel::by_op("conv.group_norm"),
-        TOp::Attend { .. } => crate::kernel::by_op("attn.voxel"),
-        _ => None,
-    };
-    k.and_then(|k| k.tiled())
-}
-
 /// Words the hub's loop holds for certain (the routers and queues from a PE's send to the hub
 /// and back along the broadcast tree to the PE's own receive), as run: flux2-mini's tiled decode
 /// sent 32 words (its attention's keys, its norms' 8 groups) ahead of its receive on the chip,
@@ -917,7 +906,9 @@ pub fn hub_loops(p: &crate::stream::tiled::TileProgram, pe: &str) -> Vec<String>
     };
     let mut out = Vec::new();
     for (i, op) in p.ops.iter().enumerate() {
-        let Some(f) = tiled_form(op) else { continue };
+        let Some(f) = crate::kernel::tiled_form(op).and_then(|f| f.hub.as_ref()) else {
+            continue;
+        };
         let (words, sends) = ((f.words)(p, op), blocking(f.func));
         if words > HUB_LOOP_WORDS && !sends.is_empty() {
             out.push(format!(

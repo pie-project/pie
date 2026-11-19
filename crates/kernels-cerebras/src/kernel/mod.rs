@@ -89,15 +89,40 @@ pub struct GemmForm {
     pub drift_after: &'static str,
 }
 
-/// A kernel's op in the tiled regime: a function of the tiled PE's image (`tiled_pe.csl`), and
-/// what the hub-loop check needs of it.
+/// A kernel's op in the tiled regime: a function of the tiled PE's image (`tiled_pe.csl`), its
+/// price and what the hub-loop check needs of it.
 pub struct TiledForm {
-    /// Its function in the PE's code: its sends before its receive off the hub's broadcast.
+    /// It, as the price's ops name it (`conv`, `norm`, `up`, `attend`).
+    pub what: &'static str,
+    /// Op `i`'s cycles on the busiest PE (past every op's own, `cost::tiled::OP`).
+    pub price: fn(p: &crate::stream::tiled::TileProgram, i: usize) -> f64,
+    /// Its sends towards the hub before its receive off the hub's broadcast, where it has any.
+    pub hub: Option<HubSend>,
+}
+
+/// A tiled op's sends towards the hub before its receive (`check::hazard::hub_loops`).
+pub struct HubSend {
+    /// Its function in the PE's code.
     pub func: &'static str,
     /// It, as the check's message names it.
     pub what: &'static str,
     /// The words a PE sends towards the hub before its receive, for op `op` of `p`.
     pub words: fn(p: &crate::stream::tiled::TileProgram, op: &crate::stream::tiled::TOp) -> u32,
+}
+
+/// The tiled form of the kernel a tiled-regime op is (a conv's, a group norm's, an upsampling's,
+/// a voxel attention's); none for the host's ins and outs and a printed region.
+#[must_use]
+pub fn tiled_form(op: &crate::stream::tiled::TOp) -> Option<&'static TiledForm> {
+    use crate::stream::tiled::TOp;
+    let k = match op {
+        TOp::Conv { .. } => by_op("conv.conv3d"),
+        TOp::Norm { .. } => by_op("conv.group_norm"),
+        TOp::Up { .. } => by_op("conv.upsample"),
+        TOp::Attend { .. } => by_op("attn.voxel"),
+        TOp::In(_) | TOp::Out(_) | TOp::Region(_) => None,
+    };
+    k.and_then(|k| k.tiled())
 }
 
 /// A kernel in the unit regime (stream readings, decode through units): the steps its ops
@@ -218,6 +243,8 @@ pub static KERNELS: &[&dyn Kernel] = &[
     &linear::moe::MOE,
     &linear::gemm::GEMM,
     &conv::norm::GROUP_NORM,
+    &conv::conv3d::CONV3D,
+    &conv::up::UP,
     &attn::voxel::VOXEL,
     &ssm::short_conv::SHORT_CONV,
 ];
