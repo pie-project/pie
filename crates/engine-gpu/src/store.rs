@@ -826,6 +826,19 @@ impl<B: Backend> Pools<B> {
         refs.iter().map(|&r| self.units(LIST, r)).collect()
     }
 
+    /// Seat `slot`'s first `pages` pages as slot refs of the list shape, as
+    /// a lane by refs names them (none where the pool lists no pages).
+    pub fn seat_refs(&self, slot: u32, pages: u32) -> Result<Vec<u32>> {
+        if self.layout.list.is_none() {
+            return Ok(Vec::new());
+        }
+        let list = *self.shape(LIST)?;
+        let first = u64::from(slot) * u64::from(self.paging.pages_per_slot);
+        (0..pages)
+            .map(|page| list.seat_ref(u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX)))
+            .collect()
+    }
+
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
         self.units(LIST, page)

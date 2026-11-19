@@ -161,7 +161,14 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
 
 pub(crate) type View = (wgpu::Buffer, u64, u64);
 
-type BindKey = (usize, Vec<View>);
+/// A group by its layout, not its pipeline: kernels of one layout (the
+/// variants of a kernel, by the rows they take) share what a dispatch binds
+/// over the same views.
+type BindKey = (wgpu::BindGroupLayout, Vec<View>);
+
+/// A bind group layout by what it holds: each storage binding a kernel
+/// reaches and whether it is read-only, and its uniform's binding.
+type LayoutKey = (Vec<(u32, bool)>, Option<u32>);
 
 #[derive(Default)]
 struct BindCache {
@@ -220,6 +227,8 @@ pub struct Pipelines {
     /// The kernels built, in the order their pipelines were.
     order: RefCell<Vec<&'static str>>,
     binds: RefCell<BindCache>,
+    /// One layout for every kernel that declares the same bindings.
+    layouts: RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     bind_hits: Cell<u64>,
     bind_misses: Cell<u64>,
     /// Groups a fire made of its own frame's scratch views, which no cache
@@ -307,7 +316,7 @@ impl Pipelines {
         views: &[View],
         uniform_bytes: u64,
     ) -> Result<wgpu::BindGroup> {
-        let key: BindKey = (std::ptr::from_ref(pipeline) as usize, views.to_vec());
+        let key: BindKey = (pipeline.layout.clone(), views.to_vec());
         if let Some(group) = self.binds.borrow().groups.get(&key) {
             self.bind_hits.set(self.bind_hits.get() + 1);
             BIND_TRAFFIC[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -332,7 +341,7 @@ impl Pipelines {
             return Ok(Arc::clone(pipeline));
         }
         let wgsl = module(file, key)?;
-        let pipeline = Arc::new(build(device.core(), file, key, &wgsl)?);
+        let pipeline = Arc::new(build(device.core(), &self.layouts, file, key, &wgsl)?);
         self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
@@ -399,8 +408,34 @@ fn compile(
 
 /// The bind group layout of a kernel as `declared`: each storage buffer
 /// `main` reaches, read-only as it is declared, and its uniform block at a
-/// dynamic offset (a dispatch's slot of the frames' uniform buffer).
-fn bind_layout(core: &Arc<Core>, name: &'static str, declared: &Declared) -> wgpu::BindGroupLayout {
+/// dynamic offset (a dispatch's slot of the frames' uniform buffer). One for
+/// every kernel declaring the same, so a group binds any of them.
+fn bind_layout(
+    core: &Arc<Core>,
+    layouts: &RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
+    name: &'static str,
+    declared: &Declared,
+) -> wgpu::BindGroupLayout {
+    let key: LayoutKey = (
+        (0..declared.bindings)
+            .filter(|&at| declared.used.get(at as usize).copied().unwrap_or(false))
+            .map(|at| {
+                (
+                    at,
+                    declared.read_only.get(at as usize).copied().unwrap_or(false),
+                )
+            })
+            .collect(),
+        declared.uniform,
+    );
+    layouts
+        .borrow_mut()
+        .entry(key)
+        .or_insert_with(|| made_layout(core, name, declared))
+        .clone()
+}
+
+fn made_layout(core: &Arc<Core>, name: &'static str, declared: &Declared) -> wgpu::BindGroupLayout {
     let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..declared.bindings)
         .filter(|&at| declared.used.get(at as usize).copied().unwrap_or(false))
         .map(|at| wgpu::BindGroupLayoutEntry {
@@ -441,6 +476,7 @@ fn bind_layout(core: &Arc<Core>, name: &'static str, declared: &Declared) -> wgp
 
 fn build(
     core: &Arc<Core>,
+    layouts: &RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     file: &'static str,
     name: &'static str,
     wgsl: &str,
@@ -460,7 +496,7 @@ fn build(
         declared.pool,
         core.limits.max_storage_buffers_per_shader_stage,
     )?;
-    let layout = bind_layout(core, name, &declared);
+    let layout = bind_layout(core, layouts, name, &declared);
     let pipelined = core
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

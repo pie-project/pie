@@ -5545,6 +5545,9 @@ struct NamingLane<B: Serve> {
     /// The score rows the class writes: a capturing lane named reads them
     /// all, so its fire names every kernel a capture asks for.
     reads: Vec<String>,
+    /// Where it names its slots by ref, its pages and its record (the null
+    /// record, ref 0 a piece), as a fire of more lanes than seats names them.
+    by_ref: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 struct NamingMedia {
@@ -5558,6 +5561,17 @@ struct NamingMedia {
 /// The views a fire of `owned` lanes stages: its seated lanes, their media
 /// and their clips, each lane at its own slot.
 #[allow(clippy::type_complexity)]
+/// Lane `at`'s share of `total` over `lanes`: an equal part, the last
+/// taking what the division leaves.
+fn spread(total: u64, lanes: u64, at: u64) -> u64 {
+    let each = total / lanes;
+    if at + 1 == lanes {
+        total - each * (lanes - 1)
+    } else {
+        each
+    }
+}
+
 fn lane_views<B: Serve>(
     owned: &[NamingLane<B>],
 ) -> (Vec<Seated<'_, B>>, Vec<Media<'_>>, Vec<Clips<'_>>) {
@@ -5569,6 +5583,10 @@ fn lane_views<B: Serve>(
             adapter: lane.adapter,
             inputs: &lane.inputs,
             reads: &lane.reads,
+            refs: lane.by_ref.is_some(),
+            held: lane.by_ref.as_ref().map(|_| 0),
+            pages: lane.by_ref.as_ref().map_or(&[][..], |(pages, _)| pages),
+            record: lane.by_ref.as_ref().map(|(_, record)| record.as_slice()),
             ..Seated::of(Lane {
                 slot: at as u32,
                 word: lane.word,
@@ -5625,11 +5643,11 @@ impl<B: Serve> Shell<B> {
             .last()
             .map_or(1, |rung| rung.tokens)
             .max(1);
-        // A fire holds a lane a seat: at most the seats the load holds.
+        // A fire of more lanes than the load holds seats names its slots by
+        // ref, as the runtime's fires do: every count of lanes it serves.
         let seats = u32::try_from(self.held.len()).unwrap_or(u32::MAX);
-        let lanes_cap = self.budget().max_lanes.min(seats).clamp(1, top);
-        // Each power of two under the cap, and the cap, whose views round to
-        // the power over it.
+        let lanes_cap = self.budget().max_lanes.clamp(1, top);
+        // Each power of two under the cap, and the cap.
         let mut counts: Vec<u32> = std::iter::successors(Some(1u32), |n| n.checked_mul(2))
             .take_while(|&n| n < lanes_cap)
             .collect();
@@ -5644,23 +5662,25 @@ impl<B: Serve> Shell<B> {
         for class in classes {
             // Every count of lanes with every power of two of rows they can
             // bring between them (a decode is rows = lanes, a prefill one
-            // lane), the rows spread over the lanes: the views a fire binds
-            // round by both.
+            // lane), the rows spread over the lanes: each rung's views are
+            // fixed (bound at what the rung lays), and what changes with the
+            // rows and lanes is the kernels a fire takes. Kernels of one
+            // layout share a group, so a variant the walk's rows don't pick
+            // binds what its sibling's fire built.
             for &lanes in &counts {
-                let mut rows = u64::from(lanes).next_power_of_two();
+                let lanes = u64::from(lanes);
+                let mut rows = lanes.next_power_of_two();
                 while rows <= u64::from(top) {
-                    let each = rows / u64::from(lanes);
-                    let shape = (0..u64::from(lanes))
-                        .map(|at| {
-                            let here = if at + 1 == u64::from(lanes) {
-                                rows - each * (u64::from(lanes) - 1)
-                            } else {
-                                each
-                            };
-                            (class, u32::try_from(here).unwrap_or(u32::MAX))
-                        })
-                        .collect();
-                    shapes.push(shape);
+                    shapes.push(
+                        (0..lanes)
+                            .map(|at| {
+                                (
+                                    class,
+                                    u32::try_from(spread(rows, lanes, at)).unwrap_or(u32::MAX),
+                                )
+                            })
+                            .collect(),
+                    );
                     rows = rows.saturating_mul(2);
                 }
             }
@@ -5684,6 +5704,10 @@ impl<B: Serve> Shell<B> {
             for _ in 0..depth {
                 match self.bind_fire(lanes) {
                     Ok(arm) => {
+                        // A bind-only fire settles nothing, which is where
+                        // a fire takes its arm: the walk takes it, so the
+                        // next fire stages on the next arm.
+                        self.arms.take(arm);
                         taken.push(arm);
                         walked += 1;
                     }
@@ -5703,11 +5727,24 @@ impl<B: Serve> Shell<B> {
         Ok(walked)
     }
 
-    /// One fire of `lanes`, staged and walked bind-only; the arm it took.
+    /// One fire of `lanes`, each `(class, rows)`, staged and walked
+    /// bind-only; the arm it took.
     fn bind_fire(&mut self, lanes: &[(usize, u32)]) -> Result<usize> {
         let owned = lanes
             .iter()
-            .map(|&(class, rows)| self.naming_lane(class, rows))
+            .map(|&(class, rows)| {
+                let mut lane = self.naming_lane(class, rows)?;
+                if lanes.len() > self.held.len() {
+                    // Seat 0's pages, and the null record: a bind-only fire
+                    // reads and writes none of them.
+                    let page = self.pools.paging().page_size.max(1);
+                    lane.by_ref = Some((
+                        self.pools.seat_refs(0, rows.div_ceil(page).max(1))?,
+                        vec![0; self.pools.pieces() as usize],
+                    ));
+                }
+                Ok(lane)
+            })
             .collect::<Result<Vec<NamingLane<B>>>>()?;
 
         let (seated, media, clips) = lane_views(&owned);
@@ -5850,6 +5887,7 @@ impl<B: Serve> Shell<B> {
                 .filter(|plane| plane.captured.is_some() && plane.classes.contains(class))
                 .map(|plane| plane.output.clone())
                 .collect(),
+            by_ref: None,
         })
     }
 
