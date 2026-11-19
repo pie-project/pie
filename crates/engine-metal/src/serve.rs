@@ -1997,8 +1997,21 @@ impl Shell {
 
     /// See `Engine::copy_slots`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if let Some(frame) = self.encode_copy(copy)? {
+            self.grafted = Some(frame.commit_async(None)?);
+        }
+        Ok(())
+    }
+
+    /// `copy` drained behind every frame and encoded (a host copy to or
+    /// from the host tier or the slot files done here); the frame to
+    /// commit, `None` for an empty copy.
+    fn encode_copy(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> Result<Option<Frame>> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.drain()?;
         // Every fold has landed and been told once drained: a record moved
@@ -2013,7 +2026,45 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
-        self.grafted = Some(frame.commit_async(None)?);
+        Ok(Some(frame))
+    }
+
+    /// See `Engine::copy_slots_landing`: whether `copy`'s sources may go
+    /// back now. A copy on the device is encoded into a command buffer the
+    /// device may still be running when this returns: `false`, and
+    /// `landed`'s sink is called with its token from that buffer's
+    /// completion (with no sink, it waits for it, and answers `true`). A
+    /// move to or from the host tier or the slot files is a host copy done
+    /// here, past the drain: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<(engine::LandingSink, u64)>,
+    ) -> Result<bool> {
+        let device = engine::MemoryDomain::MetalShared;
+        if copy.src != device || copy.dst != device {
+            self.copy_slots(copy)?;
+            return Ok(true);
+        }
+        let Some(frame) = self.encode_copy(copy)? else {
+            return Ok(true);
+        };
+        let Some((sink, token)) = landed else {
+            frame.commit()?;
+            return Ok(true);
+        };
+        // Told once the buffer retires, faulted or not: a faulted copy has
+        // stopped reading its sources too, and its fault reaches the next
+        // drain.
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        Ok(false)
+    }
+
+    /// See `Engine::settle_copies`: the last copy's command buffer retires.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        if let Some(grafted) = self.grafted.take() {
+            grafted.wait()?;
+        }
         Ok(())
     }
 
