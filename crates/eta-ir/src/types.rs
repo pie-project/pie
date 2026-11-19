@@ -45,6 +45,17 @@ pub enum DtypeClass {
 //   mass in f32; its threshold operand is `f32` or `bf16`.
 // - `cast` converts in and out: to `bf16` it rounds (as above), from `bf16`
 //   it widens exactly to f32 first, then converts as from f32.
+// - A sampling draw is never a bf16 row. `gumbel_argmax { logits, keep,
+//   divisor, state }` reduces each row to the index of its largest
+//   `logits[i] / divisor + gumbel(state, i)` (`-inf` where `keep` is
+//   false), every lane computed in f32 from its operands as loaded and
+//   never stored: rounding the perturbed lane to bf16 would collapse near
+//   ties onto the lowest index and bias the draw. The noise is lane `i` of
+//   `rng_keyed { state, shape: logits' shape, kind: Gumbel }`, generated
+//   in the reduction (no noise row), so over f32 logits the draw is
+//   bit-identical to `reduce_argmax(select(keep, logits / divisor, -inf) +
+//   rng_keyed(..))`. Ties and NaN go as `reduce_argmax`'s: the lowest index
+//   of the largest non-NaN lane.
 // - Values that are ids, positions, indices, masks or rng state never take
 //   `bf16`; `rng` returns `f32`. A model output (`output`) is the dtype its
 //   declaration states.

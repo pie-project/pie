@@ -341,6 +341,32 @@ fn infer(
             );
         }
 
+        Op::GumbelArgmax {
+            logits,
+            keep,
+            divisor,
+            state,
+        } => {
+            let (tl, tk, td, ts) = (g(logits)?, g(keep)?, g(divisor)?, g(state)?);
+            if !is_float(tl.dtype)
+                || tk.dtype != Dtype::Bool
+                || !is_float(td.dtype)
+                || ts.dtype != Dtype::U32
+            {
+                return Err(dtype_err());
+            }
+            if (!tk.shape.is_scalar() && tk.shape != tl.shape)
+                || !td.shape.is_scalar()
+                || *ts.shape.dims() != [2]
+            {
+                return Err(shape_err());
+            }
+            push(
+                &mut out,
+                ValueType::new(tl.shape.drop_last().ok_or_else(shape_err)?, Dtype::I32),
+            );
+        }
+
         Op::Broadcast { value, shape } => {
             let t = g(value)?;
             if !can_broadcast_to(t.shape, shape) {
@@ -663,6 +689,45 @@ mod tests {
         // An int never mixes with bf16.
         let ops = vec![Op::ChanTake(0), Op::ChanTake(1), Op::Add(0, 1)];
         assert!(body_types(&ops, &ctx_with(&chans)).is_err());
+    }
+
+    /// `gumbel_argmax` takes a float row, a row-shaped or scalar bool, a
+    /// float scalar divisor and a `[2]` u32 state, and returns each row's
+    /// index.
+    #[test]
+    fn gumbel_argmax_types() {
+        let chans = [
+            ValueType::new(Shape::matrix(3, 7), Dtype::Bf16),
+            ValueType::new(Shape::matrix(3, 7), Dtype::Bool),
+            ValueType::vector(2, Dtype::U32),
+        ];
+        let draw = |keep, divisor| Op::GumbelArgmax {
+            logits: 0,
+            keep,
+            divisor,
+            state: 2,
+        };
+        let base = || {
+            vec![
+                Op::ChanTake(0),
+                Op::ChanTake(1),
+                Op::ChanTake(2),
+                Op::Const(Literal::F32(0.7)),
+                Op::Const(Literal::Bool(true)),
+            ]
+        };
+        for keep in [1, 4] {
+            let mut ops = base();
+            ops.push(draw(keep, 3));
+            let types = body_types(&ops, &ctx_with(&chans)).expect("types");
+            assert_eq!(types[5], ValueType::vector(3, Dtype::I32));
+        }
+        // The divisor is a float scalar; keep is a bool.
+        for (keep, divisor) in [(1, 1), (3, 3), (1, 0)] {
+            let mut ops = base();
+            ops.push(draw(keep, divisor));
+            assert!(body_types(&ops, &ctx_with(&chans)).is_err(), "{keep} {divisor}");
+        }
     }
 
     #[test]

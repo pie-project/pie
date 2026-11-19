@@ -358,14 +358,19 @@ pub struct LaunchPackage {
 pub const NO_BF16: &str = "this engine has no bf16 guest dtype";
 
 impl LaunchPackage {
-    /// Whether the program stores anything as `bf16`: a value, a stage
-    /// plan's value, a channel or a constant port. An engine whose guest
-    /// runtime has no `bf16` refuses such a program at registration
-    /// ([`LaunchPackage::refuse_bf16`]); it never computes it as another
-    /// dtype.
+    /// Whether the program takes the bf16 guest work: it stores anything as
+    /// `bf16` (a value, a stage plan's value, a channel or a constant port)
+    /// or draws with `gumbel_argmax`, the reduction that keeps a bf16 row's
+    /// draw in f32. An engine whose guest runtime has neither refuses such
+    /// a program at registration ([`LaunchPackage::refuse_bf16`]); it never
+    /// computes it as another dtype.
     #[must_use]
     pub fn stores_bf16(&self) -> bool {
-        self.values.iter().any(|value| value.dtype == Dtype::Bf16)
+        self.plans
+            .iter()
+            .flat_map(|plan| &plan.ops)
+            .any(|op| op.tag == tags::GUMBEL_ARGMAX)
+            || self.values.iter().any(|value| value.dtype == Dtype::Bf16)
             || self
                 .plans
                 .iter()
@@ -383,8 +388,9 @@ impl LaunchPackage {
     pub fn refuse_bf16(&self) -> Result<(), String> {
         if self.stores_bf16() {
             Err(alloc::format!(
-                "{NO_BF16}: the program stores a bf16 value (vocab-sized guest intermediates \
-                 are bf16 by default), and this engine runs it once its guest runtime has bf16"
+                "{NO_BF16}: the program stores a bf16 value or draws with gumbel_argmax \
+                 (vocab-sized guest intermediates are bf16 by default), and this engine runs \
+                 it once its guest runtime has both"
             ))
         } else {
             Ok(())

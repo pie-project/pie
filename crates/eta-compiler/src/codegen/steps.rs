@@ -66,6 +66,9 @@ pub enum Reduce {
     Max,
     Min,
     Argmax,
+    /// `gumbel_argmax`: an argmax whose lanes are the Gumbel-perturbed
+    /// logits, made in the reduction's first level.
+    GumbelArgmax,
 }
 
 /// What a sort ladder's finishing step lands.
@@ -162,7 +165,11 @@ pub struct NodeStep {
 pub const fn is_reduce(tag: u8) -> bool {
     matches!(
         tag,
-        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
+        tags::REDUCE_SUM
+            | tags::REDUCE_MAX
+            | tags::REDUCE_MIN
+            | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
     )
 }
 
@@ -177,6 +184,7 @@ const fn reduce_of(tag: u8) -> Option<Reduce> {
         tags::REDUCE_MAX => Some(Reduce::Max),
         tags::REDUCE_MIN => Some(Reduce::Min),
         tags::REDUCE_ARGMAX => Some(Reduce::Argmax),
+        tags::GUMBEL_ARGMAX => Some(Reduce::GumbelArgmax),
         _ => None,
     }
 }

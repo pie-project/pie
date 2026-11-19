@@ -112,6 +112,7 @@ pub fn emits(tag: u8) -> bool {
             | tags::REDUCE_MAX
             | tags::REDUCE_MIN
             | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
             | tags::CUMSUM
             | tags::CUMPROD
             | tags::BROADCAST
@@ -208,6 +209,7 @@ fn reduce_kind(tag: u8) -> Option<&'static str> {
         tags::REDUCE_MAX => Some("RED_MAX"),
         tags::REDUCE_MIN => Some("RED_MIN"),
         tags::REDUCE_ARGMAX => Some("RED_ARGMAX"),
+        tags::GUMBEL_ARGMAX => Some("RED_GUMBEL"),
         _ => None,
     }
 }
@@ -397,7 +399,10 @@ pub struct Stepwise {
 /// 6: `bf16` values (`DT_BF16`, wire tag 5): loaded a half of a word,
 /// computed in f32, and stored rounded to nearest even a word at a time,
 /// an invocation owning both elements of every word it writes.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
+/// 7: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
+/// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
+/// the divisor and the keyed rng, with no noise row.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 7;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -424,6 +429,7 @@ fn reduce_name(reduce: Reduce) -> &'static str {
         Reduce::Max => "RED_MAX",
         Reduce::Min => "RED_MIN",
         Reduce::Argmax => "RED_ARGMAX",
+        Reduce::GumbelArgmax => "RED_GUMBEL",
     }
 }
 

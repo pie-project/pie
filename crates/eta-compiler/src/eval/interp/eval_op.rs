@@ -88,6 +88,7 @@ pub(crate) fn narrows(op: &Op, bf16: impl Fn(ValueId) -> bool) -> bool {
         | Op::ReduceMax(_)
         | Op::ReduceMin(_)
         | Op::ReduceArgmax(_)
+        | Op::GumbelArgmax { .. }
         | Op::MatMul(..)
         | Op::Gt(..)
         | Op::Ge(..)
@@ -385,6 +386,42 @@ fn eval_wide(
                 Value::Bf16(_) => return Err(unwidened()),
             };
             One(Value::I32(result))
+        }
+
+        Op::GumbelArgmax {
+            logits,
+            keep,
+            divisor,
+            state,
+        } => {
+            // Each lane as `select(keep, logits / divisor, -inf) +
+            // rng_keyed(state)` holds it, in f32, then the argmax.
+            let t = ty_of(logits);
+            let x = lanes_f32(v(logits));
+            let Value::Bool(k) = v(keep) else {
+                return Err(fault("gumbel_argmax keep".into()));
+            };
+            let d = lanes_f32(v(divisor))[0];
+            let st = lanes_i64(v(state));
+            let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
+            let seed64 = rng::keyed_seed(key as u32, ctr as u32);
+            let noise = rng_lanes(seed64, x.len(), RngKind::Gumbel);
+            let perturbed: Vec<f32> = (0..x.len())
+                .map(|i| {
+                    if k[pick(k.len(), i)] {
+                        x[i] / d + noise[i]
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            let rows = rows_of(t.shape);
+            let len = perturbed.len().checked_div(rows).unwrap_or(0);
+            One(Value::I32(
+                (0..rows)
+                    .map(|row| argmax_row(&perturbed[row * len..(row + 1) * len]))
+                    .collect(),
+            ))
         }
 
         Op::Broadcast { value, shape } => {
