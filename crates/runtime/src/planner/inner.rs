@@ -442,10 +442,15 @@ impl Inner {
         // completion while its runs stood free, it waited on an event that
         // need not come (Mac Pro's beam mix: 2 runs of 4 short, 440 such
         // runs free, flat for 191 s with every thread parked).
+        // Funded too while another process waits at a bind behind it: that
+        // bind goes only once the head is served, so the head's room comes
+        // from no completion of the waiter's, and a fleet whose decoders
+        // never stop firing is never stalled (a roles-short head starved
+        // behind a steady decoder with binds waiting on it).
         if let Some(need) = roles_short {
             return RestoreGate::Evict {
                 need: (need.run, need.pieces),
-                fund: stalled,
+                fund: stalled || self.bind_waits_behind(pid),
             };
         }
         if spare < self.growth_reserve() && !stalled {
@@ -493,6 +498,15 @@ impl Inner {
                 !proc.firing()
                     && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
             })
+    }
+
+    /// Whether a process other than `head` waits at a bind for room
+    /// ([`super::proc::Proc::bind_waiting`]): read by each process's own
+    /// flag, never by counting the queue's waiter kinds.
+    pub(super) fn bind_waits_behind(&self, head: ProcessId) -> bool {
+        self.procs
+            .iter()
+            .any(|(pid, proc)| *pid != head && proc.bind_waiting)
     }
 
     pub(super) fn fleet_stalled(&self) -> bool {

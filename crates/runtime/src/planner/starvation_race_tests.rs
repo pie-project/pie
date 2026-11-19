@@ -4230,3 +4230,66 @@ async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_
     assert_eq!(attempts.get(), 2, "sent again once, after the restore");
     assert_eq!(bind_rooms(&planner), 0, "the queue holds nothing of it");
 }
+
+/// The same head with a decoder that never stops firing: funded only once
+/// nothing was in flight, it starved. Another process waiting at a bind
+/// behind it funds it: the chunks it needs are emptied (their occupant,
+/// the waiting binder, parked) while the decoder keeps firing, resident.
+/// Without a bind waiting behind it nothing is moved for it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_roles_short_restore_is_funded_beside_a_steady_decoder_once_a_bind_waits_behind_it() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for binder_waits in [false, true] {
+        let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let (restoring, decoder, binder) =
+            (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [restoring, decoder, binder] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        planner.with_inner(|inner| {
+            let firing = inner.procs.get_mut(&decoder).unwrap();
+            firing.progressed = true;
+            firing.fires = 1;
+            firing.fired_at = crate::rt::Instant::now();
+            inner.procs.get_mut(&binder).unwrap().bind_waiting = binder_waits;
+            let proc = inner.procs.get_mut(&restoring).unwrap();
+            proc.state = Residency::Evicted;
+            proc.roles_short = Some(super::proc::PendingBind {
+                run: 3,
+                pieces: 1,
+                pages: 3,
+            });
+            inner.enqueue(
+                restoring,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        });
+        *pool.occupant.lock() = Some(binder);
+        assert!(
+            !planner.with_inner(|inner| inner.nothing_in_flight()),
+            "the decoder fires"
+        );
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        let started = planner.stats.evictions_started.load(Ordering::Relaxed);
+        if binder_waits {
+            assert!(started > 0, "the chunks' occupant is moved for the restore's run");
+        } else {
+            assert_eq!(started, 0, "control: nothing moved while the fleet decodes");
+        }
+        assert_eq!(
+            planner.with_inner(|inner| inner.procs[&decoder].state),
+            Residency::Resident,
+            "the decoder keeps firing"
+        );
+    }
+}
