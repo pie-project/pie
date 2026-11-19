@@ -58,7 +58,29 @@ pub(crate) fn act_x_wt_normed(
     if m <= 0 || n <= 0 || k <= 0 || route(ctx, m, n, k, vector_operands(w, norm.x, y)) != Route::Skinny {
         return Ok(false);
     }
-    super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm)
+    super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store)
+}
+
+/// [`act_x_wt_swiglu`] over rows normed where the skinny kernel stages them,
+/// where the gated product takes the skinny kernel; `Ok(false)` otherwise or
+/// where the fold does not pay.
+pub(crate) fn act_x_wt_swiglu_normed(
+    ctx: &Ctx,
+    gate_up: u64,
+    h: u64,
+    m: i32,
+    intermediate: i32,
+    k: i32,
+    norm: super::gemv::SkinnyNorm,
+) -> Result<bool, Error> {
+    if m <= 0
+        || intermediate <= 0
+        || k <= 0
+        || route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, norm.x, h)) != Route::Skinny
+    {
+        return Ok(false);
+    }
+    super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, intermediate, k, norm, SkinnyEpilogue::Swiglu)
 }
 
 fn vector_operands(w: u64, act: u64, y: u64) -> bool {

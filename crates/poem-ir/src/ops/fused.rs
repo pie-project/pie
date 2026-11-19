@@ -113,6 +113,35 @@ pub enum Fused {
         #[output]
         z: ValueId,
     },
+    /// [`Fused::ResidualAddRmsnormMatmul`]'s norm feeding a dense MLP
+    /// whole ([`Fused::MatmulSwigluMatmul`] over `out`): a backend may norm
+    /// the rows where it stages them for the gate-up product, one block
+    /// landing `out` for its other readers. `y_out` is a plane of its own.
+    ResidualAddRmsnormMatmulSwigluMatmul {
+        #[input]
+        x: ValueId,
+        #[input]
+        y: ValueId,
+        #[output]
+        y_out: ValueId,
+        #[input]
+        weight: ValueId,
+        plus_one: bool,
+        eps: f32,
+        #[output]
+        out: ValueId,
+        #[input]
+        gate_up: ValueId,
+        #[input]
+        down: ValueId,
+        intermediate: u32,
+        #[output]
+        packed: ValueId,
+        #[output]
+        h: ValueId,
+        #[output]
+        z: ValueId,
+    },
     RmsnormResidualAdd {
         #[input]
         x: ValueId,

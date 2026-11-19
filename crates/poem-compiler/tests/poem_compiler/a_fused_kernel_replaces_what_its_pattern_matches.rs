@@ -1375,3 +1375,30 @@ fn a_residual_norm_before_a_dense_mlp_leaves_the_mlp_whole() {
         ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul", "elemwise.act"]
     );
 }
+
+/// A residual norm feeding a dense MLP folds with the whole MLP where the
+/// norm-and-MLP rule runs.
+#[test]
+fn a_residual_norm_before_a_dense_mlp_folds_with_it() {
+    let rules = [
+        "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+        "fused.residual_add_rmsnorm_matmul",
+        "fused.residual_add_rmsnorm",
+        "fused.matmul_swiglu_matmul",
+    ];
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            let packed = linear::matmul(&normed, &p.weight("gate_up", [128, 64]));
+            let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
+            elemwise::silu(&linear::matmul(&h, &p.weight("down", [64, 64])));
+            elemwise::silu(&y_out);
+        }),
+        &rules,
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.residual_add_rmsnorm_matmul_swiglu_matmul", "elemwise.act", "elemwise.act"]
+    );
+}

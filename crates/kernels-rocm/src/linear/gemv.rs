@@ -130,7 +130,8 @@ pub(crate) struct SkinnyNorm {
 /// `out[m, n] = rmsnorm(x + y) · w[n, k]ᵀ` on the skinny kernel, the norm
 /// computed by every block where it stages the rows (`x + y` landed in
 /// `norm.y_out`, the normed rows in `norm.out`, by the first): one launch
-/// where the norm and the product were two. `Ok(false)`, launching nothing, where that does not pay: the
+/// where the norm and the product were two. Under a gated `epilogue` the
+/// bank is a packed `[gate | up]` of 2n rows and `out` the n gated columns. `Ok(false)`, launching nothing, where that does not pay: the
 /// blocks' redundant reads (`grid · m · k` rows of x, y and the norm's
 /// weight) take longer at the device's copy rate than the launch they save
 /// (the profile's measured `[rates]`), or the plan stages no rows in LDS.
@@ -143,16 +144,18 @@ pub(crate) fn skinny_norm_bf16(
     n: i32,
     k: i32,
     norm: SkinnyNorm,
+    epilogue: SkinnyEpilogue,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.skinny";
+    let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
     if !super::skinny::fits(m, n, k) {
         return Ok(false);
     }
     let plan = skinny_plan(
         m.unsigned_abs(),
-        n.unsigned_abs(),
+        n.unsigned_abs() * if gated { 2 } else { 1 },
         k.unsigned_abs(),
-        false,
+        gated,
         ctx.tuning().gemm_skinny_quad_from,
         ctx.multiprocessors(OP)?,
     );
@@ -166,7 +169,7 @@ pub(crate) fn skinny_norm_bf16(
     let folds = t.launch_ns > 0
         && t.hbm_gbps > 0
         && redundant / f64::from(t.hbm_gbps) < f64::from(t.launch_ns);
-    told_fold(m, n, k, plan.grid, redundant, t.launch_ns, t.hbm_gbps, folds);
+    told_fold(m, n, k, gated, plan.grid, redundant, t.launch_ns, t.hbm_gbps, folds);
     if !folds {
         return Ok(false);
     }
@@ -182,21 +185,32 @@ pub(crate) fn skinny_norm_bf16(
             return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
         }
     }
-    skinny_launch(ctx, weight, 0, out, m, n, k, SkinnyEpilogue::Store, plan, Some(norm))?;
+    skinny_launch(ctx, weight, 0, out, m, n, k, epilogue, plan, Some(norm))?;
     Ok(true)
 }
 
 /// The fold's choice for a shape, said once.
 #[allow(clippy::too_many_arguments)]
-fn told_fold(m: i32, n: i32, k: i32, grid: u32, bytes: f64, launch_ns: u32, gbps: u32, folds: bool) {
+fn told_fold(
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+    grid: u32,
+    bytes: f64,
+    launch_ns: u32,
+    gbps: u32,
+    folds: bool,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static TOLD: Mutex<Option<HashSet<(i32, i32, i32, u32)>>> = Mutex::new(None);
+    static TOLD: Mutex<Option<HashSet<(i32, i32, i32, bool, u32)>>> = Mutex::new(None);
     let mut told = TOLD.lock().expect("told lock poisoned");
-    if told.get_or_insert_with(HashSet::new).insert((m, n, k, grid)) {
+    if told.get_or_insert_with(HashSet::new).insert((m, n, k, gated, grid)) {
         eprintln!(
-            "kernels-rocm: the norm {} the {m}x{n}x{k} skinny product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
+            "kernels-rocm: the norm {} the {m}x{n}x{k} skinny{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
             if folds { "folds into" } else { "stays apart from" },
+            if gated { " gated" } else { "" },
             bytes / 1e6
         );
     }

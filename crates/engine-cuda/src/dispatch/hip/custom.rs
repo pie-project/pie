@@ -65,6 +65,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnormMatmul { .. } => self.norm_matmul(op),
+            Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. } => self.norm_mlp(op),
             // Kernels this backend does not ship as one: never formed for it,
             // and run as the primitives they stand for where a trace states
             // them.
