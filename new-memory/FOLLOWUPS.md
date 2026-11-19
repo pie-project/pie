@@ -335,3 +335,28 @@ before any change, on memory-redesign 5963ceb17 / c1188a53d:
    (sc/amd-rocm-declined c6fbc79af): counted where `hip/lt.rs:387`
    answers `Ok(false)` (rocBLAS takes the product). No shape declines on c64
    or the beam load.
+
+## F28. wgpu has no safe GPU time per serving frame: a span-only frame timestamp mode
+
+wgpu's only GPU clock is `encode::profile_timing` (`engine-wgpu
+encode.rs:260`, `:531`), which gives every kernel its own timestamped compute
+pass and opens a 4096-query plane a frame (`device/ctx.rs:65`, `:837`
+`timestamp_slot`). The planes are read only in `Pending::wait`
+(`ctx.rs:1089` → `:738` `Inner::harvest`), and a serving frame lands
+asynchronously and is never waited, so nothing is harvested while serving.
+Turned on in a served Qwen3-0.6B on the Adreno 840, it read 0 ns for every
+kernel (452 kernels a step). At 8 lanes, submit reached 611 ms a step, the
+engine stalled for 70 s, and the phone rebooted. It stays a tune/check tool.
+
+What serving needs instead: one begin/end timestamp a frame
+(`write_timestamp` at the encoder's start and in `Frame::submit`,
+`ctx.rs:966`). The pair is resolved into a small ring and harvested from the
+landing callback (`on_submitted_work_done`), not from a wait, and adds no
+pass boundaries. That gives F25 a measured GPU term. Until then, the per-fire
+host split (encode, finish+submit, every `block_on_poll` by label) is the
+measure. At 1 lane on the Adreno 840 it reads ~27 ms a step: ~4.5 ms of host
+work (encode 1.6, finish+submit 2.0, the guest readback 0.75, 15 queue
+writes) in series with ~23 ms parked at the guest gate (GPU plus the guest
+pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
+wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
+boundary), not host time.
