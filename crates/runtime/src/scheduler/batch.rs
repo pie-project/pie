@@ -427,6 +427,7 @@ pub(crate) fn build_frame_submission(
                 lanes,
                 instance,
                 adapter_only,
+                scratch: ::engine::ScratchPlace::None,
             });
         }
         steps.push(StepFire {

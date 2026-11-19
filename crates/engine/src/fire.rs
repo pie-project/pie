@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::channel::ChannelId;
 use crate::chunk::{ChunkFacts, ShapeId, SlotKind};
 use crate::error::{Error, Result};
-use crate::program::InstanceId;
+use crate::program::{InstanceId, ScratchPlace};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -746,11 +746,10 @@ pub struct Attachment {
     pub instance: InstanceId,
     /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
     pub adapter_only: bool,
-    /// The value scratch this fire's stages read ([`crate::GuestState::scratch`]):
-    /// one of the instance's arms, held until the fire lands. None only
-    /// where the program reads no scratch.
+    /// The scratch arm the runtime took for this fire ([`crate::GuestState::scratch`]):
+    /// `None` only where the instance's scratch is 0.
     #[serde(default)]
-    pub scratch: crate::program::ScratchPlace,
+    pub scratch: ScratchPlace,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1252,7 +1251,7 @@ mod tests {
             lanes: 1,
             instance: InstanceId(7),
             adapter_only: true,
-            scratch: crate::program::ScratchPlace::None,
+            scratch: ScratchPlace::None,
         });
         assert!(
             step.validate_captures(captures).is_err(),

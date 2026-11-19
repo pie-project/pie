@@ -110,38 +110,67 @@ pub struct InstanceBinding {
 }
 
 /// What a guest program bound at given extents holds in the pool, as state
-/// (REDESIGN §6): what each bound instance keeps between fires, the value
-/// scratch one fire of it reads, and what the (program, extents) pair keeps
-/// once while any instance of it is bound ([`crate::Engine::guest_state`]).
-/// The resident state and the pair's are taken at the bind and held while
-/// bound ([`InstanceBinding::pair`], [`ScratchPlace`]). The scratch is held
-/// only while a fire naming it is in flight: the runtime hands a fire one
-/// of the instance's arms on its attachment ([`crate::Attachment::scratch`])
-/// and takes it back at the landing; an engine keeps none across fires.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// (REDESIGN §6): the scratch each bound instance keeps for its lanes, and
+/// what the (program, extents) pair keeps once while any instance of it is
+/// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
+/// taken at the bind and held while bound ([`InstanceBinding::scratch`],
+/// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
+/// between fires: a park gives them back and an unpark takes fresh room,
+/// nothing copied, the engine told where ([`Rebind::Instance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes each bound instance keeps between fires.
+    /// Bytes an instance holds from bind to unbind, at rest included: launch tables,
+    /// status words, rings, anything a later fire reads. Placed at bind (today's
+    /// per_instance minus the value scratch).
     #[serde(default)]
     pub resident: u64,
-    /// Bytes one fire of an instance reads as its value scratch.
+    /// Bytes ONE fire of the instance needs for its value scratch: dead outside that
+    /// fire, never read by a later one.
     #[serde(default)]
     pub scratch: u64,
-    /// The arms an instance's fires need at most, one a fire in flight, for
-    /// the geometry class asked: at least 1.
-    #[serde(default)]
+    /// Fires of one instance this engine may have in flight at once for the class
+    /// being bound, each needing its own scratch: the arms (>= 1).
+    #[serde(default = "one_arm")]
     pub scratch_arms: u32,
-    /// Bytes the pair holds once while any instance of it is bound.
+    /// The pair's tables, held once while any instance of it is bound (a layout
+    /// cache: stays resident; unchanged).
     #[serde(default)]
     pub per_pair: u64,
-    /// The chunks a piece of any of them takes where it lies in whole
-    /// chunks: a run of `run` adjacent chunks inside one segment, the least
-    /// that holds the program's widest value (or its temporary area) whole,
-    /// so each piece is addressed from its first chunk (0 or 1: a chunk).
+    /// Chunks a piece takes (unchanged; applies to resident and to each scratch arm).
+    /// A run of `run` adjacent chunks inside one segment, the least that
+    /// holds the program's widest value (or its temporary area) whole, so
+    /// each piece is addressed from its first chunk (0 or 1: a chunk). Its
+    /// bytes past a chunk's are whole runs, `resident`, `scratch` and
+    /// `per_pair` a multiple of `run` chunks.
     #[serde(default)]
     pub run: u32,
 }
 
+fn one_arm() -> u32 {
+    1
+}
+
+impl Default for GuestState {
+    fn default() -> Self {
+        Self {
+            resident: 0,
+            scratch: 0,
+            scratch_arms: 1,
+            per_pair: 0,
+            run: 0,
+        }
+    }
+}
+
 impl GuestState {
+    /// Bytes an instance holds with every scratch arm held: [`Self::resident`]
+    /// plus [`Self::scratch`] times [`Self::scratch_arms`] (at least one).
+    #[must_use]
+    pub fn instance_bytes(&self) -> u64 {
+        self.resident
+            .saturating_add(self.scratch.saturating_mul(u64::from(self.scratch_arms.max(1))))
+    }
+
     /// The chunks a piece takes: [`Self::run`], at least one.
     #[must_use]
     pub fn chunks_a_piece(&self) -> u32 {

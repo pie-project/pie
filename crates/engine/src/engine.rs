@@ -1,3 +1,4 @@
+use crate::ports::GeometryClass;
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::AdapterRegistration;
@@ -260,20 +261,22 @@ pub trait Engine: Send {
         Ok(FireFacts::default())
     }
 
-    /// What `program` bound at `extents` for geometry `class` holds as
-    /// state ([`GuestState`]): each instance's resident state and the
-    /// pair's, taken in the `Instance` role at the bind
-    /// ([`crate::ScratchPlace`]) and held while bound, and the scratch a
-    /// fire reads, handed on each fire's attachment
-    /// ([`crate::Attachment::scratch`]) with as many arms as the class needs.
-    /// Asked at every bind, on the lane, before it is sent. The default states
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]), held while bound, and told to
+    /// the engine in the binding ([`InstanceBinding::scratch`],
+    /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
+    /// at every bind, on the lane, before it is sent. The default states
     /// none: an engine that lays its guests' scratch in the fire's span
     /// ([`Self::fire_facts`]) states it there until it moves it here.
+    /// `class` is the geometry class the instance is bound at
+    /// ([`InstanceBinding::geometry`]): the engine states its scratch arms
+    /// per class ([`GuestState::scratch_arms`]).
     fn guest_state(
         &self,
         program: ProgramId,
         extents: &BindExtents,
-        class: eta_ir::registry::GeometryClass,
+        class: GeometryClass,
     ) -> Result<GuestState> {
         let _ = (program, extents, class);
         Ok(GuestState::default())
