@@ -1026,6 +1026,25 @@ impl Engine for Xla {
         Ok(self.loaded_mut()?.weight_uses())
     }
 
+    /// Its copies land inside the call (see [`Engine::copy_slots_landing`]):
+    /// nothing to wait for.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
+    /// Lands inside the call: a move between tiers reads its source slots
+    /// into host memory before it writes anywhere, and a move within the
+    /// device runs as a pool program, ordered ahead of every program (a
+    /// fire, a bind's seeds, a channel's cells) enqueued after it.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
