@@ -87,6 +87,9 @@ fn adapter_banks(trace: &Trace) -> BTreeMap<String, AdapterBank> {
 
 pub struct Weights {
     buffers: Vec<Option<Buffer>>,
+    /// The weight stacks (`crate::roll::stacks`): each run's weight of one
+    /// place in its body, every pass's plane end to end in one buffer.
+    stacks: Vec<Buffer>,
     gemm_buffers: BTreeMap<u32, Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, AdapterBank>,
@@ -293,8 +296,29 @@ impl Weights {
             }
         }
 
+        // The layer stack's weights land as stacks (`crate::roll`): each
+        // run's weight of one place in its body, every pass's plane end to
+        // end in one buffer. A param that lands in two buffers (a tied gemm
+        // copy), streams, or pairs with a partner plane at landing (a
+        // pre-scaled mxfp4 bank) keeps a buffer of its own, and its stack
+        // with it.
+        let (member, stacks) = stacks_of(trace, &|at| {
+            streams(at)
+                || tied_gemm.contains(&at)
+                || prescale.contains_key(&at)
+                || scales_of.contains_key(&at)
+        });
+
         let streaming = compile_streaming(&metadata, contract, target)?;
         let mut sink = Landing {
+            member: &member,
+            stacking: (stacks.iter())
+                .map(|params| Stacking {
+                    form: None,
+                    planes: vec![None; params.len()],
+                    buffer: None,
+                })
+                .collect(),
             device,
             trace,
             index: &index,
@@ -333,8 +357,36 @@ impl Weights {
             + tied_gemm.iter().map(|&at| sizes[at]).sum::<u64>();
         let buffers = sink.buffers;
         let gemm_buffers = sink.gemm_buffers;
+        let mut stack_buffers = Vec::with_capacity(stacks.len());
+        for (stacking, params) in sink.stacking.into_iter().zip(&stacks) {
+            let Some(buffer) = stacking.buffer else {
+                let missing = (stacking.planes.iter().zip(params))
+                    .find(|(plane, _)| plane.is_none())
+                    .map_or(params[0], |(_, &at)| at);
+                return Err(Fault::Param {
+                    name: trace.params[missing].name.clone(),
+                    why: "is a plan param the load contract never published",
+                });
+            };
+            stack_buffers.push(buffer);
+        }
 
         let banks = adapter_banks(trace);
+        // Where param `at`'s plane is read from: its own buffer, or its pass
+        // of its stack.
+        let weight_source = |at: usize, transposed: bool| match member.get(&at) {
+            Some(&(stack, pass)) => Source::Stacked {
+                stack: stack as u32,
+                pass: pass as u32,
+                passes: stacks[stack].len() as u32,
+                transposed,
+            },
+            None => Source::Weight {
+                param: at as u32,
+                plane: 0,
+                transposed,
+            },
+        };
 
         let mut table = Vec::with_capacity(trace.params.len());
         let mut gemm_table = Vec::with_capacity(trace.params.len());
@@ -359,7 +411,7 @@ impl Weights {
                 gemm_table.push(None);
                 continue;
             }
-            if buffers[at].is_none() {
+            if buffers[at].is_none() && !member.contains_key(&at) {
                 return Err(Fault::Param {
                     name: param.name.clone(),
                     why: "is a plan param the load contract never published",
@@ -369,11 +421,7 @@ impl Weights {
                 let p = &trace.params[at];
                 if let Some(&(rows, width)) = folded.get(&at) {
                     return handles.root(Root {
-                        source: Source::Weight {
-                            param: at as u32,
-                            plane: 0,
-                            transposed: false,
-                        },
+                        source: weight_source(at, false),
                         dtype: stored[at],
                         rows: u32::try_from(rows).unwrap_or(u32::MAX),
                         width: u32::try_from(width).unwrap_or(u32::MAX),
@@ -390,11 +438,7 @@ impl Weights {
                     kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                 };
                 handles.root(Root {
-                    source: Source::Weight {
-                        param: at as u32,
-                        plane: 0,
-                        transposed: transposed.contains(&at),
-                    },
+                    source: weight_source(at, transposed.contains(&at)),
                     dtype: stored[at],
                     rows: u32::try_from(rows).unwrap_or(u32::MAX),
                     width: u32::try_from(width).unwrap_or(u32::MAX),
@@ -426,8 +470,18 @@ impl Weights {
                 None
             });
         }
+        let rolled: usize = stacks.iter().map(Vec::len).sum();
+        tracing::info!(
+            stacks = stacks.len(),
+            params = rolled,
+            "xla weights: the layer stack's weights land as stacks, a run's weight one buffer"
+        );
+        if crate::serve::timing() {
+            eprintln!("xla weights: {} stacks of {rolled} params", stacks.len());
+        }
         Ok(Weights {
             buffers,
+            stacks: stack_buffers,
             gemm_buffers,
             table: WeightTable(table, gemm_table),
             banks,
@@ -443,6 +497,12 @@ impl Weights {
     #[must_use]
     pub fn buffer(&self, param: u32) -> Option<&Buffer> {
         self.buffers.get(param as usize)?.as_ref()
+    }
+
+    /// Weight stack `stack`'s buffer.
+    #[must_use]
+    pub fn stack_buffer(&self, stack: u32) -> Option<&Buffer> {
+        self.stacks.get(stack as usize)
     }
 
     #[must_use]
@@ -923,8 +983,56 @@ fn transpose_elems(bytes: &[u8], rows: usize, cols: usize, e: usize) -> Vec<u8> 
     dst
 }
 
+/// The layer stack's weights as stacks (`crate::roll`): each run's weight
+/// of one place in its body, every pass's plane end to end in one buffer,
+/// and param -> (stack, pass) for their members. A param that lands
+/// otherwise (`own`: two buffers, a stream, a partner plane landing with it)
+/// or as an adapter bank keeps a buffer of its own, and its stack with it;
+/// so does a stack whose planes differ in type.
+fn stacks_of(
+    trace: &Trace,
+    own: &dyn Fn(usize) -> bool,
+) -> (BTreeMap<usize, (usize, usize)>, Vec<Vec<usize>>) {
+    let runs = crate::roll::runs(trace);
+    let mut member: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut stacks: Vec<Vec<usize>> = Vec::new();
+    for params in crate::roll::stacks(trace, &runs) {
+        let params: Vec<usize> = params.iter().map(|&p| p as usize).collect();
+        let first = &trace.params[params[0]];
+        let alike = params.iter().all(|&at| {
+            let p = &trace.params[at];
+            p.dtype == first.dtype && p.shape == first.shape
+        });
+        let kept = params.iter().any(|&at| {
+            own(at)
+                || trace.params[at].source == ParamSource::Registered
+                || member.contains_key(&at)
+        });
+        if !alike || kept {
+            continue;
+        }
+        for (pass, &at) in params.iter().enumerate() {
+            member.insert(at, (stacks.len(), pass));
+        }
+        stacks.push(params);
+    }
+    (member, stacks)
+}
+
+/// A weight stack as it lands: each pass's stored plane until the last
+/// lands, then one buffer of them all.
+struct Stacking {
+    /// The form every pass's plane lands in: dtype, rows, width.
+    form: Option<(Dtype, u32, u32)>,
+    planes: Vec<Option<Vec<u8>>>,
+    buffer: Option<Buffer>,
+}
+
 struct Landing<'a> {
     device: &'a Device,
+    /// param -> (stack, pass) for every param landing in a stack.
+    member: &'a BTreeMap<usize, (usize, usize)>,
+    stacking: Vec<Stacking>,
     trace: &'a Trace,
     index: &'a BTreeMap<&'a str, usize>,
     sizes: &'a [u64],
@@ -956,14 +1064,45 @@ struct Landing<'a> {
 }
 
 impl Landing<'_> {
+    /// Lands param `at`'s stored plane: a buffer of its own, or its pass of
+    /// the stack it belongs to, the stack uploading once every pass landed.
+    fn put(&mut self, at: usize, dtype: Dtype, rows: u32, width: u32, bytes: &[u8]) -> Result<()> {
+        let Some(&(stack, pass)) = self.member.get(&at) else {
+            self.buffers[at] = Some(self.device.upload(dtype, rows, width, bytes)?);
+            return Ok(());
+        };
+        let s = &mut self.stacking[stack];
+        match s.form {
+            None => s.form = Some((dtype, rows, width)),
+            Some(form) if form != (dtype, rows, width) => {
+                return Err(Fault::Param {
+                    name: self.trace.params[at].name.clone(),
+                    why: "lands in another form than the other layers' planes of its stack",
+                });
+            }
+            Some(_) => {}
+        }
+        s.planes[pass] = Some(bytes.to_vec());
+        if s.planes.iter().all(Option::is_some) {
+            let passes = s.planes.len() as u32;
+            let mut all = Vec::with_capacity(bytes.len() * s.planes.len());
+            for plane in &mut s.planes {
+                all.extend(plane.take().unwrap_or_default());
+            }
+            s.buffer = Some(self.device.upload(dtype, rows * passes, width, &all)?);
+        }
+        Ok(())
+    }
+
     fn upload(&mut self, at: usize, dtype: Dtype, width: u64, bytes: &[u8]) -> Result<()> {
         let (rows, _) = (self.shape_of)(at);
-        self.buffers[at] = Some(self.device.upload(
+        self.put(
+            at,
             dtype,
             u32::try_from(rows).unwrap_or(u32::MAX),
             u32::try_from(width).unwrap_or(u32::MAX),
             bytes,
-        )?);
+        )?;
         self.stored[at] = dtype;
         Ok(())
     }
@@ -1005,23 +1144,25 @@ impl Landing<'_> {
                     t[c * padded + r] = v;
                 }
             }
-            self.buffers[at] = Some(self.device.upload(
+            self.put(
+                at,
                 dtype,
                 u32::try_from(k).unwrap_or(u32::MAX),
                 u32::try_from(padded).unwrap_or(u32::MAX),
                 &t,
-            )?);
+            )?;
             return Ok(());
         }
         if self.transposed.contains(&at) {
             let e = if dtype == Dtype::E4m3 { 1 } else { 2 };
             let t = transpose_elems(bytes, rows as usize, width as usize, e);
-            self.buffers[at] = Some(self.device.upload(
+            self.put(
+                at,
                 dtype,
                 u32::try_from(width).unwrap_or(u32::MAX),
                 u32::try_from(rows).unwrap_or(u32::MAX),
                 &t,
-            )?);
+            )?;
             return Ok(());
         }
         if let Some(&(rows, fold_width)) = self.folded.get(&at) {
@@ -1035,12 +1176,13 @@ impl Landing<'_> {
             let mut padded = bytes.to_vec();
             let elem = poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u64;
             padded.resize((rows * fold_width * elem) as usize, 0);
-            self.buffers[at] = Some(self.device.upload(
+            self.put(
+                at,
                 dtype,
                 u32::try_from(rows).unwrap_or(u32::MAX),
                 u32::try_from(fold_width).unwrap_or(u32::MAX),
                 &padded,
-            )?);
+            )?;
             self.stored[at] = dtype;
             return Ok(());
         }
@@ -1229,7 +1371,33 @@ impl Weights {
                 stored[at] = Dtype::U8;
             }
         }
+        let prescaled: std::collections::BTreeSet<usize> = if prescale {
+            (pairings.iter())
+                .filter(|(at, p)| trace.params[**at].dtype == Dtype::Mxfp4 && p.biases.is_none())
+                .flat_map(|(at, p)| [*at, p.scales])
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let (member, stacks) = stacks_of(trace, &|at| {
+            tied_gemm.contains(&at) || prescaled.contains(&at)
+        });
         let banks = adapter_banks(trace);
+        // Where param `at`'s plane is read from: its own buffer, or its pass
+        // of its stack.
+        let weight_source = |at: usize, transposed: bool| match member.get(&at) {
+            Some(&(stack, pass)) => Source::Stacked {
+                stack: stack as u32,
+                pass: pass as u32,
+                passes: stacks[stack].len() as u32,
+                transposed,
+            },
+            None => Source::Weight {
+                param: at as u32,
+                plane: 0,
+                transposed,
+            },
+        };
         let mut table = Vec::with_capacity(trace.params.len());
         let mut gemm_table = Vec::with_capacity(trace.params.len());
         for at in 0..trace.params.len() {
@@ -1255,11 +1423,7 @@ impl Weights {
                     }
                 };
                 handles.root(Root {
-                    source: Source::Weight {
-                        param: at as u32,
-                        plane: 0,
-                        transposed: transposed.contains(&at),
-                    },
+                    source: weight_source(at, transposed.contains(&at)),
                     dtype: stored[at],
                     rows: u32::try_from(rows).unwrap_or(u32::MAX),
                     width: u32::try_from(width).unwrap_or(u32::MAX),
@@ -1293,6 +1457,7 @@ impl Weights {
         }
         Ok(Weights {
             buffers: (0..trace.params.len()).map(|_| None).collect(),
+            stacks: Vec::new(),
             gemm_buffers: BTreeMap::new(),
             table: WeightTable(table, gemm_table),
             banks,

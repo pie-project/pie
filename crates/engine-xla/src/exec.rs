@@ -136,6 +136,7 @@ fn bind_and_run(
             Source::Weight { param, plane, .. } => {
                 weights.and_then(|w| w.buffer_plane(param, plane))
             }
+            Source::Stack { stack } => weights.and_then(|w| w.stack_buffer(stack)),
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::HostBank { param } => pools.host_bank(param),
             Source::Stage => slot.and_then(|at| pools.ring_buffer(at)),
@@ -146,7 +147,8 @@ fn bind_and_run(
             Source::Readout { .. }
             | Source::Temp
             | Source::Staged { .. }
-            | Source::Streamed { .. } => None,
+            | Source::Streamed { .. }
+            | Source::Stacked { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),

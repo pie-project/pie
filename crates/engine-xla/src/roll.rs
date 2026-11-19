@@ -212,3 +212,49 @@ pub fn runs(trace: &Trace) -> Vec<Run> {
     }
     runs
 }
+
+/// Layer `layer`'s weights (trace params), in the order its nodes first
+/// read them.
+#[must_use]
+pub fn weights_of(trace: &Trace, layer: u32) -> Vec<u32> {
+    let mut seen = Vec::new();
+    for n in trace.nodes.iter().filter(|n| n.layer == Some(layer)) {
+        let mut ins = Vec::new();
+        poem_ir::Operands::inputs(&n.op, &mut ins);
+        for v in ins {
+            if let Some(Def::Weight(param)) = trace.values.get(v.0 as usize).map(|d| &d.def)
+                && !seen.contains(param)
+            {
+                seen.push(*param);
+            }
+        }
+    }
+    seen
+}
+
+/// A run's weights as stacks: for each weight its body reads (by place in
+/// the body), the params each pass of the run reads there, pass by pass. A
+/// weight every pass reads alike (one param) is no stack.
+#[must_use]
+pub fn stacks(trace: &Trace, runs: &[Run]) -> Vec<Vec<u32>> {
+    let mut stacks = Vec::new();
+    for run in runs.iter().filter(|r| r.repeats > 1) {
+        for k in 0..run.period {
+            let passes: Vec<Vec<u32>> = (0..run.repeats)
+                .map(|r| weights_of(trace, run.first + r * run.period + k))
+                .collect();
+            let slots = passes[0].len();
+            if passes.iter().any(|p| p.len() != slots) {
+                continue;
+            }
+            for slot in 0..slots {
+                let params: Vec<u32> = passes.iter().map(|p| p[slot]).collect();
+                if params.iter().all(|&p| p == params[0]) {
+                    continue;
+                }
+                stacks.push(params);
+            }
+        }
+    }
+    stacks
+}

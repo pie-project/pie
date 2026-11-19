@@ -60,6 +60,18 @@ pub enum Source {
     /// as the pool lays it (`crate::store::streamed`): a fire copies the
     /// routed experts in no slot from it into staging slots.
     HostBank { param: u32 },
+    /// Pass `pass` of `passes` of a weight stack (`crate::weights`,
+    /// `crate::roll::stacks`): one layer's plane of a run's weight, landed
+    /// with the run's other layers' planes end to end in one buffer, read as
+    /// its own plane would be (`transposed` as for [`Source::Weight`]).
+    Stacked {
+        stack: u32,
+        pass: u32,
+        passes: u32,
+        transposed: bool,
+    },
+    /// A weight stack's whole buffer: the parameter its passes are cut from.
+    Stack { stack: u32 },
 }
 
 impl Source {
@@ -462,11 +474,24 @@ fn root_value(
         current.insert(root, v);
         return Ok(v);
     }
+    if let Source::Stacked {
+        stack,
+        pass,
+        passes,
+        transposed: false,
+    } = r.source
+    {
+        let v = stacked_pass(func, current, params, stack, pass, passes, &ty)?;
+        current.insert(root, v);
+        return Ok(v);
+    }
     let v = if let Source::Weight {
+        transposed: true, ..
+    }
+    | Source::Stacked {
         transposed: true, ..
     } = r.source
     {
-        params.push((root, r.source));
         // A sub-byte codes plane lands with its rows padded to whole
         // 128-lane tiles (`crate::weights::gemm_only`).
         let rows = if ty.elem.bits() < 8 {
@@ -476,7 +501,18 @@ fn root_value(
             ty.dims[0]
         };
         let landed = Ty::new(ty.elem, &[ty.dims[1], rows]);
-        let p = func.param(landed, None);
+        let p = if let Source::Stacked {
+            stack,
+            pass,
+            passes,
+            ..
+        } = r.source
+        {
+            stacked_pass(func, current, params, stack, pass, passes, &landed)?
+        } else {
+            params.push((root, r.source));
+            func.param(landed, None)
+        };
         let t = func.transpose(p, &[1, 0])?;
         if rows == ty.dims[0] {
             t
@@ -513,6 +549,40 @@ fn root_value(
 }
 
 const ROW_WORDS: i64 = crate::inputs::ROW_WORDS as i64;
+
+/// Where a weight stack's parameter sits among the roots a program names:
+/// below the stage's, one a stack.
+const fn stack_root(stack: u32) -> u32 {
+    STAGE_ROOT - 1 - stack
+}
+
+/// Pass `pass` of a weight stack: the stack's buffer (`passes` planes of
+/// `plane`'s type end to end, a parameter named once a program) cut to the
+/// pass's plane.
+fn stacked_pass(
+    func: &mut Func,
+    current: &mut BTreeMap<u32, Val>,
+    params: &mut Vec<(u32, Source)>,
+    stack: u32,
+    pass: u32,
+    passes: u32,
+    plane: &Ty,
+) -> Result<Val, kernels_xla::Error> {
+    let rows = plane.dims[0];
+    let whole = match current.get(&stack_root(stack)) {
+        Some(&v) => v,
+        None => {
+            params.push((stack_root(stack), Source::Stack { stack }));
+            let mut dims = plane.dims.clone();
+            dims[0] = rows * i64::from(passes);
+            let v = func.param(Ty::new(plane.elem, &dims), None);
+            current.insert(stack_root(stack), v);
+            v
+        }
+    };
+    let at = rows * i64::from(pass);
+    Ok(func.slice_axis(whole, 0, at, at + rows)?)
+}
 
 /// The fire's staged image on the device, u32 `[used rows, 128]`: the
 /// staging ring's slot (a pinned host parameter) cut to the rows this fire
