@@ -665,6 +665,31 @@ impl Run<'_> {
                         })?;
                     let pool_v = l.read(pool)?;
                     let starts_v = l.read(starts)?;
+                    // Inside a rolled block's loop the bank is the counter's
+                    // pass's: its starts are picked from every pass's.
+                    let starts_v = match self.rolled_starts(bank) {
+                        Some((each, pass, step, counter)) => {
+                            let k = i64::from(starts.rows);
+                            let mut rows = Vec::with_capacity(each.len());
+                            for t in each {
+                                let v = l.read(t)?.val;
+                                rows.push(l.f().reshape(v, &[1, k])?);
+                            }
+                            let f = l.f();
+                            let all = f.concat(&rows, 0)?;
+                            let first = f.const_i(kernels_xla::hlo::Elem::I32, i64::from(pass), &[]);
+                            let by = f.const_i(kernels_xla::hlo::Elem::I32, i64::from(step), &[]);
+                            let moved = f.mul(counter, by)?;
+                            let at = f.add(first, moved)?;
+                            let zero = f.const_i(kernels_xla::hlo::Elem::I32, 0, &[]);
+                            let row = f.dynamic_slice(all, &[at, zero], &[1, k])?;
+                            kernels_xla::tensor::Operand {
+                                val: f.reshape(row, &[k])?,
+                                ..starts_v
+                            }
+                        }
+                        None => starts_v,
+                    };
                     let f = l.f();
                     let plane = i64::from(plane);
                     // An `Adapter` slot is whole pool rows: u32 `[rows, 128]`

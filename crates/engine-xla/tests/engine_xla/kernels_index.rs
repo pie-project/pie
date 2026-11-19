@@ -33,6 +33,7 @@ fn cell(req: usize, pos: usize) -> usize {
 const KEY_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
     stride: 3,
     offset: 1,
+    dynamic: None,
 };
 
 /// The plane pages a `map` lays the pool's 5 pages over, one more as a sink.

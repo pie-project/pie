@@ -139,3 +139,51 @@ fn a_donated_buffer_is_updated_in_place() {
     assert_eq!(&got[20..24], &[1., 2., 3., 4.]);
     assert!(got[..20].iter().chain(&got[24..]).all(|&v| v == 0.0));
 }
+
+/// A loop the caller opens and closes op by op (`Func::open_for` /
+/// `close_for`, for a body built outside a closure) runs: its body reads an
+/// outer value (a stack of per-pass rows) at the counter's row and carries a
+/// running sum, which answers the host's.
+#[test]
+fn a_loop_opened_and_closed_by_hand_answers_the_host() {
+    let Some(client) = client() else { return };
+    let dev = client.device(0).expect("a device");
+    let (passes, width) = (5i64, 4i64);
+    let mut f = Func::new("main");
+    let stack = f.param(Ty::new(Elem::F32, &[passes, width]), None);
+    let init = f.param(Ty::new(Elem::F32, &[1, width]), None);
+    let (open, counter, carried) = f.open_for(passes, &[init]).unwrap();
+    let zero = f.const_i(Elem::I32, 0, &[]);
+    let row = f
+        .dynamic_slice(stack, &[counter, zero], &[1, width])
+        .unwrap();
+    let next = f.add(carried[0], row).unwrap();
+    let out = f.close_for(open, counter, &[next]).unwrap();
+    let text = f.module("rolled", &[out[0]]);
+    let exe = client
+        .compile(&text)
+        .unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let rows: Vec<f32> = (0..passes * width).map(|i| i as f32 * 0.5).collect();
+    let start: Vec<f32> = (0..width).map(|i| i as f32).collect();
+    let bytes = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let sb = client
+        .upload(dev, &bytes(&rows), ElementType::F32, &[passes, width])
+        .unwrap();
+    let ib = client
+        .upload(dev, &bytes(&start), ElementType::F32, &[1, width])
+        .unwrap();
+    let (outs, done) = exe
+        .execute(dev, vec![Arg::Keep(&sb), Arg::Keep(&ib)])
+        .unwrap();
+    done.wait().unwrap();
+    let got = f32s(&outs[0].download().unwrap());
+    let want: Vec<f32> = (0..width as usize)
+        .map(|c| {
+            start[c]
+                + (0..passes as usize)
+                    .map(|p| rows[p * width as usize + c])
+                    .sum::<f32>()
+        })
+        .collect();
+    assert_eq!(got, want);
+}

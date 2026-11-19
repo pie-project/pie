@@ -167,10 +167,12 @@ const MAPPED: (PageMap, PageMap) = (
     PageMap {
         stride: 3,
         offset: 1,
+        dynamic: None,
     },
     PageMap {
         stride: 2,
         offset: 3,
+        dynamic: None,
     },
 );
 

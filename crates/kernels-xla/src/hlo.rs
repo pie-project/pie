@@ -258,6 +258,14 @@ pub enum Combine {
 /// One function under construction. Values are numbered across the whole
 /// function (regions included), so any value may be named anywhere below its
 /// definition.
+/// A loop [`Func::open_for`] opened and [`Func::close_for`] closes.
+#[derive(Debug)]
+#[must_use]
+pub struct OpenFor {
+    id: u32,
+    tys: Vec<Ty>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Func {
     name: String,
@@ -2083,6 +2091,95 @@ impl Func {
                 self.fresh(name, ty)
             })
             .collect())
+    }
+
+    /// Opens a counted loop `for i in 0..n` carrying `inits`, whose body the
+    /// caller emits op by op before [`Func::close_for`]: for a body built by
+    /// code that cannot run inside a closure on this function (a tracer
+    /// walking a model's regions). Writes the loop's head and condition and
+    /// opens the body; returns what closing needs, the i32 counter and the
+    /// carried values as the body reads them.
+    pub fn open_for(&mut self, n: i64, inits: &[Val]) -> Built<(OpenFor, Val, Vec<Val>)> {
+        let zero = self.const_i(Elem::I32, 0, &[]);
+        let mut carried = vec![zero];
+        carried.extend(self.solid(inits, "a loop's carried value"));
+        let tys: Vec<Ty> = carried.iter().map(|&v| self.ty(v).clone()).collect();
+        let id = self.next;
+        self.next += 1;
+        let head = if tys.len() == 1 {
+            format!("%{id}")
+        } else {
+            format!("%{id}:{}", tys.len())
+        };
+        let text = format!(
+            "{head} = \"stablehlo.while\"({}) ({{",
+            self.names_of(&carried)
+        );
+        self.line(&text);
+        self.block(&tys, |f, a| {
+            let bound = f.const_i(Elem::I32, n, &[]);
+            Ok(vec![f.compare(Cmp::Lt, a[0], bound)?])
+        })?;
+        self.line("}, {");
+        let mut args = Vec::with_capacity(tys.len());
+        let mut head = String::from("^bb0(");
+        for (i, ty) in tys.iter().enumerate() {
+            let at = self.next;
+            self.next += 1;
+            let name = format!("%b{at}");
+            if i > 0 {
+                head.push_str(", ");
+            }
+            let _ = write!(head, "{name}: {ty}");
+            args.push(self.fresh(name, ty.clone()));
+        }
+        head.push_str("):");
+        self.depth += 1;
+        self.line(&head);
+        self.depth += 1;
+        Ok((OpenFor { id, tys }, args[0], args[1..].to_vec()))
+    }
+
+    /// Closes a loop [`Func::open_for`] opened: the body yields `yields`, the
+    /// next carried values, each of its carried value's type; returns the
+    /// carried values after the last pass.
+    pub fn close_for(&mut self, open: OpenFor, counter: Val, yields: &[Val]) -> Built<Vec<Val>> {
+        let one = self.const_i(Elem::I32, 1, &[]);
+        let next = self.add(counter, one)?;
+        let mut ys = vec![next];
+        ys.extend(self.solid(yields, "a loop's yield"));
+        let got: Vec<Ty> = ys.iter().map(|&v| self.ty(v).clone()).collect();
+        if got != open.tys {
+            return Err(Malformed {
+                op: "close_for",
+                detail: format!(
+                    "a loop's body yields ({}) for carried ({})",
+                    list(&got),
+                    list(&open.tys)
+                ),
+            });
+        }
+        let text = format!(
+            "\"stablehlo.return\"({}) : ({}) -> ()",
+            self.names_of(&ys),
+            self.tys_of(&ys)
+        );
+        self.line(&text);
+        self.depth -= 2;
+        let text = format!("}}) : ({}) -> ({})", list(&open.tys), list(&open.tys));
+        self.line(&text);
+        let single = open.tys.len() == 1;
+        let outs: Vec<Val> = (open.tys.into_iter().enumerate())
+            .map(|(i, ty)| {
+                let name = if single {
+                    format!("%{}", open.id)
+                } else {
+                    format!("%{}#{i}", open.id)
+                };
+                self.fresh(name, ty)
+            })
+            .collect();
+        Ok(outs[1..].to_vec())
     }
 
     /// A counted loop `for i in 0..n` carrying `inits`; `body` receives the

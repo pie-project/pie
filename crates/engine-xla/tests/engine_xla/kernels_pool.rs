@@ -33,6 +33,7 @@ fn cell(req: usize, pos: usize) -> usize {
 const KV_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
     stride: 3,
     offset: 1,
+    dynamic: None,
 };
 
 /// The plane pages a `map` lays the pool's 5 pages over, one more as a sink.
@@ -75,6 +76,7 @@ fn unlay(laid: &[f32], w: usize, map: kernels_xla::tensor::PageMap) -> (Vec<f32>
 const SCORE_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
     stride: 2,
     offset: 3,
+    dynamic: None,
 };
 
 /// The compressor's kv and score planes laid by maps of their own: each

@@ -341,6 +341,13 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
     if old.mask.is_some() {
         prefetch.push(vec![nb]);
     }
+    // A plane whose offset is the function's (a rolled block's pass) reads
+    // it from one more prefetched operand, each plane's offset.
+    let offsets_at = prefetch.len();
+    let dynamic = old.maps.iter().any(|m| m.dynamic.is_some());
+    if dynamic {
+        prefetch.push(vec![2]);
+    }
     let planes = match src {
         Src::Plain { slots } => vec![any(vec![slots, wk]), any(vec![slots, wv])],
         Src::Pooled { rows } => vec![any_of(vec![rows, 128], Elem::U32)],
@@ -547,7 +554,12 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
                     let mut planes_pages = [raw; 2];
                     for (at, map) in old.maps.iter().enumerate() {
                         let by = b.i32(map.stride);
-                        let off = b.i32(map.offset);
+                        let off = if dynamic {
+                            let atv = b.i32(at as i64);
+                            b.load(pre[offsets_at], &[atv])?
+                        } else {
+                            b.i32(map.offset)
+                        };
                         let page = b.muli(raw, by)?;
                         let page = b.addi(page, off)?;
                         planes_pages[at] = b.select(unread, sink, page)?;
@@ -1412,6 +1424,17 @@ fn run(
         let blk = f.reduce(on, &[1], Fold::Max)?;
         operands.push(blk);
     }
+    if old.maps.iter().any(|m| m.dynamic.is_some()) {
+        let mut each = Vec::with_capacity(2);
+        for map in &old.maps {
+            let at = match map.dynamic {
+                Some(at) => f.convert(at, Elem::I32),
+                None => f.const_i(Elem::I32, map.offset, &[]),
+            };
+            each.push(f.reshape(at, &[1])?);
+        }
+        operands.push(f.concat(&each, 0)?);
+    }
     operands.extend([q2, ap.k, ap.v, klo, khi, okl, okh]);
     match s.src {
         // both planes out of the pool itself
@@ -1517,6 +1540,7 @@ mod tests {
                 PageMap {
                     stride: 2,
                     offset: 1,
+                    dynamic: None,
                 },
             ],
             sink: 255,

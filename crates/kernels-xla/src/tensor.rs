@@ -150,6 +150,12 @@ pub struct PageMap {
     pub stride: i64,
 
     pub offset: i64,
+
+    /// The offset as an i32 scalar of the function, when it is one: a
+    /// rolled block's loop reads each pass's plane at an offset of its
+    /// counter. `offset` is then the largest it takes (what an id may be
+    /// mapped by without overflowing).
+    pub dynamic: Option<crate::hlo::Val>,
 }
 
 impl Default for PageMap {
@@ -162,11 +168,12 @@ impl PageMap {
     pub const IDENTITY: PageMap = PageMap {
         stride: 1,
         offset: 0,
+        dynamic: None,
     };
 
     #[must_use]
     pub const fn is_identity(self) -> bool {
-        self.stride == 1 && self.offset == 0
+        self.stride == 1 && self.offset == 0 && self.dynamic.is_none()
     }
 
     /// The plane's page of each id (i32, any shape): `x * stride + offset`
@@ -189,7 +196,14 @@ impl PageMap {
         let fits = f.compare(Cmp::Le, base, top)?;
         let stride = f.like_i(base, self.stride);
         let mapped = f.mul(base, stride)?;
-        let offset = f.like_i(mapped, self.offset);
+        let offset = match self.dynamic {
+            Some(at) => {
+                let at = f.convert(at, Elem::I32);
+                let dims = f.dims(mapped).to_vec();
+                f.broadcast(at, &dims, &[])?
+            }
+            None => f.like_i(mapped, self.offset),
+        };
         let mapped = f.add(mapped, offset)?;
         let neg_one = f.like_i(mapped, -1);
         let back = f.sub(neg_one, mapped)?;

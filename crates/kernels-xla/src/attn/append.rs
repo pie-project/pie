@@ -114,12 +114,19 @@ pub(crate) fn write(
             (ins, vec![any_of(vec![r, 128], Elem::U32)])
         }
     };
+    // A plane whose offset is the function's (a rolled block's pass) reads
+    // it from one more scalar operand, each plane's offset.
+    let dynamic = maps.iter().any(|m| m.dynamic.is_some());
     let limit = (vmem(n, w, m) * 3 / 2 + (8 << 20)).min(vmem_cap);
     let kern = Kernel {
         name: "kv_append".into(),
         grid: vec![1],
         semantics: vec![Sem::Arbitrary],
-        prefetch: vec![vec![m], vec![m], vec![m], vec![m], vec![1]],
+        prefetch: if dynamic {
+            vec![vec![m], vec![m], vec![m], vec![m], vec![1], vec![np as i64]]
+        } else {
+            vec![vec![m], vec![m], vec![m], vec![m], vec![1]]
+        },
         ins,
         outs,
         vmem_limit: Some(u64::try_from(limit).unwrap_or(0)),
@@ -192,7 +199,12 @@ pub(crate) fn write(
             } else {
                 let by = b.i32(map.stride);
                 let p = b.muli(p, by)?;
-                let from = b.i32(map.offset);
+                let from = if dynamic {
+                    let xv = b.i32(x);
+                    b.load(pre[5], &[xv])?
+                } else {
+                    b.i32(map.offset)
+                };
                 b.addi(p, from)?
             };
             let rows = b.i32(tile[0]);
@@ -391,15 +403,27 @@ pub(crate) fn write(
         })
     })?;
     let mut ops = vec![runs[0], runs[1], runs[2], runs[3], total];
+    if dynamic {
+        let mut each = Vec::with_capacity(np);
+        for map in &maps {
+            let at = match map.dynamic {
+                Some(at) => f.convert(at, Elem::I32),
+                None => f.const_i(Elem::I32, map.offset, &[]),
+            };
+            each.push(f.reshape(at, &[1])?);
+        }
+        ops.push(f.concat(&each, 0)?);
+    }
+    let lead = ops.len();
     ops.extend_from_slice(srcs);
     match planes {
         Planes::Two { keys, values } => {
             ops.extend([keys, values]);
-            c.call_aliased(f, &ops, &[(0, 5 + np), (1, 6 + np)])
+            c.call_aliased(f, &ops, &[(0, lead + np), (1, lead + 1 + np)])
         }
         Planes::Pool { pool, .. } => {
             ops.push(pool);
-            c.call_aliased(f, &ops, &[(0, 5 + np)])
+            c.call_aliased(f, &ops, &[(0, lead + np)])
         }
     }
 }

@@ -250,6 +250,13 @@ impl Handles {
         self.roots.borrow()[root as usize]
     }
 
+    /// Root `root`, when it is one (not a program's own name for a staged
+    /// image or a weight stack).
+    #[must_use]
+    pub fn root_of_checked(&self, root: u32) -> Option<Root> {
+        self.roots.borrow().get(root as usize).copied()
+    }
+
     #[must_use]
     pub fn roots(&self) -> usize {
         self.roots.borrow().len()
@@ -300,9 +307,14 @@ pub struct StageAt {
     pub slab_row: u32,
 }
 
+#[derive(Clone)]
 struct State {
     stage: StageAt,
     func: Func,
+    /// The loop the function is inside, when a rolled block's body is
+    /// being traced: its counter and, per weight stack the body reads, the
+    /// passes one turn of the loop steps (`stacked_pass`).
+    rolling: Option<Rolling>,
     current: BTreeMap<u32, Val>,
     params: Vec<(u32, Source)>,
     written: BTreeMap<u32, ()>,
@@ -316,6 +328,188 @@ struct State {
     views: Vec<(ViewKey, Val)>,
 }
 
+/// A rolled block's loop as the body sees it: the counter, and per weight
+/// stack the passes a turn steps.
+#[derive(Clone, Debug)]
+struct Rolling {
+    counter: Val,
+    steps: BTreeMap<u32, u32>,
+}
+
+/// What a traced body did to the roots ([`Tracer::trial`]).
+#[derive(Debug, Default)]
+pub struct Touched {
+    /// Roots the body wrote.
+    pub written: Vec<u32>,
+    /// Roots the body read that nothing had named before it.
+    pub named: Vec<u32>,
+}
+
+/// A loop [`Tracer::open_loop`] opened.
+#[must_use]
+pub struct LoopFrame {
+    open: kernels_xla::hlo::OpenFor,
+    counter: Val,
+    carried: Vec<u32>,
+    before: BTreeMap<u32, Val>,
+    params: usize,
+}
+
+impl Tracer<'_> {
+    /// Runs `body` (a walk of a block's regions) against the function as it
+    /// stands and puts everything back after: what it wrote and named.
+    pub fn trial<R>(&self, body: impl FnOnce() -> R) -> (R, Touched) {
+        let saved = self.state.borrow().clone();
+        let out = body();
+        let after = std::mem::replace(&mut *self.state.borrow_mut(), saved);
+        let before = &self.state.borrow().current;
+        let mut touched = Touched::default();
+        for (&root, v) in &after.current {
+            match before.get(&root) {
+                Some(was) if was == v => {}
+                Some(_) => touched.written.push(root),
+                None if after.written.contains_key(&root) => touched.written.push(root),
+                None => touched.named.push(root),
+            }
+        }
+        (out, touched)
+    }
+
+    /// The counter of the loop the function is inside, when it is inside one.
+    #[must_use]
+    pub fn counter(&self) -> Option<Val> {
+        self.state.borrow().rolling.as_ref().map(|r| r.counter)
+    }
+
+    /// Root `dst` holds what root `src` holds now (a rolled block's last
+    /// pass's values, which later regions read by the last pass's names,
+    /// lie in the first pass's roots after the loop).
+    pub fn alias(&self, dst: u32, src: u32) {
+        let mut state = self.state.borrow_mut();
+        if let Some(&v) = state.current.get(&src) {
+            state.current.insert(dst, v);
+            state.written.insert(dst, ());
+            state.sums.remove(&dst);
+        }
+    }
+
+    /// Names `roots` now, outside any loop, so a body reads them as values
+    /// every turn shares.
+    pub fn name(&self, roots: &[u32]) -> Result<(), kernels_xla::Error> {
+        let mut state = self.state.borrow_mut();
+        let State {
+            func,
+            current,
+            params,
+            stage,
+            written,
+            ..
+        } = &mut *state;
+        for &root in roots {
+            root_value(
+                self.handles,
+                func,
+                current,
+                params,
+                *stage,
+                written,
+                None,
+                root,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Opens `for i in 0..n` carrying `carried` (roots, read as they stand),
+    /// each weight stack in `steps` read at its pass plus the counter times
+    /// its step: a rolled block's body traces next, its roots' values the
+    /// loop's, until [`Tracer::close_loop`].
+    pub fn open_loop(
+        &self,
+        n: u32,
+        carried: &[u32],
+        steps: BTreeMap<u32, u32>,
+    ) -> Result<LoopFrame, kernels_xla::Error> {
+        self.name(carried)?;
+        let mut state = self.state.borrow_mut();
+        let inits: Vec<Val> = carried.iter().map(|r| state.current[r]).collect();
+        let before = state.current.clone();
+        let (open, counter, args) = state.func.open_for(i64::from(n), &inits)?;
+        for (&root, &v) in carried.iter().zip(&args) {
+            state.current.insert(root, v);
+            state.sums.remove(&root);
+        }
+        // A pass of a stack the loop steps is the counter's in the body.
+        let handles = self.handles;
+        state.current.retain(|&root, _| {
+            !matches!(
+                handles.root_of_checked(root).map(|r| r.source),
+                Some(Source::Stacked { stack, .. }) if steps.contains_key(&stack)
+            )
+        });
+        state.view_reads.clear();
+        state.views.clear();
+        state.rolling = Some(Rolling { counter, steps });
+        let params = state.params.len();
+        Ok(LoopFrame {
+            open,
+            counter,
+            carried: carried.to_vec(),
+            before,
+            params,
+        })
+    }
+
+    /// Closes the loop `frame` opened: each carried root's next value is
+    /// `yields`' root's as the body left it; after the loop each carried
+    /// root holds what the last turn left.
+    pub fn close_loop(&self, frame: LoopFrame, yields: &[u32]) -> Result<(), kernels_xla::Error> {
+        let mut state = self.state.borrow_mut();
+        let State {
+            func,
+            current,
+            params,
+            stage,
+            written,
+            rolling,
+            ..
+        } = &mut *state;
+        let mut ys = Vec::with_capacity(yields.len());
+        for &root in yields {
+            ys.push(root_value(
+                self.handles,
+                func,
+                current,
+                params,
+                *stage,
+                written,
+                rolling.as_ref(),
+                root,
+            )?);
+        }
+        let outs = func.close_for(frame.open, frame.counter, &ys)?;
+        // The body's values stay in it; the stack parameters it named first
+        // are the function's.
+        let mut kept: Vec<(u32, Val)> = Vec::new();
+        for &(root, _) in &params[frame.params..] {
+            if let Some(&v) = current.get(&root) {
+                kept.push((root, v));
+            }
+        }
+        *current = frame.before;
+        current.extend(kept);
+        for (&root, &v) in frame.carried.iter().zip(&outs) {
+            current.insert(root, v);
+            written.insert(root, ());
+        }
+        state.sums.clear();
+        state.view_reads.clear();
+        state.views.clear();
+        state.rolling = None;
+        Ok(())
+    }
+}
+
 impl<'h> Tracer<'h> {
     #[must_use]
     pub fn new(handles: &'h Handles) -> Self {
@@ -325,6 +519,7 @@ impl<'h> Tracer<'h> {
             state: RefCell::new(State {
                 stage: StageAt::default(),
                 func: Func::new("main"),
+                rolling: None,
                 current: BTreeMap::new(),
                 params: Vec::new(),
                 written: BTreeMap::new(),
@@ -366,10 +561,20 @@ impl<'h> Tracer<'h> {
             params,
             stage,
             written,
+            rolling,
             ..
         } = &mut *state;
         let (root, _) = self.locate(t)?;
-        root_value(self.handles, func, current, params, *stage, written, root)
+        root_value(
+            self.handles,
+            func,
+            current,
+            params,
+            *stage,
+            written,
+            rolling.as_ref(),
+            root,
+        )
     }
 
     /// Runs `f` against the function under construction.
@@ -448,6 +653,7 @@ fn root_value(
     params: &mut Vec<(u32, Source)>,
     stage: StageAt,
     written: &mut BTreeMap<u32, ()>,
+    rolling: Option<&Rolling>,
     root: u32,
 ) -> Result<Val, kernels_xla::Error> {
     if let Some(&v) = current.get(&root) {
@@ -481,7 +687,7 @@ fn root_value(
         transposed: false,
     } = r.source
     {
-        let v = stacked_pass(func, current, params, stack, pass, passes, &ty)?;
+        let v = stacked_pass(func, current, params, rolling, stack, pass, passes, &ty)?;
         current.insert(root, v);
         return Ok(v);
     }
@@ -508,7 +714,7 @@ fn root_value(
             ..
         } = r.source
         {
-            stacked_pass(func, current, params, stack, pass, passes, &landed)?
+            stacked_pass(func, current, params, rolling, stack, pass, passes, &landed)?
         } else {
             params.push((root, r.source));
             func.param(landed, None)
@@ -559,10 +765,12 @@ const fn stack_root(stack: u32) -> u32 {
 /// Pass `pass` of a weight stack: the stack's buffer (`passes` planes of
 /// `plane`'s type end to end, a parameter named once a program) cut to the
 /// pass's plane.
+#[allow(clippy::too_many_arguments)]
 fn stacked_pass(
     func: &mut Func,
     current: &mut BTreeMap<u32, Val>,
     params: &mut Vec<(u32, Source)>,
+    rolling: Option<&Rolling>,
     stack: u32,
     pass: u32,
     passes: u32,
@@ -580,6 +788,20 @@ fn stacked_pass(
             v
         }
     };
+    // Inside a rolled block's loop a stack it steps is read at its pass
+    // plus the counter times its step.
+    if let Some((counter, step)) =
+        rolling.and_then(|r| r.steps.get(&stack).map(|&step| (r.counter, step)))
+    {
+        let first = func.const_i(Elem::I32, rows * i64::from(pass), &[]);
+        let stride = func.const_i(Elem::I32, rows * i64::from(step), &[]);
+        let moved = func.mul(counter, stride)?;
+        let at = func.add(first, moved)?;
+        let zero = func.const_i(Elem::I32, 0, &[]);
+        let mut sizes = plane.dims.clone();
+        sizes[0] = rows;
+        return Ok(func.dynamic_slice(whole, &[at, zero], &sizes)?);
+    }
     let at = rows * i64::from(pass);
     Ok(func.slice_axis(whole, 0, at, at + rows)?)
 }
@@ -647,6 +869,7 @@ fn from_words(func: &mut Func, words: Val, word: i64, ty: &Ty) -> Result<Val, ke
 struct Lens<'a> {
     handles: &'a Handles,
     stage: StageAt,
+    rolling: Option<&'a Rolling>,
     current: &'a mut BTreeMap<u32, Val>,
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
@@ -680,6 +903,7 @@ impl Env for Lens<'_> {
             self.params,
             self.stage,
             self.written,
+            self.rolling,
             root,
         )?;
         if r.source.persistent() {
@@ -756,6 +980,7 @@ impl Env for Lens<'_> {
                 self.params,
                 self.stage,
                 self.written,
+                self.rolling,
                 root,
             )?;
             let at = f.const_i(Elem::I32, i64::from(offset), &[]);
@@ -933,10 +1158,12 @@ impl Emit for Tracer<'_> {
             sums,
             view_reads,
             views,
+            rolling,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
             stage: *stage,
+            rolling: rolling.as_ref(),
             current,
             params,
             written,

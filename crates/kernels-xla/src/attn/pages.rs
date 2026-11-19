@@ -809,10 +809,12 @@ mod tests {
             PageMap {
                 stride: 3,
                 offset: 1,
+                dynamic: None,
             },
             PageMap {
                 stride: 3,
                 offset: 2,
+                dynamic: None,
             },
         ];
         let laid = kernel(&shape(mapped), 100 << 20).unwrap();

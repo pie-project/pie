@@ -10,6 +10,7 @@ use crate::emit::Ctx;
 use crate::handle::{Bank, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use std::collections::BTreeMap;
 
 use crate::store::{CachePool, CacheTable};
 use crate::trace::Handles;
@@ -199,6 +200,15 @@ pub struct Run<'c> {
 
     rs: Option<std::rc::Rc<crate::rs::Seat>>,
 
+    /// Inside a rolled block's loop: the pool each cache row block 0 reads
+    /// is read as, its page maps at the counter's pass.
+    rolled_caches: BTreeMap<usize, CachePool>,
+
+    /// Inside a rolled block's loop: for each adapter bank block 0 reads,
+    /// the bank each pass reads in its place, block 0's pass, the passes a
+    /// turn steps, and the counter.
+    rolled_banks: BTreeMap<u32, (Vec<u32>, u32, u32, kernels_xla::hlo::Val)>,
+
     /// Values whose planes a debugging reader asked for, and what the walk
     /// read of them as their writers ran (see `DispatchProbe`).
     probes: Vec<ValueId>,
@@ -279,6 +289,8 @@ impl<'c> Run<'c> {
             place,
             compressor: Vec::new(),
             rs: None,
+            rolled_caches: BTreeMap::new(),
+            rolled_banks: BTreeMap::new(),
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
             head_norms: Vec::new(),
@@ -319,6 +331,38 @@ impl<'c> Run<'c> {
             .iter()
             .find(|(p, ..)| *p == param)
             .map(|&(_, plane, starts)| (*view, plane, starts))
+    }
+
+    /// The adapter banks block 0 reads inside a rolled block's loop, from
+    /// now until the next call (empty: outside any loop): by block 0's
+    /// bank param, every pass's bank, block 0's pass, the passes a turn
+    /// steps, and the counter.
+    pub(crate) fn roll_banks(
+        &mut self,
+        banks: BTreeMap<u32, (Vec<u32>, u32, u32, kernels_xla::hlo::Val)>,
+    ) {
+        self.rolled_banks = banks;
+    }
+
+    /// Bank `bank`'s starts as a rolled block's loop reads them: each pass's
+    /// staged starts, block 0's pass and its step, and the counter.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn rolled_starts(
+        &self,
+        bank: ValueId,
+    ) -> Option<(Vec<Tensor>, u32, u32, kernels_xla::hlo::Val)> {
+        let param = self.weight_param(bank)?;
+        let (params, pass, step, counter) = self.rolled_banks.get(&(param as u32))?;
+        let (_, banks) = self.fire.adapter_planes.as_ref()?;
+        let starts = (params.iter())
+            .map(|p| {
+                banks
+                    .iter()
+                    .find(|(held, ..)| *held as u32 == *p)
+                    .map(|&(_, _, starts)| starts)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((starts, *pass, *step, *counter))
     }
 
     /// A streamed table's pool view and the fire's row of it for each of
@@ -959,11 +1003,37 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// Value `id`'s arena handle, when it has one (an op's or a merge's
+    /// value the compiler kept).
+    pub(crate) fn arena_tensor(&self, id: ValueId) -> Option<Tensor> {
+        if !matches!(
+            self.values.get(id.0 as usize)?.def,
+            Def::Op(_) | Def::Merge(_)
+        ) {
+            return None;
+        }
+        self.arena.0.get(id.0 as usize).copied().flatten()
+    }
+
+    /// Cache row `row`'s pool as the load lays it.
+    pub(crate) fn cache_row(&self, row: usize) -> Option<&CachePool> {
+        self.caches.0.get(row)
+    }
+
+    /// The pools block 0's cache rows are read as inside a rolled block's
+    /// loop, from now until the next call (empty: outside any loop).
+    pub(crate) fn roll_caches(&mut self, pools: BTreeMap<usize, CachePool>) {
+        self.rolled_caches = pools;
+    }
+
     fn cache(&self, id: ValueId) -> &CachePool {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Cache(c) => {
                 let row = *c as usize;
+                if let Some(pool) = self.rolled_caches.get(&row) {
+                    return pool;
+                }
                 self.caches.0.get(row).unwrap_or_else(|| {
                     panic!(
                         "value {at} is cache row {row}, and the shell binds {} pools",

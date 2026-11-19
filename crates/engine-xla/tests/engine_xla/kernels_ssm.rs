@@ -1221,6 +1221,7 @@ fn unlay_bank(laid: &[f32], block: usize, slots: usize, map: PageMap) -> (Vec<f3
 const SLOT_MAP: PageMap = PageMap {
     stride: 3,
     offset: 2,
+    dynamic: None,
 };
 
 /// A gated-delta decode of `rows` lanes over a bank of `per` rows a slot,

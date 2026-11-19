@@ -271,6 +271,9 @@ pub struct Shell {
     compiled: CompiledModel,
     /// The layer stack's runs and what rolls (`crate::roll::Plan`).
     rolling: crate::roll::Plan,
+    /// The adapter banks a run's layers read, stacked: each stack's params
+    /// pass by pass (stack `BANK_STACKS + at` of the plan).
+    bank_stacks: Vec<Vec<u32>>,
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
@@ -1043,8 +1046,30 @@ impl Shell {
         });
         // The layer stack's runs, each one body of regions over stacked
         // weights or spelled out with its reason (`crate::roll`).
-        let rolling =
-            crate::roll::Plan::of(&boot.trace, &compiled, &|param| weights.member_of(param));
+        // Adapter banks of a run's layers stack too: each pass's staged
+        // starts, which a body selects at its counter.
+        let bank_stacks: Vec<Vec<u32>> = {
+            let runs = crate::roll::runs(&boot.trace);
+            (crate::roll::stacks(&boot.trace, &runs).into_iter())
+                .filter(|params| {
+                    params.iter().all(|&p| {
+                        boot.trace.params[p as usize].source == poem_ir::ParamSource::Registered
+                    })
+                })
+                .collect()
+        };
+        let bank_of = |param: u32| -> Option<(u32, u32)> {
+            (bank_stacks.iter().enumerate()).find_map(|(at, params)| {
+                let pass = params.iter().position(|&p| p == param)?;
+                Some((crate::roll::BANK_STACKS + at as u32, pass as u32))
+            })
+        };
+        let rolling = crate::roll::Plan::of(
+            &boot.trace,
+            &compiled,
+            &|param| weights.member_of(param).or_else(|| bank_of(param)),
+            &|param| streamed.streams(param as usize),
+        );
         tracing::info!(plan = %rolling.line(), "xla layer stack");
         if timing() {
             eprintln!("xla layer stack: {}", rolling.line());
@@ -1065,6 +1090,7 @@ impl Shell {
             trace: boot.trace,
             compiled,
             rolling,
+            bank_stacks,
             budgets,
             weights,
             pools,
@@ -3416,6 +3442,305 @@ impl Shell {
 
     /// The program text of one fire's walk, and the values it probes.
     #[allow(clippy::too_many_arguments)]
+    /// Walks the template's regions into `tracer`, each block the plan
+    /// rolls (`crate::roll::Plan`) as one loop over its body's regions.
+    fn walk_rolled(
+        &self,
+        descriptor: &FireDescriptor,
+        run: &mut crate::run::Run<'_>,
+        place: &At,
+        tracer: &Tracer<'_>,
+    ) -> Result<()> {
+        let span = |from: usize, upto: usize| Filter {
+            regions: poem_exec::fire::Regions::Span {
+                from: from as u32,
+                upto: upto as u32,
+            },
+            ..Filter::default()
+        };
+        let mut at = 0usize;
+        for (block, checked) in &self.rolling.blocks {
+            let Ok(steps) = checked else { continue };
+            walk(
+                &self.trace,
+                &self.compiled,
+                descriptor,
+                run,
+                &mut Cursor::new(place),
+                span(at, block.start),
+            )?;
+            self.roll_block(descriptor, run, place, tracer, block, steps)?;
+            at = block.start + block.regions * block.repeats as usize;
+        }
+        walk(
+            &self.trace,
+            &self.compiled,
+            descriptor,
+            run,
+            &mut Cursor::new(place),
+            span(at, self.compiled.template().len()),
+        )?;
+        Ok(())
+    }
+
+    /// Traces `block`'s passes as one loop over its first pass's regions:
+    /// the weight stacks its body reads stepped by `steps`, its cache rows'
+    /// page maps and adapter banks at the counter's pass, what the body
+    /// writes and what one pass hands the next carried, and every value the
+    /// last pass defines read after the loop where the first pass's lies.
+    fn roll_block(
+        &self,
+        descriptor: &FireDescriptor,
+        run: &mut crate::run::Run<'_>,
+        place: &At,
+        tracer: &Tracer<'_>,
+        block: &crate::roll::Block,
+        steps: &BTreeMap<u32, u32>,
+    ) -> Result<()> {
+        use poem_ir::Operands as _;
+        let template = self.compiled.template();
+        let body = block.start..block.start + block.regions;
+        let nodes_of = |k: u32| -> Vec<usize> {
+            let lo = block.start + k as usize * block.regions;
+            (lo..lo + block.regions)
+                .flat_map(|r| template[r].nodes.clone())
+                .map(|n| n as usize)
+                .collect()
+        };
+        let io = |n: usize| -> (Vec<ValueId>, Vec<ValueId>) {
+            let op = &self.trace.nodes[n].op;
+            let (mut ins, mut outs) = (Vec::new(), Vec::new());
+            op.inputs(&mut ins);
+            op.outputs(&mut outs);
+            (ins, outs)
+        };
+        let root_of = |run: &crate::run::Run<'_>, v: ValueId| -> Option<u32> {
+            run.arena_tensor(v)
+                .and_then(|t| self.handles.locate(t.buf))
+                .map(|(root, _)| root)
+        };
+        let passes: Vec<Vec<usize>> = (0..block.repeats).map(nodes_of).collect();
+        let first = &passes[0];
+        let mut def_at: std::collections::HashMap<u32, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (j, &n) in first.iter().enumerate() {
+            for (s, v) in io(n).1.iter().enumerate() {
+                def_at.insert(v.0, (j, s));
+            }
+        }
+        // What one pass hands the next: block 0's input at a place where
+        // block 1 reads a value block 0 defines, carried, the def yielding.
+        let mut carries: Vec<(u32, u32)> = Vec::new();
+        for (&n0, &n1) in first.iter().zip(&passes[1]) {
+            let (i0, i1) = (io(n0).0, io(n1).0);
+            for (u, w) in i0.iter().zip(&i1) {
+                let Some(&(j, s)) = def_at.get(&w.0) else {
+                    continue;
+                };
+                let d = io(first[j]).1[s];
+                if let (Some(ru), Some(rd)) = (root_of(run, *u), root_of(run, d))
+                    && !carries.iter().any(|c| c.0 == ru)
+                {
+                    carries.push((ru, rd));
+                }
+            }
+        }
+        // The cache rows block 0 reads, and the row each pass reads there.
+        let mut rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (j, &n0) in first.iter().enumerate() {
+            for (at, v) in io(n0).0.iter().enumerate() {
+                let poem_ir::Def::Cache(row) = self.trace.values[v.0 as usize].def else {
+                    continue;
+                };
+                let each: Vec<usize> = (passes.iter())
+                    .map(|p| match self.trace.values[io(p[j]).0[at].0 as usize].def {
+                        poem_ir::Def::Cache(r) => r as usize,
+                        _ => usize::MAX,
+                    })
+                    .collect();
+                rows.insert(row as usize, each);
+            }
+        }
+        // The adapter banks block 0 reads: block 0's pass and the step.
+        let banks: Vec<(u32, Vec<u32>, u32, u32)> = (steps.iter())
+            .filter(|(stack, _)| **stack >= crate::roll::BANK_STACKS)
+            .filter_map(|(&stack, &step)| {
+                let params = self
+                    .bank_stacks
+                    .get((stack - crate::roll::BANK_STACKS) as usize)?;
+                let read = first.iter().any(|&n| {
+                    io(n).0.iter().any(|v| {
+                        matches!(self.trace.values[v.0 as usize].def,
+                            poem_ir::Def::Weight(w) if params.contains(&w))
+                    })
+                });
+                read.then_some(())?;
+                let pass = (params.iter()).position(|p| {
+                    first.iter().any(|&n| {
+                        io(n).0.iter().any(|v| {
+                            matches!(self.trace.values[v.0 as usize].def,
+                                poem_ir::Def::Weight(w) if w == *p)
+                        })
+                    })
+                })?;
+                Some((params[pass], params.clone(), pass as u32, step))
+            })
+            .collect();
+
+        // What the body writes and first reads, put back after.
+        let (trial, touched) = tracer.trial(|| {
+            walk(
+                &self.trace,
+                &self.compiled,
+                descriptor,
+                run,
+                &mut Cursor::new(place),
+                Filter {
+                    regions: poem_exec::fire::Regions::Span {
+                        from: body.start as u32,
+                        upto: body.end as u32,
+                    },
+                    ..Filter::default()
+                },
+            )
+        });
+        trial?;
+        let stepped = |root: u32| {
+            matches!(
+                self.handles.root_of_checked(root).map(|r| r.source),
+                Some(Source::Stacked { stack, .. }) if steps.contains_key(&stack)
+            )
+        };
+        let named: Vec<u32> = (touched.named.iter())
+            .copied()
+            .filter(|&r| !stepped(r) && self.handles.root_of_checked(r).is_some())
+            .collect();
+        tracer.name(&named)?;
+        let mut carried: Vec<u32> = carries.iter().map(|c| c.0).collect();
+        let mut yields: Vec<u32> = carries.iter().map(|c| c.1).collect();
+        for &root in &touched.written {
+            if !carried.contains(&root) && self.handles.root_of_checked(root).is_some() {
+                carried.push(root);
+                yields.push(root);
+            }
+        }
+        let frame = tracer.open_loop(block.repeats, &carried, steps.clone())?;
+        let counter = tracer.counter().ok_or_else(|| Fault::Program {
+            at: "serve::roll_block",
+            why: "a rolled block's loop opened with no counter".into(),
+        })?;
+        // Each cache row's page maps at the counter's pass.
+        let mut pools: BTreeMap<usize, crate::store::CachePool> = BTreeMap::new();
+        // Two handles of one root, from one row, read alike.
+        let same_view = |a: crate::handle::Tensor, b: crate::handle::Tensor| {
+            self.handles.locate(a.buf) == self.handles.locate(b.buf)
+                && (a.rows, a.width, a.dtype) == (b.rows, b.width, b.dtype)
+                && self.handles.order_of(a.buf) == self.handles.order_of(b.buf)
+        };
+        for (&row, each) in &rows {
+            let maps = |r: usize| match run.cache_row(r) {
+                Some(crate::store::CachePool::Kv(p)) => Some((*p, p.keys_map, p.values_map)),
+                _ => None,
+            };
+            let base = maps(row).ok_or_else(|| Fault::Program {
+                at: "serve::roll_block",
+                why: format!("cache row {row} is no kv pool"),
+            })?;
+            let second = maps(each[1]).ok_or_else(|| Fault::Program {
+                at: "serve::roll_block",
+                why: format!("cache row {} is no kv pool", each[1]),
+            })?;
+            let (dk, dv) = (
+                second.1.offset - base.1.offset,
+                second.2.offset - base.2.offset,
+            );
+            for (k, &r) in each.iter().enumerate() {
+                let m = maps(r).ok_or_else(|| Fault::Program {
+                    at: "serve::roll_block",
+                    why: format!("cache row {r} is no kv pool"),
+                })?;
+                let k = k as i64;
+                let affine = m.1.stride == base.1.stride
+                    && m.2.stride == base.2.stride
+                    && m.1.offset == base.1.offset + k * dk
+                    && m.2.offset == base.2.offset + k * dv
+                    && same_view(m.0.keys, base.0.keys)
+                    && same_view(m.0.values, base.0.values);
+                if !affine {
+                    return Err(Fault::Program {
+                        at: "serve::roll_block",
+                        why: format!(
+                            "cache row {r}'s pages do not lie a whole step on from row {row}'s: \
+                             a rolled block's rows lie at one stride"
+                        ),
+                    });
+                }
+            }
+            let last = i64::from(block.repeats - 1);
+            let dynamic = |offset: i64, step: i64| -> Result<kernels_xla::tensor::PageMap> {
+                tracer.with(|f| -> Result<kernels_xla::tensor::PageMap> {
+                    let first = f.const_i(kernels_xla::hlo::Elem::I32, offset, &[]);
+                    let by = f.const_i(kernels_xla::hlo::Elem::I32, step, &[]);
+                    let moved = f.mul(counter, by)?;
+                    Ok(kernels_xla::tensor::PageMap {
+                        stride: 0,
+                        offset: offset + last * step,
+                        dynamic: Some(f.add(first, moved)?),
+                    })
+                })
+            };
+            let mut keys_map = dynamic(base.1.offset, dk)?;
+            keys_map.stride = base.1.stride;
+            let mut values_map = dynamic(base.2.offset, dv)?;
+            values_map.stride = base.2.stride;
+            pools.insert(
+                row,
+                crate::store::CachePool::Kv(crate::handle::KvPool {
+                    keys_map,
+                    values_map,
+                    ..base.0
+                }),
+            );
+        }
+        run.roll_caches(pools);
+        run.roll_banks(
+            (banks.into_iter())
+                .map(|(param, params, pass, step)| (param, (params, pass, step, counter)))
+                .collect(),
+        );
+        let walked = walk(
+            &self.trace,
+            &self.compiled,
+            descriptor,
+            run,
+            &mut Cursor::new(place),
+            Filter {
+                regions: poem_exec::fire::Regions::Span {
+                    from: body.start as u32,
+                    upto: body.end as u32,
+                },
+                ..Filter::default()
+            },
+        );
+        run.roll_caches(BTreeMap::new());
+        run.roll_banks(BTreeMap::new());
+        walked?;
+        tracer.close_loop(frame, &yields)?;
+        // The last pass's values, read after the loop by their own names,
+        // lie in the first pass's roots.
+        let last = &passes[block.repeats as usize - 1];
+        for (&n0, &nl) in first.iter().zip(last) {
+            for (d0, dl) in io(n0).1.iter().zip(&io(nl).1) {
+                if let (Some(r0), Some(rl)) = (root_of(run, *d0), root_of(run, *dl))
+                    && r0 != rl
+                {
+                    tracer.alias(rl, r0);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn trace_text(
         &self,
         slots: &SlotTable,
@@ -3488,14 +3813,7 @@ impl Shell {
             .with_probes(self.probes.clone())
             .with_head_norms(Self::head_norms(&self.trace))
             .with_streamed(self.fire_streamed.clone());
-            walk(
-                &self.trace,
-                &self.compiled,
-                descriptor,
-                &mut run,
-                &mut Cursor::new(&place),
-                Filter::default(),
-            )?;
+            self.walk_rolled(descriptor, &mut run, &place, &tracer)?;
             run.take_probed()
         };
 

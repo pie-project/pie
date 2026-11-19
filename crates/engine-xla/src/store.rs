@@ -90,7 +90,11 @@ pub type Map = kernels_xla::tensor::PageMap;
 
 fn map_of(layout: &Layout, shape: &layout::Shape, plane: &Plane) -> Map {
     let (stride, offset) = layout.map(shape, plane);
-    Map { stride, offset }
+    Map {
+        stride,
+        offset,
+        dynamic: None,
+    }
 }
 
 /// A fire's page geometry for one page table, as handles.

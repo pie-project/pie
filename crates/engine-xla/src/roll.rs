@@ -21,6 +21,10 @@ use std::fmt::Write as _;
 
 use poem_ir::{Def, Trace, ValueId};
 
+/// Where adapter bank stacks are numbered in a [`Plan`]'s steps, past every
+/// weight stack.
+pub const BANK_STACKS: u32 = 1 << 20;
+
 /// `repeats` passes of a body of `period` layers, from layer `first`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Run {
@@ -409,9 +413,9 @@ pub fn blocks(trace: &Trace, compiled: &poem_compiler::CompiledModel) -> Vec<Blo
 /// stack passes, or why it stays spelled out.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
-    /// Each block, with the stack pass block 0 reads each weight at (by
-    /// param), or why the block does not roll.
-    pub blocks: Vec<(Block, Result<Vec<(u32, u32)>, String>)>,
+    /// Each block, with the passes a turn steps each weight stack its body
+    /// reads (by stack), or why the block does not roll.
+    pub blocks: Vec<(Block, Result<std::collections::BTreeMap<u32, u32>, String>)>,
     pub layers: u32,
 }
 
@@ -423,6 +427,7 @@ impl Plan {
         trace: &Trace,
         compiled: &poem_compiler::CompiledModel,
         member: &dyn Fn(u32) -> Option<(u32, u32)>,
+        streams: &dyn Fn(u32) -> bool,
     ) -> Plan {
         let layers = layer_count(trace);
         let blocks = (blocks(trace, compiled).into_iter())
@@ -432,18 +437,48 @@ impl Plan {
                     region_weights(trace, compiled, lo..lo + block.regions)
                 };
                 let first = weights(0);
-                let mut checked: Result<Vec<(u32, u32)>, String> = Ok(Vec::new());
+                let lo = block.start;
+                let reads_state = (lo..lo + block.regions)
+                    .flat_map(|r| compiled.template()[r].nodes.clone())
+                    .any(|n| {
+                        let mut ins = Vec::new();
+                        poem_ir::Operands::inputs(&trace.nodes[n as usize].op, &mut ins);
+                        ins.iter().any(|v| {
+                            matches!(
+                                trace.values.get(v.0 as usize).map(|d| &d.def),
+                                Some(Def::Cache(row))
+                                    if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+                            )
+                        })
+                    });
+                let mut checked: Result<(), String> = if reads_state {
+                    Err("its body reads recurrent state rows, which a body does not yet address \
+                         by its counter"
+                        .to_string())
+                } else {
+                    Ok(())
+                };
                 let mut step: Vec<Option<u32>> = vec![None; first.len()];
                 'blocks: for k in 0..block.repeats {
+                    if checked.is_err() {
+                        break;
+                    }
                     let at = weights(k);
                     for (j, (&p0, &pk)) in first.iter().zip(&at).enumerate() {
                         if p0 == pk {
                             continue;
                         }
                         let (Some((s0, a0)), Some((sk, ak))) = (member(p0), member(pk)) else {
-                            let lone =
-                                &trace.params[if member(p0).is_none() { p0 } else { pk } as usize];
-                            checked = Err(if lone.source == poem_ir::ParamSource::Registered {
+                            let at = if member(p0).is_none() { p0 } else { pk };
+                            let lone = &trace.params[at as usize];
+                            checked = Err(if streams(at) {
+                                format!(
+                                    "weight `{}` streams through the pool: a fire whose layers' \
+                                     weights are not all resident runs each layer as its own \
+                                     segment, cut before its first read",
+                                    lone.name
+                                )
+                            } else if lone.source == poem_ir::ParamSource::Registered {
                                 format!(
                                     "weight `{}` is an adapter bank, read through the pool's \
                                      adapter slots, which a body does not yet address by its \
@@ -473,9 +508,9 @@ impl Plan {
                         step[j] = d;
                     }
                 }
-                let checked = checked.map(|_| {
-                    (first.iter())
-                        .filter_map(|&p| member(p).map(|(_, pass)| (p, pass)))
+                let checked = checked.map(|()| {
+                    (first.iter().zip(&step))
+                        .filter_map(|(&p, step)| Some((member(p)?.0, (*step)?)))
                         .collect()
                 });
                 (block, checked)
