@@ -129,7 +129,7 @@ pub const KEYS: [&str; 8] = [
 
 /// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
 /// decode's few to the matmul curve's first.
-const TILE_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
+const TILE_ROWS: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 /// The rows each vector kernel is timed at for `vector_tflops_by_rows`: a
 /// decode's one to the matmul curve's first.

@@ -179,13 +179,21 @@ pub fn choose(
         all.extend(tiled_kernels(target, base));
         all
     };
-    // `curves`' rate (keyed `key`) at `rows` in flops a ns, where it states
-    // the key and reaches the rows.
-    let measured = |curves: &[(u32, Vec<(u32, f64)>)], key: u32, rows: u32| -> Option<f64> {
-        let (_, curve) = curves.iter().find(|(at, _)| *at == key)?;
-        curve.last().filter(|&&(most, _)| rows <= most)?;
-        profile::fire::interpolate(curve, f64::from(rows)).map(|t| t * 1e3)
-    };
+    // The time `curves` (keyed `key`) state for `flops` of `rows`, in ns,
+    // where they state the key and reach the rows: the flops over the rate
+    // at the rows, between measured row counts in log rows; below the first
+    // row count timed, that count's time (a kernel takes no less for fewer
+    // rows than it was timed at, so its rate there is not held).
+    let measured =
+        |curves: &[(u32, Vec<(u32, f64)>)], key: u32, rows: u32, flops: &dyn Fn(u32) -> f64| {
+            let (_, curve) = curves.iter().find(|(at, _)| *at == key)?;
+            let (&(first, _), &(most, _)) = (curve.first()?, curve.last()?);
+            if rows > most {
+                return None;
+            }
+            let at = rows.max(first);
+            profile::fire::interpolate(curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
+        };
     // `tactic`'s cost over every plane at `rows`, in ns.
     let cost = |tactic: Tactic, rows: u32| -> f64 {
         let mut ns = 0.0;
@@ -199,13 +207,13 @@ pub fn choose(
             // a tiled kernel's on the matmul curve, its rows padded to its
             // tile, each reading the plane once a group of rows sharing a
             // read (no cache assumed).
-            let rate = if tactic.vector > 0 {
-                measured(vectors, tactic.vector, rows)
+            let timed = if tactic.vector > 0 {
+                measured(vectors, tactic.vector, rows, &flops)
             } else {
-                measured(tiles, kernel.row_tile().max(1), rows)
+                measured(tiles, kernel.row_tile().max(1), rows, &flops)
             };
-            let (compute, read) = match rate {
-                Some(rate) => (flops(rows) / rate, bytes),
+            let (compute, read) = match timed {
+                Some(ns) => (ns, bytes),
                 None => {
                     let passes = f64::from(rows.div_ceil(kernel.rows_a_read().max(1)));
                     let compute = if tactic.vector > 0 {
@@ -450,5 +458,26 @@ mod tests {
         ]);
         let (eager, _) = choose(Target::Wgsl, &[1, 2, 4], coopmat, &r, &counts(), false).unwrap();
         assert_eq!(eager.at(3).vector, 1);
+    }
+
+    /// Below the first row count a kernel was timed at it takes that count's
+    /// time, not its rate over fewer flops: a tile timed from 4 rows is not
+    /// priced at a quarter of that at 1 row.
+    #[test]
+    fn below_its_first_timed_rows_a_kernel_takes_that_time() {
+        let baseline = |_| Tactic {
+            tier: Tier::Baseline,
+            vector: 0,
+            wide: false,
+        };
+        let tiles = vec![
+            (32, vec![(4, 4.0), (256, 8.0)]),
+            (256, vec![(4, 4.0), (256, 8.0)]),
+        ];
+        let r = rates(Some(1.0), tiles);
+        let (_, one) = choose(Target::Spirv, &[1], baseline, &r, &counts(), true).unwrap();
+        let (_, four) = choose(Target::Spirv, &[4], baseline, &r, &counts(), true).unwrap();
+        let tiled = |w: &[Weighed]| w[0].costs.iter().find(|c| c.0.vector == 0).unwrap().2;
+        assert_eq!(tiled(&one), tiled(&four));
     }
 }
