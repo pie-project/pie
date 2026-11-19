@@ -113,48 +113,46 @@ impl Registry {
     }
 
     /// A program bound for one pass is checked again against the next's `lanes`.
+    #[cfg(test)]
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
         lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
-        let mut hash = container_hash(&bytes);
-        if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
-            hash ^= 0x9e37_79b9_7f4a_7c15;
+        let hash = program_hash(&bytes);
+        if let Some(hit) = self.hit(hash, &bytes, &lanes)? {
+            return Ok(hit);
         }
-        if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
-            hash ^= 0xbf58_476d_1ce4_e5b9;
+        let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps)?);
+        Ok(self.insert(entry))
+    }
+
+    fn hit(
+        &mut self,
+        hash: u64,
+        bytes: &[u8],
+        lanes: &[Vec<OutputDecl>],
+    ) -> Result<Option<Arc<RegisteredProgram>>, RegisterError> {
+        let Some(hit) = self.inner.get(&hash) else {
+            return Ok(None);
+        };
+        if hit.bytes != bytes {
+            return Err(RegisterError::HashCollision(hash));
         }
-        if let Some(hit) = self.inner.get(&hash) {
-            if hit.bytes != bytes {
-                return Err(RegisterError::HashCollision(hash));
+        check_outputs(&hit.bound.container, lanes).map_err(RegisterError::Bind)?;
+        Ok(Some(hit.clone()))
+    }
+
+    /// A program another caller registered meanwhile wins, so every caller shares one entry.
+    fn insert(&mut self, entry: Arc<RegisteredProgram>) -> Arc<RegisteredProgram> {
+        if let Some(raced) = self.inner.get(&entry.hash) {
+            if raced.bytes == entry.bytes {
+                return raced.clone();
             }
-            check_outputs(&hit.bound.container, &lanes).map_err(RegisterError::Bind)?;
-            return Ok(hit.clone());
         }
-        let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
-        let pricing = price(&decoded);
-        let channel_accesses = Self::channel_accesses(&decoded);
-        let reads = Self::reads(&decoded);
-        let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
-        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
-        let launch = std::sync::OnceLock::new();
-        let entry = Arc::new(RegisteredProgram {
-            bytes,
-            hash,
-            bound,
-            compiled_stages,
-            channel_accesses,
-            reads,
-            launch,
-            geometry_taint: std::sync::OnceLock::new(),
-            shadow_plan: std::sync::OnceLock::new(),
-            pricing,
-            emitted: Mutex::new(HashMap::new()),
-        });
-        self.inner.put(hash, entry.clone());
-        Ok(entry)
+        self.inner.put(entry.hash, entry.clone());
+        entry
     }
 
     fn reads(container: &TraceContainer) -> Vec<(String, u32)> {
@@ -201,6 +199,47 @@ impl Registry {
 
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
+    }
+}
+
+fn program_hash(bytes: &[u8]) -> u64 {
+    let mut hash = container_hash(bytes);
+    if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
+        hash ^= 0x9e37_79b9_7f4a_7c15;
+    }
+    if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
+        hash ^= 0xbf58_476d_1ce4_e5b9;
+    }
+    hash
+}
+
+impl RegisteredProgram {
+    /// Bind validates every channel index before anything else indexes by one.
+    fn build(
+        bytes: Vec<u8>,
+        hash: u64,
+        lanes: Vec<Vec<OutputDecl>>,
+        caps: EngineCaps,
+    ) -> Result<Self, RegisterError> {
+        let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
+        let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
+        let pricing = price(&bound.container);
+        let channel_accesses = Registry::channel_accesses(&bound.container);
+        let reads = Registry::reads(&bound.container);
+        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
+        Ok(Self {
+            bytes,
+            hash,
+            bound,
+            compiled_stages,
+            channel_accesses,
+            reads,
+            launch: std::sync::OnceLock::new(),
+            geometry_taint: std::sync::OnceLock::new(),
+            shadow_plan: std::sync::OnceLock::new(),
+            pricing,
+            emitted: Mutex::new(HashMap::new()),
+        })
     }
 }
 
@@ -272,7 +311,22 @@ pub fn register(
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    global().register(bytes, lanes, caps)
+    register_with(bytes, lanes, caps)
+}
+
+/// Decode, bind and compile run outside the global lock, so a slow or refused
+/// program never holds up, or poisons, every other process's registry access.
+fn register_with(
+    bytes: Vec<u8>,
+    lanes: Vec<Vec<OutputDecl>>,
+    caps: EngineCaps,
+) -> Result<Arc<RegisteredProgram>, RegisterError> {
+    let hash = program_hash(&bytes);
+    if let Some(hit) = global().hit(hash, &bytes, &lanes)? {
+        return Ok(hit);
+    }
+    let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps)?);
+    Ok(global().insert(entry))
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -343,5 +397,36 @@ mod pricing_tests {
         };
         assert_eq!(price(&container).rows, 256);
         assert_eq!(price(&TraceContainer::default()).rows, 1);
+    }
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::{RegisterError, register_with};
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::validate::ValidateError;
+
+    #[test]
+    fn an_out_of_range_channel_is_refused_and_the_registry_stays_usable() {
+        let bad = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(5)],
+            }],
+            ..TraceContainer::default()
+        };
+        let err = register_with(bad.encode(), vec![], EngineCaps::default()).unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Bind(ValidateError::Body { .. })),
+            "{err}"
+        );
+        assert!(err.to_string().contains('5'), "{err}");
+        let good = TraceContainer::default();
+        let hash = register_with(good.encode(), vec![], EngineCaps::default())
+            .expect("a valid program registers after a refused one")
+            .hash;
+        assert!(super::lookup(hash).is_some());
     }
 }
