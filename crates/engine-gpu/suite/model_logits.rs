@@ -845,15 +845,24 @@ fn every_rung_of_a_miniature_with_unservable_classes_names_what_the_largest_name
 }
 
 /// A fire whose lanes mix classes so that a region's mask comes in runs: a
-/// plain prompt and a prompt under an adapter, which run the prompt's
-/// attention, with a plain decode between them in the class order. Where
-/// the load copies windows the region's rows are copied into one (its
-/// attention reads the fire's masks, which the copy carries), launching as
-/// the plain prompts do; else it launches a run at a time. Either way the
-/// fire asks for no pipeline the load did not build and encodes no more
-/// dispatches than the load named.
+/// prompt and a decode under an adapter, which run the adapter's region,
+/// with a plain decode between them in the class order. Where the load
+/// copies windows the region's rows are copied into one (its attention
+/// reads the fire's masks, which the copy carries), launching as the same
+/// fire without the plain decode does; else it launches a run at a time.
+/// Either way the fire asks for no pipeline the load did not build and
+/// encodes no more dispatches than the load named.
+///
+/// The lanes are the order's, read off the compiled model, not assumed:
+/// since the mask is per-lane data (5b538b76d, 20a6c0cdf) a lane's mask is
+/// no class bit, so the seriated order lays every prompt class before every
+/// decode class, and a plain prompt beside an adapted one (this test's fire
+/// before the fold) cuts no region.
 #[test]
 fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
+    use poem_exec::fire::fallback;
+    use poem_ir::{ClassSet, RowAxis};
+
     let fixture = fixture("qwen3-micro-text", None);
     let Some(mut shell) = load(&fixture, CONTEXT) else {
         return;
@@ -863,15 +872,57 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     let tokens: Vec<u32> = (0..CONTEXT).map(|at| (at * 37 + 11) % 256).collect();
     const ROWS: usize = 8;
     let plain = |rows: usize| word(&fixture.trace, rows as u32);
-    let adapted = fixture
-        .trace
-        .facts
-        .word(&Request::new(ROWS as u32, false).adapted(true));
+    let adapted = |rows: usize| {
+        fixture
+            .trace
+            .facts
+            .word(&Request::new(rows as u32, false).adapted(true))
+    };
     assert_ne!(
-        adapted,
+        adapted(ROWS),
         plain(ROWS),
         "the fixture tells an adapted lane apart"
     );
+
+    // The adapted prompt, the plain decode and the adapted decode lie in
+    // that turn of the class order, and a region holds both adapted lanes'
+    // classes and not the plain decode's: the fire cuts it.
+    {
+        let compiled = shell.compiled_model();
+        let axis = RowAxis::Tokens;
+        let classes = compiled.classes.classes.len();
+        let class = |word: u64| {
+            compiled
+                .classes
+                .classes
+                .iter()
+                .position(|class| class.words.contains(&word))
+                .unwrap_or_else(|| panic!("no class holds word {word:#x}"))
+        };
+        let order = compiled
+            .order_for(axis)
+            .map(|order| order.class_order(&ClassSet::of(0..classes)))
+            .unwrap_or_default();
+        let turn = |word: u64| {
+            order
+                .iter()
+                .position(|&at| usize::from(at) == class(word))
+                .expect("the order holds every class")
+        };
+        let (a, b, c) = (adapted(ROWS), plain(1), adapted(1));
+        assert!(
+            turn(a) < turn(b) && turn(b) < turn(c),
+            "the class order {order:?} does not lay the plain decode between the adapted lanes"
+        );
+        let cut = compiled.template().iter().enumerate().any(|(at, region)| {
+            compiled.axis_of(at) == axis
+                && !fallback::promised(compiled, axis, region)
+                && region.mask.contains(class(a))
+                && region.mask.contains(class(c))
+                && !region.mask.contains(class(b))
+        });
+        assert!(cut, "no region holds the adapted lanes and not the plain decode");
+    }
 
     // Three plain prompts seat their rows: no region is cut.
     let seated: Vec<Seated<'_>> = (0..3)
@@ -887,11 +938,9 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     shell
         .fire_seated(&seated)
         .expect("three plain prompts fire");
-    let (_, whole) = shell.walked_serving();
+    shell.walked_serving();
     shell.recorded_serving();
 
-    // A new plain prompt, a decode of the second seat, and a new prompt
-    // under an adapter.
     let lane = |slot: u32, held: u32, word: u64, rows: usize| Seated {
         held: Some(held),
         ..Seated::of(Lane {
@@ -900,16 +949,29 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
             tokens: &tokens[..rows],
         })
     };
-    let seated = [
-        lane(0, 0, plain(ROWS), ROWS),
-        lane(1, ROWS as u32, plain(1), 1),
+    fn under(seated: Seated<'_>) -> Seated<'_> {
         Seated {
             adapter: Some(0),
-            ..lane(2, 0, adapted, ROWS)
-        },
+            ..seated
+        }
+    }
+    // A new prompt under an adapter and a decode of the third seat under
+    // it: the adapter's region in one run.
+    let whole = [
+        under(lane(0, 0, adapted(ROWS), ROWS)),
+        under(lane(2, ROWS as u32, adapted(1), 1)),
+    ];
+    shell.fire_seated(&whole).expect("the adapted fire fires");
+    let (_, whole) = shell.walked_serving();
+
+    // The same with a plain decode of the second seat between them.
+    let seated = [
+        under(lane(0, 0, adapted(ROWS), ROWS)),
+        lane(1, ROWS as u32, plain(1), 1),
+        under(lane(2, ROWS as u32 + 1, adapted(1), 1)),
     ];
     let got = shell.fire_seated(&seated).expect("the mixed fire fires");
-    assert!(got[..2].iter().all(|row| row.iter().all(|v| v.is_finite())));
+    assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
     let (dispatches, launches) = shell.walked_serving();
     if shell.copies() {
         assert_eq!(
@@ -919,7 +981,7 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     } else {
         assert!(
             launches > whole,
-            "the mixed fire cut no region: {launches} launches, {whole} of the plain prompts"
+            "the mixed fire cut no region: {launches} launches, {whole} without the plain decode"
         );
     }
     assert_eq!(
