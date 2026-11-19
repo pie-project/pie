@@ -726,3 +726,84 @@ duration. Kernel choices are compared on device durations.
 What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
 that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
 slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
+
+## F40. ROCm 4-row decode: where the 4-parallel step's ~170 µs over 1 greedy goes (MI300X, qwen3-0.6b)
+
+At short context 1 greedy is 1.31 ms a step and 4 parallel 1.48 (after the turned norm
+fold). The attach kernel trace attributed the gap mostly to o-proj + down (+78 µs). That
+was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts after a
+~290 µs idle gap, so its durations describe a cold, down-clocked device, not graph replay.
+The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
+are 0.
+
+The instrument that measures in context is ablation by duplication. Launch one product
+twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
+median of 5, two rounds):
+
+| product (per call) | m = 1 | m = 4 | 4-row extra a step |
+|---|---|---|---|
+| o-proj 1024 x 2048, skinny | 3.7 µs | 3.7 µs | 0 |
+| down 1024 x 3072, skinny | 4.6 µs | 4.8 µs | +6 |
+| qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
+| gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
+
+The other kernels, ablated the same way (one extra launch of each, Δ step µs at g1 → g4):
+
+| kernel | g1 | g4 | 4-row extra |
+|---|---|---|---|
+| attention decode (`paged_decode_mfma`) | +204 | +202 | 0 |
+| `merge_partials` | +125 | +128 | 0 |
+| qkv / rope / KV write | +137 | +162 | +25 |
+| lm head (one call a step) | +71 | +81 | +10 |
+
+The ledger: gated turned gate-up +67, folded qkv on turn +30, qkv/rope +25, lm head +10,
+down +6. o-proj, attention and merge add nothing. That is ≈138 µs; the remaining ~30 is
+host / channel / sampling work, not kernel-ablated.
+
+The routes are already the faster ones here. Gate-up on the folded skinny kernel instead of
+turn costs 4-parallel +20 µs (1.497 vs 1.476 ms); o-proj on turn costs +28 (F39). The gated
+turned product's cost is its own: 9.0 µs a call against skinny's 6.6 at m = 1, about
+1.4 TB/s against 1.9. More tiles a block (one norm stage walking them) does not help: two a
+block 1.488 ms (the same), three 1.524, four 1.573. A 16 + 16-column gated tile is the same
+work a block as two tiles, so it is not expected to help either.
+
+Tried, none kept (4-parallel ms a step, against 1.475–1.484):
+- skinny at m = 4: staging the activation four loads at a time (worse); reading it from
+  global, not LDS (no change); 16-wave blocks over 64 (worse); a grid trimmed to the blocks
+  with rows (noise); the quad kernel on narrow banks (much worse, 402 vs 306 µs traced);
+- turn_min_n removed (o-proj on turn): 1.510 (F39);
+- the turned kernel's tiles spread evenly (192 two-tile blocks for gate-up's 384 tiles over
+  304 CUs): 1.498–1.505.
+
+Next:
+- gated turned product at m = 4: why its walk streams at 1.4 TB/s (latency per tile under
+  one wave a SIMD), with the PMC counters inside a duplication run rather than the attach
+  trace;
+- the ~30 µs host / channel / sampling share at four lanes;
+- the duplication switch is a scratch patch: a profile probe that times a kernel in place
+  (in a captured body) would make it a standing instrument.
+
+## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
+
+`runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
+(Windows on Arm, NVIDIA driver) in about half its runs, on wgpu-Vulkan and on native Vulkan,
+on memory-redesign (04df99f24) as on the branches after it. It passes on Linux (RTX PRO 4500).
+One fire stalls 100 to 600 ms; the lane fires once inside the compile window instead of
+~100 times. Measured in-process (no nsys on the Spark):
+
+- The time is inside the submit: wgpu's `queue.submit`, or the native submit. The fire's
+  settle (its fence wait) is ~1.5 ms.
+- It is not the compile and not a lock in pie. `program::adopt` is host-only and
+  single-threaded, ~46 ms, and the stall outlasts it by up to 470 ms. With the off-lane thread
+  replaced by a pure spin, a spin that yields every millisecond, or a thread that only
+  sleeps, the stall still shows (1 of 3, 3 of 5, 3 of 5 runs).
+- It is not native Vulkan's pipeline-cache write either. In the test the cache has no file,
+  so `PipelineCache::persist` never reads the driver's data, and a run still stalled 601 ms.
+- It lands on one submit early in the engine's life. Three or more fires between building
+  the registration and the compile window avoid it in every variant run (16 of 16), and the
+  fires after the stalled one take ~1 ms.
+
+Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, landing on
+whichever submit is in flight; the test catches it when that submit overlaps the compile.
+The test stays strict, known on this device. Owed: driver-level tracing on that box (not
+nsys, which bluescreens it), or a driver update that moves it.
