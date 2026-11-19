@@ -1753,9 +1753,9 @@ fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
 }
 
 /// A waiter that holds nothing is no sole holder (a restart frees nothing
-/// of it), yet one that could never fit alone is still refused by name, at
-/// once: one ask past the pool where it asks, and concurrent asks whose
-/// sum is past the pool by the overcommit check.
+/// of it), yet an ask that could never fit alone is still refused by name,
+/// at once, where it asks. Asks that each fit alone are over-demand, not
+/// this: they wait to be served one after the other.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_handed_waiter_that_could_never_fit_is_refused_by_name() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -1778,33 +1778,7 @@ async fn an_empty_handed_waiter_that_could_never_fit_is_refused_by_name() {
         Err(error) => panic!("refused, but not by name: {error}"),
         Ok(_) => panic!("an ask past the pool is refused at once"),
     }
-    let keys = park_asks(&planner, pid, &[3, 3]);
     assert!(!planner.sole_holder(pid), "it holds nothing");
-    assert!(planner.check_overcommit());
-    planner.with_inner(|inner| {
-        for key in &keys {
-            let WaitKind::Allocation {
-                outcome: Some(Err(error)),
-                ..
-            } = &inner.queue[key].kind
-            else {
-                panic!("each parked ask fails");
-            };
-            assert!(
-                matches!(
-                    error,
-                    PlannerError::Overcommit {
-                        asks: 2,
-                        need: 6,
-                        held: 0,
-                        total: 4,
-                        ..
-                    }
-                ),
-                "{error}"
-            );
-        }
-    });
 }
 
 /// Mac's gemma-4-e4b c64 stall: a windowed model on a pool that states no
