@@ -394,6 +394,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
+            lane: Some(quorum_pipeline_id),
         },
     );
     Ok(Ok(()))

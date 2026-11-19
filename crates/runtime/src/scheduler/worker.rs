@@ -91,6 +91,19 @@ pub(crate) fn notify_owner_away(pid: ProcessId) {
     broadcast(|| SchedulerItem::OwnerAway(pid));
 }
 
+/// `lane`'s process on `engine` waits on the output of the fire
+/// `completion` settles, having submitted nothing since: no frame on
+/// `engine` waits on the lane until it submits again
+/// ([`super::frame::FramePolicy::on_lane_waits`]).
+pub(crate) fn notify_lane_waits(engine: usize, lane: ProcessId, completion: WorkItemCompletion) {
+    if completion.is_settled() {
+        return;
+    }
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::LaneWaits { lane, completion });
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -321,6 +334,12 @@ enum SchedulerItem {
     /// frame until each submits again
     /// ([`super::frame::FramePolicy::on_owner_away`]).
     OwnerAway(ProcessId),
+    /// The lane's process waits on the output of the fire the completion
+    /// settles ([`super::frame::FramePolicy::on_lane_waits`]).
+    LaneWaits {
+        lane: ProcessId,
+        completion: WorkItemCompletion,
+    },
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -2283,6 +2302,9 @@ impl BatchScheduler {
             }
             SchedulerItem::OwnerAway(pid) => {
                 frame_policy.on_owner_away(pid);
+            }
+            SchedulerItem::LaneWaits { lane, completion } => {
+                frame_policy.on_lane_waits(lane, completion);
             }
             SchedulerItem::FrameTruncate {
                 lane,

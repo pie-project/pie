@@ -275,6 +275,7 @@ async fn materialize_channel(
                 })?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
+                        crate::pipeline::fire::tell_front_awaited(Some(&fires));
                         fires.await_front_completion().await;
                         continue;
                     }
@@ -300,6 +301,7 @@ async fn materialize_channel(
             ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
+                crate::pipeline::fire::tell_front_awaited(fires.as_ref());
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
@@ -327,6 +329,7 @@ pub(crate) async fn materialize_channel_blocking(
                 let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
+                        crate::pipeline::fire::tell_front_awaited(Some(&fires));
                         fires.await_front_completion().await;
                         continue;
                     }
@@ -350,6 +353,7 @@ pub(crate) async fn materialize_channel_blocking(
             ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
+                crate::pipeline::fire::tell_front_awaited(fires.as_ref());
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
