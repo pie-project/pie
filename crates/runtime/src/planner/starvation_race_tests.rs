@@ -3008,9 +3008,11 @@ async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
 }
 
 /// An evicted process's gate sleeps until its own residency changes: the
-/// planner poked for others, room freed, and time passing (it re-reported
-/// a standing shortfall every 100 ms, waking each waiter ten times a
-/// second) wake it not once. Its restore wakes it, once.
+/// planner poked for others and room freed wake it not once (it holds no
+/// clock: on a 100 ms re-report of a standing shortfall it woke each
+/// waiter ten times a second). Its restore wakes it, once. Every event is
+/// driven here in order on one thread, each followed by yields that would
+/// run a woken gate to its next park before the count is read: no sleep.
 #[tokio::test(flavor = "current_thread")]
 async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3022,20 +3024,25 @@ async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
         planner.note_admitted(pid);
     }
     planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    let parks = |planner: &Arc<ResidencyPlanner>| planner.stats.gate_parks.load(Ordering::Relaxed);
     let p = planner.clone();
     let gate = crate::rt::spawn(async move { p.wait_resident(pid).await });
     for _ in 0..50 {
         crate::rt::yield_now().await;
+        if parks(&planner) == 1 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 1, "parked");
+    // No drain task armed: each poke plans now, on this thread.
+    for _ in 0..50 {
         planner.poke();
         planner.pages_freed();
+        crate::rt::yield_now().await;
+        crate::rt::yield_now().await;
     }
-    tokio::time::sleep(Duration::from_millis(350)).await;
     assert!(!gate.is_finished(), "still evicted");
-    assert_eq!(
-        planner.stats.gate_parks.load(Ordering::Relaxed),
-        1,
-        "parked once, woken by nothing of its own"
-    );
+    assert_eq!(parks(&planner), 1, "parked once, woken by nothing of its own");
     let signal = planner.with_inner(|inner| {
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Resident;
@@ -3043,7 +3050,81 @@ async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
     });
     signal.notify_waiters();
     gate.await.expect("the gate ends").expect("resident");
-    assert_eq!(planner.stats.gate_parks.load(Ordering::Relaxed), 1);
+    assert_eq!(parks(&planner), 1, "its restore ends the wait, no park after");
+}
+
+/// The policy's answer of nothing is process-wide (any planner's, any
+/// tier's), and an evicted gate woke on every one, a restore of its own
+/// queued or not, to find nothing changed and park again. A gate with no
+/// short restore sleeps through such answers; a gate whose queued restore
+/// is short on the tier answered wakes on it, once, and gives up.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_sleeps_through_policy_answers_that_are_not_its_restore_s() {
+    use crate::policy::pressure::{Tier, answered_nothing};
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (idle, short) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [idle, short] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+        planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    }
+    let parks = |planner: &Arc<ResidencyPlanner>| planner.stats.gate_parks.load(Ordering::Relaxed);
+
+    // No restore queued: the policy answering anyone's shortfall is not its.
+    let p = planner.clone();
+    let idle_gate = crate::rt::spawn(async move { p.wait_resident(idle).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if parks(&planner) == 1 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 1, "parked");
+    for _ in 0..10 {
+        answered_nothing(Tier::Device);
+        answered_nothing(Tier::Host);
+        crate::rt::yield_now().await;
+        crate::rt::yield_now().await;
+    }
+    assert!(!idle_gate.is_finished(), "still evicted");
+    assert_eq!(parks(&planner), 1, "answers that are not its wake it not once");
+
+    // Control: a restore queued short of host room gives up on the answer.
+    let key = planner.with_inner(|inner| {
+        inner.enqueue(
+            short,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    planner.note_short(key, 0, 1 << 20);
+    let p = planner.clone();
+    let short_gate = crate::rt::spawn(async move { p.wait_resident(short).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if parks(&planner) == 2 {
+            break;
+        }
+    }
+    assert_eq!(parks(&planner), 2, "the short gate parked, once");
+    answered_nothing(Tier::Host);
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if short_gate.is_finished() {
+            break;
+        }
+    }
+    let ended = short_gate.await.expect("the gate ends");
+    assert!(
+        matches!(ended, Err(PlannerError::Short { tier: Tier::Host, .. })),
+        "its own restore's answer wakes it and it gives up: {ended:?}"
+    );
+    assert!(!idle_gate.is_finished(), "the other gate sleeps through it");
+    assert_eq!(parks(&planner), 2, "neither parked again");
+    idle_gate.abort();
 }
 
 /// Reuse after release, the eviction window (the 1200-beam divergence:
