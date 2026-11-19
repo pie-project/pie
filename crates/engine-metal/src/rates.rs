@@ -784,6 +784,7 @@ pub fn measure(
         workgroups_per_core: per_core,
         tile_tflops_by_rows: None,
         vector_tflops_by_rows: None,
+        product_ns: None,
     })
 }
 

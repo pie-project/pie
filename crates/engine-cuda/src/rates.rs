@@ -165,6 +165,47 @@ fn ensure_by(
     })
 }
 
+/// What a load measured of its decode products (`Shell::routes_by_body`):
+/// each shape under each kernel, the median ns of the decode step whose
+/// body serves it so, and the interquartile spread of the rounds.
+#[cfg(feature = "rocm")]
+pub type ProductTimes =
+    Vec<(kernels_cuda::linear::routes::Shape, kernels_cuda::linear::routes::Kernel, f64, f64)>;
+
+/// `measured` saved in device `device`'s user profile under `profiles`
+/// (`[rates] product_ns`, joining what it holds), with its provenance; the
+/// path, or `None` where the load names no profile directory.
+#[cfg(feature = "rocm")]
+pub fn save_product_times(
+    profiles: Option<&std::path::Path>,
+    device: &str,
+    measured: &ProductTimes,
+) -> Result<Option<String>, String> {
+    let Some(profiles) = profiles else {
+        return Ok(None);
+    };
+    let path = crate::chip::SHELF.user_path(profiles, device);
+    let registry = crate::chip::registry();
+    let existing = std::fs::read_to_string(&path).ok().map(|text| registry.prune(&text).0);
+    let rates = Rates {
+        product_ns: Some(kernels_cuda::linear::routes::product_times(measured)),
+        ..Rates::default()
+    };
+    let how = (
+        "product_ns",
+        format!("\"measured in place at load, {}\"", engine::rates::build_commit()),
+    );
+    let text = engine::rates::saved_text(existing.as_deref(), &rates, &how);
+    registry
+        .parse(&text, "the measured product times", profile::Strict::User)
+        .map_err(|why| format!("{}: the product times would not read back: {why}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// The rows `few_row_tflops` is timed at: the most the backend's few-rows
 /// kernel takes (`linear::gemm::FEW_ROWS`).
 pub const FEW_ROWS: u32 = kernels_cuda::linear::gemm::FEW_ROWS;
@@ -543,6 +584,7 @@ mod on_device {
                 workgroups_per_core: Some(f64::from(resident)),
                 tile_tflops_by_rows: None,
                 vector_tflops_by_rows: None,
+                product_ns: None,
             },
             attn_by_dim,
         })
@@ -1129,13 +1171,15 @@ mod ensure_tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),
             hbm_gbps: Some(600.0),
-            cached_gbps: None,
+            // ROCm's rates step measures it; CUDA's estimate weighs none.
+            cached_gbps: cfg!(feature = "rocm").then_some(28800.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         }
     }
 
