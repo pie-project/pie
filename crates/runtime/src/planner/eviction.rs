@@ -236,15 +236,6 @@ impl ResidencyPlanner {
             },
             None => None,
         });
-        // Free chunks enough but scattered: chunks move until the runs
-        // stand, no process moved (the 500-at-once livelock: 262 free
-        // chunks, no run of 3, every resident waiting on a grant and so no
-        // candidate, picks=[] for minutes).
-        if let Some((run, pieces)) = shape
-            && self.waits_on_compaction(run, pieces)
-        {
-            return;
-        }
         let candidates = victims.preferred();
         let residents: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
         // Parked state lying on the device is an occupant too: a chunk it
