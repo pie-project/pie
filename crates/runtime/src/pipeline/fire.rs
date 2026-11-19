@@ -4880,21 +4880,27 @@ pub(crate) type FireWrites = Option<Vec<SetStart>>;
 
 fn record_writes<C: FireContext>(ctx: &mut C, pipeline: u32, writes: FireWrites) -> Anyhow<()> {
     let pipeline: Resource<Pipeline> = Resource::new_borrow(pipeline);
-    ctx.resources()
-        .get(&pipeline)?
-        .written
-        .lock()
-        .unwrap()
-        .push(writes);
+    let pipeline = ctx.resources().get(&pipeline)?;
+    let mut written = pipeline.written.lock().unwrap();
+    written.push_back(writes);
+    // A fire further back than the run-ahead window is one the program
+    // read past before submitting the newest: never taken back.
+    let window = crate::scheduler::run_ahead_window();
+    while written.len() > window {
+        written.pop_front();
+    }
     Ok(())
 }
 
 /// The row each working set the last `fires` fires wrote ends at once they
 /// are taken back: where the first of them began writing it. `Err` names
 /// what cannot be taken back.
-fn retracted_ends(written: &[FireWrites], fires: usize) -> Result<Vec<SetStart>, String> {
+fn retracted_ends(
+    written: &std::collections::VecDeque<FireWrites>,
+    fires: usize,
+) -> Result<Vec<SetStart>, String> {
     let mut ends: Vec<SetStart> = Vec::new();
-    for (at, fire) in written[written.len() - fires..].iter().enumerate() {
+    for (at, fire) in written.iter().skip(written.len() - fires).enumerate() {
         let Some(sets) = fire else {
             return Err(format!(
                 "the {} fire from the end placed its rows where the device says, which the \
@@ -4942,8 +4948,10 @@ pub async fn pipeline_retract<C: FireContext>(
         let written = pipeline.written.lock().unwrap();
         if fires > written.len() {
             return Ok(Err(format!(
-                "pipeline: retract of {fires} fire(s), past the {} submitted",
-                written.len()
+                "pipeline: retract of {fires} fire(s), past the {} it can take back: the \
+                 fires submitted, up to its run-ahead window of {}",
+                written.len(),
+                crate::scheduler::run_ahead_window()
             )));
         }
         (
@@ -6566,7 +6574,22 @@ pub(crate) mod lifecycle_tests {
         }
         let pipeline = run.pipeline;
         let past = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 5).await?;
-        assert!(past.unwrap_err().contains("past the 4 submitted"));
+        assert!(past.unwrap_err().contains("past the 4 it can take back"));
+        // No more than the run-ahead window is kept, however long the
+        // pipeline runs.
+        let window = crate::scheduler::run_ahead_window();
+        let long = run_ahead(u32::try_from(window).unwrap() + 3, false)?;
+        let borrowed: Resource<Pipeline> = Resource::new_borrow(long.pipeline);
+        assert_eq!(
+            long.context
+                .resources
+                .get(&borrowed)?
+                .written
+                .lock()
+                .unwrap()
+                .len(),
+            window
+        );
         let mut run = run_ahead(4, true)?;
         for completion in &run.completions {
             resolve_test_completion(completion, false);
