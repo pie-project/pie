@@ -87,6 +87,9 @@ pub enum RegisterError {
     /// A size the program declares does not fit the arithmetic it is
     /// priced in: `what` names it.
     Overflow(&'static str),
+    /// The program's channel cells ([`Pricing::channel_bytes`]) take more
+    /// than an instance's state room holds, where they are laid.
+    ChannelsPastRoom { bytes: u64, room: u64 },
 }
 
 impl fmt::Display for RegisterError {
@@ -100,6 +103,11 @@ impl fmt::Display for RegisterError {
             RegisterError::Overflow(what) => {
                 write!(f, "{what} overflows the arithmetic it is priced in")
             }
+            RegisterError::ChannelsPastRoom { bytes, room } => write!(
+                f,
+                "the program's channel cells take {bytes} bytes and an instance's state \
+                 room on the device serving this model holds {room}; it can bind nowhere"
+            ),
         }
     }
 }
@@ -107,26 +115,76 @@ impl std::error::Error for RegisterError {}
 
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// Who registered a program: a guest process, or the runtime itself
+/// (`None`: the standard samplers).
+pub type Tenant = Option<uuid::Uuid>;
+
 pub struct Registry {
     inner: LruCache<u64, Arc<RegisteredProgram>>,
+    /// The tenant that brought each held program in: what bounds how much
+    /// of the registry one tenant's registrations may churn
+    /// ([`Registry::make_room`]).
+    owners: HashMap<u64, Tenant>,
 }
 
 impl Registry {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: LruCache::new(capacity),
+            owners: HashMap::new(),
+        }
+    }
+
+    /// Room for one more program `tenant` brings in, in a full registry.
+    /// Each tenant holding programs (and `tenant`) has an equal share of
+    /// the registry's size: a tenant at or past its share gives up its own
+    /// least recently used program; one under it takes the least recently
+    /// used of a tenant past its share (one is, the registry being full).
+    /// A tenant registering program after program so churns only its own
+    /// share, never another tenant's programs within theirs.
+    fn make_room(&mut self, tenant: Tenant) {
+        let capacity = self.inner.cap().get();
+        if self.inner.len() < capacity {
+            return;
+        }
+        let mut held: HashMap<Tenant, usize> = HashMap::new();
+        for owner in self.owners.values() {
+            *held.entry(*owner).or_default() += 1;
+        }
+        let tenants = held.len() + usize::from(!held.contains_key(&tenant));
+        let share = (capacity / tenants.max(1)).max(1);
+        let own = held.get(&tenant).copied().unwrap_or(0);
+        let victim = self
+            .inner
+            .iter()
+            .rev()
+            .map(|(hash, _)| *hash)
+            .find(|hash| {
+                let owner = self.owners.get(hash).copied().flatten();
+                if own >= share {
+                    owner == tenant
+                } else {
+                    held.get(&owner).copied().unwrap_or(0) > share
+                }
+            })
+            .or_else(|| self.inner.peek_lru().map(|(hash, _)| *hash));
+        if let Some(victim) = victim {
+            self.inner.pop(&victim);
+            self.owners.remove(&victim);
         }
     }
 
     /// A program bound for one pass is checked again against the next's
-    /// `lanes`. It binds within `budget` (`validate::bind_within`): past
-    /// it, refused by name before anything of it is evaluated or laid.
+    /// `lanes`. It binds within `budget` (`validate::bind_within`), its
+    /// channel cells too: past it, refused by name before anything of it is
+    /// evaluated or laid. `tenant` brought it in ([`Registry::make_room`]).
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
         lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
         budget: Budget,
+        tenant: Tenant,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let mut hash = container_hash(&bytes);
         if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
@@ -144,6 +202,14 @@ impl Registry {
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded)?;
+        // A program's channel cells lie in the `Channel` slots of the same
+        // state room its stages do.
+        if pricing.channel_bytes > budget.room_bytes {
+            return Err(RegisterError::ChannelsPastRoom {
+                bytes: pricing.channel_bytes,
+                room: budget.room_bytes,
+            });
+        }
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads = Self::reads(&decoded);
         let bound = bind_within(decoded, lanes, caps, budget).map_err(RegisterError::Bind)?;
@@ -162,7 +228,9 @@ impl Registry {
             pricing,
             emitted: Mutex::new(HashMap::new()),
         });
+        self.make_room(tenant);
         self.inner.put(hash, entry.clone());
+        self.owners.insert(hash, tenant);
         Ok(entry)
     }
 
@@ -287,13 +355,14 @@ fn global() -> MutexGuard<'static, Registry> {
 pub fn register(
     bytes: Vec<u8>,
     lanes: Vec<Vec<OutputDecl>>,
+    tenant: Tenant,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
     let eta = crate::model::model().eta_caps();
     let caps = EngineCaps {
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    global().register(bytes, lanes, caps, eta.budget)
+    global().register(bytes, lanes, caps, eta.budget, tenant)
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -450,6 +519,7 @@ mod budget_tests {
                 vec![],
                 EngineCaps::default(),
                 budget,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -467,8 +537,111 @@ mod budget_tests {
         assert_eq!(registry.inner.len(), 0, "a refused program is not held");
 
         let fits = registry
-            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget)
+            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget, None)
             .expect("a 16 KiB prologue registers");
         assert_eq!(fits.bound.budget, Some(budget));
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::{RegisterError, Registry, Tenant};
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::types::{Dtype, Literal, Shape};
+    use eta_ir::validate::Budget;
+    use std::num::NonZeroUsize;
+
+    const ROOM: Budget = Budget {
+        room_bytes: 1 << 30,
+        submit: None,
+    };
+
+    /// A distinct program for each `n`.
+    fn program(n: u32) -> Vec<u8> {
+        TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![
+                    Op::Const(Literal::F32(1.0)),
+                    Op::Broadcast {
+                        value: 0,
+                        shape: Shape::vector(n),
+                    },
+                ],
+            }],
+            ..TraceContainer::default()
+        }
+        .encode()
+    }
+
+    fn held(registry: &mut Registry, n: u32) -> bool {
+        registry.inner.contains(&eta_ir::container_hash(&program(n)))
+    }
+
+    /// One tenant registering program after program churns only its own
+    /// share of the registry (its size over the tenants holding programs):
+    /// another tenant's programs within their share stay.
+    #[test]
+    fn one_tenant_churns_only_its_own_share_of_the_registry() {
+        let mut registry = Registry::new(NonZeroUsize::new(4).unwrap());
+        let (a, b): (Tenant, Tenant) = (Some(uuid::Uuid::from_u128(1)), Some(uuid::Uuid::from_u128(2)));
+        let register = |registry: &mut Registry, n: u32, tenant: Tenant| {
+            registry
+                .register(program(n), vec![], EngineCaps::default(), ROOM, tenant)
+                .expect("registers");
+        };
+        for n in 1..=4 {
+            register(&mut registry, n, a);
+        }
+        // b's first program takes a's least recent: a is past its share (2).
+        register(&mut registry, 100, b);
+        assert!(!held(&mut registry, 1) && held(&mut registry, 100));
+        register(&mut registry, 101, b);
+        assert!(!held(&mut registry, 2));
+        // a churns a thousand programs: only its own two slots turn over.
+        for n in 5..1005 {
+            register(&mut registry, n, a);
+        }
+        assert!(held(&mut registry, 100) && held(&mut registry, 101), "b's share stands");
+        assert!(held(&mut registry, 1003) && held(&mut registry, 1004));
+        assert_eq!(registry.inner.len(), 4);
+        // The runtime's own programs (no tenant) are a tenant like any other.
+        register(&mut registry, 2000, None);
+        assert!(held(&mut registry, 100) || held(&mut registry, 101));
+        assert!(held(&mut registry, 2000));
+    }
+
+    /// A program whose channel cells pass an instance's state room is
+    /// refused by name at its registration (`Pricing::channel_bytes`).
+    #[test]
+    fn channel_cells_past_the_room_are_refused_by_name() {
+        let mut registry = Registry::new(NonZeroUsize::new(4).unwrap());
+        let bytes = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: Shape::vector(1 << 20),
+                dtype: ChanDType::Concrete(Dtype::F32),
+                capacity: 7,
+                host_role: HostRole::None,
+                seeded: false,
+            }],
+            ..TraceContainer::default()
+        }
+        .encode();
+        let room = Budget {
+            room_bytes: 16 << 20,
+            submit: None,
+        };
+        let refused = registry
+            .register(bytes, vec![], EngineCaps::default(), room, None)
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                RegisterError::ChannelsPastRoom { bytes, room } if bytes == 32 << 20 && room == 16 << 20
+            ),
+            "{refused}"
+        );
     }
 }

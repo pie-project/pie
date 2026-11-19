@@ -648,6 +648,12 @@ impl Plane {
         Ok(id)
     }
 
+    /// The device cache keys of the compiled stages the stage cache evicted
+    /// since the last call ([`crate::guest::run::Stages::yield_room`]).
+    pub fn take_evicted(&mut self) -> Vec<[u8; 32]> {
+        self.stages.take_evicted()
+    }
+
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {

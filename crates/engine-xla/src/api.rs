@@ -665,6 +665,7 @@ impl Engine for Xla {
             .programs
             .register(registration, device)
             .map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -697,6 +698,7 @@ impl Engine for Xla {
         };
         let Compiled { pending, staged } = *compiled;
         let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -1143,6 +1145,17 @@ struct DeviceLane {
 }
 
 impl Xla {
+    /// Drops from the device's cache the compiled stages the guest stage
+    /// cache evicted, so their memory is freed with them.
+    fn forget_evicted(&mut self) {
+        let evicted = self.programs.take_evicted();
+        if let Some(shell) = &self.shell {
+            for key in &evicted {
+                shell.device().forget_key(key);
+            }
+        }
+    }
+
     /// Resolves every lane an instance bound in `DeviceGeometry` describes
     /// on its descriptor ports: its tokens, positions, KV extent, the slots
     /// its rows land in (whose page table and write descriptor come from

@@ -245,7 +245,7 @@ fn registration(
     traced: Traced,
     outputs: &[OutputDecl],
 ) -> anyhow::Result<::engine::ProgramRegistration> {
-    let program = super::program::register(traced.encode(), vec![outputs.to_vec()])?;
+    let program = super::program::register(traced.encode(), vec![outputs.to_vec()], None)?;
     Ok(::engine::ProgramRegistration {
         program_hash: program.hash,
         launch: program.launch().clone(),
@@ -289,6 +289,7 @@ mod tests {
                     room_bytes: u64::MAX,
                     submit: None,
                 },
+                None,
             )
             .expect("registers");
         if backend == "wgsl" {
