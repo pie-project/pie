@@ -135,6 +135,10 @@ impl Context {
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -192,6 +196,16 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn copy_rows(
+        &mut self,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+        _most: usize,
+    ) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn fill_zero(&mut self, _into: &Buffer, _at: u64, _len: u64) -> Result<()> {
         match self.never {}
     }
@@ -206,9 +220,37 @@ pub struct Kept {
     never: std::convert::Infallible,
 }
 
+/// What a walk laid in a fire block: none, with no device.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Image;
+
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn image(&self) -> &Image {
+        match self.never {}
+    }
+
+    pub fn refill(&self, _image: &std::sync::Arc<Image>) -> Result<()> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn indirect(&self, _at: usize) -> bool {
         match self.never {}
     }
 

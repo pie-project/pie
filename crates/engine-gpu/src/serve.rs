@@ -2235,6 +2235,13 @@ impl<B: Serve> Shell<B> {
         std::mem::take(&mut self.recorded)
     }
 
+    /// A step walked to be kept made no recording: its commands were a held
+    /// recording's, which it filled (the backend keeps what a fire changes
+    /// apart from its commands).
+    pub fn kept_none(&mut self) {
+        self.recorded = self.recorded.saturating_sub(1);
+    }
+
     /// The steps walked and not kept since the last count: each a fire
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
@@ -4814,9 +4821,11 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         }
 
         let layout = prepared.readout_layout.clone();
+        let mut rows_of: std::collections::BTreeMap<u32, Vec<(u64, u64, u64)>> =
+            std::collections::BTreeMap::new();
         for span in layout.iter().filter(|span| span.rows > 0) {
             let plane = &self.readouts[span.plane as usize];
-            let (from, layers) = bases[span.plane as usize]
+            let (_, layers) = bases[span.plane as usize]
                 .as_ref()
                 .ok_or_else(|| Fault::Unbound {
                     what: format!("output `{}`, a read plane of no value", plane.output),
@@ -4831,15 +4840,26 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                     u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
                 }
             };
-            for copy in span_copies(span, layers, row_bytes, source_row) {
-                frame.copy(
-                    from,
-                    copy.from,
-                    &self.readout[prepared.arm],
-                    copy.to,
-                    copy.bytes,
-                )?;
-            }
+            let regions = rows_of.entry(span.plane).or_default();
+            regions.extend(
+                span_copies(span, layers, row_bytes, source_row)
+                    .into_iter()
+                    .map(|copy| (copy.from, copy.to, copy.bytes)),
+            );
+        }
+        // A plane's rows move as one set of regions, at most a row of each
+        // layer for every readout the fire's rung holds.
+        let readouts = self
+            .span
+            .rungs()
+            .get(prepared.rung)
+            .map_or(0, |rung| rung.tokens as usize);
+        for (plane, regions) in &rows_of {
+            let (from, layers) = bases[*plane as usize]
+                .as_ref()
+                .expect("a plane read out has its base");
+            let most = readouts * layers.len();
+            frame.copy_rows(from, &self.readout[prepared.arm], regions, most)?;
         }
 
         let pixels = self.copy_pixels(&mut frame, &prepared)?;

@@ -39,16 +39,16 @@ struct Params {
     // two writable bindings over one range and a WGSL kernel's are all so.
     uint same;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     float2 a = pair_at(x, i, both);
     float2 b = params.same != 0u ? a : pair_at(y, i, both);
     pair_put(z, i, both, combine(a, b));
@@ -64,16 +64,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(y, i, both, pair_at(y, i, both) + pair_at(x, i, both));
 }
 
@@ -100,7 +100,7 @@ float2 bias_pair(uint c, bool both) {
 struct Params {
     int width;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -128,7 +128,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float scalar() {
     return pair_at(s, 0u, false).x;
@@ -138,7 +138,7 @@ struct Params {
     float s;
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 float scalar() {
     return act_round(params.s);
@@ -149,10 +149,10 @@ float scalar() {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(x, i, both, pair_at(x, i, both) * scalar());
 }
 
@@ -166,16 +166,16 @@ struct Params {
     float s;
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     float2 v = pair_at(x, i, both) * params.s;
     pair_put(x, i, both, v / (1.0 + exp(-v)));
 }
@@ -189,7 +189,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 // `1 - 2 / (e^2|v| + 1)` with the sign put back: the exponential may
 // overflow to infinity and the quotient still lands on 1.
@@ -202,10 +202,10 @@ float2 stable_tanh(float2 v) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(x, i, both, stable_tanh(pair_at(x, i, both)));
 }
 
@@ -217,16 +217,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(x, i, both, sqrt(pair_at(x, i, both)));
 }
 
@@ -240,7 +240,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 // erf to 1.5e-7 (Abramowitz & Stegun 7.1.26).
 float2 erf2(float2 v) {
@@ -253,10 +253,10 @@ float2 erf2(float2 v) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * gid.x;
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     float2 v = pair_at(x, i, both);
 #ifdef PIE_TANH_APPROX
     pair_put(x, i, both, 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))));
@@ -278,7 +278,7 @@ struct Params {
     uint n;
     uint width;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 float snake(float v, uint c) {
     float s = sin(v * exp(alpha[c]));
@@ -289,10 +289,10 @@ float snake(float v, uint c) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * gid.x;
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     float2 v = pair_at(x, i, both);
     pair_put(x, i, both, float2(snake(v.x, i % params.width), both ? snake(v.y, (i + 1u) % params.width) : 0.0));
 }
@@ -307,16 +307,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(o, i, both, float2(x[i], both ? x[i + 1u] : 0.0));
 }
 
@@ -334,7 +334,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 float2 bounds() {
     return float2(pair_at(lo_t, 0u, false).x, pair_at(hi_t, 0u, false).x);
@@ -345,7 +345,7 @@ struct Params {
     float hi;
     uint n;
 };
-PIE_PARAMS(1, Params, params);
+PIE_PARAMS_FIRED(1, Params, params);
 
 float2 bounds() {
     return float2(act_round(params.lo), act_round(params.hi));
@@ -356,10 +356,10 @@ float2 bounds() {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     float2 b = bounds();
     pair_put(x, i, both, min(max(pair_at(x, i, both), b.x), b.y));
 }
@@ -375,7 +375,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float2 sigmoid(float2 g) {
     float2 e = 1.0 / (1.0 + exp(-abs(g)));
@@ -386,10 +386,10 @@ float2 sigmoid(float2 g) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * PIE_FLAT_LANE(gid);
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
     pair_put(x, i, both, pair_at(x, i, both) * sigmoid(pair_at(gate, i, both)));
 }
 

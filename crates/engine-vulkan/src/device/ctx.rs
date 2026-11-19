@@ -439,7 +439,16 @@ pub struct Context {
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+    /// The kernel a frame moves a fire's readout rows with
+    /// ([`Frame::copy_rows`]), built with the device.
+    copier: Arc<super::pipelines::Pipeline>,
+    /// The dispatches the next frame makes indirect, by their place in its
+    /// walk ([`Context::indirect_next`]).
+    indirect_next: Mutex<Option<Arc<Vec<bool>>>>,
 }
+
+/// The kernel [`Frame::copy_rows`] dispatches.
+const COPIER: (&str, &str) = ("gather/rows.slang", "gather_rows_copy_regions_words");
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
 /// build marks it changed, and it reaches its file shortly after rather
@@ -1047,6 +1056,24 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
+        let (file, entry) = COPIER;
+        let unbuilt = |why: &str| Fault::Shader {
+            file,
+            entrypoint: entry,
+            why: why.to_string(),
+        };
+        let key = kernels_slang::key(entry, kernels_slang::Tier::Baseline)
+            .ok_or_else(|| unbuilt("kernels-slang names no such instantiation"))?;
+        let code = kernels_slang::spirv(key)
+            .ok_or_else(|| unbuilt("kernels-slang holds no SPIR-V module by that key"))?;
+        let copier = Arc::new(super::pipelines::build(
+            &core,
+            pipeline_cache.handle(),
+            file,
+            key,
+            code,
+        )?);
+        pipeline_cache.built();
         Ok(Context {
             core,
             budget,
@@ -1054,6 +1081,8 @@ impl Context {
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
+            copier,
+            indirect_next: Mutex::new(None),
         })
     }
 
@@ -1253,6 +1282,13 @@ impl Context {
         self.frame_with(true)
     }
 
+    /// The dispatches, by their place in the walk, the next frame opened
+    /// makes indirect: those whose group counts differ between the shapes of
+    /// one recording. Every other dispatch carries its counts.
+    pub fn indirect_next(&self, at: Option<Arc<Vec<bool>>>) {
+        *self.indirect_next.lock().expect("indirect lock poisoned") = at;
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
     }
@@ -1347,6 +1383,18 @@ impl Context {
             hazards: std::cell::RefCell::new(Hazards::default()),
             retained: std::cell::RefCell::new(std::collections::HashSet::new()),
             dispatches: std::cell::Cell::new(0),
+            block: std::cell::RefCell::new(super::block::FireBlock::default()),
+            copier: Arc::clone(&self.copier),
+            indirect: if one_time {
+                None
+            } else {
+                self.indirect_next
+                    .lock()
+                    .expect("indirect lock poisoned")
+                    .take()
+            },
+            groups: std::cell::RefCell::new(Vec::new()),
+            baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
         })
     }
 }
@@ -1527,9 +1575,53 @@ pub struct Frame {
     pub(crate) hazards: std::cell::RefCell<Hazards>,
 
     retained: std::cell::RefCell<std::collections::HashSet<usize>>,
+
+    /// Where the walk lays each dispatch's scalars and group counts.
+    block: std::cell::RefCell<super::block::FireBlock>,
+
+    /// Everything the frame's commands carry, hashed: two walks whose
+    /// commands hash alike differ only in what their fire blocks hold.
+    baked: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
+
+    copier: Arc<super::pipelines::Pipeline>,
+
+    /// The dispatches made indirect, by their place in the walk.
+    indirect: Option<Arc<Vec<bool>>>,
+
+    /// Each dispatch's group counts, in the walk's order.
+    groups: std::cell::RefCell<Vec<[u32; 3]>>,
 }
 
 impl Frame {
+    /// Takes the next dispatch's group counts, and answers whether it reads
+    /// them from the fire block (indirect) rather than carrying them.
+    pub(crate) fn dispatched(&self, groups: [u32; 3]) -> bool {
+        let mut seen = self.groups.borrow_mut();
+        let at = seen.len();
+        seen.push(groups);
+        self.indirect
+            .as_ref()
+            .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+    }
+
+    /// Lays `bytes` in the frame's fire block at an offset a multiple of
+    /// `align`, the chunk retained with the frame, and answers where: the
+    /// chunk's buffer, and its place among the chunks with the offset, which
+    /// is the same in every walk laid alike.
+    pub(crate) fn lay(&self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, (usize, u64))> {
+        let (slab, chunk, at) = self
+            .block
+            .borrow_mut()
+            .lay(&self.inner.core, bytes, align)?;
+        self.retain(&slab);
+        Ok((slab.buffer, (chunk, at)))
+    }
+
+    /// Folds `what`, a command the frame records, into its hash.
+    pub(crate) fn bake(&self, what: &impl std::hash::Hash) {
+        what.hash(&mut *self.baked.borrow_mut());
+    }
+
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.inner.core
     }
@@ -1593,9 +1685,15 @@ impl Frame {
         let mut sets = match got {
             Some(sets) => sets,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
+                // A set binds its kernel's scalars as one uniform.
+                let sizes = [
+                    vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(BUFFERS_PER_POOL),
+                    vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(SETS_PER_POOL),
+                ];
                 // SAFETY: `d` is live and the create info is complete.
                 let pool = unsafe {
                     d.create_descriptor_pool(
@@ -1649,6 +1747,18 @@ impl Frame {
         into: &Buffer,
         regions: &[(u64, u64, u64)],
     ) -> Result<()> {
+        self.copy_regions_baked(source, into, regions, true)
+    }
+
+    /// [`Frame::copy_regions`]; `bake` false leaves the regions out of the
+    /// frame's hash, for a caller that weighs them itself.
+    fn copy_regions_baked(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        bake: bool,
+    ) -> Result<()> {
         let regions: Vec<vk::BufferCopy> = regions
             .iter()
             .filter(|&&(_, _, len)| len > 0)
@@ -1665,6 +1775,14 @@ impl Frame {
             return Ok(());
         }
         let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
+        if bake {
+            use ash::vk::Handle;
+            let spans: Vec<(u64, u64, u64)> = regions
+                .iter()
+                .map(|r| (r.src_offset, r.dst_offset, r.size))
+                .collect();
+            self.bake(&("copy", source.buffer.as_raw(), into.buffer.as_raw(), spans));
+        }
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`.
@@ -1711,12 +1829,214 @@ impl Frame {
         Ok(())
     }
 
+    /// Copies each `(source_at, into_at, len)` region of `source` into
+    /// `into`, the regions and their count laid in the fire block under a
+    /// table of `most` rows. Where the frame's shapes move other regions the
+    /// copier kernel moves them from the table, under commands the same for
+    /// every fire of at most `most` regions; elsewhere they are copied as
+    /// carried commands.
+    /// Regions the kernel cannot move (not whole words, past a binding's
+    /// range, more than `most`) are copied as [`Frame::copy_regions`] does.
+    pub fn copy_rows(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        use ash::vk::Handle;
+        let core = Arc::clone(&self.inner.core);
+        let limits = &core.limits;
+        let range = u64::from(limits.max_storage_buffer_range);
+        let (src, dst) = (source.slab(), into.slab());
+        let (src_range, dst_range) = (src.size.min(range), dst.size.min(range));
+        let words = |n: u64| n.is_multiple_of(4);
+        let movable = regions.len() <= most
+            && most as u64 <= u64::from(limits.max_compute_work_group_count[1])
+            && regions.iter().all(|&(from, to, len)| {
+                words(from)
+                    && words(to)
+                    && words(len)
+                    && from + len <= src_range
+                    && to + len <= dst_range
+                    && (from + len) / 4 <= u64::from(u32::MAX)
+                    && (to + len) / 4 <= u64::from(u32::MAX)
+            });
+        if most == 0 || !movable {
+            return self.copy_regions(source, into, regions);
+        }
+        let mut table = vec![0u8; most * 16];
+        for (row, &(from, to, len)) in table.chunks_exact_mut(16).zip(regions) {
+            for (word, value) in row.chunks_exact_mut(4).zip([from / 4, to / 4, len / 4]) {
+                word.copy_from_slice(&(value as u32).to_le_bytes());
+            }
+        }
+        let longest = regions
+            .iter()
+            .map(|&(_, _, len)| len / 4)
+            .max()
+            .unwrap_or(0);
+        let groups = [
+            longest
+                .div_ceil(u64::from(self.copier.local[0]))
+                .min(u64::from(limits.max_compute_work_group_count[0])) as u32,
+            regions.len() as u32,
+            1,
+        ];
+        let group_words: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let fire = self.copier.fire.clone().ok_or_else(|| Fault::Shader {
+            file: COPIER.0,
+            entrypoint: COPIER.1,
+            why: "the copier reads no fire block".to_string(),
+        })?;
+        let count = (regions.len() as u32).to_le_bytes();
+        let (table_buffer, table_place) =
+            self.lay(&table, limits.min_storage_buffer_offset_alignment)?;
+        let (params_buffer, params_place) =
+            self.lay(&count, limits.min_uniform_buffer_offset_alignment)?;
+        let (groups_buffer, groups_place) = self.lay(&group_words, 4)?;
+        // The regions' own hash stands for them in the family's weighing: a
+        // family whose shapes move the same regions copies them as carried
+        // commands; one whose shapes differ moves them with the copier, from
+        // the table.
+        let signature = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            regions.hash(&mut hasher);
+            let h = hasher.finish();
+            [h as u32, (h >> 32) as u32, regions.len() as u32]
+        };
+        let indirect = self.dispatched(signature);
+        // The count is read from the fire block alone: the push block
+        // carries none of it.
+        let pushed = vec![0u8; self.copier.push_bytes as usize];
+        self.bake(&(
+            "rows",
+            src.buffer.as_raw(),
+            dst.buffer.as_raw(),
+            table_place,
+            params_place,
+            groups_place,
+            most,
+        ));
+        if !indirect {
+            return self.copy_regions_baked(source, into, regions, false);
+        }
+        let set = self.descriptor_set(self.copier.set_layout)?;
+        let infos = [
+            vk::DescriptorBufferInfo::default()
+                .buffer(src.buffer)
+                .offset(0)
+                .range(src_range),
+            vk::DescriptorBufferInfo::default()
+                .buffer(dst.buffer)
+                .offset(0)
+                .range(dst_range),
+            vk::DescriptorBufferInfo::default()
+                .buffer(table_buffer)
+                .offset(table_place.1)
+                .range(table.len() as u64),
+            vk::DescriptorBufferInfo::default()
+                .buffer(params_buffer)
+                .offset(params_place.1)
+                .range(u64::from(fire.bytes)),
+        ];
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = infos
+            .iter()
+            .enumerate()
+            .map(|(at, info)| {
+                let ty = if at as u32 == fire.binding {
+                    vk::DescriptorType::UNIFORM_BUFFER
+                } else {
+                    vk::DescriptorType::STORAGE_BUFFER
+                };
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(at as u32)
+                    .descriptor_type(ty)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        let host = into.is_host();
+        let d = &core.device;
+        let cmd = self.inner.cmd();
+        // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
+        // `set` was handed to this dispatch alone and no submitted command
+        // uses it yet. Both slabs are live and retained below, every region
+        // was checked to lie inside the ranges bound, and the table, the
+        // count and the group counts lie in fire block chunks the frame
+        // retains, at offsets the device's alignments allow.
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.copier.pipeline);
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.copier.layout,
+                0,
+                &[set],
+                &[],
+            );
+            if self.copier.push_bytes > 0 {
+                d.cmd_push_constants(
+                    cmd,
+                    self.copier.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &pushed,
+                );
+            }
+            d.cmd_dispatch_indirect(cmd, groups_buffer, groups_place.1);
+            let (host_stage, host_read) = if host {
+                (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ)
+            } else {
+                (vk::PipelineStageFlags::empty(), vk::AccessFlags::empty())
+            };
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ
+                        | host_read,
+                );
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | host_stage,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        self.retain(src);
+        self.retain(dst);
+        self.hazards_settled();
+        Ok(())
+    }
+
     pub fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
         into.span(at, len)?;
         let into = into.slab();
+        self.bake(&("zero", ash::vk::Handle::as_raw(into.buffer), at, len));
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
@@ -1780,6 +2100,7 @@ impl Frame {
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.bake(&"flush");
         let core = &self.inner.core;
         let d = &core.device;
         let cmd = self.inner.cmd();
@@ -1896,9 +2217,14 @@ impl Frame {
     }
 
     pub fn into_kept(mut self) -> Result<Kept> {
+        use std::hash::Hasher;
         self.end()?;
         Ok(Kept {
             inner: Arc::clone(&self.inner),
+            block: std::mem::take(&mut *self.block.borrow_mut()),
+            baked: self.baked.borrow().finish(),
+            groups: std::mem::take(&mut *self.groups.borrow_mut()),
+            indirect: self.indirect.clone(),
         })
     }
 
@@ -1927,6 +2253,14 @@ impl Drop for Frame {
 
 pub struct Kept {
     inner: Arc<Inner>,
+
+    block: super::block::FireBlock,
+
+    baked: u64,
+
+    groups: Vec<[u32; 3]>,
+
+    indirect: Option<Arc<Vec<bool>>>,
 }
 
 impl std::fmt::Debug for Kept {
@@ -1936,6 +2270,48 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
+    /// What its commands carry, hashed ([`Frame::bake`]).
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        self.baked
+    }
+
+    /// What its walk laid in its fire block.
+    #[must_use]
+    pub fn image(&self) -> &super::block::Image {
+        self.block.image()
+    }
+
+    /// Each dispatch's group counts in its walk, in order.
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        &self.groups
+    }
+
+    /// Whether dispatch `at` of its walk reads its group counts from the
+    /// fire block.
+    #[must_use]
+    pub fn indirect(&self, at: usize) -> bool {
+        self.indirect
+            .as_ref()
+            .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+    }
+
+    /// Writes `image`, a walk's whose commands hash as this frame's, into
+    /// its fire block, once its last submission has landed.
+    pub fn refill(&self, image: &Arc<super::block::Image>) -> Result<()> {
+        let core = &self.inner.core;
+        if self.inner.submitted.load(Ordering::Acquire) {
+            // SAFETY: the fence is this kept frame's own.
+            unsafe {
+                core.device
+                    .wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS)
+            }
+            .map_err(|e| core.fault("vkWaitForFences", e))?;
+        }
+        self.block.refill(image)
+    }
+
     /// The segments before the last ([`Frame::cuts`] at `into_kept`).
     #[must_use]
     pub fn cuts(&self) -> usize {

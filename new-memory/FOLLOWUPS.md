@@ -159,3 +159,10 @@ handed out before that fire completes, on every engine, in the fake engine and
 on Metal; (2) if it fails, a per-page release on that page's own fire / copy
 completion (not an epoch-wide watermark), gated ≤ 2% on this over-demand.
 
+
+## F19. Vulkan: a fire's class windows bind at offsets the fire moves
+A fire that mixes classes (prefill rows with decode lanes) binds each class
+window's views at the window's row / lane offset, which moves with the rows of
+the classes before it, so those fires still record a family per prefill length
+after the fire block (sc/l40s-vkrec-fireblock). The kernels take a window offset
+(a fire-block word) and bind the views at the window's base.

@@ -7,6 +7,9 @@
 // `PIE_<KERNEL>` picks the kernel:
 //
 // - `PIE_COPY`: a flat run of words.
+// - `PIE_COPY_REGIONS`: runs of words, each `(from, to, words)` of a table
+//   that lies in engine-vulkan's fire block, a run a grid row (`y`): a fire's
+//   readout moves by values the host writes, under commands that stay.
 // - `PIE_GATHER`: `out[i] = in[rows[i]]`; `PIE_SCATTER`: `out[rows[i]] =
 //   in[i]`; `PIE_SCATTER_LIVE`: the same, skipping a negative row.
 // - `PIE_POOL`: bf16 rows averaged in blocks of `block` (a word a lane, two
@@ -25,13 +28,36 @@
 struct Params {
     int words;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     if (gid.x < uint(max(params.words, 0))) {
         dst[gid.x] = src[gid.x];
+    }
+}
+
+#elif defined(PIE_COPY_REGIONS)
+
+[[vk::binding(0)]] StructuredBuffer<uint> src;
+[[vk::binding(1)]] RWStructuredBuffer<uint> dst;
+[[vk::binding(2)]] StructuredBuffer<uint4> regions;
+
+struct Params {
+    uint count;
+};
+PIE_PARAMS_FIRED(3, Params, params);
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    if (gid.y >= PIE_FIRE(count)) {
+        return;
+    }
+    uint4 run = regions[gid.y];
+    for (uint w = gid.x; w < run.z; w += PIE_GROUP_X * 65535u) {
+        dst[run.y + w] = src[run.x + w];
     }
 }
 
@@ -45,7 +71,7 @@ struct Params {
     uint pitch;
     uint count;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -53,7 +79,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint c = gid.x;
     uint i = gid.y;
     uint pitch = params.pitch;
-    if (c >= pitch || i >= params.count) {
+    if (c >= pitch || i >= PIE_FIRE(count)) {
         return;
     }
 #if defined(PIE_GATHER)
@@ -79,7 +105,7 @@ struct Params {
     uint block;
     uint rows;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -108,7 +134,7 @@ struct Params {
     uint offset;
     uint width;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -129,7 +155,7 @@ struct Params {
     uint offset;
     uint width;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -150,7 +176,7 @@ struct Params {
     uint left_width;
     uint right_width;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -181,7 +207,7 @@ struct Params {
     uint q_width;
     uint kv_width;
 };
-PIE_PARAMS(4, Params, params);
+PIE_PARAMS_FIRED(4, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -215,7 +241,7 @@ struct Params {
     uint qg_width;
     uint q_width;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 // The grid is (head words, heads, rows).
 [shader("compute")]
@@ -238,6 +264,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
 
 // pie:instantiate gather_rows_copy_words PIE_COPY=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_copy_regions_words PIE_COPY_REGIONS=1 PIE_GROUP_X=256 PIE_TARGET=spirv
 // pie:instantiate gather_rows_words PIE_GATHER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_words PIE_SCATTER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256
