@@ -515,11 +515,12 @@ pub trait Engine: Send {
         Err(self.unsupported("copy_slots"))
     }
 
-    /// [`Engine::copy_slots`], answering whether the copy has read its
-    /// source slots by the time the call returns (`true`: they may go back
-    /// now). `false`: the copy is still landing, and the engine calls the
-    /// sink [`Engine::on_landed`] gave it with `token` once it has read
-    /// every source slot and written every destination. Every engine
+    /// [`Engine::copy_slots`], answering whether its source slots may go
+    /// back now (`true`): the copy has read them, or every write that could
+    /// reach them after they go back is ordered behind the copy. `false`:
+    /// the copy may still read them, and the engine calls the sink
+    /// [`Engine::on_landed`] gave it with `token` once it has read every
+    /// source slot. Every engine
     /// states it: an answer of `true` for a copy still reading its sources
     /// hands their memory to its next owner under the copy.
     fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> Result<bool>;
@@ -528,6 +529,13 @@ pub trait Engine: Send {
     fn on_landed(&mut self, sink: LandingSink) {
         let _ = sink;
     }
+
+    /// Returns once every copy submitted so far has read its sources and
+    /// written its destinations: what a move that gives back slots a copy
+    /// was still writing (an aborted restore's destinations) waits for, so
+    /// no late write reaches them once they are another's. Every engine
+    /// states it.
+    fn settle_copies(&mut self) -> Result<()>;
 
     /// Which atoms of the streamable weights
     /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next

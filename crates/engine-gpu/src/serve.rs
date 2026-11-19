@@ -1997,6 +1997,13 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
+    /// See `Engine::settle_copies`: every frame and copy in flight lands,
+    /// a slot file read's copy onto the device too.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        self.drain()?;
+        self.pools.settle_spill()
+    }
+
     /// See `Engine::read_tier_slots`: every frame and copy lands first.
     pub fn read_tier_slots(
         &mut self,

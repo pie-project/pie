@@ -1039,11 +1039,22 @@ impl Engine for Cuda {
         }
     }
 
-    /// A move between the device and the host tier rides the swap stream
-    /// and is still reading its sources when the call returns: told landed
-    /// from that stream, behind the copy. Every other copy reads its sources
-    /// inside the call (the slot file's moves wait for it) or on the main
-    /// stream, ahead of everything enqueued after it.
+    /// Waits, on the host, for every move between the device and the host
+    /// tier still landing; every other copy lands inside the call or in the
+    /// main stream's order, which a later fire or move stands behind.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_moves().map_err(fault)
+    }
+
+    /// A move from the device to the host tier rides the swap stream and is
+    /// still reading its device slots when the call returns: told landed
+    /// once the stream has run it, by a waiter on an event recorded behind
+    /// it (`serve::landing`), which enqueues nothing a later move would wait
+    /// on. Every other copy's sources are free at once: a move from the host
+    /// reads host slots, which the next move into them (on the same swap
+    /// stream) or a host write (behind every move still landing) reaches
+    /// only after it; the slot file's moves read inside the call; a move
+    /// within the device runs on the main stream, ahead of everything after.
     fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
@@ -1052,8 +1063,8 @@ impl Engine for Cuda {
         self.copy_slots(copy)?;
         let host = |domain| matches!(domain, MemoryDomain::HostPinned);
         let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
-        let swapped = (device(copy.src) && host(copy.dst)) || (host(copy.src) && device(copy.dst));
-        let Some(sink) = self.landed.clone().filter(|_| swapped) else {
+        let parked = device(copy.src) && host(copy.dst);
+        let Some(sink) = self.landed.clone().filter(|_| parked) else {
             return Ok(true);
         };
         let told = self

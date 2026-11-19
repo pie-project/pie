@@ -1595,8 +1595,10 @@ async fn promote<C: FireContext>(
     };
     let mut guard = PromoteGuard {
         stores: stores.clone(),
+        engine,
         txn: Some(txn),
         in_flight: Vec::new(),
+        submitted: false,
     };
     let (kind, plans) = guard.txn.as_ref().map_or_else(
         || (crate::scheduler::TierKind::Kv, Vec::new()),
@@ -1618,6 +1620,7 @@ async fn promote<C: FireContext>(
         };
         let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
             .map_err(|error| format!("{error:#}"))?;
+        guard.submitted = true;
         guard.in_flight.push(completion.clone());
         completion.wait().await.map_err(|error| error.to_string())?;
     }
@@ -1634,11 +1637,14 @@ async fn promote<C: FireContext>(
 }
 
 /// Dropped before it commits, it gives back what it took once any copy it
-/// started has landed.
+/// started has landed: written its destinations, not only settled.
 struct PromoteGuard {
     stores: crate::store::registry::Stores,
+    engine: usize,
     txn: Option<crate::store::kv::KvResidencyTxn>,
     in_flight: Vec<crate::scheduler::ControlCompletion>,
+    /// A copy of the promote was handed to the engine.
+    submitted: bool,
 }
 
 impl Drop for PromoteGuard {
@@ -1656,15 +1662,30 @@ impl Drop for PromoteGuard {
                 planner.pages_freed();
             }
         };
-        if in_flight.is_empty() || !crate::rt::has_runtime() {
+        if !self.submitted {
             abort();
             return;
         }
+        if !crate::rt::has_runtime() {
+            tracing::error!(
+                "a promote dropped with a copy handed to the engine and no runtime; \
+                 preserving its pages to avoid reuse under the copy"
+            );
+            return;
+        }
+        let engine = self.engine;
         crate::rt::spawn(async move {
-            for completion in in_flight {
-                let _ = completion.wait().await;
+            let settled = crate::scheduler::settle_copies(engine);
+            if let Err(error) =
+                crate::scheduler::abort_once_landed(in_flight, settled, abort).await
+            {
+                tracing::error!(
+                    engine,
+                    %error,
+                    "a promote's copies did not settle; preserving its pages to avoid reuse \
+                     under a copy"
+                );
             }
-            abort();
         });
     }
 }

@@ -1328,6 +1328,7 @@ impl Lane {
                         PoolOp::Rung { from, to } => engine.set_rung(from, to),
                         PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+                        PoolOp::SettleCopies => engine.settle_copies(),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),
                             &mut **engine,
@@ -1639,6 +1640,11 @@ mod landing_tests {
         }
 
         fn copy_slots(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        /// A test engine's copies land inside the call: nothing to wait for.
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
         }
 

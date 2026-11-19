@@ -945,6 +945,14 @@ where
             .map_err(refusal)
     }
 
+    /// Returns once every copy submitted so far has landed: every frame
+    /// and device copy in flight, and a slot file read's copy onto the
+    /// device (`Shell::settle_copies`). Off the hot path: an aborted move
+    /// waits on it.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_copies().map_err(fault)
+    }
+
     /// Every copy's sources may go back when the call returns
     /// (`Shell::copy_slots`):
     /// - device to host, host to device, and device to the slot file: the

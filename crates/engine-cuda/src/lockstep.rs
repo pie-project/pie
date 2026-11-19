@@ -905,6 +905,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_slots(copy))
     }
 
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.with(|cuda| cuda.settle_copies())
+    }
+
     fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,

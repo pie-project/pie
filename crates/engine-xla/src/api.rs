@@ -1026,6 +1026,12 @@ impl Engine for Xla {
         Ok(self.loaded_mut()?.weight_uses())
     }
 
+    /// Its copies land inside the call (see [`Engine::copy_slots_landing`]):
+    /// nothing to wait for.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
     /// Lands inside the call: a move between tiers reads its source slots
     /// into host memory before it writes anywhere, and a move within the
     /// device runs as a pool program, ordered ahead of every program (a
