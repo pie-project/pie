@@ -510,6 +510,8 @@ impl ReqGeometry {
                         // Where the set's commit stands as the pass is staged;
                         // a piece of a cut pass restates it as it is prepared.
                         folded: place.folded.min(start),
+                        // The host places these rows: no program does.
+                        write_end: 0,
                     },
                     rs: ::engine::RsVerb::Fold,
                     rs_reset: ::engine::RsReset::Inferred,

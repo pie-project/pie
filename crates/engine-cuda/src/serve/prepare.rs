@@ -485,6 +485,16 @@ impl Shell {
                 .map(|seated| seated.lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            // The ports state this attachment's lanes alone: one describing
+            // more would set the next lanes' positions and slots.
+            let owned = attached.lanes.max(1);
+            if carried > owned as usize {
+                return Err(Fault::Overreach {
+                    instance: attached.instance,
+                    lanes: attached.lane..attached.lane.saturating_add(owned),
+                    carried,
+                });
+            }
             if first + carried > lanes.len() {
                 return Err(Fault::program(
                     "serve::prepare",
@@ -563,6 +573,15 @@ impl Shell {
                             .map(|&page| window.get(page as usize).copied().unwrap_or(0))
                             .collect(),
                     );
+                }
+                // The table is the working set's whole, to read through: a
+                // row lands only in the slots the lane may write.
+                let writable = lanes[source].folded..lanes[source].write_end;
+                if let Some(why) = engine::fire::misplaced_write(writable, slots) {
+                    return Err(Fault::KvWrite {
+                        lane: source as u32,
+                        why,
+                    });
                 }
                 device_writes[source] = Some((
                     slots
