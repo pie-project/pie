@@ -511,9 +511,6 @@ impl Shell {
                 }
                 envelope_of[first + lane] = Some((held, lane));
             }
-            if first < lanes.len() {
-                token_src_of[first] = src;
-            }
             resolved.push(envelope);
         }
 
@@ -1762,7 +1759,8 @@ impl Shell {
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.wide.contains(*class as usize)
             });
-        let staged = crate::mask::stage(&masks, reads_masks)?;
+        let staged = crate::mask::stage(&masks, reads_masks)
+            .map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
             Some(staged) => pending_mask_injects
                 .iter()

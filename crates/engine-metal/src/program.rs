@@ -342,6 +342,7 @@ impl Plane {
         pooled: session::Pooled<'_>,
         scratch: &engine::ScratchPlace,
         pair: &engine::ScratchPlace,
+        pair_generation: u64,
     ) -> Result<InstanceId> {
         let pools = pooled.pools;
         let program = self
@@ -385,7 +386,10 @@ impl Plane {
         );
         // Its pair's batch sets and its own scratch are laid now, in the
         // state the runtime took for them: refused here rather than at a fire.
-        if let Err(why) = self.join_pair(context, pools, id, pair).and_then(|()| self.lay_scratch(pools, id)) {
+        if let Err(why) = self
+            .join_pair(context, pools, id, pair, pair_generation)
+            .and_then(|()| self.lay_scratch(pools, id))
+        {
             let _ = self.close_instance(id);
             return Err(why);
         }
@@ -458,7 +462,7 @@ impl Plane {
         };
         let scratch = take(state.per_instance);
         self.bind(
-            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair,
+            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )
     }
 
@@ -471,6 +475,7 @@ impl Plane {
         pools: &Pools,
         id: InstanceId,
         place: &engine::ScratchPlace,
+        generation: u64,
     ) -> Result<()> {
         let (program, extents) = self
             .instances
@@ -483,7 +488,18 @@ impl Plane {
             .find(|held| held.program == program && held.extents == extents);
         let pair = if let Some(held) = held {
             held.bound += 1;
-            held.id
+            // Its state another taking of slots than its sets were laid in
+            // (given back while its instances stayed bound, written by
+            // another owner, taken again, perhaps at the same refs): laid
+            // again there, over whatever the other owner left. The same
+            // live slots bound again lay nothing.
+            let pair = held.id;
+            if held.place != *place || held.generation != generation {
+                held.place = place.clone();
+                held.generation = generation;
+                self.lay_pair(pools, pair)?;
+            }
+            pair
         } else {
             let pair = self.next_pair;
             self.next_pair += 1;
@@ -493,6 +509,7 @@ impl Plane {
                 extents,
                 bound: 1,
                 place: place.clone(),
+                generation,
             });
             if let Some(bound) = self.instances.get_mut(&id) {
                 bound.pair = pair;
@@ -787,6 +804,7 @@ impl Plane {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => {
                 let bound = self
@@ -805,6 +823,7 @@ impl Plane {
                 if !matches!(pair, engine::ScratchPlace::None) {
                     if let Some(held) = self.pairs.iter_mut().find(|held| held.id == owner) {
                         held.place = pair.clone();
+                        held.generation = *pair_generation;
                     }
                     self.lay_pair(pools, owner)?;
                 }
@@ -1301,6 +1320,9 @@ struct Pair {
     extents: Extents,
     bound: u32,
     place: engine::ScratchPlace,
+    /// Which taking of `place` its sets were laid in
+    /// (`engine::InstanceBinding::pair_generation`).
+    generation: u64,
 }
 
 #[derive(Debug)]

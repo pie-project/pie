@@ -3681,6 +3681,7 @@ mod tests {
             Ok(engine::FrameTicket {
                 id,
                 steps: frame.steps.iter().map(|_| Default::default()).collect(),
+                ..Default::default()
             })
         }
     }
@@ -3816,6 +3817,7 @@ mod tests {
             Ok(engine::FrameTicket {
                 id,
                 steps: frame.steps.iter().map(|_| Default::default()).collect(),
+                ..Default::default()
             })
         }
     }
@@ -3968,6 +3970,373 @@ mod tests {
             );
         }
         let _ = lane.shutdown();
+    }
+
+    /// The word bit [`LaneRefusalEngine`] refuses a lane for: a fact its
+    /// load serves in no arm (a mask word no arm reads, say).
+    const UNSERVED: u64 = 1 << 7;
+
+    /// An engine that refuses, for its own sake, every lane whose word
+    /// states [`UNSERVED`], staging a frame step by step as the engines do:
+    /// at its first step the frame is refused naming those lanes
+    /// ([`engine::Error::Lanes`]); at a later one the frame stops there,
+    /// its ticket naming them. Each step it fires lands what each lane fed
+    /// (`fired`, as `(instance, token)`, step by step), each lane read
+    /// through its attachment, so a lane renumbered under the wrong
+    /// instance shows.
+    struct LaneRefusalEngine {
+        sink: Option<::engine::CompletionSink>,
+        asynchronous: bool,
+        fired: Arc<std::sync::Mutex<Vec<Vec<(u64, u32)>>>>,
+        next: u64,
+        /// Lands a frame stopped short after the frame submitted next,
+        /// out of the order they were submitted in.
+        reorder: bool,
+        held: Vec<::engine::StepDone>,
+    }
+
+    impl engine::Engine for LaneRefusalEngine {
+        fn kind(&self) -> &'static str {
+            "lane-refusal"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn settles_asynchronously(&self) -> bool {
+            self.asynchronous
+        }
+
+        fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+            self.sink = Some(sink);
+        }
+
+        fn submit(
+            &mut self,
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            let id = ::engine::FrameId(self.next);
+            self.next += 1;
+            let sink = self.sink.clone().expect("a sink before the first submit");
+            let mut steps = Vec::new();
+            let mut refused = None;
+            for (index, step) in frame.steps.iter().enumerate() {
+                let lanes: Vec<::engine::LaneFault> = (step.lanes.iter().enumerate())
+                    .filter(|(_, lane)| lane.word & UNSERVED != 0)
+                    .map(|(lane, _)| ::engine::LaneFault {
+                        lane: u32::try_from(lane).expect("a few lanes"),
+                        instance: None,
+                        reason: "its word reads a mask in no arm this load applies one in"
+                            .into(),
+                    })
+                    .collect();
+                if !lanes.is_empty() {
+                    let error = engine::Error::Lanes(lanes);
+                    if !error.stops_frame_at(index) {
+                        return Err(error);
+                    }
+                    refused = Some(error);
+                    break;
+                }
+                let fed = step
+                    .attachments
+                    .iter()
+                    .map(|attachment| {
+                        let lane = &step.lanes[attachment.lane as usize];
+                        assert_eq!(
+                            u64::from(lane.slot),
+                            attachment.instance.0,
+                            "an attachment reads its own instance's lane"
+                        );
+                        (attachment.instance.0, lane.tokens[0])
+                    })
+                    .collect();
+                self.fired.lock().unwrap().push(fed);
+                steps.push(::engine::FireTicket::default());
+            }
+            let landings: Vec<::engine::StepDone> = (0..steps.len())
+                .map(|step| ::engine::StepDone {
+                    frame: id,
+                    step: u32::try_from(step).expect("a few steps"),
+                })
+                .collect();
+            if self.reorder && refused.is_some() {
+                self.held.extend(landings);
+            } else {
+                for at in landings.into_iter().chain(std::mem::take(&mut self.held)) {
+                    sink(at, ::engine::StepOutcome::committed());
+                }
+            }
+            Ok(engine::FrameTicket::of(id, steps, refused))
+        }
+    }
+
+    /// A frame of steps of fires, a lane each, each the pass of its own
+    /// instance: step `s` is `steps[s]`, `(instance, unserved)` a fire. A
+    /// lane's slot is its instance and its token `1000 * step + instance`.
+    /// The fires' completions, step by step.
+    fn frame_of(
+        steps: &[&[(u64, bool)]],
+    ) -> (
+        crate::engine::FrameFire,
+        Vec<Vec<crate::engine::WorkItemCompletion>>,
+    ) {
+        let mut fire = crate::engine::FrameFire::default();
+        let mut all = Vec::new();
+        for (at, fires) in steps.iter().enumerate() {
+            let lanes = u32::try_from(fires.len()).expect("a few lanes");
+            let completions: Vec<_> = (0..lanes)
+                .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
+                .collect();
+            let token = |instance: u64| u32::try_from(1000 * at as u64 + instance).expect("small");
+            fire.steps.push(crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: fires
+                        .iter()
+                        .map(|&(instance, unserved)| {
+                            let word = if unserved { UNSERVED | 1 } else { 1 };
+                            ::engine::Lane::decode(
+                                u32::try_from(instance).expect("small"),
+                                word,
+                                token(instance),
+                                0,
+                            )
+                        })
+                        .collect(),
+                    attachments: (0..lanes)
+                        .map(|lane| ::engine::Attachment {
+                            lane,
+                            lanes: 1,
+                            instance: ::engine::InstanceId(fires[lane as usize].0),
+                            adapter_only: false,
+                        })
+                        .collect(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
+                completions: completions.clone(),
+                member_lanes: (0..=lanes).collect(),
+                instances: fires.iter().map(|&(id, _)| ::engine::InstanceId(id)).collect(),
+            });
+            all.push(completions);
+        }
+        (fire, all)
+    }
+
+    /// Fires `steps` on a [`LaneRefusalEngine`]: the frame's answer, each
+    /// fire's result step by step, and what each step the engine fired fed.
+    #[allow(clippy::type_complexity, reason = "a test's three answers")]
+    fn fire_refusing(
+        asynchronous: bool,
+        steps: &[&[(u64, bool)]],
+    ) -> (
+        std::result::Result<(), String>,
+        Vec<Vec<std::result::Result<(), String>>>,
+        Vec<Vec<(u64, u32)>>,
+    ) {
+        fire_refusing_landing(asynchronous, false, steps)
+    }
+
+    /// [`fire_refusing`], with `reorder` landing a frame stopped short
+    /// after the one submitted next.
+    #[allow(clippy::type_complexity, reason = "a test's three answers")]
+    fn fire_refusing_landing(
+        asynchronous: bool,
+        reorder: bool,
+        steps: &[&[(u64, bool)]],
+    ) -> (
+        std::result::Result<(), String>,
+        Vec<Vec<std::result::Result<(), String>>>,
+        Vec<Vec<(u64, u32)>>,
+    ) {
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(LaneRefusalEngine {
+                sink: None,
+                asynchronous,
+                fired: Arc::clone(&fired),
+                next: 0,
+                reorder,
+                held: Vec::new(),
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (fire, completions) = frame_of(steps);
+        let flat: Vec<_> = completions.iter().flatten().cloned().collect();
+        let (frame, results) = if reorder {
+            // Every fire of a launch landing out of order is failed by the
+            // lane as it lands, whenever after the frame that does.
+            let answer = within("the launch is answered", lane.fire(fire, false))
+                .expect("the launch is answered");
+            let answer = match answer {
+                Ok(frame) => {
+                    within("the frame settles", frame).map_err(|error| format!("{error:#}"))
+                }
+                Err(error) => Err(error),
+            };
+            let results = flat
+                .iter()
+                .map(|completion| {
+                    within("the fire settles", completion.clone())
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .collect();
+            (answer, results)
+        } else {
+            fire_and_settle(&lane, fire, &flat)
+        };
+        let mut results = results.into_iter();
+        let by_step = completions
+            .iter()
+            .map(|step| results.by_ref().take(step.len()).collect())
+            .collect();
+        let _ = lane.shutdown();
+        let fed = fired.lock().unwrap().clone();
+        (frame, by_step, fed)
+    }
+
+    fn refused(result: &std::result::Result<(), String>) -> bool {
+        result
+            .as_ref()
+            .is_err_and(|why| why.contains("lane") && why.contains("refused"))
+    }
+
+    /// One lane of four refused at a fire's staging fails its own fire
+    /// alone, by the engine's reason; the other three fire once each, in
+    /// the same submission, with what they fed.
+    fn one_refused_lane_fails_its_own_fire_alone(asynchronous: bool) {
+        let (frame, fires, fed) = fire_refusing(
+            asynchronous,
+            &[&[(100, false), (101, false), (102, true), (103, false)]],
+        );
+        assert_eq!(frame, Ok(()), "the frame is not failed by one lane's refusal");
+        let why = fires[0][2].as_ref().expect_err("the refused lane's fire fails");
+        assert!(why.contains("reads a mask in no arm"), "by the engine's reason: {why}");
+        assert!(why.contains("lane 2"), "naming its lane: {why}");
+        for at in [0, 1, 3] {
+            assert_eq!(fires[0][at], Ok(()), "fire {at} commits");
+        }
+        assert_eq!(
+            fed,
+            vec![vec![(100, 100), (101, 101), (103, 103)]],
+            "the three fire once, each with its own token"
+        );
+    }
+
+    #[test]
+    fn a_refused_lane_fails_its_own_fire_alone_off_the_submit() {
+        one_refused_lane_fails_its_own_fire_alone(true);
+    }
+
+    #[test]
+    fn a_refused_lane_fails_its_own_fire_alone_inside_the_submit() {
+        one_refused_lane_fails_its_own_fire_alone(false);
+    }
+
+    /// A lane refused at a frame's second step: the first step fired whole
+    /// (its fires commit, once), and the second fires again without the
+    /// refused fire, whose earlier fire stands.
+    fn a_lane_refused_past_the_first_step_stops_the_frame_there(asynchronous: bool) {
+        let (frame, fires, fed) = fire_refusing(
+            asynchronous,
+            &[
+                &[(100, false), (101, false), (102, false)],
+                &[(100, false), (101, true), (102, false)],
+            ],
+        );
+        assert_eq!(frame, Ok(()));
+        assert!(fires[0].iter().all(Result::is_ok), "the first step commits: {fires:?}");
+        assert!(refused(&fires[1][1]), "the refused fire fails: {:?}", fires[1][1]);
+        assert_eq!(fires[1][0], Ok(()));
+        assert_eq!(fires[1][2], Ok(()));
+        assert_eq!(
+            fed,
+            vec![
+                vec![(100, 100), (101, 101), (102, 102)],
+                vec![(100, 1100), (102, 1102)],
+            ],
+            "no step fires twice, and none of the others' tokens is lost"
+        );
+    }
+
+    #[test]
+    fn a_lane_refused_past_the_first_step_stops_the_frame_there_off_the_submit() {
+        a_lane_refused_past_the_first_step_stops_the_frame_there(true);
+    }
+
+    #[test]
+    fn a_lane_refused_past_the_first_step_stops_the_frame_there_inside_the_submit() {
+        a_lane_refused_past_the_first_step_stops_the_frame_there(false);
+    }
+
+    /// A launch split into two engine frames whose second lands before its
+    /// first is refused by name: every fire of the launch fails, none on
+    /// another frame's tokens.
+    #[test]
+    fn a_split_launch_landing_out_of_order_is_refused_by_name() {
+        let (_frame, fires, fed) = fire_refusing_landing(
+            true,
+            true,
+            &[
+                &[(100, false), (101, false)],
+                &[(100, false), (101, true)],
+            ],
+        );
+        assert_eq!(fed.len(), 2, "the engine fired both frames: {fed:?}");
+        assert!(refused(&fires[1][1]), "{:?}", fires[1][1]);
+        for fired in [&fires[0][0], &fires[0][1], &fires[1][0]] {
+            let why = fired.as_ref().expect_err("no fire takes an out-of-order frame's tokens");
+            assert!(
+                why.contains("settled its engine frame 1 of 2 while frame 0 was expected"),
+                "named: {why}"
+            );
+        }
+    }
+
+    /// A lane refused at a frame's first step takes its instance's later
+    /// fires of the frame with it (they read what it would have left); the
+    /// other instances' fires of every step fire once, and a step left
+    /// with nothing goes.
+    #[test]
+    fn a_refused_lane_takes_its_instances_later_fires_of_the_frame() {
+        let (frame, fires, fed) = fire_refusing(
+            true,
+            &[
+                &[(100, false), (101, true)],
+                &[(101, false)],
+                &[(100, false), (101, false)],
+            ],
+        );
+        assert_eq!(frame, Ok(()));
+        assert!(refused(&fires[0][1]), "{:?}", fires[0][1]);
+        for later in [&fires[1][0], &fires[2][1]] {
+            let why = later.as_ref().expect_err("the instance's later fires fail");
+            assert!(why.contains("an earlier fire of this instance"), "{why}");
+        }
+        assert_eq!(fires[0][0], Ok(()));
+        assert_eq!(fires[2][0], Ok(()));
+        assert_eq!(fed, vec![vec![(100, 100)], vec![(100, 2100)]]);
     }
 
     /// What [`HoldingEngine`] answers it holds back once it took a resident

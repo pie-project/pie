@@ -439,9 +439,11 @@ impl<B: Backend> Span<B> {
     }
 }
 
-/// The top rung among `rungs` (`(tokens, span bytes)`): the widest whose
-/// span lies in one `binding`, as the span lies in the pool's last segment
-/// and no segment is past a binding. `None`: not even the least does.
+/// The top rung among `rungs` (`(tokens, bytes)`, the most any one of the
+/// rung's reservations takes: its span, an arm's readout seat): the widest
+/// whose every reservation lies in one `binding`, as the span lies in the
+/// pool's last segment, no segment is past a binding, and no buffer is past
+/// the device's largest. `None`: not even the least does.
 #[must_use]
 pub fn bound_top(rungs: &[(u32, u64)], binding: u64) -> Option<u32> {
     rungs

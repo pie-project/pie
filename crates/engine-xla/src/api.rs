@@ -224,6 +224,11 @@ fn port_error(error: engine::ports::PortError) -> Error {
 }
 
 pub(crate) fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } | Fault::NoDevice { .. } => {
             Error::Device(fault.to_string())
@@ -372,6 +377,7 @@ impl Xla {
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settles = Vec::with_capacity(frame.steps.len());
         let mut latches = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             let at = engine::StepDone {
                 frame: id,
@@ -391,7 +397,17 @@ impl Xla {
             } else {
                 self.fire_step(step, &latch)
             };
-            let (ticket, settle) = fired.inspect_err(|_| self.rs_ahead = ahead)?;
+            let (ticket, settle) = match fired.inspect_err(|_| self.rs_ahead = ahead) {
+                Ok(both) => both,
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`); its latch is
+                // never told.
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             // The submitter's hold: the step is done once its passes land.
             latch.release(Ok(()));
             steps.push(ticket);
@@ -399,7 +415,7 @@ impl Xla {
             latches.push(latch);
         }
         self.latches = latches;
-        let mut ticket = FrameTicket { id, steps };
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, settles));
         tracing::debug!(frame = id.0, "xla submitted");
         if !self.settles_asynchronously() {

@@ -25,6 +25,18 @@ impl From<KernelError> for Error {
     }
 }
 
+impl Error {
+    /// The lane a fault of the fire's refuses for its own sake
+    /// ([`Fault::lane`]).
+    #[must_use]
+    pub const fn lane(&self) -> Option<u32> {
+        match self {
+            Self::Fire(fault) => fault.lane(),
+            Self::Kernel(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -1635,6 +1635,18 @@ impl<B: Backend> Pools<B> {
         self.pool.commit_segments(device, segments)
     }
 
+    /// The segments a load backs: the null chunk's and the span's where
+    /// the pool resizes, every one where it is laid whole
+    /// ([`Backend::RESIZES_POOL`]).
+    #[must_use]
+    pub fn load_segments(&self) -> u32 {
+        if B::RESIZES_POOL {
+            1
+        } else {
+            self.pool.segments()
+        }
+    }
+
     /// The segments the seat runs lie in: what a caller firing directly
     /// backs.
     #[must_use]

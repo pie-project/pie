@@ -91,6 +91,7 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
             extents: BindExtents::default(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         })
         .expect("an instance bound to the registered counter binds")
         .id
@@ -295,6 +296,7 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
                 extents: BindExtents::default(),
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
+                pair_generation: 0,
             })
             .expect("the instance binds")
             .id

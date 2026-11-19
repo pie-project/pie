@@ -99,6 +99,14 @@ pub struct InstanceBinding {
     /// at its last close.
     #[serde(default)]
     pub pair: ScratchPlace,
+    /// Which taking of the pair's slots [`Self::pair`] names: the runtime
+    /// renews it each time the pair's state is given fresh slots (its first
+    /// bind, a return from the host), so slots freed, written by another
+    /// owner and taken again at the same refs read as new. The engine lays
+    /// the pair's state again wherever it differs from the one it laid, and
+    /// not where the same live slots are bound again.
+    #[serde(default)]
+    pub pair_generation: u64,
 }
 
 /// What a guest program bound at given extents holds in the pool, as state
@@ -387,6 +395,10 @@ pub enum Rebind {
         /// Its pair's, as [`InstanceBinding::pair`].
         #[serde(default)]
         pair: ScratchPlace,
+        /// The taking of the pair's slots it names, as
+        /// [`InstanceBinding::pair_generation`].
+        #[serde(default)]
+        pair_generation: u64,
     },
     /// A registered channel's ring (`Channel` slots, as
     /// [`crate::channel::ChannelRegistration::slots`]).

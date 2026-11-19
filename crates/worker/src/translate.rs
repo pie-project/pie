@@ -36,7 +36,7 @@ pub fn build_without_engine(
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
-        memory_tolerance: user.engine.memory.tolerance(),
+        memory_yield: user.engine.memory.yields()?,
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
@@ -182,7 +182,7 @@ fn build_model(
         .collect();
 
     Ok(runtime::bootstrap::ModelConfig {
-        memory_tolerance: user.engine.memory.tolerance(),
+        memory_yield: user.engine.memory.yields()?,
         name: m.name.clone(),
         model_id: engines_facts,
         kv_page_size: group0_caps.chunks.page_tokens() as usize,

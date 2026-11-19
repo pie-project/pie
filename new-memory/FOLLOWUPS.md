@@ -12,8 +12,7 @@ holder beside working sets / prefix entries / snapshots: the governor decides ho
 
 ## F2. Config surface rename (do together with F1, only for the keys that remain)
 Agreed shape: `[engine.memory]` with prefix keys — budget_device / budget_host / budget_disk, disk_path,
-disk_persistent, governor_backoff / governor_patience / governor_release_idle (replacing memory_tolerance profiles:
-dedicated = 1.0 / never / false, aggressive = 0.9 / 4 / true, balanced = 0.8 / 2 / true, polite = 0.7 / 1 / true);
+disk_persistent, yield (done 2026-11-15: one key in [0, 1] replacing memory_tolerance and the governor_* knobs);
 `[engine]` common max_batch_tokens / max_batch_sequences / max_context. Delete max_state_slots (still accepted by six
 backend option structs and named in fit.rs messages), kv_page_size, xla seat_tokens. Old keys refused with the new
 name.
@@ -170,3 +169,16 @@ per-lane mask offsets and words the way FA2 does (an unmasked lane reads
 nothing), not a per-fire switch between kernels. A B200 gate item before the PR
 to main: the tcgen05 masked path, the goldens bit-equal on B200, and c64 / prefill
 throughput ≤ 2% vs main.
+
+## F20. An evacuation's rebase stops at the first instance it cannot place
+
+engine-cuda's `Plane::rebase` (program.rs) re-addresses every bound
+instance after an evacuation, parked ones included, whose `bound.slots`
+still name refs freed at the park. One of those refused by `guest_span`
+ends the loop with `?`: the instances after it, every pair's `base` and
+`stale`, and the channels' rebase are left at their pre-evacuation
+addresses, though the pool's copy has moved the chunks. A parked instance
+should be skipped by name (its restore's rebind places it), and the rest
+re-addressed whatever one instance answers. Not hit in the beam runs (it
+needs an evacuation while a guest is parked); `Plane::rebind` is now
+all-or-nothing and poisons an instance whose rings move only partway.

@@ -56,6 +56,12 @@ pub fn start_default() -> Result<(), LoadError> {
         .name("pie-policy".into())
         .spawn(move || run(None, rx))
         .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
+    // How long idle cache stays is a policy's to state, with its retention
+    // keys; with none, the default is said here rather than left implied.
+    tracing::info!(
+        "no worker policy: idle cache has no time-based expiry; it stays until a demand needs its room, \
+         then goes lowest retention key, then least recently used, first"
+    );
     Ok(())
 }
 

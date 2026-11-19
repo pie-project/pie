@@ -527,6 +527,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
         adapter: Vec::new(),
         scratch: ::engine::ScratchPlace::None,
         pair: ::engine::ScratchPlace::None,
+        pair_generation: 0,
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,
@@ -1430,6 +1431,7 @@ fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
             adapter: Vec::new(),
             scratch: ::engine::ScratchPlace::None,
             pair: ::engine::ScratchPlace::None,
+            pair_generation: 0,
         })
         .unwrap_err();
     assert!(

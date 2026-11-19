@@ -36,6 +36,9 @@ impl Serve for Api {
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
+    const MAX_BUFFER_SOURCE: &'static str =
+        "the least of wgpu::Limits::max_buffer_size and max_storage_buffer_binding_size";
+
     const RECORDS: bool = false;
 
     /// Every cell of a guest's rings lies on the host: a pass reads its

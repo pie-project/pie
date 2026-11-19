@@ -833,7 +833,15 @@ impl Engine for Rank {
                 frame: id,
                 step: index as u32,
             };
-            let (ticket, pending) = self.step(step, at, bucket)?;
+            // A formed step's lanes are the group's, not this rank's: a
+            // lane it refuses refuses the frame (`engine::Error::Lanes`
+            // names a lane of the step submitted).
+            let (ticket, pending) = self.step(step, at, bucket).map_err(|error| match error {
+                Error::Lanes(_) => Error::Invalid(format!(
+                    "{error}, of an expert-parallel group's formed step"
+                )),
+                other => other,
+            })?;
             tickets.push(ticket);
             settled.push(pending);
         }
@@ -841,7 +849,7 @@ impl Engine for Rank {
             cuda.adopt(id, settled);
             Ok(())
         })?;
-        Ok(FrameTicket { id, steps: tickets })
+        Ok(FrameTicket::of(id, tickets, None))
     }
 
     fn settles_asynchronously(&self) -> bool {

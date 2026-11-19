@@ -2779,6 +2779,7 @@ impl Shell {
         ring_slots: &[engine::RingSlots],
         scratch: &engine::ScratchPlace,
         pair: &engine::ScratchPlace,
+        pair_generation: u64,
     ) -> Result<engine::InstanceId> {
         let pooled = crate::program::session::Pooled {
             pools: &self.pools,
@@ -2799,6 +2800,7 @@ impl Shell {
             pooled,
             scratch,
             pair,
+            pair_generation,
         )?;
         if crate::diag::on().tier_trace {
             eprintln!(
@@ -4669,7 +4671,7 @@ impl Shell {
         )?;
         let boundaries = windows.packed();
 
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();

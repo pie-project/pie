@@ -15,6 +15,7 @@ mod a_kv_only_lane_reports_its_device_fold;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_load_walks_its_score_capturing_forms;
 mod a_recurrent_load_walks_its_pipelines;
+mod a_refused_lane_is_refused_alone;
 mod a_device_placed_kv_write_lands_in_its_buffer;
 mod a_fenced_frame_lands_both_sides;
 mod a_fire_carrying_past_its_rungs_tokens_is_refused;
