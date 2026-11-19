@@ -3,6 +3,33 @@
 Status: design for review (GPU). No code. Written by the Metal session, 2026-11-19, on memory-redesign
 6071e274e. Facts are cited by file; numbers are measured unless marked otherwise.
 
+**Revised scope (after GPU's review against memory-redesign 777f86368): Metal only.** Sections 4.1 and 4.2
+below are already true, so they need no change:
+- The sampled token is device-carried: `sampler::decode` puts it into `tok_in`, which is the pass's
+  `embed_tokens` (eta-dsl `sampler.rs`; builtins compat `generate.rs`; `pipeline/standard.rs`).
+  `classify_decode_envelope_why` accepts decode passes as DecodeEnvelope. The host takes only the copy in
+  `out` (streaming, EOS / stop strings, logprobs).
+- The guest already runs ahead (`run_ahead_window = (frames_in_flight + HOST_COVER) × frame_size`, inferlet
+  `eta.rs`), checks stops in `on_token`, and never overshoots `max_tokens`. The token ring is already ≥ 2
+  (`channel_capacity = submit_depth × frame + 1`).
+- Host-class geometry comes from the host shadow with no settle wait (`fire.rs`).
+- CUDA writes nothing from the host into memory an in-flight fire reads (commit words are multi-buffered,
+  tables staged by stream-ordered copies).
+- Prefill, scoring and float passes stay Host. The 2080 Host-class binds counted on the M1 are most
+  likely those, since host-derivable binds log nothing. A per-class bind counter will confirm.
+
+So the depth-1 serialization measured below is Metal's `fence_instances`, as §3 notes. The work is §4.3:
+- hold an envelope instance only to fire N−1's landing;
+- keep a second set, by fire parity, of what the host writes a fire (status word reset, pending flags,
+  grouped slot tables);
+- `scratch_arms` stays 1.
+
+No runtime change and no deferred take. Re-measure the idle after it.
+
+Separate issue GPU found (raised with Leader): after a stop, the run-ahead window's overshooting fires
+complete and commit KV rows into the generation's working set. It's harmless while that working set dies
+with the generation, but not under reuse (continuation, multi-turn).
+
 ## 1. The problem
 
 A guest lane bound `GeometryClass::Host` runs at depth 1. Its next fire is built on the host from what the
