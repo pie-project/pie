@@ -309,7 +309,9 @@ impl<B: Backend> Pool<B> {
 
     #[must_use]
     pub fn growth(&self) -> Growth {
-        if self.span > 0 {
+        if !B::RESIZES_POOL {
+            Growth::Fixed
+        } else if self.span > 0 {
             Growth::TwoEnded
         } else {
             Growth::Bottom

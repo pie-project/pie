@@ -998,6 +998,7 @@ impl Engine for Cuda {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => self
                 .loaded_mut()?
@@ -1008,6 +1009,7 @@ impl Engine for Cuda {
                         rings,
                         scratch,
                         pair,
+                        pair_generation,
                     },
                 )
                 .map_err(fault),
@@ -1308,6 +1310,7 @@ impl Engine for Cuda {
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
                     pair: binding.pair.clone(),
+                    pair_generation: binding.pair_generation,
                 },
             )
             .map_err(fault)?;

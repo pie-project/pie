@@ -42,6 +42,15 @@ struct Output {
     row_offset: u32,
 }
 
+/// [`Session::move_seats`] over `outputs`.
+fn move_seats(outputs: &mut [((String, u32), Output)], from: u64, bytes: u64, to: u64) {
+    for (_, output) in outputs.iter_mut() {
+        if (from..from.saturating_add(bytes)).contains(&output.base) {
+            output.base = to + (output.base - from);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     rings: Rings,
@@ -290,6 +299,11 @@ impl Session {
         self.poisoned
     }
 
+    /// Fails the instance: every later fire of it is refused by name.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     #[must_use]
     pub fn depth(&self, channel: u32) -> u64 {
         self.cursor(channel)
@@ -486,6 +500,15 @@ impl Session {
             None => self.outputs.push(((name.to_string(), lane), output)),
         }
         Ok(())
+    }
+
+    /// The instance's score rows moved from `from` to `to` (`bytes` of them,
+    /// its own slots rebound): every seat bound inside them moves with
+    /// them. A seat is bound only by a fire that writes the output, and
+    /// read by every fire its program reads it in: one left at `from` was
+    /// read and written there after the slots went to another owner.
+    pub fn move_seats(&mut self, from: u64, bytes: u64, to: u64) {
+        move_seats(&mut self.outputs, from, bytes, to);
     }
 
     fn bound(&self, name: &str, lane: u32) -> bool {
@@ -1084,6 +1107,27 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    /// A seat inside the score rows moves with them; one elsewhere (an
+    /// arena plane, bound again by its fire) stays.
+    #[test]
+    fn seats_in_the_score_rows_move_with_them() {
+        let seat = |base| super::Output {
+            base,
+            storage: 0,
+            width: 8,
+            row_stride: 8,
+            row_offset: 0,
+        };
+        let mut outputs = vec![
+            (("scores".to_string(), 0), seat(1000)),
+            (("score_pages".to_string(), 0), seat(1064)),
+            (("logits".to_string(), 0), seat(9000)),
+        ];
+        super::move_seats(&mut outputs, 1000, 128, 5000);
+        let bases: Vec<u64> = outputs.iter().map(|(_, output)| output.base).collect();
+        assert_eq!(bases, [5000, 5064, 9000]);
+    }
+
 
     #[test]
     fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {

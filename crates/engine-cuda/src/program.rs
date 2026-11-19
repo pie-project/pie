@@ -51,6 +51,9 @@ struct Batch {
     /// and the address that is now.
     pair: engine::ScratchPlace,
     base: u64,
+    /// Which taking of the pair's slots its state was laid in
+    /// (`engine::InstanceBinding::pair_generation`).
+    generation: u64,
     /// The state moved or came back since its stages last laid there: what
     /// a lay keeps between fires is staged again.
     stale: bool,
@@ -94,6 +97,7 @@ impl Program {
             bound: 0,
             pair: engine::ScratchPlace::None,
             base: 0,
+            generation: 0,
             stale: true,
         });
         Ok(self.batches.last_mut().expect("just pushed"))
@@ -461,6 +465,19 @@ impl Plane {
     /// and 136 more, a lane, and the room they are aligned in). A fire lays
     /// its wave's tables in one pair's room, the widest of those it
     /// carries: every lane of it names no more channels than that pair's.
+    /// Whether the (program, extents) pair's state is laid again at its
+    /// next fire; `None` where no instance of it ever bound. For a test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pair_stale(&self, program_id: ProgramId, extents: Extents) -> Option<bool> {
+        self.programs
+            .get(&program_id)?
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map(|batch| batch.stale)
+    }
+
     pub fn pair_room(&self, program_id: ProgramId, extents: Extents) -> Result<PairRoom> {
         let program = self
             .programs
@@ -641,12 +658,21 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let batch = program.batch(extents, room)?;
         // The pair's state, where the binding names it: the same on every
-        // instance of the pair, fresh where it came back.
+        // instance of the pair, laid again wherever its slots are another
+        // taking than it was laid in. Slots the pair gave back (parked, or
+        // freed at a last close the engine deferred), written by another
+        // owner and taken again at the same refs, are another taking: kept
+        // as they stood, every fire of the pair ran on that owner's words.
+        // The same live slots bound again are not.
         let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
             .next_multiple_of(launch::SPAN_ALIGN);
-        if batch.bound == 0 || batch.pair != slots.pair {
+        if batch.bound == 0
+            || batch.pair != slots.pair
+            || batch.generation != slots.pair_generation
+        {
             let base = piece_at(&slots.pair, batch.room.bytes(), span)?;
             batch.pair = slots.pair.clone();
+            batch.generation = slots.pair_generation;
             batch.base = base;
             batch.stale = true;
         }
@@ -741,27 +767,49 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program("program::plane", format!("instance {id}'s program is gone"))
         })?;
+        // Every address the new slots lie at, before anything changes: a
+        // rebind refused here leaves the instance as it stood, never half
+        // pointed at the new slots and half at the old.
         let held = program.held(self.score_bytes);
         let place = slots.place(&held, span)?;
-        bound.scores = held.score_at.map(|at| place.instance + at);
-        bound.session.rebase(&place)?;
-        // The pair's state where the rebind names it: fresh room, whether
-        // or not where it lay before, since what another item wrote there
-        // meanwhile is staged over.
+        let scores = held.score_at.map(|at| place.instance + at);
         let extents = bound.session.extents();
         let program_id = bound.program_id;
         let room = program.bound_room(extents)?;
-        bound.scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
+        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
             .next_multiple_of(launch::SPAN_ALIGN);
+        // The pair's state where the rebind names it: fresh room, whether
+        // or not where it lay before, since what another item wrote there
+        // meanwhile is staged over.
+        let pair_base = piece_at(&slots.pair, room.bytes(), span)?;
+        // The rings move ring by ring: one refused partway leaves the
+        // instance between its old slots and its new, and it is failed by
+        // name, never fired so.
+        if let Err(fault) = bound.session.rebase(&place) {
+            bound.session.poison();
+            return Err(Fault::program(
+                "program::plane",
+                format!("instance {id}'s rings could not all be rebound, and it is failed: {fault}"),
+            ));
+        }
+        // The score seats a fire bound inside the rows move with them.
+        if let (Some(from), Some(to)) = (bound.scores, scores) {
+            bound.session.move_seats(from, self.score_bytes, to);
+        }
+        bound.scores = scores;
+        bound.scratch = scratch;
         bound.slots = slots;
         let pair = bound.slots.pair.clone();
+        let generation = bound.slots.pair_generation;
         let batch = self
             .programs
             .get_mut(&program_id)
             .expect("found above")
-            .bound_batch(extents)?;
-        batch.base = piece_at(&pair, batch.room.bytes(), span)?;
+            .bound_batch(extents)
+            .expect("its room was found above");
+        batch.base = pair_base;
         batch.pair = pair;
+        batch.generation = generation;
         batch.stale = true;
         Ok(())
     }
@@ -1326,6 +1374,8 @@ pub struct Slots {
     pub scratch: engine::ScratchPlace,
     /// Where its pair's state lies (`engine::InstanceBinding::pair`).
     pub pair: engine::ScratchPlace,
+    /// Which taking of those slots (`engine::InstanceBinding::pair_generation`).
+    pub pair_generation: u64,
 }
 
 /// Where a guest state of `bytes` that lies at `place` starts now: its run

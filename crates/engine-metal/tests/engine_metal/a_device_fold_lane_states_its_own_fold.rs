@@ -191,6 +191,7 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
             &rings,
             &scratch,
             &pair,
+            0,
         )
         .expect("the device-geometry instance binds");
     let verbs: Vec<RsVerb> = (0..lanes).map(|_| buffering(&shell)).collect();
