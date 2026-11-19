@@ -225,6 +225,10 @@ pub struct Shell {
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
     /// Last, so it drops after everything else the shell holds.
     _released: Released,
 }
@@ -974,9 +978,10 @@ impl Shell {
         id: engine::InstanceId,
         slots: crate::program::Slots,
     ) -> Result<()> {
+        let stream = self.device.stream();
         let pools = &self.pools;
         self.programs
-            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes))
+            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes), stream)
     }
 
     /// Settles the guest batches whose steps have landed: their channels'
