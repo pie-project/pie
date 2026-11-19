@@ -4044,6 +4044,16 @@ refusal of the program where any is open):
     after it no help; the same words as plain rectangles were exact. Nothing here uses it.
     (`memcpy_h2d_colbcast` is `(x, y, w, h, elems)`, a row's words down each column, on the
     simulator; not yet tried on the chip.)
+  - **Every line's queue empty at a launch's end** (`LINE_QUEUES`, `LINE_LEFT`). A GEMM array PE
+    checks its line input queues (iq2-iq7: the row line's two colours, the weight stream, the
+    band reductions, the column line; iq1 is memcpy's) after its end stamp; one holding words sets
+    the stamps' third word's top bit, and the host's step refuses the launch naming the PE (its
+    words would be the next launch's first, which then stops). The dense layout's klein 1024²
+    left the row line's westward queue holding words on 35,348 latent PEs, columns 138-383, after
+    its last GEMM (1589, 1591), and its second launch hung; with the check it stops at step 0,
+    "PE (138, 8): a line's words were left queued" (1592). Its cost on m2: within noise (1592:
+    1,821,638 / 1,768,767 / 1,729,058 cycles against 1,821,631 / 1,728,099 / 1,733,281, every value
+    the same bit for bit); flux identity: gpe.csl alone.
   - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
     (chip 1.858M, 1.71M before); the 576-row one 168.7M.
 - **A PE's low data** (`check::lo_dsds`, `LO_DSDS`). cslc keeps every constant DSD value a PE
