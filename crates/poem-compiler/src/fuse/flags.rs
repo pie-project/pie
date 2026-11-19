@@ -43,6 +43,8 @@ flags! {
     EmbedScaleAddSelect = "fuse.embed_scale_add_select" => "fused.embed_scale_add_select",
     EmbedScaleAdd = "fuse.embed_scale_add" => "fused.embed_scale_add",
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "fused.residual_add_rmsnorm",
+    ResidualAddRmsnormMatmul = "fuse.residual_add_rmsnorm_matmul" => "fused.residual_add_rmsnorm_matmul",
+    ResidualAddRmsnormMatmulSwigluMatmul = "fuse.residual_add_rmsnorm_matmul_swiglu_matmul" => "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
     MatmulSwigluMatmul = "fuse.matmul_swiglu_matmul" => "fused.matmul_swiglu_matmul",
     MatmulGlu = "fuse.matmul_glu" => "fused.matmul_glu",
     MoeMega = "fuse.moe_mega" => "fused.moe_mega",
