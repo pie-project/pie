@@ -20,19 +20,21 @@
 //!   is neither (not a decode envelope, or its device-dependent geometry is
 //!   not one), on any engine. Host-evaluated is its class, not a fallback.
 //!
-//! Which geometry ports each engine's mask lacks today (`EngineCaps::ports`;
-//! a decode envelope needs `embed_tokens` plus what the program computes,
-//! device geometry `embed_tokens`, `positions`, `slots`, `kv_len`, and
-//! `attn_mask` when a channel feeds it; `embed_indptr` no class requires):
+//! Which geometry ports each engine's mask lacks today, as each states it
+//! in `EngineCaps::ports` (a decode envelope needs `embed_tokens` plus what
+//! the program computes, device geometry `embed_tokens`, `positions`,
+//! `slots`, `kv_len`, and `attn_mask` when a channel feeds it;
+//! `embed_indptr` no class requires). The mask is the engine's, read where
+//! it is stated:
 //!
-//! | engine            | mask                                      | lacks                                     |
-//! |-------------------|-------------------------------------------|-------------------------------------------|
-//! | cuda (and ROCm)   | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | metal             | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | xla               | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | cerebras          | device geometry                           | attn_mask, fold, embed_indptr             |
-//! | vulkan            | embed_tokens + fold                       | positions, kv_len, slots, attn_mask, embed_indptr |
-//! | wgpu              | embed_tokens + fold + attn_mask           | positions, kv_len, slots, embed_indptr    |
+//! | engine          | mask (stated at)                                          | lacks                                 |
+//! |-----------------|-----------------------------------------------------------|---------------------------------------|
+//! | cuda (and ROCm) | device geometry + attn_mask + fold (engine-cuda `api.rs`)  | embed_indptr                          |
+//! | metal           | device geometry + attn_mask + fold (engine-metal `api.rs`) | embed_indptr                          |
+//! | xla             | device geometry + attn_mask + fold (engine-xla `api.rs`)   | embed_indptr                          |
+//! | cerebras        | device geometry (engine-cerebras `spatial/engine/mod.rs`)  | attn_mask, fold, embed_indptr         |
+//! | vulkan          | embed_tokens + fold + attn_mask (engine-vulkan `Host::ports`) | positions, kv_len, slots, embed_indptr |
+//! | wgpu            | embed_tokens + fold + attn_mask (engine-wgpu `Host::ports`)   | positions, kv_len, slots, embed_indptr |
 //!
 //! So on Vulkan and wgpu no device-geometry program (beam search's, for
 //! one) binds as device geometry: its fires are host-resolved, an engine
@@ -238,7 +240,10 @@ mod tests {
         }
     }
 
-    const VULKAN: PortMask = PortMask::DECODE_ENVELOPE.with(Port::Fold);
+    /// engine-gpu's mask, Vulkan's and wgpu's alike (their `Host::ports`).
+    const VULKAN: PortMask = PortMask::DECODE_ENVELOPE
+        .with(Port::Fold)
+        .with(Port::AttnMask);
     const CUDA: PortMask = PortMask::DEVICE_GEOMETRY
         .with(Port::AttnMask)
         .with(Port::Fold);
@@ -273,6 +278,18 @@ mod tests {
         );
         assert!(message.contains("its fires serialize"), "{message}");
         assert!(!message.contains("falling back"), "{message}");
+
+        // Its mask port is the engine's: a channel-fed mask adds no lack.
+        let mut masked = program(Some(vec![0, 2]), Ok(None));
+        masked.needs_mask_port = true;
+        let bound = classify(masked, VULKAN, "vulkan");
+        assert_eq!(
+            bound.host,
+            Some(HostGeometry::EngineLacks {
+                engine: "vulkan",
+                lacks: PortMask::of(&[Port::Positions, Port::KvLen, Port::Slots])
+            })
+        );
 
         // A decode envelope whose required ports the engine lacks.
         let required = PortMask::DECODE_ENVELOPE.with(Port::Positions);
