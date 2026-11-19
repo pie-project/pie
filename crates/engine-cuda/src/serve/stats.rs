@@ -389,6 +389,28 @@ impl Shell {
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
     }
 
+    /// Waits, on the host, until every move between the device and the host
+    /// tier enqueued so far has landed.
+    pub fn settle_moves(&mut self) -> crate::Result<()> {
+        self.pools.settle_swaps()
+    }
+
+    /// Calls `landed` once every move between the device and the host tier
+    /// enqueued so far has landed, from a waiter of its own: nothing is
+    /// enqueued on the swap stream for it, so no later move waits on it.
+    /// `false` (and `landed` dropped) where the moves ride no swap stream,
+    /// so each has landed by the time it returned.
+    pub fn tell_swaps_landed(
+        &mut self,
+        landed: Box<dyn FnOnce() + Send + 'static>,
+    ) -> crate::Result<bool> {
+        if super::diag::on().tier_inline {
+            return Ok(false);
+        }
+        super::landing::tell_when_landed(self.device.swap_stream(), landed)?;
+        Ok(true)
+    }
+
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
     /// rows') within the state pool.
     pub fn copy_token_slots(

@@ -58,6 +58,7 @@ pub(crate) fn published_launches<'a>(
         if let Some(published) = published {
             // The streamed form dispatches its steps one after another, a
             // launch a step; a node two steps compute lies in both.
+            let first = each.len();
             each.extend(published.steps.iter().map(|nodes| Launch {
                 nodes,
                 stepwise: false,
@@ -67,6 +68,17 @@ pub(crate) fn published_launches<'a>(
                 held: Vec::new(),
             }));
             idle.extend_from_slice(&published.views);
+            // A folded node's step computes it in another form: its results
+            // take no bytes (idle, so hollow), and what it reads is held
+            // through that step.
+            for &(step, node) in &published.folded {
+                idle.push(node);
+                if let (Some(launch), Some(op)) =
+                    (each.get_mut(first + step as usize), plan.ops.get(node as usize))
+                {
+                    launch.held.extend(op.reads());
+                }
+            }
         } else {
             each.push(Launch {
                 nodes: &region.nodes,
@@ -1784,6 +1796,18 @@ impl Prepared {
     }
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if crate::encode::profiling() {
+            let (_, seconds) = frame.timed(|| self.encode_one_region(frame, region))?;
+            if let Some(seconds) = seconds {
+                crate::encode::record_kernel(&guest_key(region, 1), seconds);
+            }
+            return Ok(());
+        }
+        self.encode_one_region(frame, region)
+    }
+
+    fn encode_one_region(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
             Form::Fused => {
                 let scratch = self.scratch()?;
@@ -2217,6 +2241,13 @@ impl Prepared {
             let _ = (frame, region, zero);
             Err(Fault::Deviceless)
         }
+    }
+
+    /// The status word's region, as a completion handler reads it
+    /// ([`super::session::EpilogueCheck`]).
+    #[must_use]
+    pub(crate) fn status_region(&self) -> Held {
+        self.status.clone()
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -2684,6 +2715,28 @@ impl Batch {
             buffer.write(0, &record_bytes(words))?;
         }
         for region in regions {
+            #[cfg(target_vendor = "apple")]
+            if crate::encode::profiling() {
+                let (_, seconds) =
+                    frame.timed(|| self.encode_batched_region(frame, region, members, count))?;
+                if let Some(seconds) = seconds {
+                    crate::encode::record_kernel(&guest_key(region, count), seconds);
+                }
+                continue;
+            }
+            self.encode_batched_region(frame, region, members, count)?;
+        }
+        Ok(())
+    }
+
+    fn encode_batched_region(
+        &self,
+        frame: &Frame,
+        region: &Region,
+        members: &[&mut Prepared],
+        count: u32,
+    ) -> Result<()> {
+        {
             match region.form {
                 Form::Fused => {
                     // A fused region fires each member in its own scratch.
@@ -3230,3 +3283,15 @@ mod tests {
     }
 }
 
+
+/// The kernel profile's row for a guest region: its entry, form, steps
+/// and the lanes it ran for.
+#[cfg(target_vendor = "apple")]
+fn guest_key(region: &Region, lanes: u32) -> String {
+    format!(
+        "guest {} {:?} steps={} lanes={lanes}",
+        region.module.entry(),
+        region.form,
+        region.steps.len()
+    )
+}

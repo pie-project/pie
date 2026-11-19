@@ -1131,9 +1131,6 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             )
             .map_err(|why| Refusal::Program(format!("the readout widen did not build: {why}")))?;
             self.widen = Some(Arc::new(widen));
-            // The model's frames in flight, and the one a settle or a walk
-            // holds beside them.
-            place.device.core().stock_rings(place.frames + 1);
         }
         // A build with no device builds nothing, and binds no instance.
         #[cfg(not(feature = "wgpu"))]

@@ -8,12 +8,12 @@ use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_mo
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 75, 0x4523_a98b_9279_374a),
     ("hip", 35, 0xd616_5131_7e2f_c918),
-    ("metal", 68, 0x8789_9b8d_42f0_d646),
+    ("metal", 70, 0x1d9f_ba02_9e00_cd1b),
 ];
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it
 /// writes: every call's module, in the order a stage's steps index them.
-const WGSL_PINNED: (u16, u64) = (2, 0x4e0e_54f0_6d57_780d);
+const WGSL_PINNED: (u16, u64) = (3, 0xd216_a491_bb82_1c9c);
 
 fn wgsl_fingerprint() -> u64 {
     let mut bytes = Vec::new();

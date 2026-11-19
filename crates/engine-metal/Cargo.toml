@@ -15,6 +15,11 @@ path = "src/lib.rs"
 # Test builds: the scratch a hollow value points at is poisoned after each
 # zero fill, so a kernel that reads one breaks a golden.
 test-slot-fill = []
+# Tests only: `device::fail_next_frame`, which answers the next frame a
+# thread commits as failed. Off by default, so a served binary has no
+# injection path; engine-metal's own tests turn it on (the dev-dependency
+# on this crate below).
+fault-injection = []
 
 [dependencies]
 toml = "1.1"
@@ -85,6 +90,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+engine-metal = { path = ".", features = ["fault-injection"] }
 engine-cpu = { path = "../engine-cpu" }
 media = { path = "../media" }
 poem = { package = "pie-poem", path = "../poem" }

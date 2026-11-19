@@ -417,7 +417,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         runahead: engine::runahead::Runahead::F1,
         device: &device,
         residency: engine::load::Residency {
-            device: backend::ALLOWANCE,
+            device: crate::gpu::share(),
             ..engine::load::Residency::default()
         },
         handed: None,

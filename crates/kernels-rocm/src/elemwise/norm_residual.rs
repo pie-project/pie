@@ -15,11 +15,33 @@ pub fn residual_add_rmsnorm(
     eps: f32,
     out: &mut Tensor,
 ) -> Result<(), Error> {
+    let stream = *y;
+    residual_add_rmsnorm_into(ctx, x, stream, y, weight, plus_one, eps, out)
+}
+
+/// [`residual_add_rmsnorm`] landing `x + y` in `y_out` (`y` left as it
+/// was), a plane of its own.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_into(
+    ctx: &Ctx,
+    x: Tensor,
+    y: Tensor,
+    y_out: &mut Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "fused.residual_add_rmsnorm";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
-        x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
-        "the residual, the stream and the normed row share one shape"
+        x.rows == y.rows
+            && x.width == y.width
+            && out.rows == y.rows
+            && out.width == y.width
+            && y_out.rows == y.rows
+            && y_out.width == y.width,
+        "the residual, the stream, its sum and the normed row share one shape"
     );
     let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
@@ -32,6 +54,7 @@ pub fn residual_add_rmsnorm(
         &[
             x.arg(),
             y.arg(),
+            y_out.arg(),
             weight.arg(),
             out.arg(),
             hidden.arg(),
