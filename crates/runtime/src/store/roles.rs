@@ -2726,8 +2726,16 @@ pub fn bind_taken(
 ///
 /// However the wait ends (bound, refused, or dropped with its process),
 /// its need is no longer counted (`leave`, [`Roles::leave_guest_wait`]).
+///
+/// Before any wait, its process's fires already submitted are settled
+/// (`settle`): their leases on its working sets go back as they land, as
+/// they do at any other wait of the process's ([`crate::inferlet::process::gate`]).
+/// Waiting with them unsettled, the process was held between an eviction
+/// that waits for those leases and a bind that waits on that eviction.
+/// A wait for room its own eviction withdrew
+/// ([`crate::planner::BindRoomWait::Withdrawn`]) waits for its restore.
 #[allow(clippy::too_many_arguments)]
-pub async fn bind_when_resident<T, E, B, W, G, P>(
+pub async fn bind_when_resident<T, E, B, W, G, P, S>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
@@ -2738,13 +2746,15 @@ pub async fn bind_when_resident<T, E, B, W, G, P>(
     planned: impl Fn(u32, u32) -> P,
     leave: impl Fn(),
     waiting: impl Fn(bool),
+    settle: impl Fn() -> S,
 ) -> anyhow::Result<T>
 where
     E: std::fmt::Display,
     B: std::future::Future<Output = anyhow::Result<T>>,
     W: std::future::Future<Output = Result<(), E>>,
     G: std::future::Future<Output = Result<(), String>>,
-    P: std::future::Future<Output = Result<(), String>>,
+    P: std::future::Future<Output = Result<crate::planner::BindRoomWait, String>>,
+    S: std::future::Future<Output = ()>,
 {
     /// Runs its `leave` on drop: the wait's every end, its process gone
     /// (the future dropped) too.
@@ -2774,6 +2784,18 @@ where
             Ok(bound) => return Ok(bound),
             Err(error) => error,
         };
+        // Every way on from here waits, but a refusal: what the process
+        // has in flight lands and gives its leases back first.
+        let waits_on = error.downcast_ref::<RolesError>().is_some_and(|error| {
+            matches!(
+                error,
+                RolesError::PairParked(_) | RolesError::GuestGrow { .. }
+            ) || error.room_runs().is_some()
+                || matches!(error, RolesError::Parked { holder: Some(holder), .. } if *holder == pid)
+        });
+        if waits_on {
+            settle().await;
+        }
         if let Some(RolesError::PairParked(key)) = error.downcast_ref::<RolesError>()
             && let Some(watch) = &watch
         {
@@ -2828,11 +2850,22 @@ where
             };
             tokio::select! {
                 () = freed => {}
-                made = planned(run, pieces) => {
-                    if let Err(why) = made {
+                made = planned(run, pieces) => match made {
+                    Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }
-                }
+                    Ok(crate::planner::BindRoomWait::Served) => {}
+                    Ok(crate::planner::BindRoomWait::Withdrawn) => {
+                        tracing::debug!(%pid, "a bind's wait for room ends with its eviction");
+                        leave();
+                        waiting(false);
+                        if let Err(why) = resident().await {
+                            return Err(error.context(format!(
+                                "its process was evicted and is not resident again: {why}"
+                            )));
+                        }
+                    }
+                },
             }
             continue;
         }
@@ -2864,11 +2897,21 @@ where
                     }
                 }
                 () = freed => {}
-                made = planned(run, pieces) => {
-                    if let Err(why) = made {
+                made = planned(run, pieces) => match made {
+                    Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }
-                }
+                    Ok(crate::planner::BindRoomWait::Served) => {}
+                    Ok(crate::planner::BindRoomWait::Withdrawn) => {
+                        leave();
+                        waiting(false);
+                        if let Err(why) = resident().await {
+                            return Err(error.context(format!(
+                                "its process was evicted and is not resident again: {why}"
+                            )));
+                        }
+                    }
+                },
             }
             continue;
         }

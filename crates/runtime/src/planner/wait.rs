@@ -32,12 +32,17 @@ pub(super) enum WaitKind {
     /// first, then a resident parked by the planner's victim choice;
     /// `served` once the pool holds the runs free, the bind to take them.
     /// `pages`: the kv pages that, moved out whole, free its chunks.
+    /// `withdrawn` once an eviction of its own process began
+    /// ([`super::inner::Inner::begin_eviction`]): the room it waits for is
+    /// asked again after its restore, and nothing is funded for it
+    /// meanwhile.
     BindRoom {
         run: u32,
         pieces: u32,
         pages: u32,
         notify: Arc<Notify>,
         served: bool,
+        withdrawn: bool,
     },
 }
 
@@ -53,7 +58,9 @@ impl Waiter {
                 outcome, yielded, ..
             } => outcome.is_none() && !yielded,
             WaitKind::Restore { .. } => true,
-            WaitKind::BindRoom { served, .. } => !served,
+            WaitKind::BindRoom {
+                served, withdrawn, ..
+            } => !served && !withdrawn,
         }
     }
 

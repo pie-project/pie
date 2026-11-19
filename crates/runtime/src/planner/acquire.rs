@@ -546,6 +546,15 @@ impl ResidencyPlanner {
     }
 }
 
+/// How a bind's wait for room ([`ResidencyPlanner::wait_bind_room`]) ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindRoomWait {
+    /// Its runs stand free: the bind takes them.
+    Served,
+    /// Its process is being evicted: the bind waits for its restore.
+    Withdrawn,
+}
+
 impl ResidencyPlanner {
     /// Waits, queued in the planner beside admissions and restores, until
     /// the device pool holds `pieces` free runs of `run` adjacent chunks
@@ -555,17 +564,26 @@ impl ResidencyPlanner {
     /// first, then, the fleet stalled, a resident parked by its victim
     /// choice; the bind is sent again once served. `Err` where `pid` is
     /// gone. Woken by its own serve, never a clock.
+    ///
+    /// An eviction of `pid` itself withdraws the wait
+    /// ([`BindRoomWait::Withdrawn`]): evicted, its bind waits for it to be
+    /// resident again, never for room funded meanwhile.
     pub async fn wait_bind_room(
         self: &Arc<Self>,
         pid: ProcessId,
         run: u32,
         pieces: u32,
-    ) -> Result<(), PlannerError> {
+    ) -> Result<BindRoomWait, PlannerError> {
         let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
         let notify = Arc::new(Notify::new());
         let key = self
             .with_inner(|inner| {
-                inner.procs.contains_key(&pid).then(|| {
+                // Evicting already, it waits for its restore instead.
+                let proc = inner.procs.get(&pid)?;
+                if proc.state != Residency::Resident {
+                    return Some(None);
+                }
+                Some(Some({
                     inner.enqueue(
                         pid,
                         WaitKind::BindRoom {
@@ -574,11 +592,15 @@ impl ResidencyPlanner {
                             pages,
                             notify: notify.clone(),
                             served: false,
+                            withdrawn: false,
                         },
                     )
-                })
+                }))
             })
             .ok_or(PlannerError::Cancelled)?;
+        let Some(key) = key else {
+            return Ok(BindRoomWait::Withdrawn);
+        };
         // Off the queue however the wait ends.
         let _registration = WaitRegistration {
             planner: self,
@@ -593,14 +615,17 @@ impl ResidencyPlanner {
             let served = self.with_inner(|inner| {
                 let key = inner.locate(key)?;
                 match inner.queue.get(&key)?.kind {
-                    WaitKind::BindRoom { served, .. } => Some(served),
+                    WaitKind::BindRoom {
+                        served, withdrawn, ..
+                    } => Some((served, withdrawn)),
                     _ => None,
                 }
             });
             match served {
                 None => return Err(PlannerError::Cancelled),
-                Some(true) => return Ok(()),
-                Some(false) => {
+                Some((_, true)) => return Ok(BindRoomWait::Withdrawn),
+                Some((true, false)) => return Ok(BindRoomWait::Served),
+                Some((false, false)) => {
                     // Room that comes free or moves (the rung lowered or
                     // raised, a segment committed, guest state given back)
                     // has the planner quote the waiting head again, not only
@@ -631,7 +656,12 @@ impl ResidencyPlanner {
         let notify = self.with_inner(|inner| {
             let key = inner.locate(key)?;
             match &mut inner.queue.get_mut(&key)?.kind {
-                WaitKind::BindRoom { served, notify, .. } => {
+                WaitKind::BindRoom {
+                    served,
+                    notify,
+                    withdrawn: false,
+                    ..
+                } => {
                     *served = true;
                     Some(notify.clone())
                 }

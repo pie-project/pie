@@ -2249,9 +2249,14 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         || None,
         |_, _| false,
         |_, _| false,
-        |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
+        |_, _| {
+            std::future::ready(Err::<crate::planner::BindRoomWait, String>(
+                "no guest state here".into(),
+            ))
+        },
         || {},
         |_| {},
+        || std::future::ready(()),
     );
     tokio::pin!(decode);
     assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
@@ -2873,13 +2878,18 @@ async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
             crate::rt::spawn(async move { planner.wait_bind_room(pid, 3, 1).await })
         })
         .collect();
+    // Each waits: queued, or, its own process evicted meanwhile, withdrawn
+    // to wait for its restore.
+    let waiting = |planner: &Arc<ResidencyPlanner>| {
+        planner.diagnostics().queue.len() + waits.iter().filter(|wait| wait.is_finished()).count()
+    };
     for _ in 0..200 {
         crate::rt::yield_now().await;
-        if planner.diagnostics().queue.len() == 3 {
+        if waiting(&planner) == 3 {
             break;
         }
     }
-    assert_eq!(planner.diagnostics().queue.len(), 3, "all of them wait");
+    assert_eq!(waiting(&planner), 3, "all of them wait");
     // Every process is queued and none is fresh: the victim choice names
     // none, and the pass falls to the last resort.
     for _ in 0..50 {
@@ -2895,7 +2905,15 @@ async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
     );
     assert!(planner.stats.e6_relaxations.load(Ordering::Relaxed) > 0);
     for wait in waits {
-        wait.abort();
+        if wait.is_finished() {
+            assert_eq!(
+                wait.await.expect("the wait ends"),
+                Ok(crate::planner::BindRoomWait::Withdrawn),
+                "a wait that ended was withdrawn by its own eviction"
+            );
+        } else {
+            wait.abort();
+        }
     }
 }
 
@@ -4092,4 +4110,123 @@ async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past
             .contains("does not fit with every other process moved"),
         "{refused}"
     );
+}
+
+/// Mac Pro's M5 soak on f9afad90a (4 of 5 over-demand runs stalled,
+/// evicting=1 for good, pool free 0): a process restored into room that
+/// just fit its parked state binds a program that needs more, its bind
+/// waits in the planner, and the planner, short, evicts that process. Its
+/// eviction waited for its fires' leases, whose finalizer was its guest,
+/// in the bind; the bind waited on the eviction. Now the bind settles its
+/// process's fires before it waits, and its own eviction withdraws its
+/// wait for room: it waits for its restore instead, nothing funded for it
+/// meanwhile, and binds once restored (no wake lost that way either).
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_restore() {
+    use crate::store::roles::{RolesError, bind_when_resident};
+    use std::cell::Cell;
+
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+
+    // Short of one chunk until its restore; bound after it.
+    let attempts = Cell::new(0u32);
+    let restored = Cell::new(false);
+    let bind = || {
+        attempts.set(attempts.get() + 1);
+        std::future::ready(if restored.get() {
+            Ok(7u32)
+        } else {
+            Err(anyhow::Error::new(RolesError::BindShort(Box::new(
+                RolesError::Short {
+                    role: ::engine::SlotRole::Instance,
+                    slots: 1,
+                },
+            ))))
+        })
+    };
+    let settled = Cell::new(0u32);
+    let left = Cell::new(0u32);
+    let p = planner.clone();
+    let binding = bind_when_resident(
+        pid,
+        bind,
+        || planner.wait_resident(pid),
+        |_, _| std::future::ready(Err::<(), String>("no grow here".into())),
+        || None,
+        |_, _| false,
+        |_, _| false,
+        move |run, pieces| {
+            let p = p.clone();
+            async move {
+                p.wait_bind_room(pid, run, pieces)
+                    .await
+                    .map_err(|why| why.to_string())
+            }
+        },
+        || left.set(left.get() + 1),
+        |waits| planner.set_bind_waiting(pid, waits),
+        || {
+            settled.set(settled.get() + 1);
+            std::future::ready(())
+        },
+    );
+    tokio::pin!(binding);
+    let bind_rooms = |planner: &Arc<ResidencyPlanner>| {
+        planner.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .filter(|waiter| {
+                    waiter.pid == pid && matches!(waiter.kind, WaitKind::BindRoom { .. })
+                })
+                .count()
+        })
+    };
+    assert!(futures::poll!(binding.as_mut()).is_pending(), "it waits for room");
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(settled.get(), 1, "what it has in flight settles before it waits");
+    assert_eq!(bind_rooms(&planner), 1, "queued in the planner");
+    assert!(planner.with_inner(|inner| inner.procs[&pid].bind_waiting));
+
+    // The planner, short, evicts it: its wait for room is withdrawn.
+    let wake = planner.with_inner(|inner| inner.begin_eviction(pid, Reclaim::default()));
+    for notify in wake {
+        notify.notify_waiters();
+    }
+    for _ in 0..20 {
+        assert!(futures::poll!(binding.as_mut()).is_pending(), "it waits for its restore");
+        crate::rt::yield_now().await;
+    }
+    assert_eq!(bind_rooms(&planner), 0, "its wait for room is off the queue");
+    assert_eq!(attempts.get(), 1, "nothing sent while it is not resident");
+    assert!(left.get() >= 1, "its need is no longer counted");
+    assert!(
+        !planner.with_inner(|inner| inner.procs[&pid].bind_waiting),
+        "waiting for its restore, it is no bind's victim"
+    );
+    // A bind that asks while its process is evicting waits for the restore
+    // at once, queued nowhere.
+    assert_eq!(
+        planner.wait_bind_room(pid, 1, 1).await,
+        Ok(crate::planner::BindRoomWait::Withdrawn)
+    );
+    assert_eq!(bind_rooms(&planner), 0);
+
+    // Parked, then restored: the bind goes again, and lands.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Restoring);
+    restored.set(true);
+    planner.report_restored(pid);
+    let bound = crate::rt::time::timeout(Duration::from_secs(10), binding)
+        .await
+        .expect("the bind is woken by its restore")
+        .expect("it binds once restored");
+    assert_eq!(bound, 7);
+    assert_eq!(attempts.get(), 2, "sent again once, after the restore");
+    assert_eq!(bind_rooms(&planner), 0, "the queue holds nothing of it");
 }

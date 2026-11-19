@@ -4848,6 +4848,35 @@ pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: Finalize
 
 pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
     debug_assert!(op.is_preemption_detachable());
+    finalize_unattached(op).await;
+    Ok(())
+}
+
+/// Settles every fire `pid` has submitted, in each pipeline's order, from
+/// its own task where it is about to wait outside any gate that drains its
+/// pipelines (a bind waiting for room, or for its restore,
+/// [`crate::store::roles::bind_when_resident`]): each fire's leases on its
+/// working sets go back as it lands. It holds each pipeline's finalizer
+/// gate, so it is that pipeline's one finalizer and the one waiter on its
+/// fires' completions. A fire's pass is not reached from here: what failed
+/// fails its pipeline and poisons its readers, as an eviction's drain does.
+pub(crate) async fn settle_process_fires(pid: uuid::Uuid) {
+    for fires in crate::inferlet::process::residency::pipelines_of(pid) {
+        let _gate = fires.finalize_guard().await;
+        loop {
+            fires.await_front_completion().await;
+            let op = fires.lock().unwrap().pop_front();
+            let Some(op) = op else {
+                break;
+            };
+            finalize_unattached(op).await;
+        }
+    }
+}
+
+/// Finalizes `op` with no context: its failure latched on its pipeline and
+/// its readers poisoned, its leases dropped after.
+async fn finalize_unattached(op: PendingOp) {
     let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await;
     match action {
         FinalizeAction::None => {}
@@ -4865,7 +4894,6 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
         }
     }
     drop(ws_guard);
-    Ok(())
 }
 
 /// What the fire froze seals; a fold placed only now is frozen first, the
@@ -8259,6 +8287,80 @@ pub(crate) mod fold_tests {
     /// fire's lease. None ends before the fire settles, and each then reads
     /// the folded length the device's count left, one length in both
     /// stores.
+    /// The M5 soak's stall on f9afad90a: a process fired, then bound a
+    /// program short of room, and the planner evicted it while its bind
+    /// waited. The fire's lease goes back only as the fire is finalized,
+    /// and its finalizer was the guest, in the bind; the eviction's drain
+    /// finalizes only fires settled as it starts, and none of a pass whose
+    /// geometry the device keeps. The eviction waited on the lease for good.
+    /// A bind about to wait settles its process's fires first: the lease
+    /// goes back as the fire lands, and the eviction's wait ends.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their_leases_ends()
+    -> Anyhow<()> {
+        use crate::inferlet::process::residency::{ResidentPipeline, register_residency};
+        use futures::FutureExt;
+        let model = crate::store::registry::register_model(4, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let id = {
+            let mut kv = stores.kv.lock();
+            let id = kv.create_working_set();
+            kv.fold(id, 4, false).unwrap();
+            id
+        };
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let cell = cursor(12);
+        let pipeline = Pipeline::new();
+        let (fires, failure, scope) = (
+            pipeline.fires.clone(),
+            pipeline.failure.clone(),
+            pipeline.scope.clone(),
+        );
+        let pid = uuid::Uuid::new_v4();
+        let residency = Arc::new(Mutex::new(
+            crate::inferlet::process::ProcessResidency::default(),
+        ));
+        residency.lock().unwrap().pipelines.push(ResidentPipeline {
+            scope: scope.clone(),
+            fires: Arc::downgrade(&fires),
+        });
+        register_residency(pid, Arc::downgrade(&residency));
+        assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
+        // A fire of a pass whose geometry the device keeps, on its way.
+        let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &geometry::Fold::Device);
+        assert!(!fires.lock().unwrap().front().unwrap().is_preemption_detachable());
+
+        // The eviction: its sets fenced, then it waits for their leases.
+        let handle = kv.suspend_handle();
+        handle.fence();
+        assert_eq!(handle.active_leases(), 1, "the fire holds its lease");
+        let mut quiesced = Box::pin(handle.quiesce());
+        assert!(quiesced.as_mut().now_or_never().is_none());
+
+        // The bind, about to wait, settles what its process has in flight.
+        let mut settled = Box::pin(settle_process_fires(pid));
+        assert!(
+            settled.as_mut().now_or_never().is_none(),
+            "it waits for the fire to land, not for anything the eviction holds"
+        );
+        assert_eq!(handle.active_leases(), 1);
+        // The fire lands.
+        record_kv_writes(vec![report(tag, 2)]);
+        resolve_test_completion(&completion, false);
+        settled.await;
+        assert!(fires.lock().unwrap().is_empty(), "finalized");
+        assert_eq!(handle.active_leases(), 0, "its lease is back");
+        quiesced.await;
+        assert_eq!(
+            stores.kv.lock().folded(id).unwrap(),
+            6,
+            "its fold is placed as its own finalize places it"
+        );
+        assert_eq!(*failure.lock().unwrap(), None, "a fire that ran fails nothing");
+        drop(residency);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn what_copies_or_moves_a_set_waits_for_the_fold_the_device_counts() -> Anyhow<()> {
         let flight = in_flight(&geometry::Fold::Device, true);

@@ -316,12 +316,28 @@ impl Inner {
         self.evicting.insert(pid, expected);
         let mut wake = Vec::new();
         for waiter in self.queue.values_mut().filter(|w| w.pid == pid) {
-            if let WaitKind::Allocation {
-                notify, yielded, ..
-            } = &mut waiter.kind
-            {
-                *yielded = true;
-                wake.push(notify.clone());
+            match &mut waiter.kind {
+                WaitKind::Allocation {
+                    notify, yielded, ..
+                } => {
+                    *yielded = true;
+                    wake.push(notify.clone());
+                }
+                // Its own bind's wait for room ends: evicted, the bind
+                // waits for its restore, and nothing is funded for it
+                // meanwhile. Kept, the eviction waited on fires whose
+                // finalizer was that bind, and the bind on the eviction
+                // (Mac Pro's M5 soak: evicting=1 for good, pool free 0).
+                WaitKind::BindRoom {
+                    notify,
+                    served: false,
+                    withdrawn,
+                    ..
+                } => {
+                    *withdrawn = true;
+                    wake.push(notify.clone());
+                }
+                _ => {}
             }
         }
         wake

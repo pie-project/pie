@@ -196,6 +196,7 @@ impl ResidencyPlanner {
                                         run,
                                         pieces,
                                         served: false,
+                                        withdrawn: false,
                                         ..
                                     } if Some(waiter.pid) == restoring => Some(Step::BindRoom {
                                         key: *key,

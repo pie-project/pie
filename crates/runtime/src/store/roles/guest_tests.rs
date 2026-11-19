@@ -1600,12 +1600,13 @@ async fn a_small_bind_takes_free_room_while_a_long_one_waits_and_a_dropped_wait_
             },
             |_, _| false,
             |_, _| false,
-            |_, _| std::future::pending::<Result<(), String>>(),
+            |_, _| std::future::pending::<Result<crate::planner::BindRoomWait, String>>(),
             {
                 let roles = roles.clone();
                 move || roles.lock().unwrap().leave_guest_wait(holder(by))
             },
             |_| {},
+            || std::future::ready(()),
         )
     };
     let (long, long_engine) = runs_of(8, 4, 2, 0);
@@ -1651,10 +1652,11 @@ fn waiting_bind<'a>(
         move |_, _| {
             asked.set(asked.get() + 1);
             serve();
-            std::future::ready(Ok::<(), String>(()))
+            std::future::ready(Ok::<_, String>(crate::planner::BindRoomWait::Served))
         },
         move || roles.lock().unwrap().leave_guest_wait(holder(by)),
         |_| {},
+        || std::future::ready(()),
     )
 }
 

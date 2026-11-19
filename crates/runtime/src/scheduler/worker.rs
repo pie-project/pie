@@ -1339,8 +1339,12 @@ impl SchedulerHandle {
                 planner.set_bind_waiting(pid, waits);
             }
         };
+        // Before it waits, what its process has in flight lands and gives
+        // its leases back: nothing else finalizes it while its guest is in
+        // this bind.
+        let settle = move || crate::pipeline::fire::settle_process_fires(pid);
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting, settle,
         )
         .await?;
         Ok((registered, bound))
