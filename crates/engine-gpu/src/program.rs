@@ -27,8 +27,6 @@ pub struct Place<'a, B: Serve> {
     /// and pixel): a pass reads at most one row of each plane per lane.
     pub max_lanes: u32,
     pub planes: u32,
-    /// The frames the engine keeps in flight.
-    pub frames: usize,
 }
 
 #[derive(Debug)]
