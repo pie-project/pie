@@ -996,6 +996,15 @@ impl Engine for Metal {
         Ok(())
     }
 
+    /// Commits the epilogues of every landed step (their sink was told from
+    /// the completion handler) before the runtime takes their channels.
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.reap().map_err(fault)?;
+        }
+        Ok(())
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
         if let Some(shell) = self.shell.as_mut() {

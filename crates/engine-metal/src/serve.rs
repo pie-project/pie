@@ -3305,6 +3305,11 @@ impl Shell {
                         other => Err(refused(&other, *instance)),
                     });
                 if let Err(fault) = outcome {
+                    if flight.told.is_none() {
+                        // The handler told this step from the epilogue's
+                        // status words; the full report is here.
+                        tracing::warn!(instance = %instance, %fault, "an attached epilogue did not commit");
+                    }
                     faulted.push((lanes.clone(), *instance, fault.to_string()));
                 }
             }
@@ -6038,18 +6043,40 @@ impl engine::frame::Shell for Shell {
         // One frame in flight: the engine settles inside submit, and the sink
         // has each step's reports before submit returns, told from the
         // harvest on this thread once the buffer completed. More: the
-        // completion handler tells it, unless a program is attached: its
-        // epilogue's verdict is read and committed on this thread, at the
-        // harvest, and the sink hears which lanes faulted from there.
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 || !attached.is_empty() {
+        // completion handler tells it, so a landing never waits on the
+        // lane's next activity. An attached instance's epilogue is read
+        // there from its status words and the commit its harvest will make
+        // (one pass airborne an instance, so nothing commits between); the
+        // harvest commits it on this thread when the runtime publishes the
+        // landed step (`Engine::publish_landed`).
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
             (None, Some(tell))
         } else {
-            (Some(tell), None)
+            let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
+                .iter()
+                .map(|(instance, lanes)| {
+                    (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
+                })
+                .collect();
+            (Some((tell, checks)), None)
         };
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
-            if let Some(tell) = in_handler.as_ref() {
-                tell(refused, &[]);
+            if let Some((tell, checks)) = in_handler.as_ref() {
+                let faulted: Vec<Faulted> = if refused.is_some() {
+                    Vec::new()
+                } else {
+                    checks
+                        .iter()
+                        .filter_map(|(lanes, instance, check)| {
+                            check
+                                .as_ref()
+                                .and_then(crate::program::session::EpilogueCheck::fault)
+                                .map(|why| (lanes.clone(), *instance, why))
+                        })
+                        .collect()
+                };
+                tell(refused, &faulted);
             }
         })));
         let pending = match pending {
