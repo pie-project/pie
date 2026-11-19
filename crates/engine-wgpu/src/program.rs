@@ -13,7 +13,7 @@ use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, Value};
 use eta_exec::{PassInputs, StepOutcome};
 #[cfg(feature = "wgpu")]
 use eta_ir::registry::Stage;
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use engine_gpu::program::Refusal;
 use engine_gpu::program::{decode, numel_of};
@@ -22,6 +22,9 @@ struct Instance {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
+    /// The ports its program computes on the device
+    /// (`InstanceBinding::device_resolved`).
+    device: PortMask,
 
     channels: Vec<ChannelId>,
 
@@ -654,6 +657,7 @@ impl Plane {
                 plan,
                 inst,
                 geometry: binding.geometry,
+                device: binding.device_resolved,
                 channels: binding.channels.clone(),
                 poisoned,
                 landing,
@@ -789,6 +793,50 @@ impl Plane {
             }
         }
         Ok(())
+    }
+
+    /// What `instance`'s descriptor ports hold at the fire, once the pass
+    /// that put each cell settled.
+    pub fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let channels =
+            engine_gpu::program::descriptor_channels(&seat.plan, seat.geometry, seat.device);
+        #[cfg(feature = "wgpu")]
+        if !channels.is_empty() {
+            seat.gate.settle(instance)?;
+            for &channel in &channels {
+                if seat.inst.channels[channel as usize].is_empty() {
+                    self.settle_writers(seat.channels[channel as usize])?;
+                }
+            }
+        }
+        // A cell a deferred pass on the queue puts holds its placeholder in
+        // the ring until that pass lands.
+        for &channel in &channels {
+            let ring = &seat.inst.channels[channel as usize];
+            seat.landing.wait((channel, ring.head()), &seat.poisoned);
+        }
+        if seat.poisoned.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        engine_gpu::program::descriptor_ports(
+            &seat.plan,
+            &seat.inst,
+            seat.geometry,
+            seat.device,
+            instance,
+        )
+    }
+
+    #[must_use]
+    pub fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        self.instances.get(&instance).map(|seat| seat.geometry)
     }
 
     pub fn envelope_tokens(
@@ -1250,12 +1298,16 @@ impl Plane {
             }
             let inputs = PassInputs::none();
             let mut runner =
-                crate::guest::run::OnDevice::new(device, session, &widen, seats).deferred(frame);
+                crate::guest::run::OnDevice::new(device, session, &widen, seats).deferred(
+                    frame,
+                    engine_gpu::program::read_at_fire(seat.geometry, seat.device),
+                );
             let outcome = eta_exec::step_with(inst, plan, &inputs, &mut runner, Stage::Epilogue);
             let crate::guest::run::Deferral {
                 frame,
                 pass,
                 landings,
+                ..
             } = runner.take_deferral().unwrap_or_default();
             if inst.poisoned {
                 poisoned.store(true, Ordering::Release);
@@ -1735,6 +1787,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         Plane::envelope_fold(self, instance)
+    }
+
+    fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        Plane::geometry(self, instance)
+    }
+
+    fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        Plane::descriptor_ports(self, instance)
     }
 
     fn publish(

@@ -72,11 +72,10 @@ impl Session {
                         serde_json::Value::from(crate::engine::backend::eager_rungs()),
                     );
 
-                    // Fires whose geometry the host resolved though it is
-                    // not host-derivable: an engine limit or the program's
-                    // class, each named at bind.
-                    // Summed, and split by the engine the pass bound on, the
-                    // reason and the program.
+                    // Fires whose geometry the host evaluated though it is
+                    // not host-derivable: the program's class, named at bind.
+                    // Summed, and split by the engine the pass bound on and
+                    // the program.
                     let host_fires = crate::pipeline::fire::host_geometry::by();
                     stats.insert(
                         format!("{}.host_geometry_fires", model_name),
@@ -91,7 +90,6 @@ impl Session {
                                     serde_json::json!({
                                         "engine": key.engine,
                                         "kind": key.kind,
-                                        "reason": key.reason,
                                         "program": format!("{:016x}", key.program),
                                         "fires": fires,
                                     })

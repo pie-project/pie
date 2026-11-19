@@ -2,6 +2,7 @@ mod beam_stage;
 mod bf16_values;
 mod bool_gather;
 mod bool_moves;
+mod device_geometry;
 mod fold;
 mod folded_roots;
 mod guest_settle;

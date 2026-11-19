@@ -193,7 +193,7 @@ pub struct BoundForwardPass {
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
     /// Bound with a [`crate::pipeline::fire::host_geometry::HostGeometry`]:
     /// each fire resolves its geometry on the host, and is counted here
-    /// (`host_geometry::counter`, under its engine, reason and program).
+    /// (`host_geometry::counter`, under its engine and program).
     pub host_geometry: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
     pub facts: Vec<LaneFacts>,
