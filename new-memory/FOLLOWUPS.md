@@ -663,9 +663,25 @@ median of 5, two rounds):
 | qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
 | gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
 
-About 100 µs is the folded products on the turned kernel. The other ~70 µs is not yet
-ablated: attention, the qkv/rope kernel, the m = 4 lm head, and the host side (four lanes'
-sampling and channel work).
+The other kernels, ablated the same way (one extra launch of each, Δ step µs at g1 → g4):
+
+| kernel | g1 | g4 | 4-row extra |
+|---|---|---|---|
+| attention decode (`paged_decode_mfma`) | +204 | +202 | 0 |
+| `merge_partials` | +125 | +128 | 0 |
+| qkv / rope / KV write | +137 | +162 | +25 |
+| lm head (one call a step) | +71 | +81 | +10 |
+
+The ledger: gated turned gate-up +67, folded qkv on turn +30, qkv/rope +25, lm head +10,
+down +6. o-proj, attention and merge add nothing. That is ≈138 µs; the remaining ~30 is
+host / channel / sampling work, not kernel-ablated.
+
+The routes are already the faster ones here. Gate-up on the folded skinny kernel instead of
+turn costs 4-parallel +20 µs (1.497 vs 1.476 ms); o-proj on turn costs +28 (F39). The gated
+turned product's cost is its own: 9.0 µs a call against skinny's 6.6 at m = 1, about
+1.4 TB/s against 1.9. More tiles a block (one norm stage walking them) does not help: two a
+block 1.488 ms (the same), three 1.524, four 1.573. A 16 + 16-column gated tile is the same
+work a block as two tiles, so it is not expected to help either.
 
 Tried, none kept (4-parallel ms a step, against 1.475–1.484):
 - skinny at m = 4: staging the activation four loads at a time (worse); reading it from
@@ -676,8 +692,9 @@ Tried, none kept (4-parallel ms a step, against 1.475–1.484):
   304 CUs): 1.498–1.505.
 
 Next:
-- gated turned product at m = 4 (9.0 vs 6.6 µs at m = 1 on skinny): an exact device-duration
-  breakdown (the norm stage per block × 384 blocks, the gated epilogue, residency);
-- ablate the remaining ~70 µs the same way;
+- gated turned product at m = 4: why its walk streams at 1.4 TB/s (latency per tile under
+  one wave a SIMD), with the PMC counters inside a duplication run rather than the attach
+  trace;
+- the ~30 µs host / channel / sampling share at four lanes;
 - the duplication switch is a scratch patch: a profile probe that times a kernel in place
   (in a captured body) would make it a standing instrument.
