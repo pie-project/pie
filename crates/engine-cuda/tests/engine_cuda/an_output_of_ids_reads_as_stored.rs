@@ -110,6 +110,7 @@ fn an_output_of_ids_reads_as_stored() {
             DEPTH,
             DEPTH,
             1,
+            ROWS,
         )
         .expect("the drafts bind");
     let fired = plane.fire(&context, instance).expect("the fire runs");

@@ -537,6 +537,7 @@ impl Session {
             .iter()
             .flat_map(|stage| stage.tables.iter().cloned())
             .collect();
+        staging_fits(&core, &resolved)?;
         let (placed, run) =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
@@ -1156,6 +1157,42 @@ impl Drop for Session {
             d.destroy_descriptor_pool(self.pool, None);
         }
     }
+}
+
+/// The host memory a session's stages stage through: each stage's
+/// staging and landing, its scratch's bytes each, in pinned host memory
+/// off the device's heaps on a discrete device (where the device's heap
+/// is the host's, the device's books hold them). Refused by name past
+/// what the host has room for now (`MemAvailable` less what lmkd defends
+/// and the floor, where the host states it), beside what the books
+/// already count there ([`engine_gpu::books::Books::host`]).
+fn staging_fits(core: &Core, resolved: &[StageTables]) -> Result<()> {
+    let need = resolved
+        .iter()
+        .try_fold(0u64, |sum, stage| {
+            sum.checked_add(stage.scratch.checked_mul(2)?)
+        })
+        .ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: "a guest session's staging bytes pass a u64".into(),
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let room = engine_gpu::host_memory::room()?.room;
+        if need > room {
+            return Err(Fault::Ceiling {
+                what: "host bytes of a guest session's staging",
+                need,
+                have: room,
+            });
+        }
+    }
+    tracing::debug!(
+        need,
+        held = core.books.host(),
+        "a guest session's staging, in host memory"
+    );
+    Ok(())
 }
 
 /// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a

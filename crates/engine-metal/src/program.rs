@@ -1064,6 +1064,56 @@ impl Plane {
         )
     }
 
+    /// The stage `at` of every instance `ids` names, in one command buffer
+    /// and one wait: each instance's regions in order, the instances one
+    /// after another. A step's prologues waited a buffer a region an
+    /// instance; their verdicts are read once this one has landed.
+    pub fn fire_batched(
+        &mut self,
+        context: &Context,
+        ids: &[InstanceId],
+        at: Attach,
+    ) -> Result<Vec<(InstanceId, Fired)>> {
+        let mut frame = context.frame()?;
+        let mut encoded = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let bound = self
+                .instances
+                .get_mut(&id)
+                .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+            let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!(
+                        "instance {id} names program {}, which is gone",
+                        bound.program_id
+                    ),
+                )
+            })?;
+            let scratch = bound.scratch.first().cloned();
+            encoded.push((
+                id,
+                bound
+                    .session
+                    .encode_stages(&mut frame, &program.compiled, &program.plan, at, scratch)?,
+            ));
+        }
+        frame.commit()?;
+        let mut fired = Vec::with_capacity(encoded.len());
+        for (id, launched) in encoded {
+            let verdict = match launched {
+                Err(refused) => refused,
+                Ok(launched) => {
+                    let bound = self.instances.get_mut(&id).expect("encoded above");
+                    let program = self.programs.get(&bound.program_id).expect("encoded above");
+                    bound.session.verdict_of_launched(&program.plan, &launched, at)?
+                }
+            };
+            fired.push((id, verdict));
+        }
+        Ok(fired)
+    }
+
     pub fn stage_batched(
         &mut self,
         frame: &mut Frame,

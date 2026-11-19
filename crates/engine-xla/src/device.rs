@@ -567,6 +567,12 @@ impl Device {
         self.cache.lock().expect("cache lock poisoned").remove(&key);
     }
 
+    /// [`Device::forget`] by the cache key of a program's text (the blake3
+    /// of it): a stage the guest stage cache evicted.
+    pub fn forget_key(&self, key: &[u8; 32]) {
+        self.cache.lock().expect("cache lock poisoned").remove(key);
+    }
+
     /// Marks the warm ladder done: every program wanted from now on is
     /// counted (and logged) as a miss.
     /// Whether the load sealed its programs: a serving fire's program built
