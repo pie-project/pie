@@ -296,8 +296,8 @@ impl ResidencyPlanner {
     fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {
         let reason = format!("KV restore failed: {reason}");
         // The engine's scheduler gone: the worker is shutting down, and the
-        // restore was cut by it, no failure of the process's (Mac Pro's
-        // logs after SIGTERM: "engine 0 has no scheduler").
+        // restore was cut by it, no failure of the process's (logs after
+        // SIGTERM: "engine 0 has no scheduler").
         let (_, engine) = self.port.locus();
         if crate::scheduler::scheduler_handle(engine).is_err() {
             tracing::debug!(pid = %pid, %reason, "planner: a restore cut by shutdown");

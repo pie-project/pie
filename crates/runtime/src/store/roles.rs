@@ -1604,9 +1604,10 @@ impl Roles {
                 // Parked with its instances: its contents are dead between
                 // fires, so it comes back on its own, fresh room on the
                 // device for this bind; its parked instances are rebound to
-                // it as they unpark. Parked where it lies, its dead part
-                // given back ([`Item::shed`]), it comes back the same way:
-                // bound to its emptied part, the bind named no place.
+                // it as they unpark.
+                // Parked where it lies, its dead part given back
+                // ([`Item::shed`]), it comes back the same way: bound to its
+                // emptied part, the bind named no place.
                 Some(item)
                     if item.tier == Tier::Host || (item.tier == Tier::Device && item.shed) =>
                 {
@@ -2399,9 +2400,9 @@ impl Roles {
                 // Its holders on the device; a parked one is rebound when it
                 // unparks. One parked where it lies (no tier below took its
                 // live parts, its dead ones given back: [`Item::shed`]) is
-                // parked too: rebound now, it named no scratch at all (the
-                // disk-only home: "a guest item ... and its binding names
-                // []" on another process's restore of the pair).
+                // parked too: rebound now, it named no scratch at all ("a
+                // guest item ... and its binding names []" on another
+                // process's restore of the pair).
                 Owner::Adapter(_) | Owner::Pair(_)
                     if item.stale && self.unparks_with(*owner, item, holder) =>
                 {
