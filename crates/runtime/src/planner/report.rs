@@ -224,6 +224,7 @@ impl ResidencyPlanner {
 
     pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId, need: (u32, u32)) {
         let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
+        let gives = self.port.room_gives();
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
@@ -238,6 +239,7 @@ impl ResidencyPlanner {
                 // the same: the need understates its unpark.
                 if proc.roles_free_retry.take() == Some(need) {
                     proc.roles_free_short = Some(need);
+                    proc.roles_free_short_at = gives;
                 }
             }
         });

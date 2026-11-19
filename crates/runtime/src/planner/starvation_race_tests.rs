@@ -4467,3 +4467,96 @@ async fn a_restore_head_among_residents_waiting_on_grants_is_served_after_a_comp
         assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
     }
 }
+
+/// Mac Pro's disk-only home on 45cf89b8c (500 at once, stalled in
+/// seconds): the head a restore with no kv to ask (head_pages=0) and a
+/// roles need of a run of 3, 70 free runs of 3 standing (the map's
+/// cheapest cost 0), every resident waiting on a grant. A head whose runs
+/// stand is sent at once. One whose need was marked understated (it went
+/// on free runs before and came back short) is not sent again on the same
+/// room (the 20M-round livelock) but is once room has been given back
+/// since; it is never held for good on runs that stand.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_room_is_given() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for understated in [false, true] {
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let pool = Arc::new(BindRoomPool {
+            model,
+            ..BindRoomPool::new(12, 0..0, 0)
+        });
+        pool.free.lock().extend([0, 1, 2, 6, 7, 8]);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        let residents: Vec<ProcessId> = (0..3).map(|_| ProcessId::new_v4()).collect();
+        for &pid in &residents {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&head).unwrap();
+            proc.state = Residency::Evicted;
+            proc.roles_short = Some(super::proc::PendingBind {
+                run: 3,
+                pieces: 1,
+                pages: 3,
+            });
+            if understated {
+                proc.roles_free_short = Some((3, 1));
+                proc.roles_free_short_at = 0;
+            }
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+            for &pid in &residents {
+                inner.enqueue(
+                    pid,
+                    WaitKind::Allocation {
+                        demand: Demand {
+                            kv_pages: 1,
+                            rs: RsUnits::default(),
+                        },
+                        notify: Arc::new(Notify::new()),
+                        outcome: None,
+                        yielded: false,
+                        rise: false,
+                    },
+                );
+            }
+        });
+        assert!(pool.guest_room_free(3, 1), "runs of its need stand");
+        let sent = |planner: &Arc<ResidencyPlanner>| {
+            planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some())
+                || planner.stats.restores.load(Ordering::Relaxed) > 0
+        };
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if sent(&planner) {
+                break;
+            }
+        }
+        if !understated {
+            assert!(sent(&planner), "its runs stand: it is sent at once");
+            assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
+            continue;
+        }
+        assert!(!sent(&planner), "understated: not sent again on the same room");
+        assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one moved");
+        // Room is given back: the runs that stand send it once more.
+        pool.gives.fetch_add(1, Ordering::Relaxed);
+        planner.pages_freed();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if sent(&planner) {
+                break;
+            }
+        }
+        assert!(sent(&planner), "room given since: sent once more");
+    }
+}
