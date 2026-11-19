@@ -423,6 +423,45 @@ impl<'c, B: Backend> Run<'c, B> {
         self.slice(handle, span.row_offset, span.rows)
     }
 
+    /// A row-shaped value as attention binds it: in a window of the fire's
+    /// own rows, the fire's whole value, the window's rows from
+    /// [`Self::row0`] on (so its views are the ones the load bound, whatever
+    /// window a fire cuts); in a gathered window, its compacted column.
+    pub fn attended(&self, id: ValueId) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.tensor(id)
+        } else {
+            self.uncut(id)
+        }
+    }
+
+    /// A fire table as attention binds it, as [`Self::attended`]: whole, or
+    /// a gathered window's own.
+    pub fn attended_rows(&self, handle: Tensor) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.cut_rows(handle)
+        } else {
+            handle
+        }
+    }
+
+    /// The row of what [`Self::attended`] binds the window's first row is.
+    pub fn row0(&self) -> u32 {
+        if self.window().gathered.is_some() {
+            0
+        } else {
+            self.window().span.row_offset
+        }
+    }
+
+    /// The window's rows.
+    pub fn window_rows(&self) -> u32 {
+        match &self.window().gathered {
+            Some(gathered) => gathered.positions.rows,
+            None => self.window().span.rows,
+        }
+    }
+
     pub fn at_region(&self) -> u32 {
         self.place.region.get()
     }
