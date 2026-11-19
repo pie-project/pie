@@ -370,12 +370,17 @@ fn abort(model: usize, engine: usize, txn: Move) {
     }
 }
 
-/// Aborts the move it still holds when dropped, after any copy in flight.
+/// Aborts the move it still holds when dropped, after any copy in flight
+/// has landed: a copy's completion may settle before it has written its
+/// destinations (its sources go back at once where nothing can reach them
+/// first), so the slots an abort gives back wait for every copy to land.
 struct MoveGuard {
     model: usize,
     engine: usize,
     txn: Option<Move>,
     in_flight: Vec<crate::scheduler::ControlCompletion>,
+    /// A copy of the move was handed to the engine.
+    submitted: bool,
 }
 
 impl MoveGuard {
@@ -385,6 +390,7 @@ impl MoveGuard {
             engine,
             txn: Some(txn),
             in_flight: Vec::new(),
+            submitted: false,
         }
     }
 
@@ -396,6 +402,7 @@ impl MoveGuard {
             let started = Instant::now();
             let completion = crate::scheduler::copy_tier_tracked(self.engine, &copy)
                 .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+            self.submitted = true;
             self.in_flight.push(completion.clone());
             waits.push((copy, started, completion));
         }
@@ -425,7 +432,7 @@ impl Drop for MoveGuard {
             return;
         };
         let in_flight = std::mem::take(&mut self.in_flight);
-        if in_flight.is_empty() {
+        if !self.submitted {
             abort(self.model, self.engine, txn);
             return;
         }
@@ -440,10 +447,20 @@ impl Drop for MoveGuard {
             return;
         };
         crate::rt::spawn(async move {
-            for completion in in_flight {
-                let _ = completion.wait().await;
+            let settled = crate::scheduler::settle_copies(engine);
+            if let Err(error) =
+                crate::scheduler::abort_once_landed(in_flight, settled, || abort(model, engine, txn))
+                    .await
+            {
+                tracing::error!(
+                    model,
+                    engine,
+                    %error,
+                    "a residency move's copies did not settle; preserving its pages and \
+                     slots to avoid reuse under a copy"
+                );
+                return;
             }
-            abort(model, engine, txn);
             if let Some(planner) = crate::planner::planner_for(model, engine) {
                 planner.pages_freed();
             }
