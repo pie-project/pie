@@ -479,6 +479,7 @@ impl<B: Serve> Serve for Named<B> {
         _pipelines: &Self::Pipelines,
         _readout: &[NoBuffer],
         _weights_stream: bool,
+        _guest: crate::serve::GuestRoom,
     ) -> Result<()> {
         Ok(())
     }

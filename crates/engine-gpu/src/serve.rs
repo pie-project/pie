@@ -177,13 +177,15 @@ pub trait Serve: Backend {
     fn bound(pipelines: &Self::Pipelines) -> u64;
 
     /// The backend's state of a fresh load over its `readout` seats, with
-    /// whatever device memory it keeps for every fire (made before the pool
-    /// is sized, so the pool is sized past it).
+    /// whatever device memory it keeps for every fire and its guest plane
+    /// takes (`guest`), made before the pool is sized, so the pool is sized
+    /// past it.
     fn shelf(
         device: &Self::Context,
         pipelines: &Self::Pipelines,
         readout: &[Self::Buffer],
         weights_stream: bool,
+        guest: GuestRoom,
     ) -> Result<Self::Shelf>;
 
     /// What a kept step binds moved: the segments, or a layer's stage.
@@ -1715,7 +1717,18 @@ impl<B: Serve> Shell<B> {
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         let weights_stream = weights.streams() || weights.gathered().is_some();
-        let shelf = B::shelf(&device, &pipelines, &readout, weights_stream)?;
+        let shelf = B::shelf(
+            &device,
+            &pipelines,
+            &readout,
+            weights_stream,
+            GuestRoom {
+                chunk_bytes: chunk,
+                seats: readout.len() + pixel_out.len(),
+                max_lanes: boot.budget.max_lanes,
+                planes: u32::try_from(readouts.len() + pixels.len()).unwrap_or(u32::MAX),
+            },
+        )?;
 
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation beside the
@@ -5567,6 +5580,19 @@ struct NamingMedia {
     routes: Vec<i32>,
     positions: Vec<i32>,
     grids: Vec<i32>,
+}
+
+/// What a load's guest plane reserves by, which a backend's shelf reserves
+/// before the pool is sized ([`Serve::shelf`]): a guest pass reads at most
+/// one row of each of the `planes` a fire reads out per lane, from the
+/// `seats` (each arm's readout and pixel seats), and reads back at most a
+/// chunk of the pool.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestRoom {
+    pub chunk_bytes: u64,
+    pub seats: usize,
+    pub max_lanes: u32,
+    pub planes: u32,
 }
 
 /// The views a fire of `owned` lanes stages: its seated lanes, their media

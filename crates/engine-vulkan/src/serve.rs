@@ -163,6 +163,7 @@ impl Serve for Api {
         _pipelines: &Pipelines,
         _readout: &[Buffer],
         weights_stream: bool,
+        _guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the

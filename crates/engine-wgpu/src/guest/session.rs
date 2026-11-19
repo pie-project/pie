@@ -7,7 +7,7 @@ use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
-use crate::device::alloc::{Buffer, Memory};
+use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
 use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
@@ -244,9 +244,9 @@ impl std::fmt::Debug for Library {
 }
 
 impl Library {
-    /// The guest pipelines, and `threads` readback buffers of
-    /// `outbox_bytes` each.
-    pub fn build(device: &Context, outbox_bytes: u64, threads: u32) -> Result<Library> {
+    /// The guest pipelines, reading back through `outboxes` (one a thread
+    /// that runs guest passes, which the load's shelf reserved).
+    pub fn build(device: &Context, outboxes: Vec<Buffer>) -> Result<Library> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -261,16 +261,6 @@ impl Library {
         let pipelines: Vec<_> = (0..engine_gpu::guest::step_calls())
             .map(|call| build_call(&core, &layout, call))
             .collect();
-        let outboxes = (0..threads)
-            .map(|_| {
-                Buffer::with(
-                    device,
-                    outbox_bytes,
-                    Memory::Readback,
-                    engine_gpu::books::owners::GUEST,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
         let library = Library {
             core: core.clone(),
             binds,
@@ -1232,7 +1222,14 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&crate::api::DeviceBoot::default(), allowance).unwrap();
-        let library = Library::build(&device, 4096, 1).unwrap();
+        let outbox = Buffer::with(
+            &device,
+            4096,
+            crate::device::alloc::Memory::Readback,
+            engine_gpu::books::owners::GUEST,
+        )
+        .unwrap();
+        let library = Library::build(&device, vec![outbox]).unwrap();
         let call = eta_compiler::codegen::wgsl::step_calls()
             .iter()
             .position(|text| text.contains("op_copy("))

@@ -12,6 +12,12 @@ use engine_gpu::error::Result;
 pub struct Shelf {
     mirror: Vec<Buffer>,
 
+    /// The guest plane's readback buffers, one a thread that runs guest
+    /// passes, a chunk of the pool each, and its readout widen's table:
+    /// reserved before the pool is sized, the plane takes them at its load.
+    #[cfg(feature = "wgpu")]
+    pub(crate) guest: (Vec<Buffer>, Buffer),
+
     mailbox: crate::landing::Mailbox,
 
     worker: crate::landing::Worker,
@@ -157,6 +163,7 @@ impl Serve for Api {
         pipelines: &Pipelines,
         readout: &[Buffer],
         _weights_stream: bool,
+        guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // A frame takes a scratch chunk from the ring: stocked for each frame
         // in flight (an arm a readout seat) and the one a settle or a walk
@@ -166,9 +173,35 @@ impl Serve for Api {
         #[cfg(feature = "wgpu")]
         device.core().stock_rings(readout.len() + 1);
         #[cfg(not(feature = "wgpu"))]
-        let _ = device;
+        let _ = (device, guest);
         let _ = pipelines;
+        #[cfg(feature = "wgpu")]
+        let threads = u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX);
         Ok(Shelf {
+            #[cfg(feature = "wgpu")]
+            guest: (
+                (0..threads)
+                    .map(|_| {
+                        Buffer::with(
+                            device,
+                            guest.chunk_bytes,
+                            crate::device::Memory::Readback,
+                            engine_gpu::books::owners::GUEST,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Buffer::with(
+                    device,
+                    crate::guest::widen::Widen::table_bytes(
+                        device,
+                        guest.seats,
+                        threads,
+                        u64::from(guest.max_lanes) * u64::from(guest.planes),
+                    ),
+                    crate::device::Memory::Device,
+                    engine_gpu::books::owners::GUEST,
+                )?,
+            ),
             mirror: readout
                 .iter()
                 .map(|seat| {

@@ -483,6 +483,7 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         max_lanes: shell.budget().max_lanes,
         planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
             .unwrap_or(u32::MAX),
+        shelf: &shell.shelf,
     }
 }
 
