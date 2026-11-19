@@ -55,6 +55,9 @@ pub struct Metal {
     adapters: BTreeMap<InstanceId, u32>,
     /// What the load armed and what its fires tallied (`engine::live`).
     live: engine::live::Live,
+    /// Where a tier copy still landing is told landed
+    /// (`Engine::copy_slots_landing`).
+    landed: Option<engine::LandingSink>,
 }
 
 impl Metal {
@@ -86,6 +89,7 @@ impl Metal {
             pending: None,
             adapters: BTreeMap::new(),
             live: engine::live::Live::armed(),
+            landed: None,
         }
     }
 
@@ -792,27 +796,32 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
-    /// Not stated yet, as [`Engine::copy_slots_landing`] is not.
+    /// Waits on the last copy's command buffer: every copy submitted so far
+    /// has read its sources and written its destinations.
     fn settle_copies(&mut self) -> EngineResult<()> {
-        Err(Error::unsupported(
-            self.kind(),
-            "settle_copies (copy landing is not stated on Metal yet)",
-        ))
+        match self.shell.as_mut() {
+            Some(shell) => shell.settle_copies().map_err(fault),
+            None => Ok(()),
+        }
     }
 
-    /// Not stated yet: this engine's tier copies may still be reading their
-    /// sources when `copy_slots` returns, and only its own completion (not a
-    /// guess of `true`) may tell the runtime they can go back.
+    /// A copy on the device rides a command buffer that may still be
+    /// reading its sources when the call returns: told landed from that
+    /// buffer's completion. A move to or from the host tier or the slot
+    /// files is a host copy done inside the call: its sources are read.
     fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        let _ = (copy, token);
-        Err(Error::unsupported(
-            self.kind(),
-            "copy_slots_landing (copy landing is not stated on Metal yet)",
-        ))
+        let landed = self.landed.clone();
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
