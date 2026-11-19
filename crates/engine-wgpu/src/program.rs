@@ -990,10 +990,9 @@ impl Plane {
             let stride = engine_gpu::guest::session::step_stride(place.device.table_align());
             if let Some(library) = &self.library {
                 let room = library.outbox_bytes();
-                for (stage, bytes) in crate::guest::session::stage_read_bytes(&plan.package)
-                    .into_iter()
-                    .enumerate()
-                {
+                let reads = crate::guest::session::stage_read_bytes(&plan.package)
+                    .map_err(|why| Refusal::Program(format!("program {}: {why}", program.0)))?;
+                for (stage, bytes) in reads.into_iter().enumerate() {
                     if bytes > room {
                         return Err(Refusal::Program(format!(
                             "program {} stage {stage} reads back {bytes} bytes (its status and                              puts), past the {room} a guest thread's readback buffer holds",

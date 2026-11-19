@@ -119,40 +119,65 @@ pub fn instance_table_sizes(
 
 /// What each stage of `package` reads back at its collect: its status, then
 /// each value it puts, in whole words. A put is its channel's shape, fixed in
-/// the container, so this is known when the program registers.
-#[must_use]
-pub fn stage_read_bytes(package: &LaunchPackage) -> Vec<u64> {
+/// the container, so this is known when the program registers; a put into a
+/// channel the package does not declare is refused.
+pub fn stage_read_bytes(package: &LaunchPackage) -> std::result::Result<Vec<u64>, String> {
     package
         .stages
         .iter()
-        .map(|stage| {
-            STATUS_SPAN
-                + stage
-                    .puts
+        .enumerate()
+        .map(|(at, stage)| {
+            stage.puts.iter().try_fold(STATUS_SPAN, |sum, put| {
+                let channel = package
+                    .channels
                     .iter()
-                    .map(|put| {
-                        package
-                            .channels
-                            .iter()
-                            .find(|channel| channel.id == put.channel)
-                            .map_or(4, |channel| {
-                                let len = channel
-                                    .shape
-                                    .iter()
-                                    .map(|&dim| u64::from(dim))
-                                    .product::<u64>();
-                                let bytes = match channel.dtype {
-                                    eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bool) => {
-                                        len
-                                    }
-                                    _ => len * 4,
-                                };
-                                bytes.max(4).next_multiple_of(4)
-                            })
-                    })
-                    .sum::<u64>()
+                    .find(|channel| channel.id == put.channel)
+                    .ok_or_else(|| {
+                        format!(
+                            "stage {at} puts value {} into channel {}, which the package \
+                             declares no channel of",
+                            put.value, put.channel
+                        )
+                    })?;
+                let len = channel
+                    .shape
+                    .iter()
+                    .map(|&dim| u64::from(dim))
+                    .product::<u64>();
+                let bytes = match channel.dtype {
+                    eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bool) => len,
+                    _ => len * 4,
+                };
+                Ok(sum + bytes.max(4).next_multiple_of(4))
+            })
         })
         .collect()
+}
+
+/// Refuses a stage whose puts (`reads`, the stage's values its collect
+/// copies to the host) do not each lie, in whole words, inside its heap of
+/// `heap_bytes`: a span past it would read another instance's bytes back.
+fn puts_in_heap(
+    reads: &[u32],
+    offsets: &[u64],
+    descriptors: &[ValueDesc],
+    heap_bytes: u64,
+) -> std::result::Result<(), String> {
+    for &value in reads {
+        let at = value as usize;
+        let (Some(&offset), Some(desc)) = (offsets.get(at), descriptors.get(at)) else {
+            return Err(format!("the put value {value} has no span in its stage"));
+        };
+        let end = offset.checked_add(desc.device_bytes().next_multiple_of(4));
+        if end.is_none_or(|end| end > heap_bytes) {
+            return Err(format!(
+                "the put value {value} at byte {offset} of {} runs past its heap of \
+                 {heap_bytes} bytes",
+                desc.device_bytes()
+            ));
+        }
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -466,9 +491,26 @@ impl Session {
         }
         let places = [&instance, &pair];
         let mut stages = Vec::with_capacity(plans.len());
-        for ((lowered, resolved), &heap) in code.iter().zip(resolved).zip(&layout.stages) {
+        for (at, ((lowered, resolved), &heap)) in
+            code.iter().zip(resolved).zip(&layout.stages).enumerate()
+        {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let args = placed.next().expect("a stage's step uniforms");
+            let reads = package.stages.get(at).map_or(Ok(Vec::new()), |stage| {
+                stage
+                    .puts
+                    .iter()
+                    .filter_map(|put| {
+                        engine_gpu::guest::run::local_of(package, at, put.value).transpose()
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            puts_in_heap(&reads, &resolved.offsets, &resolved.descriptors, heap.2).map_err(
+                |why| Fault::Program {
+                    at: "guest::session",
+                    why: format!("stage {at}: {why}"),
+                },
+            )?;
             let span = heap_span(places, heap)?;
             stages.push(build_stage(
                 device, &core, &library, &status, resolved, tables, lowered, args, stride, heap,
@@ -671,9 +713,10 @@ impl Session {
                 at: "guest::session",
                 why: format!("value {value} is not stage {stage}'s"),
             })?;
-            let held = self.stages[stage].heap.2 - at;
-            layout.push((value, at, cursor, len.next_multiple_of(4).min(held)));
-            cursor += len.next_multiple_of(4).min(held);
+            // Inside its heap, as its bind checked ([`puts_in_heap`]).
+            let len = len.next_multiple_of(4);
+            layout.push((value, at, cursor, len));
+            cursor += len;
         }
         let (heap, base, _) = self.heap_at(stage)?;
         let heap = heap.clone();
@@ -972,7 +1015,7 @@ fn build_stage(
 
 #[cfg(test)]
 mod tests {
-    use super::{STATUS_SPAN, stage_read_bytes};
+    use super::{STATUS_SPAN, puts_in_heap, stage_read_bytes};
     use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, LaunchPut, LaunchStage};
     use eta_ir::Dtype;
     use eta_ir::container::ChanDType;
@@ -1026,13 +1069,56 @@ mod tests {
         };
         // f32 x4, three bools in a word, a scalar; then a vocab row; then none.
         assert_eq!(
-            stage_read_bytes(&package),
+            stage_read_bytes(&package).unwrap(),
             [
                 STATUS_SPAN + 16 + 4 + 4,
                 STATUS_SPAN + 151_936 * 4,
                 STATUS_SPAN
             ]
         );
+    }
+
+    #[test]
+    fn a_put_into_a_channel_the_package_does_not_declare_is_refused() {
+        let package = LaunchPackage {
+            channels: vec![channel(0, &[4], Dtype::F32)],
+            stages: vec![LaunchStage {
+                puts: vec![LaunchPut {
+                    channel: 7,
+                    value: 0,
+                }],
+                ..LaunchStage::default()
+            }],
+            ..LaunchPackage::default()
+        };
+        let why = stage_read_bytes(&package).expect_err("refused");
+        assert!(why.contains("channel 7"), "{why}");
+    }
+
+    fn f32s(len: u32) -> eta_exec::ValueDesc {
+        eta_exec::ValueDesc {
+            len,
+            ..eta_exec::ValueDesc::default()
+        }
+    }
+
+    #[test]
+    fn a_put_inside_its_heap_is_read_back() {
+        let descriptors = [f32s(3), f32s(1)];
+        let offsets = [0, 12];
+        assert_eq!(puts_in_heap(&[0, 1], &offsets, &descriptors, 16), Ok(()));
+    }
+
+    #[test]
+    fn a_put_past_its_heap_is_refused() {
+        // Value 1 ends at byte 20 of a 16-byte heap: the rest is another
+        // instance's.
+        let descriptors = [f32s(3), f32s(2)];
+        let offsets = [0, 12];
+        assert!(puts_in_heap(&[1], &offsets, &descriptors, 16).is_err());
+        assert!(puts_in_heap(&[0], &offsets, &descriptors, 16).is_ok());
+        // A put with no span in its stage.
+        assert!(puts_in_heap(&[2], &offsets, &descriptors, 16).is_err());
     }
 
     #[test]
