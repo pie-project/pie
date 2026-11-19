@@ -394,7 +394,10 @@ pub struct Stepwise {
 /// stage's one area at `cfg.temporary`.
 /// 5: a reshape that covers its source is read as its source whatever the
 /// stage's channel slots number, and launches nothing.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 5;
+/// 6: `bf16` values (`DT_BF16`, wire tag 5): loaded a half of a word,
+/// computed in f32, and stored rounded to nearest even a word at a time,
+/// an invocation owning both elements of every word it writes.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -1356,5 +1359,172 @@ mod select_tests {
         // State, a histogram per workgroup, a tally pair per workgroup, and
         // the candidates' keys and indices.
         assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
+    }
+}
+
+/// The runtime's `bf16` stores, read from its text: no two invocations
+/// write one word, and every op whose result may be `bf16` stores it so.
+#[cfg(test)]
+mod bf16_store_tests {
+    use super::RUNTIME;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Each runtime function's name and body.
+    fn functions() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in RUNTIME.lines() {
+            if let Some(rest) = line.strip_prefix("fn ") {
+                if let Some(done) = current.take() {
+                    out.push(done);
+                }
+                let name = rest.split('(').next().unwrap_or("").trim().into();
+                current = Some((name, String::new()));
+            } else if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        out.extend(current);
+        out
+    }
+
+    /// The ops whose result may be `bf16` (`eta_ir::infer`): every one
+    /// that stores a float result an element at a time, but a reduction's,
+    /// a product's, an rng's, a constant's and an iota's, which are never
+    /// `bf16`.
+    const NEVER_BF16: &[&str] = &[
+        "op_reduce_finish",
+        "op_matmul",
+        "op_rng",
+        "op_const",
+        "op_iota",
+    ];
+
+    #[test]
+    fn a_bf16_word_is_one_invocation_s() {
+        let functions = functions();
+        let mut storers = 0;
+        for (name, body) in &functions {
+            let stores_h = body.contains("st_h_word(");
+            if name == "st_h_word" {
+                // The one store: a whole word, both halves.
+                assert!(body.contains("hst(base(v) + w, packed)"), "{body}");
+                assert!(body.contains("w * 2u + 1u < n"), "the padding half is the value's");
+                continue;
+            }
+            if stores_h {
+                storers += 1;
+                // An invocation strides over words (or rows of whole words,
+                // the scan), never over elements.
+                let by_words = body.contains("< h_words(") && body.contains("= w + lanes")
+                    || body.contains("< h_words(") && body.contains("= w2 + lanes");
+                let by_groups = name == "op_cumulative" && body.contains("g < groups");
+                assert!(
+                    by_words || by_groups,
+                    "`{name}` stores bf16 words but does not hand an invocation whole words"
+                );
+                // A bf16 branch stores nothing an element at a time.
+                let branch = body
+                    .split("DT_BF16")
+                    .nth(1)
+                    .and_then(|rest| rest.split("return;").next())
+                    .unwrap_or("");
+                for single in ["st_f(o", "st_as_f(o", "st_raw(o", "st_i(o", "hst(base(o)"] {
+                    assert!(
+                        !branch.contains(single),
+                        "`{name}`'s bf16 branch stores an element alone (`{single}`)"
+                    );
+                }
+            } else if (body.contains("st_f(o,") || body.contains("st_as_f(o,"))
+                && !NEVER_BF16.contains(&name.as_str())
+            {
+                panic!("`{name}` stores a float result with no bf16 word store");
+            }
+        }
+        assert!(storers >= 12, "{storers} ops store bf16 words");
+    }
+
+    #[test]
+    fn the_runtime_rounds_as_the_ir_does() {
+        // The runtime's rounding, transcribed: it must be eta_ir's.
+        fn wgsl_round(x: f32) -> u32 {
+            let b = x.to_bits();
+            if (b & 0x7FFF_FFFF) > 0x7F80_0000 {
+                return ((b >> 16) | 0x40) & 0xFFFF;
+            }
+            b.wrapping_add(0x7FFF + ((b >> 16) & 1)) >> 16
+        }
+        assert!(RUNTIME.contains("return (b + 0x7FFFu + ((b >> 16u) & 1u)) >> 16u;"));
+        assert!(RUNTIME.contains("return ((b >> 16u) | 0x40u) & 0xFFFFu;"));
+        assert!(RUNTIME.contains("const DT_BF16 : u32 = 5u;"));
+        assert_eq!(u32::from(eta_ir::types::WIRE_BF16), 5);
+        let mut x = 0x0001_2345u32;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let f = f32::from_bits(x);
+            assert_eq!(
+                wgsl_round(f),
+                u32::from(eta_ir::types::bf16_bits(f)),
+                "{x:#010x}"
+            );
+        }
+    }
+
+    /// A word-pair store over a value of `n` elements, as the runtime's
+    /// loops run it with `lanes` invocations: every element stored once, by
+    /// the invocation that owns its word, and nothing past the value's words.
+    #[test]
+    fn word_pairs_cover_a_value_of_any_length_once() {
+        for n in [1u32, 2, 3, 7, 8, 151_935, 151_936] {
+            for lanes in [1u32, 3, 256] {
+                let words = n.div_ceil(2);
+                let mut owner = alloc::vec![u32::MAX; words as usize];
+                let mut stored = alloc::vec![0u8; n as usize];
+                for tid in 0..lanes.min(words) {
+                    let mut w = tid;
+                    while w < words {
+                        assert_eq!(owner[w as usize], u32::MAX, "word {w} written twice");
+                        owner[w as usize] = tid;
+                        stored[(w * 2) as usize] += 1;
+                        if w * 2 + 1 < n {
+                            stored[(w * 2 + 1) as usize] += 1;
+                        }
+                        w += lanes;
+                    }
+                }
+                assert!(stored.iter().all(|&c| c == 1), "n {n}, lanes {lanes}");
+                assert!(owner.iter().all(|&o| o != u32::MAX));
+            }
+        }
+    }
+
+    /// The scan's invocations: a row of whole words each, or two rows
+    /// where a row is an odd number of elements, so a word two rows share
+    /// is one invocation's.
+    #[test]
+    fn a_scan_s_groups_begin_and_end_on_a_word() {
+        for len in [1u32, 2, 3, 5, 8] {
+            for rows in [1u32, 2, 3, 7] {
+                let group = if len % 2 == 0 { 1 } else { 2 };
+                let total = rows * len;
+                let groups = rows.div_ceil(group);
+                let mut owner = alloc::vec![u32::MAX; total.div_ceil(2) as usize];
+                for g in 0..groups {
+                    let first = g * group * len;
+                    let last = (first + group * len).min(total);
+                    assert_eq!(first % 2, 0, "a group begins on a word");
+                    assert!(last % 2 == 0 || last == total, "a group ends on a word");
+                    for at in first..last {
+                        let w = (at / 2) as usize;
+                        assert!(owner[w] == u32::MAX || owner[w] == g, "word {w} shared");
+                        owner[w] = g;
+                    }
+                }
+            }
+        }
     }
 }

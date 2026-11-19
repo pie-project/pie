@@ -3,7 +3,10 @@ use alloc::vec::Vec;
 use eta_ir::container::const_elem_size;
 use eta_ir::expand;
 use eta_ir::op::Op;
-use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
+use eta_ir::infer::reduced_dtype;
+use eta_ir::types::{
+    Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueType, float_result, is_float,
+};
 
 use crate::context::{self, emit};
 use crate::error::Span;
@@ -78,6 +81,9 @@ fn const_scalar(a: &Arg) -> Option<f64> {
     Some(match c.dtype {
         Dtype::Bool => (b.first().copied().unwrap_or(0) != 0) as u8 as f64,
         Dtype::F32 => f32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+        Dtype::Bf16 => {
+            eta_ir::types::bf16_to_f32(u16::from_le_bytes(b.get(..2)?.try_into().ok()?)) as f64
+        }
         Dtype::I32 => i32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
         Dtype::U32 => u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
         _ => return None,
@@ -157,10 +163,25 @@ pub(crate) fn poison(detail: alloc::string::String, ty: ValueType) -> Tensor {
 #[track_caller]
 fn poison_id(detail: alloc::string::String, ty: ValueType) -> ValueId {
     context::record_error(detail, Span::here());
-    let scalar = emit(
-        Op::Const(scalar_literal(ty.dtype, &[0; 8])),
-        &[ValueType::scalar(ty.dtype)],
+    // No literal is bf16: a bf16 poison is an f32 zero cast to it.
+    let literal = if ty.dtype == Dtype::Bf16 {
+        Dtype::F32
+    } else {
+        ty.dtype
+    };
+    let mut scalar = emit(
+        Op::Const(scalar_literal(literal, &[0; 8])),
+        &[ValueType::scalar(literal)],
     );
+    if literal != ty.dtype {
+        scalar = emit(
+            Op::Cast {
+                value: scalar,
+                dtype: ty.dtype,
+            },
+            &[ValueType::scalar(ty.dtype)],
+        );
+    }
     if ty.shape.is_scalar() {
         return scalar;
     }
@@ -176,7 +197,7 @@ fn poison_id(detail: alloc::string::String, ty: ValueType) -> ValueId {
 #[track_caller]
 pub(crate) fn poison_const(detail: alloc::string::String, ty: ValueType) -> Tensor {
     context::record_error(detail, Span::here());
-    let width = if ty.dtype == Dtype::Bool { 1 } else { 4 };
+    let width = const_elem_size(ty.dtype).max(1);
     Tensor {
         inner: TensorInner::Const(ConstData {
             shape: ty.shape,
@@ -194,10 +215,15 @@ fn poison_shape(detail: alloc::string::String, fallback: Shape) -> Shape {
 
 #[track_caller]
 fn poison_dtype(dtype: Dtype) {
-    context::record_error(
-        alloc::format!("{dtype:?} is not a dtype ETA computes in"),
-        Span::here(),
-    );
+    let detail = if dtype == Dtype::Bf16 {
+        alloc::string::String::from(
+            "bf16 has no literal: a constant is an f32, which an op over a bf16 value mixes in \
+             (cast a value to bf16 to store it so)",
+        )
+    } else {
+        alloc::format!("{dtype:?} is not a dtype ETA computes in")
+    };
+    context::record_error(detail, Span::here());
 }
 
 fn scalar_literal(dtype: Dtype, bytes: &[u8]) -> Literal {
@@ -220,6 +246,9 @@ fn elem_at(dtype: Dtype, bytes: &[u8], i: usize) -> f64 {
     match dtype {
         Dtype::Bool => (bytes.get(i).copied().unwrap_or(0) != 0) as u8 as f64,
         Dtype::F32 => f32::from_le_bytes(word(i * 4)) as f64,
+        Dtype::Bf16 => {
+            eta_ir::types::bf16_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]])) as f64
+        }
         Dtype::I32 => i32::from_le_bytes(word(i * 4)) as f64,
         Dtype::U32 => u32::from_le_bytes(word(i * 4)) as f64,
         other => {
@@ -436,14 +465,17 @@ fn reconcile(a: Arg, b: Arg) -> (Arg, Arg) {
             bytes: scalar_bytes_of(v, to),
         })
     }
+    // A constant is never bf16: meeting a bf16 value it is an f32, which
+    // the op mixes in unrounded.
+    let literal = |d: Dtype| if d == Dtype::Bf16 { Dtype::F32 } else { d };
     match (&a, &b) {
         (Arg::Const(ca), Arg::Node { ty, .. }) => {
-            if let Some(c) = coerce(ca, ty.dtype) {
+            if let Some(c) = coerce(ca, literal(ty.dtype)) {
                 return (Arg::Const(c), b);
             }
         }
         (Arg::Node { ty, .. }, Arg::Const(cb)) => {
-            if let Some(c) = coerce(cb, ty.dtype) {
+            if let Some(c) = coerce(cb, literal(ty.dtype)) {
                 return (a, Arg::Const(c));
             }
         }
@@ -471,8 +503,9 @@ fn emit_binary(
     let (aa, bb) = reconcile(a.to_arg(), b.to_arg());
     let shape = non_scalar_shape(aa.ty().shape, bb.ty().shape);
     let (ia, tya) = aa.materialize();
-    let (ib, _) = bb.materialize();
-    let rty = ValueType::new(shape, result_dtype(tya.dtype));
+    let (ib, tyb) = bb.materialize();
+    let common = float_result(tya.dtype, tyb.dtype).unwrap_or(tya.dtype);
+    let rty = ValueType::new(shape, result_dtype(common));
     Tensor::node(emit(mk(ia, ib), &[rty]), rty)
 }
 
@@ -655,8 +688,9 @@ pub fn select(cond: impl AsTensor, a: impl AsTensor, b: impl AsTensor) -> Tensor
     let (aa, bb) = reconcile(a.to_arg(), b.to_arg());
     let shape = non_scalar_shape(aa.ty().shape, bb.ty().shape);
     let (ia, tya) = aa.materialize();
-    let (ib, _) = bb.materialize();
-    let rty = ValueType::new(shape, tya.dtype);
+    let (ib, tyb) = bb.materialize();
+    let common = float_result(tya.dtype, tyb.dtype).unwrap_or(tya.dtype);
+    let rty = ValueType::new(shape, common);
     Tensor::node(
         emit(
             Op::Select {
@@ -775,17 +809,17 @@ pub fn scatter_add(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor)
 
 pub fn reduce_sum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceSum, |t| {
-        ValueType::new(reduce_shape(t.shape), t.dtype)
+        ValueType::new(reduce_shape(t.shape), reduced_dtype(t.dtype))
     })
 }
 pub fn reduce_max(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceMax, |t| {
-        ValueType::new(reduce_shape(t.shape), t.dtype)
+        ValueType::new(reduce_shape(t.shape), reduced_dtype(t.dtype))
     })
 }
 pub fn reduce_min(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceMin, |t| {
-        ValueType::new(reduce_shape(t.shape), t.dtype)
+        ValueType::new(reduce_shape(t.shape), reduced_dtype(t.dtype))
     })
 }
 pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
@@ -809,7 +843,7 @@ impl Traced {
     fn over(row: ValueType) -> Self {
         Self {
             row,
-            reduced: ValueType::new(reduce_shape(row.shape), row.dtype),
+            reduced: ValueType::new(reduce_shape(row.shape), reduced_dtype(row.dtype)),
         }
     }
 }
@@ -822,26 +856,44 @@ impl expand::Sink for Traced {
             expand::StepShape::Scalar => ValueType::scalar(Dtype::F32),
             expand::StepShape::RowMask => ValueType::new(self.row.shape, Dtype::Bool),
             expand::StepShape::ReducedIndex => ValueType::new(self.reduced.shape, Dtype::I32),
+            expand::StepShape::ReducedAsRow => ValueType::new(self.reduced.shape, self.row.dtype),
+            expand::StepShape::RowStat => ValueType::new(self.row.shape, self.reduced.dtype),
         };
         emit(op, &[ty])
     }
 }
 
-fn expanded(x: impl AsTensor, seq: impl FnOnce(&mut Traced, ValueId, Shape) -> ValueId) -> Tensor {
+/// `x`'s row expanded by `wide` (an f32 row) or `narrow` (a bf16 row,
+/// whose results stay bf16 and whose statistics reduce in f32).
+fn expanded(
+    x: impl AsTensor,
+    wide: impl FnOnce(&mut Traced, ValueId, Shape) -> ValueId,
+    narrow: impl FnOnce(&mut Traced, ValueId, Shape) -> ValueId,
+) -> Tensor {
     let (xid, ty) = x.to_arg().materialize();
-    let row = ValueType::new(ty.shape, Dtype::F32);
+    let dtype = if ty.dtype == Dtype::Bf16 {
+        Dtype::Bf16
+    } else {
+        Dtype::F32
+    };
+    let row = ValueType::new(ty.shape, dtype);
     let mut sink = Traced::over(row);
-    Tensor::node(seq(&mut sink, xid, ty.shape), row)
+    let result = if dtype == Dtype::Bf16 {
+        narrow(&mut sink, xid, ty.shape)
+    } else {
+        wide(&mut sink, xid, ty.shape)
+    };
+    Tensor::node(result, row)
 }
 
 pub fn softmax(x: impl AsTensor) -> Tensor {
-    expanded(x, expand::softmax)
+    expanded(x, expand::softmax, expand::softmax_bf16)
 }
 pub fn log_softmax(x: impl AsTensor) -> Tensor {
-    expanded(x, expand::log_softmax)
+    expanded(x, expand::log_softmax, expand::log_softmax_bf16)
 }
 pub fn l2norm(x: impl AsTensor) -> Tensor {
-    expanded(x, expand::l2norm)
+    expanded(x, expand::l2norm, expand::l2norm_bf16)
 }
 
 pub fn top_k(x: impl AsTensor, k: u32) -> (Tensor, Tensor) {
@@ -859,7 +911,12 @@ pub fn top_k(x: impl AsTensor, k: u32) -> (Tensor, Tensor) {
 pub fn sort_desc(x: impl AsTensor) -> (Tensor, Tensor) {
     let (ix, tyx) = x.to_arg().materialize();
     let n = tyx.shape.dims().last().copied().unwrap_or(0);
-    let val_ty = ValueType::vector(n, Dtype::F32);
+    let val_dtype = if is_float(tyx.dtype) {
+        tyx.dtype
+    } else {
+        Dtype::F32
+    };
+    let val_ty = ValueType::vector(n, val_dtype);
     let idx_ty = ValueType::vector(n, Dtype::U32);
     let base = emit(Op::SortDesc(ix), &[val_ty, idx_ty]);
     (Tensor::node(base, val_ty), Tensor::node(base + 1, idx_ty))
@@ -1204,7 +1261,14 @@ pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl A
     let (state, _) = state.to_arg().materialize();
     let mut sink = Traced::over(logits_type);
     let token_type = ValueType::new(reduce_shape(logits_type.shape), Dtype::I32);
-    let result = expand::nucleus_sample(&mut sink, logits, top_p, state, logits_type.shape);
+    let result = expand::nucleus_sample(
+        &mut sink,
+        logits,
+        top_p,
+        state,
+        logits_type.shape,
+        logits_type.dtype,
+    );
     Tensor::node(result, token_type)
 }
 

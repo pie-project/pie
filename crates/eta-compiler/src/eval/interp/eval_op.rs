@@ -13,7 +13,101 @@ use super::{ChanEffect, Evaled, PassInputs, StepError, Value, value_matches};
 /// operands' types: its result(s), or the effect it asks of the caller (a
 /// channel, a kernel, a sink). The one evaluator of an op on the host: the
 /// tier-0 interpreter here and eta-exec's both run it.
+///
+/// A `bf16` operand is widened to f32 exactly, the op computes in f32, and
+/// a `bf16` result is rounded once, to nearest even (`eta_ir::types`' bf16
+/// rules): a reduction's or a scan's running value is f32 throughout.
 pub fn eval_op(
+    op: &Op,
+    vals: &[Value],
+    ty_of: &dyn Fn(ValueId) -> ValueType,
+    inputs: &PassInputs,
+    names: &[String],
+) -> Result<Evaled, StepError> {
+    let operands = op.operands();
+    let effect = op.is_effectful() || matches!(op, Op::Output { .. });
+    let bf16 = |id: &ValueId| vals[*id as usize].dtype() == Dtype::Bf16;
+    let casts_to_bf16 = matches!(op, Op::Cast { dtype: Dtype::Bf16, .. });
+    if effect || !(casts_to_bf16 || operands.iter().any(bf16)) {
+        return eval_wide(op, vals, ty_of, inputs, names);
+    }
+    // The op over its operands widened, numbered 0.. in its operand order.
+    let local: Vec<Value> = operands
+        .iter()
+        .map(|&id| widen(&vals[id as usize]))
+        .collect();
+    let mut wide = op.clone();
+    let mut next = 0;
+    wide.map_operands(|_| {
+        next += 1;
+        next - 1
+    });
+    if let Op::Cast { dtype, .. } = &mut wide
+        && *dtype == Dtype::Bf16
+    {
+        *dtype = Dtype::F32;
+    }
+    let wide_ty = |id: ValueId| {
+        let ty = ty_of(operands[id as usize]);
+        if ty.dtype == Dtype::Bf16 {
+            ValueType::new(ty.shape, Dtype::F32)
+        } else {
+            ty
+        }
+    };
+    let narrow = narrows(op, |id| bf16(&id));
+    let round = |value: Value| match value {
+        Value::F32(x) if narrow => Value::bf16_of(&x),
+        other => other,
+    };
+    Ok(match eval_wide(&wide, &local, &wide_ty, inputs, names)? {
+        Evaled::One(value) => Evaled::One(round(value)),
+        Evaled::Two(values, indices) => Evaled::Two(round(values), indices),
+        other => other,
+    })
+}
+
+/// `value` with a `bf16` value widened to its exact f32s.
+fn widen(value: &Value) -> Value {
+    match value {
+        Value::Bf16(x) => Value::F32(x.iter().map(|&b| eta_ir::types::bf16_to_f32(b)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Whether `op`'s (first) result is `bf16`, given which of its operands are
+/// (`eta_ir::infer`'s rules): a cast to it; the result of a reduction, a
+/// product, a comparison, a pivot or an argmax never; a gather's, a
+/// scatter's or a mask's where its source, base or logits is; an
+/// elementwise op's, a scan's, an order op's values and a shape op's where
+/// any operand is.
+pub(crate) fn narrows(op: &Op, bf16: impl Fn(ValueId) -> bool) -> bool {
+    match *op {
+        Op::Cast { dtype, .. } => dtype == Dtype::Bf16,
+        Op::ReduceSum(_)
+        | Op::ReduceMax(_)
+        | Op::ReduceMin(_)
+        | Op::ReduceArgmax(_)
+        | Op::MatMul(..)
+        | Op::Gt(..)
+        | Op::Ge(..)
+        | Op::Eq(..)
+        | Op::Ne(..)
+        | Op::Lt(..)
+        | Op::Le(..)
+        | Op::And(..)
+        | Op::Or(..)
+        | Op::Not(_)
+        | Op::PivotThreshold { .. } => false,
+        Op::Gather { src, .. } | Op::GatherRow { src, .. } => bf16(src),
+        Op::ScatterAdd { base, .. } | Op::ScatterSet { base, .. } => bf16(base),
+        Op::MaskApply { logits, .. } => bf16(logits),
+        Op::Select { a, b, .. } => bf16(a) || bf16(b),
+        _ => op.operands().into_iter().any(bf16),
+    }
+}
+
+fn eval_wide(
     op: &Op,
     vals: &[Value],
     ty_of: &dyn Fn(ValueId) -> ValueType,
@@ -44,12 +138,14 @@ pub fn eval_op(
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_neg()).collect()),
             Value::U32(x) => Value::U32(x.iter().map(|&a| a.wrapping_neg()).collect()),
             Value::Bool(_) => return Err(fault("neg on bool".into())),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Abs(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| a.abs()).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_abs()).collect()),
             Value::U32(x) => Value::U32(x.clone()),
             Value::Bool(x) => Value::Bool(x.clone()),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Sign(a) => One(match v(a) {
             Value::F32(x) => Value::F32(
@@ -68,6 +164,7 @@ pub fn eval_op(
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.signum()).collect()),
             Value::U32(x) => Value::U32(x.iter().map(|&a| (a != 0) as u32).collect()),
             Value::Bool(_) => return Err(fault("sign on bool".into())),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Cast { value, dtype } => One(match dtype {
             Dtype::F32 => Value::F32(lanes_f32(v(value))),
@@ -285,6 +382,7 @@ pub fn eval_op(
                         .collect()
                 }
                 Value::Bool(_) => return Err(fault("argmax on bool".into())),
+                Value::Bf16(_) => return Err(unwidened()),
             };
             One(Value::I32(result))
         }
@@ -659,6 +757,7 @@ pub(super) fn gather_flat(v: &Value, idx: &[usize]) -> Value {
         Value::I32(x) => Value::I32(idx.iter().map(|&i| x[i]).collect()),
         Value::U32(x) => Value::U32(idx.iter().map(|&i| x[i]).collect()),
         Value::Bool(x) => Value::Bool(idx.iter().map(|&i| x[i]).collect()),
+        Value::Bf16(x) => Value::Bf16(idx.iter().map(|&i| x[i]).collect()),
     }
 }
 
@@ -680,7 +779,18 @@ pub(super) fn gather_flat_fill0(v: &Value, idx: &[usize]) -> Value {
                 .collect(),
         ),
         Value::Bool(x) => Value::Bool(idx.iter().map(|&i| i != usize::MAX && x[i]).collect()),
+        Value::Bf16(x) => Value::Bf16(
+            idx.iter()
+                .map(|&i| if i == usize::MAX { 0 } else { x[i] })
+                .collect(),
+        ),
     }
+}
+
+/// A `bf16` value reached the f32 evaluator, which [`eval_op`] widens
+/// every one before.
+fn unwidened() -> StepError {
+    StepError::Fault("a bf16 operand reached the interpreter's f32 evaluator unwidened".into())
 }
 
 pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) -> Value {

@@ -3,6 +3,7 @@
 mod a_float_lane_program_traces_from_its_inputs;
 mod authoring_errors;
 mod beam_search;
+mod bf16;
 mod inferlet_goldens;
 mod lowering;
 mod op_reachability;

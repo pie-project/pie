@@ -245,7 +245,12 @@ impl Plane {
         registrations: &[ProgramRegistration],
     ) -> Result<u64> {
         let before = self.cache.stats().compilations;
-        for registration in registrations {
+        // A program that stores bf16 is refused at its registration
+        // (`prepare_register`); its stages are not compiled.
+        for registration in registrations
+            .iter()
+            .filter(|registration| !registration.launch.stores_bf16())
+        {
             let plan = adopt_launch_package(registration.launch.clone())?;
             self.cache.compile(
                 context,
@@ -283,6 +288,12 @@ impl Plane {
                 step: Step::Registered(existing),
             });
         }
+        // Metal's guest kernels have no bf16 yet: such a program is refused
+        // by name, never computed as another dtype.
+        registration
+            .launch
+            .refuse_bf16()
+            .map_err(|why| Fault::program("program::plane", why))?;
         let plan = adopt_launch_package(registration.launch.clone())?;
         let planned = self.cache.plan(
             context,

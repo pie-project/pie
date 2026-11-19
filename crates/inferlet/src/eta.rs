@@ -79,6 +79,10 @@ fn to_wit_dtype(d: Dtype) -> WitDtype {
         Dtype::I32 => WitDtype::I32,
         Dtype::U32 => WitDtype::U32,
         Dtype::Bool => WitDtype::Bool,
+        Dtype::Bf16 => panic!(
+            "a channel holds f32, i32, u32 or bool: bf16 is a guest program's intermediate \
+             dtype and has no WIT channel tag; cast a bf16 value to f32 before a put"
+        ),
         other => panic!("{other:?} is not a dtype ETA computes in; it has no WIT tag"),
     }
 }
