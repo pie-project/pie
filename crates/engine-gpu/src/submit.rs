@@ -192,13 +192,22 @@ pub fn rate_at_keys(curve: &[(u32, f64)], keys: u32) -> Option<f64> {
 
 /// `by_rows` (ascending in rows, each a curve by keys) at `rows` against
 /// `keys`: each curve read at the keys ([`rate_at_keys`]), linear in `log
-/// rows` between the two rows bracketing it, the nearest rows' outside them.
+/// rows` between the two rows bracketing it; past the widest, the widest's
+/// (more rows fill more of the device, never read faster than measured);
+/// below the narrowest, the narrowest's time (its rate scaled by the rows:
+/// fewer rows against the same keys fill less of a device the narrowest
+/// already underfills, and finish no sooner; on an RTX the rate fell in
+/// proportion to the rows from 512 down to 128).
 #[must_use]
 pub fn rate_at(by_rows: &[(u32, Vec<(u32, f64)>)], rows: u32, keys: u32) -> Option<f64> {
     let at: Vec<(u32, f64)> = by_rows
         .iter()
         .filter_map(|(r, curve)| rate_at_keys(curve, keys).map(|rate| (*r, rate)))
         .collect();
+    let &(narrowest, rate) = at.first()?;
+    if rows < narrowest {
+        return Some(rate * f64::from(rows.max(1)) / f64::from(narrowest));
+    }
     profile::fire::interpolate(&at, f64::from(rows))
 }
 
@@ -524,7 +533,9 @@ mod tests {
         let by_rows = vec![(256, vec![(4096, 0.2e3)]), (1024, vec![(4096, 0.4e3)])];
         let mid = rate_at(&by_rows, 512, 4096).unwrap();
         assert!((mid - 0.3e3).abs() < 1e-6, "{mid}");
-        assert_eq!(rate_at(&by_rows, 128, 4096), Some(0.2e3));
+        assert_eq!(rate_at(&by_rows, 2048, 4096), Some(0.4e3));
+        // Below the narrowest rows, the narrowest's time.
+        assert_eq!(rate_at(&by_rows, 128, 4096), Some(0.1e3));
     }
 
     /// A prompt step against a long prefix is estimated at the prefixed
