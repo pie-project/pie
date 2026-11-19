@@ -5,7 +5,9 @@
     clippy::mem_forget
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
-#![forbid(unsafe_code)]
+// Unsafe only where an OS reading has no safe call: `pressure`'s macOS
+// sysctl, allowed there by name.
+#![deny(unsafe_code)]
 
 pub mod adapter;
 pub mod caps;
@@ -23,6 +25,7 @@ pub mod load;
 pub mod memory;
 pub mod placement;
 pub mod ports;
+pub mod pressure;
 pub mod program;
 pub mod rates;
 pub mod roofline;

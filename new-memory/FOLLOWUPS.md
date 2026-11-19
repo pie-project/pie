@@ -12,8 +12,7 @@ holder beside working sets / prefix entries / snapshots: the governor decides ho
 
 ## F2. Config surface rename (do together with F1, only for the keys that remain)
 Agreed shape: `[engine.memory]` with prefix keys — budget_device / budget_host / budget_disk, disk_path,
-disk_persistent, governor_backoff / governor_patience / governor_release_idle (replacing memory_tolerance profiles:
-dedicated = 1.0 / never / false, aggressive = 0.9 / 4 / true, balanced = 0.8 / 2 / true, polite = 0.7 / 1 / true);
+disk_persistent, yield (done 2026-11-15: one key in [0, 1] replacing memory_tolerance and the governor_* knobs);
 `[engine]` common max_batch_tokens / max_batch_sequences / max_context. Delete max_state_slots (still accepted by six
 backend option structs and named in fit.rs messages), kv_page_size, xla seat_tokens. Old keys refused with the new
 name.
