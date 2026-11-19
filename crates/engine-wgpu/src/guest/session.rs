@@ -170,10 +170,10 @@ pub fn device_puts(package: &LaunchPackage, at: usize) -> Result<Vec<u32>> {
     })?;
     let mut puts = Vec::with_capacity(stage.puts.len());
     for put in &stage.puts {
-        match engine_gpu::guest::run::local_of(package, at, put.value)? {
-            Some(local) => puts.push(local),
-            // Held on the host: no span to copy, none to check.
-            None => {}
+        // A put with no local is held on the host: no span to copy, none
+        // to check.
+        if let Some(local) = engine_gpu::guest::run::local_of(package, at, put.value)? {
+            puts.push(local);
         }
     }
     Ok(puts)
