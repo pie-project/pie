@@ -416,6 +416,9 @@ pub struct Runtime {
     /// The words last written to each kept array (one the program never writes, by symbol and
     /// rectangle origin) since the load: a later write sends the PEs' changed words alone.
     pub kept: std::collections::HashMap<(String, i32, i32), Vec<u32>>,
+    /// `rowp` as the device holds it where its program advances it (`state.advances`); `None`
+    /// after a load or a failed launch.
+    pub rows_held: Option<Vec<u32>>,
 }
 
 /// A runtime's blocking calls by kind: how many, how long they took, how
@@ -527,6 +530,7 @@ impl Runtime {
             unlanded: 0,
             landing: None,
             kept: std::collections::HashMap::new(),
+            rows_held: None,
             io: IoStats::default(),
         })
     }
@@ -552,6 +556,7 @@ impl Runtime {
     /// Loads the program's ELFs onto the fabric.
     pub fn load(&mut self) {
         self.kept.clear();
+        self.rows_held = None;
         // SAFETY: constructed runtime.
         unsafe { (self.api().load)(self.this()) }
     }
