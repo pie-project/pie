@@ -43,12 +43,12 @@ impl Dense {
 }
 
 /// The name a kernel is said by.
-fn name(tactic: &Tactic) -> &'static str {
-    match (tactic.vector > 0, tactic.tier, tactic.wide) {
-        (true, ..) => "gemv",
-        (false, kernels_slang::Tier::Coopmat, _) => "coopmat",
-        (false, _, false) => "tiled",
-        (false, _, true) => "wide tiled",
+fn name(tactic: &Tactic) -> String {
+    match (tactic.vector, tactic.tier, tactic.wide) {
+        (0, kernels_slang::Tier::Coopmat, _) => "coopmat".to_owned(),
+        (0, _, false) => "tiled".to_owned(),
+        (0, _, true) => "wide tiled".to_owned(),
+        (rows, ..) => format!("gemv x{rows}"),
     }
 }
 
@@ -333,7 +333,7 @@ mod tests {
         assert!(
             weighed[2]
                 .to_string()
-                .starts_with("rung 4: gemv by the estimate ("),
+                .starts_with("rung 4: gemv x4 by the estimate ("),
             "{}",
             weighed[2]
         );
