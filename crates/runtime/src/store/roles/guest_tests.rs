@@ -181,7 +181,9 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                per_instance,
+                resident: per_instance,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair,
                 run: 1,
             },
@@ -193,6 +195,22 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-guests"
     }
@@ -231,6 +249,7 @@ impl Engine for GuestEngine {
         &self,
         _program: ProgramId,
         _extents: &BindExtents,
+        _class: eta_ir::registry::GeometryClass,
     ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }

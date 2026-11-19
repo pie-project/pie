@@ -874,6 +874,7 @@ pub fn attach_over(lane: u32, lanes: u32, instance: InstanceId) -> Attachment {
         lanes,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

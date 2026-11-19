@@ -1246,6 +1246,116 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     );
 }
 
+/// A park to the host tier is told landed only once it has read its device
+/// slots (or has read them when it returns): what the runtime gives those
+/// slots to next (any shape, written by anything, not a fire alone) cannot
+/// reach the parked bytes. The slots are overwritten from the host the
+/// moment the park is told landed, outside any frame, and the host tier
+/// still holds what they held.
+#[test]
+fn a_park_is_told_landed_once_it_has_read_its_slots() {
+    use engine::chunk::{SlotCopy, SlotKind};
+    use engine::transfer::MemoryDomain;
+    use engine_gpu::backend::Buffer as _;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        Some(64 << 10),
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    let host = MemoryDomain::HostPinned;
+    let facts = shell.pool_chunk_facts();
+    shell
+        .commit_segments(facts.segments.max.min(4))
+        .expect("the segments commit");
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.id == LIST && matches!(shape.kind, SlotKind::List { .. }))
+        .expect("a kv list");
+    let per = list.slots_per_chunk;
+    let n = per.min(4);
+    // Device slots of chunk 1 (chunk 0 is the null chunk).
+    let slots: Vec<u32> = (per..per + n).collect();
+    let (seed, parked, back): (Vec<u32>, Vec<u32>, Vec<u32>) = (
+        (0..n).collect(),
+        (n..2 * n).collect(),
+        (2 * n..3 * n).collect(),
+    );
+    let pattern: Vec<u8> = (0..u64::from(n) * list.slot_bytes)
+        .map(|at| (at * 13 + 7) as u8 ^ (at >> 9) as u8)
+        .collect();
+    let pairs = |from: &[u32], to: &[u32]| from.iter().copied().zip(to.iter().copied()).collect();
+    let copy = |src, dst, slots| SlotCopy {
+        shape: LIST,
+        src,
+        dst,
+        slots,
+        runs: Vec::new(),
+    };
+    shell
+        .write_tier_slots(&[(LIST, seed.clone())], &pattern)
+        .expect("the host slots take the pattern");
+    for round in 0..8u8 {
+        shell
+            .copy_slots(&copy(host, device, pairs(&seed, &slots)))
+            .expect("the slots land on the device");
+        // On the queue past the call where the host chunks are mapped, told
+        // landed from its fence; else waited out in the call.
+        let (told, landed) = std::sync::mpsc::channel();
+        let now = shell
+            .copy_slots_landing(
+                &copy(device, host, pairs(&slots, &parked)),
+                Some(Box::new(move || {
+                    let _ = told.send(());
+                })),
+            )
+            .expect("the slots park");
+        if !now {
+            landed
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the park is told landed");
+        }
+        // The slots go to their next owner, which writes them at once.
+        for &slot in &slots {
+            let (buffer, at) = shell
+                .pools()
+                .slot_place(LIST, slot)
+                .expect("a device slot's place");
+            buffer
+                .write_shared(at, &vec![0x5a ^ round; list.slot_bytes as usize])
+                .expect("the next owner writes the slot");
+        }
+        let held = shell
+            .read_tier_slots(&[(LIST, parked.clone())])
+            .expect("the parked slots read");
+        assert!(
+            held == pattern,
+            "round {round}: the host tier holds what the slots held when the park landed"
+        );
+        // The overwrite reached the device slots.
+        shell
+            .copy_slots(&copy(device, host, pairs(&slots, &back)))
+            .expect("the overwritten slots read back");
+        let theirs = shell
+            .read_tier_slots(&[(LIST, back.clone())])
+            .expect("the overwritten slots read");
+        assert!(
+            theirs.iter().all(|&byte| byte == 0x5a ^ round),
+            "round {round}: the next owner's bytes are on the device"
+        );
+    }
+    shell.settle_copies().expect("every copy settles");
+}
+
 /// A masked fire after a partial fold: a lane's mask speaks of the keys from
 /// its committed boundary on (`KvDelta::folded`). Past a boundary at 100 of
 /// a 150-key prompt, a mask over the buffer and the fire's own rows lands
