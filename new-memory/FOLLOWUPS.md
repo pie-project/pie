@@ -1209,3 +1209,13 @@ than another candidate ladder must never be picked. sc/macpro-dense-fit (held) r
 per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
 the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
 under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).
+
+## F58. Cerebras refuses device-geometry binds until it carries attn_mask / fold
+
+Since engine-gpu carries device geometry, an engine whose port mask lacks a
+port a program's device class needs refuses the bind by name
+(`runtime pipeline/fire/host_geometry.rs` `EngineLacks`) instead of serving
+it host-resolved. Cerebras advertises device geometry without `attn_mask` and
+`fold`, so beam search (a channel-fed mask) and any decode envelope with a
+device fold no longer bind there. It gets them back when its spatial engine
+reads those two ports from the device.
