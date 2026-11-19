@@ -511,9 +511,6 @@ impl Shell {
                 }
                 envelope_of[first + lane] = Some((held, lane));
             }
-            if first < lanes.len() {
-                token_src_of[first] = src;
-            }
             resolved.push(envelope);
         }
 
