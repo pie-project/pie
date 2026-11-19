@@ -485,6 +485,16 @@ impl Shell {
                 .map(|seated| seated.lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            // The ports state this attachment's lanes alone: one describing
+            // more would set the next lanes' positions and slots.
+            let owned = attached.lanes.max(1);
+            if carried > owned as usize {
+                return Err(Fault::Overreach {
+                    instance: attached.instance,
+                    lanes: attached.lane..attached.lane.saturating_add(owned),
+                    carried,
+                });
+            }
             if first + carried > lanes.len() {
                 return Err(Fault::program(
                     "serve::prepare",

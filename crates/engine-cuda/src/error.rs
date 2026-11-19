@@ -98,6 +98,16 @@ pub enum Fault {
         why: String,
     },
 
+    /// A device-geometry program's `embed_indptr` port describes more lanes
+    /// than its attachment spans: its ports would state the next lanes'
+    /// positions and slots. Every lane of the attachment is refused, before
+    /// any of it is written.
+    Overreach {
+        instance: engine::InstanceId,
+        lanes: std::ops::Range<u32>,
+        carried: usize,
+    },
+
     AdapterWord {
         lane: u32,
         word: u64,
@@ -299,6 +309,17 @@ impl fmt::Display for Fault {
                  read: here `attn.decode`, a selection's and a bias's arms read no per-lane mask"
             ),
             Self::KvWrite { lane, why } => write!(f, "lane {lane} refused: {why}"),
+            Self::Overreach {
+                instance,
+                lanes,
+                carried,
+            } => write!(
+                f,
+                "instance {instance} is attached over lanes {}..{} and its `embed_indptr` port \
+                 describes {carried} lane(s): a program's ports state its own lanes' geometry, \
+                 never the next request's",
+                lanes.start, lanes.end
+            ),
             Self::Adapterless { lane } => write!(
                 f,
                 "lane {lane} routes to an adapter bank and this load's artifact bakes \
