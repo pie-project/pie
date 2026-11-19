@@ -249,6 +249,9 @@ pub struct GemmProgram {
     pub wstream: Vec<Vec<Span>>,
     /// Where each span of a column's stream starts (16-bit halves from the column's start).
     pub wat: Vec<Vec<u64>>,
+    /// Where each op's words start in column 0's stream (32-bit words: its own words, then its
+    /// residents or blocks), the stream's end last: a profile's op by where the tape has got to.
+    pub wop: Vec<u64>,
     pub wwords: u32,
     /// Each column's stream words (an uneven output's columns differ).
     pub wcol: Vec<u32>,
@@ -1322,6 +1325,7 @@ pub(crate) fn laid(l: &Lowering, c: u32, r: u32, kbm: u32) -> Result<GemmProgram
         arena,
         wstream: Vec::new(),
         wat: Vec::new(),
+        wop: Vec::new(),
         wwords: 0,
         wcol: Vec::new(),
         tape: 0,
@@ -1511,12 +1515,17 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
         *ws = m;
     }
     let words = crate::emit::gemm::op_words(p)?;
-    for (ws, wc) in wstream.iter_mut().zip(wcol.iter_mut()) {
+    // (column 0's span at which each op starts)
+    let mut op_span: Vec<usize> = Vec::new();
+    for (ci, (ws, wc)) in wstream.iter_mut().zip(wcol.iter_mut()).enumerate() {
         let mut out = Vec::with_capacity(ws.len() * 2);
         for s in ws.drain(..) {
             if s[0] != OPMARK {
                 out.push(s);
                 continue;
+            }
+            if ci == 0 {
+                op_span.push(out.len());
             }
             let w = &words[s[1] as usize];
             for &x in w {
@@ -1537,6 +1546,11 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
     }
     p.odd = any_odd;
     p.wat = wstream.iter().map(|ws| starts(ws)).collect();
+    p.wop = op_span
+        .iter()
+        .map(|&i| p.wat[0].get(i).copied().unwrap_or(0) / 2)
+        .chain(std::iter::once(u64::from(p.wcol[0])))
+        .collect();
     p.wstream = wstream;
     Ok(())
 }

@@ -6,7 +6,9 @@
 //! - **`gseg.csl`**: the all-reduces over a row (a row's sums) or a head's band (a head's
 //!   sums, the attention's scores and probabilities), the printed regions' `seg`.
 //! - **The tapes** (`gtape.csl`, rows below the array): a column's weight stream, each PE
-//!   sending its words, then forwarding those of the PEs past it, up into the column's tree.
+//!   sending its words, then forwarding those of the PEs past it, up into the column's tree
+//!   (its stamps: the start, its own words gone (the column has read its stream to that PE's
+//!   end: a launch's profile by the stream's ops, `GemmProgram::wop`), the end).
 //! - Colours (a pattern of the array, laid by loops): the row line (east, west), the K / V
 //!   line (south, north), the weight tree, the tape (two, by parity), the all-reduce chain
 //!   (two, by parity), the row's and the band's broadcasts.
@@ -637,7 +639,8 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
 /// past it forwarded (16,384 at a time: a fabric transfer of 32,768 stalls).
 /// A tape PE's image past its tape's words, as a link measures it (the system links of 9064b2e41's GEMM programs at 10,000 tape words: every `gtape.csl` image 44,544 B used): the check's
 /// estimate of it misses by ~500 B, past the stack's room. A change to `gtape.csl`'s code
-/// re-measures it.
+/// re-measures it (its own-words stamp: +48 B, klein 1024²'s tape images 47,920 B used, 1,232 B
+/// of stack room left: inside the margin, the words a PE holds as they were).
 pub const TAPE_IMAGE_BYTES: i64 = 4544;
 
 /// Words a tape PE holds: the room `gtape.csl`'s image leaves past its own bytes, the stack and the
@@ -657,7 +660,7 @@ fn tape_file(tw: u32) -> String {
         "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {tw};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
     t.push_str(
-        "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  stamp(2);\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
     );
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(tape_p, \"tape\");\n  @initialize_queue(q_i, .{ .color = @get_color(C_I) });\n  @initialize_queue(q_o, .{ .color = @get_color(C_O) });\n}\n");
     t

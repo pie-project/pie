@@ -648,8 +648,15 @@ fn stream(args: &[String]) -> Result<(), String> {
                 println!("  {w}: {:.3}M", cy / 1e6);
             }
             println!("  memory {m:?}");
+            // (each op's first word of column 0's weight stream: where the tape is during it)
             for o in &c.ops {
-                println!("  op {} {}: {:.0}", o.op, o.what, o.cycles);
+                println!(
+                    "  op {} {}: {:.0} cycles, from stream word {}",
+                    o.op,
+                    o.what,
+                    o.cycles,
+                    p.wop.get(o.op).copied().unwrap_or(0)
+                );
             }
         }
         if args.iter().any(|a| a == "--emulate") {
