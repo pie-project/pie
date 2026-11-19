@@ -219,6 +219,7 @@ pub static KERNELS: &[&dyn Kernel] = &[
     &linear::gemm::GEMM,
     &conv::norm::GROUP_NORM,
     &attn::voxel::VOXEL,
+    &ssm::short_conv::SHORT_CONV,
 ];
 
 /// The GEMM-regime forms of every kernel that has one.
@@ -255,5 +256,18 @@ mod tests {
             by_op("ssm.gated_delta").map(|k| k.name()),
             Some("ssm.state")
         );
+    }
+
+    /// A root kernel's op is claimed for the roots: Inkling's short convs on its keys and values
+    /// lower, and its decode step stops past them, at its attention's relative bias.
+    #[test]
+    fn inklings_short_convs_are_claimed_for_the_roots() {
+        let t = poem_compiler::catalog::repository()
+            .parse("inkling-mini-l7-e8-bf16-kv-bf16-l1")
+            .expect("inkling parses")
+            .trace(poem_ir::Platform::Cerebras);
+        let classes = poem_compiler::spatial::layer::stream::decode_classes(&t, 1);
+        let e = crate::stream::shape(&t, "decode", &classes).unwrap_err();
+        assert!(e.contains("linear.rel_bias has no spatial lowering"), "{e}");
     }
 }

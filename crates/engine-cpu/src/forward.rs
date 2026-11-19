@@ -35,8 +35,8 @@ use std::sync::Arc;
 use engine::placement::Placement;
 use poem_ir::{
     Attn, Collective, Def, Dim, Dtype, Elemwise, Gather, GluAct, Guard, Linear, NormAxis,
-    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Shard, Trace, Turn, Ty,
-    ValueId,
+    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Shard, Ssm, Trace,
+    Turn, Ty, ValueId,
 };
 
 pub use crate::exchange::{Exchange, Post};
@@ -88,6 +88,9 @@ struct Ints<'a> {
 struct Lane {
     k: Vec<Option<Vec<f32>>>,
     v: Vec<Option<Vec<f32>>>,
+    /// A short conv's state (`ssm.short_conv`): its last rows before the next, the oldest
+    /// first, each a row of its channels.
+    hist: Vec<f32>,
 }
 
 /// A layer's placement: the dispatch's table (`stride` i32 an expert) and
@@ -576,7 +579,63 @@ impl Run<'_> {
             Operation::Linear(op) => self.linear(op),
             Operation::Collective(op) => self.collective(op),
             Operation::Conv(op) => self.conv(op),
+            Operation::Ssm(op) => self.ssm(op),
             other => Err(format!("`{}` has no host forward", Operands::name(other))),
+        }
+    }
+
+    /// A recurrent mixer: a short causal conv (`ssm.short_conv`, a row a step or a prompt's
+    /// rows in order), each channel over its last `conv_width` rows, no activation; the rows
+    /// before a row at position 0 its lane's state, cleared.
+    fn ssm(&mut self, op: &Ssm) -> Result<(), String> {
+        match *op {
+            Ssm::ShortConv {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            }
+            | Ssm::ShortConvChunked {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            } => {
+                let Def::Cache(c) = self.trace.values[state.0 as usize].def else {
+                    return Err("a short conv over no state".into());
+                };
+                let (xs, w) = (self.floats(x)?, self.floats(weight)?);
+                let (taps, ch) = (conv_width as usize, xs.width);
+                if w.v.len() != ch * taps {
+                    return Err(format!(
+                        "a short conv's taps: {} values for {ch} x {taps}",
+                        w.v.len()
+                    ));
+                }
+                let (rows, xv, wv) = (xs.rows, xs.v.to_vec(), w.v.to_vec());
+                let lane = &mut self.lanes[c as usize];
+                let held = (taps - 1) * ch;
+                let mut out = Vec::with_capacity(rows * ch);
+                for r in 0..rows {
+                    if self.positions[r] == 0 || lane.hist.len() != held {
+                        lane.hist = vec![0.0; held];
+                    }
+                    let xr = &xv[r * ch..(r + 1) * ch];
+                    for i in 0..ch {
+                        let mut acc = wv[i * taps + taps - 1] * xr[i];
+                        for j in 0..taps - 1 {
+                            acc += wv[i * taps + j] * lane.hist[j * ch + i];
+                        }
+                        out.push(acc);
+                    }
+                    lane.hist.drain(..ch.min(held));
+                    lane.hist.extend_from_slice(&xr[..ch.min(held)]);
+                }
+                self.put(y, rows, out)
+            }
+            ref other => Err(format!("`{}` has no host forward", Operands::name(other))),
         }
     }
 
