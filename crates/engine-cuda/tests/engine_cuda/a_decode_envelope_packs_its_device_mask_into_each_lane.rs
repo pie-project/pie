@@ -176,7 +176,10 @@ fn token(beam: u32) -> u32 {
     (beam * 11 + 7) % VOCAB
 }
 
-fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
+/// A bound instance, and the arm of scratch its fires are handed.
+type Bound = (engine::InstanceId, engine::ScratchPlace);
+
+fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> Bound {
     bind_on(shell, beams, device, false)
 }
 
@@ -184,7 +187,7 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
 /// only the device touches, as the runtime binds a program's channels: the
 /// host's view of such a ring is its mirror, filled as the device's puts
 /// land.
-fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> engine::InstanceId {
+fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> Bound {
     let bound = crate::bound::logits(beam_step(beams), VOCAB).expect("the beam step binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -268,7 +271,7 @@ fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> eng
             .guest_state(program, extents)
             .expect("the program's guest state"),
     );
-    shell
+    let instance = shell
         .bind_program(
             program,
             &[(TOKENS, tokens), (MASK, mask), (POSITIONS, positions)],
@@ -280,12 +283,12 @@ fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> eng
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
-                scratch,
                 pair,
                 pair_generation: 0,
             },
         )
-        .expect("the instance binds")
+        .expect("the instance binds");
+    (instance, scratch)
 }
 
 struct Pool {
@@ -378,12 +381,13 @@ fn a_decode_envelope_packs_its_device_mask_into_each_lane() {
             let host = shell
                 .fire_rows(&pool.lanes(&trace, true), &want)
                 .expect("the host-masked beams fire");
-            let instance = bind(&mut shell, beams, device);
+            let (instance, scratch) = bind(&mut shell, beams, device);
             let attached = [Attached {
                 lane: 0,
                 lanes: beams,
                 instance,
                 adapter_only: false,
+                scratch: scratch.clone(),
             }];
             for fire in 0..2 {
                 let got = shell
@@ -420,7 +424,7 @@ fn a_decode_envelope_packs_its_device_mask_into_each_lane() {
     let pool = Pool::new(2);
     let mut shell = shell(trace.clone(), &path, Runahead::F1);
     prefill(&mut shell, &trace, &pool.pages);
-    let instance = bind(
+    let (instance, scratch) = bind(
         &mut shell,
         2,
         PortMask::of(&[Port::EmbedTokens, Port::AttnMask, Port::Positions]),
@@ -430,6 +434,7 @@ fn a_decode_envelope_packs_its_device_mask_into_each_lane() {
         lanes: 2,
         instance,
         adapter_only: false,
+        scratch,
     }];
     let refused = shell
         .fire_media(&pool.lanes(&trace, false), &attached, &[])
@@ -468,12 +473,13 @@ fn a_decode_envelope_embeds_each_lanes_token_its_epilogue_has_yet_to_put() {
             let host = shell
                 .fire_rows(&pool.lanes(&trace, true), &want)
                 .expect("the host-masked beams fire");
-            let instance = bind_on(&mut shell, beams, device, true);
+            let (instance, scratch) = bind_on(&mut shell, beams, device, true);
             let attached = [Attached {
                 lane: 0,
                 lanes: beams,
                 instance,
                 adapter_only: false,
+                scratch: scratch.clone(),
             }];
 
             let lanes = pool.lanes(&trace, false);

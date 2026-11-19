@@ -175,7 +175,7 @@ fn reader() -> TraceContainer {
     }
 }
 
-fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
+fn bind(shell: &mut Shell, rows: u32) -> (engine::InstanceId, engine::ScratchPlace) {
     let decl = OutputDecl {
         name: "attn.scores".into(),
         axis: Axis::Lane,
@@ -235,7 +235,6 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
-                scratch,
                 pair,
                 pair_generation: 0,
             },
@@ -246,7 +245,7 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
         backed,
         "the bind of a score reader backed activation"
     );
-    instance
+    (instance, scratch)
 }
 
 fn floats(at: u64, count: u32) -> Vec<f32> {
@@ -321,7 +320,7 @@ fn the_score_rows_are_the_oracles() {
 
     // One capturing lane among 256, its reader attached.
     open_all(&mut shell);
-    let instance = bind(&mut shell, prompt.len() as u32);
+    let (instance, scratch) = bind(&mut shell, prompt.len() as u32);
     let seated: Vec<Seated<'_>> = (0..LANES)
         .map(|slot| {
             Seated::of(Lane {
@@ -336,6 +335,7 @@ fn the_score_rows_are_the_oracles() {
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch,
     }];
     let mixed = shell
         .fire_media(&seated, &attached, &[])

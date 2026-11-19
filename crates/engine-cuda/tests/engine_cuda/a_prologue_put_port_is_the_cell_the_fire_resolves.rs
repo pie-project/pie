@@ -136,7 +136,7 @@ fn stating_prologue() -> TraceContainer {
     }
 }
 
-fn bind(shell: &mut Shell) -> engine::InstanceId {
+fn bind(shell: &mut Shell) -> (engine::InstanceId, engine::ScratchPlace) {
     let bound = crate::bound::logits(stating_prologue(), VOCAB).expect("the prologue binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -176,7 +176,7 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
             .guest_state(program, extents)
             .expect("the program's guest state"),
     );
-    shell
+    let instance = shell
         .bind_program(
             program,
             &[],
@@ -188,12 +188,12 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
-                scratch,
                 pair,
                 pair_generation: 0,
             },
         )
-        .expect("the instance binds")
+        .expect("the instance binds");
+    (instance, scratch)
 }
 
 fn fire(shell: &mut Shell, word: u64, tokens: &[u32], attachments: &[Attached]) -> Vec<f32> {
@@ -229,12 +229,13 @@ fn the_forward_reads_the_ports_its_prologue_put() {
     drop(plain);
 
     let mut shell = shell(trace, &path);
-    let instance = bind(&mut shell);
+    let (instance, scratch) = bind(&mut shell);
     let attached = [Attached {
         lane: 0,
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch,
     }];
     let placeholder = vec![0u32; ROWS as usize];
     let stale = fire(&mut shell, word, &placeholder, &[]);

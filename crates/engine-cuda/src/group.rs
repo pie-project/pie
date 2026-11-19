@@ -477,9 +477,10 @@ impl Engine for Group {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        class: eta_ir::registry::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
-            Some(rank) => rank.guest_state(program, extents),
+            Some(rank) => rank.guest_state(program, extents, class),
             None => Err(Error::Program(
                 "a rank is busy: a program's guest state is asked between frames".to_string(),
             )),

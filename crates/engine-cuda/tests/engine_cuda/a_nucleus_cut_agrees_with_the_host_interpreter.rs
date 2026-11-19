@@ -145,9 +145,7 @@ impl Rig {
     }
 
     fn fire(&mut self) -> Vec<u8> {
-        let fired = self
-            .plane
-            .fire(&self.context, self.instance)
+        let fired = crate::guest::fire(&mut self.plane, &self.context, self.instance)
             .expect("the fire runs");
         assert!(
             matches!(fired, Fired::Committed),

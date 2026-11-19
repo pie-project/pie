@@ -143,7 +143,7 @@ fn bind(
     guest: &mut crate::guest::Guest,
     faulting: bool,
     first_channel: u64,
-) -> engine::InstanceId {
+) -> (engine::InstanceId, engine::ScratchPlace) {
     let bound = crate::bound::logits(epilogue(faulting), VOCAB).expect("the epilogue binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -178,7 +178,7 @@ fn bind(
             .guest_state(program, extents)
             .expect("the program's guest state"),
     );
-    shell
+    let instance = shell
         .bind_program(
             program,
             &[],
@@ -190,12 +190,12 @@ fn bind(
             engine_cuda::program::Slots {
                 instance: slots.0,
                 rings: slots.1,
-                scratch,
                 pair,
                 pair_generation: 0,
             },
         )
-        .expect("the instance binds")
+        .expect("the instance binds");
+    (instance, scratch)
 }
 
 type Told = Arc<Mutex<Vec<engine::StepOutcome>>>;
@@ -273,20 +273,22 @@ fn a_faulted_epilogue_faults_its_own_lanes() {
         .commit_segments(segments)
         .expect("the first segment commits");
     let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
-    let sound = bind(&mut shell, &mut guest, false, 1);
-    let faulting = bind(&mut shell, &mut guest, true, 11);
+    let (sound, sound_arm) = bind(&mut shell, &mut guest, false, 1);
+    let (faulting, faulting_arm) = bind(&mut shell, &mut guest, true, 11);
     let attachments = [
         Attached {
             lane: 0,
             lanes: 1,
             instance: sound,
             adapter_only: false,
+            scratch: sound_arm,
         },
         Attached {
             lane: 1,
             lanes: 1,
             instance: faulting,
             adapter_only: false,
+            scratch: faulting_arm,
         },
     ];
     let told: Told = Arc::default();

@@ -1,8 +1,9 @@
 #![cfg(feature = "device")]
-//! A guest program's scratch is state, not the fire's: each instance holds
-//! its lane's value scratch and the pair its tables, both in `Instance`
-//! slots, and a fire of 64 bound lanes lays nothing of the guest in the
-//! activation's span, which stays what the rungs state.
+//! A guest program's scratch is guest state, not the fire's span: each fire
+//! is handed its lanes' value scratch on its attachments and the pair holds
+//! its tables, both in `Instance` slots, and a fire of 64 bound lanes lays
+//! nothing of the guest in the activation's span, which stays what the rungs
+//! state. The scratch is held only while a fire naming it is in flight.
 
 use std::path::Path;
 
@@ -214,16 +215,19 @@ fn a_bound_guest_holds_its_scratch_as_state() {
         ..Extents::default()
     };
 
-    // Each instance holds its lane's scratch, the pair its tables.
+    // Each fire is handed its lane's scratch, the pair holds its tables,
+    // and an instance keeps nothing past its tables and rings: one arm
+    // serves every fire in flight on the engine's one stream.
     let state = shell
         .guest_state(program, extents)
         .expect("the program's guest state");
-    assert!(state.per_instance > 0, "{state:?}");
+    assert!(state.scratch > 0, "{state:?}");
     assert!(state.per_pair > 0, "{state:?}");
+    assert_eq!((state.resident, state.scratch_arms), (0, 1), "{state:?}");
 
     let rungs = shell.chunk_facts().expect("the chunk facts").act_chunks;
     let activation = shell.footprint().1;
-    let instances: Vec<engine::InstanceId> = (0..LANES)
+    let bound: Vec<(engine::InstanceId, engine::ScratchPlace)> = (0..LANES)
         .map(|_| {
             let (scratch, pair) = guest.places((program, extents), &state);
             assert!(
@@ -237,7 +241,7 @@ fn a_bound_guest_holds_its_scratch_as_state() {
                 &shell.program_facts(program).expect("the program's facts"),
                 |_| false,
             );
-            shell
+            let instance = shell
                 .bind_program(
                     program,
                     &[],
@@ -249,14 +253,15 @@ fn a_bound_guest_holds_its_scratch_as_state() {
                     engine_cuda::program::Slots {
                         instance: slots.0,
                         rings: slots.1,
-                        scratch,
                         pair,
                         pair_generation: 0,
                     },
                 )
-                .expect("the instance binds")
+                .expect("the instance binds");
+            (instance, scratch)
         })
         .collect();
+    let instances: Vec<engine::InstanceId> = bound.iter().map(|(id, _)| *id).collect();
     // 64 bound lanes ask the same state, and nothing of the span.
     assert_eq!(
         shell
@@ -275,14 +280,15 @@ fn a_bound_guest_holds_its_scratch_as_state() {
         "nothing backed past the span"
     );
 
-    let attachments: Vec<Attached> = instances
+    let attachments: Vec<Attached> = bound
         .iter()
         .enumerate()
-        .map(|(lane, &instance)| Attached {
+        .map(|(lane, (instance, scratch))| Attached {
             lane: lane as u32,
             lanes: 1,
-            instance,
+            instance: *instance,
             adapter_only: false,
+            scratch: scratch.clone(),
         })
         .collect();
     let got = fire(&mut shell, word, &tokens, &attachments);
@@ -368,11 +374,14 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
         .expect("the program's guest state");
     assert!(state.per_pair > 0, "{state:?}");
 
+    // The arm each bind took, the last handed to the next fire.
+    let arms = std::cell::RefCell::new(Vec::new());
     let bind = |shell: &mut Shell,
                 guest: &mut crate::guest::Guest,
                 pair: &engine::ScratchPlace,
                 generation: u64| {
         let (scratch, _) = guest.places((program, extents), &state);
+        arms.borrow_mut().push(scratch);
         let slots = guest.slots(
             &shell.program_facts(program).expect("the program's facts"),
             |_| false,
@@ -389,7 +398,6 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
                 engine_cuda::program::Slots {
                     instance: slots.0,
                     rings: slots.1,
-                    scratch,
                     pair: pair.clone(),
                     pair_generation: generation,
                 },
@@ -407,6 +415,7 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: arms.borrow().last().expect("an arm").clone(),
             }],
         );
         shell.drain().expect("the device drains");
@@ -466,4 +475,140 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
             .close_program_instance(instance)
             .expect("the instance closes");
     }
+}
+
+/// A guest's scratch is held only while a fire naming it is in flight
+/// (`engine::Attachment::scratch`): two consecutive fires of one instance
+/// may be handed different arms, and each reads and writes only its own.
+/// The first fire's arm is overwritten by another owner before the second
+/// fire, which answers as the first did, leaves that arm as the other
+/// owner wrote it, and writes the arm it was handed.
+#[test]
+fn consecutive_fires_read_only_the_arm_each_is_handed() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-arms", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 5309).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![(0..ROWS).map(|row| (row * 13 + 3) % VOCAB).collect()];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let (first, pair) = guest.places((program, extents), &state);
+    let second = guest.scratch(&state);
+    let slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let instance = shell
+        .bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+                pair,
+                pair_generation: 0,
+            },
+        )
+        .expect("the instance binds");
+
+    let bytes = usize::try_from(state.scratch).expect("bytes");
+    let at = |arm: &engine::ScratchPlace| {
+        let engine::ScratchPlace::Run { first, slots } = *arm else {
+            panic!("a small guest's arm lies in a run of Instance slots: {arm:?}");
+        };
+        let refs: Vec<u32> = (first..first + slots).collect();
+        shell
+            .guest_span(engine::chunk::SlotRole::Instance, &refs, state.scratch)
+            .expect("the arm is a guest item's span")
+    };
+    let (first_at, second_at) = (at(&first), at(&second));
+    assert_ne!(first_at, second_at, "two arms are two places");
+    let read = |shell: &Shell, at: u64| {
+        let mut bytes = vec![0u8; bytes];
+        engine_cuda::device::Buffer::over(at, bytes.len())
+            .read_on(shell.stream(), 0, &mut bytes)
+            .expect("the arm reads back");
+        bytes
+    };
+    let fill = |shell: &Shell, at: u64, byte: u8| {
+        engine_cuda::device::alloc::stage_raw(shell.stream(), at, &vec![byte; bytes])
+            .expect("another owner writes the arm");
+    };
+    let answer = |shell: &mut Shell, arm: &engine::ScratchPlace| {
+        let got = fire(
+            shell,
+            word,
+            &tokens,
+            &[Attached {
+                lane: 0,
+                lanes: 1,
+                instance,
+                adapter_only: false,
+                scratch: arm.clone(),
+            }],
+        );
+        shell.drain().expect("the device drains");
+        let cell = shell
+            .program_instance(instance)
+            .expect("the instance settles")
+            .expect("the instance")
+            .take(0)
+            .expect("its channel reads")
+            .expect("its epilogue put a cell");
+        let argmax = i32::from_le_bytes(cell[..4].try_into().expect("an i32 cell"));
+        let most = got[0].iter().copied().fold(f32::MIN, f32::max);
+        assert_eq!(
+            got[0].get(argmax as usize).copied(),
+            Some(most),
+            "the epilogue put {argmax}, not an argmax of its lane's logits"
+        );
+        argmax
+    };
+
+    fill(&shell, second_at, 0x5A);
+    let once = answer(&mut shell, &first);
+    assert!(
+        read(&shell, second_at).iter().all(|&byte| byte == 0x5A),
+        "the first fire wrote the arm it was not handed"
+    );
+    // The first arm goes back at the landing; another owner writes it.
+    fill(&shell, first_at, 0xA5);
+    let twice = answer(&mut shell, &second);
+    assert_eq!(once, twice, "the second fire answers as the first");
+    assert!(
+        read(&shell, first_at).iter().all(|&byte| byte == 0xA5),
+        "the second fire touched the arm the first was handed"
+    );
+    assert!(
+        read(&shell, second_at).iter().any(|&byte| byte != 0x5A),
+        "the second fire wrote nothing of the arm it was handed"
+    );
+    shell
+        .close_program_instance(instance)
+        .expect("the instance closes");
 }

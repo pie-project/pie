@@ -7,7 +7,7 @@ use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_cl
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
-use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
+use engine::fire::{FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -346,12 +346,7 @@ fn four_ranks_land_what_one_rank_lands() {
             }],
             ..Lane::default()
         });
-        attachments.push(Attachment {
-            lane: at as u32,
-            lanes: 1,
-            instance,
-            adapter_only: false,
-        });
+        attachments.push(guest.attach(at as u32, instance));
         instances.push(instance);
     }
     let mut ticket = group

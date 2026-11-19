@@ -9,7 +9,6 @@
 use crate::common_two_axis::{Rig, WIDTH, Weights, assert_close, frame, trace};
 use engine::Engine;
 use engine::chunk::SlotRole;
-use engine::fire::Attachment;
 use engine::program::Rebind;
 use engine_cuda::program::Endpoint;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -135,12 +134,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
             .engine
             .submit(&frame(
                 vec![rig.dit_lane(0, ROWS, ring, timestep, position)],
-                vec![Attachment {
-                    lane: 0,
-                    lanes: 1,
-                    instance,
-                    adapter_only: false,
-                }],
+                vec![rig.attach(0, instance)],
                 Vec::new(),
             ))
             .unwrap_or_else(|why| panic!("{what}: the fire submits: {why}"));

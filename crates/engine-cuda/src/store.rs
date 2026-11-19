@@ -2315,16 +2315,19 @@ impl Pools {
         }
     }
 
-    /// What a guest holding `per_instance` bytes an instance and
-    /// `per_pair` a pair, each in one piece, states (`engine::GuestState`):
-    /// the bytes, each a run of `Instance` slots where the runtime lays it
-    /// so, else one run of the adjacent chunks that hold the larger, which
-    /// a segment must hold.
-    pub fn guest_state(&self, per_instance: u64, per_pair: u64) -> Result<engine::GuestState> {
+    /// What a guest whose fire reads `scratch` bytes for an instance and
+    /// whose pair holds `per_pair`, each in one piece, states
+    /// (`engine::GuestState`): the bytes, each a run of `Instance` slots
+    /// where the runtime lays it so, else one run of the adjacent chunks
+    /// that hold the larger, which a segment must hold. An instance keeps
+    /// nothing between fires past its tables and rings
+    /// (`engine::ProgramFacts`), and one arm of scratch serves every fire in
+    /// flight: the engine's one stream runs a fire's stages only after the
+    /// one before it has read its scratch.
+    pub fn guest_state(&self, scratch: u64, per_pair: u64) -> Result<engine::GuestState> {
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes.max(1);
-        let run =
-            u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
+        let run = u32::try_from(scratch.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
         if run > layout.segment_chunks {
             return Err(Fault::Ceiling {
                 what: "chunks of a segment a guest's state lies in, one run",
@@ -2333,7 +2336,9 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            per_instance,
+            resident: 0,
+            scratch,
+            scratch_arms: 1,
             per_pair,
             run,
         })

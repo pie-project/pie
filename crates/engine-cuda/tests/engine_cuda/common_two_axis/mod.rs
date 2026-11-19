@@ -533,6 +533,12 @@ impl Rig {
         )
     }
 
+    /// An attachment of `instance` at `lane`, over its arm of scratch.
+    #[must_use]
+    pub fn attach(&self, lane: u32, instance: InstanceId) -> Attachment {
+        self.guest.attach(lane, instance)
+    }
+
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
         self.guest
             .bind(
@@ -585,15 +591,7 @@ impl Rig {
     }
 }
 
-#[must_use]
-pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
-    Attachment {
-        lane,
-        lanes: 1,
-        instance,
-        adapter_only: false,
-    }
-}
+
 
 #[must_use]
 pub fn frame(

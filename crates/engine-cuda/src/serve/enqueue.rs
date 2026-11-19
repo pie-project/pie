@@ -288,7 +288,7 @@ impl Shell {
     pub(super) fn prologue(&mut self, attachments: &[super::Attached]) -> Result<()> {
         let runs =
             |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
-        let prologues: Vec<super::Attached> = attachments.iter().filter(runs).copied().collect();
+        let prologues: Vec<super::Attached> = attachments.iter().filter(runs).cloned().collect();
         // A batch a step that never settled left owed tells no sink.
         for batch in self.owed.iter_mut().filter(|batch| batch.told.is_none()) {
             batch.told = Some(false);
@@ -307,12 +307,14 @@ impl Shell {
         )?;
         let mut verdicts: Vec<(Flying, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
+        let pools = &self.pools;
+        let span = |item: crate::program::Item<'_>, bytes| pools.guest_item(item, bytes);
         for attached in &prologues {
             if let Some(verdict) = launched.stage(
                 &self.device,
                 &mut self.programs,
-                attached.span(),
-                attached.instance,
+                &span,
+                attached,
                 Attach::Prologue,
             )? {
                 verdicts.push(verdict);
@@ -1233,11 +1235,12 @@ impl FireCtx<'_> {
                     )?;
                 }
             }
+            let pools = &*self.pools;
             if let Some((flying, fired)) = epilogues.stage(
                 self.device,
                 self.programs,
-                attached.span(),
-                attached.instance,
+                &|item, bytes| pools.guest_item(item, bytes),
+                attached,
                 Attach::Epilogue,
             )? {
                 noted(self.guest_faults, &flying, fired);
@@ -1516,14 +1519,17 @@ struct AirborneFires {
 }
 
 impl AirborneFires {
+    /// Stages `attached`'s stages at `at`, reading the scratch its fire
+    /// handed it, where `span` finds it.
     fn stage(
         &mut self,
         device: &Context,
         programs: &mut ProgramPlane,
-        lanes: std::ops::Range<u32>,
-        instance: engine::InstanceId,
+        span: crate::program::Span<'_>,
+        attached: &super::Attached,
         at: Attach,
     ) -> Result<Option<(Flying, Fired)>> {
+        let instance = attached.instance;
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
         }
@@ -1532,12 +1538,12 @@ impl AirborneFires {
             self.flush(device, programs)?;
         }
         let mut flying = Flying {
-            lanes,
+            lanes: attached.span(),
             instance,
             at: point(at),
             commit: 0,
         };
-        match programs.stage(instance, at)? {
+        match programs.stage(instance, at, &attached.scratch, span)? {
             crate::program::Launched::Airborne => {
                 flying.commit = programs
                     .instance(instance)
@@ -1713,6 +1719,7 @@ mod tests {
             lanes: 1,
             instance: engine::InstanceId(77),
             adapter_only: false,
+            scratch: engine::ScratchPlace::None,
         };
         committed_or(Fired::Committed, attached.instance, "epilogue")
             .expect("a committed pass is the ordinary answer");

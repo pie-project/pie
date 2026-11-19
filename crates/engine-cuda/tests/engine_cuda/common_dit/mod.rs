@@ -411,6 +411,8 @@ pub fn epilogue(rows: u32) -> TraceContainer {
 
 pub struct LaneHandles {
     pub instance: InstanceId,
+    /// The arm of scratch its fires are handed (`crate::guest::Guest::arm`).
+    pub scratch: engine::ScratchPlace,
     pub latent: ChannelId,
     pub timestep: ChannelId,
     pub positions: ChannelId,
@@ -599,6 +601,7 @@ impl Rig {
         );
         LaneHandles {
             instance: bound.id,
+            scratch: self.guest.arm(bound.id),
             latent,
             timestep,
             positions,
@@ -663,6 +666,7 @@ pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
         lanes: 1,
         instance: handles.instance,
         adapter_only: false,
+        scratch: handles.scratch.clone(),
     }
 }
 

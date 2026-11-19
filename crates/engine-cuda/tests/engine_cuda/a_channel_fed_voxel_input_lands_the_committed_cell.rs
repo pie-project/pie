@@ -1,7 +1,7 @@
 #![cfg(feature = "device")]
 
 use crate::common_two_axis::{
-    C_IN, C_OUT, Lcg, Rig, Weights, assert_close, attach, bf, conv_reference, frame,
+    C_IN, C_OUT, Lcg, Rig, Weights, assert_close, bf, conv_reference, frame,
     pixel_epilogue, trace,
 };
 use engine::Engine;
@@ -49,7 +49,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             .engine
             .submit(&frame(
                 vec![rig.vae_lane(0, cell)],
-                vec![attach(0, instance)],
+                vec![rig.attach(0, instance)],
                 vec![StepVoxels {
                     lane: 0,
                     clips: vec![CLIP],

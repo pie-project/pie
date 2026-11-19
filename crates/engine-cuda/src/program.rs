@@ -230,19 +230,23 @@ impl Plane {
     }
 }
 
+/// An instance staged on a fire, and where the scratch the fire handed it
+/// lies (`engine::Attachment::scratch`).
+type Member = (InstanceId, u64);
+
 /// A staged fire's groups: each program at each extents it was staged at,
-/// with its instances, in staging order.
+/// with its members, in staging order.
 fn staged_groups(
-    staged: &[(ProgramId, Extents, InstanceId)],
-) -> Vec<(ProgramId, Extents, Vec<InstanceId>)> {
-    let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
-    for (program_id, extents, instance) in staged {
+    staged: &[(ProgramId, Extents, Member)],
+) -> Vec<(ProgramId, Extents, Vec<Member>)> {
+    let mut groups: Vec<(ProgramId, Extents, Vec<Member>)> = Vec::new();
+    for (program_id, extents, member) in staged {
         match groups
             .iter_mut()
             .find(|(pid, ext, _)| pid == program_id && ext == extents)
         {
-            Some((_, _, members)) => members.push(*instance),
-            None => groups.push((*program_id, *extents, vec![*instance])),
+            Some((_, _, members)) => members.push(*member),
+            None => groups.push((*program_id, *extents, vec![*member])),
         }
     }
     groups
@@ -256,7 +260,7 @@ pub struct Plane {
     instances: BTreeMap<InstanceId, Bound>,
     next_program: u64,
     next_instance: u64,
-    staged: Vec<(ProgramId, Extents, InstanceId)>,
+    staged: Vec<(ProgramId, Extents, Member)>,
     at: Attach,
     wave: Wave,
     shadow: bool,
@@ -278,8 +282,8 @@ pub struct Plane {
 
 /// What a flight of one program at one bind's extents lays: every stage's
 /// tables, a lane and fixed; and the value scratch each of its lanes reads,
-/// one region its stages share ([`launch::lane_scratch`]), which lies in
-/// the lane's instance's state, not with the tables.
+/// one region its stages share ([`launch::lane_scratch`]), which lies where
+/// the fire hands the lane's instance its scratch, not with the tables.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FireBytes {
     pub a_lane: u64,
@@ -315,9 +319,11 @@ pub fn flight_lanes(members: u32) -> u32 {
 /// flight of its most lanes (each lane's scratch base among them, the
 /// grouped kernels' `lane_scratch`), and the room the wave's own tables
 /// take for a fire of the most lanes, where a fire carrying the pair may
-/// lay them. Each instance (`per_instance`): its lane's value scratch, one
-/// contiguous piece. Sized once from the load's lanes, so neither grows as
-/// instances bind.
+/// lay them. Each fire of an instance (`scratch`): its lane's value
+/// scratch, one contiguous piece, handed with the fire and read by it
+/// alone; the instance keeps nothing past its tables and rings between
+/// fires. Sized once from the load's lanes, so neither grows as instances
+/// bind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PairRoom {
     /// What a flight of the pair lays.
@@ -337,10 +343,10 @@ impl PairRoom {
         launch::SPAN_ALIGN + self.wave + self.flight.tables(self.lanes)
     }
 
-    /// An instance's bytes: its lane's scratch, and the alignment its first
-    /// byte may take.
+    /// A fire's scratch for an instance: its lane's value scratch, and the
+    /// alignment its first byte may take.
     #[must_use]
-    pub fn instance_bytes(&self) -> u64 {
+    pub fn scratch_bytes(&self) -> u64 {
         launch::SPAN_ALIGN + launch::lane_scratch(self.flight.scratch)
     }
 
@@ -496,11 +502,11 @@ impl Plane {
         })
     }
 
-    /// What [`Plane::pair_room`] holds: each instance's bytes and the
-    /// pair's.
+    /// What [`Plane::pair_room`] holds: a fire's scratch for an instance,
+    /// and the pair's bytes.
     pub fn state_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<(u64, u64)> {
         self.pair_room(program_id, extents)
-            .map(|room| (room.instance_bytes(), room.bytes()))
+            .map(|room| (room.scratch_bytes(), room.bytes()))
     }
 
     pub fn set_shadow(&mut self, shadow: bool) {
@@ -664,8 +670,6 @@ impl Plane {
         // owner and taken again at the same refs, are another taking: kept
         // as they stood, every fire of the pair ran on that owner's words.
         // The same live slots bound again are not.
-        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
-            .next_multiple_of(launch::SPAN_ALIGN);
         if batch.bound == 0
             || batch.pair != slots.pair
             || batch.generation != slots.pair_generation
@@ -716,7 +720,6 @@ impl Plane {
                 ids: ids.to_vec(),
                 slots,
                 scores,
-                scratch,
             },
         );
         Ok(id)
@@ -741,9 +744,6 @@ impl Plane {
             let place = bound.slots.place(&held, span)?;
             bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
-            let room = program.bound_room(bound.session.extents())?;
-            bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
-                .next_multiple_of(launch::SPAN_ALIGN);
         }
         for program in self.programs.values_mut() {
             for batch in program.batches.iter_mut().filter(|batch| batch.bound > 0) {
@@ -776,8 +776,6 @@ impl Plane {
         let extents = bound.session.extents();
         let program_id = bound.program_id;
         let room = program.bound_room(extents)?;
-        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
-            .next_multiple_of(launch::SPAN_ALIGN);
         // The pair's state where the rebind names it: fresh room, whether
         // or not where it lay before, since what another item wrote there
         // meanwhile is staged over.
@@ -797,7 +795,6 @@ impl Plane {
             bound.session.move_seats(from, self.score_bytes, to);
         }
         bound.scores = scores;
-        bound.scratch = scratch;
         bound.slots = slots;
         let pair = bound.slots.pair.clone();
         let generation = bound.slots.pair_generation;
@@ -958,18 +955,33 @@ impl Plane {
         Ok(bound.session.blocked_channel(&program.plan))
     }
 
-    pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
+    /// Fires instance `id` alone, its stages reading the scratch at
+    /// `scratch` (`engine::Attachment::scratch`), and waits for it.
+    pub fn fire(
+        &mut self,
+        context: &Context,
+        id: InstanceId,
+        scratch: &engine::ScratchPlace,
+        span: Span<'_>,
+    ) -> Result<Fired> {
         if self.prologue_runs(id) {
-            let fired = self.fire_at(context, id, Attach::Prologue)?;
+            let fired = self.fire_at(context, id, Attach::Prologue, scratch, span)?;
             if fired != Fired::Committed {
                 return Ok(fired);
             }
         }
-        self.fire_at(context, id, Attach::Epilogue)
+        self.fire_at(context, id, Attach::Epilogue, scratch, span)
     }
 
-    fn fire_at(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
-        match self.stage(id, at)? {
+    fn fire_at(
+        &mut self,
+        context: &Context,
+        id: InstanceId,
+        at: Attach,
+        scratch: &engine::ScratchPlace,
+        span: Span<'_>,
+    ) -> Result<Fired> {
+        match self.stage(id, at, scratch, span)? {
             Launched::Airborne => {
                 self.fly(context)?;
                 self.land(context)?;
@@ -988,8 +1000,17 @@ impl Plane {
             .is_some_and(|program| program.plan.prologue_runs())
     }
 
-    /// Every fire a wave carries runs the stages of one point.
-    pub fn stage(&mut self, id: InstanceId, at: Attach) -> Result<Launched> {
+    /// Stages instance `id`'s stages at `at` on the wave, reading the
+    /// scratch the fire hands it at `scratch` (`engine::Attachment::scratch`)
+    /// for this fire alone. Every fire a wave carries runs the stages of
+    /// one point.
+    pub fn stage(
+        &mut self,
+        id: InstanceId,
+        at: Attach,
+        scratch: &engine::ScratchPlace,
+        span: Span<'_>,
+    ) -> Result<Launched> {
         if !self.staged.is_empty() && self.at != at {
             return Err(Fault::program(
                 "program::plane",
@@ -1031,12 +1052,25 @@ impl Plane {
                     .collect()
             })
             .unwrap_or_default();
+        let room = program
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map(|batch| batch.room)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("instance {id}'s pair at {extents:?} is not bound"),
+                )
+            })?;
+        let scratch = piece_at(scratch, room.scratch_bytes(), span)?
+            .next_multiple_of(launch::SPAN_ALIGN);
         let launched =
             bound
                 .session
                 .stage(&program.compiled, &program.plan, &rows_read, wave, at)?;
         if matches!(launched, Launched::Airborne) {
-            staged.push((program_id, bound.session.extents(), id));
+            staged.push((program_id, extents, (id, scratch)));
         }
         Ok(launched)
     }
@@ -1123,7 +1157,7 @@ impl Plane {
         instances: &mut BTreeMap<InstanceId, Bound>,
         program_id: ProgramId,
         extents: Extents,
-        members: &[InstanceId],
+        members: &[Member],
         lanes: u32,
         base: u64,
         fresh: bool,
@@ -1146,7 +1180,7 @@ impl Plane {
         instances: &mut BTreeMap<InstanceId, Bound>,
         program_id: ProgramId,
         extents: Extents,
-        members: &[InstanceId],
+        members: &[Member],
         lanes: u32,
         base: u64,
         fresh: bool,
@@ -1171,18 +1205,18 @@ impl Plane {
             for prepared in batch.stages.iter_mut().flatten() {
                 next = prepared.lay(extents, lanes, next, fresh, stream)?;
             }
-            for instance in members {
-                let bound = instances.get_mut(instance).ok_or_else(|| {
+            for &(instance, scratch) in members {
+                let bound = instances.get_mut(&instance).ok_or_else(|| {
                     Fault::program(
                         "program::plane",
                         format!("a staged fire names instance {instance}, which is gone"),
                     )
                 })?;
-                // Every stage's lane reads its scratch at its instance's own
-                // (`launch::lane_scratch`).
+                // Every stage's lane reads the scratch this fire handed its
+                // instance (`launch::lane_scratch`).
                 bound
                     .session
-                    .take_lane(at_point(&mut batch.stages, &runs), bound.scratch)?;
+                    .take_lane(at_point(&mut batch.stages, &runs), scratch)?;
             }
             for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.commit_lanes(stream)?;
@@ -1365,9 +1399,6 @@ struct Bound {
     /// Where its lane's captured score rows lie now, for a program that
     /// reads them.
     scores: Option<u64>,
-    /// Where its lane's value scratch lies now
-    /// (`engine::InstanceBinding::scratch`, [`PairRoom::instance_bytes`]).
-    scratch: u64,
 }
 
 /// Where a guest item lies in the pool, as a binding names it.
@@ -1389,8 +1420,6 @@ pub type Span<'a> = &'a dyn Fn(Item<'_>, u64) -> Result<u64>;
 pub struct Slots {
     pub instance: Vec<u32>,
     pub rings: Vec<engine::program::RingSlots>,
-    /// Where its lane's scratch lies (`engine::InstanceBinding::scratch`).
-    pub scratch: engine::ScratchPlace,
     /// Where its pair's state lies (`engine::InstanceBinding::pair`).
     pub pair: engine::ScratchPlace,
     /// Which taking of those slots (`engine::InstanceBinding::pair_generation`).

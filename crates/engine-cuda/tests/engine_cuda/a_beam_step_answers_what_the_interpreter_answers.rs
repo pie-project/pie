@@ -75,7 +75,7 @@ fn fired(case: &Case, seats: &[Seat]) -> Result<Vec<Vec<u8>>, String> {
             )
             .expect("the logits bind");
     }
-    let fired = plane.fire(&context, instance).map_err(|why| why.to_string())?;
+    let fired = crate::guest::fire(&mut plane, &context, instance).map_err(|why| why.to_string())?;
     assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
     let session = plane.instance_mut(instance).expect("the instance");
     Ok(case

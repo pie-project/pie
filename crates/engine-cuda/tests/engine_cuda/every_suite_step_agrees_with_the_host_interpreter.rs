@@ -547,7 +547,7 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
             }
             for lane in &fleet {
                 let launched = plane
-                    .stage(lane.device, Stage::Epilogue)
+                    .stage(lane.device, Stage::Epilogue, &engine::ScratchPlace::None, &crate::guest::arm(lane.device))
                     .unwrap_or_else(|e| panic!("{}: stages: {e:?}", suite.name));
                 assert!(
                     matches!(launched, Launched::Airborne),
@@ -716,7 +716,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
                 1,
             )
             .expect("the logits bind");
-        let launched = plane.stage(lane, Stage::Epilogue).expect("the lane stages");
+        let launched = plane.stage(lane, Stage::Epilogue, &engine::ScratchPlace::None, &crate::guest::arm(lane)).expect("the lane stages");
         assert!(
             matches!(launched, Launched::Airborne),
             "refused: {launched:?}"

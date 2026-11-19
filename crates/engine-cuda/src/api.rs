@@ -960,7 +960,11 @@ impl Engine for Cuda {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        class: GeometryClass,
     ) -> EngineResult<engine::GuestState> {
+        // One arm for every class: the engine's one stream orders each fire's
+        // stages after the reads of the fire before (`Pools::guest_state`).
+        let _ = class;
         match self.shell.as_ref() {
             Some(shell) => shell
                 .guest_state(program, self::extents(extents))
@@ -1004,7 +1008,6 @@ impl Engine for Cuda {
                 id,
                 instance,
                 rings,
-                scratch,
                 pair,
                 pair_generation,
                 ..
@@ -1015,7 +1018,6 @@ impl Engine for Cuda {
                     crate::program::Slots {
                         instance,
                         rings,
-                        scratch,
                         pair,
                         pair_generation,
                     },
@@ -1316,7 +1318,6 @@ impl Engine for Cuda {
                 crate::program::Slots {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
-                    scratch: binding.scratch.clone(),
                     pair: binding.pair.clone(),
                     pair_generation: binding.pair_generation,
                 },
@@ -1773,6 +1774,7 @@ impl Cuda {
                 lanes: attachment.lanes,
                 instance: attachment.instance,
                 adapter_only: attachment.adapter_only,
+                scratch: attachment.scratch.clone(),
             })
             .collect();
 

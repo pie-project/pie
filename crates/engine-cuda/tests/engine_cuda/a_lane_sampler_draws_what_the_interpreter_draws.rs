@@ -251,7 +251,7 @@ fn draw_all(rank: bool, cases: &[Case], flies: &[Fly]) -> (usize, usize) {
                     // The same draw, fired again and again, lands on one token.
                     let mut drawn = Vec::new();
                     for _ in 0..REPEATS {
-                        let fired = plane.fire(&context, instance).expect("the fire runs");
+                        let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
                         assert!(matches!(fired, Fired::Committed), "{fired:?}");
                         drawn.push(take(&mut plane, instance));
                     }
@@ -266,7 +266,12 @@ fn draw_all(rank: bool, cases: &[Case], flies: &[Fly]) -> (usize, usize) {
             Fly::Together(_) => {
                 for &(_, instance) in &bound_draws {
                     let launched = plane
-                        .stage(instance, Stage::Epilogue)
+                        .stage(
+                            instance,
+                            Stage::Epilogue,
+                            &engine::ScratchPlace::None,
+                            &crate::guest::arm(instance),
+                        )
                         .expect("the lane stages");
                     assert!(matches!(launched, Launched::Airborne), "a lane was refused");
                 }

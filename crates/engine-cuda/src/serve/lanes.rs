@@ -87,7 +87,7 @@ impl<'a> Seated<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attached {
     /// The first of its pass's lanes, `lanes` of them in a row.
     pub lane: u32,
@@ -95,6 +95,9 @@ pub struct Attached {
     pub instance: engine::InstanceId,
     /// Carries the pass's adapter alone and runs none of its stages.
     pub adapter_only: bool,
+    /// The value scratch this fire's stages read for the instance
+    /// (`engine::Attachment::scratch`), for this fire alone.
+    pub scratch: engine::ScratchPlace,
 }
 
 impl Attached {

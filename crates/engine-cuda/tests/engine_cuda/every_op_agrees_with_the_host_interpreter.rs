@@ -983,7 +983,7 @@ impl Rig {
         for &instance in &instances {
             let launched = self
                 .plane
-                .stage(instance, Stage::Epilogue)
+                .stage(instance, Stage::Epilogue, &engine::ScratchPlace::None, &crate::guest::arm(instance))
                 .unwrap_or_else(|e| panic!("{}: the lane stages: {e:?}", case.name));
             assert!(
                 matches!(launched, Launched::Airborne),

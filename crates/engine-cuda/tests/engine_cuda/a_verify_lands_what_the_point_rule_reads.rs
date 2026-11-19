@@ -153,7 +153,7 @@ fn a_verify_lands_what_the_point_rule_reads() {
                 context.stream(),
             )
             .expect("the epilogue binds an instance");
-        let fired = plane.fire(&context, instance).expect("the fire runs");
+        let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
         assert!(matches!(fired, Fired::Committed), "{fired:?}");
         let session = plane.instance_mut(instance).expect("the instance");
         let chances: Vec<f32> = session

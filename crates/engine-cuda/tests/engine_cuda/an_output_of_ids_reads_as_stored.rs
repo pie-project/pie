@@ -113,7 +113,7 @@ fn an_output_of_ids_reads_as_stored() {
             ROWS,
         )
         .expect("the drafts bind");
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     assert!(matches!(fired, Fired::Committed), "{fired:?}");
     let cell = plane
         .instance_mut(instance)

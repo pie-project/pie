@@ -152,7 +152,7 @@ fn a_guest_reads_no_row_past_its_seat() {
             .expect("the logits bind");
     };
     seat(&mut plane, 1);
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     let Fired::Faulted(why) = &fired else {
         panic!("a read past the seat's rows fired: {fired:?}");
     };
@@ -161,7 +161,7 @@ fn a_guest_reads_no_row_past_its_seat() {
     // Seated with both rows, the same program reads both: the sentinel is
     // what the refused fire would have read.
     seat(&mut plane, 2);
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     assert!(matches!(fired, Fired::Committed), "{fired:?}");
     assert_eq!(taken(&mut plane, instance), Some(values));
 
@@ -188,14 +188,14 @@ fn a_guest_reads_no_row_past_its_seat() {
     };
     seat(&mut plane, 0);
     seat(&mut plane, 1);
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     let Fired::Faulted(why) = &fired else {
         panic!("a read past the seated lanes fired: {fired:?}");
     };
     assert!(why.contains("`logits`"), "{why}");
     assert_eq!(taken(&mut plane, instance), None, "a refused fire put a cell");
     seat(&mut plane, 2);
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     assert!(matches!(fired, Fired::Committed), "{fired:?}");
     assert_eq!(taken(&mut plane, instance), Some(values));
 }

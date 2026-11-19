@@ -10,7 +10,6 @@ use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, ops};
 use poem_ir::InputAxis;
 
 use crate::common_two_axis::{Weights, contract_for};
-use engine::fire::Attachment;
 use engine::program::{InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
@@ -294,12 +293,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 },
             )
             .id;
-        attachments.push(Attachment {
-            lane: at as u32,
-            lanes: 1,
-            instance,
-            adapter_only: false,
-        });
+        attachments.push(guest.attach(at as u32, instance));
         readers.push(instance);
     }
     let mut ticket = engine

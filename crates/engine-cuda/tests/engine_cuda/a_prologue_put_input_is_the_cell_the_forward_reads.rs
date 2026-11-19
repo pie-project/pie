@@ -2,7 +2,6 @@
 
 use crate::common_two_axis::{Rig, WIDTH, Weights, assert_close, frame, trace, velocity_epilogue};
 use engine::Engine;
-use engine::fire::Attachment;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::Stage;
@@ -110,12 +109,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
             .engine
             .submit(&frame(
                 vec![rig.dit_lane(0, ROWS, latent_cell, timestep, position_cell)],
-                vec![Attachment {
-                    lane: 0,
-                    lanes: 1,
-                    instance: noised,
-                    adapter_only: false,
-                }],
+                vec![rig.attach(0, noised)],
                 Vec::new(),
             ))
             .unwrap_or_else(|why| {
@@ -152,7 +146,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
         .engine
         .submit(&frame(
             vec![rig.dit_lane(0, ROWS, host_latent, host_timestep, host_positions)],
-            vec![crate::common_two_axis::attach(0, host)],
+            vec![rig.attach(0, host)],
             Vec::new(),
         ))
         .expect("the host-fed fire fires");

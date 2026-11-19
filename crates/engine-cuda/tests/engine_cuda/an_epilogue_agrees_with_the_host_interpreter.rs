@@ -238,7 +238,7 @@ fn device_outputs(
             .expect("the logits bind");
         buffer
     });
-    let fired = plane.fire(&context, instance).expect("the fire runs");
+    let fired = crate::guest::fire(&mut plane, &context, instance).expect("the fire runs");
     assert!(
         matches!(fired, Fired::Committed),
         "the device fire did not commit: {fired:?}"

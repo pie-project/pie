@@ -65,6 +65,10 @@ pub struct Guest {
     /// Each pair's state, taken at its first bind ([`Guest::pair`]).
     /// Keyed by the pair's program and extents, as written.
     pairs: Vec<(String, ScratchPlace)>,
+    /// Each instance's arm of scratch, taken at its bind and handed with
+    /// every fire of it ([`Guest::arm`]): the idle arm a runtime keeps with
+    /// an instance whose fires are one in flight at a time.
+    arms: Vec<(engine::InstanceId, ScratchPlace)>,
 }
 
 #[cfg(feature = "device")]
@@ -88,6 +92,7 @@ impl Guest {
             chunk_bytes: facts.chunk_bytes,
             committed,
             pairs: Vec::new(),
+            arms: Vec::new(),
         }
     }
 
@@ -149,17 +154,18 @@ impl Guest {
         (instance, rings)
     }
 
-    /// Where a bind of `pair` with guest state `state` finds its own
-    /// scratch and its pair's, as the runtime takes them (`store::roles`):
-    /// each a run of `Instance` slots where two of its size share a chunk,
-    /// else runs of `state.run` adjacent chunks; the instance's fresh, the
-    /// pair's taken at its first bind and named the same after.
+    /// Where a bind of `pair` with guest state `state` finds an arm of
+    /// scratch for its fires and its pair's state, as the runtime takes
+    /// them (`store::roles`): each a run of `Instance` slots where two of
+    /// its size share a chunk, else runs of `state.run` adjacent chunks;
+    /// the arm fresh, the pair's taken at its first bind and named the same
+    /// after.
     pub fn places(
         &mut self,
         pair: (engine::ProgramId, impl std::fmt::Debug),
         state: &GuestState,
     ) -> (ScratchPlace, ScratchPlace) {
-        let scratch = self.take_state(state.per_instance, state);
+        let scratch = self.scratch(state);
         let pair = format!("{pair:?}");
         if let Some((_, place)) = self.pairs.iter().find(|(held, _)| *held == pair) {
             return (scratch, place.clone());
@@ -167,6 +173,32 @@ impl Guest {
         let place = self.take_state(state.per_pair, state);
         self.pairs.push((pair, place.clone()));
         (scratch, place)
+    }
+
+    /// A fresh arm of scratch for a fire of a guest with state `state`.
+    pub fn scratch(&mut self, state: &GuestState) -> ScratchPlace {
+        self.take_state(state.scratch, state)
+    }
+
+    /// The arm instance `id` took at its bind ([`Guest::bind`]), for an
+    /// attachment of a fire of it.
+    pub fn arm(&self, id: engine::InstanceId) -> ScratchPlace {
+        self.arms
+            .iter()
+            .find(|(held, _)| *held == id)
+            .map(|(_, arm)| arm.clone())
+            .unwrap_or_else(|| panic!("instance {id} was not bound through the guest"))
+    }
+
+    /// An attachment of instance `id` at `lane`, over its arm.
+    pub fn attach(&self, lane: u32, id: engine::InstanceId) -> engine::Attachment {
+        engine::Attachment {
+            lane,
+            lanes: 1,
+            instance: id,
+            adapter_only: false,
+            scratch: self.arm(id),
+        }
     }
 
     fn take_state(&mut self, bytes: u64, state: &GuestState) -> ScratchPlace {
@@ -212,18 +244,19 @@ impl Guest {
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
         let state = engine
-            .guest_state(binding.program, &binding.extents)
+            .guest_state(binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
         let (scratch, pair) = self.places((binding.program, binding.extents), &state);
-        engine
+        let bound = engine
             .bind_instance(&InstanceBinding {
                 instance_slots,
                 ring_slots,
-                scratch,
                 pair,
                 ..binding
             })
-            .expect("the instance binds")
+            .expect("the instance binds");
+        self.arms.push((bound.id, scratch));
+        bound
     }
 }
 
@@ -247,10 +280,45 @@ pub fn alone_slots(
                 slots: Vec::new(),
             })
             .collect(),
-        scratch: ScratchPlace::None,
         pair: ScratchPlace::None,
         pair_generation: 0,
     }
+}
+
+/// The scratch a fire of `instance` on a plane with no pool reads
+/// ([`alone_span`]): a buffer of its own, the same one every fire of the
+/// instance, as a runtime that keeps an idle arm with it hands it again.
+pub fn arm(
+    instance: engine::InstanceId,
+) -> impl Fn(engine_cuda::program::Item<'_>, u64) -> engine_cuda::Result<u64> {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    thread_local! {
+        static ARMS: RefCell<BTreeMap<engine::InstanceId, (u64, u64)>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+    move |item, bytes| {
+        ARMS.with(|arms| {
+            let mut arms = arms.borrow_mut();
+            match arms.get(&instance) {
+                Some(&(held, at)) if held >= bytes => Ok(at),
+                _ => {
+                    let at = alone_span(item, bytes)?;
+                    arms.insert(instance, (bytes, at));
+                    Ok(at)
+                }
+            }
+        })
+    }
+}
+
+/// Fires `instance` alone on a plane with no pool, over its [`arm`].
+pub fn fire(
+    plane: &mut engine_cuda::ProgramPlane,
+    context: &engine_cuda::device::Context,
+    instance: engine::InstanceId,
+) -> engine_cuda::Result<engine_cuda::program::session::Fired> {
+    plane.fire(context, instance, &ScratchPlace::None, &arm(instance))
 }
 
 /// A guest item of a plane with no pool: a buffer of its own, the test

@@ -877,9 +877,6 @@ impl Shell {
         )
     }
 
-    /// What `program` bound at `extents` holds as state, as the pool lays
-    /// it: each instance's lane scratch and its pair's tables
-    /// ([`crate::program::Plane::pair_room`]).
     /// Whether the pair's state is laid again at its next fire
     /// ([`crate::program::Plane::pair_stale`]). For a test.
     #[doc(hidden)]
@@ -888,13 +885,16 @@ impl Shell {
         self.programs.pair_stale(program, extents)
     }
 
+    /// What `program` bound at `extents` holds as state, as the pool lays
+    /// it: a fire's lane scratch for an instance and its pair's tables
+    /// ([`crate::program::Plane::pair_room`]).
     pub fn guest_state(
         &self,
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
-        self.pools.guest_state(per_instance, per_pair)
+        let (scratch, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(scratch, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and

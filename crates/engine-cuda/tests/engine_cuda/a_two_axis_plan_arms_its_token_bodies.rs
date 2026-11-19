@@ -3,7 +3,7 @@
 use crate::common_two_axis;
 
 use common_two_axis::{
-    C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, conv_reference, frame,
+    C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, bf, conv_reference, frame,
     pixel_epilogue, trace,
 };
 use engine::Engine;
@@ -55,7 +55,7 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
         .engine
         .submit(&frame(
             vec![rig.vae_lane(0, cell)],
-            vec![attach(0, vae)],
+            vec![rig.attach(0, vae)],
             vec![StepVoxels {
                 lane: 0,
                 clips: vec![CLIP],
@@ -98,7 +98,7 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
         .engine
         .submit(&frame(
             vec![rig.dit_lane(0, ROWS, latent, timestep, positions)],
-            vec![attach(0, dit)],
+            vec![rig.attach(0, dit)],
             Vec::new(),
         ))
         .expect("the token arm fires");
