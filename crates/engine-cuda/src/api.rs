@@ -1041,7 +1041,9 @@ impl Engine for Cuda {
 
     /// A move between the device and the host tier rides the swap stream
     /// and is still reading its sources when the call returns: told landed
-    /// from that stream, behind the copy. Every other copy reads its sources
+    /// once the stream has run it, by a waiter on an event recorded behind
+    /// it (`serve::landing`), which enqueues nothing that a later move
+    /// would wait on. Every other copy reads its sources
     /// inside the call (the slot file's moves wait for it) or on the main
     /// stream, ahead of everything enqueued after it.
     fn copy_slots_landing(
