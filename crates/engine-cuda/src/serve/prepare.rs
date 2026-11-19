@@ -620,6 +620,21 @@ impl Shell {
                 .map(|seated| seated.lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            // A pass's ports describe its own lanes alone: one describing
+            // more would place the next lane's rows (somebody else's)
+            // through that lane's own table.
+            if carried > attached.lanes.max(1) as usize {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "instance {} is attached over {} lane(s) and its `embed_indptr` port \
+                         describes {carried}; a pass's geometry ports describe its own lanes \
+                         and never a lane past them",
+                        attached.instance,
+                        attached.lanes.max(1)
+                    ),
+                ));
+            }
             if first + carried > lanes.len() {
                 return Err(Fault::program(
                     "serve::prepare",

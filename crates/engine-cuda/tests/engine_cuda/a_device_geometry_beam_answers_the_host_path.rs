@@ -621,3 +621,120 @@ fn a_placed_slot_past_the_reserve_faults_its_lane() {
         "{refused}"
     );
 }
+
+/// A program attached over one lane whose geometry ports describe two: a
+/// pass's ports never reach past its own lanes, so the fire is refused by
+/// name, placed on the device or read on the host, before anything is
+/// staged; the lane beside it (another tenant's) reads what it read before.
+#[test]
+fn ports_describing_lanes_past_the_attachment_are_refused() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let decl = |shape: Shape, dtype: EtaDtype| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 4,
+        host_role: HostRole::None,
+        seeded: true,
+    };
+    let (indptr, tokens, positions, slots) = (0u32, 1u32, 2u32, 3u32);
+    let container = || TraceContainer {
+        names: Vec::new(),
+        channels: vec![
+            decl(Shape::vector(3), EtaDtype::U32),
+            decl(Shape::vector(2), EtaDtype::I32),
+            decl(Shape::vector(2), EtaDtype::U32),
+            decl(Shape::vector(2), EtaDtype::U32),
+        ],
+        ports: vec![
+            PortBinding {
+                port: Port::EmbedIndptr,
+                source: PortSource::Channel(indptr),
+            },
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(tokens),
+            },
+            PortBinding {
+                port: Port::Positions,
+                source: PortSource::Channel(positions),
+            },
+            PortBinding {
+                port: Port::Slots,
+                source: PortSource::Channel(slots),
+            },
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: [indptr, tokens, positions, slots]
+                .iter()
+                .flat_map(|&chan| [Op::ChanTake(chan), Op::ChanPut { chan, value: chan }])
+                .collect(),
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let words = |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let seeds = vec![
+        (indptr, words(&[0, 1, 2])),
+        (tokens, words(&[token(0), token(1)])),
+        (positions, words(&[PROMPT, PROMPT])),
+        (slots, words(&[PROMPT, PROMPT + 1])),
+    ];
+    let (mut shell, trace, _dir) = setup(2, Runahead::of(2));
+    let pool = Pool::new(2);
+    let word = trace.facts.word(&Request::new(1, true));
+    // The neighbour: another tenant's lane over pages of its own, reading
+    // the slot the program would place its second lane at.
+    let other: Vec<u32> = (64 / PAGE..128 / PAGE).collect();
+    prefill(&mut shell, &trace, &other);
+    let neighbour = || Seated {
+        pages: &other,
+        held: Some(PROMPT + 2),
+        positions: &pool.depth,
+        ..Seated::of(Lane {
+            slot: 1,
+            word,
+            tokens: &pool.tokens[0],
+        })
+    };
+    let before = shell
+        .fire_rows(&[neighbour()], &[Readout::Last])
+        .expect("the neighbour fires");
+    // Placed on the device (no report asked) and read on the host (one asked).
+    for (reports, shared) in [(0u64, true), (1, false)] {
+        let instance = bind_with(&mut shell, container(), 0xde70 + reports, &seeds, 2, shared);
+        let attached = [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }];
+        let lanes = [
+            Seated {
+                translation: &pool.pages,
+                reports,
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word,
+                    tokens: &pool.placeholder,
+                })
+            },
+            neighbour(),
+        ];
+        let refused = shell
+            .fire_media(&lanes, &attached, &[])
+            .expect_err("ports past the attachment are refused");
+        let said = format!("{refused}");
+        assert!(
+            said.contains("describes 2") || said.contains("carries 2 token(s)"),
+            "reports {reports}: {said}"
+        );
+    }
+    let after = shell
+        .fire_rows(&[neighbour()], &[Readout::Last])
+        .expect("the neighbour fires again");
+    assert_eq!(worst(&after, &before), 0.0, "the neighbour's cache was written");
+}
