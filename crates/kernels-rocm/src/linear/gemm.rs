@@ -235,6 +235,70 @@ pub fn residual_add_rmsnorm_matmul(
     }
 }
 
+/// `h = swiglu(rmsnorm(x + y) · gate_upᵀ)` in one launch where that pays
+/// (`ResidualAddRmsnormMatmulSwigluMatmul`'s first half): `x + y` lands in
+/// `y_out` and the normed rows in `out`, each block norming its own copy
+/// where it stages them for the packed `[gate | up]` product. `Ok(false)`,
+/// landing nothing, where the gated product would not take the skinny
+/// kernel or the blocks' redundant norms cost more than the launch they
+/// save; the caller then runs the norm and the MLP apart.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_matmul_swiglu(
+    ctx: &Ctx,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    gate_up: Tensor,
+    y_out: &mut Tensor,
+    out: &mut Tensor,
+    h: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.residual_add_rmsnorm_matmul_swiglu_matmul";
+    if [x.dtype, y.dtype, weight.dtype, gate_up.dtype, y_out.dtype, out.dtype, h.dtype]
+        .iter()
+        .any(|&d| d != Dtype::Bf16)
+        || x.rows != y.rows
+        || x.rows != h.rows
+        || x.width != y.width
+        || u64::from(weight.rows) * u64::from(weight.width) != u64::from(x.width)
+        || gate_up.width != x.width
+        || gate_up.rows != 2 * h.width
+        || h.rows == 0
+    {
+        return Ok(false);
+    }
+    let i = count(OP, "the intermediate width", h.width)?;
+    let k = count(OP, "the contraction this projection walks", x.width)?;
+    let m = ctx.opaque_rows(stated(OP, h.rows)?);
+    #[cfg(feature = "rocm")]
+    {
+        dense::act_x_wt_swiglu_normed(
+            ctx,
+            gate_up.ptr,
+            h.ptr,
+            m,
+            i,
+            k,
+            super::gemv::SkinnyNorm {
+                x: x.ptr,
+                y: y.ptr,
+                w: weight.ptr,
+                y_out: y_out.ptr,
+                out: out.ptr,
+                eps,
+                plus_one: i32::from(plus_one),
+            },
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, plus_one, eps, y_out, out, m, i, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
 pub fn act_x_wt(
     ctx: &Ctx,
     op: &'static str,

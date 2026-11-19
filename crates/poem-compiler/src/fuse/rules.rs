@@ -57,6 +57,8 @@ pub fn all() -> Vec<Rule> {
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
+        // Before the MLP alone takes its products.
+        residual_add_rmsnorm_matmul_swiglu_matmul(),
         matmul_swiglu_matmul(),
         matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
         moe_mega(),
@@ -1115,6 +1117,53 @@ pub fn residual_add_rmsnorm_matmul() -> Rule {
             z: m.value("z"),
         }
     })
+}
+
+/// [`residual_add_rmsnorm_matmul`]'s norm feeding a dense MLP whole
+/// ([`matmul_swiglu_matmul`]'s chain over the normed rows): a backend may
+/// norm them where it stages them for the gate-up product.
+#[must_use]
+pub fn residual_add_rmsnorm_matmul_swiglu_matmul() -> Rule {
+    let chain = |norm: Norm| {
+        template(move |p| {
+            let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
+            p.export("y_out", &y_out);
+            let out = norm.apply(p, &y_out, "weight", "eps");
+            p.export("out", &out);
+            let packed = linear::matmul(&out, &p.weight("gate_up", [2 * W, W]));
+            p.name("packed", &packed);
+            let h = linear::glu(
+                &packed,
+                GluAct::Swiglu,
+                Some(p.u32("intermediate")),
+                None,
+                None,
+                None,
+            );
+            p.name("h", &h);
+            let z = linear::matmul(&h, &p.weight("down", [W, W]));
+            p.export("z", &z);
+        })
+    };
+    Rule::new(
+        "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+        Norm::BOTH.map(chain),
+        |m| Fused::ResidualAddRmsnormMatmulSwigluMatmul {
+            x: m.value("x"),
+            y: m.value("y"),
+            y_out: m.value("y_out"),
+            weight: m.value("weight"),
+            plus_one: plus_one(m.op("out")),
+            eps: m.f32("eps"),
+            out: m.value("out"),
+            gate_up: m.value("gate_up"),
+            down: m.value("down"),
+            intermediate: m.u32("intermediate"),
+            packed: m.value("packed"),
+            h: m.value("h"),
+            z: m.value("z"),
+        },
+    )
 }
 
 /// A dense MLP whole: the packed gate-up projection, swiglu, and the down

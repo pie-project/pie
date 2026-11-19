@@ -479,3 +479,54 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
         close_abs(&format!("{m}x{n}x{k} against the host"), &gpu.read(&z), &want, 2e-2);
     }
 }
+
+/// The residual norm folded into a dense MLP's gate-up product
+/// (`ResidualAddRmsnormMatmulSwigluMatmul`'s first half): the gated columns
+/// are the norm's then the gated product's, bit for bit; the sum and the
+/// normed rows land for their readers.
+#[test]
+fn the_normed_gated_skinny_product_is_the_norm_then_the_gated_product() {
+    let Some(gpu) = Gpu::open() else { return };
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.launch_ns = 1536;
+    t.hbm_gbps = 4090;
+    let ctx = gpu.ctx().with_tuning(t);
+    for (m, i, k, plus_one) in [(1u32, 3072u32, 1024u32, false), (2, 1536, 1024, true)] {
+        let x: Vec<f32> = values((m * k) as usize, 51, 1.0).into_iter().map(round_bf16).collect();
+        let y: Vec<f32> = values((m * k) as usize, 52, 1.0).into_iter().map(round_bf16).collect();
+        let nw: Vec<f32> = values(k as usize, 53, 0.5).into_iter().map(round_bf16).collect();
+        let w: Vec<f32> = values((2 * i * k) as usize, 54, 0.05).into_iter().map(round_bf16).collect();
+        let (xt, yt, nwt, wt) = (
+            gpu.tensor(&x, m, k, Dtype::Bf16),
+            gpu.tensor(&y, m, k, Dtype::Bf16),
+            gpu.tensor(&nw, k, 1, Dtype::Bf16),
+            gpu.tensor(&w, 2 * i, k, Dtype::Bf16),
+        );
+        let mut y_out = gpu.zeros(m, k, Dtype::Bf16);
+        let mut folded_normed = gpu.zeros(m, k, Dtype::Bf16);
+        let mut h = gpu.tensor(&vec![7.0; (m * i) as usize], m, i, Dtype::Bf16);
+        let landed = gpu
+            .laid(&ctx, |ctx| {
+                gemm::residual_add_rmsnorm_matmul_swiglu(
+                    ctx, xt, yt, nwt, plus_one, 1e-6, wt, &mut y_out, &mut folded_normed, &mut h,
+                )
+            })
+            .unwrap();
+        assert!(landed, "{m}x{i}x{k}: one or two rows fold");
+        let mut apart_sum = gpu.zeros(m, k, Dtype::Bf16);
+        let mut normed = gpu.zeros(m, k, Dtype::Bf16);
+        let mut apart = gpu.zeros(m, i, Dtype::Bf16);
+        let gated = gpu
+            .laid(&ctx, |ctx| {
+                kernels_rocm::elemwise::norm_residual::residual_add_rmsnorm_into(
+                    ctx, xt, yt, &mut apart_sum, nwt, plus_one, 1e-6, &mut normed,
+                )?;
+                gemm::matmul_swiglu(ctx, normed, wt, &mut apart)
+            })
+            .unwrap();
+        assert!(gated, "{m}x{i}x{k}: the gated product apart takes the skinny kernel");
+        assert_eq!(gpu.read(&y_out), gpu.read(&apart_sum), "{m}x{i}x{k}: the sum");
+        assert_eq!(gpu.read(&folded_normed), gpu.read(&normed), "{m}x{i}x{k}: the normed rows");
+        assert_eq!(gpu.read(&h), gpu.read(&apart), "{m}x{i}x{k} plus_one={plus_one}: the gated columns");
+    }
+}
