@@ -55,17 +55,27 @@ fn xsend(src: mem1d_dsd, n: u16) void {
     route(C_XF, 0x12);
   }
 }
-// a column line member's turn (south root 0x84, north root 0x88), the line its request's rows
-fn csend(cf: u16, cb: u16, src: mem1d_dsd, n: u16) void {
+// a column line member's turn (south root 0x84, north root 0x88), the line its request's rows:
+// toward the next member last (south in a forward attention, north in a reverse one), so the
+// next member's piece, sent once it has this one, never passes this one's other half
+fn csend_b(cb: u16, src: mem1d_dsd, n: u16) void {
   if (Y > R0) {
     route(cb, 0x88); fab.oqc(3, cb); @mov32(fab.fout(q_co, n), src); drain(3);
     route(cb, 0x58);
   }
+}
+fn csend_f(cf: u16, src: mem1d_dsd, n: u16) void {
   if (Y + 1 < R0 + RQ) {
     route(cf, 0x84); fab.oqc(3, cf); @mov32(fab.fout(q_co, n), src); drain(3);
     route(cf, 0x74);
   }
 }
+fn csend(cf: u16, cb: u16, src: mem1d_dsd, n: u16, rev: bool) void {
+  if (rev) { csend_f(cf, src, n); csend_b(cb, src, n); }
+  else { csend_b(cb, src, n); csend_f(cf, src, n); }
+}
+// the attentions run this launch (their members' order alternates)
+var NATT: u16 = 0;
 
 // The column's weight stream: its tape's words up the column (a tree: every PE of the
 // column takes every word), in op order.
@@ -185,22 +195,30 @@ fn attend(a: u16) void {
     @fmovs(md(oo + t * lo, nc), 0.0);
     @fs2h(@set_dsd_length(@increment_dsd_offset(D_qh, @as(i16, t * nc), @fp16()), nc), md(qo + t * lq, nc));
   }
-  fab.iqc(6, C_KF);
+  // The members' order alternates, the request's rows forward (north first: pieces come on
+  // C_KF until a PE's turn, then on C_KB) in one attention, reverse in the next: an attention
+  // starts on the colour the last one ended on, iq6 rebound only at a PE's own turn (no piece
+  // of the other colour is coming then). Rebound between attentions, a row still in the
+  // last's key blocks (on C_KB from its turn to the last piece, over their band reductions)
+  // took the next one's first C_KF on its ramp, its reductions' words behind it (1558, s3).
+  const rev = (NATT & 1) != 0;
+  NATT += 1;
+  if (rev) { fab.iqc(6, C_KB); } else { fab.iqc(6, C_KF); }
   const half = TB * nc;
-  // (the request's rows of PEs: its keys)
-  var j: u16 = R0;
-  while (j < R0 + RQ) : (j += kbm) {
+  // (the request's rows of PEs: its keys, `j` the block's first in the order)
+  var j: u16 = 0;
+  while (j < RQ) : (j += kbm) {
     var i: u16 = 0;
     while (i < kbm) : (i += 1) {
-      const m = j + i;
+      const m = if (rev) R0 + RQ - 1 - (j + i) else R0 + j + i;
       if (m == Y) {
-        fab.iqc(6, C_KB);
+        if (rev) { fab.iqc(6, C_KF); } else { fab.iqc(6, C_KB); }
         t = 0;
         while (t < TB) : (t += 1) {
           @fs2h(@set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, t * nc), @fp16()), nc), md(ko + t * lk, nc));
           @fs2h(@set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, half + t * nc), @fp16()), nc), md(vo + t * lv, nc));
         }
-        csend(C_KF, C_KB, @set_dsd_length(D_kvw, half), half);
+        csend(C_KF, C_KB, @set_dsd_length(D_kvw, half), half, rev);
       } else {
         @mov32(@set_dsd_length(D_kvw, half), fab.fin(q_ki, half));
       }
@@ -225,7 +243,11 @@ fn attend(a: u16) void {
       while (t < TB) : (t += 1) {
         const qi = (Y - R0) * TB + t;
         var c: u16 = 0;
-        while (c < KB) : (c += 1) { if ((j - R0) * TB + c > qi) { mem[SC + t * KB + c] = -1.0e30; } }
+        while (c < KB) : (c += 1) {
+          // (key c's row: its member's, in the block's order)
+          const kp = if (rev) (RQ - 1 - j - c / TB) * TB + c % TB else j * TB + c;
+          if (kp > qi) { mem[SC + t * KB + c] = -1.0e30; }
+        }
       }
     }
     t = 0;
@@ -252,6 +274,13 @@ fn attend(a: u16) void {
       matvec.mac32(md(oo + t * lo, nc), vv, @set_dsd_length(D_ph, KB));
     }
   }
+  // A row-wide ordering point (a one-word all-reduce over the row): the key blocks' reductions
+  // are the band's alone, so a row's bands drift apart over them, a key block each; past the
+  // attention, without one, a band ahead met one behind in the ops after it and the row
+  // stopped (klein 1024²: s2, one attention, ran; s3, its second, hung, at 136, 272 and 576
+  // rows; with this the whole program ran: 1558, 1561, 1564). Its price: one row chain an
+  // attention (flux2-mini's kbm-16 GEMM +0.087%).
+  gseg.allred(md(RT, 1), 1, false);
   t = 0;
   while (t < TB) : (t += 1) {
     @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), math.recip(ll[t]));
@@ -292,6 +321,7 @@ fn run_op(a: u16) void {
 // The ops in order, each off the column's stream before its weights: its first word (its
 // code and length), then the rest (an even count of 16-bit words).
 fn run_all() void {
+  NATT = 0;
   var i: u16 = 0;
   while (i < NOPS) : (i += 1) {
     @mov32(@set_dsd_length(D_progw, 1), fab.fin(q_wi, 1));

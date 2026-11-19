@@ -663,10 +663,47 @@ pub fn line_queues(pe: &str) -> Vec<Line> {
         .collect()
 }
 
+/// A line `l` whose function alternates the colour it starts on, one run to the next: its
+/// first rebind of the queue picks between two colours (`if (c) { fab.iqc(q, A); } else {
+/// fab.iqc(q, B); }`, the attention's members' order by its parity). Each run then starts on
+/// the colour the last ended on, the queue rebound only inside a run (at a PE's own turn),
+/// none between: no window there. (Rebound back at a run's end, after its last piece, it is
+/// not shut: a PE behind in the run's key blocks keeps the other colour until then.)
+fn line_alternates(pe: &str, l: &Line) -> bool {
+    let Some(b) = body(pe, &l.func) else {
+        return false;
+    };
+    let bind = format!("fab.iqc({}, ", l.queue);
+    let Some(at) = b.find(&bind) else {
+        return false;
+    };
+    let before = b[..at].trim_end();
+    let cond = before.ends_with('{')
+        && before
+            .rsplit('\n')
+            .next()
+            .is_some_and(|ln| ln.trim_start().starts_with("if ("));
+    let rest = &b[at + bind.len()..];
+    let Some(end) = rest.find(')') else {
+        return false;
+    };
+    let first = rest[..end].trim();
+    let other = rest[end..]
+        .strip_prefix(");")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('}'))
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix("else {"))
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix(bind.as_str()))
+        .and_then(|r| r.find(')').map(|e| r[..e].trim()));
+    cond && other.is_some_and(|o| o != first && l.colours.contains(o) && l.colours.contains(first))
+}
+
 /// The attention ends in a row-wide ordering point: an all-reduce over the row after its last
 /// key block (`gseg.allred(.., false)` or `gseg.all_reduce(`), so no PE of the row leaves it
 /// before every other has reached its end.
-fn attention_orders_row(pe: &str) -> bool {
+pub(crate) fn attention_orders_row(pe: &str) -> bool {
     body(pe, "attend").is_some_and(|b| {
         let tail = b.rfind("gseg.allred(").map_or("", |i| &b[i..]);
         let last = tail.find(';').map_or(tail, |e| &tail[..e]);
@@ -699,9 +736,15 @@ fn attention_orders_row(pe: &str) -> bool {
 /// - **H2** (between ops): a row-line op a class runs while an op since the last row-wide
 ///   ordering point is `skew`: its first pieces can reach PEs still in that op, on the colour
 ///   the line left them bound to.
-/// - **H2** (column line): two attentions with no op between (the column line leaves `KB`
-///   bound, the next starts on `KF`).
+/// - **H2** (column line): an attention after another, whatever between (no op orders a
+///   column), where the column line leaves `KB` bound and the next starts on `KF`: a PE still in
+///   the last's key blocks keeps `KB` until its last piece (so rebinding `KF` after that piece,
+///   v17, does not shut it: 1558's s3 hung). None where the attentions alternate their
+///   members' order (`line_alternates`).
 /// - **H3** (no overtaking): covered by H2's ordering point.
+/// - **H4** (row drift): an attention with ops after it and no row-wide ordering point at its
+///   end, lines rebound or not: klein 1024²'s second attention hung (1558, 1561), a row
+///   all-reduce at the end cured it.
 ///
 /// A line on queues of its own (no queue rebound) has no window: nothing here.
 #[must_use]
@@ -711,6 +754,7 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
     let row_line = ls.iter().find(|l| l.func == "gemm");
     let col_line = ls.iter().find(|l| l.func == "attend");
     let att_row = attention_orders_row(pe);
+    let col_shut = col_line.is_some_and(|l| line_alternates(pe, l));
     let mut out = Vec::new();
     let classes: BTreeSet<usize> = p.row_class.iter().copied().collect();
     // (a region's all-reduces over the row, as printed)
@@ -738,13 +782,13 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
                     skew = None;
                 }
                 GOp::Attend { .. } => {
-                    if let (Some(l), Some(j)) = (col_line, last_attend)
-                        && j + 1 == i
-                    {
+                    // (no op orders a column: the tape's words are buffered, not a barrier)
+                    if let (Some(l), Some(j), false) = (col_line, last_attend, col_shut) {
                         out.push(format!(
-                            "op {i}: an attention right after op {j}'s: the column line (iq{} \
-                             rebound {:?}) leaves its PEs on the last colour while the next \
-                             starts on the first (H2)",
+                            "op {i}: an attention after op {j}'s with no column-wide ordering \
+                             point between: the column line (iq{} rebound {:?}) leaves its PEs \
+                             on its last colour, and the next one's first pieces can reach PEs \
+                             still in op {j} (H2)",
                             l.queue, l.colours
                         ));
                     }
@@ -760,6 +804,20 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+    // H4: a row's bands drift apart over an attention's key blocks; past it, with no row-wide
+    // ordering point, a band ahead meets one behind in the ops after it and the row stops,
+    // lines on queues of their own or not (1558 / 1561: klein's second attention hung at 136,
+    // 272 and 576 rows; with a row all-reduce at each attention's end it ran)
+    if !att_row {
+        for (i, op) in p.l.ops.iter().enumerate() {
+            if matches!(op, GOp::Attend { .. }) && i + 1 < p.l.ops.len() {
+                out.push(format!(
+                    "op {i}: an attention with no row-wide ordering point at its end, ops after \
+                     it: its key blocks' band reductions let the row's bands drift apart (H4)"
+                ));
             }
         }
     }
@@ -974,7 +1032,9 @@ mod tests {
         let turn =
             "    const kc = if (even) kd else plen(cp, GX, K);\n    if (kc == 0) { continue; }";
         assert!(pe.contains(own) && pe.contains(tail) && pe.contains(turn));
+        // (as built before the row ordering point at each attention's end)
         let rebound = pe
+            .replace("  gseg.allred(md(RT, 1), 1, false);\n", "")
             .replace(own, "      @mov32(xhw(0, nw), fab.fin(q_xi, nw));\n")
             .replace(tail, &format!("  fab.iqc(2, C_XF);\n{tail}"))
             .replacen(
@@ -984,7 +1044,10 @@ mod tests {
             );
         let open = lines(&p, &rebound);
         assert!(
-            !open.is_empty() && open.iter().all(|w| w.contains("(H2)")),
+            open.iter().any(|w| w.contains("(H2)"))
+                && open
+                    .iter()
+                    .all(|w| w.contains("(H2)") || w.contains("(H4)")),
             "{open:?}"
         );
         eprintln!("{} windows; {}", open.len(), open[0]);
@@ -993,5 +1056,69 @@ mod tests {
         assert!(rebound.contains(end));
         let v14 = rebound.replace(end, &format!("  gseg.allred(md(RT, 1), 1, false);\n{end}"));
         assert_eq!(lines(&p, &v14), Vec::<String>::new(), "v14");
+    }
+
+    /// H4: as emitted every attention ends in a row-wide ordering point; without it, every
+    /// attention with an op after it is a window, the lines on their own queues or not.
+    #[test]
+    fn an_attention_with_no_row_ordering_point_is_a_window() {
+        let p = mini_gemm();
+        let pe = crate::emit::gemm::GPE_OPS;
+        assert!(attention_orders_row(pe));
+        let bar = "  gseg.allred(md(RT, 1), 1, false);\n";
+        assert_eq!(pe.matches(bar).count(), 1);
+        let open = lines(&p, &pe.replace(bar, ""));
+        let after =
+            p.l.ops
+                .iter()
+                .enumerate()
+                .filter(|(i, o)| {
+                    matches!(o, crate::stream::gemm::GOp::Attend { .. }) && i + 1 < p.l.ops.len()
+                })
+                .count();
+        assert!(after > 0);
+        assert_eq!(
+            open.iter().filter(|w| w.contains("(H4)")).count(),
+            after,
+            "{open:?}"
+        );
+    }
+
+    /// The column line: as emitted, the attentions alternate their members' order, so none is
+    /// a window; with the order fixed (as built before, `KF` bound at each attention's start),
+    /// every attention after the first is one, the GEMMs between ordering rows, not columns;
+    /// and so with `KF` rebound after the last piece too (v17: 1558's s3 hung).
+    #[test]
+    fn the_column_lines_windows_open_unless_the_attentions_alternate() {
+        let p = mini_gemm();
+        let pe = crate::emit::gemm::GPE_OPS;
+        let col = line_queues(pe)
+            .into_iter()
+            .find(|l| l.func == "attend")
+            .expect("the column line");
+        assert!(line_alternates(pe, &col), "as emitted");
+        assert_eq!(lines(&p, pe), Vec::<String>::new(), "as emitted");
+        let attends =
+            p.l.ops
+                .iter()
+                .filter(|o| matches!(o, crate::stream::gemm::GOp::Attend { .. }))
+                .count();
+        assert!(attends > 1, "{attends} attentions");
+        let start = "  if (rev) { fab.iqc(6, C_KB); } else { fab.iqc(6, C_KF); }\n";
+        assert_eq!(pe.matches(start).count(), 1);
+        let fixed = pe.replace(start, "  fab.iqc(6, C_KF);\n");
+        let open = lines(&p, &fixed);
+        assert_eq!(open.len(), attends - 1, "{open:?}");
+        assert!(
+            open.iter()
+                .all(|w| w.contains("column line") && w.contains("(H2)"))
+        );
+        let turn = "        if (rev) { fab.iqc(6, C_KF); } else { fab.iqc(6, C_KB); }\n";
+        assert_eq!(fixed.matches(turn).count(), 1);
+        let v17 = fixed.replace(
+            turn,
+            &format!("{turn}        if (Y + 1 == R0 + RQ) {{ fab.iqc(6, C_KF); }}\n"),
+        );
+        assert_eq!(lines(&p, &v17).len(), attends - 1, "v17");
     }
 }

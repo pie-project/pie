@@ -3868,6 +3868,9 @@ behind, the row stops. Chip runs 1543, 1550 and 1551 confirmed this mechanism, a
 | v14 | a one-word row all-reduce at each attention's end | clean | ran (12.7M, 16.2M cycles) |
 | v15 | v13 and a row all-reduce after each GEMM, words not packed west | holds | hung |
 | v16 | `XF` and `XB` on queues of their own, never rebound | clean | ran, 2% faster than v14 |
+| v17 | (the column line) iq6 back on `KF` once the last row's piece is read | holds (klein whole) | flux2-mini m2 bit for bit; klein 1024² s3 hung (1558) |
+| alt | (the column line) the attentions alternate their members' order | clean | flux2-mini m2 held to its golden (1559); klein s3 still hung |
+| alt + v14 | and a row all-reduce at each attention's end (as emitted) | clean | klein 1024² ran whole, 2 steps, 185.8M cycles a step (1564); s3 at 136, 272 and 576 rows without it hung (1561) |
 
 **The rule** (`check::hazard::lines(p, pe)`: a GEMM-regime program's ops and its PE code; a
 refusal of the program where any is open):
@@ -3891,9 +3894,33 @@ refusal of the program where any is open):
   ordering point is `skew`. Its first pieces can reach PEs still in that op, on the colour the
   line left them bound to. A window only a tail's drift reaches (one GEMM after another) ran on
   the chip (c4; v14's c5 and c2), so it is not one.
-  - For the column line: two attentions with no op between.
+  - For the column line: an attention after another, whatever ops between. No op orders a
+    column (a GEMM's row line orders a row, a region's all-reduce a row or a band; the tape's
+    words are buffered, not a barrier). A PE is on `KB` from its own turn to the last row's
+    piece, over the attention's remaining key blocks and their band reductions; a row slow
+    there is still on `KB` when the rest of its column has finished, run the GEMMs between and
+    sent the next attention's first `KF`. That `KF` holds its ramp with the reduction's words
+    behind it (1558: klein 1024²'s s2, one attention, ran; s3, the second attention, hung).
+    Rebinding `KF` after the last piece (v17) does not shut it. Shut where the attentions
+    alternate their members' order (`line_alternates`: the attention's first rebind picks a
+    colour by its parity): forward, pieces on `KF` until a PE's turn and `KB` after; reverse,
+    from the last row, `KB` then `KF`. Each starts on the colour the last ended on, and iq6 is
+    rebound only at a PE's own turn, when nothing of the other colour can come. A reverse
+    turn sends south first and north last, so the next member's piece never passes the
+    other half of this one on a link.
 - **H3** (no overtaking): a later op's piece passing an earlier op's on one colour. H2's
   ordering point covers it.
+- **H4** (row drift, lines rebound or not): an attention with ops after it and no row-wide
+  ordering point at its end. Its key blocks' reductions are a band's alone, so a row's bands
+  drift apart over them; klein 1024²'s denoise with both lines shut (v16, the alternation) still
+  hung at its second attention (s2 ran; s3 hung at 136, 272 and 576 rows) and ran with a row
+  all-reduce at each attention's end (1561). `place::flow` does not reproduce this window (its
+  messages land whole, its links have no buffers): the rule is the chip's, one ordering point an
+  attention (flux2-mini's kbm-16 GEMM: +0.087%, 1564). The emitter ends every attention with
+  one. A route restored only once a send's last wavelet is through the router (the switch's
+  advance) did not cure it (1563), nor did the column line alone (1559).
+- **Price** (1564): klein 1024²'s whole denoise, priced 151.5M cycles, ran 185.8M a step
+  (+23%): an open item for the cost model.
 
 As emitted today, every GEMM after an attention is an H2 window: flux2-mini's denoise has 8,
 and klein's at c5 and c2 have 50. With v14's barrier or v16's queues, none
