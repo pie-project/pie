@@ -1384,11 +1384,17 @@ inline void m4_reduce_two_levels(
     return;
   }
   const uint span = 32u * M4_REDUCE_CHUNKS_PER_GROUP;
-  if (group * M4_REDUCE_CHUNKS_PER_GROUP >= next_chunks) return;
+  // A row's groups side by side, the rows one after another: the host
+  // launches per_row groups a row (`StepKind::Reduce`), so the rows fold
+  // at once, not one after another in every group.
+  const uint per_row = max((next_chunks + M4_REDUCE_CHUNKS_PER_GROUP - 1u) / M4_REDUCE_CHUNKS_PER_GROUP, 1u);
+  const uint row = group / per_row;
+  group = group % per_row;
+  if (row >= d.rows || group * M4_REDUCE_CHUNKS_PER_GROUP >= next_chunks) return;
   threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
   const uint simds = threads / 32u;
   const uint rounds = span / simds;
-  for (uint row = 0; row < d.rows; ++row) {
+  {
     const device uint* src = level == 0u
         ? reinterpret_cast<const device uint*>(input) + row * d.last
         : plane + ((level - 1u) & 1u) * d.rows * pitch + row * pitch;

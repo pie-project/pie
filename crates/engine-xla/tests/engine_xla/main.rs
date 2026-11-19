@@ -19,6 +19,7 @@ mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_mask_reads_from_the_committed_boundary;
 mod a_pool_view_reads_the_packed_rows_order;
+mod a_prompt_reading_every_row_is_on_the_ladder;
 mod a_readout_lands_in_one_plane_shape;
 mod a_registered_channel_carries_one_cell_across_its_instances;
 mod a_registration_build_is_counted_and_cached;

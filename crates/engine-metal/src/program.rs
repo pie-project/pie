@@ -365,8 +365,22 @@ impl Plane {
             pooled,
             self.rows,
             capture,
+            self.arms,
         ) {
-            Ok(session) => session,
+            Ok(mut session) => {
+                // A decode envelope's next pass is staged while this one
+                // runs: its pages and slots are the host's, its token the
+                // device's.
+                if geometry == GeometryClass::DecodeEnvelope {
+                    session.allow_run_ahead(&program.compiled, &program.plan, geometry, device);
+                    tracing::debug!(
+                        program = program_id.0,
+                        runs_ahead = session.runs_ahead(),
+                        "metal: a decode envelope bound"
+                    );
+                }
+                session
+            }
             Err(why) => {
                 release_seats(&adopted);
                 return Err(why);
@@ -742,6 +756,7 @@ impl Plane {
             program.plan.package.channels.len(),
             self.rows,
             self.capture_of(program),
+            self.arms,
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
         if layout.slots > instance_per_chunk {
@@ -885,6 +900,58 @@ impl Plane {
                 ),
             )
         })
+    }
+
+    /// Where instance `id`'s next pass reads its token, while a pass of it
+    /// is in flight (that pass puts it): `None` with none in flight, the
+    /// host then reading the committed cell.
+    pub fn token_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        let Some(bound) = self.instances.get(&id) else {
+            return Ok(None);
+        };
+        if bound.session.in_flight() == 0 {
+            return Ok(None);
+        }
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.token_cell(&program.plan)
+    }
+
+    /// Passes of instance `id` that may fly while its next is staged:
+    /// none unless it runs ahead ([`Session::ahead_depth`]).
+    #[must_use]
+    pub fn ahead_depth(&self, id: InstanceId) -> usize {
+        self.instances
+            .get(&id)
+            .filter(|bound| bound.session.runs_ahead())
+            .map_or(0, |bound| bound.session.ahead_depth())
+    }
+
+    /// Whether the host may take from instance `id`'s channel `channel`
+    /// while its passes are still in flight: it runs ahead, and no stage of
+    /// its program takes from that channel (a pass in flight puts there at
+    /// most, past the committed cell the host takes, and its commit moves
+    /// the tail, not the head).
+    #[must_use]
+    pub fn takes_ahead(&self, id: InstanceId, channel: u32) -> bool {
+        let Some(bound) = self.instances.get(&id) else {
+            return false;
+        };
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return false;
+        };
+        bound.session.runs_ahead()
+            && ![Attach::Prologue, Attach::Epilogue]
+                .into_iter()
+                .any(|at| program.plan.takes_channel(channel, at))
+    }
+
+    /// Whether instance `id` keeps two passes in flight
+    /// ([`Session::runs_ahead`]).
+    #[must_use]
+    pub fn runs_ahead(&self, id: InstanceId) -> bool {
+        self.instances.get(&id).is_some_and(|bound| bound.session.runs_ahead())
     }
 
     #[must_use]
