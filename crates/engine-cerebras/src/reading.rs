@@ -1207,6 +1207,17 @@ impl Runtime {
         let Some(ts) = self.tsc(reading)? else {
             return Ok(None);
         };
+        // (a PE whose line queues held words at the launch's end: the next launch reads them
+        // first and stops; the GEMM PE sets the third word's top bit)
+        if let Some(i) = ts.chunks(3).position(|s| s[2] & LINE_LEFT != 0) {
+            let w = reading.w as usize;
+            return Err(format!(
+                "PE ({}, {}): a line's words were left queued at the launch's end (the next \
+                 launch would read them first)",
+                i % w,
+                i / w
+            ));
+        }
         let live = ts.chunks(3).filter(|s| s[0] != 0 || s[1] != 0);
         let (lo, hi) = live.fold((u64::MAX, 0u64), |(lo, hi), s| {
             (lo.min(u64::from(s[0])), hi.max(u64::from(s[1])))
@@ -1531,6 +1542,10 @@ fn kept_writes(old: &[u32], new: &[u32], w: usize, h: usize, len: usize) -> Opti
     let words: usize = out.iter().map(|kw| kw.w * kw.n * h).sum();
     (out.len() <= KEPT_WRITES && words < w * h * len).then_some(out)
 }
+
+/// The stamps' third word's top bit: a PE's line queues held words at the launch's end
+/// (`emit::gemm`'s `LINE_LEFT`).
+const LINE_LEFT: u32 = 0x8000_0000;
 
 /// How many times a back's words the rectangle around a band's backs may hold before they are
 /// read a back at a time.

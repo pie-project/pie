@@ -76,6 +76,12 @@ var NATT: u16 = 0;
 // the cycles this PE spent in the launch's attentions (its stamps' third word, which the tape's
 // stamps cannot split from the ops around it)
 var ATT_CY: u32 = 0;
+// at the launch's end, every line's input queue empty (iq2-iq7: the row line's two colours, the
+// weight stream, the band reductions, the column line; iq1 is memcpy's); one that is not sets the
+// top bit of the stamps' third word (`LINE_LEFT`): its words would be read first by the next
+// launch, which then stops (the dense layout's klein 1024^2: 1589)
+const LINE_QUEUES: u16 = 0xfc;
+const LINE_LEFT: u32 = 0x80000000;
 fn now32() u32 { timestamp.get_timestamp(&ts); return @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
 
 // The column's weight stream: its tape's words up the column (a tree: every PE of the

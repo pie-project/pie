@@ -620,7 +620,7 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
     }
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  CLS = @as(u16, pcfg[2]);\n  R0 = @as(u16, pcfg[3]) * RQ;\n  D_xhw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &xh[0]));\n  D_progw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &prog[0]));\n  D_kvw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &kvh[0]));\n  gseg.setup(X, GX, BAND);\n  fab.iqc(2, C_XF);\n  fab.iqc(6, C_KF);\n{init}  run_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
+        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  CLS = @as(u16, pcfg[2]);\n  R0 = @as(u16, pcfg[3]) * RQ;\n  D_xhw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &xh[0]));\n  D_progw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &prog[0]));\n  D_kvw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &kvh[0]));\n  gseg.setup(X, GX, BAND);\n  fab.iqc(2, C_XF);\n  fab.iqc(6, C_KF);\n{init}  run_all();\n  stamp(1);\n  // (a line's words left queued: the next launch would read them first)\n  if ((tile_config.input_queue_status.get_raw() & LINE_QUEUES) != LINE_QUEUES) {{ tsc[2] |= LINE_LEFT; }}\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(hin_p, \"hin\");\n  @export_symbol(hsc_p, \"hsc\");\n  @export_symbol(hout_p, \"hout\");\n");
     for s in &exports {
