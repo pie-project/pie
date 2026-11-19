@@ -68,9 +68,14 @@ impl Serve for Api {
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile (a
         // browser masks its adapter, so no profile states its rates, and
-        // keeps them for its load alone). No bound on one submission is
-        // stated on wgpu yet.
-        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
+        // keeps them for its load alone), each submission within the
+        // platform's stated bound on one.
+        let tuning = crate::rates::at_load(
+            &device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::STATED_SUBMIT_BOUND,
+        )?;
         Ok((device, tuning))
     }
 
