@@ -154,6 +154,31 @@ pub fn stage_read_bytes(package: &LaunchPackage) -> std::result::Result<Vec<u64>
         .collect()
 }
 
+/// The values stage `at` of `package` puts that its collect copies from the
+/// device, in the stage's own numbering: the read-back set, which a bind
+/// checks against the stage's heap ([`puts_in_heap`]) and a run reads back.
+/// A put whose value the stage's plan lays nowhere on the device (its value
+/// map names none) is held on the host and copied from no span. A stage the
+/// package does not list, or a put of another stage's value, is refused.
+pub fn device_puts(package: &LaunchPackage, at: usize) -> Result<Vec<u32>> {
+    let stage = package.stages.get(at).ok_or_else(|| Fault::Program {
+        at: "guest::session",
+        why: format!(
+            "stage {at} has a plan, and the package lists {} stage(s)",
+            package.stages.len()
+        ),
+    })?;
+    let mut puts = Vec::with_capacity(stage.puts.len());
+    for put in &stage.puts {
+        match engine_gpu::guest::run::local_of(package, at, put.value)? {
+            Some(local) => puts.push(local),
+            // Held on the host: no span to copy, none to check.
+            None => {}
+        }
+    }
+    Ok(puts)
+}
+
 /// Refuses a stage whose puts (`reads`, the stage's values its collect
 /// copies to the host) do not each lie, in whole words, inside its heap of
 /// `heap_bytes`: a span past it would read another instance's bytes back.
@@ -496,15 +521,7 @@ impl Session {
         {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let args = placed.next().expect("a stage's step uniforms");
-            let reads = package.stages.get(at).map_or(Ok(Vec::new()), |stage| {
-                stage
-                    .puts
-                    .iter()
-                    .filter_map(|put| {
-                        engine_gpu::guest::run::local_of(package, at, put.value).transpose()
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
+            let reads = device_puts(package, at)?;
             puts_in_heap(&reads, &resolved.offsets, &resolved.descriptors, heap.2).map_err(
                 |why| Fault::Program {
                     at: "guest::session",
@@ -1015,7 +1032,7 @@ fn build_stage(
 
 #[cfg(test)]
 mod tests {
-    use super::{STATUS_SPAN, puts_in_heap, stage_read_bytes};
+    use super::{STATUS_SPAN, device_puts, puts_in_heap, stage_read_bytes};
     use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, LaunchPut, LaunchStage};
     use eta_ir::Dtype;
     use eta_ir::container::ChanDType;
@@ -1119,6 +1136,51 @@ mod tests {
         assert!(puts_in_heap(&[0], &offsets, &descriptors, 16).is_ok());
         // A put with no span in its stage.
         assert!(puts_in_heap(&[2], &offsets, &descriptors, 16).is_err());
+    }
+
+    /// Two stages: stage 0 lays its first value on the device as local 0
+    /// and holds its second on the host; stage 1 lays its one value.
+    fn two_stages(puts: Vec<LaunchPut>) -> LaunchPackage {
+        use eta_compiler::codegen::launch::LaunchStagePlan;
+        LaunchPackage {
+            plans: vec![
+                LaunchStagePlan {
+                    value_map: vec![0, u32::MAX],
+                    ..LaunchStagePlan::default()
+                },
+                LaunchStagePlan {
+                    value_map: vec![0],
+                    ..LaunchStagePlan::default()
+                },
+            ],
+            stages: vec![
+                LaunchStage {
+                    puts,
+                    ..LaunchStage::default()
+                },
+                LaunchStage::default(),
+            ],
+            ..LaunchPackage::default()
+        }
+    }
+
+    #[test]
+    fn a_stage_reads_back_its_device_puts_and_no_host_held_one() {
+        let put = |value| LaunchPut { channel: 0, value };
+        let package = two_stages(vec![put(0), put(1)]);
+        assert_eq!(device_puts(&package, 0).unwrap(), [0]);
+        assert_eq!(device_puts(&package, 1).unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_put_of_another_stages_value_or_an_unlisted_stage_is_refused() {
+        // Global value 2 is stage 1's.
+        let package = two_stages(vec![LaunchPut {
+            channel: 0,
+            value: 2,
+        }]);
+        assert!(device_puts(&package, 0).is_err());
+        assert!(device_puts(&package, 2).is_err());
     }
 
     #[test]

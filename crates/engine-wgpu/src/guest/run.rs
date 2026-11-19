@@ -125,12 +125,8 @@ impl<'a> OnDevice<'a> {
         self.widen.encode(&frame, &rows)?;
         self.session.flush(&mut frame, at)?;
         self.session.dispatch(&frame, at)?;
-        let mut locals = Vec::with_capacity(wanted.len());
-        for &global in wanted {
-            if let Some(local) = local_of(package, at, global)? {
-                locals.push(local);
-            }
-        }
+        // The set its bind checked against the stage's heap.
+        let locals = super::session::device_puts(package, at)?;
         self.session.read_back(&mut frame, at, &locals)?;
         let pending = frame.commit_async(None)?;
         self.session.collect(at)?;
