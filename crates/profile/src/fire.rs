@@ -54,6 +54,10 @@ pub struct Rates {
     pub attn_tflops_by_keys: Option<Vec<(u32, f64)>>,
     /// Device memory GB/s, achieved by a streaming copy (read plus write).
     pub hbm_gbps: Option<f64>,
+    /// GB/s of reads the last-level caches serve: every workgroup reading a
+    /// small set the others read too, as a normed skinny product's
+    /// workgroups read its rows (what such a fold's redundant reads cost).
+    pub cached_gbps: Option<f64>,
     /// GB/s the per-row ops (a norm, the gated activation) achieve as a
     /// fire runs them.
     pub elementwise_gbps: Option<f64>,
@@ -100,11 +104,12 @@ pub struct Rates {
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
-pub const KEYS: [&str; 10] = [
+pub const KEYS: [&str; 11] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
+    "cached_gbps",
     "elementwise_gbps",
     "scan_gelems",
     "few_row_tflops",
@@ -122,6 +127,7 @@ impl Rates {
             gemm_tflops_by_rows: self.gemm_tflops_by_rows.or(below.gemm_tflops_by_rows),
             attn_tflops_by_keys: self.attn_tflops_by_keys.or(below.attn_tflops_by_keys),
             hbm_gbps: self.hbm_gbps.or(below.hbm_gbps),
+            cached_gbps: self.cached_gbps.or(below.cached_gbps),
             elementwise_gbps: self.elementwise_gbps.or(below.elementwise_gbps),
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
@@ -151,6 +157,7 @@ impl Rates {
                 .clone()
                 .filter(|_| has("attn_tflops_by_keys")),
             hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
+            cached_gbps: self.cached_gbps.filter(|_| has("cached_gbps")),
             elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
             scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
             few_row_tflops: self.few_row_tflops.filter(|_| has("few_row_tflops")),
@@ -178,6 +185,7 @@ impl Rates {
             "gemm_tflops_by_rows" => self.gemm_tflops_by_rows.is_none(),
             "attn_tflops_by_keys" => self.attn_tflops_by_keys.is_none(),
             "hbm_gbps" => self.hbm_gbps.is_none(),
+            "cached_gbps" => self.cached_gbps.is_none(),
             "elementwise_gbps" => self.elementwise_gbps.is_none(),
             "scan_gelems" => self.scan_gelems.is_none(),
             "few_row_tflops" => self.few_row_tflops.is_none(),
@@ -232,6 +240,7 @@ impl Rates {
             }
         };
         float("hbm_gbps", self.hbm_gbps);
+        float("cached_gbps", self.cached_gbps);
         float("elementwise_gbps", self.elementwise_gbps);
         float("scan_gelems", self.scan_gelems);
         float("few_row_tflops", self.few_row_tflops);
@@ -347,6 +356,7 @@ mod tests {
             rates: Rates {
                 gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(2.0),
+                cached_gbps: None,
                 ..Rates::default()
             },
             measured_this_load: false,
@@ -357,6 +367,7 @@ mod tests {
         let up = Tuned {
             rates: Rates {
                 hbm_gbps: Some(3.0),
+                cached_gbps: None,
                 launch_ns: Some(7),
                 ..Rates::default()
             },
@@ -371,6 +382,7 @@ mod tests {
             Rates {
                 gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(3.0),
+                cached_gbps: None,
                 launch_ns: Some(7),
                 ..Rates::default()
             }
@@ -388,6 +400,7 @@ mod tests {
             ]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
             hbm_gbps: Some(654.4),
+            cached_gbps: None,
             elementwise_gbps: Some(450.0),
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
