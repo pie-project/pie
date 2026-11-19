@@ -4435,8 +4435,8 @@ byte-identical.
   matches no mixer op.
 - **Hazards and price** (`kernel::{GemmForm, TiledForm}`): `check::hazard::lines` (H1-H4) reads
   each GEMM op's form (`linear.gemm`'s row line, `attn.column`'s column line and row order from
-  its code), `hub_loops` each tiled op's `HubSend`; `cost::tiled` sums the tiled forms' prices.
-  The GEMM price moves once D1's stamps refit lands.
+  its code), `hub_loops` each tiled op's `HubSend`; `cost::tiled` and `cost::gemm` sum the
+  forms' prices (a GEMM's by its terms, the attention's with its key block's fitted remainder).
 - **Root kernels** (`kernel::RootKernel`, the first of their kind, built with the demonstration):
   a kernel's op at a unit's roots lowers to a region step of one node (its interface: rows in and
   out), so the roots place, chunk, feed, price and check it as any region; its module (in place

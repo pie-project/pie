@@ -83,6 +83,11 @@ pub struct GemmForm {
     /// Whether its code (`pe`) ends in a row-wide ordering point: no PE of the row leaves it
     /// before every other has reached its end. Else it leaves the row's bands drifted.
     pub orders_row: fn(pe: &str) -> bool,
+    /// It, as the price's ops name it (`gemm`, `attention`).
+    pub what_price: &'static str,
+    /// Op `i`'s cycles on the busiest PE (past every op's own, `cost::gemm::OP`), its terms
+    /// (`cost::gemm::OpCost::terms`) where it states them.
+    pub price: fn(p: &crate::stream::gemm::GemmProgram, i: usize, terms: &mut [f64; 5]) -> f64,
     /// Why it leaves the row drifted where it does not order it (H2's message).
     pub drift: &'static str,
     /// The same, with ops after it (H4's message).
@@ -248,6 +253,19 @@ pub static KERNELS: &[&dyn Kernel] = &[
     &attn::voxel::VOXEL,
     &ssm::short_conv::SHORT_CONV,
 ];
+
+/// The GEMM form of the kernel a GEMM-regime op is (`linear.matmul`'s GEMM, an attention's);
+/// none for the host's ins and outs and a printed region.
+#[must_use]
+pub fn gemm_form(op: &crate::stream::gemm::GOp) -> Option<&'static GemmForm> {
+    use crate::stream::gemm::GOp;
+    let k = match op {
+        GOp::Gemm { .. } => by_op("linear.matmul"),
+        GOp::Attend { .. } => by_op("attn.ragged"),
+        _ => None,
+    };
+    k.and_then(|k| k.gemm())
+}
 
 /// The GEMM-regime forms of every kernel that has one.
 pub fn gemm_forms() -> impl Iterator<Item = &'static GemmForm> {

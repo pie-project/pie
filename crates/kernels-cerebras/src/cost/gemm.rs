@@ -18,7 +18,7 @@
 use serde::Serialize;
 
 use super::stream::{ALL_REDUCE, RegionFeatures};
-use crate::stream::gemm::{GOp, GemmProgram, piece};
+use crate::stream::gemm::{GOp, GemmProgram};
 
 /// A line's turn: two sends, two drains, four route writes, the next member's first word.
 pub const TURN: f64 = 150.0;
@@ -92,12 +92,12 @@ impl GemmCost {
 }
 
 /// A `mac32` call of `n` multiply-accumulates.
-fn mac(n: u32) -> f64 {
+pub(crate) fn mac(n: u32) -> f64 {
     MAC_CALL + MAC_ELEM * f64::from(n)
 }
 
 /// An all-reduce of `n` words over `members` PEs.
-fn allred(n: u32, members: u32) -> f64 {
+pub(crate) fn allred(n: u32, members: u32) -> f64 {
     if members <= 1 {
         return 0.0;
     }
@@ -128,33 +128,11 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                 ("in", f64::from(rows * w) + CALL)
             }
             GOp::Out { width, .. } => ("out", f64::from(tb * width / c) + CALL * f64::from(tb)),
-            GOp::Gemm {
-                k, y, x32, lane, ..
-            } => {
-                let rows = if *lane { 1 } else { tb };
-                let segs = crate::stream::gemm::local(&p.l.vals[y], c, 0);
-                for cp in 0..c {
-                    let (a, b) = piece(cp, c, *k);
-                    let kc = b - a;
-                    if kc == 0 {
-                        continue;
-                    }
-                    let xw = (rows * kc).div_ceil(2) * if *x32 { 2 } else { 1 };
-                    terms[0] += TURN + PIECE;
-                    terms[1] += 3.0 * f64::from(xw);
-                    for s in &segs {
-                        let p = s.4;
-                        let wb = f64::from(kc * p / 2);
-                        // the block off the column's tree
-                        terms[2] += wb + CALL;
-                        // (a call a row and half: its block's MACs)
-                        let calls = f64::from(rows) * if *x32 { 2.0 } else { 1.0 };
-                        terms[3] += calls * MAC_CALL;
-                        terms[4] += calls * MAC_ELEM * f64::from(kc * p);
-                    }
-                }
-                ("gemm", terms.iter().sum())
-            }
+            // a kernel's op: its price its module's ([`crate::kernel::GemmForm`])
+            GOp::Gemm { .. } | GOp::Attend { .. } => match crate::kernel::gemm_form(op) {
+                Some(f) => (f.what_price, (f.price)(p, i, &mut terms)),
+                None => ("unpriced", 0.0),
+            },
             GOp::Region(ri) => {
                 let g = &p.l.regs[*ri];
                 let rows = if g.lane { 1 } else { tb };
@@ -169,37 +147,6 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                     + f64::from(heads) * allred(1, p.band)
                     + f64::from((g.args.len() + g.outs.len()) as u32) * (CALL + f64::from(ch));
                 ("region", f64::from(rows) * row)
-            }
-            GOp::Attend { causal, .. } => {
-                let kb = p.kbm * tb;
-                let nc = p.qchunk;
-                let half = tb * nc;
-                // (a request's key blocks: its rows of PEs')
-                let blocks = p.r / p.l.batch.max(1) / p.kbm;
-                let sl = kb / p.band.max(1);
-                let blk = KEY_BLOCK
-                    + f64::from(p.kbm)
-                        * (TURN
-                            + 3.0 * f64::from(half)
-                            + f64::from(tb) * (CALL + f64::from(nc))
-                            + CALL
-                            + f64::from(half))
-                    + f64::from(tb) * mac(kb * nc)
-                    + 2.0 * allred(tb * kb, p.band)
-                    + f64::from(tb * kb) * 1.0
-                    + f64::from(tb)
-                        * (2.0 * (f64::from(kb) + 8.0 * CALL)
-                            + f64::from(sl) * EXP
-                            + 3.0 * EXP
-                            + 4.0 * CALL
-                            + f64::from(kb)
-                            + mac(kb * nc))
-                    + if *causal {
-                        f64::from(tb * kb) * 4.0
-                    } else {
-                        0.0
-                    };
-                ("attention", f64::from(blocks) * blk)
             }
         };
         ops.push(OpCost {

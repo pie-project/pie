@@ -762,7 +762,7 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
     }
     let forms: Vec<Option<Op>> = (p.l.ops.iter())
         .map(|op| {
-            let form = gemm_form(op)?;
+            let form = crate::kernel::gemm_form(op)?;
             let line = ls.iter().find(|l| l.func == form.func);
             Some(Op {
                 form,
@@ -849,17 +849,6 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
-}
-
-/// The GEMM form of the kernel a GEMM-regime op is (`linear.matmul`'s GEMM, an attention's).
-fn gemm_form(op: &crate::stream::gemm::GOp) -> Option<&'static crate::kernel::GemmForm> {
-    use crate::stream::gemm::GOp;
-    let k = match op {
-        GOp::Gemm { .. } => crate::kernel::by_op("linear.matmul"),
-        GOp::Attend { .. } => crate::kernel::by_op("attn.ragged"),
-        _ => None,
-    };
-    k.and_then(|k| k.gemm())
 }
 
 /// Words the hub's loop holds for certain (the routers and queues from a PE's send to the hub

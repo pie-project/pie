@@ -267,10 +267,52 @@ static GEMM: GemmForm = GemmForm {
     line: LineAlong::Column,
     masked: false,
     orders_row: crate::check::hazard::attention_orders_row,
+    what_price: "attention",
+    price: gemm_price,
     drift: "the attention: its key blocks over a band's reductions, a drift growing with its key \
             blocks",
     drift_after: "its key blocks' band reductions let the row's bands drift apart",
 };
+
+/// Its GEMM op's cycles: a request's key blocks, each its rows of PEs' turn, its pieces, the
+/// scores' product and all-reduces, the softmax and the values' product (and the causal mask),
+/// plus a block's unattributed cycles (`cost::gemm::KEY_BLOCK`).
+fn gemm_price(p: &crate::stream::gemm::GemmProgram, i: usize, _: &mut [f64; 5]) -> f64 {
+    use crate::cost::gemm::{CALL, EXP, KEY_BLOCK, TURN, allred, mac};
+    let crate::stream::gemm::GOp::Attend { causal, .. } = &p.l.ops[i] else {
+        return 0.0;
+    };
+    let tb = p.tb;
+    let kb = p.kbm * tb;
+    let nc = p.qchunk;
+    let half = tb * nc;
+    // (a request's key blocks: its rows of PEs')
+    let blocks = p.r / p.l.batch.max(1) / p.kbm;
+    let sl = kb / p.band.max(1);
+    let blk = KEY_BLOCK
+        + f64::from(p.kbm)
+            * (TURN
+                + 3.0 * f64::from(half)
+                + f64::from(tb) * (CALL + f64::from(nc))
+                + CALL
+                + f64::from(half))
+        + f64::from(tb) * mac(kb * nc)
+        + 2.0 * allred(tb * kb, p.band)
+        + f64::from(tb * kb) * 1.0
+        + f64::from(tb)
+            * (2.0 * (f64::from(kb) + 8.0 * CALL)
+                + f64::from(sl) * EXP
+                + 3.0 * EXP
+                + 4.0 * CALL
+                + f64::from(kb)
+                + mac(kb * nc))
+        + if *causal {
+            f64::from(tb * kb) * 4.0
+        } else {
+            0.0
+        };
+    f64::from(blocks) * blk
+}
 
 /// A column with no attention of its own (its block's first unit has none): the reading's,
 /// whose sizes the program's shape states.
