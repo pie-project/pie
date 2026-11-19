@@ -1662,8 +1662,9 @@ fn serve_refs(
 /// A model served out of the chunk pool lands the same logits, bit for bit,
 /// wherever its slots sit: in the seats' own runs, or scattered over chunks
 /// the runtime names by slot refs in a segment of their own, those chunks
-/// evacuated mid-decode below it and that segment given back, the decode
-/// running on through the moved chunks.
+/// evacuated mid-decode below it and that segment given back (where the
+/// pool grows; a pool laid whole at its load keeps it), the decode running
+/// on through the moved chunks.
 fn scattered(model: &str) -> Vec<Vec<f32>> {
     scattered_at(model, None)
 }
@@ -1734,7 +1735,14 @@ fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
             shell
                 .release_segments(kept)
                 .expect("the top segments go back");
-            assert_eq!(shell.pool_chunk_facts().segments.committed, kept);
+            // A pool laid whole at its load (`Growth::Fixed`, as wgpu lays
+            // it) stands whole: it gives no segment back.
+            let stands = if facts.segments.growth == engine::chunk::Growth::Fixed {
+                facts.segments.max
+            } else {
+                kept
+            };
+            assert_eq!(shell.pool_chunk_facts().segments.committed, stands);
         },
     );
     same(
