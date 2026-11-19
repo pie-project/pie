@@ -485,7 +485,16 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
     let rs_working_sets =
         crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
-    if working_sets.is_empty() && rs_working_sets.is_empty() {
+    // A process with no kv or state yet (a prompt not seated) may still hold
+    // guest state on the device, the room a bind short of runs was chosen to
+    // free (a chunk's occupant): it parks all the same, its guest scratch
+    // given back. Found nothing, the M1 stress froze with eleven binds short
+    // of runs and every chosen occupant "found no working set".
+    let holds_guest = crate::store::registry::get(model, engine)
+        .roles
+        .as_ref()
+        .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+    if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
         tracing::debug!(pid = %pid, "planner: eviction found no working set");
         planner.eviction_failed(pid);
         return;

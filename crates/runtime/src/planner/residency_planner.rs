@@ -1036,6 +1036,7 @@ impl ResidencyPlanner {
             pieces,
             pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
         };
+
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",

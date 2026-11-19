@@ -75,6 +75,13 @@ pub(super) struct Proc {
     /// again; room is made for it (idle cache, a grow, the chunks'
     /// occupants) until its restore lands.
     pub(super) roles_free_short: Option<(u32, u32)>,
+    /// Suspended by a bind short of room, and parked: the device pool's
+    /// count of room given back when its park ended. Its restore takes its
+    /// own items back, so the room its park gave back is no room for the
+    /// bind; it is served only once room has come free since (the M1
+    /// freeze: suspended, restored straight back into the room it freed,
+    /// short again, 750 times a second).
+    pub(super) bind_room_after: Option<u64>,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside
@@ -142,6 +149,7 @@ impl Proc {
             roles_short: None,
             roles_free_retry: None,
             roles_free_short: None,
+            bind_room_after: None,
             bind_room: None,
         }
     }

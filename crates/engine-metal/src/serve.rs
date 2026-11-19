@@ -1474,7 +1474,7 @@ impl PreparedLoad<'_> {
             }
         }
         let (span_view, span_at, span_bytes) = pools.span_view();
-        let arena = Arena::over(
+        let mut arena = Arena::over(
             span_view.clone(),
             (span_at, span_bytes),
             scratch.bytes(),
@@ -1483,6 +1483,19 @@ impl PreparedLoad<'_> {
             rs_room,
             arms as u64,
         );
+        // The runtime holds, from the start, the widest rung whose activation
+        // the smallest rung's chunks hold (`SlotPool::rung` over this `act`),
+        // and sends no notice for it: frames stage in that rung's regions
+        // from the load, or its first fires, cut to it, find the floor's
+        // (the M1 stress: "this fire wants 2 token rows ... the load
+        // reserved 1" at rung 2, until the first raise).
+        if let Some(boot) = act
+            .first()
+            .map(|&(_, floor)| floor)
+            .and_then(|floor| act.iter().filter(|&&(_, chunks)| chunks <= floor).map(|&(tokens, _)| tokens).max())
+        {
+            arena.set_current(boot);
+        }
         if crate::diag::on().tier_trace {
             let layout = pools.layout();
             eprintln!(
@@ -1496,9 +1509,10 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // The smallest rung's fire is backed from the load, so a raise the
-        // system refuses always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach())?;
+        // The rung the load starts at is backed from the load (the smallest
+        // rung's chunks, which it shares), so a raise the system refuses
+        // always has a rung in hand to cut back to.
+        pools.cover(arena.floor_reach().max(arena.rung_reach(arena.current_tokens())))?;
         // Every rung's staged regions laid in the span; the floor's hosted,
         // where frames stage until the runtime raises.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
@@ -1597,7 +1611,7 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
-            rung: arena.floor_tokens(),
+            rung: arena.current_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
             arena,
@@ -1866,24 +1880,34 @@ impl Shell {
         if moved || to < from {
             self.drain()?;
         }
+        // A refused move leaves the rung as it was: the runtime keeps `from`
+        // on a refusal (`lower_refused`), so a switch made before a step that
+        // failed is undone, or Metal would stage in `to`'s regions while the
+        // runtime cuts fires to `from` (the M1 stress: "this fire wants 2
+        // token rows ... the load reserved 1" at rung 2).
+        let left = self.arena.current();
         if moved {
-            let left = self.arena.current();
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 left,
                 false,
-            )?;
+            ) {
+                self.rehost(left);
+                return Err(fault);
+            }
             self.arena.set_current(to);
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 index,
                 true,
-            )?;
-            self.rung = to;
+            ) {
+                self.unswitch(from, index, left);
+                return Err(fault);
+            }
         }
         if to >= from {
             self.rung = to;
@@ -1892,9 +1916,33 @@ impl Shell {
         // SAFETY: drained just above, on the one thread that submits; the
         // runtime lowers only once every fire wider than `to` retired, and
         // the rung's regions lie inside what stays.
-        unsafe { self.pools.narrow(reach)? };
+        if let Err(fault) = unsafe { self.pools.narrow(reach) } {
+            if moved {
+                self.unswitch(from, index, left);
+            }
+            return Err(fault);
+        }
         self.rung = to;
         Ok(())
+    }
+
+    /// Hosts rung `slot`'s regions again after a move that failed; a failure
+    /// here leaves the load unable to stage, and says so.
+    fn rehost(&mut self, slot: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true) {
+            tracing::error!(%fault, "metal: a refused rung move could not host the rung it kept");
+        }
+    }
+
+    /// Undoes a rung switch to `index` whose next step failed: `index`'s
+    /// regions let go, the arena back on `from` and its regions (`left`)
+    /// hosted again.
+    fn unswitch(&mut self, from: u32, index: usize, left: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false) {
+            tracing::error!(%fault, "metal: a refused rung move could not let go of the rung it tried");
+        }
+        self.arena.set_current(from);
+        self.rehost(left);
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the

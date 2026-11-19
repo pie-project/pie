@@ -253,7 +253,20 @@ impl Inner {
         }
         let head = match (allocation, oldest_restore) {
             (Some(allocation), Some(restore)) => {
-                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
+                // An older restore comes back ahead of new work: the
+                // admission of a prompt not yet seated waits behind it
+                // (Mac Pro's M5: processes evicted in the ramp waited
+                // behind every later arrival, then froze the tail). A seated
+                // process's own growth keeps its turn, or the decoders whose
+                // completions free the restore's room would wait on it.
+                let admits_new = self
+                    .queue
+                    .get(&allocation)
+                    .and_then(|waiter| self.procs.get(&waiter.pid))
+                    .is_some_and(|proc| !proc.seated);
+                if restore < allocation
+                    && (admits_new || self.fleet_stalled() || self.eviction_unfundable())
+                {
                     restore
                 } else {
                     allocation
