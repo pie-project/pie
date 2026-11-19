@@ -125,16 +125,83 @@ __device__ __forceinline__ void skinny_put(bf16* out, long long at, float v) {
     }
 }
 
-template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false>
+// The rows a NORM skinny kernel multiplies, normed where it stages them:
+// `h = x + y` (landed in `y_out` by the first block, a plane of its own),
+// then `h · rsqrt(mean(h²) + eps) · w` (w + 1 under `plus_one`; landed in
+// `out` by the first block too, for the rows' other readers), each rounded
+// to bf16 as `ResidualAddRmsnorm` lands them. Every block norms its own
+// copy; none waits on another.
+struct SkinnyNorm {
+    const bf16* x;
+    const bf16* y;
+    const bf16* w;
+    bf16* y_out;
+    bf16* out;
+    float eps;
+    int plus_one;
+};
+
+template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false, bool NORM = false>
 __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
-                                                    bf16* __restrict__ out, int N, int K, int waves, float cap) {
+                                                    bf16* __restrict__ out, int N, int K, int waves, float cap,
+                                                    const SkinnyNorm norm) {
     constexpr bool SWIGLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;  // two weight rows a column
     constexpr int WR = SWIGLU ? 2 * YT : YT;  // weight rows a wavefront streams
+    static_assert(!NORM || !ACT_G, "a normed activation stages in LDS");
     extern __shared__ b128 act_s[];
     const int wave = threadIdx.y, l = lane();
     const int packs = K / 8;
     const b128* act_g = reinterpret_cast<const b128*>(act);
-    if constexpr (!ACT_G) {
+    if constexpr (NORM) {
+        __shared__ float sums[ROWS][16];
+        const int t = wave * kWave + l, threads = blockDim.y * kWave;
+        const b128* xg = reinterpret_cast<const b128*>(norm.x);
+        const b128* yg = reinterpret_cast<const b128*>(norm.y);
+        b128* og = reinterpret_cast<b128*>(norm.y_out);
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            float ss = 0.f;
+            for (int i = t; i < packs; i += threads) {
+                const b128 xv = xg[r * packs + i], yv = yg[r * packs + i];
+                const bf16* xe = reinterpret_cast<const bf16*>(&xv);
+                const bf16* ye = reinterpret_cast<const bf16*>(&yv);
+                b128 hv;
+                bf16* he = reinterpret_cast<bf16*>(&hv);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    he[e] = from_f32<bf16>(to_f32(ye[e]) + to_f32(xe[e]));
+                    const float h = to_f32(he[e]);
+                    ss += h * h;
+                }
+                act_s[r * packs + i] = hv;
+                if (blockIdx.x == 0) og[r * packs + i] = hv;
+            }
+            ss = wave_sum(ss);
+            if (l == 0) sums[r][wave] = ss;
+        }
+        __syncthreads();
+        const b128* wg = reinterpret_cast<const b128*>(norm.w);
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            float ss = 0.f;
+            for (int w = 0; w < static_cast<int>(blockDim.y); ++w) ss += sums[r][w];
+            const float inv = rsqrtf(ss / static_cast<float>(K) + norm.eps);
+            for (int i = t; i < packs; i += threads) {
+                b128 hv = act_s[r * packs + i];
+                const b128 wv = wg[i];
+                bf16* he = reinterpret_cast<bf16*>(&hv);
+                const bf16* we = reinterpret_cast<const bf16*>(&wv);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float w = to_f32(we[e]) + (norm.plus_one ? 1.f : 0.f);
+                    he[e] = from_f32<bf16>(to_f32(he[e]) * inv * w);
+                }
+                act_s[r * packs + i] = hv;
+                if (blockIdx.x == 0) reinterpret_cast<b128*>(norm.out)[r * packs + i] = hv;
+            }
+        }
+        __syncthreads();
+    } else if constexpr (!ACT_G) {
         for (int i = wave * kWave + l; i < ROWS * packs; i += blockDim.y * kWave) act_s[i] = act_g[i];
         __syncthreads();
     }

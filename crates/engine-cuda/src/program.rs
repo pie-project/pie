@@ -315,7 +315,7 @@ pub fn flight_lanes(members: u32) -> u32 {
 /// flight of its most lanes (each lane's scratch base among them, the
 /// grouped kernels' `lane_scratch`), and the room the wave's own tables
 /// take for a fire of the most lanes, where a fire carrying the pair may
-/// lay them. Each instance (`per_instance`): its lane's value scratch, one
+/// lay them. Each instance (`resident`): its lane's value scratch, one
 /// contiguous piece. Sized once from the load's lanes, so neither grows as
 /// instances bind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

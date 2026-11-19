@@ -23,6 +23,8 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::MatmulSoftcap { .. }
         | Fused::MatmulGlu { .. }
         | Fused::ResidualAddRmsnorm { .. }
+        | Fused::ResidualAddRmsnormMatmul { .. }
+        | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend { .. }
         | Fused::RopeYarnAppend { .. }
@@ -60,6 +62,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulGlu { .. }
             | Fused::ResidualAddRmsnorm { .. }
+            | Fused::ResidualAddRmsnormMatmul { .. }
+            | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend { .. }
             | Fused::RopeYarnAppend { .. }

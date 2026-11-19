@@ -348,6 +348,7 @@ impl Model {
                         lanes: 1,
                         instance,
                         adapter_only: false,
+                        scratch: ::engine::ScratchPlace::None,
                     })
                     .into_iter()
                     .collect(),

@@ -365,7 +365,11 @@ pub struct Stepwise {
 /// 1: every step a call of the closed set, reading its node, rung and
 /// selector from a uniform; before, each stage one module with its nodes
 /// spelled in.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 2;
+/// 3: every heap, descriptor, offset and op-param access is bounded by its
+/// stage's cfg (the heap's words, its values, its ops), indices read from
+/// the heap by their own bounds, and a refused access writes the runtimes'
+/// fault status (state 3, `OUT_OF_BOUNDS`, the index, the limit).
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 3;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -519,8 +523,10 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
+    // The stage's heap bound, read once ([`RUNTIME`]'s `hld` / `hst`).
+    source.push_str("  lim_heap = cfg.heap_words;\n");
     source.push_str(call);
-    source.push_str("}\n");
+    source.push_str("  heap_flush();\n}\n");
 }
 
 /// `plan`'s launches as steps of the closed set; a node no call serves is

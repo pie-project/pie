@@ -192,6 +192,7 @@ impl Rig {
                     lanes: 1,
                     instance,
                     adapter_only: true,
+                    scratch: ::engine::ScratchPlace::None,
                 });
             }
         }

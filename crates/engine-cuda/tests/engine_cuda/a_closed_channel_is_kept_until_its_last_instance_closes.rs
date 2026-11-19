@@ -140,6 +140,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 Vec::new(),
             ))

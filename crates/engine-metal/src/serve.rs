@@ -1474,7 +1474,7 @@ impl PreparedLoad<'_> {
             }
         }
         let (span_view, span_at, span_bytes) = pools.span_view();
-        let arena = Arena::over(
+        let mut arena = Arena::over(
             span_view.clone(),
             (span_at, span_bytes),
             scratch.bytes(),
@@ -1483,6 +1483,19 @@ impl PreparedLoad<'_> {
             rs_room,
             arms as u64,
         );
+        // The runtime holds, from the start, the widest rung whose activation
+        // the smallest rung's chunks hold (`SlotPool::rung` over this `act`),
+        // and sends no notice for it: frames stage in that rung's regions
+        // from the load, or its first fires, cut to it, find the floor's
+        // (the M1 stress: "this fire wants 2 token rows ... the load
+        // reserved 1" at rung 2, until the first raise).
+        if let Some(boot) = act
+            .first()
+            .map(|&(_, floor)| floor)
+            .and_then(|floor| act.iter().filter(|&&(_, chunks)| chunks <= floor).map(|&(tokens, _)| tokens).max())
+        {
+            arena.set_current(boot);
+        }
         if crate::diag::on().tier_trace {
             let layout = pools.layout();
             eprintln!(
@@ -1496,9 +1509,10 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // The smallest rung's fire is backed from the load, so a raise the
-        // system refuses always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach())?;
+        // The rung the load starts at is backed from the load (the smallest
+        // rung's chunks, which it shares), so a raise the system refuses
+        // always has a rung in hand to cut back to.
+        pools.cover(arena.floor_reach().max(arena.rung_reach(arena.current_tokens())))?;
         // Every rung's staged regions laid in the span; the floor's hosted,
         // where frames stage until the runtime raises.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
@@ -1597,7 +1611,7 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
-            rung: arena.floor_tokens(),
+            rung: arena.current_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
             arena,
@@ -1866,24 +1880,34 @@ impl Shell {
         if moved || to < from {
             self.drain()?;
         }
+        // A refused move leaves the rung as it was: the runtime keeps `from`
+        // on a refusal (`lower_refused`), so a switch made before a step that
+        // failed is undone, or Metal would stage in `to`'s regions while the
+        // runtime cuts fires to `from` (the M1 stress: "this fire wants 2
+        // token rows ... the load reserved 1" at rung 2).
+        let left = self.arena.current();
         if moved {
-            let left = self.arena.current();
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 left,
                 false,
-            )?;
+            ) {
+                self.rehost(left);
+                return Err(fault);
+            }
             self.arena.set_current(to);
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 index,
                 true,
-            )?;
-            self.rung = to;
+            ) {
+                self.unswitch(from, index, left);
+                return Err(fault);
+            }
         }
         if to >= from {
             self.rung = to;
@@ -1892,9 +1916,33 @@ impl Shell {
         // SAFETY: drained just above, on the one thread that submits; the
         // runtime lowers only once every fire wider than `to` retired, and
         // the rung's regions lie inside what stays.
-        unsafe { self.pools.narrow(reach)? };
+        if let Err(fault) = unsafe { self.pools.narrow(reach) } {
+            if moved {
+                self.unswitch(from, index, left);
+            }
+            return Err(fault);
+        }
         self.rung = to;
         Ok(())
+    }
+
+    /// Hosts rung `slot`'s regions again after a move that failed; a failure
+    /// here leaves the load unable to stage, and says so.
+    fn rehost(&mut self, slot: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true) {
+            tracing::error!(%fault, "metal: a refused rung move could not host the rung it kept");
+        }
+    }
+
+    /// Undoes a rung switch to `index` whose next step failed: `index`'s
+    /// regions let go, the arena back on `from` and its regions (`left`)
+    /// hosted again.
+    fn unswitch(&mut self, from: u32, index: usize, left: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false) {
+            tracing::error!(%fault, "metal: a refused rung move could not let go of the rung it tried");
+        }
+        self.arena.set_current(from);
+        self.rehost(left);
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
@@ -1997,8 +2045,21 @@ impl Shell {
 
     /// See `Engine::copy_slots`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if let Some(frame) = self.encode_copy(copy)? {
+            self.grafted = Some(frame.commit_async(None)?);
+        }
+        Ok(())
+    }
+
+    /// `copy` drained behind every frame and encoded (a host copy to or
+    /// from the host tier or the slot files done here); the frame to
+    /// commit, `None` for an empty copy.
+    fn encode_copy(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> Result<Option<Frame>> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.drain()?;
         // Every fold has landed and been told once drained: a record moved
@@ -2013,7 +2074,49 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
-        self.grafted = Some(frame.commit_async(None)?);
+        Ok(Some(frame))
+    }
+
+    /// See `Engine::copy_slots_landing`: whether `copy`'s sources may go
+    /// back now. A copy on the device is encoded into a command buffer the
+    /// device may still be running when this returns: `false`, and
+    /// `landed`'s sink is called with its token from that buffer's
+    /// completion; with no sink installed (the runtime installs it before
+    /// any copy) it is refused by name, before anything is encoded. A move
+    /// to or from the host tier or the slot files is a host copy done here,
+    /// past the drain: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<(engine::LandingSink, u64)>,
+    ) -> Result<bool> {
+        let device = engine::MemoryDomain::MetalShared;
+        if copy.src != device || copy.dst != device {
+            self.copy_slots(copy)?;
+            return Ok(true);
+        }
+        let Some((sink, token)) = landed else {
+            return Err(Fault::Unbound {
+                what: "a copy on the device with no landing sink installed \
+                       (Engine::on_landed comes before any copy_slots_landing)"
+                    .into(),
+            });
+        };
+        let Some(frame) = self.encode_copy(copy)? else {
+            return Ok(true);
+        };
+        // Told once the buffer retires, faulted or not: a faulted copy has
+        // stopped reading its sources too, and its fault reaches the next
+        // drain.
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        Ok(false)
+    }
+
+    /// See `Engine::settle_copies`: the last copy's command buffer retires.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        if let Some(grafted) = self.grafted.take() {
+            grafted.wait()?;
+        }
         Ok(())
     }
 
@@ -2238,37 +2341,44 @@ impl Shell {
         // ones' are the capture's, which no rung's rows key.
         let rungs = self.arena.rung_tokens();
         let octaves = engine::load::armed::scored_buckets(&rungs);
+        // Beside each rung's own rows, every band start of the matmul
+        // routing below it and above the rung before
+        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
+        // a fire's rows reach every band its rungs span, and each band's
+        // kernel is built here, not refused while serving.
+        let mut below = 0u32;
+        let sized: Vec<(u32, Vec<u32>)> = rungs
+            .iter()
+            .map(|&rung| {
+                let mut sizes = vec![rung];
+                sizes.extend(
+                    kernels_metal::linear::gemm::ROW_BANDS
+                        .iter()
+                        .copied()
+                        .filter(|&band| band > below && band < rung),
+                );
+                below = rung;
+                (rung, sizes)
+            })
+            .collect();
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
-            for rung in rungs {
+            for (rung, sizes) in sized {
                 self.set_rung(self.rung, rung)?;
-                for &form in forms
-                    .iter()
-                    .filter(|(_, scores)| !scores || octaves.contains(&rung))
-                {
-                    for (verb, held) in &verbs {
-                        let prompt = rung
-                            .min(self.budgets.tokens.max_tokens)
-                            .min(context.saturating_sub(*held))
-                            .max(1);
-                        let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                        let prompt_tokens = vec![0u32; prompt as usize];
-                        let one = [0u32];
-                        let prefill = [Seated {
-                            held: Some(*held),
-                            rs: verb,
-                            refs: true,
-                            pages: &kv_pages,
-                            record: (!record.is_empty()).then_some(&record[..]),
-                            windows: &windows,
-                            ..Seated::of(Lane {
-                                slot: 0,
-                                word: word(prompt, form),
-                                tokens: &prompt_tokens,
-                            })
-                        }];
-                        let decode: Vec<Seated<'_>> = (0..lanes)
-                            .map(|slot| Seated {
+                for size in sizes {
+                    for &form in forms
+                        .iter()
+                        .filter(|(_, scores)| !scores || octaves.contains(&rung))
+                    {
+                        for (verb, held) in &verbs {
+                            let prompt = size
+                                .min(self.budgets.tokens.max_tokens)
+                                .min(context.saturating_sub(*held))
+                                .max(1);
+                            let lanes = size.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                            let prompt_tokens = vec![0u32; prompt as usize];
+                            let one = [0u32];
+                            let prefill = [Seated {
                                 held: Some(*held),
                                 rs: verb,
                                 refs: true,
@@ -2276,34 +2386,49 @@ impl Shell {
                                 record: (!record.is_empty()).then_some(&record[..]),
                                 windows: &windows,
                                 ..Seated::of(Lane {
-                                    slot,
-                                    word: word(1, form),
-                                    tokens: &one,
+                                    slot: 0,
+                                    word: word(prompt, form),
+                                    tokens: &prompt_tokens,
                                 })
-                            })
-                            .collect();
-                        for lanes in [&prefill[..], &decode[..]] {
-                            // Each dropped fire's command buffer goes back
-                            // with its own pool: left to the thread's, a
-                            // walk of more fires than the queue holds
-                            // command buffers blocks making the next one.
-                            let walked = pooled(|| -> Result<()> {
-                                let prepared = FrameShell::prepare(
-                                    self,
-                                    StepView {
-                                        lanes,
-                                        attachments: &[],
-                                        media: &[],
-                                        clips: &[],
-                                        done: None,
-                                    },
-                                    None,
-                                )?;
-                                drop(self.walk(&prepared, true)?);
-                                Ok(())
-                            });
-                            walked?;
-                            fires += 1;
+                            }];
+                            let decode: Vec<Seated<'_>> = (0..lanes)
+                                .map(|slot| Seated {
+                                    held: Some(*held),
+                                    rs: verb,
+                                    refs: true,
+                                    pages: &kv_pages,
+                                    record: (!record.is_empty()).then_some(&record[..]),
+                                    windows: &windows,
+                                    ..Seated::of(Lane {
+                                        slot,
+                                        word: word(1, form),
+                                        tokens: &one,
+                                    })
+                                })
+                                .collect();
+                            for lanes in [&prefill[..], &decode[..]] {
+                                // Each dropped fire's command buffer goes back
+                                // with its own pool: left to the thread's, a
+                                // walk of more fires than the queue holds
+                                // command buffers blocks making the next one.
+                                let walked = pooled(|| -> Result<()> {
+                                    let prepared = FrameShell::prepare(
+                                        self,
+                                        StepView {
+                                            lanes,
+                                            attachments: &[],
+                                            media: &[],
+                                            clips: &[],
+                                            done: None,
+                                        },
+                                        None,
+                                    )?;
+                                    drop(self.walk(&prepared, true)?);
+                                    Ok(())
+                                });
+                                walked?;
+                                fires += 1;
+                            }
                         }
                     }
                 }
@@ -3655,23 +3780,29 @@ impl Shell {
     }
 
     /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
+    /// The step's prologues in one command buffer and one wait
+    /// (`Programs::fire_batched`): their status and the cells they put are
+    /// read on the host before the forward is encoded (each prologue's
+    /// verdict, the descriptor ports and input feeds), so the wait stays,
+    /// once a step rather than once a region an instance.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        for attached in attachments.iter().filter(|a| !a.adapter_only) {
-            if !self.programs.prologue_runs(attached.instance) {
-                continue;
-            }
-            match self
-                .programs
-                .fire(&self.device, attached.instance, Stage::Prologue)?
-            {
+        let ids: Vec<engine::InstanceId> = attachments
+            .iter()
+            .filter(|a| !a.adapter_only && self.programs.prologue_runs(a.instance))
+            .map(|a| a.instance)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for (instance, fired) in self.programs.fire_batched(&self.device, &ids, Stage::Prologue)? {
+            match fired {
                 crate::Fired::Committed => {}
                 other => {
                     return Err(Fault::program(
                         "serve::prologue",
                         format!(
-                            "instance {}'s prologue did not commit ({other:?}), so the \
-                             forward has no cells to read",
-                            attached.instance
+                            "instance {instance}'s prologue did not commit ({other:?}), so the \
+                             forward has no cells to read"
                         ),
                     ));
                 }
@@ -5791,6 +5922,7 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        self.pools.weights_ready()?;
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.stage(step)
@@ -5829,7 +5961,7 @@ impl engine::frame::Shell for Shell {
             for (name, ns, launches) in profile.iter().take(crate::diag::on().kernel_profile.rows())
             {
                 eprintln!(
-                    "  {:>9.1} ms  {:>5} launch(es)  {name}",
+                    "  {:>9.3} ms  {:>5} launch(es)  {name}",
                     *ns as f64 / 1e6,
                     launches
                 );

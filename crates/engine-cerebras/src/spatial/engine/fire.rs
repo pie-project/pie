@@ -940,6 +940,7 @@ mod tests {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 })
                 .collect(),
             media: Vec::new(),

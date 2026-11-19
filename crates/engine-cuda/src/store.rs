@@ -2333,7 +2333,11 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            per_instance,
+            // Today's arms are folded into the instance's bytes: one arm, no
+            // scratch apart.
+            resident: per_instance,
+            scratch: 0,
+            scratch_arms: 1,
             per_pair,
             run,
         })

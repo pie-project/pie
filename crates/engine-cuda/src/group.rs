@@ -26,6 +26,9 @@ pub struct Group {
     ordinals: Vec<i32>,
     poison: Poison,
     facts: Option<DeviceFacts>,
+    /// Each copy still landing on some rank, by token: how many ranks have
+    /// yet to tell it landed ([`Engine::copy_slots_landing`]).
+    landing: Arc<Mutex<std::collections::HashMap<u64, usize>>>,
 }
 
 /// The first refusal poisons the group: every later verb answers it without
@@ -169,6 +172,7 @@ pub fn open_group(boots: Vec<DeviceBoot>, contract_for: ContractFor) -> Result<G
         ordinals,
         poison: Poison::over(&held),
         facts,
+        landing: Arc::default(),
     })
 }
 
@@ -477,9 +481,10 @@ impl Engine for Group {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
-            Some(rank) => rank.guest_state(program, extents),
+            Some(rank) => rank.guest_state(program, extents, class),
             None => Err(Error::Program(
                 "a rank is busy: a program's guest state is asked between frames".to_string(),
             )),
@@ -654,6 +659,75 @@ impl Engine for Group {
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_slots(&copy))
+    }
+
+    /// Every rank's moves landed.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.each(|rank| rank.settle_copies())?;
+        Ok(())
+    }
+
+    /// Landed once every rank's copy has: the ranks that answer it landed
+    /// inside the call count down here, the others from their own sinks
+    /// ([`Engine::on_landed`]), and whichever brings the count to nothing
+    /// tells it.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.landing
+            .lock()
+            .unwrap()
+            .insert(token, self.ranks.len());
+        let copy = copy.clone();
+        let answers = match self.each(move |rank| rank.copy_slots_landing(&copy, token)) {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.landing.lock().unwrap().remove(&token);
+                return Err(error);
+            }
+        };
+        let landed = answers.iter().filter(|landed| **landed).count();
+        let mut left = self.landing.lock().unwrap();
+        // Gone: every rank still landing told it, and their last told it on.
+        let Some(count) = left.get_mut(&token) else {
+            return Ok(false);
+        };
+        *count -= landed;
+        if *count == 0 {
+            left.remove(&token);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        let left = Arc::clone(&self.landing);
+        let each: engine::LandingSink = Arc::new(move |token| {
+            let last = {
+                let mut left = left.lock().unwrap();
+                match left.get_mut(&token) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        false
+                    }
+                    Some(_) => {
+                        left.remove(&token);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if last {
+                sink(token);
+            }
+        });
+        for shell in &self.ranks {
+            if let Ok(mut shell) = shell.try_lock() {
+                shell.on_landed(each.clone());
+            }
+        }
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
