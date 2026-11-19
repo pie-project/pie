@@ -702,8 +702,52 @@ impl FramePolicy {
         }
         // Not joining while it waits: it holds no frame back as one.
         self.forget_staged(owner);
+        self.seal_owner_now(owner);
         self.maybe_reset_episode();
     }
+
+    /// `owner`'s complete frames go to the engine now, each fire a wave of
+    /// its own in order, not at a boundary: parked (suspended, or waiting
+    /// on a bind), it submits nothing more, and what waits on these fires
+    /// (its eviction's wait on their leases, its bind's settle) must not
+    /// wait on lanes whose owners wait on the planner in turn (the disk-only
+    /// soaks: a complete front frame of a parked owner never sealed while
+    /// the boundary stayed open, its eviction waiting on its lease for good).
+    fn seal_owner_now(&mut self, owner: ProcessId) {
+        let owned: Vec<ProcessId> = self
+            .lanes
+            .iter()
+            .filter(|(_, lane)| lane.owner == Some(owner))
+            .map(|(id, _)| *id)
+            .collect();
+        for lane_id in owned {
+            let Some(lane) = self.lanes.get_mut(&lane_id) else {
+                continue;
+            };
+            let mut waves = Vec::new();
+            let mut widest = 0usize;
+            while lane.frames.front().is_some_and(PendingFrame::is_complete) {
+                let frame = lane.frames.pop_front().expect("a front frame");
+                for fire in &frame.fires {
+                    widest = widest.max(fire.rung_rows);
+                    if let Some(id) = fire.fire_id {
+                        waves.push(vec![id]);
+                    }
+                }
+            }
+            if lane.frames.is_empty() {
+                self.lanes.remove(&lane_id);
+            }
+            if !waves.is_empty() {
+                self.sealed.push_back(SealedFrame {
+                    waves,
+                    members: std::iter::once(lane_id).collect(),
+                    widest,
+                });
+            }
+        }
+    }
+
 
     pub fn on_process_resume(&mut self, owner: ProcessId) {
         self.suspended.remove(&owner);
@@ -1436,7 +1480,53 @@ mod tests {
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
+        a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary();
     }
+
+    /// The disk-only soaks' self-cycle: a process whose guest went into a
+    /// bind had a complete front frame queued, a continuing lane mid
+    /// boundary, and the boundary stayed open on lanes whose owners waited
+    /// on the planner's grants. Its frame was never sealed, so its fire
+    /// never ran, its lease never went back, and its eviction waited on it
+    /// for good. Parked (suspended, or waiting at its bind), an owner's
+    /// complete frames go to the engine at once, not at a boundary.
+    fn a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary() {
+        for suspend in [true, false] {
+            let mut policy = FramePolicy::new(1, 64, 4096, None)
+                .with_submit_deadline(Duration::from_secs(86_400));
+            let (binder, waiting) = (pid(), pid());
+            // A frame of both: the boundary opens with both fired.
+            policy.on_fire_enqueued(stamp(binder, 0, 0, 1), Some(binder), 1, 1, 1);
+            policy.on_fire_enqueued(stamp(waiting, 0, 0, 1), Some(waiting), 2, 1, 1);
+            let queued: QueuedFireIds = [1, 2].into_iter().collect();
+            let mut first = fires(&plan(&mut policy, &queued, Instant::now()));
+            first.sort_unstable();
+            assert_eq!(first, vec![1, 2]);
+            policy.on_frame_posted([binder, waiting], Instant::now());
+            policy.on_frame_retired([binder, waiting]);
+            // The binder's next frame, complete; the other lane's owner
+            // waits on a grant and submits nothing.
+            policy.on_fire_enqueued(stamp(binder, 1, 0, 1), Some(binder), 3, 1, 1);
+            let queued: QueuedFireIds = [3].into_iter().collect();
+            let held = plan(&mut policy, &queued, Instant::now());
+            assert!(
+                !matches!(&held, FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)),
+                "control: mid boundary, it waits for the other lane: {held:?}"
+            );
+            // Its guest goes into a bind that waits, or it is evicted.
+            if suspend {
+                policy.on_process_suspend(binder);
+            } else {
+                policy.on_owner_waits(binder);
+            }
+            assert_eq!(
+                fires(&plan(&mut policy, &queued, Instant::now())),
+                vec![3],
+                "parked, its complete frame goes at once"
+            );
+        }
+    }
+
 
     /// A prompt split across a lower: its last piece, cut under the cap
     /// before it came down, is kept whole out of the frames sealed under
