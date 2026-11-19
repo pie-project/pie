@@ -2975,18 +2975,9 @@ fn beam_pool_fits(lane: usize, end: u64, named: u64, capacity: u32) -> Result<()
 }
 
 /// Whether `fwd`'s program states each beam's parent (its lanes hold their
-/// own page lists of their set's reserve).
+/// own page lists of their set's reserve): decided when it registered.
 fn binds_pages<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
-    Ok(ctx
-        .resources()
-        .get(fwd)?
-        .instance
-        .program
-        .bound
-        .container
-        .ports
-        .iter()
-        .any(|binding| binding.port == Port::Parents))
+    Ok(ctx.resources().get(fwd)?.instance.program.binds_pages)
 }
 
 /// The slots lane `lane`'s rows may land at where the device places them,
