@@ -203,10 +203,10 @@ impl CudaOpParams {
 
 #[must_use]
 pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
-    if dtype == Dtype::Bool {
-        numel.max(1)
-    } else {
-        numel.max(1) * 4
+    match dtype {
+        Dtype::Bool => numel.max(1),
+        Dtype::Bf16 => numel.max(1) * 2,
+        _ => numel.max(1) * 4,
     }
 }
 
@@ -1981,6 +1981,79 @@ mod tests {
             b.build().expect("the sorted epilogue traces")
         }
 
+        /// The SDK's standard sampler's decode fire of `shape`
+        /// (`eta_dsl::sampler::decode`), its knobs in channels, as the
+        /// built-in inferlets build it.
+        pub fn standard(vocab: u32, shape: &eta_dsl::sampler::Shape) -> Traced {
+            use eta_dsl::sampler::{self, Knobs, Slots};
+            let knob = |on: bool| on.then(|| leak(Channel::from([0.9f32])));
+            let top_p = knob(shape.top_p);
+            let top_k = shape.top_k.then(|| leak(Channel::from([40u32])));
+            let (min_p, repetition) = (knob(shape.min_p), knob(shape.repetition));
+            let (frequency, presence) = (knob(shape.frequency), knob(shape.presence));
+            let penalized = shape.repetition || shape.frequency || shape.presence;
+            let hist = penalized.then(|| {
+                (
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                )
+            });
+            let logprobs = shape.logprobs.map(|top| {
+                let values = Channel::new([1 + top], dtype::f32).capacity(8);
+                values.note_host_take();
+                let ids = (top > 0).then(|| {
+                    let ids = Channel::new([top], dtype::i32).capacity(8);
+                    ids.note_host_take();
+                    ids
+                });
+                (values, ids)
+            });
+            let slots: &'static Slots = Box::leak(Box::new(Slots {
+                rng: Channel::from([0x9e37u32, 1]),
+                hist,
+                mask: None,
+                logprobs,
+            }));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            out.note_host_take();
+            let temperature = shape.temperature;
+            let logprob_top = shape.logprobs;
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
+                let knobs = Knobs {
+                    temperature,
+                    top_p: t(top_p),
+                    top_k: t(top_k),
+                    min_p: t(min_p),
+                    repetition: t(repetition),
+                    frequency: t(frequency),
+                    presence: t(presence),
+                    logprobs: logprob_top,
+                };
+                sampler::decode(vocab, &knobs, slots, tok_in, out);
+            });
+            b.build().expect("the standard sampler traces")
+        }
+
+        /// The standard sampler's shapes and a penalized top-p one, each
+        /// its decode fire, by name.
+        pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
+            let penalized = eta_dsl::sampler::Shape {
+                temperature: Some(1.0),
+                top_p: true,
+                repetition: true,
+                frequency: true,
+                presence: true,
+                ..eta_dsl::sampler::Shape::GREEDY
+            };
+            eta_dsl::sampler::STANDARD
+                .iter()
+                .map(|(name, shape)| (format!("standard {name}"), standard(vocab, shape)))
+                .chain([("standard penalized top-p".to_string(), standard(vocab, &penalized))])
+                .collect()
+        }
+
         /// Every program here, by name.
         pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
             vec![
@@ -2077,6 +2150,44 @@ mod tests {
             assert!(*now < was, "{name}: {now} bytes a lane, {was} before");
         }
     }
+
+    /// What a lane's scratch is for the standard sampler's decode fires,
+    /// their vocabulary-sized values bf16: each value's own bytes, and as
+    /// laid.
+    #[test]
+    fn the_standard_samplers_scratch_a_lane() {
+        let vocab = shipped::QWEN_VOCAB;
+        let totals: Vec<(String, u64, u64)> = shipped::standard_all(vocab)
+            .into_iter()
+            .map(|(name, traced)| {
+                let package = shipped::package(&traced, vocab);
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+                let own = eta_exec::layout(&descriptors).expect("fits").total;
+                let laid = lay_out(plan, &descriptors).expect("fits").total;
+                (name, own, laid)
+            })
+            .collect();
+        let got: Vec<(&str, u64, u64)> =
+            totals.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
+        assert_eq!(got, STANDARD_SCRATCH);
+    }
+
+    /// Each standard decode fire's scratch, its own and as laid; with f32
+    /// intermediates they were: greedy 3,689,472 / 1,536; gumbel-max
+    /// 5,512,960 / 1,792; top-p 9,312,768 / 1,368,832 (the f32 lane
+    /// sampler's chain); top-k + top-p 9,617,408 / 2,813,440; top logprobs
+    /// 6,732,544 / 1,901,312; penalized top-p 20,254,720 / 2,585,600.
+    const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
+        ("standard greedy", 3_689_472, 1_536),
+        ("standard gumbel-max", 5_209_088, 1_792),
+        ("standard top-p", 6_577_920, 1_749_248),
+        ("standard top-k + top-p", 6_882_560, 1_901_824),
+        ("standard top logprobs", 4_910_080, 1_294_080),
+        ("standard penalized top-p", 12_050_176, 2_966_016),
+    ];
 
     /// No generated kernel of the programs inferlets ship names the bytes
     /// of a value its stage states to take none (a generated kernel
