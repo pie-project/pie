@@ -487,3 +487,91 @@ Streamed PLE rows (per-fire row indices, no cut) could roll as adapter banks do.
 
 Host RAM is attacked by shrinking the ladder instead: logprobs sharing the forward's
 programs, and prefill buckets chosen from measured costs.
+
+## F36. XLA prefill buckets: which rungs a model can drop is measured per model, not per device
+
+The token rungs come from `Pad::ladder` (`engine-xla chip.rs`). They are the powers of
+two up to 512, then `engine.pad.row_steps` steps between powers of two from 512 up (v6e:
+4, i.e. 640, 768, 896, 1024, …). Each rung brings its prefill and mixed ladder shapes.
+
+The rule (Leader): a rung goes if padding every prompt it serves up to the next remaining
+rung costs at most 2%. Measured as t(next) / t(rung) on single-lane prefill fires (engine
+probe), and on batched fires (several lanes beside decodes, a c64 step); both must stay
+within 2%.
+
+qwen3-0.6b on v6e, single-lane prefill, ms per fire:
+
+| rung | ms | dropping it pads to | cost |
+|---|---|---|---|
+| 64 | 3.40 | 128 | +3.2% |
+| 128 | 3.51 | 256 | +10.9% |
+| 256 | 3.89 | 512 | +16.5% |
+| 512 | 4.53 | 640 | +10.6% |
+| 640 | 5.01 | 768 | +0.6% |
+| 768 | 5.04 | 896 | +17.2% |
+| 896 | 5.91 | 1024 | −1.0% |
+| 1024 | 5.78 | 1280 | +17% |
+| 1280 | 6.77 | 1536 | +16.1% |
+| 1536 | 7.86 | | |
+| 1792 | 9.04 | 2048 | +15.5% |
+| 2048 | 10.44 | | |
+| 2560 | 13.29 | | |
+
+Only 640 and 896 pass. The model is weight-bound up to about 1024 rows and compute-bound
+past that.
+
+Why per model:
+- `row_steps = 4` is itself a measured device decision. It came from Gemma-4-31B, where a
+  512-token prompt plus its template ran a 1024-row fire, and the 128-row steps took cut
+  Raw prefill toward vLLM-TPU (8.8k vs 12.8k tok/s).
+- A compute-bound model pays nearly in proportion to its rows for the same padding.
+- So the kept set is a property of (device, model).
+
+What it would need:
+- the kept set derived at load from a measured cost curve: the device's measured rates (bandwidth, MXU throughput) against the model's weight bytes and FLOPs per row, or a per-model probe;
+- the batched-fire check beside it.
+
+What it would buy on qwen3-0.6b: 2 of 21 rungs, of the order of 50 programs, about 8–10
+GB of host at ready, against 126 GiB (F37). Not built.
+
+## F37. XLA host RAM at ready is libtpu's live per-executable data, about 200 MB a program
+
+qwen3-0.6b's ladder (652 programs, tip e88370f2c, census config) holds 126 GiB of host RSS
+at ready. 129 GiB peaks on a cold boot. A ladder twice the size froze the 172 GB host
+(readout iii).
+
+smaps at ready: 132.8 GB RSS, all anonymous (61 GB in THP, 0.15 GB file-backed).
+
+| mapping class | maps | RSS |
+|---|---|---|
+| exactly 64 MiB (glibc's per-thread arena heaps) | 992 | 49.9 GB |
+| variable 16 MiB – 1 GiB large mmaps | 319 | 49.9 GB |
+| 128 MiB | 147 | 19.1 GB |
+| 1–2 GiB | 21 | 13.5 GB |
+
+It is live: `malloc_trim(0)` after the warm ladder returned nothing (126 GiB before and
+after).
+
+Per executable, in a bare PJRT client, the 28-layer qwen3 decode program (22.5 MB of code,
+38.5 MB serialized, 1.8 MB of StableHLO) holds:
+- 177 MB after `DeserializeAndLoad` (about 7.6× its code);
+- 380 MB after a compile.
+
+Pie keeps nothing besides the loaded executable: `Executable::adopt` destroys the
+`PJRT_Executable` it reads, and the cache bytes are dropped.
+
+libtpu flags tried, deserialize per program:
+
+| flag | deserialize | compile |
+|---|---|---|
+| `xla_xprof_register_llo_debug_info=false` | 174 MB | |
+| `xla_tpu_impure_track_debug_metadata=false` | 177 MB | 306 MB |
+| `xla_tpu_keep_hlo_proto_literals_up_to=0` | 176 MB | |
+
+The PJRT C API has no call that drops a loaded executable's host-side data.
+
+Levers:
+- fewer programs (the ladder: logprobs share the forward's programs since 6123377f2; buckets, F36);
+- smaller code a program (rolling, F35, does not land under 2%);
+- a libtpu change: release or make configurable the host-side program data after load (an upstream request);
+- evicting cold executables to the disk cache (parked: a reload at fire time is a fire built after ready).
