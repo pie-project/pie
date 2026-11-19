@@ -247,3 +247,124 @@ template [[host_name("dense_gemv_t_ksplit_bfloat16_float32")]]
     const device bfloat*, const device bfloat*, device float*,
     const constant int&, const constant int&, const constant int&,
     uint2, uint, uint, uint);
+
+// `M` rows (2 to 8) against one weight row: the weight row is read once
+// and each row's dot accumulates from it, so a decode of a few rows reads
+// its weights once, as one row does (each row's own simdgroup read them
+// `M` times, and at 4 rows the tile took over at ~2x the cost). `R`, the
+// rows unrolled, is the power of two at or above `M`; rows past `M` are
+// neither read nor written. Eight bf16 a load where `K` is a multiple of 8.
+
+inline float bf16x8_dot(uint4 a, uint4 b) {
+  return (bf16x2_dot(a.x, b.x) + bf16x2_dot(a.y, b.y)) +
+         (bf16x2_dot(a.z, b.z) + bf16x2_dot(a.w, b.w));
+}
+
+template <typename T, int R>
+inline void gemv_rows_dot(const device T* act, int M, const device T* w_row, int K,
+                          int k0, int stride, thread float* acc) {
+  for (int r = 0; r < R; ++r) {
+    acc[r] = 0.0f;
+  }
+  if ((K & 7) == 0) {
+    const int octs = K >> 3;
+    const device uint4* w8 = reinterpret_cast<const device uint4*>(w_row);
+    const device uint4* a8 = reinterpret_cast<const device uint4*>(act);
+    for (int p = k0; p < octs; p += stride) {
+      const uint4 wv = w8[p];
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        if (r < M) {
+          acc[r] += bf16x8_dot(a8[size_t(r) * size_t(octs) + size_t(p)], wv);
+        }
+      }
+    }
+  } else {
+    for (int k = k0; k < K; k += stride) {
+      const float wv = float(w_row[k]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        if (r < M) {
+          acc[r] += float(act[size_t(r) * size_t(K) + size_t(k)]) * wv;
+        }
+      }
+    }
+  }
+}
+
+template <typename T, int R>
+[[kernel]] void dense_gemv_t_rows(
+    const device T* act      [[buffer(0)]],
+    const device T* w        [[buffer(1)]],
+    device T* y              [[buffer(2)]],
+    const constant int& M    [[buffer(3)]],
+    const constant int& N    [[buffer(4)]],
+    const constant int& K    [[buffer(5)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint lane  [[thread_index_in_simdgroup]]) {
+  const int n = int(gid.x) / SIMD_SIZE;
+  if (n >= N) {
+    return;
+  }
+  float acc[R];
+  gemv_rows_dot<T, R>(act, M, w + size_t(n) * size_t(K), K, int(lane), SIMD_SIZE, acc);
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const float total = simd_sum(acc[r]);
+    if (lane == 0 && r < M) {
+      y[size_t(r) * size_t(N) + size_t(n)] = static_cast<T>(total);
+    }
+  }
+}
+
+template <typename T, int R>
+[[kernel]] void dense_gemv_t_ksplit_rows(
+    const device T* act      [[buffer(0)]],
+    const device T* w        [[buffer(1)]],
+    device T* y              [[buffer(2)]],
+    const constant int& M    [[buffer(3)]],
+    const constant int& N    [[buffer(4)]],
+    const constant int& K    [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]],
+    uint sg    [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part[KSPLIT_SIMDGROUPS][R];
+  const int n = int(tgid.x);
+  if (n >= N) {
+    return;
+  }
+  float acc[R];
+  gemv_rows_dot<T, R>(act, M, w + size_t(n) * size_t(K), K, int(tid), KSPLIT_GROUP, acc);
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const float total = simd_sum(acc[r]);
+    if (lane == 0) {
+      part[sg][r] = total;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(tid) < M) {
+    float total = 0.0f;
+    for (int i = 0; i < KSPLIT_SIMDGROUPS; ++i) {
+      total += part[i][tid];
+    }
+    y[size_t(tid) * size_t(N) + size_t(n)] = static_cast<T>(total);
+  }
+}
+
+#define instantiate_dense_gemv_t_rows(r)                                     \
+  template [[host_name("dense_gemv_t_rows" #r "_bfloat16")]]                 \
+  [[kernel]] void dense_gemv_t_rows<bfloat, r>(                              \
+      const device bfloat*, const device bfloat*, device bfloat*,            \
+      const constant int&, const constant int&, const constant int&,         \
+      uint2, uint);                                                          \
+  template [[host_name("dense_gemv_t_ksplit_rows" #r "_bfloat16")]]          \
+  [[kernel]] void dense_gemv_t_ksplit_rows<bfloat, r>(                       \
+      const device bfloat*, const device bfloat*, device bfloat*,            \
+      const constant int&, const constant int&, const constant int&,         \
+      uint2, uint, uint, uint);
+
+instantiate_dense_gemv_t_rows(2)
+instantiate_dense_gemv_t_rows(4)
+instantiate_dense_gemv_t_rows(8)

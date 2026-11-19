@@ -24,13 +24,43 @@ const KSPLIT_ENTRY: &str = "dense_gemv_t_ksplit_bfloat16";
 
 const KSPLIT_F32_ENTRY: &str = "dense_gemv_t_ksplit_bfloat16_float32";
 
+/// 2 to [`ROWS_MAX`] rows, each weight row read once for every row: a
+/// simdgroup a column (wide) or a threadgroup a column (narrow), unrolled
+/// for 2, 4 or 8 rows, the power of two at or above the rows.
+const ROWS_ENTRY: [&str; 3] = [
+    "dense_gemv_t_rows2_bfloat16",
+    "dense_gemv_t_rows4_bfloat16",
+    "dense_gemv_t_rows8_bfloat16",
+];
+
+const KSPLIT_ROWS_ENTRY: [&str; 3] = [
+    "dense_gemv_t_ksplit_rows2_bfloat16",
+    "dense_gemv_t_ksplit_rows4_bfloat16",
+    "dense_gemv_t_ksplit_rows8_bfloat16",
+];
+
+/// The most rows the many-row vector forms take.
+const ROWS_MAX: u32 = 8;
+
+/// The unrolled form `rows` (2 to [`ROWS_MAX`]) takes: 2, 4 or 8 rows.
+fn unrolled(rows: u32) -> usize {
+    match rows {
+        ..=2 => 0,
+        3..=4 => 1,
+        _ => 2,
+    }
+}
+
 const VECTOR_GROUP: u32 = 128;
 
 const KSPLIT_MAX_COLUMNS: u32 = 1024;
 
 const LANES_PER_COLUMN: u32 = 32;
 
-pub const VECTOR_MAX_ROWS: u32 = 4;
+/// Rows below it take the vector forms: one row as it is, a few rows
+/// against each weight row read once ([`ROWS_MAX`]). Past it a row tile
+/// pads the rows; at 4 rows the tile cost ~2x one row's vector on the M1.
+pub const VECTOR_MAX_ROWS: u32 = ROWS_MAX + 1;
 
 const FILE: &str = "linear/gemm.metal";
 
@@ -83,10 +113,14 @@ pub fn act_x_wt(
     let (entry, grid) = if y.dtype == dtype::Dtype::F32 {
         // f32 columns (`matmul_f32`), a threadgroup each.
         (KSPLIT_F32_ENTRY, ksplit_grid(op, rows, columns)?)
-    } else if rows < VECTOR_MAX_ROWS && columns <= KSPLIT_MAX_COLUMNS {
+    } else if rows == 1 && columns <= KSPLIT_MAX_COLUMNS {
         (KSPLIT_ENTRY, ksplit_grid(op, rows, columns)?)
-    } else if rows < VECTOR_MAX_ROWS {
+    } else if rows == 1 {
         (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
+    } else if few_rows(tuning, rows, columns, contraction) && columns <= KSPLIT_MAX_COLUMNS {
+        (KSPLIT_ROWS_ENTRY[unrolled(rows)], ksplit_grid(op, 1, columns)?)
+    } else if few_rows(tuning, rows, columns, contraction) {
+        (ROWS_ENTRY[unrolled(rows)], vector_grid(op, 1, columns)?)
     } else if let Some((bm, bn)) = mpp_fit(tuning, rows, columns, contraction) {
         return mpp(ctx, op, (act, w, y), (rows, columns, contraction), (bm, bn));
     } else if rows < TILE_M {
@@ -138,7 +172,7 @@ const MPP_NARROW_ROWS: u32 = 64;
 /// pads `rows` to its height. What a load weighs a rung's matmul rows by.
 #[must_use]
 pub fn rows_computed(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> u32 {
-    if rows < VECTOR_MAX_ROWS {
+    if rows == 1 || few_rows(tuning, rows, columns, contraction) {
         rows
     } else if let Some((bm, _)) = mpp_fit(tuning, rows, columns, contraction) {
         rows.next_multiple_of(bm.max(1))
@@ -147,6 +181,13 @@ pub fn rows_computed(tuning: &Tuning, rows: u32, columns: u32, contraction: u32)
     } else {
         rows.next_multiple_of(TILE_M)
     }
+}
+
+/// Whether `rows` (past one) take the few-row vector forms: below
+/// [`VECTOR_MAX_ROWS`], and not where the tensor-op tile fits (from its
+/// smallest row tile up it reads the weight once on the tensor ops).
+fn few_rows(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> bool {
+    rows > 1 && rows < VECTOR_MAX_ROWS && mpp_fit(tuning, rows, columns, contraction).is_none()
 }
 
 fn mpp_fit(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> Option<(u32, u32)> {
