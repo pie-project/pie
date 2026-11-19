@@ -180,10 +180,13 @@ pub fn lo_dsds(
             .filter_map(|(at, _)| {
                 let rest = &m.outside[at + 6..];
                 let name: String = rest.chars().take_while(|&ch| ident(ch)).collect();
-                rest[name.len()..]
-                    .trim_start()
-                    .starts_with("= @get_dsd(")
-                    .then_some(name)
+                // (a fabric DSD constant takes no low-data descriptor: flux2-mini's 32 x 128
+                // GEMM PE with the line sends' two linked at 1,008 B, as without them)
+                let rhs = rest[name.len()..].trim_start();
+                (rhs.starts_with("= @get_dsd(")
+                    && !rhs.starts_with("= @get_dsd(fabout_dsd")
+                    && !rhs.starts_with("= @get_dsd(fabin_dsd"))
+                .then_some(name)
             })
             .collect();
         tops += consts.len() as i64;
@@ -1252,5 +1255,31 @@ mod tests {
             &rep.errors[..rep.errors.len().min(5)]
         );
         assert!(rep.margin() > 0, "{}", rep.line());
+    }
+
+    #[test]
+    fn a_fabric_dsd_constant_takes_no_low_data_slot() {
+        let est = |extra: &str| {
+            let src = format!(
+                "var a = @zeros([4]f32);\nconst D_a = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{4}} -> a[i] }});\n{extra}"
+            );
+            let files: BTreeMap<String, String> =
+                [("pe.csl".to_string(), src)].into_iter().collect();
+            lo_dsds(&files, "pe.csl", &BTreeMap::new())
+        };
+        let base = est("");
+        // (a fabout constant, as a line send's advancing-switch DSD: none; 1,008 B linked either way)
+        assert_eq!(
+            est(
+                "const D_o = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q, .advance_switch = true });\n"
+            ),
+            base
+        );
+        assert_eq!(
+            est(
+                "var b = @zeros([4]f32);\nconst D_b = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> b[i] });\n"
+            ),
+            base + 1
+        );
     }
 }
