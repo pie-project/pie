@@ -7,16 +7,18 @@ use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
-use crate::device::alloc::{Buffer, Memory};
+use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
+use engine_gpu::backend::Buffer as _;
 use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
 use engine_gpu::store::layout::INSTANCE;
 
+use engine_gpu::guest::claims::{Claims, Run};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, STEP_BINDING, StageTables, groups_for, stage_tables, step_stride,
-    step_uniforms,
+    HEAP_BINDING, STATUS_BINDING, STEP_BINDING, StageTables, TABLES_BINDING, bases, groups_for,
+    stage_tables, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -36,27 +38,16 @@ pub struct Tables<'a> {
 }
 
 /// What the runtime declares read-only (the tables, storage) or a uniform
-/// (the config), and the same binding declared read_write storage. An
-/// instance's tables and config lie in its pool slots, in the segment buffer
-/// its heap binds read_write, and a WebGPU usage scope takes one buffer one
-/// way only: a stage's module declares them read_write, and its layout binds
-/// every binding read_write storage.
-const WIDENED: [(&str, &str); 5] = [
+/// (the step's record), and the same binding declared read_write storage.
+/// The tables and the records lie in the segment the status binds read_write
+/// (and the heap may too), and a WebGPU usage scope takes one buffer one way
+/// only: a stage's module declares them read_write, and its layout binds
+/// every binding read_write storage. No step stores to them (the runtime's
+/// isolation facts, held by the step modules' naga test).
+const WIDENED: [(&str, &str); 2] = [
     (
-        "@binding(1) var<storage, read>       descs",
-        "@binding(1) var<storage, read_write> descs",
-    ),
-    (
-        "@binding(2) var<storage, read>       params",
-        "@binding(2) var<storage, read_write> params",
-    ),
-    (
-        "@binding(3) var<storage, read>       offs",
-        "@binding(3) var<storage, read_write> offs",
-    ),
-    (
-        "@binding(5) var<uniform>             cfg",
-        "@binding(5) var<storage, read_write> cfg",
+        "@binding(1) var<storage, read>       tables",
+        "@binding(1) var<storage, read_write> tables",
     ),
     (
         "@binding(6) var<uniform> pie_step",
@@ -109,7 +100,7 @@ pub fn instance_table_sizes(
         .zip(code)
         .flat_map(|(plan, lowered)| {
             let mut stage = eta_exec::tables::table_sizes(plan).to_vec();
-            stage.push(step_uniforms(&lowered.steps, stride).len() as u64);
+            stage.push(lowered.steps.len().max(1) as u64 * stride);
             stage
         })
         .collect();
@@ -220,7 +211,14 @@ thread_local! {
 /// ([`Library::built_serving`]).
 pub struct Library {
     core: Arc<Core>,
-    binds: wgpu::BindGroupLayout,
+    /// One group for each pair of the pool's segments: the one an
+    /// instance's slots lie in (its status, tables and step records) and the
+    /// one its heap does, each bound whole, by their slab ids. Made at load,
+    /// with every segment; a dispatch picks its instance's and binds its
+    /// step's record at a dynamic offset.
+    groups: std::collections::HashMap<(u64, u64), wgpu::BindGroup>,
+    /// Where every live instance's slots and heap lie ([`Claims`]).
+    claims: Claims,
     layout: wgpu::PipelineLayout,
     /// By call; why one is missing where it did not build.
     pipelines: std::sync::Mutex<Vec<std::result::Result<wgpu::ComputePipeline, String>>>,
@@ -244,9 +242,10 @@ impl std::fmt::Debug for Library {
 }
 
 impl Library {
-    /// The guest pipelines, and `threads` readback buffers of
-    /// `outbox_bytes` each.
-    pub fn build(device: &Context, outbox_bytes: u64, threads: u32) -> Result<Library> {
+    /// The guest pipelines, reading back through `outboxes` (one a thread
+    /// that runs guest passes, which the load's shelf reserved), and a bind
+    /// group for each pair of the pool's `segments`.
+    pub fn build(device: &Context, outboxes: Vec<Buffer>, segments: &[&Buffer]) -> Result<Library> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -261,19 +260,19 @@ impl Library {
         let pipelines: Vec<_> = (0..engine_gpu::guest::step_calls())
             .map(|call| build_call(&core, &layout, call))
             .collect();
-        let outboxes = (0..threads)
-            .map(|_| {
-                Buffer::with(
-                    device,
-                    outbox_bytes,
-                    Memory::Readback,
-                    engine_gpu::books::owners::GUEST,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut groups = std::collections::HashMap::with_capacity(segments.len().pow(2));
+        for slots in segments {
+            for heap in segments {
+                groups.insert(
+                    (slots.slab_id(), heap.slab_id()),
+                    segment_group(&core, &binds, slots, heap)?,
+                );
+            }
+        }
         let library = Library {
             core: core.clone(),
-            binds,
+            groups,
+            claims: Claims::default(),
             layout,
             pipelines: std::sync::Mutex::new(pipelines),
             serving: std::sync::atomic::AtomicU64::new(0),
@@ -297,6 +296,19 @@ impl Library {
             "every guest step's pipeline is built"
         );
         Ok(library)
+    }
+
+    /// The group of an instance whose slots lie in `slots` and heap in
+    /// `heap`; refused by name where a segment is not the pool's.
+    fn group(&self, slots: &Buffer, heap: &Buffer) -> Result<&wgpu::BindGroup> {
+        self.groups
+            .get(&(slots.slab_id(), heap.slab_id()))
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: "an instance's slots or heap lie in a buffer that is none of the pool's \
+                      segments the library binds"
+                    .into(),
+            })
     }
 
     /// The calls whose pipelines are built.
@@ -377,13 +389,13 @@ impl Library {
 }
 
 struct Stage {
-    group: wgpu::BindGroup,
-
     /// Its steps' pipelines, in dispatch order.
     steps: Vec<wgpu::ComputePipeline>,
-    /// Its steps' uniforms in the instance's `Instance` slots, `stride`
-    /// apart ([`STEP_BINDING`]).
+    /// Its steps' records in the instance's `Instance` slots, `stride`
+    /// apart ([`STEP_BINDING`]); each states where the instance lies.
     args: Held,
+    /// The steps the records are for.
+    lowered: Vec<eta_compiler::codegen::wgsl::Step>,
     stride: u64,
 
     groups: u32,
@@ -393,7 +405,7 @@ struct Stage {
     descriptors: Vec<ValueDesc>,
 
     /// The stage's bind-time tables in the instance's `Instance` slots,
-    /// in `TABLE_BINDINGS` order.
+    /// in the order they lie: descriptors, op params, offsets, config.
     tables: [Held; 4],
 
     /// Its heap ([`engine_gpu::guest::state`]): the side whose state it
@@ -409,14 +421,15 @@ struct Stage {
 }
 
 pub struct Session {
-    core: Arc<Core>,
     /// The status word the stages share, in the instance's `Instance` slots.
     status: Held,
     stages: Vec<Stage>,
-    /// The `Instance` slots the stages' tables lie in, in binding order,
-    /// and whether they are one run.
+    /// The `Instance` slots the stages' tables lie in: one run.
     slots: Vec<u32>,
-    run: bool,
+    /// An `Instance` slot's bytes.
+    slot_bytes: u64,
+    /// The name its slots and heap are claimed by ([`Claims`]).
+    claim: u64,
     /// The instance's state and its pair's ([`engine_gpu::guest::state`]),
     /// which its stages' heaps and the pair's score room lie in, their
     /// contents dead between fires.
@@ -437,6 +450,12 @@ impl std::fmt::Debug for Session {
                 &self.stages.iter().map(|s| s.heap.2).sum::<u64>(),
             )
             .finish()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.library.claims.release(self.claim);
     }
 }
 
@@ -463,7 +482,6 @@ impl Session {
             });
         }
 
-        let core = device.core().clone();
         let resolved = plans
             .iter()
             .map(|plan| {
@@ -473,22 +491,24 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<StageTables>>>()?;
-        // Every stage's tables and step uniforms, then the status word, in
-        // the instance's slots ([`instance_table_sizes`]), written at once.
-        // The step uniforms lie in a pool segment beside storage, so they
-        // bind as storage too, each at an offset storage's alignment allows.
+        // Every stage's tables and step records, then the status word, in
+        // one run of the instance's slots ([`instance_table_sizes`]), written
+        // at once. The records lie in a pool segment beside storage, so they
+        // bind as storage too, each at an offset storage's alignment allows;
+        // each states where the instance lies, so they are written once the
+        // tables are placed ([`Session::locate`]).
         let stride = step_stride(device.table_align());
         let mut bytes: Vec<Vec<u8>> = resolved
             .iter()
             .zip(code)
             .flat_map(|(stage, lowered)| {
                 let mut tables = stage.tables.to_vec();
-                tables.push(step_uniforms(&lowered.steps, stride));
+                tables.push(vec![0u8; lowered.steps.len().max(1) * stride as usize]);
                 tables
             })
             .collect();
         bytes.push(vec![0u8; eta_exec::STATUS_BYTES]);
-        let (placed, run) =
+        let placed =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let status = placed
@@ -515,7 +535,6 @@ impl Session {
                 ),
             });
         }
-        let places = [&instance, &pair];
         let mut stages = Vec::with_capacity(plans.len());
         for (at, ((lowered, resolved), &heap)) in
             code.iter().zip(resolved).zip(&layout.stages).enumerate()
@@ -533,24 +552,62 @@ impl Session {
                     at: "guest::session",
                     why: format!("stage {at}: {why}"),
                 })?;
-            let span = heap_span(places, heap)?;
             stages.push(build_stage(
-                device, &core, &library, &status, resolved, tables, lowered, args, stride, heap,
-                span,
+                device, &library, resolved, tables, lowered, args, stride, heap,
             )?);
         }
 
-        Ok(Session {
-            core,
+        let claim = library.claims.instance();
+        let session = Session {
             status,
             stages,
             slots: tables.slots.to_vec(),
-            run,
+            slot_bytes: tables.pools.slot_bytes(INSTANCE)?,
+            claim,
             instance,
             pair,
             scores: layout.scores,
             library,
-        })
+        };
+        session.locate()?;
+        Ok(session)
+    }
+
+    /// Writes each stage's step records with where the instance lies now,
+    /// each base checked ([`bases`]), and claims its slots and heap
+    /// ([`Claims`]): at the bind, and again where they moved.
+    fn locate(&self) -> Result<()> {
+        let places = [&self.instance, &self.pair];
+        for stage in &self.stages {
+            let bases = bases(
+                &self.status,
+                &stage.tables,
+                &stage.args,
+                heap_span(places, stage.heap)?,
+                self.slot_bytes,
+            )?;
+            self.library
+                .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
+            stage
+                .args
+                .write(0, &step_records(&stage.lowered, stage.stride, bases))?;
+        }
+        let (start, end) = self.status.run_span(self.slot_bytes);
+        let mut runs = vec![Run {
+            segment: self.status.buffer().slab_id(),
+            start,
+            end,
+        }];
+        // The instance's own state, its heaps' place; the pair's is every
+        // instance of the pair's, shared by design.
+        if let Some((buffer, at)) = self.instance.span() {
+            runs.push(Run {
+                segment: buffer.slab_id(),
+                start: at,
+                end: at + self.instance.bytes(),
+            });
+        }
+        self.library.claims.claim(self.claim, &runs)
     }
 
     /// The pair's score room, where its program reads captured scores.
@@ -587,7 +644,7 @@ impl Session {
         self.status.rebind(pools)?;
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
-        self.regroup()
+        self.locate()
     }
 
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they
@@ -617,13 +674,12 @@ impl Session {
         scratch: &engine::program::ScratchPlace,
         pair: &engine::program::ScratchPlace,
     ) -> Result<()> {
-        if slots.len() != self.slots.len() || (self.run && !consecutive(slots)) {
+        if slots.len() != self.slots.len() || !consecutive(slots) {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
-                    "tables in {} instance slot(s){} rebound to {slots:?}",
+                    "tables in a run of {} instance slot(s) rebound to {slots:?}",
                     self.slots.len(),
-                    if self.run { " of one run" } else { "" }
                 ),
             });
         }
@@ -646,22 +702,7 @@ impl Session {
         self.slots = slots.to_vec();
         self.instance.retarget(pools, scratch)?;
         self.pair.retarget(pools, pair)?;
-        self.regroup()
-    }
-
-    fn regroup(&mut self) -> Result<()> {
-        let places = [&self.instance, &self.pair];
-        for stage in &mut self.stages {
-            stage.group = group(
-                &self.core,
-                &self.library.binds,
-                &self.status,
-                &stage.tables,
-                heap_span(places, stage.heap)?,
-                &stage.args,
-            )?;
-        }
-        Ok(())
+        self.locate()
     }
 
     #[must_use]
@@ -728,17 +769,18 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
+        let heap = heap_span([&self.instance, &self.pair], stage.heap)?.0;
+        let group = self.library.group(self.status.buffer(), heap)?;
         for (step, pipeline) in stage.steps.iter().enumerate() {
-            // The step's node, rung and selector, at its own offset.
-            let offset = u32::try_from(step as u64 * stage.stride)
-                .expect("a stage's step uniforms fit a dynamic offset");
-            frame.dispatch_at(
-                "guest",
-                pipeline,
-                &stage.group,
-                &[offset],
-                [stage.groups, 1, 1],
-            )?;
+            // The step's record, at its own offset in the slots' segment.
+            let offset =
+                u32::try_from(stage.args.offset() + step as u64 * stage.stride).map_err(|_| {
+                    Fault::Program {
+                        at: "guest::session",
+                        why: "a step's record lies past a dynamic offset's reach".into(),
+                    }
+                })?;
+            frame.dispatch_at("guest", pipeline, group, &[offset], [stage.groups, 1, 1])?;
         }
         Ok(())
     }
@@ -855,36 +897,30 @@ impl Session {
 }
 
 fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
-    let step = wgpu::BindGroupLayoutEntry {
-        binding: STEP_BINDING,
+    let storage = |binding: u32, dynamic: bool| wgpu::BindGroupLayoutEntry {
+        binding,
         visibility: wgpu::ShaderStages::COMPUTE,
+        // Read_write storage, every one ([`WIDENED`]).
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: false },
-            has_dynamic_offset: true,
-            min_binding_size: std::num::NonZeroU64::new(u64::from(
-                eta_compiler::codegen::wgsl::STEP_BYTES,
-            )),
+            has_dynamic_offset: dynamic,
+            min_binding_size: if dynamic {
+                std::num::NonZeroU64::new(u64::from(eta_compiler::codegen::wgsl::STEP_BYTES))
+            } else {
+                None
+            },
         },
         count: None,
     };
-    let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..BINDINGS)
-        .map(|at| wgpu::BindGroupLayoutEntry {
-            binding: at,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            // Read_write storage, every one ([`WIDENED`]).
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        })
-        .chain([step])
-        .collect();
     core.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pie guest"),
-            entries: &entries,
+            entries: &[
+                storage(STATUS_BINDING, false),
+                storage(TABLES_BINDING, false),
+                storage(HEAP_BINDING, false),
+                storage(STEP_BINDING, true),
+            ],
         })
 }
 
@@ -919,63 +955,44 @@ fn build_call(
     .map_err(|error| format!("guest step call {call} was refused: {error}"))
 }
 
-fn span(held: &Held) -> wgpu::BindingResource<'_> {
-    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-        buffer: &held.buffer().slab().buffer,
-        offset: held.offset(),
-        size: std::num::NonZeroU64::new(held.bytes()),
-    })
-}
-
-/// A stage's bind group: the status word, its tables where their slots lie
-/// now (each at an offset the table layout aligned to the device's binding
-/// alignment), its heap.
-fn group(
+/// The group of every instance whose slots lie in segment `slots` and heap
+/// in segment `heap`: the status and the tables over the whole of `slots`,
+/// the heap over the whole of `heap`, and a step's record in `slots` at the
+/// dynamic offset its dispatch names.
+fn segment_group(
     core: &Arc<Core>,
     binds: &wgpu::BindGroupLayout,
-    status: &Held,
-    tables: &[Held; 4],
-    (heap, heap_at, heap_bytes): (&Buffer, u64, u64),
-    args: &Held,
+    slots: &Buffer,
+    heap: &Buffer,
 ) -> Result<wgpu::BindGroup> {
-    let [descs, params, offs, cfg] = tables;
+    fn whole(segment: &Buffer) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &segment.slab().buffer,
+            offset: 0,
+            size: std::num::NonZeroU64::new(segment.bytes()),
+        })
+    }
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
         layout: binds,
         entries: &[
             wgpu::BindGroupEntry {
-                binding: 0,
-                resource: span(status),
+                binding: STATUS_BINDING,
+                resource: whole(slots),
             },
             wgpu::BindGroupEntry {
-                binding: 1,
-                resource: span(descs),
+                binding: TABLES_BINDING,
+                resource: whole(slots),
             },
             wgpu::BindGroupEntry {
-                binding: 2,
-                resource: span(params),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: span(offs),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &heap.slab().buffer,
-                    offset: heap_at,
-                    size: std::num::NonZeroU64::new(heap_bytes),
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: CFG_BINDING,
-                resource: span(cfg),
+                binding: HEAP_BINDING,
+                resource: whole(heap),
             },
             wgpu::BindGroupEntry {
                 binding: STEP_BINDING,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &args.buffer().slab().buffer,
-                    offset: args.offset(),
+                    buffer: &slots.slab().buffer,
+                    offset: 0,
                     size: std::num::NonZeroU64::new(u64::from(
                         eta_compiler::codegen::wgsl::STEP_BYTES,
                     )),
@@ -987,9 +1004,8 @@ fn group(
     Ok(group)
 }
 
-/// Where a stage's heap (`heap`: its side, first byte and bytes) lies in
-/// `places` (the instance's state, its pair's): the segment buffer, its
-/// first byte there and its bytes.
+/// Stage heap `(side, at, bytes)`: the segment buffer it lies in, its first
+/// byte there and its bytes.
 fn heap_span(
     [instance, pair]: [&Pair; 2],
     (side, at, bytes): (Side, u64, u64),
@@ -1008,16 +1024,13 @@ fn heap_span(
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
-    core: &Arc<Core>,
     library: &Library,
-    status: &Held,
     resolved: StageTables,
     tables: [Held; 4],
     lowered: &engine_gpu::guest::Lowered,
     args: Held,
     stride: u64,
     heap: (Side, u64, u64),
-    span: (&Buffer, u64, u64),
 ) -> Result<Stage> {
     let StageTables {
         descriptors,
@@ -1029,12 +1042,11 @@ fn build_stage(
         .iter()
         .map(|step| library.pipeline(step.call))
         .collect::<Result<Vec<_>>>()?;
-    let group = group(core, &library.binds, status, &tables, span, &args)?;
 
     Ok(Stage {
-        group,
         steps,
         args,
+        lowered: lowered.steps.clone(),
         stride,
         groups: if lowered.strides_the_grid {
             groups_for(&descriptors, device.cores())
@@ -1231,16 +1243,21 @@ mod tests {
         assert!(read_status(status(0x3f33_3333, 0)).is_err());
         assert!(read_status(status(151_936, 0)).is_err());
     }
-    /// A guest's write past its heap, run on the device: an `op_copy` into a
-    /// value whose offset lies at its heap's end. The runtime refuses every
-    /// store (the heap is bound at its exact span, beside words it must not
-    /// reach), and the first fault's status reads Fault, OUT_OF_BOUNDS, the
-    /// index and the limit.
+    /// Two instances in one segment, run on the device: their tables,
+    /// status words and step records, and their heaps side by side, as one
+    /// group binds them (the segment whole, each instance at the bases its
+    /// step's record states). Instance A copies into a value whose offset
+    /// lies at its heap's end, on the first words of B's heap; B copies
+    /// inside its own. A's every store past its heap is refused and its
+    /// status reads Fault, OUT_OF_BOUNDS, the index and the limit; B runs
+    /// clean, its heap holds only its own copy, and its tables, status and
+    /// records are byte-identical to before.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_guest_write_past_its_heap_faults_out_of_bounds_and_lands_nowhere() {
-        use super::{Library, STEP_BINDING};
+    fn a_guest_write_past_its_heap_faults_and_leaves_its_neighbour_byte_identical() {
+        use super::Library;
         use crate::device::{Buffer, Context, present};
+        use eta_compiler::codegen::steps::{Bases, StepUniform};
         if !present() {
             return;
         }
@@ -1248,7 +1265,16 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&crate::api::DeviceBoot::default(), allowance).unwrap();
-        let library = Library::build(&device, 4096, 1).unwrap();
+        let owner = engine_gpu::books::owners::TEST;
+        let outbox = Buffer::with(
+            &device,
+            4096,
+            crate::device::alloc::Memory::Readback,
+            engine_gpu::books::owners::GUEST,
+        )
+        .unwrap();
+        let mut segment = Buffer::zeroed(&device, 8192, owner).unwrap();
+        let library = Library::build(&device, vec![outbox], &[&segment]).unwrap();
         let call = eta_compiler::codegen::wgsl::step_calls()
             .iter()
             .position(|text| text.contains("op_copy("))
@@ -1257,98 +1283,107 @@ mod tests {
 
         let words =
             |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
-        let owner = engine_gpu::books::owners::TEST;
-        let buffer = |bytes: &[u8]| {
-            let mut buffer = Buffer::zeroed(&device, bytes.len() as u64, owner).unwrap();
-            buffer.write(0, bytes).unwrap();
-            buffer
-        };
-        // Two f32 values of four: `a` at the heap's start, `o` at its end.
+        // Two f32 values of four a stage, `a` at its heap's start and `o` at
+        // `o_at`: an instance's tables from `at`, its record at `at + 512`.
         const HEAP: u64 = 64;
         const SENTINEL: u32 = 0xdead_beef;
         let f32_tag =
             u32::from(eta_ir::types::to_wire(eta_ir::Dtype::F32).expect("f32 has a wire tag"));
         let desc = |len: u32| [len, 1, len, 1, f32_tag, len, 1, 1, 1];
-        let descs = buffer(&words(&[desc(4), desc(4)].concat()));
-        let mut op = [0u32; 16];
-        op[1] = 0; // a
-        op[4] = 1; // o
-        let params = buffer(&words(&op));
-        let offs = buffer(&words(&[0, u32::try_from(HEAP).unwrap()]));
         let heap_words = u32::try_from(HEAP / 4).unwrap();
-        let cfg = buffer(&words(&[2, 0, 1, 0, heap_words, 0, 0, 0]));
-        let mut heap_image: Vec<u32> = vec![0; 32];
-        heap_image[..4].copy_from_slice(&[
-            1.0f32.to_bits(),
-            2.0f32.to_bits(),
-            3.0f32.to_bits(),
-            4.0f32.to_bits(),
-        ]);
-        heap_image[16..].fill(SENTINEL);
-        let heap = buffer(&words(&heap_image));
-        let status = buffer(&[0u8; 16]);
-        let step = buffer(&[0u8; 256]);
+        let mut lay = |at: u64, o_at: u32, heap_at: u64| -> (Bases, u64) {
+            let mut op = [0u32; 16];
+            op[1] = 0; // a
+            op[4] = 1; // o
+            for (from, bytes) in [
+                (at, words(&[desc(4), desc(4)].concat())),
+                (at + 128, words(&op)),
+                (at + 256, words(&[0, o_at])),
+                (at + 320, words(&[2, 0, 1, 0, heap_words, 0, 0, 0])),
+            ] {
+                segment.write(from, &bytes).unwrap();
+            }
+            let word = |byte: u64| u32::try_from(byte / 4).unwrap();
+            let bases = Bases {
+                status: word(at + 384),
+                descs: word(at),
+                params: word(at + 128),
+                offs: word(at + 256),
+                cfg: word(at + 320),
+                heap: word(heap_at),
+            };
+            let record = StepUniform::default().bytes(bases);
+            segment.write(at + 512, &record).unwrap();
+            (bases, at + 512)
+        };
+        // A's `o` at its heap's end, on B's first words; B's inside its own.
+        let (_, a_record) = lay(0, u32::try_from(HEAP).unwrap(), 4096);
+        let (_, b_record) = lay(1024, 16, 4096 + HEAP);
+        let values = |x: f32| [x, x + 1.0, x + 2.0, x + 3.0].map(f32::to_bits);
+        let mut heaps = vec![SENTINEL; 2 * HEAP as usize / 4 + 16];
+        heaps[..4].copy_from_slice(&values(1.0));
+        heaps[16..20].copy_from_slice(&values(5.0));
+        segment.write(4096, &words(&heaps)).unwrap();
 
-        fn whole(buffer: &Buffer, size: u64) -> wgpu::BindingResource<'_> {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &buffer.slab().buffer,
-                offset: 0,
-                size: std::num::NonZeroU64::new(size),
-            })
-        }
-        let entry = |binding: u32, resource| wgpu::BindGroupEntry { binding, resource };
-        let group = device
-            .core()
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("pie guest bounds test"),
-                layout: &library.binds,
-                entries: &[
-                    entry(0, whole(&status, 16)),
-                    entry(1, whole(&descs, descs.bytes())),
-                    entry(2, whole(&params, params.bytes())),
-                    entry(3, whole(&offs, offs.bytes())),
-                    // The heap at its exact span, the sentinel words past it.
-                    entry(4, whole(&heap, HEAP)),
-                    entry(5, whole(&cfg, cfg.bytes())),
-                    entry(
-                        STEP_BINDING,
-                        whole(&step, u64::from(eta_compiler::codegen::wgsl::STEP_BYTES)),
-                    ),
-                ],
-            });
-        device.core().take_error("create_bind_group").unwrap();
-        let frame = device.frame().unwrap();
-        frame
-            .dispatch_at("bounds test", &pipeline, &group, &[0], [1, 1, 1])
-            .unwrap();
-        frame.commit().unwrap();
-
-        let read = |buffer: &Buffer, n: usize| -> Vec<u32> {
+        let read = |at: u64, n: usize| -> Vec<u32> {
             let mut bytes = vec![0u8; n * 4];
-            buffer.read(0, &mut bytes).unwrap();
+            segment.read(at, &mut bytes).unwrap();
             bytes
                 .chunks_exact(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect()
         };
-        let status = read(&status, 4);
-        assert_eq!(status[0], 3, "the stage faulted: {status:x?}");
+        let b_before = read(1024, 256);
+        let group = library.group(&segment, &segment).unwrap();
+        let frame = device.frame().unwrap();
+        for record in [a_record, b_record] {
+            frame
+                .dispatch_at(
+                    "neighbours test",
+                    &pipeline,
+                    group,
+                    &[u32::try_from(record).unwrap()],
+                    [1, 1, 1],
+                )
+                .unwrap();
+        }
+        frame.commit().unwrap();
+
+        let a_status = read(384, 4);
+        assert_eq!(a_status[0], 3, "A faulted: {a_status:x?}");
         assert_eq!(
-            status[1],
+            a_status[1],
             eta_compiler::codegen::fault::OUT_OF_BOUNDS,
-            "{status:x?}"
+            "{a_status:x?}"
         );
         assert!(
-            (heap_words..heap_words + 4).contains(&status[2]),
-            "the index of a refused store of `o`: {status:x?}"
+            (heap_words..heap_words + 4).contains(&a_status[2]),
+            "the index of a refused store of A's `o`: {a_status:x?}"
         );
-        assert_eq!(status[3], heap_words, "the limit: {status:x?}");
-        let heap = read(&heap, 32);
+        assert_eq!(a_status[3], heap_words, "A's limit: {a_status:x?}");
+        assert_eq!(
+            read(1024, 256),
+            b_before,
+            "B's tables, status and record stand"
+        );
+        let heaps = read(4096, 2 * HEAP as usize / 4);
+        assert_eq!(heaps[..4], values(1.0), "A's `a` stands: {heaps:x?}");
+        assert_eq!(
+            heaps[16..20],
+            values(5.0),
+            "B's `a` stands, A wrote none of it: {heaps:x?}"
+        );
+        assert_eq!(
+            heaps[20..24],
+            values(5.0),
+            "B's copy landed in its own heap: {heaps:x?}"
+        );
         assert!(
-            heap[16..].iter().all(|&w| w == SENTINEL),
-            "nothing past the heap: {heap:x?}"
+            heaps[4..16]
+                .iter()
+                .chain(&heaps[24..])
+                .all(|&w| w == SENTINEL),
+            "nothing else written: {heaps:x?}"
         );
-        assert_eq!(heap[0], 1.0f32.to_bits(), "`a` stands: {heap:x?}");
     }
 }

@@ -685,9 +685,25 @@ median of 5, two rounds):
 | qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
 | gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
 
-About 100 µs is the folded products on the turned kernel. The other ~70 µs is not yet
-ablated: attention, the qkv/rope kernel, the m = 4 lm head, and the host side (four lanes'
-sampling and channel work).
+The other kernels, ablated the same way (one extra launch of each, Δ step µs at g1 → g4):
+
+| kernel | g1 | g4 | 4-row extra |
+|---|---|---|---|
+| attention decode (`paged_decode_mfma`) | +204 | +202 | 0 |
+| `merge_partials` | +125 | +128 | 0 |
+| qkv / rope / KV write | +137 | +162 | +25 |
+| lm head (one call a step) | +71 | +81 | +10 |
+
+The ledger: gated turned gate-up +67, folded qkv on turn +30, qkv/rope +25, lm head +10,
+down +6. o-proj, attention and merge add nothing. That is ≈138 µs; the remaining ~30 is
+host / channel / sampling work, not kernel-ablated.
+
+The routes are already the faster ones here. Gate-up on the folded skinny kernel instead of
+turn costs 4-parallel +20 µs (1.497 vs 1.476 ms); o-proj on turn costs +28 (F39). The gated
+turned product's cost is its own: 9.0 µs a call against skinny's 6.6 at m = 1, about
+1.4 TB/s against 1.9. More tiles a block (one norm stage walking them) does not help: two a
+block 1.488 ms (the same), three 1.524, four 1.573. A 16 + 16-column gated tile is the same
+work a block as two tiles, so it is not expected to help either.
 
 Tried, none kept (4-parallel ms a step, against 1.475–1.484):
 - skinny at m = 4: staging the activation four loads at a time (worse); reading it from
@@ -704,8 +720,34 @@ Instruments, ranked by fidelity, for a kernel's cost in a decode step:
 - stream-timed microbenchmarks (dispatch-capped near 5 µs).
 
 Next:
-- gated turned product at m = 4 (9.0 vs 6.6 µs at m = 1 on skinny): an exact device-duration
-  breakdown (the norm stage per block × 384 blocks, the gated epilogue, residency);
-- ablate the remaining ~70 µs the same way;
+- gated turned product at m = 4: why its walk streams at 1.4 TB/s (latency per tile under
+  one wave a SIMD), with the PMC counters inside a duplication run rather than the attach
+  trace;
+- the ~30 µs host / channel / sampling share at four lanes;
 - the duplication switch is a scratch patch: a profile probe that times a kernel in place
   (in a captured body) would make it a standing instrument.
+
+## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
+
+`runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
+(Windows on Arm, NVIDIA driver) in about half its runs, on wgpu-Vulkan and on native Vulkan,
+on memory-redesign (04df99f24) as on the branches after it. It passes on Linux (RTX PRO 4500).
+One fire stalls 100 to 600 ms; the lane fires once inside the compile window instead of
+~100 times. Measured in-process (no nsys on the Spark):
+
+- The time is inside the submit: wgpu's `queue.submit`, or the native submit. The fire's
+  settle (its fence wait) is ~1.5 ms.
+- It is not the compile and not a lock in pie. `program::adopt` is host-only and
+  single-threaded, ~46 ms, and the stall outlasts it by up to 470 ms. With the off-lane thread
+  replaced by a pure spin, a spin that yields every millisecond, or a thread that only
+  sleeps, the stall still shows (1 of 3, 3 of 5, 3 of 5 runs).
+- It is not native Vulkan's pipeline-cache write either. In the test the cache has no file,
+  so `PipelineCache::persist` never reads the driver's data, and a run still stalled 601 ms.
+- It lands on one submit early in the engine's life. Three or more fires between building
+  the registration and the compile window avoid it in every variant run (16 of 16), and the
+  fires after the stalled one take ~1 ms.
+
+Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, landing on
+whichever submit is in flight; the test catches it when that submit overlaps the compile.
+The test stays strict, known on this device. Owed: driver-level tracing on that box (not
+nsys, which bluescreens it), or a driver update that moves it.
