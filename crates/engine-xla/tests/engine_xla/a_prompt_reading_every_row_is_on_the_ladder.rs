@@ -29,6 +29,23 @@ fn a_prompt_reading_every_row_is_on_the_ladder() {
     let lane = logprobs(&mut model, &mut refs, 0, 12);
     let read = model.fire(vec![lane]);
     assert_eq!(read[0].len(), 12 * vocab as usize, "a row a prompt row");
+    // Its last row is the row a plain fire of the same prompt reads out
+    // (contract A: the argmax, or a near-tie of the plain row's two best).
+    let mut seq = Seq::new(4);
+    let plain = seq.lane(&model, &mut refs, tokens(1, 12, vocab));
+    let want = model.fire(vec![plain]).remove(0);
+    let got = &read[0][11 * vocab as usize..];
+    let argmax = |row: &[f32]| {
+        (row.iter().enumerate())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(at, _)| at)
+    };
+    let (a, b) = (argmax(&want), argmax(got));
+    let scale = want.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1.0);
+    assert!(
+        a == b || (want[a] - want[b]).abs() <= 2e-2 * scale,
+        "the every-row lane's last row answers {b} and the plain fire's {a}"
+    );
     // Beside two decodes.
     let mut decodes = Vec::new();
     for slot in [1u32, 2] {
