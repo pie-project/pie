@@ -361,7 +361,7 @@ pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
 wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
 boundary), not host time.
 
-## F32. A split ROCm decode folding its own partials: no gain, dropped
+## F32. ROCm last-block (ticket) fusions: the split decode's fold and the norm epilogues, measured and dropped
 
 Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
 matrix-core decode (`kernels-rocm attn/paged.hip` `paged_decode_mfma`) folds
@@ -390,3 +390,15 @@ their place past the seat. Staged with the table each fire; a kernel
 argument would be baked into a captured body. The bucket's
 `Shape::lane_offset` is not the seat's (`Live::lane_offset`): counting the
 rows from it diverged 12-24% of beams.
+
+The same ticket tail does not pay for the residual + norm epilogues of the
+o-proj and down GEMMs either (56 nodes a step), measured before building:
+a hipcc microbench of 28 layers of a 1-row GEMV (N 1024, K 2048 / 3072,
+eight rows a block) then `residual_add_rmsnorm` as its own launch, against
+the GEMV whose last block to land (sc1 partials, a relaxed atomic ticket)
+adds the residual and norms the row: 7.0 -> 9.1-9.6 us a layer at K 2048,
+8.4 -> 10.2-10.7 at K 3072 (the block sums as one float atomic or as sc1
+partials summed by the last block). On MI300X a ticket tail (stores through
+the L2, the atomic's round trip, reads past the L2) costs more than the
+~1.6 us node it removes. Fusions that cut nodes there want one block to own
+the whole row (no tail), not a last-block reduction.
