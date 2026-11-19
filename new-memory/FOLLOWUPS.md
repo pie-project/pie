@@ -294,3 +294,111 @@ a device test that a park of guest state an owed epilogue is still writing
 waits for it, and one with none owed does not. Gate: 0 divergences on the
 200 + 300 load at depths 1 / 2 / 4, eviction copy phase and load walls
 against the landing hash.
+
+## F27. The ROCm audit items, measured on MI300X (gfx942)
+
+From the serialization audit's six ROCm items (5355faa9a), each measured
+before any change, on memory-redesign 5963ceb17 / c1188a53d:
+
+1. **lm head over padded rows below 129** (`kernels-rocm linear/gemm.rs:142`
+   `lm_head_live`, `engine-cuda profiles/gfx94.toml:45` `gemm.live_from =
+   129`): no change. Activation rungs are powers of two, so a body's live
+   rows are always more than half its rung. Qwen-7B-shaped head (151936 ×
+   3584): from half to full live, the live route is 0–55 µs slower than the
+   padded product at 32–128 rows (e.g. 64 rows: 351–365 µs padded,
+   374–385 µs live); it wins (up to ~115 µs) only at ≤ ¼ live, which a
+   power-of-two rung never leaves. 129 stands.
+2. **Only gfx94 is tuned** (`engine-cuda chip.rs:217`): MI200 (gfx90a) and
+   gfx950 boot on the defaults (`gemm.live_from` 0, the turned GEMM off,
+   `gemm.turn_from` / `turn_until` unset). Not measurable here (gfx942
+   only); needs a tune on each chip.
+3. **HIP graphs have no conditional node** (`engine-cuda chip.rs:155`,
+   `window.rs:1194`): the per-node fixed cost is real but not the
+   conditionals'. A graph node replays at ~1.55–1.6 µs even when empty
+   (hipcc microbench: 367 empty kernel nodes replay in 567–594 µs). The
+   1-lane decode body `b1[c1:1]` has 367 nodes and replays at 1756 µs a fire
+   (`arm-bench`), the served greedy step's 1.76 ms: ~0.57 ms (a third) is
+   the node floor. A conditional skips no node there: bodies are keyed by
+   the classes present (`record.rs` `Ladder`), so a single-class body holds
+   none to skip. The lever is fewer nodes a step (fusions, one launch for
+   what is now several), not conditionals; gate on `arm-bench` µs/fire and
+   the greedy wall.
+4. **Staging over 1 MiB falls back to a pageable `hipMemcpyAsync`**
+   (`engine-cuda device/hip/held.rs:17`, `:20` `RING_SLOT_BYTES`): never
+   reached; an instrumented build counted 0 such copies on c64 and on the
+   200 + 300 beam load. No change.
+5. **One block per argmax row** (`kernels-rocm sampling/topk.rs:15`): bf16
+   at 151936 columns, 7.5 µs at 1 row, 7.8 at 8, 8.4 at 64, 21.7 at 256
+   (3.6 TB/s); f32 8.9–40 µs. A split-row argmax might save ~4–5 µs a step,
+   ≤ 0.3% of a 1-lane greedy step. Not worth a kernel today.
+6. **`kernels_rocm::tally::declined()` had no caller**: fixed
+   (sc/amd-rocm-declined c6fbc79af): counted where `hip/lt.rs:387`
+   answers `Ok(false)` (rocBLAS takes the product). No shape declines on c64
+   or the beam load.
+
+## F28. wgpu has no safe GPU time per serving frame: a span-only frame timestamp mode
+
+wgpu's only GPU clock is `encode::profile_timing` (`engine-wgpu
+encode.rs:260`, `:531`), which gives every kernel its own timestamped compute
+pass and opens a 4096-query plane a frame (`device/ctx.rs:65`, `:837`
+`timestamp_slot`). The planes are read only in `Pending::wait`
+(`ctx.rs:1089` → `:738` `Inner::harvest`), and a serving frame lands
+asynchronously and is never waited, so nothing is harvested while serving.
+Turned on in a served Qwen3-0.6B on the Adreno 840, it read 0 ns for every
+kernel (452 kernels a step). At 8 lanes, submit reached 611 ms a step, the
+engine stalled for 70 s, and the phone rebooted. It stays a tune/check tool.
+
+What serving needs instead: one begin/end timestamp a frame
+(`write_timestamp` at the encoder's start and in `Frame::submit`,
+`ctx.rs:966`). The pair is resolved into a small ring and harvested from the
+landing callback (`on_submitted_work_done`), not from a wait, and adds no
+pass boundaries. That gives F25 a measured GPU term. Until then, the per-fire
+host split (encode, finish+submit, every `block_on_poll` by label) is the
+measure. At 1 lane on the Adreno 840 it reads ~27 ms a step: ~4.5 ms of host
+work (encode 1.6, finish+submit 2.0, the guest readback 0.75, 15 queue
+writes) in series with ~23 ms parked at the guest gate (GPU plus the guest
+pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
+wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
+boundary), not host time.
+
+## F32. ROCm last-block (ticket) fusions: the split decode's fold and the norm epilogues, measured and dropped
+
+Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
+matrix-core decode (`kernels-rocm attn/paged.hip` `paged_decode_mfma`) folds
+its split itself instead of a second launch (`merge_partials`). Each work
+item draws its request's ticket for its kv head (`Ctx::tickets`) once its
+partial rows land past the L2 (sc1 stores, `s_waitcnt vmcnt(0)`, a relaxed
+atomic, as `linear/fp8.hip`'s split tiles), and the last to land folds the
+head group's rows (sc1 loads) and puts the ticket back to zero. An
+agent-scope fence in every block instead cost more than the node (greedy
++9%).
+
+Correct (beam gate 0 / 800 over the landing fix; attn_paged 9 / 9 with a
+seat past its bucket's first lane), but no faster on MI300X, Qwen3-0.6B:
+the 1-lane decode body 255 -> 227 nodes, `arm-bench` b1[c1:1] 1459 / 1484
+us a fire against the tip's 1476 / 1481, greedy 2.3 / 2.3 s and c64
+10.5 / 10.3 s on both (B-A-A-B). The serial tail spends what the 28 nodes
+saved (~45 us a step): one block per kv head folds all of its chunks after
+the rest finish, where `merge_partials` spreads rows x heads over the
+device. Folding the group's heads in parallel across waves might reach
+1-2% at best.
+
+The seat's first lane is read from the first work item
+(`request_indices[0]`; `sched_decode.rs` builds the table, every request
+taking one): a work item names its request by its lane, the split's rows by
+their place past the seat. Staged with the table each fire; a kernel
+argument would be baked into a captured body. The bucket's
+`Shape::lane_offset` is not the seat's (`Live::lane_offset`): counting the
+rows from it diverged 12-24% of beams.
+
+The same ticket tail does not pay for the residual + norm epilogues of the
+o-proj and down GEMMs either (56 nodes a step), measured before building:
+a hipcc microbench of 28 layers of a 1-row GEMV (N 1024, K 2048 / 3072,
+eight rows a block) then `residual_add_rmsnorm` as its own launch, against
+the GEMV whose last block to land (sc1 partials, a relaxed atomic ticket)
+adds the residual and norms the row: 7.0 -> 9.1-9.6 us a layer at K 2048,
+8.4 -> 10.2-10.7 at K 3072 (the block sums as one float atomic or as sc1
+partials summed by the last block). On MI300X a ticket tail (stores through
+the L2, the atomic's round trip, reads past the L2) costs more than the
+~1.6 us node it removes. Fusions that cut nodes there want one block to own
+the whole row (no tail), not a last-block reduction.

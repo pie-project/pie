@@ -265,6 +265,8 @@ impl Engine for Spatial {
             facts: facts.trace().facts.clone(),
             inputs: facts.input_decls(),
             classes: facts.classes(),
+            // Cerebras states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
         };
         self.facts = Some(facts);
         self.caps = Some(caps.clone());

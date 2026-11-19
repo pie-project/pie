@@ -27,6 +27,24 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The boot every suite load takes: the backend's default with a profiles
+/// directory, so a load reads the device's measured `[rates]` (and keeps
+/// what it measures) instead of the checked-in profiles alone, which leave
+/// an unprofiled device (a phone's GPU) with no roofline rates. The
+/// directory is `$PIE_HOME/profiles` where `PIE_HOME` is set, as `pie`'s
+/// own loads use, and otherwise one directory per backend in the temp dir,
+/// shared by every test of the run.
+pub fn device_boot() -> DeviceBoot {
+    let profiles = std::env::var_os("PIE_HOME").map_or_else(
+        || std::env::temp_dir().join(format!("pie-{}-profiles", crate::backend::NAME)),
+        |home| std::path::PathBuf::from(home).join("profiles"),
+    );
+    DeviceBoot {
+        profiles: Some(profiles),
+        ..DeviceBoot::default()
+    }
+}
+
 pub struct Gpu {
     pub device: Context,
     handles: Handles,
@@ -36,7 +54,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn open() -> Option<Gpu> {
-        let device = Context::bind(&DeviceBoot::default(), ALLOWANCE).ok()?;
+        let device = Context::bind(&device_boot(), ALLOWANCE).ok()?;
         Some(Gpu {
             device,
             handles: Handles::new(),

@@ -853,6 +853,17 @@ where
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // The platform's stated bound on one submission (KGSL's on
+            // Android, none elsewhere) and the rates this load measured.
+            guest_cost: {
+                let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
+                engine::GuestCost {
+                    submit_bound_ns: crate::rates::STATED_SUBMIT_BOUND
+                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    launch_ns: rates.launch_ns,
+                    elementwise_gbps: rates.elementwise_gbps,
+                }
+            },
         };
 
         self.shell = Some(shell);

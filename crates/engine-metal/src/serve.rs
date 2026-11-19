@@ -3783,6 +3783,17 @@ impl Shell {
                     .map(|seated| seated.lane.tokens.len() as u32)
                     .collect();
                 let carried = envelope.lanes();
+                // Its ports describe its own lanes only: past them they
+                // would set another request's positions and kv slots.
+                let owned = attached.lanes.max(1) as usize;
+                if carried > owned {
+                    return Err(Fault::GeometryLanes {
+                        lane: attached.lane,
+                        instance: attached.instance.0,
+                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
+                        owned: owned as u32,
+                    });
+                }
                 if first + carried > lanes.len() {
                     return Err(Fault::program(
                         "serve::prepare",
@@ -4568,12 +4579,11 @@ impl Shell {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
-            self.drain()?;
-        }
-        for record in beginning.iter().filter(|_| !self.warming) {
-            self.pools.clear(record)?;
-        }
+        // A fresh record is zeroed by the fire that first reads it, at the
+        // head of its own command buffer (`walk`): in queue order behind the
+        // frames before it. Zeroed on the host, it drained every frame in
+        // flight first, and each hybrid / SSM admission ran at depth 1.
+        let zeroed: Vec<Vec<u32>> = if self.warming { Vec::new() } else { beginning };
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
         let slot_of_row: Vec<i32> = row_bands.concat();
@@ -5183,6 +5193,7 @@ impl Shell {
         };
 
         Ok(Prepared {
+            zeroed,
             capture_rows,
             ends,
             lanes,
@@ -5510,6 +5521,13 @@ impl Shell {
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
         }
+        if !dry && !p.zeroed.is_empty() {
+            for record in &p.zeroed {
+                self.pools.clear_into(&mut frame, record)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         self.feed_inputs(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         {
@@ -5657,6 +5675,9 @@ pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 pub struct Prepared<'a> {
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
+    /// The fresh state records its lanes begin, zeroed at the head of its
+    /// command buffer.
+    zeroed: Vec<Vec<u32>>,
     /// What the fire reports where it settles: each port-placed reporting
     /// lane's written end.
     ends: Vec<engine::KvWrites>,

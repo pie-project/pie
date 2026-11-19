@@ -38,6 +38,131 @@ pub struct BoundTrace {
     pub stage_types: Vec<Vec<ValueType>>,
     pub readiness: Vec<ReadinessEntry>,
     pub classes: Vec<ChannelClass>,
+    /// What the bind held the program to ([`bind_within`]); `None` for a
+    /// [`bind`] that states none (an engine's own rebind of a program the
+    /// runtime already held to it, or a test's), which nothing evaluates on
+    /// the host.
+    pub budget: Option<Budget>,
+}
+
+/// What a bind may take of the device and load serving it
+/// ([`bind_within`]), derived from what they state: nothing here is
+/// picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Budget {
+    /// The bytes one instance's state room holds on the device serving the
+    /// program: its pool's state chunks less what the engine holds back of
+    /// them. A stage's values are laid in that room on the device, and the
+    /// host's evaluation of a stage (`eta_compiler::eval::pareval`) holds
+    /// every value of it at once: a stage whose values together pass it
+    /// can bind nowhere, and is refused at its registration.
+    pub room_bytes: u64,
+    /// The device's stated bound on one submission and the rates its load
+    /// measured, where it states one: a stage the rates cost past the bound
+    /// would run long enough for the driver to fault the submission, and
+    /// every tenant's fire in it, so it is refused at its registration.
+    /// `None` where the device states no bound.
+    pub submit: Option<SubmitBound>,
+}
+
+/// What a guest stage's time is held to ([`Budget::submit`]): the device's
+/// stated bound and the rates the load measured, none of it picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubmitBound {
+    /// The device's stated bound on one submission, ns.
+    pub bound_ns: u64,
+    /// What the load measured one launch takes, ns.
+    pub launch_ns: f64,
+    /// What the load measured an elementwise pass moves, bytes a ns.
+    pub elementwise_bytes_per_ns: f64,
+}
+
+impl SubmitBound {
+    /// What a stage of `launches` launches touching `work` bytes takes at
+    /// these rates, ns ([`StageFootprint`]): its launches' fixed cost and
+    /// its bytes at the elementwise rate.
+    #[must_use]
+    pub fn cost_ns(&self, launches: u64, work: u64) -> f64 {
+        launches as f64 * self.launch_ns + work as f64 / self.elementwise_bytes_per_ns
+    }
+}
+
+/// What one stage of a program takes as it declares itself: the bytes of
+/// every value it defines, as the host's evaluation holds them all at
+/// once; and what it does on a device, the launches its ops take and the
+/// bytes they touch ([`op_work`]), which a device's rates cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageFootprint {
+    pub stage: Stage,
+    pub bytes: u64,
+    pub launches: u64,
+    pub work: u64,
+}
+
+/// Whether `op` takes a launch of its own on a device that steps a stage
+/// op by op (the closed set's steps, which the engines stating a submit
+/// bound run): every op but a channel's or an output's read, a constant
+/// and a reshape, which the host stages or aliases.
+fn launches(op: &Op) -> bool {
+    !matches!(
+        op,
+        Op::ChanTake(_)
+            | Op::ChanRead(_)
+            | Op::ChanPut { .. }
+            | Op::Output { .. }
+            | Op::Const(_)
+            | Op::Reshape { .. }
+            | Op::SinkCall { .. }
+    )
+}
+
+/// The bytes `op` touches as the closed set's steps run it (the WGSL/SPIR-V
+/// runtime of the engines stating a submit bound), its operands of `types`
+/// and its results `results`: each operand read and each result written
+/// once, but for the ops whose steps loop past that: a matmul reads a row
+/// and a column for every result (`m·k·n`), a scatter visits every index
+/// for every result element (`n × slots`), and a sort passes its row
+/// `⌈log2 width⌉` times. Saturates at `u64::MAX`, which costs past any
+/// bound.
+#[must_use]
+pub fn op_work(op: &Op, types: &[ValueType], results: &[ValueType]) -> u64 {
+    let bytes = |ty: &ValueType| {
+        ty.shape
+            .numel()
+            .saturating_mul(super::container::const_elem_size(ty.dtype) as u64)
+    };
+    let of = |id: u32| types.get(id as usize).copied();
+    let linear = op
+        .operands()
+        .into_iter()
+        .filter_map(of)
+        .chain(results.iter().copied())
+        .map(|ty| bytes(&ty))
+        .fold(0u64, u64::saturating_add);
+    match *op {
+        Op::MatMul(a, b) => match (of(a), of(b)) {
+            (Some(a), Some(b)) => {
+                let k = a.shape.last_len().unwrap_or(1) as u64;
+                let elem = super::container::const_elem_size(a.dtype) as u64;
+                let mn = a.shape.rows().saturating_mul(b.shape.last_len().unwrap_or(1) as u64);
+                mn.saturating_mul(k).saturating_mul(elem).max(linear)
+            }
+            _ => linear,
+        },
+        Op::ScatterAdd { idx, .. } | Op::ScatterSet { idx, .. } => {
+            let slots = of(idx).map_or(1, |ty| ty.shape.numel());
+            results
+                .iter()
+                .map(|ty| bytes(ty).saturating_mul(slots))
+                .fold(linear, u64::saturating_add)
+        }
+        Op::SortDesc(x) => {
+            let width = of(x).and_then(|ty| ty.shape.last_len()).unwrap_or(1).max(2);
+            let passes = u64::from(u32::BITS - (width - 1).leading_zeros());
+            linear.saturating_mul(passes)
+        }
+        _ => linear,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +238,24 @@ pub enum ValidateError {
     ExternDirViolation {
         chan: u32,
         stage: Stage,
+    },
+    /// A stage's values take more bytes than an instance's state room
+    /// holds ([`Budget::room_bytes`]).
+    StagePastRoom {
+        stage: Stage,
+        bytes: u64,
+        room: u64,
+    },
+    /// A stage's values' bytes pass a u64.
+    StageBytesOverflow {
+        stage: Stage,
+    },
+    /// A stage the device's measured rates cost past its stated bound on
+    /// one submission ([`Budget::submit`]).
+    StagePastSubmit {
+        stage: Stage,
+        cost_ns: u64,
+        bound_ns: u64,
     },
 }
 
@@ -202,6 +345,28 @@ impl fmt::Display for ValidateError {
                  (import ⇒ consume-only, export ⇒ produce-only — SPSC across the pair)",
                 stage.name()
             ),
+            StagePastRoom { stage, bytes, room } => write!(
+                f,
+                "stage {}: its values take {bytes} bytes and an instance's state room \
+                 on the device serving this model holds {room}; it can bind nowhere",
+                stage.name()
+            ),
+            StagePastSubmit {
+                stage,
+                cost_ns,
+                bound_ns,
+            } => write!(
+                f,
+                "stage {}: the rates this device's load measured cost it at least \
+                 {cost_ns} ns, past the {bound_ns} ns the device states one submission \
+                 may take; its fire would fault every tenant's",
+                stage.name()
+            ),
+            StageBytesOverflow { stage } => write!(
+                f,
+                "stage {}: its values' bytes pass a u64",
+                stage.name()
+            ),
         }
     }
 }
@@ -262,7 +427,88 @@ pub fn bind(
         stage_types,
         readiness,
         classes,
+        budget: None,
     })
+}
+
+/// [`bind`], then every stage held to `budget` ([`check_budget`]): what a
+/// registration binds, refused by name past it.
+pub fn bind_within(
+    container: TraceContainer,
+    lanes: Vec<Vec<OutputDecl>>,
+    caps: EngineCaps,
+    budget: Budget,
+) -> Result<BoundTrace, ValidateError> {
+    let mut bound = bind(container, lanes, caps)?;
+    check_budget(&bound, budget)?;
+    bound.budget = Some(budget);
+    Ok(bound)
+}
+
+/// The bytes the values `types` take, each its elements times its
+/// dtype's; `None` past a u64.
+#[must_use]
+pub fn values_bytes(types: &[ValueType]) -> Option<u64> {
+    types.iter().try_fold(0u64, |sum, ty| {
+        let elem = super::container::const_elem_size(ty.dtype) as u64;
+        sum.checked_add(ty.shape.numel().checked_mul(elem)?)
+    })
+}
+
+/// Every stage's footprint ([`StageFootprint`]) as `bound` declares it.
+pub fn footprints(bound: &BoundTrace) -> Result<Vec<StageFootprint>, ValidateError> {
+    bound
+        .container
+        .stages
+        .iter()
+        .zip(&bound.stage_types)
+        .map(|(program, types)| {
+            let stage = program.stage;
+            let bytes = values_bytes(types).ok_or(ValidateError::StageBytesOverflow { stage })?;
+            let (mut launched, mut work, mut next) = (0u64, 0u64, 0usize);
+            for op in &program.ops {
+                let count = op.result_count() as usize;
+                let results = types.get(next..next + count).unwrap_or(&[]);
+                next += count;
+                if launches(op) {
+                    launched += 1;
+                    work = work.saturating_add(op_work(op, types, results));
+                }
+            }
+            Ok(StageFootprint {
+                stage,
+                bytes,
+                launches: launched,
+                work,
+            })
+        })
+        .collect()
+}
+
+/// Every stage of `bound` within `budget`: its values within an
+/// instance's state room, and where the device states a bound on one
+/// submission, its cost at the load's measured rates within it.
+pub fn check_budget(bound: &BoundTrace, budget: Budget) -> Result<(), ValidateError> {
+    for footprint in footprints(bound)? {
+        if footprint.bytes > budget.room_bytes {
+            return Err(ValidateError::StagePastRoom {
+                stage: footprint.stage,
+                bytes: footprint.bytes,
+                room: budget.room_bytes,
+            });
+        }
+        if let Some(submit) = budget.submit {
+            let cost = submit.cost_ns(footprint.launches, footprint.work);
+            if !(cost <= submit.bound_ns as f64) {
+                return Err(ValidateError::StagePastSubmit {
+                    stage: footprint.stage,
+                    cost_ns: if cost.is_finite() { cost as u64 } else { u64::MAX },
+                    bound_ns: submit.bound_ns,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn channel_decl(
