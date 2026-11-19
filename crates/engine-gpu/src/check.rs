@@ -52,6 +52,10 @@ pub struct Bench<B: Serve> {
     trace: Trace,
     contract: checkpoint::contract::ModelContract,
     device: B::DeviceBoot,
+    /// What the check's loads may take of the device (`[engine.memory]
+    /// budget_device`, `pie tune` reading the operator's config): an
+    /// adapter that reports no memory size (WebGPU) is refused without one.
+    allowance: engine::Allowance,
     probe: Probe,
 }
 
@@ -64,6 +68,7 @@ impl<B: Serve> Bench<B> {
         platform: Platform,
         contract_for: ContractFor,
         device: B::DeviceBoot,
+        allowance: engine::Allowance,
         probe: Probe,
     ) -> Result<Bench<B>, String> {
         let row = poem_compiler::catalog::deployment(deployment)
@@ -75,6 +80,7 @@ impl<B: Serve> Bench<B> {
             trace,
             contract,
             device,
+            allowance,
             probe,
         })
     }
@@ -111,7 +117,10 @@ impl<B: Serve> engine::load::check::Bench for Bench<B> {
             slots,
             runahead: engine::runahead::Runahead::F1,
             device: &self.device,
-            residency: engine::load::Residency::default(),
+            residency: engine::load::Residency {
+                device: self.allowance,
+                ..engine::load::Residency::default()
+            },
             handed: None,
             check: Some(rungs),
         })

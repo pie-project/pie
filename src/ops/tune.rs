@@ -61,7 +61,18 @@ pub struct TuneArgs {
     pub rates: bool,
 }
 
-pub fn run(args: TuneArgs) -> Result<Answer> {
+/// `[engine.memory] budget_device` of the operator's config at `path`, in
+/// bytes: none where the file states none or there is no file; a file that
+/// does not read is refused by name.
+fn budget_device(path: &std::path::Path) -> Result<Option<u64>> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let config = worker::config::Config::parse_file(&text, Some(path))?;
+    Ok(config.engine.memory.budget_device.map(|b| b.as_bytes()))
+}
+
+pub fn run(args: TuneArgs, global: &crate::args::GlobalArgs) -> Result<Answer> {
     let mut all = backends();
     let names: Vec<&str> = all.iter().map(|b| b.name).collect();
     let tunable: Vec<&str> = all
@@ -99,6 +110,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         check_estimate: args.check_estimate.is_some(),
         dissect: &args.dissect,
         rates: args.rates,
+        budget_device: budget_device(&crate::args::config_path_or(global, "config.toml").0)?,
         ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
     };
     // A check of the estimate is a test: it writes nothing.
@@ -217,4 +229,30 @@ fn write_profile(
         backend.name
     ));
     Ok(out)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::budget_device;
+
+    /// A tune reads the operator's `[engine.memory] budget_device` for its
+    /// check's loads; none where the config states none or there is none.
+    #[test]
+    fn a_tune_reads_the_configs_device_budget() {
+        let dir = std::env::temp_dir().join(format!("pie-tune-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let engine = "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n\
+                      [engine]\ntype = \"wgpu\"\ndevice = [\"wgpu:0\"]\n";
+        std::fs::write(
+            &path,
+            format!("{engine}[engine.memory]\nbudget_device = \"12GiB\"\n"),
+        )
+        .unwrap();
+        assert_eq!(budget_device(&path).unwrap(), Some(12 << 30));
+        std::fs::write(&path, engine).unwrap();
+        assert_eq!(budget_device(&path).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(budget_device(&dir.join("config.toml")).unwrap(), None);
+    }
 }

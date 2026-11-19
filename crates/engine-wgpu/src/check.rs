@@ -14,6 +14,7 @@ pub fn bench(
     artifact: &Path,
     deployment: &str,
     contract_for: engine_gpu::api::ContractFor,
+    allowance: engine::Allowance,
 ) -> Result<engine_gpu::check::Bench<Api>, String> {
     engine_gpu::check::Bench::new(
         artifact,
@@ -24,6 +25,7 @@ pub fn bench(
             profiles: Some(profiles.to_path_buf()),
             ..crate::api::DeviceBoot::default()
         },
+        allowance,
         engine_gpu::check::Probe {
             timing: crate::encode::profile_timing,
             reset: crate::encode::reset_kernel_profile,

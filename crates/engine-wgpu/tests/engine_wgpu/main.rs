@@ -88,3 +88,29 @@ mod runtime;
 mod sampling;
 #[path = "../../../engine-gpu/suite/ssm/mod.rs"]
 mod ssm;
+
+/// A load (a check's, `pie tune --check-estimate` passing the config's
+/// `[engine.memory] budget_device`) binds the adapter at the budget stated;
+/// one stating none takes what the adapter reports, or is refused by name
+/// where it reports nothing.
+#[test]
+fn a_load_binds_the_adapter_at_its_stated_budget_and_refuses_none() {
+    use engine_wgpu::api::DeviceBoot;
+    use engine_wgpu::device::Context;
+    let budget = 1u64 << 30;
+    let Ok(device) = Context::bind(
+        &DeviceBoot::default(),
+        engine::Allowance {
+            budget: Some(budget),
+        },
+    ) else {
+        return;
+    };
+    assert!(device.left() <= budget, "{} past the budget", device.left());
+    drop(device);
+    // No budget stated: the adapter's own reading where it reports one (a
+    // native backend), else a refusal naming the key (a browser's).
+    if let Err(refused) = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE) {
+        assert!(refused.to_string().contains("budget_device"), "{refused}");
+    }
+}

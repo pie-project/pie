@@ -65,6 +65,10 @@ pub struct TuneRequest<'a> {
     pub check_estimate: bool,
     /// With `check_estimate`: rung widths dissected beside the picks.
     pub dissect: &'a [u32],
+    /// `[engine.memory] budget_device` of the operator's config, in bytes:
+    /// what a check's loads may take of the device (an adapter reporting no
+    /// memory size, WebGPU's, is refused without it).
+    pub budget_device: Option<u64>,
     /// Run the `[rates]` step alone.
     pub rates: bool,
 }
@@ -88,6 +92,7 @@ impl<'a> TuneRequest<'a> {
             check_estimate: false,
             dissect: &[],
             rates: false,
+            budget_device: None,
         }
     }
 }
@@ -287,6 +292,9 @@ fn bench_vulkan<'a>(
         artifact,
         deployment,
         crate::engine::load::contract_for,
+        engine::Allowance {
+            budget: req.budget_device,
+        },
     )?;
     Ok(Box::new(bench))
 }
@@ -302,6 +310,9 @@ fn bench_wgpu<'a>(
         artifact,
         deployment,
         crate::engine::load::contract_for,
+        engine::Allowance {
+            budget: req.budget_device,
+        },
     )?;
     Ok(Box::new(bench))
 }

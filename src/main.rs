@@ -153,7 +153,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Profile { cmd } => {
             tokio::task::spawn_blocking(move || ops::profile::run(cmd)).await??
         }
-        Command::Tune(args) => tokio::task::spawn_blocking(move || ops::tune::run(args)).await??,
+        Command::Tune(args) => {
+            let global = cli.global.clone();
+            tokio::task::spawn_blocking(move || ops::tune::run(args, &global)).await??
+        }
     };
 
     let code = answer.code();
