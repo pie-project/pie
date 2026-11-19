@@ -166,6 +166,9 @@ Revised after GPU's note on CUDA's one arm.
   - decode c1 / c16 / c64 ABBA, busy and idle per frame, against the tip (M1 and M5);
   - text_completion outputs identical (temperature 0), including stops at EOS, at stop sequences and at
     max_tokens (the one-step-late stop is where it could go wrong);
+  - after each stop, no token past it reaches the client, and the process's committed KV length (and,
+    for a set that is forked or saved after it, its pages) equals the one at depth 1: N+1's row never
+    commits;
   - beam --verify clean;
   - the failed-buffer test extended to a pair in flight (N faults, so N+1 is abandoned, the instance
     recovers);
