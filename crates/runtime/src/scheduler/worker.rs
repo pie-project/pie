@@ -82,6 +82,12 @@ pub(crate) fn notify_owner_blocked(pid: ProcessId) {
     broadcast(|| SchedulerItem::OwnerWaits(pid));
 }
 
+/// `pid`'s wait on the planner or a store ended (told before control goes
+/// back to its guest): its fires are awaited at boundaries again.
+pub(crate) fn notify_owner_unblocked(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerUnblocked(pid));
+}
+
 /// The owners told blocked, in order; for a test.
 #[cfg(test)]
 pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
@@ -310,6 +316,8 @@ enum SchedulerItem {
     /// raise of the activation rung): its lanes go out of the frame
     /// ([`super::frame::FramePolicy::on_owner_waits`]).
     OwnerWaits(ProcessId),
+    /// The owner's wait on the planner or a store ended.
+    OwnerUnblocked(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -2071,6 +2079,9 @@ impl BatchScheduler {
             SchedulerItem::OwnerWaits(pid) => {
                 frame_policy.on_owner_waits(pid);
             }
+            SchedulerItem::OwnerUnblocked(pid) => {
+                frame_policy.on_owner_unblocked(pid);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
@@ -3044,6 +3055,11 @@ impl BatchScheduler {
                     },
             } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Bound: whatever wait its refusals marked it blocked for
+                // has ended.
+                if let Some(pid) = pipeline_id {
+                    frame_policy.on_owner_unblocked(pid);
+                }
                 if instances.contains_key(&bound.instance_id) {
                     tracing::error!(
                         instance_id = bound.instance_id.0,
