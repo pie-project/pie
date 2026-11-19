@@ -523,6 +523,11 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
+    // The stage's bounds, read once ([`RUNTIME`]'s `hld` / `hst`, `d_word`,
+    // `base`, `p_at`).
+    source.push_str(
+        "  lim_heap = cfg.heap_words;\n  lim_values = cfg.value_count;\n  lim_ops = cfg.op_count;\n",
+    );
     source.push_str(call);
     source.push_str("}\n");
 }

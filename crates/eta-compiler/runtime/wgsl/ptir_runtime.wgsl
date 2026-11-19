@@ -49,6 +49,12 @@ var<private> sel_group : u32;
 var<private> sel_groups : u32;
 
 
+// The stage's bounds (its cfg's heap words, values and ops), read once at
+// the step's entry: every access below is checked against them.
+var<private> lim_heap : u32;
+var<private> lim_values : u32;
+var<private> lim_ops : u32;
+
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
 fn pie_fault(code : u32, at : u32, limit : u32) {
@@ -61,19 +67,19 @@ fn pie_fault(code : u32, at : u32, limit : u32) {
 // The heap's words, each access refused past the stage's heap: a read
 // reads zero, a write writes nothing, and the stage faults.
 fn hld(w : u32) -> u32 {
-  if (w >= cfg.heap_words) { pie_fault(OUT_OF_BOUNDS, w, cfg.heap_words); return 0u; }
+  if (w >= lim_heap) { pie_fault(OUT_OF_BOUNDS, w, lim_heap); return 0u; }
   return heap[w];
 }
 
 fn hst(w : u32, x : u32) {
-  if (w >= cfg.heap_words) { pie_fault(OUT_OF_BOUNDS, w, cfg.heap_words); return; }
+  if (w >= lim_heap) { pie_fault(OUT_OF_BOUNDS, w, lim_heap); return; }
   heap[w] = x;
 }
 
 // A value's descriptor word `k`, refused past the stage's values.
 fn d_word(v : u32, k : u32) -> u32 {
-  if (v >= cfg.value_count || k >= DESC_WORDS) {
-    pie_fault(OUT_OF_BOUNDS, v * DESC_WORDS + k, cfg.value_count * DESC_WORDS);
+  if (v >= lim_values || k >= DESC_WORDS) {
+    pie_fault(OUT_OF_BOUNDS, v * DESC_WORDS + k, lim_values * DESC_WORDS);
     return 0u;
   }
   return descs[v * DESC_WORDS + k];
@@ -86,7 +92,7 @@ fn d_dtype(v : u32) -> u32 { return d_word(v, 4u); }
 fn d_dim(v : u32, k : u32) -> u32 { return d_word(v, 5u + k); }
 
 fn base(v : u32) -> u32 {
-  if (v >= cfg.value_count) { pie_fault(OUT_OF_BOUNDS, v, cfg.value_count); return 0u; }
+  if (v >= lim_values) { pie_fault(OUT_OF_BOUNDS, v, lim_values); return 0u; }
   return offs[v] >> 2u;
 }
 
@@ -100,8 +106,8 @@ fn rows_of(v : u32) -> u32 {
 
 
 fn p_at(p : u32, k : u32) -> u32 {
-  if (p >= cfg.op_count || k >= PARAM_WORDS) {
-    pie_fault(OUT_OF_BOUNDS, p * PARAM_WORDS + k, cfg.op_count * PARAM_WORDS);
+  if (p >= lim_ops || k >= PARAM_WORDS) {
+    pie_fault(OUT_OF_BOUNDS, p * PARAM_WORDS + k, lim_ops * PARAM_WORDS);
     return 0u;
   }
   return params[p * PARAM_WORDS + k];
