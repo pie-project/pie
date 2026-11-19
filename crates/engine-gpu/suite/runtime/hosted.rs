@@ -116,6 +116,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &[channel],
     );
