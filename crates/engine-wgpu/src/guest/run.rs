@@ -136,7 +136,11 @@ impl<'a> OnDevice<'a> {
         self.session.collect(at)?;
         pending.wait()?;
 
-        if let Some(code) = self.session.status(at)? {
+        let status = self.session.status(at);
+        if status.is_err() {
+            self.session.clear_status()?;
+        }
+        if let Some(code) = status? {
             self.session.clear_status()?;
             return Err(Fault::Program {
                 at: "guest::run",

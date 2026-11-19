@@ -74,6 +74,19 @@ fn widened(call: usize, source: String) -> std::result::Result<String, String> {
 
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
+/// A status's fault code: none where it is unset, the code where it is a
+/// fault, and refused where its state is one no guest runtime writes.
+fn read_status(status: eta_exec::Status) -> std::result::Result<Option<u32>, String> {
+    match status.state() {
+        Some(eta_exec::State::Unset) => Ok(None),
+        Some(eta_exec::State::Fault) => Ok(Some(status.fault)),
+        _ => Err(format!(
+            "status was overwritten: its words read {:#x} {:#x} {:#x} {:#x}, and no guest              runtime writes state {:#x}",
+            status.state, status.fault, status.reserved0, status.reserved1, status.state
+        )),
+    }
+}
+
 /// A stage's outbox: its status, then each value the stage puts (what its
 /// run reads back, `eta_exec`'s wanted set), in whole words within its heap.
 fn outbox_bytes(
@@ -632,17 +645,24 @@ impl Session {
             })
     }
 
+    /// Stage `stage`'s fault code, if it faulted: the runtimes' status
+    /// layout ([`eta_exec::Status`]), a fault the state `Fault` with its code
+    /// in the word after. A stage that ran clean leaves its status unset;
+    /// any other state is a status something else overwrote, refused by name
+    /// rather than read as a code.
     pub fn status(&self, stage: usize) -> Result<Option<u32>> {
-        let raw = self
+        let status = self
             .stages
             .get(stage)
-            .and_then(|seat| seat.collected.get(..4))
+            .and_then(|seat| eta_exec::Status::read(&seat.collected))
             .ok_or_else(|| Fault::Program {
                 at: "guest::session",
                 why: format!("stage {stage}'s status was not collected"),
             })?;
-        let code = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        Ok((code != 0).then_some(code))
+        read_status(status).map_err(|why| Fault::Program {
+            at: "guest::session",
+            why: format!("stage {stage}'s {why}"),
+        })
     }
 
     pub fn clear_status(&mut self) -> Result<()> {
@@ -921,6 +941,23 @@ mod tests {
             outbox_bytes(&[0], &[0], &descriptors, 20).unwrap(),
             STATUS_SPAN + 20
         );
+    }
+
+    #[test]
+    fn a_status_is_read_in_the_runtimes_layout() {
+        use super::read_status;
+        use eta_exec::Status;
+        let status = |state, fault| Status {
+            state,
+            fault,
+            ..Status::default()
+        };
+        assert_eq!(read_status(status(0, 0)), Ok(None));
+        assert_eq!(read_status(status(3, 0x2a)), Ok(Some(0x2a)));
+        // What DX12 read back: top-p's temperature and the vocab where the
+        // state lies are an overwritten status, not fault codes.
+        assert!(read_status(status(0x3f33_3333, 0)).is_err());
+        assert!(read_status(status(151_936, 0)).is_err());
     }
 
     #[test]
