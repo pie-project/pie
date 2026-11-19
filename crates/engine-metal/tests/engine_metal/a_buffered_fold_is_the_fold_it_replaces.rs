@@ -804,7 +804,7 @@ fn a_replaying_wide_decode_costs() {
     let fixture: &'static _ = Box::leak(Box::new(
         super::a_scattered_pool_serves_the_same_logits::fixture_of("qwen35-d0.8b", None),
     ));
-    const SLOTS: u32 = 64;
+    const SLOTS: u32 = 80;
     let trace = fixture.trace.clone();
     let shell = Shell::load(Boot {
         kv_budget: crate::full_pool(&trace, PAGE, 128, SLOTS),
@@ -831,7 +831,7 @@ fn a_replaying_wide_decode_costs() {
     // state pool asked 313 chunks for them).
     let facts = shell.pool_chunk_facts();
     shell
-        .commit_segments(352u32.div_ceil(facts.segment_chunks.max(1)).min(facts.total_chunks.div_ceil(facts.segment_chunks.max(1))))
+        .commit_segments(448u32.div_ceil(facts.segment_chunks.max(1)).min(facts.total_chunks.div_ceil(facts.segment_chunks.max(1))))
         .expect("the pool commits");
     const N: u32 = 16;
     const FIRES: usize = 20;
@@ -841,7 +841,7 @@ fn a_replaying_wide_decode_costs() {
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
     };
-    for lanes in [16u32, 32] {
+    for lanes in [64u32] {
         let mut plain = 0.0;
         for lag in [None, Some(0u32), Some(1), Some(2)] {
             // The same slots each time: a fresh prompt resets each one.
