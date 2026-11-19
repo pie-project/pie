@@ -20,7 +20,8 @@ pub(crate) struct Raw {
     /// What the driver took for it (its requirement, at least `size`):
     /// what the device's books count, where it lies in a device-local heap.
     charged: u64,
-    /// Whose it is in the device's books; `None` off the device's heaps.
+    /// Whose it is in the device's books; `None` off the device's heaps,
+    /// where the books' host count holds it.
     owner: Option<Owner>,
     pub(crate) mapped: Option<NonNull<u8>>,
     pub(crate) kind: Memory,
@@ -155,8 +156,11 @@ impl Raw {
             .flags
             .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
             .then_some(owner);
-        if let Some(owner) = owner {
-            core.books.take(owner, need.size);
+        match owner {
+            Some(owner) => core.books.take(owner, need.size),
+            // Pinned host memory: no device ledger holds it, the books'
+            // host count does.
+            None => core.books.host_take(need.size),
         }
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
@@ -312,8 +316,9 @@ impl Drop for Raw {
             d.destroy_buffer(self.buffer, None);
             d.free_memory(self.memory, None);
         }
-        if let Some(owner) = self.owner {
-            self.core.books.give(owner, self.charged);
+        match self.owner {
+            Some(owner) => self.core.books.give(owner, self.charged),
+            None => self.core.books.host_give(self.charged),
         }
     }
 }

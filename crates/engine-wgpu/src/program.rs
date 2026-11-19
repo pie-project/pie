@@ -965,7 +965,7 @@ impl Plane {
         };
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
+            &plan.package,
             compiled.all(),
             &args,
             library,

@@ -591,7 +591,10 @@ impl<B: Backend> Inputs<B> {
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32 / self.laid.pieces;
 
-        let valid = vec![1u8; rows as usize];
+        // Whole words, its slot laid at `ALIGN`: a sub-word write would have
+        // the device read its last word back first.
+        let mut valid = vec![1u8; rows as usize];
+        valid.resize(valid.len().next_multiple_of(4), 0);
 
         self.store.write(self.laid.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.laid.positions, bytes_of(fire.positions))?;
