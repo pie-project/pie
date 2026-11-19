@@ -345,10 +345,23 @@ impl Sink<'_> {
                     storage_view_fits(views.len(), view, max_binding)
                         .map_err(|detail| Sink::backend(fire, detail))?;
                     if binding.offset().is_multiple_of(storage_align) {
+                        // Bound at the power of two over what it holds, no
+                        // further than its buffer's end (no kernel reads a
+                        // binding's length; each takes its extent in its
+                        // scalars), so a group serves every fire whose rows
+                        // round to the same power, not one row count each.
+                        let to_end = (binding
+                            .buffer()
+                            .slab()
+                            .size
+                            .saturating_sub(binding.offset())
+                            & !3)
+                            .min(max_binding & !3);
+                        let to_end = view.next_power_of_two().min(to_end).max(view);
                         views.push((
                             binding.buffer().slab().buffer.clone(),
                             binding.offset(),
-                            view,
+                            to_end,
                             mutable,
                         ));
                         continue;
