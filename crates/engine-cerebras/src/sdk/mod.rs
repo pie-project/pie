@@ -413,6 +413,9 @@ pub struct Runtime {
     pub unlanded: usize,
     /// A PE of the last such write (where a read lands them).
     pub landing: Option<Rect>,
+    /// The words last written to each kept array (one the program never writes, by symbol and
+    /// rectangle origin) since the load: a later write sends the PEs' changed words alone.
+    pub kept: std::collections::HashMap<(String, i32, i32), Vec<u32>>,
 }
 
 /// A runtime's blocking calls by kind: how many, how long they took, how
@@ -523,6 +526,7 @@ impl Runtime {
             pending: Vec::new(),
             unlanded: 0,
             landing: None,
+            kept: std::collections::HashMap::new(),
             io: IoStats::default(),
         })
     }
@@ -547,6 +551,7 @@ impl Runtime {
 
     /// Loads the program's ELFs onto the fabric.
     pub fn load(&mut self) {
+        self.kept.clear();
         // SAFETY: constructed runtime.
         unsafe { (self.api().load)(self.this()) }
     }

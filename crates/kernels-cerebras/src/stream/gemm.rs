@@ -1827,6 +1827,13 @@ pub fn compile_program(
     )
     .map_err(|e| e.to_string())?;
     let (mut h2d, d2h) = super::grid::host_arrays(&e.arrays, out, true)?;
+    // (the step's entries, which the PEs read and never write: what the device holds is what
+    // was last written, a step's write its changed words alone)
+    for item in h2d.iter_mut() {
+        if item["entry"].is_string() && matches!(item["sym"].as_str(), Some("hin" | "hsc")) {
+            item["kept"] = serde_json::json!(true);
+        }
+    }
     // given a step's capture, every static array's words on file too (a runner with no
     // checkpoint writes them)
     if let Some(dir) = values {

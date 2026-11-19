@@ -4026,7 +4026,24 @@ refusal of the program where any is open):
     reads each band's backs (one symbol, words a PE, top row and height) as one rectangle where
     it holds at most 4x their words (`PACK_SLACK`), each back cut out of it: 1576, 514 calls ->
     6, d2h 140 -> 50 ms, wall 145.2 -> 55.0 ms (2.6x), every velocity and latent the same bit
-    for bit; with the stamps read too 55.1 ms.
+    for bit; with the stamps read too 55.1 ms. At 1024² (1577) 130 calls -> 3, wall 264-265 ->
+    248.0 ms, the same bit for bit.
+  - **A step's entries, kept.** The GEMM PEs only read `hin` and `hsc` (host.json `kept`):
+    what the device holds is what was last written since the load, so a later write sends each
+    column's words up to the last any of its PEs changed, a plain rectangle around each count's
+    columns (`kept_writes`). klein's context entries are never sent again after step 0; its
+    per-step words (the latents, words 1-8 at columns 2, 5, ..., 383; the timestep, word 0 at
+    two columns of each three) span the whole band, so they still go whole (1579: h2d 6.9 ->
+    6.1 ms, done 222.7 -> 220.7 ms, wall 248.6 -> 247.8 ms, the same bit for bit). Sending them alone wants a layout that
+    puts them in a dense rectangle of columns.
+  - **SDK pitfall: `memcpy_h2d_stride` is not what its simulator shows.** On the simulator
+    `(sym, src, px, py, w, h, elems_per_pe, col_stride, row_stride)` writes the PEs
+    `px + k * col_stride` (k < ceil(w / col_stride)) of rows `py + j * row_stride`, row-major. On a
+    CS-3 the same calls (1577, 1578: the kept writes a stride of 3 apart) left the step's inputs
+    wrong (velocity 1's relative L2 0.82 against whole writes), a read of each write's first PE
+    after it no help; the same words as plain rectangles were exact. Nothing here uses it.
+    (`memcpy_h2d_colbcast` is `(x, y, w, h, elems)`, a row's words down each column, on the
+    simulator; not yet tried on the chip.)
   - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
     (chip 1.858M, 1.71M before); the 576-row one 168.7M.
 - **A PE's low data** (`check::lo_dsds`, `LO_DSDS`). cslc keeps every constant DSD value a PE

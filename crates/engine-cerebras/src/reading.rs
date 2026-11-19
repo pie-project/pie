@@ -69,6 +69,9 @@ pub struct Array {
     /// Each row's PEs take the same words (its first PE's): written a row's words a row,
     /// broadcast along it (host.json's `rowbcast`; a GEMM program's row scalars, `hsc`).
     pub rowbcast: bool,
+    /// The program never writes it (host.json's `kept`; a GEMM program's entries): a write
+    /// after the load's first sends each PE's words up to its last changed one alone.
+    pub kept: bool,
 }
 
 impl Array {
@@ -484,6 +487,7 @@ impl Reading {
                 statics,
                 group: a["group"].as_u64().map(|g| g as usize),
                 rowbcast: a["rowbcast"].as_bool().unwrap_or(false),
+                kept: a["kept"].as_bool().unwrap_or(false),
             });
         }
         let backs = |key: &str| -> R<Vec<Back>> {
@@ -1417,6 +1421,7 @@ impl Fabric for Runtime {
     fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
         self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
+        self.keep_for(reading);
         self.launch("run", &args).map_err(|x| x.to_string())?;
         self.stamps(reading)
     }
@@ -1441,6 +1446,45 @@ impl Fabric for Runtime {
             "cerebras: an array written"
         );
         let row = (a.rect.w.max(1) as usize) * a.len.max(1);
+        // (a kept array written before since the load: each column's words up to the last any
+        // of its PEs changed, the columns of a count one rectangle around them)
+        if a.kept
+            && !a.rowbcast
+            && !self.simulated()
+            && words.len() == row * a.rect.h.max(0) as usize
+        {
+            let key = (a.sym.clone(), a.rect.x, a.rect.y);
+            let (w, h) = (a.rect.w.max(0) as usize, a.rect.h.max(0) as usize);
+            let plan = self
+                .kept
+                .get(&key)
+                .filter(|old| old.len() == words.len())
+                .and_then(|old| kept_writes(old, words, w, h, a.len));
+            if let Some(plan) = plan {
+                for kw in &plan {
+                    let mut data = Vec::with_capacity(h * kw.w * kw.n);
+                    for y in 0..h {
+                        for x in kw.x..kw.x + kw.w {
+                            let at = (y * w + x) * a.len;
+                            data.extend_from_slice(&words[at..at + kw.n]);
+                        }
+                    }
+                    let rect = Rect {
+                        x: a.rect.x + kw.x as i32,
+                        w: kw.w as i32,
+                        ..a.rect
+                    };
+                    self.memcpy_h2d(&a.sym, &data, rect, kw.n, Order::RowMajor, dt)
+                        .map_err(|x| x.to_string())?;
+                }
+                self.kept.insert(key, words.to_vec());
+                return Ok(());
+            }
+            self.kept.insert(key, words.to_vec());
+        } else {
+            // (any other write of the symbol: what it held before no longer known)
+            self.kept.retain(|k, _| k.0 != a.sym);
+        }
         // (each row's PEs the same words: the row's first PE's, broadcast along it, the
         // rectangle's words written once a row, not once a PE)
         if a.rowbcast && words.len() == row * a.rect.h.max(0) as usize {
@@ -1502,6 +1546,7 @@ impl Fabric for Runtime {
         let e = |x: crate::sdk::Error| x.to_string();
         self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
+        self.keep_for(reading);
         let t0 = std::time::Instant::now();
         self.launch("run", &args).map_err(e)?;
         if reading.poll && self.rpc().symbols().contains_key("tsc") {
@@ -1607,12 +1652,81 @@ fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R
             statics: None,
             group: None,
             rowbcast: false,
+            kept: false,
         };
         let n = (r.w * r.h) as usize;
         let all: Vec<u32> = (0..n).flat_map(|_| words.iter().copied()).collect();
         rt.write(&a, &all)?;
     }
     Ok(())
+}
+
+impl Runtime {
+    /// Before `reading`'s launch: the kept words of arrays it does not keep forgotten (a
+    /// co-resident reading's program may write them).
+    fn keep_for(&mut self, reading: &Reading) {
+        self.kept.retain(|k, _| {
+            reading
+                .h2d
+                .iter()
+                .any(|a| a.kept && a.sym == k.0 && a.rect.x == k.1 && a.rect.y == k.2)
+        });
+    }
+}
+
+/// A kept array's write after its first: each PE's first `n` words over the columns `x..x + w`
+/// of every row (the rectangle around the columns whose PEs changed that many). A plain
+/// rectangle: the SDK's strided copy (`memcpy_h2d_stride`) lands its words elsewhere on a CS-3
+/// (1578), however its simulator places them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeptWrite {
+    x: usize,
+    w: usize,
+    n: usize,
+}
+
+/// More writes than a whole rectangle's one is worth.
+const KEPT_WRITES: usize = 16;
+
+/// The writes of a kept array (`w` x `h` PEs, `len` words each, row-major) from `old` to `new`:
+/// each column's words up to the last any of its rows changed, the columns of each count one
+/// rectangle around them (a column between them its words rewritten, unchanged or not), one
+/// inside a rectangle of more words dropped. `None` where that takes more than [`KEPT_WRITES`]
+/// writes or sends no fewer words than the whole.
+fn kept_writes(old: &[u32], new: &[u32], w: usize, h: usize, len: usize) -> Option<Vec<KeptWrite>> {
+    let mut n = vec![0usize; w];
+    for y in 0..h {
+        for (x, nx) in n.iter_mut().enumerate() {
+            let at = (y * w + x) * len;
+            if let Some(i) = (0..len).rev().find(|&i| old[at + i] != new[at + i]) {
+                *nx = (*nx).max(i + 1);
+            }
+        }
+    }
+    // (each count's columns' span)
+    let mut by: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for (x, &k) in n.iter().enumerate() {
+        if k > 0 {
+            let e = by.entry(k).or_insert((x, x));
+            e.1 = x;
+        }
+    }
+    let spans: Vec<(usize, (usize, usize))> = by.into_iter().collect();
+    let out: Vec<KeptWrite> = spans
+        .iter()
+        .filter(|&&(k, (a, b))| {
+            !spans
+                .iter()
+                .any(|&(k2, (a2, b2))| k2 > k && a2 <= a && b <= b2)
+        })
+        .map(|&(k, (a, b))| KeptWrite {
+            x: a,
+            w: b - a + 1,
+            n: k,
+        })
+        .collect();
+    let words: usize = out.iter().map(|kw| kw.w * kw.n * h).sum();
+    (out.len() <= KEPT_WRITES && words < w * h * len).then_some(out)
 }
 
 /// How many times a back's words the rectangle read around a band's backs may hold (the
@@ -1934,5 +2048,87 @@ mod held_tests {
             }
         }
         assert!(seen.iter().all(|&n| n == 1));
+    }
+
+    #[test]
+    fn a_kept_arrays_write_is_its_changed_columns_words() {
+        // klein 1024\u00b2's latent band: word 0 (the timestep) at columns 1 and 2 of each
+        // three, words 1-8 (the latents) at column 2, column 0 nothing; then a step's change
+        let (w, h, len) = (12, 3, 9);
+        let mut old = vec![0u32; w * h * len];
+        let mut new = old.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * w + x) * len;
+                if x % 3 != 0 {
+                    old[at] = 1;
+                    new[at] = 2;
+                }
+                if x % 3 == 2 {
+                    for i in 1..len {
+                        old[at + i] = 10;
+                        new[at + i] = 20 + i as u32;
+                    }
+                }
+            }
+        }
+        let plan = kept_writes(&old, &new, w, h, len).expect("a plan");
+        let kw = |x, w, n| KeptWrite { x, w, n };
+        assert_eq!(plan, vec![kw(1, 10, 1), kw(2, 10, 9)]);
+        // the words it sends make `old` `new`
+        let mut dev = old.clone();
+        for k in &plan {
+            for y in 0..h {
+                for x in k.x..k.x + k.w {
+                    let at = (y * w + x) * len;
+                    dev[at..at + k.n].copy_from_slice(&new[at..at + k.n]);
+                }
+            }
+        }
+        assert_eq!(dev, new);
+        // nothing changed: no writes; everything: the whole rectangle's
+        assert_eq!(kept_writes(&new, &new, w, h, len), Some(Vec::new()));
+        let all: Vec<u32> = new.iter().map(|x| x + 1).collect();
+        assert_eq!(kept_writes(&new, &all, w, h, len), None);
+    }
+
+    #[test]
+    fn a_new_requests_context_mid_load_sends_its_columns_alone() {
+        // two batch slots of 4 rows, a context of 8 words a PE on 12 columns; the second slot's
+        // request is replaced mid-load: its context differs on columns 3-6 alone, the timestep
+        // (word 0) on every column of both slots
+        let (w, h, len) = (12, 8, 9);
+        let mut old = vec![0u32; w * h * len];
+        for (i, v) in old.iter_mut().enumerate() {
+            *v = i as u32;
+        }
+        let mut new = old.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * w + x) * len;
+                new[at] += 1_000_000;
+                if y >= 4 && (3..7).contains(&x) {
+                    for i in 1..len {
+                        new[at + i] += 2_000_000;
+                    }
+                }
+            }
+        }
+        let plan = kept_writes(&old, &new, w, h, len).expect("a plan");
+        let kw = |x, w, n| KeptWrite { x, w, n };
+        assert_eq!(plan, vec![kw(0, 12, 1), kw(3, 4, 9)]);
+        let sent: usize = plan.iter().map(|k| k.w * k.n * h).sum();
+        assert!(sent < w * h * len / 2, "{sent} words");
+        // the device after the writes holds what a whole write leaves
+        let mut dev = old.clone();
+        for k in &plan {
+            for y in 0..h {
+                for x in k.x..k.x + k.w {
+                    let at = (y * w + x) * len;
+                    dev[at..at + k.n].copy_from_slice(&new[at..at + k.n]);
+                }
+            }
+        }
+        assert_eq!(dev, new);
     }
 }
