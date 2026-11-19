@@ -597,7 +597,7 @@ mod tests {
             }],
             ..TraceContainer::default()
         };
-        let room = eta_ir::validate::Budget { room_bytes: 32 };
+        let room = eta_ir::validate::Budget { room_bytes: 32, submit: None };
         let mut bound =
             eta_ir::validate::bind_within(c, vec![vec![]], EngineCaps::default(), room).unwrap();
         let four = Value::F32(alloc::vec![1.0, 2.0, 3.0, 4.0]);
@@ -614,7 +614,7 @@ mod tests {
             "{refused}"
         );
 
-        bound.budget = Some(eta_ir::validate::Budget { room_bytes: 31 });
+        bound.budget = Some(eta_ir::validate::Budget { room_bytes: 31, submit: None });
         let refused = fold_stage(&bound, Stage::Prologue, &mut |_| Some(four.clone())).unwrap_err();
         assert!(
             matches!(&refused, EvalBlocker::Fault(why) if why.contains("state room")),

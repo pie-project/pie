@@ -287,6 +287,7 @@ mod tests {
                 EngineCaps::default(),
                 eta_ir::validate::Budget {
                     room_bytes: u64::MAX,
+                    submit: None,
                 },
             )
             .expect("registers");

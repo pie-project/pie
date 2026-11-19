@@ -442,6 +442,7 @@ mod budget_tests {
         let mut registry = Registry::new(NonZeroUsize::new(4).unwrap());
         let budget = Budget {
             room_bytes: 64 << 20,
+            submit: None,
         };
         let refused = registry
             .register(

@@ -25,6 +25,7 @@ fn broadcast(shape: Shape) -> TraceContainer {
 fn a_stage_past_its_budget_is_refused_by_name() {
     let room = Budget {
         room_bytes: 1 << 20,
+        submit: None,
     };
     let fits = bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), room)
         .expect("a 4 KiB stage binds within a MiB");
@@ -47,10 +48,12 @@ fn a_stage_past_its_budget_is_refused_by_name() {
     // The exact room binds; a byte less does not.
     let exact = Budget {
         room_bytes: 4 + 4 * 1024,
+        submit: None,
     };
     assert!(bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), exact).is_ok());
     let short = Budget {
         room_bytes: 3 + 4 * 1024,
+        submit: None,
     };
     assert!(matches!(
         bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), short),
@@ -67,7 +70,7 @@ fn a_stage_past_a_u64_of_bytes_is_refused_by_name() {
         broadcast(past),
         vec![],
         EngineCaps::default(),
-        Budget { room_bytes: u64::MAX },
+        Budget { room_bytes: u64::MAX, submit: None },
     )
     .unwrap_err();
     assert_eq!(

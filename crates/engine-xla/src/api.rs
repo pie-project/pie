@@ -583,6 +583,8 @@ impl Engine for Xla {
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
             classes: shell.classes(),
+            // XLA states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
