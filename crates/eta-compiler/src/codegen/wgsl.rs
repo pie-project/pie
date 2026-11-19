@@ -526,7 +526,7 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     // The stage's heap bound, read once ([`RUNTIME`]'s `hld` / `hst`).
     source.push_str("  lim_heap = cfg.heap_words;\n");
     source.push_str(call);
-    source.push_str("}\n");
+    source.push_str("  heap_flush();\n}\n");
 }
 
 /// `plan`'s launches as steps of the closed set; a node no call serves is

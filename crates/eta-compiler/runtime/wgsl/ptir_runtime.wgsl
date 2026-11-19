@@ -71,14 +71,31 @@ fn pie_fault(code : u32, at : u32, limit : u32) {
 
 // The heap's words, each access refused past the stage's heap: a read
 // reads zero, a write writes nothing, and the stage faults.
+// The first heap access this invocation refused, written as the step's
+// fault when it ends (heap_flush): a refused read reads zero with no branch,
+// a refused store stores nothing.
+var<private> heap_bad : bool;
+var<private> heap_at : u32;
+
+fn heap_refuse(w : u32, ok : bool) {
+  heap_at = select(heap_at, w, !ok && !heap_bad);
+  heap_bad = heap_bad || !ok;
+}
+
 fn hld(w : u32) -> u32 {
-  if (w >= lim_heap) { pie_fault(OUT_OF_BOUNDS, w, lim_heap); return 0u; }
-  return heap[w];
+  let ok = w < lim_heap;
+  heap_refuse(w, ok);
+  return select(0u, heap[min(w, lim_heap - 1u)], ok);
 }
 
 fn hst(w : u32, x : u32) {
-  if (w >= lim_heap) { pie_fault(OUT_OF_BOUNDS, w, lim_heap); return; }
-  heap[w] = x;
+  let ok = w < lim_heap;
+  heap_refuse(w, ok);
+  if (ok) { heap[w] = x; }
+}
+
+fn heap_flush() {
+  if (heap_bad) { pie_fault(OUT_OF_BOUNDS, heap_at, lim_heap); }
 }
 
 // A value's descriptor word `k`. The descriptors, offsets and op params
