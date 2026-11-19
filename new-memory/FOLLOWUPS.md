@@ -182,3 +182,61 @@ should be skipped by name (its restore's rebind places it), and the rest
 re-addressed whatever one instance answers. Not hit in the beam runs (it
 needs an evacuation while a guest is parked); `Plane::rebind` is now
 all-or-nothing and poisons an instance whose rings move only partway.
+
+## F22. The runtime's per-token host work grows with context and vocabulary
+
+From the serialization audit (memory-redesign 5355faa9a), none counted today:
+- `store/kv.rs:1908`: each fold calls `sealed_prefix`, visiting every page of
+  the working set every token (~512k lookups a step at 256 lanes × 32k tokens).
+- `pipeline/fire.rs:2819` `map_lane_pages` copies a lane's whole flat page
+  table each fire; `fire/geometry.rs:504` rebuilds lane pages with
+  `(0..n).collect()`.
+- ~12 KV-mutex takes per lane per fire (`store/registry.rs:23`) plus the
+  global `KV_WRITES` (`fire.rs:2286`); no contention counter.
+- `pipeline/fire/shadow.rs:114`: the host shadow re-runs the sampler every
+  fire; with penalties the `[vocab]` f32 present histogram is cloned 3× per
+  fire (~1.8 MB per lane per token); the grammar mask is unpacked every fire;
+  compat `generate.rs` does an O(vocab) unpack and a 152 KB WIT put per token.
+- `scheduler/worker.rs:2459`: a pre-launch copy (beam copy-on-write, window /
+  RS copies) holds launches for the whole engine until the queue drains;
+  `fire.rs:5051` every finalize wakes every planner and pool walker;
+  `worker.rs:1527` rows recounted per wakeup and a 1408 B `PendingRequest`
+  boxed per fire.
+Gate for each: a counter first (time under the KV mutex, shadow cost, pre-launch
+holds), then incremental structures (sealed-prefix kept per set, page tables
+shared not copied); throughput ≤ 2% vs main must not regress.
+
+## F23. Vulkan per-step host overhead beyond record-at-load step 2
+
+Passed to the step-2 work, recorded here so nothing is lost
+(5355faa9a): 3 submits per 1-lane step (forward, a 4-byte token-feed frame
+`engine-gpu serve.rs:2884`, a guest frame re-encoded every step
+`program.rs:1132`); two fence-watcher threads spawned per step
+(`device/ctx.rs:2068`); 2–3 command buffers allocated / freed per step; an
+ALL_COMMANDS barrier at each frame head (`ctx.rs:1268`); the record key
+Debug-formatted per fire (`record.rs:55`); any segment commit / release drops
+every recording (`engine-vulkan serve.rs:2198`); group-mask / rs_snaps fires
+never recorded (`serve.rs:180`); weight streaming `vkQueueWaitIdle` per step
+and expert layer (`store/rows.rs:840`, `experts.rs:794`); fire inputs in
+HOST_CACHED memory re-read over PCIe by each attention layer (inferred,
+`inputs.rs:470`).
+
+## F24. Capabilities missing off CUDA (not silent: refused by name today)
+
+From the parity audit (5355faa9a): no per-fire adapter attach on Metal /
+Vulkan / wgpu (long adapted prompts refused past one fire's capacity);
+bidirectional attention refused on Vulkan / wgpu (encoder / DiT /
+text-diffusion); draft ops MarkovWalk / KvEnds / WindowSink missing on Metal /
+XLA / Slang, TopK / SelectorWalk on Slang. Each is a feature to port with the
+CUDA kernel as the reference and the model goldens as the gate.
+
+## F25. wgpu's guest path: host round trips per token
+
+wgpu channel cells are host-only (`engine-wgpu serve.rs:44-45`,
+`engine-gpu store/layout.rs:266-270`), so every guest pass reads takes and
+writes puts through host memory; two round trips per sampled token
+(`guest/run.rs:117` `pending.wait`, `program.rs:676` `gate.settle`) and
+nothing recorded. Depends on device geometry for engine-gpu and the WGSL
+guest bounds checks (per-instance limits) landing first; the bind-group cache
+key including per-step scalars (`pipelines.rs:253`) is in Windows' step 7
+item 5.
