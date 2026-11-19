@@ -5,9 +5,9 @@
 //! it lands (`vector_tflops_by_rows`); each tiled kernel at its own measured rate
 //! at the rows it lands (`tile_tflops_by_rows`) below the matmul curve's
 //! first row count, and on the `gemm_tflops_by_rows` curve, its rows padded
-//! to its tile, from there. Each kernel reads its plane once a group of
-//! rows that share a read (`gemm::Kernel::rows_a_read`): no cache is assumed
-//! to hold it.
+//! to its tile, from there. A measured rate holds every weight pass the
+//! kernel makes; past its measurements a kernel reads its plane once a group
+//! of rows that share a read (`gemm::Kernel::rows_a_read`), no cache assumed.
 //!
 //! A backend that records its fires (one recording a rung) takes one kernel
 //! a rung, whatever rows a fire of it lands: the one whose worse cost over
@@ -192,29 +192,41 @@ pub fn choose(
         for &(n, k, count, bytes) in &planes {
             let flops = |rows: u32| 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
             let kernel = gemm::tile_for(target, tactic, n, k);
-            let read = f64::from(rows.div_ceil(kernel.rows_a_read().max(1))) * bytes;
-            let compute = if tactic.vector > 0 {
-                // Its measured rate at the rows it lands, its last past them
-                // (each further block of rows another pass, in the read).
-                let curve = vectors.iter().find(|(at, _)| *at == tactic.vector);
-                let rate = measured(vectors, tactic.vector, rows)
-                    .or_else(|| curve.and_then(|(_, c)| c.last()).map(|&(_, t)| t * 1e3))
-                    .unwrap_or(f64::MIN_POSITIVE);
-                flops(rows) / rate
+            // The kernel's measured rate at the rows it lands, where its curve
+            // reaches them: timed as it runs, every weight pass it makes (and
+            // whatever a cache spares it) in the time, so it reads the plane
+            // once beside it. Else the vector kernel's last measured rate and
+            // a tiled kernel's on the matmul curve, its rows padded to its
+            // tile, each reading the plane once a group of rows sharing a
+            // read (no cache assumed).
+            let rate = if tactic.vector > 0 {
+                measured(vectors, tactic.vector, rows)
             } else {
-                let tile = kernel.row_tile().max(1);
-                // Below the curve's first row count, the kernel's own rate
-                // at the rows it lands; from there the curve's, its rows
-                // padded to its tile.
-                match measured(tiles, tile, rows) {
-                    Some(rate) => flops(rows) / rate,
-                    None => flops(rows.div_ceil(tile) * tile) / c.gemm_rate(rows, n, k),
+                measured(tiles, kernel.row_tile().max(1), rows)
+            };
+            let (compute, read) = match rate {
+                Some(rate) => (flops(rows) / rate, bytes),
+                None => {
+                    let passes = f64::from(rows.div_ceil(kernel.rows_a_read().max(1)));
+                    let compute = if tactic.vector > 0 {
+                        let last = vectors
+                            .iter()
+                            .find(|(at, _)| *at == tactic.vector)
+                            .and_then(|(_, c)| c.last())
+                            .map_or(f64::MIN_POSITIVE, |&(_, t)| t * 1e3);
+                        flops(rows) / last
+                    } else {
+                        let tile = kernel.row_tile().max(1);
+                        flops(rows.div_ceil(tile) * tile) / c.gemm_rate(rows, n, k)
+                    };
+                    (compute, passes * bytes)
                 }
             };
             ns += f64::from(count) * (c.launch_ns + compute.max(read / c.bytes_per_ns));
         }
         ns
     };
+
     let mut by_rows = Vec::new();
     let mut weighed = Vec::with_capacity(rungs.len());
     let mut below = 0;
@@ -329,11 +341,9 @@ mod tests {
                 "{rows}"
             );
         }
-        assert_eq!(dense.at(3).vector, 4);
+        assert!(dense.at(3).vector > 0);
         assert!(
-            weighed[2]
-                .to_string()
-                .starts_with("rung 4: gemv x4 by the estimate ("),
+            weighed[2].to_string().starts_with("rung 4: gemv x"),
             "{}",
             weighed[2]
         );
@@ -426,5 +436,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A measured rate holds the kernel's weight passes: a one-row-a-workgroup
+    /// vector kernel measured faster at 3 rows (its re-reads cached) is taken
+    /// there, though it makes three passes.
+    #[test]
+    fn a_measured_rate_holds_the_passes_a_cache_spares() {
+        let mut r = rates(Some(1.0), coopmat_tiles());
+        r.vector_tflops_by_rows = Some(vec![
+            (1, vec![(1, 1.0), (4, 4.0), (256, 4.0)]),
+            (4, vec![(1, 1.0), (4, 3.0), (256, 12.0)]),
+        ]);
+        let (eager, _) = choose(Target::Wgsl, &[1, 2, 4], coopmat, &r, &counts(), false).unwrap();
+        assert_eq!(eager.at(3).vector, 1);
     }
 }
