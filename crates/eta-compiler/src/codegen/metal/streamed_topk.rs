@@ -58,8 +58,12 @@ const BODY: &str = r#"
   const uint rows = in_desc.rows;
   const uint last = in_desc.last;
   const uint total = rows * last;
-  const device float* input = reinterpret_cast<const device float*>(scratch + offsets[kInput]);
-  device float* top_values = reinterpret_cast<device float*>(scratch + offsets[kValues]);
+  // The row is read at its dtype and the values stored at theirs: a bf16
+  // element widens exactly and stores back exactly.
+  const device uchar* input = scratch + offsets[kInput];
+  const uint in_dtype = in_desc.dtype;
+  device uchar* top_values = scratch + offsets[kValues];
+  const uint top_dtype = descriptors[kValues].dtype;
   device uint* top_indices = reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
   device atomic_uint* hist = reinterpret_cast<device atomic_uint*>(temporary);
   device uint* pick = reinterpret_cast<device uint*>(temporary) + rows * 512u;      // [row][4]: flag, prefix, remaining, total_lt
@@ -98,7 +102,7 @@ const BODY: &str = r#"
       float held[8];
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * m4_gthreads;
-        held[u] = i < total ? input[i] : 0.0f;
+        held[u] = i < total ? m1_load_f(input, i, in_dtype) : 0.0f;
       }
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * m4_gthreads;
@@ -164,7 +168,7 @@ const BODY: &str = r#"
       float held[8];
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * m4_gthreads;
-        held[u] = i < total ? input[i] : 0.0f;
+        held[u] = i < total ? m1_load_f(input, i, in_dtype) : 0.0f;
       }
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * m4_gthreads;
@@ -194,7 +198,7 @@ const BODY: &str = r#"
   if (step_index == 10u) {
     if (m4_group.x != 0u) return;
     for (uint r = 0u; r < rows; ++r) {
-      const device float* row_in = input + ulong(r) * last;
+      const uint row_at = r * last;
       const ulong pivot = (ulong(pick[r * 4u + 0u]) << 32) | ulong(pick[r * 4u + 1u]);
       const uint remaining = pick[r * 4u + 2u];
       const uint total_lt = pick[r * 4u + 3u];
@@ -212,7 +216,7 @@ const BODY: &str = r#"
         uint mine = 0u;
         for (uint i = chunk_begin; i < chunk_end; ++i) {
           uint flag;
-          const uint key = m4_topk_key(row_in[i], flag);
+          const uint key = m4_topk_key(m1_load_f(input, row_at + i, in_dtype), flag);
           mine += (((ulong(flag) << 32) | ulong(key)) == pivot) ? 1u : 0u;
         }
         tg_scan[m3_tid] = mine;
@@ -229,7 +233,7 @@ const BODY: &str = r#"
         uint at = tg_scan[m3_tid];
         for (uint i = chunk_begin; i < chunk_end; ++i) {
           uint flag;
-          const uint key = m4_topk_key(row_in[i], flag);
+          const uint key = m4_topk_key(m1_load_f(input, row_at + i, in_dtype), flag);
           if ((((ulong(flag) << 32) | ulong(key)) == pivot)) {
             if (at < remaining) {
               tg_key[total_lt + at] = pivot;
@@ -267,7 +271,7 @@ const BODY: &str = r#"
       }
       for (uint p = m3_tid; p < count_k; p += m3_threads) {
         const uint index = tg_idx[p];
-        top_values[ulong(r) * kK + p] = row_in[index];
+        m1_store_fd(top_values, r * kK + p, m1_load_f(input, row_at + index, in_dtype), top_dtype);
         top_indices[ulong(r) * kK + p] = index;
       }
       threadgroup_barrier(mem_flags::mem_device);

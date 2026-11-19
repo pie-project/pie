@@ -245,12 +245,7 @@ impl Plane {
         registrations: &[ProgramRegistration],
     ) -> Result<u64> {
         let before = self.cache.stats().compilations;
-        // A program that stores bf16 is refused at its registration
-        // (`prepare_register`); its stages are not compiled.
-        for registration in registrations
-            .iter()
-            .filter(|registration| !registration.launch.stores_bf16())
-        {
+        for registration in registrations {
             let plan = adopt_launch_package(registration.launch.clone())?;
             self.cache.compile(
                 context,
@@ -288,12 +283,6 @@ impl Plane {
                 step: Step::Registered(existing),
             });
         }
-        // Metal's guest kernels have no bf16 yet: such a program is refused
-        // by name, never computed as another dtype.
-        registration
-            .launch
-            .refuse_bf16()
-            .map_err(|why| Fault::program("program::plane", why))?;
         let plan = adopt_launch_package(registration.launch.clone())?;
         let planned = self.cache.plan(
             context,
@@ -2370,6 +2359,245 @@ mod tests {
                         wrong.push(format!("step {step}: {why}"));
                         break 'steps;
                     }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// bf16 guest values on the device answer what the host interpreter
+    /// answers: a cast in, an f32 constant mixed in unrounded, softmax and
+    /// log-softmax of a bf16 row, a sum and a max (f32), a cumsum, a top-k,
+    /// a widening cast and an argmax, over an odd vocabulary (a value's last
+    /// word holds padding) and a short one. The interpreter computes in f32
+    /// and rounds each bf16 store to nearest even; the device's exp and log
+    /// and its order of f32 accumulation may move a result by an f32 ulp
+    /// before its rounding, so a bf16 result through them is held within
+    /// one bf16 ulp, every other bit for bit.
+    #[test]
+    fn bf16_values_answer_what_the_interpreter_answers() {
+        use eta_compiler::contract::wire;
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        const TOP: u32 = 3;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let bf16 = |x: f32| {
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+        let logits_of = |n: usize, seed: u32| -> Vec<f32> {
+            let mut x = seed.max(1);
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    bf16((x % 20_000) as f32 / 1000.0 - 10.0)
+                })
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for (vocab, seed) in [(1001u32, 7u32), (64, 3), (5, 11)] {
+            let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+            let indptr = leak(Channel::from(vec![0u32, 1]));
+            let bf = |n: u32| leak(Channel::new([n], dtype::bf16).capacity(1));
+            let narrow = bf(vocab);
+            let scaled = bf(vocab);
+            let soft = bf(vocab);
+            let log_soft = bf(vocab);
+            let scan = bf(vocab);
+            let top = bf(TOP);
+            let top_ids = leak(Channel::new([TOP], dtype::u32).capacity(1));
+            let sums = leak(Channel::new([2], dtype::f32).capacity(1));
+            let wide = leak(Channel::new([vocab], dtype::f32).capacity(1));
+            let best = leak(Channel::new([1], dtype::i32).capacity(1));
+            let exped = bf(vocab);
+            let reversed = bf(vocab);
+            let scattered = bf(vocab);
+            // A [7, 143] view of the 1001 elements: a scan over its rows
+            // and a transpose; a [vocab] scan elsewhere.
+            let shaped = vocab == 1001;
+            let row_scan = bf(vocab);
+            let flipped = bf(vocab);
+            // (reader, name, held within a bf16 ulp)
+            let readers: [(&'static Channel, &str, bool); 15] = [
+                (exped, "exp", true),
+                (reversed, "gather (reversed)", false),
+                (scattered, "scatter_add of 1 at 0, 1, 2", false),
+                (row_scan, "cumsum over rows", true),
+                (flipped, "transpose", false),
+                (narrow, "cast", false),
+                (scaled, "x * 0.5 + 1", false),
+                (soft, "softmax", true),
+                (log_soft, "log_softmax", true),
+                (scan, "cumsum", true),
+                (top, "top-k values", false),
+                (top_ids, "top-k ids", false),
+                (sums, "sum, max", true),
+                (wide, "widened", false),
+                (best, "argmax", false),
+            ];
+            let logits = OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            };
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(vec![vec![logits.clone()]]);
+            b.bind_port(Port::EmbedIndptr, indptr);
+            b.stage(Attach::Epilogue, move || {
+                let raw = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let x = cast(&raw, dtype::bf16);
+                let s = reduce_sum(&x);
+                let m = reduce_max(&x);
+                let (vals, ids) = top_k(&x, TOP);
+                narrow.put(&x);
+                scaled.put(&(&x * 0.5f32 + 1.0f32));
+                soft.put(&softmax(&x));
+                log_soft.put(&log_softmax(&x));
+                scan.put(&cumsum(&x));
+                top.put(&vals);
+                top_ids.put(&ids);
+                sums.put(&select(
+                    eq(iota(2), broadcast(0u32, [2])),
+                    broadcast(reshape(&s, []), [2]),
+                    broadcast(reshape(&m, []), [2]),
+                ));
+                wide.put(&cast(&x, dtype::f32));
+                best.put(&reshape(&reduce_argmax(&x), [1]));
+                exped.put(&exp(&x));
+                let back = sub(broadcast(vocab - 1, [vocab]), iota(vocab));
+                reversed.put(&gather(&x, &back));
+                scattered.put(&scatter_add(&x, iota(3), 1.0f32));
+                if shaped {
+                    let grid = reshape(&x, [7, 143]);
+                    row_scan.put(&reshape(cumsum(&grid), [vocab]));
+                    flipped.put(&reshape(transpose(&grid), [vocab]));
+                } else {
+                    row_scan.put(&cumsum(&x));
+                    flipped.put(&x);
+                }
+            });
+            for (reader, _, _) in readers {
+                reader.note_host_take();
+            }
+            let traced = b.build().expect("the bf16 program traces");
+            let bound = eta_ir::validate::bind(
+                traced.container().clone(),
+                vec![vec![logits]],
+                EngineCaps {
+                    lora: true,
+                    attn_page_mask: true,
+                },
+            )
+            .expect("the bf16 program binds");
+            let stages = compile_bound(&bound);
+            let backend = Backend::parse("metal").expect("the metal codegen backend");
+            let registration = ProgramRegistration {
+                program_hash: bound.hash ^ u64::from(vocab),
+                emitted_kernels: emit_program(backend, &stages, &bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            };
+            let order = traced.channel_order();
+            let index = |c: &Channel| -> u32 {
+                let at = order.iter().position(|&gid| gid == c.gid()).expect("a channel");
+                u32::try_from(at).expect("a channel index")
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+            let mut plane = Plane::new();
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let count = bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let indptr_bytes: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let id = plane
+                .bind_placed(
+                    &context,
+                    program,
+                    &[(index(indptr), indptr_bytes)],
+                    Extents {
+                        row_count: 1,
+                        sampled_rows: 1,
+                        query_len: 1,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the instance binds");
+            let values = logits_of(vocab as usize, seed);
+            let halves: Vec<u8> = values
+                .iter()
+                .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut plane_bytes =
+                crate::device::Buffer::zeroed(&context, halves.len() as u64).expect("a logits plane");
+            plane_bytes.write(0, &halves).expect("the logits upload");
+            plane
+                .bind_output(id, "logits", 0, &plane_bytes, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
+                .expect("the logits bind");
+            let fired = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "vocab {vocab}: {fired:?}");
+            let mut reference = Instance::new(&bound, &[(index(indptr), Value::U32(vec![0, 1]))])
+                .expect("the interpreter instantiates");
+            let inputs = PassInputs {
+                outputs: vec![("logits".to_string(), 0, Value::F32(values.clone()))],
+            };
+            let stepped = reference
+                .step(&bound, &inputs, &mut NoKernels)
+                .expect("the interpreter steps");
+            assert!(stepped.committed, "vocab {vocab}: {:?}", stepped.missed);
+            for (reader, name, near) in readers {
+                let want = reference.host_take(&bound, index(reader)).expect("a cell");
+                let got = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(index(reader))
+                    .expect("a take")
+                    .expect("a cell");
+                let agree = match &want {
+                    Value::Bf16(w) => {
+                        let g: Vec<u16> =
+                            got.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        g.len() == w.len()
+                            && g.iter().zip(w).all(|(&g, &w)| {
+                                let key = |h: u16| -> i32 {
+                                    if h & 0x8000 != 0 { -i32::from(h & 0x7fff) } else { i32::from(h) }
+                                };
+                                if near { (key(g) - key(w)).abs() <= 1 } else { g == w }
+                            })
+                    }
+                    Value::F32(w) if near => {
+                        let g: Vec<f32> = got
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        g.len() == w.len()
+                            && g.iter().zip(w).all(|(g, w)| (g - w).abs() <= 1e-5 * w.abs().max(1.0))
+                    }
+                    other => got == wire(other),
+                };
+                if !agree {
+                    let shown = |b: &[u8]| format!("{:02x?}", &b[..b.len().min(24)]);
+                    wrong.push(format!(
+                        "vocab {vocab}, {name}: {} != {}",
+                        shown(&got),
+                        shown(&wire(&want))
+                    ));
                 }
             }
         }
