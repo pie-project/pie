@@ -424,11 +424,19 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
             nothing_left_ends(tier, "the tier is short no more");
             continue;
         }
+        // The runtime drops no state on its own: with no policy, only idle
+        // cache (the cached sets of finished processes) goes. A resting
+        // handle is a live process's state its client will resume, and
+        // discarding it fails that client's next call; only a policy that
+        // answers tier pressure may choose it.
         let candidates = registry
             .snapshot()
             .candidates_for(tier, keys)
             .into_iter()
-            .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
+            .filter(|c| {
+                ProcessId::from_str(&c.id)
+                    .is_ok_and(|id| !registry.handles.contains_key(&id) && !discarded.contains(&id))
+            })
             .collect();
         let chosen = pressure::choose(candidates, short);
         if chosen.is_empty() {
@@ -1525,6 +1533,33 @@ mod tests {
         scale: || None,
         fire: || Some((5120, 256)),
     };
+
+    /// With no policy, tier pressure never discards a resting handle: it is
+    /// a live process's state its client will resume (Mac Pro's restore-5
+    /// runs failed requests on "the default responder discards a working
+    /// set"). Only idle cache goes; a policy may still choose a handle.
+    #[test]
+    fn the_default_responder_never_discards_a_resting_handle() {
+        let mut registry = Registry::new(NO_CACHE);
+        let id = ProcessId::new_v4();
+        registry.apply(Event::HandleRested(
+            id,
+            crate::policy::Resting {
+                client: 1,
+                tenant: "t".into(),
+                session: None,
+                props: props(json!({})),
+                tokens: 4096,
+                folded: 0,
+                slots: 0,
+            },
+        ));
+        assert!(registry.snapshot().candidates_for(Tier::Device, &retention::Installed).iter().any(|c| c.id == id.to_string()),
+            "a resting handle is a candidate a policy may choose");
+        registry.pressure[Tier::Device.index()].short = 1 << 30;
+        let discarded = respond(&registry, &[Tier::Device], &retention::Installed);
+        assert!(!discarded.contains(&id), "the default responder discarded a live process's state");
+    }
 
     #[test]
     fn a_resting_handle_is_a_working_set_the_policy_reads_and_may_discard() {
