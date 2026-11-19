@@ -787,6 +787,14 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    /// Not stated yet, as [`Engine::copy_slots_landing`] is not.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        Err(Error::unsupported(
+            self.kind(),
+            "settle_copies (copy landing is not stated on Metal yet)",
+        ))
+    }
+
     /// Not stated yet: this engine's tier copies may still be reading their
     /// sources when `copy_slots` returns, and only its own completion (not a
     /// guess of `true`) may tell the runtime they can go back.

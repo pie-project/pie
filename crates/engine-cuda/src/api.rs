@@ -1039,6 +1039,13 @@ impl Engine for Cuda {
         }
     }
 
+    /// Waits, on the host, for every move between the device and the host
+    /// tier still landing; every other copy lands inside the call or in the
+    /// main stream's order, which a later fire or move stands behind.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_moves().map_err(fault)
+    }
+
     /// A move from the device to the host tier rides the swap stream and is
     /// still reading its device slots when the call returns: told landed
     /// once the stream has run it, by a waiter on an event recorded behind

@@ -186,6 +186,11 @@ impl FakeEngine {
 }
 
 impl Engine for FakeEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
     /// A test engine's copies complete inside the call: their sources are
     /// read by the time it returns.
     fn copy_slots_landing(

@@ -389,6 +389,12 @@ impl Shell {
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
     }
 
+    /// Waits, on the host, until every move between the device and the host
+    /// tier enqueued so far has landed.
+    pub fn settle_moves(&mut self) -> crate::Result<()> {
+        self.pools.settle_swaps()
+    }
+
     /// Calls `landed` once every move between the device and the host tier
     /// enqueued so far has landed, from a waiter of its own: nothing is
     /// enqueued on the swap stream for it, so no later move waits on it.

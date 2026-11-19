@@ -530,6 +530,13 @@ pub trait Engine: Send {
         let _ = sink;
     }
 
+    /// Returns once every copy submitted so far has read its sources and
+    /// written its destinations: what a move that gives back slots a copy
+    /// was still writing (an aborted restore's destinations) waits for, so
+    /// no late write reaches them once they are another's. Every engine
+    /// states it.
+    fn settle_copies(&mut self) -> Result<()>;
+
     /// Which atoms of the streamable weights
     /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
     /// fire on, and in which pool slots; the whole set each time. The

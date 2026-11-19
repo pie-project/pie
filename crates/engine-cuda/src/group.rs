@@ -660,6 +660,12 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_slots(&copy))
     }
 
+    /// Every rank's moves landed.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.each(|rank| rank.settle_copies())?;
+        Ok(())
+    }
+
     /// Landed once every rank's copy has: the ranks that answer it landed
     /// inside the call count down here, the others from their own sinks
     /// ([`Engine::on_landed`]), and whichever brings the count to nothing
