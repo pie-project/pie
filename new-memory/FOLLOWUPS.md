@@ -336,6 +336,31 @@ before any change, on memory-redesign 5963ceb17 / c1188a53d:
    answers `Ok(false)` (rocBLAS takes the product). No shape declines on c64
    or the beam load.
 
+## F28. wgpu has no safe GPU time per serving frame: a span-only frame timestamp mode
+
+wgpu's only GPU clock is `encode::profile_timing` (`engine-wgpu
+encode.rs:260`, `:531`), which gives every kernel its own timestamped compute
+pass and opens a 4096-query plane a frame (`device/ctx.rs:65`, `:837`
+`timestamp_slot`). The planes are read only in `Pending::wait`
+(`ctx.rs:1089` → `:738` `Inner::harvest`), and a serving frame lands
+asynchronously and is never waited, so nothing is harvested while serving.
+Turned on in a served Qwen3-0.6B on the Adreno 840, it read 0 ns for every
+kernel (452 kernels a step). At 8 lanes, submit reached 611 ms a step, the
+engine stalled for 70 s, and the phone rebooted. It stays a tune/check tool.
+
+What serving needs instead: one begin/end timestamp a frame
+(`write_timestamp` at the encoder's start and in `Frame::submit`,
+`ctx.rs:966`). The pair is resolved into a small ring and harvested from the
+landing callback (`on_submitted_work_done`), not from a wait, and adds no
+pass boundaries. That gives F25 a measured GPU term. Until then, the per-fire
+host split (encode, finish+submit, every `block_on_poll` by label) is the
+measure. At 1 lane on the Adreno 840 it reads ~27 ms a step: ~4.5 ms of host
+work (encode 1.6, finish+submit 2.0, the guest readback 0.75, 15 queue
+writes) in series with ~23 ms parked at the guest gate (GPU plus the guest
+pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
+wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
+boundary), not host time.
+
 ## F29. A parked role slot rounds up to whole kv slots of the slot file
 
 Where the load states no host tier (unified memory), a parked process's
@@ -351,18 +376,6 @@ role slots into one file slot (an offset inside it, aligned for the
 file's direct I/O) would cut that; measure the file's room under the M1 /
 M5 loads first. With guest scratch held only while a fire is in flight,
 only the small resident part (tables, rings) parks at all.
-
-role slots (Instance, Channel, Adapter) go down to the kv slot file, one
-kv list slot of the file a role slot (`Roles::prepare_park_down`,
-`DiskSlots`, CONTRACT-BC 22 in `Engine::copy_slots`): exact and with no
-file or budget of their own, but a 4 KiB Instance slot holds a whole kv
-page's slot (≈1–2 MiB), so 500 parked processes of 8 role slots take
-4000 of the file's slots. Packing several role slots into one file slot
-(an offset inside it, aligned for the file's direct I/O) or a role slot
-file per shape would cut that; measure the file's room under the M1 / M5
-loads first. A role slot larger than a kv slot is never moved to disk
-(it stays parked on the device and is no movable room).
-
 
 ## F31. Metal syncs and drains the host waits on (audits on 5355faa9a)
 Each turns depth into depth 1 or adds host work per step; CUDA does the same in queue order.
@@ -395,6 +408,48 @@ Each turns depth into depth 1 or adds host work per step; CUDA does the same in 
   pair. Cutting both to one set broke beam --verify (62 / 57 / 38 of 64, "read another beam's cells");
   cutting only the instance scratch kept 64 / 64 and halved it (11.4 -> 5.7 MB an instance, 45.6 -> 22.8 MB
   a beam instance).
+
+## F32. ROCm last-block (ticket) fusions: the split decode's fold and the norm epilogues, measured and dropped
+
+Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
+matrix-core decode (`kernels-rocm attn/paged.hip` `paged_decode_mfma`) folds
+its split itself instead of a second launch (`merge_partials`). Each work
+item draws its request's ticket for its kv head (`Ctx::tickets`) once its
+partial rows land past the L2 (sc1 stores, `s_waitcnt vmcnt(0)`, a relaxed
+atomic, as `linear/fp8.hip`'s split tiles), and the last to land folds the
+head group's rows (sc1 loads) and puts the ticket back to zero. An
+agent-scope fence in every block instead cost more than the node (greedy
++9%).
+
+Correct (beam gate 0 / 800 over the landing fix; attn_paged 9 / 9 with a
+seat past its bucket's first lane), but no faster on MI300X, Qwen3-0.6B:
+the 1-lane decode body 255 -> 227 nodes, `arm-bench` b1[c1:1] 1459 / 1484
+us a fire against the tip's 1476 / 1481, greedy 2.3 / 2.3 s and c64
+10.5 / 10.3 s on both (B-A-A-B). The serial tail spends what the 28 nodes
+saved (~45 us a step): one block per kv head folds all of its chunks after
+the rest finish, where `merge_partials` spreads rows x heads over the
+device. Folding the group's heads in parallel across waves might reach
+1-2% at best.
+
+The seat's first lane is read from the first work item
+(`request_indices[0]`; `sched_decode.rs` builds the table, every request
+taking one): a work item names its request by its lane, the split's rows by
+their place past the seat. Staged with the table each fire; a kernel
+argument would be baked into a captured body. The bucket's
+`Shape::lane_offset` is not the seat's (`Live::lane_offset`): counting the
+rows from it diverged 12-24% of beams.
+
+The same ticket tail does not pay for the residual + norm epilogues of the
+o-proj and down GEMMs either (56 nodes a step), measured before building:
+a hipcc microbench of 28 layers of a 1-row GEMV (N 1024, K 2048 / 3072,
+eight rows a block) then `residual_add_rmsnorm` as its own launch, against
+the GEMV whose last block to land (sc1 partials, a relaxed atomic ticket)
+adds the residual and norms the row: 7.0 -> 9.1-9.6 us a layer at K 2048,
+8.4 -> 10.2-10.7 at K 3072 (the block sums as one float atomic or as sc1
+partials summed by the last block). On MI300X a ticket tail (stores through
+the L2, the atomic's round trip, reads past the L2) costs more than the
+~1.6 us node it removes. Fusions that cut nodes there want one block to own
+the whole row (no tail), not a last-block reduction.
 
 ## F33. Metal's few-row dense matmul on the M1: 4 rows ≈ 1.38× one row
 The user's rule is that a beam-4 step costs about what a single greedy step costs. On the M1 Max

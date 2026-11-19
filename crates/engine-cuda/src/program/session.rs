@@ -40,6 +40,9 @@ struct Output {
     width: u32,
     row_stride: u32,
     row_offset: u32,
+    /// The rows from `row_offset` on that are the lane's own: a read past
+    /// them is another lane's rows, or past the plane.
+    rows: u32,
 }
 
 /// [`Session::move_seats`] over `outputs`.
@@ -471,8 +474,9 @@ impl Session {
         Some((src, native))
     }
 
-    /// Points the program's reads of output `name` for `lane` at `base`;
-    /// an output the program does not read is let go.
+    /// Points the program's reads of output `name` for `lane` at `base`,
+    /// `rows` rows from `row_offset` on the lane's own; an output the
+    /// program does not read is let go.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
@@ -483,6 +487,7 @@ impl Session {
         width: u32,
         row_stride: u32,
         row_offset: u32,
+        rows: u32,
     ) -> Result<()> {
         let output = Output {
             base,
@@ -490,6 +495,7 @@ impl Session {
             width,
             row_stride,
             row_offset,
+            rows,
         };
         match self
             .outputs
@@ -522,10 +528,13 @@ impl Session {
         self.extents
     }
 
+    /// Stages a fire at `at`; `rows_read` is what its stages read of each
+    /// output, by name, lane and rows.
     pub fn stage(
         &mut self,
         compiled: &Compiled,
         plan: &ExecPlan,
+        rows_read: &[(&str, u32, u32)],
         wave: &mut Wave,
         at: Attach,
     ) -> Result<Launched> {
@@ -537,6 +546,9 @@ impl Session {
         stages_and_plans_agree(compiled)?;
         if at != Attach::Prologue {
             self.outputs_bound(plan)?;
+            if let Some(unheld) = self.unheld_rows(rows_read) {
+                return Ok(Launched::Refused(Fired::Faulted(unheld)));
+            }
         }
         if let Some(blocked) = self.blocked_at(plan, at) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
@@ -608,6 +620,33 @@ impl Session {
         Ok(())
     }
 
+    /// The first read of an output past the rows its seats hold, refused by
+    /// name: a seat holds its lane's own rows, and an output read a row a
+    /// lane (`row_sets`) holds a row for each lane seated from lane 0.
+    fn unheld_rows(&self, rows_read: &[(&str, u32, u32)]) -> Option<String> {
+        let seat = |name: &str, lane: u32| {
+            self.outputs
+                .iter()
+                .find(|((n, at), _)| n == name && *at == lane)
+                .map(|(_, output)| output)
+        };
+        rows_read.iter().find_map(|&(name, lane, need)| {
+            let have = if lane == 0 && self.row_sets.iter().any(|set| set == name) {
+                (0..)
+                    .take_while(|&at| seat(name, at).is_some_and(|output| output.rows > 0))
+                    .count() as u64
+            } else {
+                seat(name, lane).map_or(0, |output| u64::from(output.rows))
+            };
+            (u64::from(need) > have).then(|| {
+                format!(
+                    "output `{name}` of lane {lane} is read {need} rows, and the fire seated \
+                     {have} of the lane's own"
+                )
+            })
+        })
+    }
+
     pub fn take_lane(&mut self, stages: Vec<&mut Prepared>, scratch: u64) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
@@ -672,6 +711,7 @@ impl Session {
                     output.width,
                     output.row_stride,
                     output.row_offset,
+                    output.row_offset.saturating_add(output.rows),
                 )?;
             }
         }
@@ -1117,6 +1157,7 @@ mod tests {
             width: 8,
             row_stride: 8,
             row_offset: 0,
+            rows: 1,
         };
         let mut outputs = vec![
             (("scores".to_string(), 0), seat(1000)),

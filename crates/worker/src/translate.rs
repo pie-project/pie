@@ -162,6 +162,7 @@ fn build_model(
                 has_lora: g.caps.has_lora,
                 adapter_attachments: g.caps.adapter_attachments,
                 rs_snapshots: g.caps.rs_snapshots,
+                guest_cost: g.caps.guest_cost,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
                 inputs: g.caps.inputs.clone(),

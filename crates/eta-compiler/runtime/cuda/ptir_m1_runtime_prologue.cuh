@@ -57,12 +57,16 @@ struct M1OpParams {
   m1_u32 bool_storage;
   m1_u32 intrinsic_row_stride;
   m1_u32 intrinsic_row_offset;
+  // The row an intrinsic's reads stop short of: rows past the lane's own
+  // are another lane's, or past the plane.
+  m1_u32 intrinsic_rows;
+  m1_u32 reserved;
   m1_u64 rng_seed;
 };
 
 static_assert(sizeof(M1Status) == 16, "M1Status ABI");
 static_assert(sizeof(M1ValueDesc) == 36, "M1ValueDesc ABI");
-static_assert(sizeof(M1OpParams) == 88, "M1OpParams ABI");
+static_assert(sizeof(M1OpParams) == 96, "M1OpParams ABI");
 
 struct M1ArgmaxCandidate {
   float value;
@@ -324,12 +328,16 @@ __device__ __forceinline__ bool m1_intrinsic_row_table(m1_u32 mode) {
   return mode == 2u || mode == 4u;
 }
 
+// A row at `rows` or past it is not the lane's: it reads as zero, and
+// nothing behind it is touched.
 __device__ __forceinline__ float m1_intrinsic_row_load(
     const m1_u8* input,
     m1_u64 row,
     m1_u32 column,
     m1_u32 stride,
-    m1_u32 mode) {
+    m1_u32 mode,
+    m1_u32 rows) {
+  if (row >= (m1_u64)rows) return 0.0f;
   if (!m1_intrinsic_row_table(mode))
     return m1_intrinsic_load(
         input, row * (m1_u64)stride + column, mode);
@@ -449,7 +457,9 @@ __device__ __forceinline__ void m1_store4_b(m1_u8* data, m1_u32 index4, uchar4 v
 }
 
 __device__ __forceinline__ float4 m1_intrinsic_row_load4(
-    const m1_u8* input, m1_u64 row, m1_u32 column, m1_u32 stride, m1_u32 mode) {
+    const m1_u8* input, m1_u64 row, m1_u32 column, m1_u32 stride, m1_u32 mode,
+    m1_u32 rows) {
+  if (row >= (m1_u64)rows) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
   if (mode == 0u) {
     const m1_u64 index = row * (m1_u64)stride + column;
     return reinterpret_cast<const float4*>(input + index * 4u)[0];
@@ -470,8 +480,8 @@ __device__ __forceinline__ float4 m1_intrinsic_row_load4(
 }
 
 __device__ __forceinline__ bool m1_intrinsic_row_vectorable(
-    const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
-  if ((stride & 3u) != 0u) return false;
+    const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode, m1_u32 rows) {
+  if ((stride & 3u) != 0u || row >= (m1_u64)rows) return false;
   if (m1_intrinsic_row_table(mode)) {
     const m1_u64 address = reinterpret_cast<const m1_u64*>(input)[row];
     return (address & (mode == 4u ? 15u : 7u)) == 0u;

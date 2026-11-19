@@ -3703,23 +3703,29 @@ impl Shell {
     }
 
     /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
+    /// The step's prologues in one command buffer and one wait
+    /// (`Programs::fire_batched`): their status and the cells they put are
+    /// read on the host before the forward is encoded (each prologue's
+    /// verdict, the descriptor ports and input feeds), so the wait stays,
+    /// once a step rather than once a region an instance.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        for attached in attachments.iter().filter(|a| !a.adapter_only) {
-            if !self.programs.prologue_runs(attached.instance) {
-                continue;
-            }
-            match self
-                .programs
-                .fire(&self.device, attached.instance, Stage::Prologue)?
-            {
+        let ids: Vec<engine::InstanceId> = attachments
+            .iter()
+            .filter(|a| !a.adapter_only && self.programs.prologue_runs(a.instance))
+            .map(|a| a.instance)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for (instance, fired) in self.programs.fire_batched(&self.device, &ids, Stage::Prologue)? {
+            match fired {
                 crate::Fired::Committed => {}
                 other => {
                     return Err(Fault::program(
                         "serve::prologue",
                         format!(
-                            "instance {}'s prologue did not commit ({other:?}), so the \
-                             forward has no cells to read",
-                            attached.instance
+                            "instance {instance}'s prologue did not commit ({other:?}), so the \
+                             forward has no cells to read"
                         ),
                     ));
                 }
@@ -4627,12 +4633,11 @@ impl Shell {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
-            self.drain()?;
-        }
-        for record in beginning.iter().filter(|_| !self.warming) {
-            self.pools.clear(record)?;
-        }
+        // A fresh record is zeroed by the fire that first reads it, at the
+        // head of its own command buffer (`walk`): in queue order behind the
+        // frames before it. Zeroed on the host, it drained every frame in
+        // flight first, and each hybrid / SSM admission ran at depth 1.
+        let zeroed: Vec<Vec<u32>> = if self.warming { Vec::new() } else { beginning };
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
         let slot_of_row: Vec<i32> = row_bands.concat();
@@ -5242,6 +5247,7 @@ impl Shell {
         };
 
         Ok(Prepared {
+            zeroed,
             capture_rows,
             ends,
             lanes,
@@ -5569,6 +5575,13 @@ impl Shell {
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
         }
+        if !dry && !p.zeroed.is_empty() {
+            for record in &p.zeroed {
+                self.pools.clear_into(&mut frame, record)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         self.feed_inputs(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         {
@@ -5716,6 +5729,9 @@ pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 pub struct Prepared<'a> {
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
+    /// The fresh state records its lanes begin, zeroed at the head of its
+    /// command buffer.
+    zeroed: Vec<Vec<u32>>,
     /// What the fire reports where it settles: each port-placed reporting
     /// lane's written end.
     ends: Vec<engine::KvWrites>,

@@ -1897,6 +1897,21 @@ impl Pools {
 
     /// Zeroes the record whose physical pieces are `record`: a fresh lane's
     /// state.
+    /// A fresh record zeroed on the device in `frame` ([`Self::clear`]'s, in
+    /// queue order): the fire that first reads it zeroes it first, and no
+    /// frame in flight is drained for it.
+    pub fn clear_into(&self, frame: &mut crate::device::ctx::Frame, record: &[u32]) -> Result<()> {
+        if !self.has_state() {
+            return Ok(());
+        }
+        let fixed = *self.shape(FIXED)?;
+        for &piece in record {
+            let at = self.physical_slot_at(&fixed, piece)?;
+            self.pool.zero_in(frame, at, fixed.slot_bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self, record: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());

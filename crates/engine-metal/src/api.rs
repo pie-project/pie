@@ -695,6 +695,9 @@ impl Engine for Metal {
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // Metal states no bound on one submission yet
+            // (`crate::rates::at_load`).
+            guest_cost: engine::GuestCost::default(),
         };
 
         // Every pipeline the load's rungs dispatch is built now, before

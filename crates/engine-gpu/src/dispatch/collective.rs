@@ -15,6 +15,14 @@ impl<B: Backend> Run<'_, B> {
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_slang::Error> {
         let t = |id| self.tensor(id);
         match op {
+            Collective::AllReduce { buf, .. } if capture_row(self.values(), *buf) => {
+                Err(kernels_slang::Error::Backend {
+                    op: "collective.all_reduce",
+                    detail: "the ranks' score rows lie in each capturing lane's score room, \
+                             not in the arena, and this backend has no sum through it yet"
+                        .to_string(),
+                })
+            }
             Collective::AllReduce { buf, buf_out: _ } => band::all_reduce(self.ctx, t(*buf)),
             Collective::AllGather { x, y } => band::all_gather(self.ctx, t(*x), t(*y)),
             Collective::ReduceScatter { x, y } => band::reduce_scatter(self.ctx, t(*x), t(*y)),
@@ -24,4 +32,13 @@ impl<B: Backend> Run<'_, B> {
             Collective::Combine { .. } => Err(kernels_slang::Error::Unsupported { op: "combine" }),
         }
     }
+}
+
+/// Whether `id` is a capturing lane's row (`Dim::Capturing`), which no arena
+/// value holds.
+fn capture_row(values: &[poem_ir::ValueDecl], id: poem_ir::ValueId) -> bool {
+    matches!(
+        &values[id.0 as usize].ty,
+        poem_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&poem_ir::Dim::Capturing)
+    )
 }
