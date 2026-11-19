@@ -1,8 +1,8 @@
 //! Dense matmuls (`linear.matmul`, `linear.matmul` over a bf16 weight, and
 //! an f32 activation's lane form). SPIR-V fires `kernels/linear/gemm.slang`
 //! (the vector kernels where the rung's tactic takes them, else the tiled
-//! kernel or its cooperative-matrix tier; `gemm_register.slang`'s where
-//! the rows fill its 256-row tile without one) and `gemm_lane.slang` for f32
+//! kernel or its cooperative-matrix tier; `gemm_register.slang`'s from 96
+//! rows without one) and `gemm_lane.slang` for f32
 //! activations; WGSL fires `gemm_pairs.slang`, which lands column pairs as
 //! words (its vector kernel at the subgroup tier where the device has one).
 
@@ -35,15 +35,12 @@ pub fn vector_rows(rows: u32) -> u32 {
 
 const REGISTER: &str = "linear/gemm_register.slang";
 
-/// The rows one register tile computes at either form (256 lanes over
-/// `cols / per` columns, 8 rows a lane): a matmul takes it only where its
-/// rows fill one, else SPIR-V's 32 x 32 tile serves them, so no fire pays a
-/// tile its rows leave mostly idle.
-const REGISTER_ROWS: u32 = 256;
+/// Fewer rows leave most of a register tile idle; SPIR-V's 32 x 32 tile
+/// serves them.
+const RT_MIN_ROWS: u32 = 96;
 
-/// The rows WGSL's wide tile computes: a matmul takes it only where its
-/// rows fill one, else the 16-row tile serves them.
-const PAIRS_WIDE_ROWS: u32 = 64;
+/// Rows below this take WGSL's 16-row tile.
+const NARROW_MAX_ROWS: u32 = 48;
 
 /// How an engine runs dense matmuls on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +140,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
         Target::Spirv if tactic.tier == Tier::Coopmat => Kernel::Coopmat,
         // Sixty-four columns a tile at eight a lane, or thirty-two at four
         // when that leaves none idle.
-        Target::Spirv if m >= REGISTER_ROWS && k.is_multiple_of(16) => {
+        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
             if n.is_multiple_of(32) && !n.is_multiple_of(64) {
                 Kernel::Register { cols: 32, per: 4 }
             } else {
@@ -154,7 +151,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
         Target::Wgsl if tactic.vector > 0 => Kernel::PairsGemv {
             rows: vector_rows(tactic.vector),
         },
-        Target::Wgsl if m < PAIRS_WIDE_ROWS => Kernel::Pairs16,
+        Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
         Target::Wgsl => Kernel::Pairs64,
     }
 }
@@ -202,7 +199,7 @@ pub fn act_x_wt(
 /// The rows at which the kernel a tiled projection takes changes:
 /// [`kernel`]'s own thresholds, so its answers at these are every answer it
 /// has.
-const ROW_BREAKS: [u32; 3] = [1, PAIRS_WIDE_ROWS, REGISTER_ROWS];
+const ROW_BREAKS: [u32; 3] = [1, NARROW_MAX_ROWS, RT_MIN_ROWS];
 
 /// Every kernel a projection of `n` columns over a contraction of `k`
 /// takes at some row count under `tactic`'s tier, vector or tiled: which
@@ -262,7 +259,7 @@ fn kernel(
         }
         // Sixty-four columns a tile at eight a lane, or thirty-two at four
         // when that leaves none idle.
-        Target::Spirv if m >= REGISTER_ROWS && k.is_multiple_of(16) => {
+        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
             let (entry, cols, per) = if n.is_multiple_of(32) && !n.is_multiple_of(64) {
                 ("linear_gemm_register_bn_32_bf16", 32, 4)
             } else {
@@ -307,7 +304,7 @@ fn kernel(
                     })
                     .groups([1, n.div_ceil(8), m.div_ceil(rows)])
                     .group([32, 8, 1])
-            } else if m < PAIRS_WIDE_ROWS {
+            } else if m < NARROW_MAX_ROWS {
                 Fire::at(PAIRS, "linear_gemm_pairs_tiled_bm_16_bf16")
                     .groups([n.div_ceil(64), m.div_ceil(16), 1])
                     .group([16, 16, 1])
@@ -460,25 +457,19 @@ mod tile_tests {
         }
     }
 
-    /// A tile wider than the smallest of its family is taken only where the
-    /// rows fill one: no row count pays a tile it leaves mostly idle, and
-    /// the rows a matmul computes never fall as its rows grow.
+    /// The rows a matmul computes never fall as its rows grow.
     #[test]
-    fn a_wide_tile_is_taken_only_where_the_rows_fill_it() {
+    fn the_padded_rows_grow_with_the_rows() {
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Coopmat] {
                 let tactic = Tactic { tier, vector: 0 };
-                for (n, k) in [(1024, 1024), (96, 4096), (4096, 1000)] {
+                for width in [1024, 96, 4096] {
                     let mut computed = 0;
                     for m in 1..=4096 {
-                        let tile = tile_for(target, tactic, m, n, k);
-                        if matches!(tile, Kernel::Register { .. } | Kernel::Pairs64) {
-                            assert!(m >= tile.row_tile(), "{target:?} {m} rows take {tile:?}");
-                        }
-                        let padded = padded_rows(target, tactic, m, n);
+                        let padded = padded_rows(target, tactic, m, width);
                         assert!(
                             padded >= computed,
-                            "{target:?} {tier:?}: {m} rows compute {padded}, fewer than {computed}"
+                            "{target:?} {tier:?}: {m} rows compute {padded}"
                         );
                         computed = padded;
                     }

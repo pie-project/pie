@@ -1148,10 +1148,10 @@ impl<B: Serve> Shell<B> {
                 .map_or(state, |budget| budget.min(state))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
         };
-        // The dense tactic at each rung to the asked top (every power of
-        // two of rows, then the top): the vector or the tiled kernels,
-        // whichever the estimate weighs faster at the rung's rows. A matmul
-        // runs its rung's, the narrowest that holds its rows.
+        // The dense tactic to the asked top (rungs: every power of two of
+        // rows, then the top): the vector or the tiled kernels, whichever the
+        // estimate weighs faster, one a rung where fires are recorded a rung
+        // (`crate::dense`), else at each fire's rows.
         let dense = {
             let top = budgets.tokens.max_tokens.max(1);
             let mut rungs = engine::memory::rungs(1, top);
@@ -1171,6 +1171,7 @@ impl<B: Serve> Shell<B> {
                 |rows| tuning.gemm(tier, rows),
                 &device_profile.rates(),
                 counts,
+                B::RECORDS,
             )
             .map_err(|key| {
                 Fault::Residency(format!(
@@ -1181,7 +1182,11 @@ impl<B: Serve> Shell<B> {
             // Said once, by the load that serves: its naming walk weighs the same.
             if !B::NAMES {
                 for w in &weighed {
-                    tracing::info!("dense matmul {w}");
+                    if B::RECORDS {
+                        tracing::info!("dense matmul {w}");
+                    } else {
+                        tracing::info!("dense matmul {w}; eager, each fire at its own rows");
+                    }
                 }
             }
             std::sync::Arc::new(dense)
