@@ -609,18 +609,34 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // the bound fire, which the square curve reads up to twice as fast as
     // they run (`profile::fire::Rates::attn_tflops_by_rows_keys`). A point
     // past the bound is dropped by name, as every rate's is.
+    //
+    // A point's first fire is estimated from the nearest shape measured: the
+    // point before it at these rows, else these keys at the rows before
+    // (fewer rows run slower, so it is estimated long), else not at all
+    // (estimated from its own frames as they land). Never from the square
+    // curve: a few rows against a prefix run several times slower than a
+    // square of the keys (128 rows ran at an eighth of it on an RTX), and a
+    // first fire estimated that far short would count that error into the
+    // margin as the device's.
     let mut prefixed: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
     if max_submit.is_some() {
-        let mut last = attn.last().map(|&(_, rate)| rate);
         for rows in PREFIX_ROWS {
-            let mut curve = Vec::new();
+            let mut curve: Vec<(u32, f64)> = Vec::new();
             for keys in engine::rates::ATTN_KEYS.into_iter().filter(|&k| k > rows) {
                 let shape = engine::rates::AttnShape {
                     rows,
                     keys,
                     ..engine::rates::ATTN_SHAPE
                 };
-                let estimate = at_rate(shape, last);
+                let nearest = curve.last().map(|&(_, tflops)| tflops * 1e3).or_else(|| {
+                    prefixed.last().and_then(|(_, before)| {
+                        before
+                            .iter()
+                            .find(|&&(k, _)| k == keys)
+                            .map(|&(_, tflops)| tflops * 1e3)
+                    })
+                });
+                let estimate = at_rate(shape, nearest);
                 let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
                 rig.release();
                 let Some(rate) = dropped(&rig, rate, say)? else {
@@ -630,7 +646,6 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                     "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s",
                     rate / 1e3
                 ));
-                last = Some(rate);
                 curve.push((keys, rate / 1e3));
             }
             if !curve.is_empty() {
