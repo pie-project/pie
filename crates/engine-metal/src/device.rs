@@ -10,7 +10,7 @@ mod models;
 pub mod sparse;
 
 pub use alloc::Buffer;
-pub use ctx::{Context, CoresFrom, Pending, present, reservations};
+pub use ctx::{Context, CoresFrom, Pending, fail_next_frame, present, reservations};
 pub use elastic::Arena as ElasticArena;
 #[cfg(target_vendor = "apple")]
 pub use elastic::Elastic;

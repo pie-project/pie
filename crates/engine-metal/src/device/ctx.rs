@@ -899,6 +899,7 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             let flushed = std::mem::take(self.flushed.get_mut());
+            let injected = FAIL_NEXT.with(|next| next.replace(false));
             if let Some(on_done) = on_done {
                 let heads = Flushed(flushed.clone());
                 let handler = block2::RcBlock::new(
@@ -914,7 +915,8 @@ impl Frame {
                             .iter()
                             .find_map(|head| head.error())
                             .or_else(|| buffer.error());
-                        on_done(refused.map(|error| error.localizedDescription().to_string()));
+                        let refused = refused.map(|error| error.localizedDescription().to_string());
+                        on_done(if injected { Some(INJECTED.to_string()) } else { refused });
                     },
                 );
                 // SAFETY: `addCompletedHandler:` copies the block, so the
@@ -929,6 +931,7 @@ impl Frame {
             Ok(Pending {
                 buffer: self.commit_buffer(),
                 flushed,
+                injected,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -965,9 +968,26 @@ pub struct Pending {
     /// The heads a flushed frame committed ahead of `buffer`.
     #[cfg(target_vendor = "apple")]
     flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Answers as failed whatever the device did ([`fail_next_frame`]).
+    #[cfg(target_vendor = "apple")]
+    injected: bool,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
+}
+
+thread_local! {
+    static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+const INJECTED: &str = "a failure injected by `fail_next_frame`";
+
+/// Answers the next frame this thread commits with a completion handler
+/// ([`Frame::commit_async`]) as failed, to its handler and to its
+/// [`Pending::wait`], whatever the device did: tests of what a failed
+/// command buffer leaves, which a real device fault can't be made to give.
+#[doc(hidden)]
+pub fn fail_next_frame() {
+    FAIL_NEXT.with(|next| next.set(true));
 }
 
 // SAFETY: what a `Pending` does to its command buffer is `status`, `error`
@@ -1020,6 +1040,12 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
+            if self.injected {
+                return Err(Fault::Device {
+                    call: "waitUntilCompleted",
+                    why: INJECTED.to_string(),
+                });
+            }
             for buffer in self.flushed.iter().chain([&self.buffer]) {
                 if let Some(error) = buffer.error() {
                     return Err(Fault::Device {

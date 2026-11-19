@@ -2952,7 +2952,13 @@ impl Shell {
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
-        self.fence_instances(&[instance_id])?;
+        // A close goes through whatever its fence met: a frame of the
+        // instance whose buffer failed has let its pass go at that harvest,
+        // and nothing of it is left to wait for.
+        // Each refusal is a harvested frame, so this ends.
+        while let Err(fault) = self.fence_instances(&[instance_id]) {
+            tracing::warn!(instance = %instance_id, %fault, "closing an instance past a failed frame");
+        }
         self.programs.close_instance(instance_id)?;
         Ok(())
     }
@@ -3333,6 +3339,22 @@ impl Shell {
         });
         if let Err(fault) = waited {
             self.arms.give(flight.arm);
+            // Nothing the buffer ran committed: each attached instance's
+            // pass is let go, so the instance stands where it stood before
+            // the fire and its next fire stages afresh (an airborne pass
+            // left set refused every later staging and fire of it).
+            for (instance, _) in &flight.attached {
+                self.programs.abandon_launched(*instance);
+            }
+            self.forgotten.remove(&flight.seq);
+            if flight.told.is_none() {
+                // The completion handler told the sink the step was lost:
+                // whoever harvests next (another submit's staging, a close's
+                // fence) is not the frame that failed and is not refused
+                // for it.
+                tracing::warn!(seq = flight.seq, %fault, "a frame's command buffer failed; its step was told lost");
+                return Ok(());
+            }
             return Err(match fault {
                 Fault::Device { call, why } => Fault::Device {
                     call,
