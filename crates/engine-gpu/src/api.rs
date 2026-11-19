@@ -230,6 +230,8 @@ pub struct Gpu<B: Host> {
     next_frame: u64,
 
     pub sink: Option<engine::CompletionSink>,
+    /// Where a slot copy still on the queue is told landed.
+    landed: Option<engine::LandingSink>,
 
     pending: Option<(FrameId, Vec<PendingStep>)>,
 
@@ -265,6 +267,7 @@ impl<B: Host> Gpu<B> {
             next_fire: 1,
             next_frame: 1,
             sink: None,
+            landed: None,
             pending: None,
             programs: B::Programs::default(),
             adapters: BTreeMap::new(),
@@ -945,19 +948,26 @@ where
             .map_err(refusal)
     }
 
-    /// Not stated yet: this engine's tier copies may still be reading their
-    /// sources when `copy_slots` returns, and only its own completion (not a
-    /// guess of `true`) may tell the runtime they can go back.
+    /// A copy to or from the host tier or the slot file has read its
+    /// sources when the call returns (the shell waits its frame out); a copy
+    /// within the device is still on the queue, told landed from its frame's
+    /// fence (`Shell::copy_slots_landing`).
     fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        let _ = (copy, token);
-        Err(Error::unsupported(
-            self.kind(),
-            "copy_slots_landing (copy landing is not stated on engine-gpu yet)",
-        ))
+        let landed = self
+            .landed
+            .clone()
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed)
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
