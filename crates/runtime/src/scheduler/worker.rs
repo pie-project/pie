@@ -71,6 +71,21 @@ pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
     }
 }
 
+/// `pid` is blocked on the planner or a store (a grant, its restore, room
+/// for a bind, a segment, a fire span, a rung): until it is through it
+/// submits nothing, so no frame on any engine waits on its lanes, and its
+/// complete frames go at once ([`super::frame::FramePolicy::on_owner_waits`]).
+/// Its next submit brings its lanes back.
+pub(crate) fn notify_owner_blocked(pid: ProcessId) {
+    #[cfg(test)]
+    OWNERS_BLOCKED.lock().unwrap().push(pid);
+    broadcast(|| SchedulerItem::OwnerWaits(pid));
+}
+
+/// The owners told blocked, in order; for a test.
+#[cfg(test)]
+pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }

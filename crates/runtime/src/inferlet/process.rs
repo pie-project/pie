@@ -214,6 +214,24 @@ impl WaitEpisode {
 /// the wait ends, with its duration: what a stall on the way from a process
 /// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
 /// it only awaits.
+/// Whether a wait stage is one on the planner or a store (its process
+/// blocked until room, a grant, its restore, a segment, a fire span or a
+/// rung comes), not a request the engine's lane answers on its own.
+pub(crate) fn blocks_on_planner(stage: &str) -> bool {
+    matches!(
+        stage,
+        "plan: the planner's grant"
+            | "plan: resident again"
+            | "bind: resident again"
+            | "bind: room for its guest state"
+            | "bind: a segment for its guest state"
+            | "bind: the program's fire span"
+            | "enqueue: the activation rung"
+            | "bind: its pair's move"
+            | "seat the lanes"
+    )
+}
+
 pub(crate) async fn said<F: std::future::Future>(
     stage: &'static str,
     pid: ProcessId,
@@ -223,6 +241,17 @@ pub(crate) async fn said<F: std::future::Future>(
         return step.await;
     }
     tokio::pin!(step);
+    // A wait on the planner or a store that does not end at once: the
+    // process is blocked there, and no frame waits on its lanes meanwhile
+    // (the soaks' self-cycle: a frame held for lanes whose owners waited on
+    // grants, an eviction waiting on that frame's fire, the grants on the
+    // eviction). One that ends at once (a grant at hand) parks nothing.
+    if blocks_on_planner(stage) {
+        if let std::task::Poll::Ready(output) = futures::poll!(step.as_mut()) {
+            return output;
+        }
+        crate::scheduler::worker::notify_owner_blocked(pid);
+    }
     let started = Instant::now();
     let mut episode = WaitEpisode::default();
     loop {
@@ -1292,5 +1321,65 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
         assert_eq!(result.unwrap().unwrap(), Err("closed".to_string()));
         assert!(!RESTART_ALIAS.read().unwrap().contains_key(&pid));
+    }
+}
+
+#[cfg(test)]
+mod blocked_tests {
+    use super::*;
+
+    /// Every wait on the planner or a store parks its process's lanes once
+    /// it blocks (no frame waits on them, its complete frames go at once):
+    /// one case per wait kind, each a wait that does not end at once. A
+    /// wait that ends at once (a grant at hand) parks nothing, and a lane
+    /// request (the engine answering on its own) never does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_wait_on_the_planner_or_a_store_parks_its_process_once_it_blocks() {
+        use crate::scheduler::frame::FramePolicy;
+        let kinds = [
+            "plan: the planner's grant",
+            "plan: resident again",
+            "bind: resident again",
+            "bind: room for its guest state",
+            "bind: a segment for its guest state",
+            "bind: the program's fire span",
+            "enqueue: the activation rung",
+            "bind: its pair's move",
+            "seat the lanes",
+        ];
+        for stage in kinds {
+            assert!(blocks_on_planner(stage), "{stage}");
+            let pid = ProcessId::new_v4();
+            // It blocks: told at once, before any clock.
+            let waiting = tokio::spawn(said(stage, pid, std::future::pending::<()>()));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&pid),
+                "{stage}: a blocked wait parks its process"
+            );
+            waiting.abort();
+            // And its complete frame on a lane that fired goes at once.
+            assert!(
+                FramePolicy::parked_owner_frame_goes_at_once(pid),
+                "{stage}: its complete frame waits on no boundary"
+            );
+            // A wait that ends at once parks nothing.
+            let quick = ProcessId::new_v4();
+            said(stage, quick, std::future::ready(())).await;
+            assert!(!crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&quick));
+        }
+        // Evicted while its guest is between waits (in no said() at all):
+        // the eviction's suspension parks its lanes, and its complete frame
+        // goes at once all the same (the od-2 dump: its bind wait had ended
+        // 6 s before its eviction began).
+        assert!(
+            FramePolicy::parked_owner_frame_goes_at_once_by(ProcessId::new_v4(), true),
+            "suspended between waits: its complete frame waits on no boundary"
+        );
+        for request in ["bind", "bind: the lane's bind", "bind: register the program"] {
+            assert!(!blocks_on_planner(request), "{request} is the engine's lane, no wait on the planner");
+        }
     }
 }

@@ -673,6 +673,53 @@ impl FramePolicy {
     /// the process submits nothing, so a frame does not wait on its lanes:
     /// they are parked as a suspension's are, and come back with its next
     /// submit ([`Self::record_arrival`]).
+    /// For a test of the waits that park an owner: `owner`'s lane fired at
+    /// a boundary another lane holds open, its next frame complete; told
+    /// it waits, its frame goes at once.
+    #[cfg(test)]
+    pub(crate) fn parked_owner_frame_goes_at_once(owner: ProcessId) -> bool {
+        Self::parked_owner_frame_goes_at_once_by(owner, false)
+    }
+
+    /// As [`Self::parked_owner_frame_goes_at_once`], the owner parked by
+    /// its suspension (`suspend`: an eviction, its guest between waits)
+    /// rather than by a wait of its own.
+    #[cfg(test)]
+    pub(crate) fn parked_owner_frame_goes_at_once_by(owner: ProcessId, suspend: bool) -> bool {
+        let mut policy =
+            Self::new(1, 64, 4096, None).with_submit_deadline(std::time::Duration::from_secs(86_400));
+        let other = ProcessId::new_v4();
+        let stamp = |lane, seq| FrameStamp {
+            lane,
+            seq,
+            slot: 0,
+            fires: 1,
+        };
+        policy.on_fire_enqueued(stamp(owner, 0), Some(owner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(other, 0), Some(other), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        let now = Instant::now();
+        let _ = policy.plan_dispatch(&queued, &HashSet::new(), false, now);
+        policy.on_frame_posted([owner, other], now);
+        policy.on_frame_retired([owner, other]);
+        policy.on_fire_enqueued(stamp(owner, 1), Some(owner), 3, 1, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        let held = matches!(
+            policy.plan_dispatch(&queued, &HashSet::new(), false, now),
+            FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
+        );
+        if suspend {
+            policy.on_process_suspend(owner);
+        } else {
+            policy.on_owner_waits(owner);
+        }
+        let goes = matches!(
+            policy.plan_dispatch(&queued, &HashSet::new(), false, now),
+            FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
+        );
+        !held && goes
+    }
+
     pub fn on_owner_waits(&mut self, owner: ProcessId) {
         self.park_owner(owner);
     }
@@ -1527,6 +1574,110 @@ mod tests {
         }
     }
 
+
+    /// Shape (2) as a seeded schedule: lanes submit frames in rounds, some
+    /// owners then stop submitting because they wait on the planner (their
+    /// lanes stay awaited, holding the boundary open), and some owners are
+    /// parked (suspended, or waiting at a bind) with a complete frame
+    /// queued. After every plan, no parked owner's complete frame is left
+    /// undispatched: what waits on its fires (an eviction's wait on their
+    /// leases, a bind's settle) waits only on work the engine has. Failing
+    /// seeds print their schedules.
+    #[test]
+    fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        let mut failures = Vec::new();
+        for seed in 0..1000u64 {
+            let mut rng = Rng(seed);
+            // One frame or two in flight per lane (the dumps' k=2).
+            let k = 1 + rng.below(2) as usize;
+            let mut policy = FramePolicy::new(k, 64, 4096, None)
+                .with_submit_deadline(Duration::from_secs(86_400));
+            let lanes: Vec<ProcessId> = (0..2 + rng.below(4)).map(|_| pid()).collect();
+            let mut seq = vec![0u64; lanes.len()];
+            let mut last = vec![0u64; lanes.len()];
+            let mut next_id = 1u64;
+            let mut queued: Vec<u64> = Vec::new();
+            // 0 submitting, 1 waiting on the planner (silent, awaited), 2 parked.
+            let mut state = vec![0u8; lanes.len()];
+            let mut parked_fires: Vec<u64> = Vec::new();
+            let mut schedule = vec![format!("k={k} lanes={}", lanes.len())];
+            let mut failed = None;
+            for round in 0..10 {
+                for (at, &lane) in lanes.iter().enumerate() {
+                    if state[at] != 0 {
+                        continue;
+                    }
+                    policy.on_fire_enqueued(stamp(lane, seq[at], 0, 1), Some(lane), next_id, 1, 1);
+                    queued.push(next_id);
+                    last[at] = next_id;
+                    next_id += 1;
+                    seq[at] += 1;
+                }
+                // Some owners change state after submitting this round.
+                for at in 0..lanes.len() {
+                    if state[at] == 0 && rng.below(5) == 0 {
+                        state[at] = 1;
+                        schedule.push(format!("r{round}: lane {at} waits on the planner"));
+                    } else if state[at] == 0 && rng.below(6) == 0 {
+                        state[at] = 2;
+                        // Its last-submitted fire, if still queued, is complete.
+                        if queued.contains(&last[at]) {
+                            parked_fires.push(last[at]);
+                        }
+                        if rng.below(2) == 0 {
+                            policy.on_process_suspend(lanes[at]);
+                            schedule.push(format!("r{round}: lane {at} suspended"));
+                        } else {
+                            policy.on_owner_waits(lanes[at]);
+                            schedule.push(format!("r{round}: lane {at} waits at a bind"));
+                        }
+                    }
+                }
+                // Plan until it holds; posted fires land at once.
+                for _ in 0..8 {
+                    let ids: QueuedFireIds = queued.iter().copied().collect();
+                    match plan(&mut policy, &ids, Instant::now()) {
+                        FramePlan::Dispatch(waves) => {
+                            let posted: Vec<u64> = waves.iter().flatten().copied().collect();
+                            if posted.is_empty() {
+                                continue;
+                            }
+                            queued.retain(|id| !posted.contains(id));
+                            parked_fires.retain(|id| !posted.contains(id));
+                            let members: Vec<ProcessId> = lanes.clone();
+                            policy.on_frame_posted(members.clone(), Instant::now());
+                            policy.on_frame_retired(members);
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(id) = parked_fires.iter().find(|id| queued.contains(id)) {
+                    failed = Some(format!("r{round}: a parked owner's complete fire {id} not dispatched"));
+                    break;
+                }
+            }
+            if let Some(why) = failed {
+                failures.push(format!("seed {seed}: {why}\n  schedule: {}", schedule.join(" -> ")));
+                if failures.len() > 10 {
+                    break;
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
+    }
 
     /// A prompt split across a lower: its last piece, cut under the cap
     /// before it came down, is kept whole out of the frames sealed under
