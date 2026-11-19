@@ -1839,6 +1839,7 @@ dependencies = [
  "checkpoint",
  "engine",
  "engine-cpu",
+ "engine-metal",
  "eta-compiler",
  "eta-exec",
  "kernels-metal",
