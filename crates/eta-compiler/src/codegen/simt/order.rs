@@ -20,14 +20,18 @@ pub const TOP_K_SELECT_MAX: u32 = 1024;
 
 pub const TOP_K_SELECT_POOL: u32 = 4096;
 
-/// The most blocks a split select's row runs on: the lane arenas' homes
-/// (`lane_arena.cuh`'s `M1_LANE_ARENAS`, the launcher's
-/// `LANE_SAMPLER_BLOCKS`).
-pub const TOP_K_SPLIT_BLOCKS: u32 = 16;
+/// The widest select a lane's one row may split across blocks: at least two
+/// blocks' candidates, padded to the select's power of two, merge in the
+/// pool.
+pub const TOP_K_SPLIT_MAX: u32 = TOP_K_SELECT_POOL / 2;
 
-/// The widest select a lane's one row may split across blocks: each block's
-/// candidates, padded to the select's power of two, merge in the pool.
-pub const TOP_K_SPLIT_MAX: u32 = TOP_K_SELECT_POOL / TOP_K_SPLIT_BLOCKS;
+/// The most blocks a select of `width` over a lane's one row splits across:
+/// as many as the merge pool holds their candidates (each block's land in
+/// the lane's first arena, which holds the pool's).
+#[must_use]
+pub const fn top_k_split_blocks(width: u32) -> u32 {
+    TOP_K_SELECT_POOL / select_cap(width)
+}
 
 /// Whether a select of `width` over a lane's one row runs split across the
 /// lane's blocks (`BODY_SELECT`): each block selects over its stretch of
@@ -371,9 +375,9 @@ const BODY_SELECT: &str = r#"
         // Each block's candidates, sorted, into its arena past its line;
         // the last block to count itself in merges them all, in the same
         // (key, index) order a one-block select keeps.
-        m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(lane_blocks);
-        m1_u64* sel_out = reinterpret_cast<m1_u64*>(
-            sel_span + (m1_u64)lane_row * M1_LANE_ARENA_STRIDE + M1_LANE_HEAD);
+        m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u);
+        m1_u64* sel_out = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) +
+            (m1_u64)lane_row * kSelectCap;
         for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
           M1_LANE_PUT64(sel_out + at, sel_cand[at]);
         M1_LANE_RELEASE();
@@ -387,14 +391,10 @@ const BODY_SELECT: &str = r#"
         if (sel_lands) {
           M1_LANE_ACQUIRE();
           const m1_u32 merged = lane_blocks * kSelectCap;
-          for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x) {
-            const m1_u32 block = at / kSelectCap;
+          for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x)
             sel_pool[at] = at < merged
-                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(
-                      sel_span + (m1_u64)block * M1_LANE_ARENA_STRIDE + M1_LANE_HEAD) +
-                      (at - block * kSelectCap))
+                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
                 : 0xFFFFFFFFFFFFFFFFull;
-          }
           __syncthreads();
           m1_u32 sel_merge = 2u;
           while (sel_merge < merged) sel_merge <<= 1u;
