@@ -957,6 +957,19 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         rt.stop();
     }
     // each step's latent, from the velocities the program gave
+    // (a latent is the golden's only on its schedule: its steps, as many as its velocities; a
+    // run of fewer steps takes other sigmas, so its latents are not the golden's)
+    let golden_steps = golden.as_ref().map_or(0, |g| {
+        (0..)
+            .take_while(|k| g.join(format!("cpu_velocity{k}.f32")).is_file())
+            .count()
+    });
+    if golden.is_some() && golden_steps != vs.len() {
+        println!(
+            "READING_LATENT not held: the golden's schedule is {golden_steps} steps, this run's {}",
+            vs.len()
+        );
+    }
     let mut x = x0;
     for (i, v) in vs.iter().enumerate() {
         let dt = d.sigmas[i + 1] - d.sigmas[i];
@@ -975,7 +988,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
                 std::fs::write(&p, bytes(v)).map_err(|e| format!("{}: {e}", p.display()))?;
             }
         }
-        if let Some(g) = &golden {
+        if let Some(g) = golden.as_ref().filter(|_| golden_steps == vs.len()) {
             let p = g.join(format!("cpu_latent{}.f32", i + 1));
             if p.is_file() {
                 let (rel, cos) = rel_cos(&x, &read_f32(&p)?);
