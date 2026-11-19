@@ -69,6 +69,8 @@ pub struct Cuda {
     closing: std::collections::BTreeSet<ChannelId>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
+    /// Where a tier copy still landing on the swap stream is told landed.
+    landed: Option<engine::LandingSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
@@ -98,6 +100,7 @@ impl Cuda {
             closing: std::collections::BTreeSet::new(),
             sink: None,
             tap_sink: None,
+            landed: None,
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
@@ -1034,6 +1037,34 @@ impl Engine for Cuda {
                 Ok(())
             }
         }
+    }
+
+    /// A move between the device and the host tier rides the swap stream
+    /// and is still reading its sources when the call returns: told landed
+    /// from that stream, behind the copy. Every other copy reads its sources
+    /// inside the call (the slot file's moves wait for it) or on the main
+    /// stream, ahead of everything enqueued after it.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.copy_slots(copy)?;
+        let host = |domain| matches!(domain, MemoryDomain::HostPinned);
+        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let swapped = (device(copy.src) && host(copy.dst)) || (host(copy.src) && device(copy.dst));
+        let Some(sink) = self.landed.clone().filter(|_| swapped) else {
+            return Ok(true);
+        };
+        let told = self
+            .loaded_mut()?
+            .tell_swaps_landed(Box::new(move || sink(token)))
+            .map_err(fault)?;
+        Ok(!told)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {

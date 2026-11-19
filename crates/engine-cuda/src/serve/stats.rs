@@ -389,6 +389,21 @@ impl Shell {
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
     }
 
+    /// Calls `landed` once every move between the device and the host tier
+    /// enqueued so far has landed: from the swap stream, behind them.
+    /// `false` (and `landed` dropped) where the moves ride no swap stream,
+    /// so each has landed by the time it returned.
+    pub fn tell_swaps_landed(
+        &mut self,
+        landed: Box<dyn FnOnce() + Send + 'static>,
+    ) -> crate::Result<bool> {
+        if super::diag::on().tier_inline {
+            return Ok(false);
+        }
+        crate::device::ctx::host_fn_on(self.device.swap_stream(), landed)?;
+        Ok(true)
+    }
+
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
     /// rows') within the state pool.
     pub fn copy_token_slots(
