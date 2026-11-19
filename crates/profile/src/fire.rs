@@ -84,13 +84,15 @@ pub struct Rates {
     /// `S = W · t / t_full`, over the cores. A real number of workgroups a
     /// unit.
     pub workgroups_per_core: Option<f64>,
-    /// The worst ratio of a timed frame's time to the estimate it was
-    /// submitted under that the device's rates step measured, its clock's
-    /// swing from fire to fire at least (`engine::rates::Admission::worst`):
-    /// the margin a serving step's estimate is held to a stated bound on one
-    /// GPU submission at (`engine_gpu::submit`). At least 1. Measured, and
-    /// read, only where the platform states such a bound (Android); not one
-    /// of [`KEYS`], which the estimate weighs a fire by.
+    /// How much slower the device ran than its own measurements said, as
+    /// its rates step measured: the largest of the worst ratio of a frame's
+    /// time to the same step's frame before it, the clock's swing from fire
+    /// to fire, and the drop of its settled clock under sustained load (the
+    /// warm-up's cube rotated again once every rate is timed). The margin a
+    /// serving step's estimate is held to a stated bound on one GPU
+    /// submission at (`engine_gpu::submit`). At least 1. Measured, and read,
+    /// only where the platform states such a bound (Android); not one of
+    /// [`KEYS`], which the estimate weighs a fire by.
     pub submit_worst_ratio: Option<f64>,
     /// Prefill attention TFLOP/s (the rectangle's flops, four a query
     /// element a key, as [`Rates::attn_tflops_by_keys`] counts them) of a

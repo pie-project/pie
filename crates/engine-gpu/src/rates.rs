@@ -228,6 +228,15 @@ struct Rig<'a, B: Serve> {
     /// then holds more than one fire's work, whatever the margin is yet
     /// known to be, and the device stays loaded across them.
     queue: std::cell::Cell<bool>,
+    /// The worst ratio of a settled frame's time to its estimate where the
+    /// estimate is the same step's own last frame (no more fires than it):
+    /// the device's own drift between like frames, what the margin a serving
+    /// step is held to carries (`[rates] submit_worst_ratio`). A step's
+    /// first frame, estimated from another shape or another fire count, is
+    /// left out: its error is the estimate's scaling and a submission's host
+    /// latency against a fire's work (a tiny first fire under a queued
+    /// frame's estimate read x10 on an RTX), not the device.
+    drift: std::cell::Cell<f64>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -247,6 +256,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
             queue: std::cell::Cell::new(max_submit.is_some()),
+            drift: std::cell::Cell::new(1.0),
         }
     }
 
@@ -435,6 +445,13 @@ impl<'a, B: Serve> Rig<'a, B> {
         let took = timed.0.unwrap_or(timed.1) as f64;
         let mut admission = self.admission.get();
         admission.landed(estimate, took, count >= self.basis.get());
+        if let Some(e) = estimate.filter(|&e| e > 0.0)
+            && admission.settled
+            && self.basis.get() > 0
+            && count >= self.basis.get()
+        {
+            self.drift.set(self.drift.get().max(took / e));
+        }
         self.admission.set(admission);
         self.per_fire.set(Some(took / f64::from(count.max(1))));
         self.basis.set(count);
@@ -661,7 +678,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     };
     let launch = launch_ns as f64;
-    let (side, warmed) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
@@ -887,8 +904,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // The margin a serving step is held to carries the drop as measured
     // (an Adreno 840 halved its clock ~10 s into load).
     let sustained = if max_submit.is_some() {
-        let worst = rig.admission.get().worst;
-        match warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, worst)? {
+        // Rotated as the warm-up rotated it: each fire its own submission,
+        // admitted at the worst ratio the warm-up's walk measured.
+        match warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, walk_worst)? {
             Some(hot) => {
                 let drop = (warmed.rate / hot.rate.max(f64::MIN_POSITIVE)).max(1.0);
                 say(&format!(
@@ -900,13 +918,17 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                 drop
             }
             None => {
-                return Err(Fault::Device {
-                    call: "rates",
-                    why: format!(
-                        "sustained: a {side}^3 matmul, timed at the step's start, no longer fits \
-                         the device's bound on one submission once the step has loaded it"
-                    ),
-                });
+                // The cube's fire no longer fits the bound at the walk's
+                // ratio once loaded: not rotated whole, the drop is read off
+                // the fires it did run (the slowest against the fastest).
+                let drop = rig.swing.get().max(1.0);
+                tracing::warn!(
+                    side,
+                    drop,
+                    "rates: sustained: the warm-up's cube no longer fits the bound once loaded; \
+                     its drop is the swing of the fires it ran"
+                );
+                drop
             }
         }
     } else {
@@ -932,18 +954,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
         vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
         workgroups_per_core: None,
-        // The worst ratio of a frame's time to its estimate this step
-        // measured (the clock's swing at least): the margin a serving step's
-        // estimate is held to the bound at (`crate::submit`), measured where
-        // the platform states one.
-        submit_worst_ratio: max_submit.map(|_| {
-            rig.admission
-                .get()
-                .worst
-                .max(rig.swing.get())
-                .max(sustained)
-                .max(1.0)
-        }),
+        // How much slower the device ran than its own measurements said:
+        // like frames' drift, the clock's swing and its sustained drop
+        // (`Rig::drift`, `sustained`): the margin a serving step's estimate
+        // is held to the bound at (`crate::submit`), measured where the
+        // platform states one.
+        submit_worst_ratio: max_submit
+            .map(|_| rig.drift.get().max(rig.swing.get()).max(sustained).max(1.0)),
         attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
     };
     // A rate that settled at nothing is refused by name, never saved or
@@ -1012,7 +1029,7 @@ fn warm<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-) -> Result<(u32, engine::rates::Warmed)> {
+) -> Result<(u32, engine::rates::Warmed, f64)> {
     // The cube's side, walked up by real fires under the device's bound on
     // one submission (`engine::rates::warm_side`): each size's second fire
     // timed (its first builds and touches).
@@ -1053,7 +1070,7 @@ fn warm<B: Serve>(
                 // is never admitted nearer the bound than that.
                 admission.worst = admission.worst.max(rig.swing.get());
                 rig.admission.set(admission);
-                return Ok((side, warmed));
+                return Ok((side, warmed, worst));
             }
             None if side > engine::rates::WARM_PROBE / 2 => side /= 2,
             None => {
