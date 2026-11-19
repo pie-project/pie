@@ -1490,3 +1490,28 @@ fn an_instance_closed_while_evicted_or_coming_back_is_never_rebound() {
     assert_eq!(held(&host), 0);
     assert_eq!(held(&device), before);
 }
+
+/// Reuse after release: a park gives an instance's device slots back at
+/// once, and another owner may take them the next moment. The roles keep
+/// no fence of their own: what keeps a fire of the instance from being in
+/// flight then is its process's eviction, which parks only once every set
+/// the process holds is fenced and quiesced (a set registered mid-eviction
+/// born fenced: `planner::starvation_race_tests::
+/// a_set_registered_mid_eviction_prefills_only_after_the_restore`).
+#[test]
+fn a_park_gives_an_instance_s_slots_back_at_once_to_the_next_owner() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine::default();
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let was = roles.lock().unwrap().slots(Owner::Instance(instance));
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    let shape = device.lock().unwrap().roles().instance.unwrap().pool;
+    let free = device.lock().unwrap().pool().available(shape);
+    let taken = device.lock().unwrap().take_refs(shape, free).unwrap();
+    assert!(
+        was[..3].iter().all(|slot| taken.contains(slot)),
+        "the parked instance's tables are another owner's at once"
+    );
+    device.lock().unwrap().give_refs(shape, &taken);
+}

@@ -211,6 +211,21 @@ impl RolesError {
         }
     }
 
+    /// What an unpark short of room ([`Self::UnparkShort`]) needs, as runs
+    /// of whole chunks `(run, pieces)`: a guest state's runs, or one chunk
+    /// for slots in a chunk (a run of Channel slots too).
+    #[must_use]
+    pub fn unpark_runs(&self) -> Option<(u32, u32)> {
+        let Self::UnparkShort(short) = self else {
+            return None;
+        };
+        match short.as_ref() {
+            Self::GuestShort { room, .. } | Self::GuestGrow { room, .. } => Some(room.chunk_runs()),
+            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1)),
+            _ => None,
+        }
+    }
+
     /// The device pool lacks room for it now: what a park, a completion or
     /// a commit may make, not a wrong ask.
     #[must_use]
@@ -1705,7 +1720,9 @@ impl Roles {
                 for (_, parts) in &shed {
                     self.give(&device, &taken_dead(parts));
                 }
-                if error.is_short() && self.fits_budget(&shed_owners) {
+                // It held these parts on the device before its park: the
+                // budget holds them, and the restore waits for room.
+                if error.is_short() {
                     return Err(RolesError::UnparkShort(Box::new(error)));
                 }
                 return Err(error);
@@ -1722,8 +1739,10 @@ impl Roles {
                     for (_, parts) in &shed {
                         self.give(&device, &taken_dead(parts));
                     }
-                    // Short of room the budget holds: the restore waits.
-                    if error.is_short() && self.fits_budget(&owners) {
+                    // It held these items on the device before its park: the
+                    // budget holds them, and the restore waits for room,
+                    // never failed for it.
+                    if error.is_short() {
                         return Err(RolesError::UnparkShort(Box::new(error)));
                     }
                     return Err(error);

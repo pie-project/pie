@@ -724,6 +724,13 @@ impl SlotPool {
         }
     }
 
+    /// How many times room was given back (a chunk opened for state) since
+    /// the pool was made.
+    #[must_use]
+    pub fn room_gives(&self) -> u64 {
+        self.given.gives.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// A watch on room given back from now on: what a rise short of free
     /// room waits on.
     #[must_use]
@@ -1194,6 +1201,13 @@ impl SlotPool {
     #[must_use]
     pub fn open_chunks(&self) -> Vec<u32> {
         self.open.iter_in(0, self.total).collect()
+    }
+
+    /// The open chunks a guest's state may take ([`Self::chunk_runs_for`]'s):
+    /// below the activation the rung lends and the ceiling.
+    #[must_use]
+    pub fn state_open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.state_limit().min(self.ceiling)).collect()
     }
 
     /// The logical -> physical table the engine keeps: a permutation, free
