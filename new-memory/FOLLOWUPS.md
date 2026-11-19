@@ -240,3 +240,37 @@ nothing recorded. Depends on device geometry for engine-gpu and the WGSL
 guest bounds checks (per-instance limits) landing first; the bind-group cache
 key including per-step scalars (`pipelines.rs:253`) is in Windows' step 7
 item 5.
+
+## F26. A guest-state park waits on its instances' owed batches, not on every fire
+
+After the shared-chunk landing fix (sc/amd-shared-chunk-landing 5bbec2aa5), a
+park (device → host move) gives its slots back only once it has landed, and
+it starts only after every fire enqueued on the main stream before it
+(`engine-cuda store.rs:4297`, `copy_tier_slots`: an event recorded on the
+main stream's tail, waited on the swap stream). Under heavy eviction (200
+beam + 300 decode on MI300X, ~2000 evictions a round) that wait is ~5 ms of
+the eviction copy phase's median and ~20 ms of its p90 (22 / 59 ms with it,
+15–17 / 32–35 ms without), on top of the transfer itself (accepted).
+
+The runtime cannot simply state that a moving process's writers have
+settled. Tried (a `settled` flag on `Engine::copy_slots_landing`, the move
+skipping the main-stream wait): with every kind of an eviction settled, the
+first 200 + 300 round diverged (`DIVERGE Some((5, -0.16, -24.8))`); with only
+kv pages settled, 0 / 800 but no gain, since the eviction also waits for its
+role-slot copies, which still wait on the stream. A process's guest state
+(Instance and Channel slots) is written past its fires' settling: owed
+guest epilogue batches (`serve/enqueue.rs:1248` `epilogues.defer`, `:1255`
+`owed.push_back`, reaped at `:1568` `reap_guest_fires`) land on side
+streams joined back into main, after the runtime's fire settles.
+
+The fix: a role-slot park waits on exactly the owed guest batches of the
+instances whose slots it moves (each batch has its `landed` event), and a kv
+page park of a fenced, quiesced process waits on no fire. That needs the
+parked role slots mapped to their instances (in engine-cuda's program plane,
+or stated by the runtime with the move: the roles store knows each item's
+owner, `runtime planner/exec.rs:318`), the `settled` flag for kv pages
+(`TierMove`, `Engine::copy_slots_landing` at `engine-cuda api.rs:1058`), and
+a device test that a park of guest state an owed epilogue is still writing
+waits for it, and one with none owed does not. Gate: 0 divergences on the
+200 + 300 load at depths 1 / 2 / 4, eviction copy phase and load walls
+against the landing hash.
