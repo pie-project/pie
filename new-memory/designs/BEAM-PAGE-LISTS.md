@@ -1,0 +1,193 @@
+# Beam page lists: `Port::Parents` (spec)
+
+Status: agreed (GPU, Leader, ROCm), 2026-11-19. The single written spec the
+device kernels (engine-cuda CUDA/HIP, engine-gpu Vulkan/wgpu, engine-metal)
+and the host replay all follow. Where an implementation and this text
+disagree, this text is right and the implementation is the bug.
+
+## 1. What it is
+
+A beam search of `B` beams runs `B` lanes of one decode pass over **one
+working set** (the *group's* set). The prompt is folded into the set; the
+pages of the set's reserve past its frozen full pages are a *pool* from
+which each beam holds its own *page list*: the pages its own generated
+slots lie in. A beam's rows read the frozen prompt and its own pages only
+(maskless, a read extent of its own length), and write only its own pages.
+
+The guest states one thing per fire: each beam's **parent** (which beam of
+the previous fire it continues). The engine keeps every list and the free
+pages as resident state of the instance, and at the head of each fire
+reorders the lists by the parents, copies the tail pages forks need, and
+resolves the fire's page tables over the lists. Nothing of it is guest
+memory, and nothing waits on the host.
+
+## 2. Guest surface
+
+- WIT `forward.wit` `state-geometry.parents: option<borrow<channel>>` —
+  `[lanes]` u32. eta-ir `Port::Parents`. Every lane of the pass names the
+  same working set; lane `b` is beam `b`.
+- The lanes' `slots` and `positions` stay host-derivable (a decode
+  envelope): every beam writes the same slot `s_t` at fire `t` (its depth)
+  and ropes at the same position. No `kv-len`, no `mask`.
+- The set reserves its pool with `working-set.reserve(end)` before the
+  first decode fire: `end = (f0 + Q) * S` (§3).
+- The parents channel is written by the guest's epilogue and read by the
+  next fire (loop-carried, device only: `HostRole::None`). Its initial value
+  is ignored (the first fire primes, §5).
+- SDK: `inferlet::beam::BeamGroup::new(&ws, beams, folded, steps)` reserves
+  the pool; `group.geometry()` binds `positions`, `slots`, `parents`;
+  `group.reorder(&parent)` in the epilogue puts the parents and advances
+  `slots` / `positions`.
+- An engine whose capabilities lack `Port::Parents` refuses the bind by name
+  (`HostGeometry::EngineLacks`). A pass binding `parents` whose lanes name
+  more than one working set, or that also binds `kv-len`, `mask` or `fold`,
+  is refused by name.
+
+## 3. Numbers
+
+- `S`: the engine's kv page size (tokens). `folded`: the set's frozen slots
+  when the pass first fires. `f0 = folded / S` (frozen **full** pages).
+  `tail = folded % S`: the prompt's slots on page `f0`.
+- Pool page `q` (`0 <= q < Q`) is the set's page `f0 + q`. `Q = reserved
+  pages - f0` (`reserved` from `reserve`). Page 0 is the prompt's own last
+  page when `tail > 0`: its first `tail` slots are frozen.
+- `s_t`: the slot every beam writes at fire `t` (`s_0 = folded`). Column
+  `c_t = s_t / S - f0`, offset `o_t = s_t % S`. Entry `j` of a list covers
+  slots `[(f0 + j) S, (f0 + j + 1) S)`.
+- `P` (list width): columns a list may hold, `P = ceil(reserved / S) - f0`
+  bounds it; an engine may size by its context pages (`pages_per_slot`).
+- Sizing the guest asks for (`BeamGroup`): `P_used = (folded + steps - 1) /
+  S - f0 + 1`, `Q = B * P_used + 2B + 1`. (Each column's pages, a beam's
+  each at most; the pages a fire hands out; those freed one fire late; the
+  frozen prompt page.) A fire that finds fewer free pages than it needs
+  faults the lanes that needed one (`RESERVE_EXHAUSTED`).
+
+## 4. Resident state (per instance)
+
+    map[B][P]   u32   pool page of each beam's column (columns > c_t: unspecified)
+    free[Q]     bit   page may be handed out
+    pending[Q]  bit   page freed by the previous fire; joins `free` one fire late
+    primed      bit   the first fire has run
+
+Stated in `engine::GuestState::resident` (bind to unbind; `scratch` and
+`scratch_arms` unchanged): `B*P*4 + 2*ceil(Q/32)*4 + 16` bytes, by the
+engine's bound on `P` and `Q`. The state is pool-relative: it never names a
+physical page, so the runtime may move, suspend and restore the set's pages
+and the instance's resident bytes freely (§8).
+
+## 5. Priming (the instance's first fire, `primed == 0`)
+
+    for b in 0..B: map[b][0] = b                (columns 1.. unspecified)
+    free[q]    = (q >= B) && !(q == 0 && tail > 0)
+    pending[q] = 0
+    copies: for b in 1..B, if tail > 0 and o_0 > 0: copy(src = 0, dst = b, tokens = tail)
+    primed = 1
+
+The parents are not read. `c_0` must be 0 (the first write lies on page
+`f0`); otherwise every lane faults `SHORT`. Beam 0 keeps page 0 (the
+prompt's own when `tail > 0`), every other beam gets the prompt's tail
+slots copied into its first page.
+
+## 6. Each later fire `t >= 1` (in this order, before the fire appends or reads)
+
+Inputs: the state after fire `t-1`, `parent[B]` (the cell the epilogue of
+fire `t-1` wrote), `s_t` (host-derived; `c = c_t`, `o = o_t`, `cp = c_{t-1}`).
+
+**6.1 Check.** For each `b`: `parent[b] < B`, else lane `b` faults
+`PARENT` (and §6.2–6.5 do nothing for it; its list keeps `map[b]`).
+
+**6.2 Reorder.**
+
+    inh[b]   = map[parent[b]]                                   (whole row)
+    first[b] = no b' < b with parent[b'] == parent[b]
+    need[b]  = (o == 0) || !first[b]
+    rank[b]  = #{ b' < b : need[b'] }
+    hand[k]  = the k-th lowest q with free[q] (k = 0, 1, ...)
+    fresh[b] = hand[rank[b]]          (fewer free than needed: lanes past them fault RESERVE_EXHAUSTED)
+    map'[b]  = inh[b] with map'[b][c] = fresh[b] where need[b]
+    copy[b]  = (src = inh[b][c], dst = fresh[b], tokens = o)  where need[b] && o > 0, else none
+
+  The first child of a parent keeps the parent's pages, its tail included;
+  every other child (and every beam at a page boundary, `o == 0`) takes a
+  fresh page at column `c`. A child mid-page has its parent's `o` tail slots
+  copied into its fresh page.
+
+**6.3 Free.** A page lies in one column of every list that names it.
+
+    freed[q] = exists (p, j), j <= cp, map[p][j] == q, and no b with map'[b][j] == q
+    taken[q] = exists b, need[b] && fresh[b] == q
+    free'    = (free & !taken) | pending
+    pending' = freed
+    (when tail > 0: free'[0] = pending'[0] = 0, always)
+
+  A page freed by fire `t` is handed out no earlier than fire `t+2`'s
+  reorder: one fire late, on every engine.
+
+**6.4 Copy.** For each `b` with a copy: copy the first `tokens` slots of the
+set's page `f0 + src` to page `f0 + dst`, in every kv plane a page holds
+(keys and values of every full-context layer), before any lane of the fire
+appends or reads. Checks (else lane `b` faults `COPY_BOUNDS` and nothing is
+copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`.
+
+**6.5 Resolve.** Over the page tables the fire stages for each lane as for
+any envelope lane (its slots `[0, s_t + 1)`): entry `f0 + j` of lane `b`'s
+list becomes the set's page `f0 + map'[b][j]` for `j <= c`, and its row's
+write page becomes the set's page `f0 + map'[b][c]` (write offset `o`
+unchanged). Checks (else lane `b` faults and keeps the staged words, which
+name its own set's pages): `map'[b][j] < Q` (`PAST_RESERVE`), `c < P`
+(`SHORT`), and the absolute write slot `(f0 + map'[b][c]) S + o >= folded`
+and `< reserved` (`BELOW_FLOOR`).
+
+Commit the state (`map = map'`, `free = free'`, `pending = pending'`) for
+every lane, faulted or not. A faulted lane fails its fire by name
+(`Overreach: lane b's page list ...`); the others proceed.
+
+## 7. Faults (one word a lane, read at settle)
+
+| code | name              | meaning |
+|------|-------------------|---------|
+| 1    | PAST_RESERVE      | an entry names a page past the pool |
+| 2    | SHORT             | the lane reads past its list's width (or the first write is not on page `f0`) |
+| 3    | BELOW_FLOOR       | a row would land below the set's frozen slots or past its reserve |
+| 4    | COPY_BOUNDS       | a copy past the pool, longer than a page, or into frozen slots |
+| 5    | PARENT            | `parent[b] >= B` |
+| 6    | RESERVE_EXHAUSTED | fewer free pages than the fire hands out |
+
+Nothing outside the group's own working set is read or written in any
+case; the staged words a faulted lane keeps are its own set's pages.
+
+## 8. Ordering, suspend, restore
+
+- Stream order: the reorder + copy + resolve run in the fire's own stream
+  ahead of its first append or read (one launch, or launches separated by
+  the backend's barrier), never behind a host wait. The parents cell they
+  read was written by the previous fire's epilogue, earlier in the stream.
+- The copy-landing rule holds by construction: a copy's source page is
+  named by `map'` (the first child's), so it is not freed by this fire, and
+  a freed page is handed out a fire later (§6.3).
+- Suspend moves the set's pages and the instance's resident bytes only
+  after the fires in flight have landed (their copies with them). Restore
+  re-resolves pool pages to physical pages at the next fire: the state names
+  pool pages only, so a restored search continues identically.
+
+## 9. Host replay and its test
+
+The host replay is §5–6 as a pure function, in Rust:
+`step(state, parents, s_t) -> (state', copies, lists, faults)`. It is not on
+the serving path. The test, on every backend that implements the port:
+widths 2, 4, 8; at least `3S` steps from a `folded` with `tail > 0` and one
+with `tail == 0`; parents drawn with forks (repeated parents) and
+retirements (beams no child continues). After every step the device's
+`map` (columns `<= c`), `free`, `pending`, the copies it made and the
+resolved table entries equal the replay's; and a run suspended and restored
+mid-search continues with beams identical to an unsuspended run.
+
+## 10. Costs (MI300X, Qwen3-0.6B)
+
+- Copy: one launch per fire for all of its copies, 2.3–4.1 µs (1–3 copies of
+  1–15 slots, 0.34–5.2 MB); the reorder and resolve add `B * P` work in the
+  same launch.
+- Attention keys per beam row: its own length (`s_t + 1`), against
+  `folded + B t` with the earlier shared pool and ancestry mask.
+- Memory: live pages at most `B (c_t + 1)` plus `2B + 1`, against
+  `folded + B T` slots held to the end before.
