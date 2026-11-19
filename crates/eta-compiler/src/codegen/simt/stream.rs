@@ -399,13 +399,13 @@ impl<'a> Streams<'a> {
         let members = self.plan(at)?;
         let safe = members.iter().all(|member| match member.role {
             Role::Map | Role::Broadcast | Role::Intrinsic => true,
-            Role::Reduce => self.ops[member.node].args.first().is_some_and(|&arg| {
+            Role::Reduce | Role::Argmax => self.ops[member.node].args.first().is_some_and(|&arg| {
                 matches!(
                     self.class(arg),
                     RowClass::Full(Dimension::Static(width)) if u64::from(width) >= SPLIT_ROW_MIN
                 )
             }),
-            Role::Rng | Role::Argmax => false,
+            Role::Rng => false,
         });
         Some((members.len(), safe))
     }
@@ -1187,6 +1187,28 @@ pub(super) fn emit_stream(
                     "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
                 );
                 let ptr = (pass.pointer)(out);
+                if streams.split {
+                    // Each part's candidate to the lane arena; after the
+                    // meeting every block takes the row's best of them, the
+                    // one a block's scan picks (the order is total).
+                    let meet = streams.meets.get() + 1;
+                    streams.meets.set(meet);
+                    let _ = writeln!(
+                        epilogue,
+                        "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, ptir_row, ptir_part, cand{node});"
+                    );
+                    let _ = writeln!(epilogue, "    }}");
+                    let _ = writeln!(epilogue, "    ptir_meet(ptir_meet_word, {meet}u * ptir_split);");
+                    let _ = writeln!(epilogue, "    if (stream_warp == 0u) {{");
+                    let _ = writeln!(
+                        epilogue,
+                        "      cand{node} = stream_lane < ptir_split ? ptir_get_candidate(ptir_meet_word, ptir_row, stream_lane) : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"
+                    );
+                    let _ = writeln!(
+                        epilogue,
+                        "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
+                    );
+                }
                 let _ = writeln!(
                     epilogue,
                     "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"

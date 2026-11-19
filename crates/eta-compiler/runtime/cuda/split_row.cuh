@@ -77,3 +77,26 @@ __device__ __forceinline__ void ptir_split_copy(
     output[index] = input[index];
 }
 
+// A split row's argmax candidates, one a part, past the barrier line of the
+// lane's first arena: a row's sixteen parts' sixteen bytes each.
+__device__ __forceinline__ m1_u32* ptir_candidate_at(
+    m1_u32* meet_word, m1_u32 row, m1_u32 part) {
+  m1_u8* line = reinterpret_cast<m1_u8*>(meet_word - row);
+  return reinterpret_cast<m1_u32*>(line + M1_LANE_HEAD + ((m1_u64)row * 16u + part) * 16u);
+}
+
+__device__ __forceinline__ void ptir_put_candidate(
+    m1_u32* meet_word, m1_u32 row, m1_u32 part, M1ArgmaxCandidate candidate) {
+  m1_u32* at = ptir_candidate_at(meet_word, row, part);
+  M1_LANE_PUT32(at, __float_as_uint(candidate.value));
+  M1_LANE_PUT32(at + 1, candidate.index);
+  M1_LANE_PUT32(at + 2, candidate.have);
+}
+
+__device__ __forceinline__ M1ArgmaxCandidate ptir_get_candidate(
+    m1_u32* meet_word, m1_u32 row, m1_u32 part) {
+  m1_u32* at = ptir_candidate_at(meet_word, row, part);
+  return M1ArgmaxCandidate{
+      __uint_as_float(M1_LANE_GET32(at)), M1_LANE_GET32(at + 1), M1_LANE_GET32(at + 2), 0u};
+}
+
