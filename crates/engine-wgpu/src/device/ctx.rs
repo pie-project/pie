@@ -740,7 +740,15 @@ impl Context {
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
+            bind_only: false,
         })
+    }
+
+    /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
+    pub fn bind_frame(&self) -> Result<Frame> {
+        let mut frame = self.frame()?;
+        frame.bind_only = true;
+        Ok(frame)
     }
 }
 
@@ -791,6 +799,10 @@ pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
     pub(crate) dispatches: std::cell::Cell<u64>,
+    /// A load's bind walk's ([`engine_gpu::serve::Shell::walk_binds`]): its
+    /// sink builds and keeps each dispatch's bind group, encodes nothing, and
+    /// the frame is never submitted.
+    pub(crate) bind_only: bool,
 }
 
 impl Frame {

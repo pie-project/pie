@@ -142,6 +142,12 @@ impl Serve for Api {
         device.frame()
     }
 
+    const BINDS_AT_LOAD: bool = true;
+
+    fn bind_frame(device: &Context) -> Result<Frame> {
+        device.bind_frame()
+    }
+
     fn shelf(device: &Context, readout: &[Buffer], _weights_stream: bool) -> Result<Shelf> {
         Ok(Shelf {
             mirror: readout

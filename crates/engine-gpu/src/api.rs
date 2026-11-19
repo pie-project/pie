@@ -781,6 +781,16 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        let started = std::time::Instant::now();
+        let walked = shell.walk_binds().map_err(fault)?;
+        if walked > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                walked,
+                ms = started.elapsed().as_millis() as u64,
+                "every fire shape the load serves walked bind-only: what a dispatch binds is built"
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
         // The fire the shell took, which a binding may have bounded below

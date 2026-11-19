@@ -137,6 +137,10 @@ impl Context {
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn bind_frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
 }
 
 pub struct Frame {

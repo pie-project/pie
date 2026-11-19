@@ -497,6 +497,17 @@ impl Sink<'_> {
             .map(|(buffer, offset, size, _)| (buffer.clone(), *offset, *size))
             .collect();
         let uniform_bytes = u64::from(pipeline.push_bytes.max(rounded).max(16));
+        if self.frame.bind_only {
+            // A load's bind walk: the group a dispatch over these views binds
+            // is built and kept; nothing is encoded. A fire whose views go
+            // through scratch binds a group of its own frame's either way.
+            if scratch_views == 0 {
+                self.pipelines
+                    .bind_group(core, &pipeline, &keyed, uniform_bytes)
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
+            }
+            return Ok(());
+        }
         let group = if scratch_views == 0 {
             self.pipelines
                 .bind_group(core, &pipeline, &keyed, uniform_bytes)

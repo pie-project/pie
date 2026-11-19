@@ -159,6 +159,18 @@ pub trait Serve: Backend {
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
+    /// Whether a load walks every fire shape it serves on the device before
+    /// it serves, bind-only ([`Shell::walk_binds`]): a backend that builds
+    /// what a dispatch binds for each set of views (wgpu's bind groups,
+    /// Vulkan's descriptor sets) builds them all there, none in a fire.
+    const BINDS_AT_LOAD: bool = false;
+
+    /// The frame a bind walk walks into: its sink builds and keeps what each
+    /// dispatch binds and encodes nothing, and the frame is never submitted.
+    fn bind_frame(device: &Self::Context) -> Result<Self::Frame> {
+        Self::walk_frame(device, false)
+    }
+
     /// The backend's state of a fresh load over its `readout` seats.
     fn shelf(
         device: &Self::Context,
@@ -4458,7 +4470,7 @@ impl<B: Serve> Shell<B> {
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
         let place = At::new();
-        self.walk_with(p, keep, split, &place, &mut Cursor::new(&place))
+        self.walk_with(p, keep, split, false, &place, &mut Cursor::new(&place))
     }
 
     /// [`Shell::walk_once`] with the walk's sink the caller's: `cursor` moves
@@ -4468,10 +4480,15 @@ impl<B: Serve> Shell<B> {
         p: &Prepared<'_, B>,
         keep: bool,
         split: bool,
+        bind_only: bool,
         place: &At,
         cursor: &mut S,
     ) -> Result<Walked<B>> {
-        let mut frame = Some(B::walk_frame(&self.device, keep)?);
+        let mut frame = Some(if bind_only {
+            B::bind_frame(&self.device)?
+        } else {
+            B::walk_frame(&self.device, keep)?
+        });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
         // with this block.
@@ -5447,7 +5464,7 @@ struct NamingLane<B: Serve> {
     media: Option<NamingMedia>,
     boxes: Vec<[u32; 3]>,
     payload: Vec<u8>,
-    inputs: Vec<(engine::fire::InputFeed, InputCell<Named<B>>)>,
+    inputs: Vec<(engine::fire::InputFeed, InputCell<B>)>,
     /// The score rows the class writes: a capturing lane named reads them
     /// all, so its fire names every kernel a capture asks for.
     reads: Vec<String>,
@@ -5461,7 +5478,189 @@ struct NamingMedia {
     grids: Vec<i32>,
 }
 
-impl<B: Serve> Shell<Named<B>> {
+/// The views a fire of `owned` lanes stages: its seated lanes, their media
+/// and their clips, each lane at its own slot.
+#[allow(clippy::type_complexity)]
+fn lane_views<B: Serve>(
+    owned: &[NamingLane<B>],
+) -> (Vec<Seated<'_, B>>, Vec<Media<'_>>, Vec<Clips<'_>>) {
+    let seated = owned
+        .iter()
+        .enumerate()
+        .map(|(at, lane)| Seated {
+            mask: lane.mask.as_ref(),
+            adapter: lane.adapter,
+            inputs: &lane.inputs,
+            reads: &lane.reads,
+            ..Seated::of(Lane {
+                slot: at as u32,
+                word: lane.word,
+                tokens: &lane.tokens,
+            })
+        })
+        .collect();
+    let media = owned
+        .iter()
+        .enumerate()
+        .filter_map(|(at, lane)| {
+            lane.media.as_ref().map(|shot| Media {
+                lane: at as u32,
+                rows: &shot.rows,
+                patches: &shot.patches,
+                routes: &shot.routes,
+                positions: &shot.positions,
+                grids: &shot.grids,
+                token_positions: &[],
+            })
+        })
+        .collect();
+    let clips = owned
+        .iter()
+        .enumerate()
+        .filter(|(_, lane)| !lane.boxes.is_empty())
+        .map(|(at, lane)| Clips {
+            lane: at as u32,
+            boxes: &lane.boxes,
+            payload: &lane.payload,
+        })
+        .collect();
+    (seated, media, clips)
+}
+
+/// A lane of a class, as a load's walks make one: the naming walk over
+/// its named shell, the bind walk over the device's.
+impl<B: Serve> Shell<B> {
+    /// Walks every fire shape this load serves on the device, bind-only
+    /// ([`Serve::BINDS_AT_LOAD`]), before it serves: for every class, a
+    /// decode of each power of two of lanes up to the lane cap and a prefill
+    /// of each power of two of rows up to the top rung, each on every arm.
+    /// A backend whose dispatch binds a group per set of views (each view
+    /// the power of two over what it holds) builds every group a fire of
+    /// the load can ask for here. Nothing is encoded or submitted. The fires
+    /// walked.
+    pub fn walk_binds(&mut self) -> Result<u64> {
+        if !B::BINDS_AT_LOAD {
+            return Ok(0);
+        }
+        let top = self
+            .span
+            .rungs()
+            .last()
+            .map_or(1, |rung| rung.tokens)
+            .max(1);
+        // A fire holds a lane a seat: at most the seats the load holds.
+        let seats = u32::try_from(self.held.len()).unwrap_or(u32::MAX);
+        let lanes_cap = self.budget().max_lanes.min(seats).clamp(1, top);
+        // Each power of two under the cap, and the cap, whose views round to
+        // the power over it.
+        let mut counts: Vec<u32> = std::iter::successors(Some(1u32), |n| n.checked_mul(2))
+            .take_while(|&n| n < lanes_cap)
+            .collect();
+        counts.push(lanes_cap);
+        let mut shapes: Vec<Vec<(usize, u32)>> = Vec::new();
+        // A capturing class's lanes lay score rows in a bound program's score
+        // room, which no instance has at load: the walk leaves those classes
+        // to the fires that bind them.
+        let classes: Vec<usize> = (0..self.compiled.classes.classes.len())
+            .filter(|&class| !self.captures(class))
+            .collect();
+        for class in classes {
+            // Every count of lanes with every power of two of rows they can
+            // bring between them (a decode is rows = lanes, a prefill one
+            // lane), the rows spread over the lanes: the views a fire binds
+            // round by both.
+            for &lanes in &counts {
+                let mut rows = u64::from(lanes).next_power_of_two();
+                while rows <= u64::from(top) {
+                    let each = rows / u64::from(lanes);
+                    let shape = (0..u64::from(lanes))
+                        .map(|at| {
+                            let here = if at + 1 == u64::from(lanes) {
+                                rows - each * (u64::from(lanes) - 1)
+                            } else {
+                                each
+                            };
+                            (class, u32::try_from(here).unwrap_or(u32::MAX))
+                        })
+                        .collect();
+                    shapes.push(shape);
+                    rows = rows.saturating_mul(2);
+                }
+            }
+        }
+        let depth = self.arms.depth();
+        tracing::info!(
+            top,
+            seats,
+            lanes_cap,
+            shapes = shapes.len(),
+            arms = depth,
+            rungs = ?self.span.rungs().iter().map(|rung| rung.tokens).collect::<Vec<_>>(),
+            "the bind walk's fire shapes"
+        );
+        let mut walked = 0u64;
+        for lanes in &shapes {
+            // Every arm: each walk holds its arm until the shape has taken
+            // them all, then gives them back.
+            let mut taken = Vec::with_capacity(depth);
+            let mut fault = None;
+            for _ in 0..depth {
+                match self.bind_fire(lanes) {
+                    Ok(arm) => {
+                        taken.push(arm);
+                        walked += 1;
+                    }
+                    Err(why) => {
+                        fault = Some(why);
+                        break;
+                    }
+                }
+            }
+            for arm in taken {
+                self.arms.give(arm);
+            }
+            if let Some(why) = fault {
+                return Err(why);
+            }
+        }
+        Ok(walked)
+    }
+
+    /// One fire of `lanes`, staged and walked bind-only; the arm it took.
+    fn bind_fire(&mut self, lanes: &[(usize, u32)]) -> Result<usize> {
+        let owned = lanes
+            .iter()
+            .map(|&(class, rows)| self.naming_lane(class, rows))
+            .collect::<Result<Vec<NamingLane<B>>>>()?;
+
+        let (seated, media, clips) = lane_views(&owned);
+        if seated.iter().any(|lane| !lane.refs) {
+            let seats = self.pools.seat_segments();
+            self.commit_segments(seats)?;
+        }
+        let prepared = self.stage(StepView {
+            lanes: &seated,
+            attachments: &[],
+            media: &media,
+            clips: &clips,
+            folds: &[],
+            done: None,
+            guests: None,
+        })?;
+        let arm = prepared.arm;
+        self.feed(&prepared)?;
+        let place = At::new();
+        self.walk_with(
+            &prepared,
+            false,
+            false,
+            true,
+            &place,
+            &mut Cursor::new(&place),
+        )?;
+        Ok(arm)
+    }
+
     /// Whether a lane of `class` runs a region of `axis`.
     fn class_runs(&self, class: usize, axis: poem_ir::RowAxis) -> bool {
         self.compiled
@@ -5529,10 +5728,10 @@ impl<B: Serve> Shell<Named<B>> {
             let bytes = cells * seat.row_bytes();
             // A cell the device keeps arrives f32 and is cast where the
             // seat is bf16: the one kernel a fire asks for beside its walk.
-            let cell = if Named::<B>::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
+            let cell = if B::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
                 InputCell::Device {
                     cell: DeviceCell {
-                        buffer: crate::backend::Buffer::<Named<B>>::host(
+                        buffer: crate::backend::Buffer::<B>::host(
                             &self.device,
                             bytes * 2,
                             crate::books::owners::CHANNELS,
@@ -5599,7 +5798,9 @@ impl<B: Serve> Shell<Named<B>> {
             seat => Some(seat),
         }
     }
+}
 
+impl<B: Serve> Shell<Named<B>> {
     /// The fires that cut a mask into runs. A fire's rows go in the class
     /// order, so a mask the order leaves in more than one run is cut by
     /// three lanes in the order's turn, the middle one outside the mask.
@@ -5675,47 +5876,8 @@ impl<B: Serve> Shell<Named<B>> {
         let owned = lanes
             .iter()
             .map(|&(class, rows)| self.naming_lane(class, rows))
-            .collect::<Result<Vec<NamingLane<B>>>>()?;
-        let seated: Vec<Seated<'_, Named<B>>> = owned
-            .iter()
-            .enumerate()
-            .map(|(at, lane)| Seated {
-                mask: lane.mask.as_ref(),
-                adapter: lane.adapter,
-                inputs: &lane.inputs,
-                reads: &lane.reads,
-                ..Seated::of(Lane {
-                    slot: at as u32,
-                    word: lane.word,
-                    tokens: &lane.tokens,
-                })
-            })
-            .collect();
-        let media: Vec<Media<'_>> = owned
-            .iter()
-            .enumerate()
-            .filter_map(|(at, lane)| {
-                lane.media.as_ref().map(|shot| Media {
-                    lane: at as u32,
-                    rows: &shot.rows,
-                    patches: &shot.patches,
-                    routes: &shot.routes,
-                    positions: &shot.positions,
-                    grids: &shot.grids,
-                    token_positions: &[],
-                })
-            })
-            .collect();
-        let clips: Vec<Clips<'_>> = owned
-            .iter()
-            .enumerate()
-            .filter(|(_, lane)| !lane.boxes.is_empty())
-            .map(|(at, lane)| Clips {
-                lane: at as u32,
-                boxes: &lane.boxes,
-                payload: &lane.payload,
-            })
-            .collect();
+            .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
+        let (seated, media, clips) = lane_views(&owned);
         // Its seat-addressed lanes read the seats' runs: back their segments
         // before staging, as a direct fire does (`Shell::fire_seated`).
         if seated.iter().any(|lane| !lane.refs) {
@@ -5749,7 +5911,7 @@ impl<B: Serve> Shell<Named<B>> {
             began: 0,
             made: Vec::with_capacity(whole.len()),
         };
-        match self.walk_with(&prepared, false, false, &place, &mut sink) {
+        match self.walk_with(&prepared, false, false, false, &place, &mut sink) {
             Ok(_) => {}
             Err(Fault::Fire(poem_exec::Error::Kernel(refusal))) => {
                 self.pipelines.0.abandon();
