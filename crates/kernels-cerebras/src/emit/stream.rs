@@ -509,96 +509,23 @@ pub fn emit(p: &Program) -> R<Emitted> {
             }
         }
     }
-    // the K / V columns
+    // the K / V columns: each its mixer's ([`crate::kernel::Column`])
     for (k, kc) in s.kv.iter().enumerate() {
         let ks = &p.kv[kc.block as usize];
-        let state = kv_joint(p, ks).state;
-        let (rname, rtext) = match state {
-            Some(_) => st_root_file(p, k, ks)?,
-            None => kv_root_file(p, k, ks)?,
-        };
+        let col = crate::kernel::column(Some(&kv_joint(p, ks)))?;
+        let (rname, rtext) = col.root_file(p, k, ks)?;
         files.push((rname.clone(), rtext));
         let root = kc.root(s);
         put(&mut tiles, root, (rname, kv_root_params(p, kc, root)))?;
-        if let Some(sk) = kv_joint(p, ks).sink {
-            // the root's heads' sink logits, its step's first position
-            let (qh, ..) = kv_consts(p, ks);
-            arrays.push(HostArray {
-                at: root,
-                sym: "snk".into(),
-                u16: false,
-                len: qh,
-                fill: Fill::Slices(vec![(sk.0, kc.head * qh, qh)]),
-            });
-            arrays.push(HostArray {
-                at: root,
-                sym: "pos".into(),
-                u16: false,
-                len: 1,
-                fill: Fill::Words(vec![0]),
-            });
-        }
-        if let Some(st) = state {
-            // the root's conv taps for its head's channels, its decay's parameters
-            let j = kv_joint(p, ks);
-            let (d, dv, t, h) = (j.head_dim, j.v_dim(), st.taps, kc.head);
-            let (qc, kc_, vc) = (
-                st.q_from + j.q_head(h) * d,
-                st.k_from + j.k_head(h) * d,
-                st.v_from + h * dv,
-            );
-            let mut slices = vec![
-                (st.conv.0, qc * t, d * t),
-                (st.conv.0, kc_ * t, d * t),
-                (st.conv.0, vc * t, dv * t),
-                (st.a_log.0, h, 1),
-                (st.dt.0, h * st.a_width(), st.a_width()),
-            ];
-            // Mamba-2's: its head's skip, its channels' conv bias
-            if let Some(m) = st.mamba {
-                slices.extend([
-                    (m.d.0, h, 1),
-                    (m.bias.0, qc, d),
-                    (m.bias.0, kc_, d),
-                    (m.bias.0, vc, dv),
-                ]);
-            }
-            let len = slices.iter().map(|s| s.2).sum();
-            arrays.push(HostArray {
-                at: root,
-                sym: "stw".into(),
-                u16: false,
-                len,
-                fill: Fill::Slices(slices),
-            });
-            if let Some(n) = rows_of(p) {
-                arrays.push(rowp_array(root, n));
-            }
-        }
-        let (pname, ptext) = match state {
-            Some(_) => st_pe_file(p, k, ks)?,
-            None => kv_pe_file(p, k, ks)?,
-        };
+        arrays.extend(col.root_arrays(p, kc, ks, root));
+        let (pname, ptext) = col.pe_file(p, k, ks)?;
         files.push((pname.clone(), ptext));
         for i in 0..kc.pya {
             let c = kc.pe(s, i);
             let (params, role) = kv_pe_params(p, c);
             put(&mut tiles, c, (pname.clone(), params))?;
             arrays.extend(cfg_array(c, &[i, role]));
-            if let Some(n) = rows_of(p) {
-                // a decode step's rows' (lane slot, state slot, position)
-                arrays.push(rowp_array(c, n));
-                if let (None, Some(g)) = (state, paging(p)) {
-                    // the lane slots' pages
-                    arrays.push(HostArray {
-                        at: c,
-                        sym: "ptab".into(),
-                        u16: false,
-                        len: g.lanes * g.pages,
-                        fill: Fill::Words(vec![0; (g.lanes * g.pages) as usize]),
-                    });
-                }
-            }
+            arrays.extend(col.pe_arrays(p, c));
         }
     }
     // the lane root
@@ -1835,12 +1762,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                     (*k, k.from + j.k_head(idx) * d, d),
                     (*v, v.from + j.v_head(idx) * dv, dv),
                 ];
-                // a recurrence's head: its beta and decay logits after them
-                if let Some(st) = j.state {
-                    let aw = st.a_width();
-                    parts.push((st.b, st.b.from + idx, 1));
-                    parts.push((st.a, st.a.from + idx * aw, aw));
-                }
+                // what else its column takes a head (a recurrence's beta and decay logits)
+                parts.extend(crate::kernel::column(Some(&j))?.head_parts(&j, idx));
                 for (c, f, len) in parts {
                     for (_, src, m) in g.pieces(c.base, f, len)? {
                         g.put(late, &format!("  @fmovs(fab.fout(q_ks, {m}), {src});\n"));
@@ -2446,7 +2369,7 @@ fn kv_pe_params(p: &Program, c: Coord) -> (Vec<(String, u32)>, u32) {
 }
 
 /// A K / V column's attention: its block's first unit's (the reading's first where none).
-fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
+pub(crate) fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
     let a = &p.shape.attn;
     ks.units
         .first()
@@ -2465,103 +2388,20 @@ fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
         })
 }
 
-fn kv_consts(p: &Program, ks: &place::KvSched) -> (u32, u32, u32, f32) {
+pub(crate) fn kv_consts(p: &Program, ks: &place::KvSched) -> (u32, u32, u32, f32) {
     let a = kv_joint(p, ks);
     let qh = a.q_heads / a.kv_heads;
     (qh, a.head_dim, qh * a.head_dim, a.scale)
 }
 
-/// A K / V column's root: each unit's rows' [q | k | v] down the column in the store order,
-/// then each query's output back to the unit that asked it.
-fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let (qh, dc, qd, _) = kv_consts(p, ks);
-    let sink = kv_joint(p, ks).sink.is_some();
-    let (lo, hi) = if p.round16 {
-        ("1.0e-30", "1.0e30")
-    } else {
-        ("0.00390625", "32768.0")
-    };
-    let name = format!("kr_{k}.csl");
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// K / V column {k}'s root (kernels-cerebras emit::stream; ops/cy_satt.csl)."
-    );
-    t.push_str("param memcpy_params;\n");
-    for u in 0..ks.units.len() {
-        let _ = writeln!(t, "param C_I{u}: u16;\nparam C_O{u}: u16;");
-    }
-    t.push_str("param C_AR: u16;\nparam C_AM: u16;\n");
-    t.push_str(COMMON);
-    let n = ks.units.len();
-    for u in 0..n {
-        let _ = writeln!(
-            t,
-            "const q_i{u} = @get_input_queue({});\nconst q_o{u} = @get_output_queue({});",
-            2 + u,
-            3 + u
-        );
-    }
-    let _ = writeln!(
-        t,
-        "const q_ar = @get_input_queue({});\nconst q_am = @get_output_queue(2);",
-        2 + n
-    );
-    let _ = writeln!(
-        t,
-        "const cy = @import_module(\"ops/cy_satt.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .Qh = {qh}, .Dc = {dc}, .LO = {lo}, .HI = {hi}{} }});",
-        if sink { ", .SINK = true" } else { "" }
-    );
-    if sink {
-        // its heads' sink logits (the checkpoint's), and the step's first position (the
-        // reference the PEs start from at 0)
-        t.push_str(
-            "var snk_p: [*]f32 = &cy.sk;\nvar pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n",
-        );
-    }
-    let sw = qd + 2 * dc;
-    t.push_str(&buf("sx", sw));
-    t.push_str(&buf("ob", qd));
-    let mut body = String::from("  stamp(0);\n  cy.passes = 0;\n");
-    if sink {
-        body.push_str("  if (pos[0] == 0) { cy.init(); }\n");
-    }
-    for &(u, rows, _) in &ks.stores {
-        let _ = writeln!(
-            body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); @fmovs(fab.fout(q_am, {sw}), D_sx); }} }}"
-        );
-    }
-    for &(u, rows) in &ks.queries {
-        let _ = writeln!(
-            body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ cy.query_q(D_ob); @fmovs(fab.fout(q_o{u}, {qd}), D_ob); }} }}"
-        );
-    }
-    body.push_str("  stamp(1);\n  tsc[2] = cy.passes;\n  sys_mod.unblock_cmd_stream();\n");
-    let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n");
-    for u in 0..n {
-        let _ = writeln!(
-            t,
-            "  @initialize_queue(q_i{u}, .{{ .color = @get_color(C_I{u}) }});\n  @initialize_queue(q_o{u}, .{{ .color = @get_color(C_O{u}) }});"
-        );
-    }
-    if sink {
-        t.push_str("  @export_symbol(snk_p, \"snk\");\n  @export_symbol(pos_p, \"pos\");\n");
-    }
-    t.push_str("  @initialize_queue(q_ar, .{ .color = @get_color(C_AR) });\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n}\n");
-    Ok((name, t))
-}
-
 /// A decode program's rows a step (its lanes): none in a stream reading's.
-fn rows_of(p: &Program) -> Option<u32> {
+pub(crate) fn rows_of(p: &Program) -> Option<u32> {
     p.shape.cache?;
     Some(p.class_rows.iter().map(|c| c.0).sum::<u32>().max(1))
 }
 
 /// The array of a decode step's `n` rows' (lane slot, state slot, position) at `c`.
-fn rowp_array(c: Coord, n: u32) -> HostArray {
+pub(crate) fn rowp_array(c: Coord, n: u32) -> HostArray {
     HostArray {
         at: c,
         sym: "rowp".into(),
@@ -2594,7 +2434,8 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
     let mut regions = Vec::new();
     for kc in &s.kv {
         let ks = &p.kv[kc.block as usize];
-        let state = kv_joint(p, ks).state;
+        let j = kv_joint(p, ks);
+        let col = crate::kernel::column(Some(&j)).ok()?;
         let mut at: Vec<Coord> = vec![kc.root(s)];
         at.extend((0..kc.pya).map(|i| kc.pe(s, i)));
         let of = |sym: &str| -> Vec<Pe> {
@@ -2609,17 +2450,12 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
             v
         };
         regions.push(Region {
-            kind: match state {
-                Some(st) if st.mamba.is_some() => "mamba2".into(),
-                Some(st) if st.kda.is_some() => "kda".into(),
-                Some(_) => "gdn".into(),
-                None => "kv".into(),
-            },
+            kind: col.region(&j).into(),
             block: kc.block,
             head: kc.head,
             slots: lanes,
-            paging: match (state, g) {
-                (None, Some(g)) => Some(Pages {
+            paging: match (col.paged(), g) {
+                (true, Some(g)) => Some(Pages {
                     size: g.size,
                     pages: g.pages,
                 }),
@@ -2641,7 +2477,10 @@ pub const PAGE_MIN: u32 = 64;
 pub fn paging(p: &Program) -> Option<Paging> {
     let cache = p.shape.cache?;
     let attn: Vec<u32> = (p.stream.kv.iter())
-        .filter(|kc| kv_joint(p, &p.kv[kc.block as usize]).state.is_none())
+        .filter(|kc| {
+            crate::kernel::column(Some(&kv_joint(p, &p.kv[kc.block as usize])))
+                .is_ok_and(|c| c.paged())
+        })
         .map(|kc| kc.pya)
         .collect();
     if attn.is_empty() {
@@ -2662,222 +2501,6 @@ pub fn paging(p: &Program) -> Option<Paging> {
         pages: cache.div_ceil(size) + 1,
         lanes,
     })
-}
-
-/// A K / V column's attention PE: the rows it keeps (q too), then every query.
-fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let (qh, dc, _, sc) = kv_consts(p, ks);
-    let total: u32 = ks.stores.iter().map(|s| s.1).sum();
-    let pya = p.stream.kv[k].pya;
-    // a decode step's cache keeps its positions across steps (in pages); a stream step's rows
-    // its own
-    let paged = paging(p);
-    let ne = match paged {
-        Some(g) => g.pages * (g.size / pya),
-        None => total.div_ceil(pya),
-    };
-    let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
-    let causal = kv_joint(p, ks).causal;
-    if causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
-        return Err(format!(
-            "K / V column {k}: a causal attention over {} stores: its rows' order is one unit's",
-            ks.stores.len()
-        ));
-    }
-    let name = format!("kp_{k}.csl");
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// K / V column {k}'s attention PEs (kernels-cerebras emit::stream; ops/satt.csl)."
-    );
-    t.push_str("param memcpy_params;\nparam C_AM: u16;\nparam C_S: u16;\nparam C_R: u16;\n");
-    t.push_str(COMMON);
-    // pcfg: the PE's index in the column, its chain role (the column's PEs one image)
-    t.push_str(&cfg_decl(&[0, 0]));
-    t.push_str("const q_am = @get_input_queue(2);\nconst q_r = @get_input_queue(3);\nconst q_s = @get_output_queue(2);\n");
-    t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
-    let _ = writeln!(
-        t,
-        "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{}{} }});",
-        pya,
-        match paged {
-            Some(g) => format!(
-                ", .PAGED = true, .EP = {}, .LANES = {}, .MAXP = {}, .ROWS = {total}",
-                g.size / pya,
-                g.lanes,
-                g.pages
-            ),
-            None => String::new(),
-        },
-        if causal {
-            match kv_joint(p, ks).window {
-                // a sliding window's: of the rows stored before a query, its last alone
-                Some(w) => format!(", .CAUSAL = true, .WIN = {w}"),
-                None => ", .CAUSAL = true".to_string(),
-            }
-        } else {
-            String::new()
-        }
-    );
-    let mut body = String::from("  stamp(0);\n");
-    if paged.is_some() {
-        // a decode step's rows each at its lane's slot (`rowp`: lane slot, position; `ptab`:
-        // each lane slot's pages, the host's)
-        t.push_str("var rowp_p: [*]u32 = &att.rowp;\nvar ptab_p: [*]u32 = &att.ptab;\n");
-        body.push_str("  att.bind(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n");
-        let _ = writeln!(
-            body,
-            "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.store_t(t); }} }}\n  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_t(t); }} }}"
-        );
-    } else {
-        body.push_str("  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n");
-        for &(_, rows, p0) in &ks.stores {
-            let _ = writeln!(
-                body,
-                "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q({p0} + t); }} }}"
-            );
-        }
-        let _ = writeln!(
-            body,
-            "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_q(t); }} }}"
-        );
-    }
-    body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
-    let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");
-    if paged.is_some() {
-        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n  @export_symbol(ptab_p, \"ptab\");\n");
-    }
-    t.push_str("}\n");
-    Ok((name, t))
-}
-
-/// A state column's root (P8, ops/cy_sst.csl): each row of its unit's, its head's [q | k | v |
-/// b | a] in, the step, its output back.
-fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let j = kv_joint(p, ks);
-    let st = j.state.ok_or("a state column of no recurrence")?;
-    let (d, dv) = (j.head_dim, j.v_dim());
-    let n_rows = rows_of(p).unwrap_or(1);
-    let name = format!("sr_{k}.csl");
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// State column {k}'s root (kernels-cerebras emit::stream; ops/cy_sst.csl)."
-    );
-    t.push_str("param memcpy_params;\n");
-    for u in 0..ks.units.len() {
-        let _ = writeln!(t, "param C_I{u}: u16;\nparam C_O{u}: u16;");
-    }
-    t.push_str("param C_AR: u16;\nparam C_AM: u16;\n");
-    t.push_str(COMMON);
-    let n = ks.units.len();
-    for u in 0..n {
-        let _ = writeln!(
-            t,
-            "const q_i{u} = @get_input_queue({});\nconst q_o{u} = @get_output_queue({});",
-            2 + u,
-            3 + u
-        );
-    }
-    let _ = writeln!(
-        t,
-        "const q_ar = @get_input_queue({});\nconst q_am = @get_output_queue(2);",
-        2 + n
-    );
-    let _ = writeln!(
-        t,
-        "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {dv}, .CONV = {}, .SLOTS = {n_rows}, .ROWS = {n_rows}{} }});",
-        st.taps,
-        match (st.mamba, st.kda) {
-            (Some(_), _) => ", .MAMBA = true".to_string(),
-            (None, Some(k)) => format!(
-                ", .KDA = true, .FLOOR = {:?}, .L2EPS = {:?}",
-                k.floor, k.eps
-            ),
-            (None, None) => String::new(),
-        }
-    );
-    let sw = 2 * d + dv + 1 + st.a_width();
-    t.push_str(&buf("sx", sw));
-    t.push_str(&buf("ob", dv));
-    // a decode step's rows each a lane's (its state slot's history; `rowp`, the host's)
-    t.push_str("var stw_p: [*]f32 = &cy.cw;\nvar rowp_p: [*]u32 = &cy.rowp;\n");
-    let decode = rows_of(p).is_some();
-    let mut body = String::from(if decode {
-        "  stamp(0);\n"
-    } else {
-        // (a stream step's rows one sequence's, from a cleared history)
-        "  stamp(0);\n  cy.init();\n"
-    });
-    let mut at = 0;
-    for &(u, rows, _) in &ks.stores {
-        let step = if decode {
-            format!("cy.row({at} + t, &sx, &ob);")
-        } else {
-            "cy.step(&sx, &ob);".to_string()
-        };
-        let _ = writeln!(
-            body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); {step} @fmovs(fab.fout(q_o{u}, {dv}), D_ob); }} }}"
-        );
-        at += rows;
-    }
-    body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
-    let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(stw_p, \"stw\");\n");
-    if decode {
-        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n");
-    }
-    for u in 0..n {
-        let _ = writeln!(
-            t,
-            "  @initialize_queue(q_i{u}, .{{ .color = @get_color(C_I{u}) }});\n  @initialize_queue(q_o{u}, .{{ .color = @get_color(C_O{u}) }});"
-        );
-    }
-    t.push_str("  @initialize_queue(q_ar, .{ .color = @get_color(C_AR) });\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n}\n");
-    Ok((name, t))
-}
-
-/// A state column's PE (P8, ops/sst.csl): its rows of each head's state, a step a row.
-fn st_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let j = kv_joint(p, ks);
-    let (d, dv) = (j.head_dim, j.v_dim());
-    let pya = p.stream.kv[k].pya;
-    let rows: u32 = ks.stores.iter().map(|s| s.1).sum();
-    let name = format!("sp_{k}.csl");
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// State column {k}'s PEs (kernels-cerebras emit::stream; ops/sst.csl)."
-    );
-    t.push_str("param memcpy_params;\nparam C_AM: u16;\nparam C_S: u16;\nparam C_R: u16;\n");
-    t.push_str(COMMON);
-    t.push_str(&cfg_decl(&[0, 0]));
-    t.push_str("const q_am = @get_input_queue(2);\nconst q_r = @get_input_queue(3);\nconst q_s = @get_output_queue(2);\n");
-    t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
-    let _ = writeln!(
-        t,
-        "const st = @import_module(\"ops/sst.csl\", .{{ .fab = fab, .red = red, .YM = q_am, .DK = {d}, .DV = {dv}, .PYA = {pya}, .SLOTS = {rows}, .ROWS = {rows} }});"
-    );
-    // a decode step's rows each a lane's (its state slot; `rowp`, the host's)
-    t.push_str("var rowp_p: [*]u32 = &st.rowp;\n");
-    // (a stream step's rows one sequence's, from a cleared state)
-    let (init, step) = if rows_of(p).is_some() {
-        ("st.myrow = @as(u16, pcfg[0]);", "st.row(t);")
-    } else {
-        ("st.init(@as(u16, pcfg[0]));", "st.step();")
-    };
-    let body = format!(
-        "  stamp(0);\n  {init}\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ {step} }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n"
-    );
-    let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");
-    if rows_of(p).is_some() {
-        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n");
-    }
-    t.push_str("}\n");
-    Ok((name, t))
 }
 
 fn lane_root_file(words: u32) -> String {

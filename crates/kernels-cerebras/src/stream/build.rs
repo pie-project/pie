@@ -767,7 +767,7 @@ pub fn program_at(
         let mut any = false;
         for (u, _) in &mut units {
             if let Some(j) = u.joint.as_mut()
-                && j.state.is_none()
+                && crate::kernel::column(Some(j)).is_ok_and(|c| c.replicates())
                 && (j.q_heads / j.kv_heads.max(1)).is_multiple_of(rep)
             {
                 j.kv_heads *= rep;
@@ -1021,30 +1021,30 @@ pub fn program_at(
     let pya = kv
         .iter()
         .map(|k| {
-            // a recurrence's column: its state's rows over the fewest PEs (a decode step's a
-            // state a lane slot, a row a lane)
-            if joint_of(k).is_some_and(|j| j.state.is_some()) {
-                let lanes = shape
-                    .cache
-                    .map_or(1, |_| class_rows.iter().map(|c| c.0).sum::<u32>());
-                return PYA * lanes.max(1);
-            }
-            let (qh, hd) = joint_of(k).map_or(
+            // each column's PEs its mixer's
+            let j = joint_of(k);
+            let (q_per_kv, head_dim) = j.map_or(
                 (
                     shape.attn.q_heads / shape.attn.kv_heads.max(1),
                     shape.attn.head_dim,
                 ),
                 |j| (j.q_heads / j.kv_heads.max(1), j.head_dim),
             );
-            kv_pya_split(
-                shape
+            let ask = crate::kernel::ColumnAsk {
+                q_per_kv,
+                head_dim,
+                positions: shape
                     .cache
                     .unwrap_or_else(|| k.stores.iter().map(|s| s.1).sum()),
-                qh,
-                hd,
+                lanes: shape
+                    .cache
+                    .map_or(1, |_| class_rows.iter().map(|c| c.0).sum::<u32>()),
                 split,
-            )
+            };
+            crate::kernel::column(j.as_ref()).map(|c| c.pya(&ask))
         })
+        .collect::<R<Vec<u32>>>()?
+        .into_iter()
         .max()
         .unwrap_or(PYA);
     // helpers below a unit's rest roots: within the band's K / V rows (where a K / V column

@@ -437,6 +437,7 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
             j.v_dim(),
             j.out_dim(),
         );
+        let col = crate::kernel::column(Some(&j)).ok()?;
         for s in &u.steps {
             match s {
                 Step::Store { q, k, v } => {
@@ -453,19 +454,10 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
                             h as usize,
                             Slice::of(v.base, v.from + vh * dv, dv),
                         );
-                        // a recurrence's head also its beta and decay logits
-                        if let Some(st) = j.state {
-                            push(
-                                &mut cols,
-                                h as usize,
-                                Slice::of(st.b.base, st.b.from + h, 1),
-                            );
-                            let aw = st.a_width();
-                            push(
-                                &mut cols,
-                                h as usize,
-                                Slice::of(st.a.base, st.a.from + h * aw, aw),
-                            );
+                        // what else its column takes a head (a recurrence's beta and decay
+                        // logits)
+                        for (c, from, width) in col.head_parts(&j, h) {
+                            push(&mut cols, h as usize, Slice::of(c.base, from, width));
                         }
                     }
                 }
