@@ -95,6 +95,10 @@ pub struct Session {
 #[derive(Debug)]
 struct Minted {
     slot: usize,
+    /// Its lane of the wave it flies in, and where its live commit word
+    /// lies there once the wave has flown (0 until then).
+    lane: usize,
+    live: u64,
     before: Vec<Cursor>,
     next: Vec<Cursor>,
     tickets: Vec<Ticket>,
@@ -612,11 +616,25 @@ impl Session {
         Ok(())
     }
 
+    /// The fire minted last flies in `wave`: its regions read its live
+    /// commit word there.
+    pub fn fly_in(&mut self, wave: &Wave) {
+        if let Some(minted) = self.pending.back_mut() {
+            minted.live = wave.commit_at(minted.lane);
+        }
+    }
+
     pub fn take_lane(&mut self, stages: Vec<&mut Prepared>, scratch: u64) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
         };
-        let commit = self.commits[minted.slot].device();
+        // Its regions read the live word in the wave's device tables; the
+        // host word is the settle's to fill.
+        let commit = if minted.live != 0 {
+            minted.live
+        } else {
+            self.commits[minted.slot].device()
+        };
         for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit, scratch)?;
             for name in &self.row_sets {
@@ -903,7 +921,7 @@ impl Session {
         let rings = self.rings.device();
         let commit = self.commits[slot].device();
 
-        let _lane = wave.stage(
+        let lane = wave.stage(
             &tickets,
             &taken,
             &put,
@@ -924,6 +942,8 @@ impl Session {
                 commit,
                 ticket_offset: 0,
                 ticket_count: 0,
+                // The wave's fly moves `commit` here and the live word in.
+                commit_host: 0,
             },
         );
 
@@ -940,6 +960,8 @@ impl Session {
         }
         Ok(Minted {
             slot,
+            lane,
+            live: 0,
             before,
             next,
             tickets,

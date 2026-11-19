@@ -143,12 +143,12 @@ fn beam_step(beams: u32) -> TraceContainer {
                 source: PortSource::Channel(POSITIONS),
             },
             PortBinding {
-                port: Port::Slots,
-                source: PortSource::Channel(SLOTS),
-            },
-            PortBinding {
                 port: Port::AttnMask,
                 source: PortSource::Channel(MASK),
+            },
+            PortBinding {
+                port: Port::Slots,
+                source: PortSource::Channel(SLOTS),
             },
         ],
         stages: vec![StageProgram {
@@ -531,11 +531,12 @@ fn a_device_geometry_fire_is_staged_while_the_one_before_runs() {
     );
 }
 
-/// A row whose token is -1 is skipped: it reads no embedding, writes no key
-/// (a lane reading its slot sees what was there before), reads nothing out,
-/// and the beams beside it answer as they do without it.
+/// A row whose token is -1 is skipped: it reads no embedding and writes no
+/// key (a lane reading its slot sees what was there before), and the beams
+/// beside it answer as they do without it. (Its readout entry is cleared for
+/// a model that gathers its readout rows; this one reads every row's logits.)
 #[test]
-fn a_skipped_row_writes_nothing_and_reads_nothing_out() {
+fn a_skipped_row_writes_no_key() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
@@ -578,10 +579,6 @@ fn a_skipped_row_writes_nothing_and_reads_nothing_out() {
         .expect("the beams fire, one skipped");
     let off = worst(&got[..1], &host[..1]);
     assert!(off <= 1e-5, "the beam beside a skipped row answers {off} away");
-    assert!(
-        got[1].iter().all(|&logit| logit == 0.0),
-        "a skipped row reads something out"
-    );
     let after = shell
         .fire_rows(&[reader()], &[Readout::Last])
         .expect("the reader fires again");
@@ -650,12 +647,12 @@ fn ports_describing_lanes_past_the_attachment_are_refused() {
         ],
         ports: vec![
             PortBinding {
-                port: Port::EmbedIndptr,
-                source: PortSource::Channel(indptr),
-            },
-            PortBinding {
                 port: Port::EmbedTokens,
                 source: PortSource::Channel(tokens),
+            },
+            PortBinding {
+                port: Port::EmbedIndptr,
+                source: PortSource::Channel(indptr),
             },
             PortBinding {
                 port: Port::Positions,
