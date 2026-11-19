@@ -3,7 +3,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use eta_ir::op::{Family, Op};
-use eta_ir::types::ValueId;
+use eta_ir::types::{Dtype, ValueId};
 
 use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
 use super::nucleus::LibraryMatch;
@@ -460,6 +460,11 @@ pub(crate) fn direct_topk(
         return None;
     };
     let input = *input;
+    // A direct read computes the row in f32: a bf16 row (its every store
+    // rounded) is ranked from its own bytes.
+    if stage.value_types.get(input as usize)?.dtype != Dtype::F32 {
+        return None;
+    }
     let through_reshapes = |mut value: ValueId| -> ValueId {
         while let Some(producer) = index.producer(value) {
             match stage.ops[producer.index()] {

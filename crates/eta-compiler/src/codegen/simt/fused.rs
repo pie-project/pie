@@ -137,7 +137,18 @@ pub(crate) struct GumbelChain {
     pub(crate) state: u32,
     pub(crate) divisor: Option<u32>,
     pub(crate) noise: u32,
+    /// Where the chain's values are bf16, each rounded once as its store
+    /// would round it ([`GUMBEL_ROUND_LOGITS`] and its kin): the fused draw
+    /// stores none of them and lands what the op-by-op chain lands.
+    pub(crate) rounding: u32,
 }
+
+/// The logits are cast to bf16 before the draw.
+pub(crate) const GUMBEL_ROUND_LOGITS: u32 = 1;
+/// The scaled logits are bf16.
+pub(crate) const GUMBEL_ROUND_SCALED: u32 = 2;
+/// The perturbed row is bf16.
+pub(crate) const GUMBEL_ROUND_PERTURBED: u32 = 4;
 
 pub(crate) fn analyze_direct_argmax(
     stage: &CompiledStage,
@@ -190,7 +201,7 @@ pub(crate) fn analyze_direct_argmax(
         let mut value = reduction.args[0];
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
-        let mut gumbel: Option<(u32, Option<u32>, u32)> = None;
+        let mut gumbel: Option<(u32, Option<u32>, u32, u32)> = None;
         if single_consumer(value, node as u32)
             && ops[producers[value as usize] as usize].tag == tags::ADD
         {
@@ -210,7 +221,13 @@ pub(crate) fn analyze_direct_argmax(
                 } else {
                     (add_op.args[0], None)
                 };
+                let bf16_value =
+                    |v: u32| stage.normalized.value_types[v as usize].dtype == Dtype::Bf16;
                 if let Some(noise) = noise {
+                    let mut rounding = 0u32;
+                    if bf16_value(value) {
+                        rounding |= GUMBEL_ROUND_PERTURBED;
+                    }
                     let rng = producers[noise as usize];
                     let state = ops[rng as usize].args[0];
                     let mut head = vec![add, rng];
@@ -228,10 +245,32 @@ pub(crate) fn analyze_direct_argmax(
                             source = scale_op.args[0];
                             consumer = scale;
                             head.push(scale);
+                            if bf16_value(logits) {
+                                rounding |= GUMBEL_ROUND_SCALED;
+                            }
                         }
                     }
+                    // The model's row cast to bf16 on its way in.
                     if single_consumer(source, consumer) {
-                        gumbel = Some((state, divisor, noise));
+                        let cast = producers[source as usize];
+                        let cast_op = &ops[cast as usize];
+                        if cast_op.tag == tags::CAST
+                            && bf16_value(source)
+                            && cast_op.args.len() == 1
+                            && stage.normalized.value_types[cast_op.args[0] as usize].dtype
+                                == Dtype::F32
+                        {
+                            rounding |= GUMBEL_ROUND_LOGITS;
+                            head.push(cast);
+                            consumer = cast;
+                            source = cast_op.args[0];
+                        }
+                    }
+                    // A bf16 row nothing here casts is another op's: its
+                    // own bytes, which the fused draw does not read.
+                    let model_row = !bf16_value(source);
+                    if model_row && single_consumer(source, consumer) {
+                        gumbel = Some((state, divisor, noise, rounding));
                         chain.extend(head);
                         value = source;
                         expected_consumer = consumer;
@@ -270,13 +309,14 @@ pub(crate) fn analyze_direct_argmax(
                 }
                 _ => false,
             };
-            if let Some((state, divisor, noise)) = gumbel {
+            if let Some((state, divisor, noise, rounding)) = gumbel {
                 if exact_shape || runtime_single_row {
                     analysis.gumbel[node] = Some(GumbelChain {
                         intrinsic: output_slot(stage, op),
                         state,
                         divisor,
                         noise,
+                        rounding,
                     });
                     for &skipped in &chain {
                         analysis.skipped[skipped as usize] = 1;
@@ -494,7 +534,7 @@ pub fn emit_fused_region(
 ",
         );
         source.push_str(
-            "    const m1_u64 elem = d.dtype == 3u ? 1u : 4u;
+            "    const m1_u64 elem = m1_elem_bytes(d.dtype);
 ",
         );
         source.push_str(
@@ -618,6 +658,7 @@ pub fn emit_fused_region(
             divisor: chain.divisor.map(resolve),
             divisor_desc: chain.divisor.map(|d| aliases.resolve(d)),
             noise_desc: aliases.resolve(chain.noise),
+            rounding: chain.rounding,
         });
 
         source.push_str("  {\n");
@@ -729,6 +770,7 @@ struct GumbelSlots {
     divisor: Option<String>,
     divisor_desc: Option<u32>,
     noise_desc: u32,
+    rounding: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,7 +844,7 @@ fn emit_body(
             "    ptir_parallel_transpose(&status, {a0}, {o0}, descriptors[p.a0], descriptors[p.o0]);"
         );
     } else if matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN) {
-        if stage.normalized.value_types[op.args[0] as usize].dtype == Dtype::F32 {
+        if eta_ir::types::is_float(stage.normalized.value_types[op.args[0] as usize].dtype) {
             let _ = writeln!(
                 source,
                 "    ptir_parallel_reduce_f32({tag}u, {a0}, {o0}, temporary, descriptors[p.a0]);"
@@ -864,9 +906,10 @@ fn emit_body(
             }
             let _ = writeln!(
                 source,
-                "        lane_row * descriptors[{}u].len);",
+                "        lane_row * descriptors[{}u].len,",
                 chain.noise_desc
             );
+            let _ = writeln!(source, "        {}u);", chain.rounding);
         } else if direct_intrinsic[node] != u16::MAX {
             let _ = writeln!(
                 source,
@@ -931,9 +974,7 @@ fn emit_body(
 fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     let tag = op.tag;
     source.push_str("    const M1ValueDesc input = descriptors[p.a0];\n");
-    source.push_str(
-        "    const m1_u32 logical_bytes = input.dtype == 3u ? input.len : input.len * 4u;\n",
-    );
+    source.push_str("    const m1_u32 logical_bytes = input.len * m1_elem_bytes(input.dtype);\n");
     source.push_str("    if (logical_bytes > p.sink_bytes) {\n");
     let _ = writeln!(
         source,
@@ -948,7 +989,7 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     source.push_str(
         "      const m1_u8* committed = reinterpret_cast<const m1_u8*>(channel.committed_cell);\n",
     );
-    source.push_str("      const m1_u32 element_bytes = input.dtype == 3u ? 1u : 4u;\n");
+    source.push_str("      const m1_u32 element_bytes = m1_elem_bytes(input.dtype);\n");
     source.push_str("      m1_u32 elements_per_validity_row = 0u;\n");
     source.push_str("      if (lane.token_count != 0u) {\n");
     source.push_str(

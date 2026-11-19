@@ -179,7 +179,7 @@ impl<'a> Streams<'a> {
         let out_dtype = self.dtype(out);
         if !matches!(
             out_dtype,
-            Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+            Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool | Dtype::Bf16
         ) {
             return None;
         }
@@ -202,7 +202,7 @@ impl<'a> Streams<'a> {
             values.iter().all(|&v| {
                 matches!(
                     self.dtype(v),
-                    Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+                    Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool | Dtype::Bf16
                 )
             })
         };
@@ -336,7 +336,7 @@ impl<'a> Streams<'a> {
                 Some(Role::Intrinsic)
             }
             tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX => {
-                if op.args.len() != 1 || self.dtype(op.args[0]) != Dtype::F32 {
+                if op.args.len() != 1 || !eta_ir::types::is_float(self.dtype(op.args[0])) {
                     return None;
                 }
                 if tag == tags::REDUCE_ARGMAX && self.direct_intrinsic[node] != u16::MAX {
@@ -506,8 +506,19 @@ impl<'a> Streams<'a> {
     }
 }
 
+/// The dtype a stream computes and holds a value in: a `bf16` value is an
+/// f32 in a register, the stored value exactly (each `bf16` result is
+/// rounded once where it is computed, [`typed_expr`]).
+fn compute(dtype: Dtype) -> Dtype {
+    if dtype == Dtype::Bf16 {
+        Dtype::F32
+    } else {
+        dtype
+    }
+}
+
 fn c_type(dtype: Dtype) -> &'static str {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => "float",
         Dtype::I32 => "int",
         Dtype::U32 => "m1_u32",
@@ -516,7 +527,7 @@ fn c_type(dtype: Dtype) -> &'static str {
 }
 
 fn letter(dtype: Dtype) -> char {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => 'f',
         Dtype::I32 => 'i',
         Dtype::U32 => 'u',
@@ -527,6 +538,7 @@ fn letter(dtype: Dtype) -> char {
 fn code(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::F32 => 0,
+        Dtype::Bf16 => u32::from(eta_ir::types::WIRE_BF16),
         Dtype::I32 => 1,
         Dtype::U32 => 2,
         _ => 3,
@@ -534,6 +546,7 @@ fn code(dtype: Dtype) -> u32 {
 }
 
 fn convert(expr: &str, from: Dtype, to: Dtype) -> String {
+    let (from, to) = (compute(from), compute(to));
     if from == to {
         return expr.into();
     }
@@ -600,24 +613,28 @@ impl Bodies {
         self.touch(ptr);
     }
 
+    /// A stored value: a `bf16` one an element's two bytes (`m1_store_h`)
+    /// a scalar iteration, a vector iteration's four elements eight bytes,
+    /// the two words they fill, by the thread that computed them.
     fn store(&mut self, dtype: Dtype, ptr: &str, reg: &str) {
         let l = letter(dtype);
+        let st = if dtype == Dtype::Bf16 { 'h' } else { l };
         let _ = writeln!(
             self.s,
-            "      if (stream_live) m1_store_{l}({ptr}, i, {reg});"
+            "      if (stream_live) m1_store_{st}({ptr}, i, {reg});"
         );
         let _ = writeln!(self.pre, "        {} w_{reg};", vec_type(dtype));
         let _ = writeln!(self.v, "      m1_set4_{l}(w_{reg}, j, {reg});");
         let _ = writeln!(
             self.post,
-            "        if (stream_live) m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});"
+            "        if (stream_live) m1_store4_{st}({ptr}, i4 >> 2u, w_{reg});"
         );
         self.touch(ptr);
     }
 }
 
 fn vec_type(dtype: Dtype) -> &'static str {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => "float4",
         Dtype::I32 => "int4",
         Dtype::U32 => "uint4",
@@ -637,6 +654,7 @@ struct Pass<'p> {
 }
 
 fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> String {
+    let want = compute(want);
     if let Some((_, from)) = pass.registers.iter().find(|(v, _)| *v == value) {
         return convert(&format!("r{value}"), *from, want);
     }
@@ -683,7 +701,7 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
         rng_read(streams, node, out, pass);
     } else {
         let out_dtype = streams.dtype(out);
-        let expr = map_expr(streams, node, out_dtype, pass);
+        let expr = typed_expr(streams, node, out_dtype, pass);
         pass.body.both(&format!(
             "      const {} r{out} = {expr};",
             c_type(out_dtype)
@@ -807,6 +825,17 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     pass.registers.push((out, Dtype::F32));
 }
 
+/// `node`'s value as its register holds it: a `bf16` result rounded once,
+/// as its store rounds it, so a reader in the stream sees the stored value.
+fn typed_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
+    let expr = map_expr(streams, node, compute(out_dtype), pass);
+    if out_dtype == Dtype::Bf16 {
+        format!("m1_round_bf16({expr})")
+    } else {
+        expr
+    }
+}
+
 fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
     let op = &streams.ops[node];
     let tag = op.tag;
@@ -832,7 +861,7 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         let x = read(streams, op.args[0], Dtype::Bool, pass);
         format!("(!{x})")
     } else if matches!(tag, tags::NEG | tags::ABS | tags::SIGN) {
-        let path = streams.dtype(op.args[0]);
+        let path = compute(streams.dtype(op.args[0]));
         let x = read(streams, op.args[0], path, pass);
         match (tag, path) {
             (tags::NEG, Dtype::F32) => format!("(-{x})"),
@@ -867,7 +896,12 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         let b = read(streams, op.pred_payload, Dtype::F32, pass);
         format!("({a} >= {b})")
     } else {
-        let path = streams.dtype(op.args[0]);
+        // Float operands compute in f32 whichever float dtype each is.
+        let path = if eta_ir::types::is_float(streams.dtype(op.args[1])) {
+            Dtype::F32
+        } else {
+            compute(streams.dtype(op.args[0]))
+        };
         let a = read(streams, op.args[0], path, pass);
         let b = read(streams, op.args[1], path, pass);
         match (tag, path) {
@@ -991,7 +1025,7 @@ pub(super) fn emit_stream(
         let tag = op.tag;
         match member.role {
             Role::Map | Role::Broadcast => {
-                let expr = map_expr(streams, node, out_dtype, &mut pass);
+                let expr = typed_expr(streams, node, out_dtype, &mut pass);
                 pass.body.both(&format!(
                     "      const {} r{out} = {expr};",
                     c_type(out_dtype)

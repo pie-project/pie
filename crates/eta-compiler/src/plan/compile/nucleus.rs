@@ -32,8 +32,8 @@ pub(crate) fn recognize_library_dataflows(
         claimed.extend(candidate.nodes.iter().copied());
         matches.push(candidate);
     }
-    // A top-p or top-k cut outside a sampler chain, over f32 rows a
-    // vocabulary wide: the lane cut (its row on several blocks).
+    // A top-p or top-k cut outside a sampler chain, over f32 or bf16 rows
+    // a vocabulary wide: the lane cut (its row on several blocks).
     for node in (0..stage.ops.len() as u32).map(NodeIndex) {
         if claimed.contains(&node) {
             continue;
@@ -52,7 +52,9 @@ pub(crate) fn recognize_library_dataflows(
             input_type.dims.last(),
             Some(Dimension::Static(width)) if *width >= LANE_CUT_WIDTH
         );
-        if input_type.dtype != Dtype::F32 || !wide || !(1..=2).contains(&input_type.rank()) {
+        // A bf16 row's cut reads it as f32 (`eta_ir::types`), as an f32 row's.
+        let float = matches!(input_type.dtype, Dtype::F32 | Dtype::Bf16);
+        if !float || !wide || !(1..=2).contains(&input_type.rank()) {
             continue;
         }
         let Some(output) = index.base(node) else {
