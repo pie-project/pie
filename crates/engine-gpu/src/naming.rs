@@ -263,6 +263,8 @@ mod tests {
             Target::Wgsl,
             kernels_slang::linear::gemm::Tactic {
                 tier: kernels_slang::Tier::Baseline,
+                vector: 0,
+                wide: true,
             },
             "linear.matmul",
             64,

@@ -11,6 +11,7 @@ pub mod blob;
 pub mod books;
 pub mod chunks;
 pub mod decoded;
+pub mod dense;
 mod dispatch;
 pub mod error;
 pub mod experts;

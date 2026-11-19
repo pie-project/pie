@@ -670,6 +670,9 @@ pub struct Shell<B: Serve> {
     /// The highest tier the device runs.
     tier: kernels_slang::Tier,
 
+    /// The dense matmul's tactic at each rung ([`crate::dense`]).
+    dense: crate::dense::Dense,
+
     pipelines: B::Pipelines,
 
     /// What the load named of its fires before it built or reserved.
@@ -1158,32 +1161,53 @@ impl<B: Serve> Shell<B> {
                 .map_or(state, |budget| budget.min(state))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
         };
-        // The dense tactic at each power of two of rows to the asked top:
-        // a matmul of `m` rows runs the tactic of the widest such row count
-        // at or below it.
-        let gemm_by_rows: std::sync::Arc<Vec<(u32, kernels_slang::linear::gemm::Tactic)>> =
-            std::sync::Arc::new(
-                engine::memory::rungs(1, budgets.tokens.max_tokens.max(1))
-                    .into_iter()
-                    .map(|rows| (rows, tuning.gemm(tier, rows)))
-                    .collect(),
-            );
-        let gemm_at = {
-            let table = std::sync::Arc::clone(&gemm_by_rows);
-            move |rows: u32| {
-                table
-                    .iter()
-                    .rev()
-                    .find(|&&(at, _)| at <= rows)
-                    .or(table.first())
-                    .map(|&(_, tactic)| tactic)
-                    .expect("one row count at least")
+        // The dense tactic to the asked top (rungs: every power of two of
+        // rows, then the top): the vector or the tiled kernels, whichever the
+        // estimate weighs faster, one a rung where fires are recorded a rung
+        // (`crate::dense`), else at each fire's rows.
+        let dense = {
+            let top = budgets.tokens.max_tokens.max(1);
+            let mut rungs = engine::memory::rungs(1, top);
+            if rungs.last() != Some(&top) {
+                rungs.push(top);
             }
+            let counts = counts.as_ref().ok_or_else(|| {
+                Fault::Residency(format!(
+                    "the profile states no `[rates]` {:?}, which the dense matmul's kernel at \
+                     each rung is chosen by",
+                    device_profile.rates().missing(&crate::rates::KEYS)
+                ))
+            })?;
+            let (dense, weighed) = crate::dense::choose(
+                B::TARGET,
+                &rungs,
+                |rows| tuning.gemm(tier, rows),
+                &device_profile.rates(),
+                counts,
+                B::RECORDS,
+            )
+            .map_err(|key| {
+                Fault::Residency(format!(
+                    "the profile states no `[rates] {key}`, which the dense matmul's kernel at \
+                     each rung is chosen by"
+                ))
+            })?;
+            // Said once, by the load that serves: its naming walk weighs the same.
+            if !B::NAMES {
+                for w in &weighed {
+                    if B::RECORDS {
+                        tracing::info!("dense matmul {w}");
+                    } else {
+                        tracing::info!("dense matmul {w}; eager, each fire at its own rows");
+                    }
+                }
+            }
+            std::sync::Arc::new(dense)
         };
         let row_tile: engine::roofline::RowTile = {
-            let tactic_at = gemm_at.clone();
+            let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), n, k).row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;
@@ -1441,7 +1465,7 @@ impl<B: Serve> Shell<B> {
                 let padded = |rows: u32| {
                     kernels_slang::linear::gemm::padded_rows(
                         B::TARGET,
-                        gemm_at(rows),
+                        dense.at(rows),
                         rows,
                         counts.width,
                     )
@@ -1842,6 +1866,7 @@ impl<B: Serve> Shell<B> {
             tuning,
             device,
             tier,
+            dense: std::sync::Arc::unwrap_or_clone(dense),
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -4593,6 +4618,7 @@ impl<B: Serve> Shell<B> {
                 self.weights.hashes(),
                 &self.tuning,
                 self.tier,
+                &self.dense,
                 self.weights.gathered(),
                 self.weights.host(),
             )
