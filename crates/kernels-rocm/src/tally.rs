@@ -45,11 +45,15 @@ fn bump(field: impl FnOnce(&mut Counts) -> &mut u64) {
 }
 
 /// A code object built or loaded on this thread.
+/// Only the HIP backend builds code objects.
+#[cfg(feature = "rocm")]
 pub(crate) fn built() {
     bump(|c| &mut c.built);
 }
 
 /// A code object refused on this thread.
+/// Only the HIP backend builds code objects.
+#[cfg(feature = "rocm")]
 pub(crate) fn refused() {
     bump(|c| &mut c.refused);
 }
@@ -61,7 +65,7 @@ pub fn declined() {
     bump(|c| &mut c.declined);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocm"))]
 mod tests {
     use super::*;
 

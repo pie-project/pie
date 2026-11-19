@@ -623,3 +623,22 @@ Next:
   points and see whether the 7 µs follows;
 - if it does, a stable placement for the decode kernels, rather than chasing each module
   edit.
+
+## F39. ROCm `kernel.gemm.turn_min_n` (2048) stands in for the turned kernel's narrow-bank idle
+
+The turned kernel (`skinnyt_bf16`) walks one 16-row tile a block, so a bank of n rows is
+n / 16 blocks. Below 2048 rows the route keeps the skinny kernel, and that constant is
+the narrow-bank idle, not a measured choice.
+
+Removing it costs MI300X 4-parallel decode +28 µs a step (qwen3-0.6b: 1.475 → 1.510 ms;
+beam-4 2.155 → 2.188). o-proj (1024 x 2048) moves to the turned kernel: 64 blocks on 304
+compute units, two serial 256-element slices a wavefront. It takes 7.2 µs a call against the
+skinny kernel's 6.2 (rocprofv3 device durations).
+
+Stream-timed microbenchmarks said the opposite: turn ahead from 128 columns up, cold weights
+too. Their back-to-back launches were capped by the dispatch rate (about 5 µs) and hid kernel
+duration. Kernel choices are compared on device durations.
+
+What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
+that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
+slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
