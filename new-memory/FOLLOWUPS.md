@@ -182,3 +182,23 @@ should be skipped by name (its restore's rebind places it), and the rest
 re-addressed whatever one instance answers. Not hit in the beam runs (it
 needs an evacuation while a guest is parked); `Plane::rebind` is now
 all-or-nothing and poisons an instance whose rings move only partway.
+
+## F21. Fragmentation under pressure: whole chunks free only after nearly everything in them goes
+
+A chunk comes free only when every page or slot in it is free, and an
+evacuation moves whole chunks. Two symptoms, one root: pages or slots of
+many owners interleave across chunks.
+
+1. Shedding idle kv (sc/np-tier-shed, CUDA Qwen3-0.6B, 160 x 512 tokens,
+   yield 1, pressure 0.6): concurrent decodes lay their pages interleaved,
+   so the default responder's first 36 discards freed 5 of 255 chunks, and
+   all 70 idle sets went before 3 segments came free. Yield works now,
+   but it takes all of the cache with it.
+2. Mac Pro's restore-4 runs, 500 at once: restores stuck waiting for
+   "2 runs of 3 adjacent Instance-slot chunks" while ~460-620 of 1932
+   chunks were free.
+
+The likely answer for both is compaction under pressure: moving single
+pages or slots out of a chunk so that whole chunks free, rather than
+dropping or waiting until a chunk empties by itself. Gate: it costs no
+serving throughput (<= 2% vs main).
