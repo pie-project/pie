@@ -2581,6 +2581,8 @@ impl PoolPort for BindRoomPool {
                 })
                 .collect(),
             free: Vec::new(),
+            headroom: None,
+            segment_chunks: 0,
         }
     }
     fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
@@ -3603,4 +3605,49 @@ async fn a_parked_process_waiting_to_be_resident_is_restored() {
         matches!(waited, Ok(Ok(()))),
         "the parked process is restored: {waited:?}"
     );
+}
+
+/// Mac Pro's M5 shape C: a restore short of role room gave up with its
+/// need marked understated, was queued again as its process waited to be
+/// resident, and, the mark still set, skipped the free runs that stood once
+/// every resident had gone: 1861 chunks free, nothing resident, the head
+/// never tried again. A restore that gives up is parked with what it
+/// learned of the room cleared.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let need = super::proc::PendingBind {
+        run: 3,
+        pieces: 2,
+        pages: 6,
+    };
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(need);
+        proc.roles_free_retry = Some((3, 2));
+        proc.roles_free_short = Some((3, 2));
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    // Alone, short, and the policy freed nothing: it gives up.
+    planner.note_short(key, 6 << 20, 0);
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    assert!(planner.restore_expired(pid).is_some(), "alone and short, it gives up");
+    planner.with_inner(|inner| {
+        let proc = &inner.procs[&pid];
+        assert!(proc.parked.is_some(), "parked");
+        assert_eq!(proc.roles_short, None, "its role need is the room's then");
+        assert_eq!(proc.roles_free_retry, None);
+        assert_eq!(proc.roles_free_short, None, "no longer marked understated");
+    });
 }

@@ -467,7 +467,7 @@ impl ResidencyPlanner {
     /// seat deadline, as a parked allocation is: it leaves the queue owing
     /// what it did (parked, as a holder's set is), and its error says what
     /// was short. `None` while it may still wait.
-    fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
+    pub(super) fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
         let key = self.with_inner(|inner| {
             inner
                 .queue
@@ -487,6 +487,16 @@ impl ResidencyPlanner {
                 && proc.state == Residency::Evicted
             {
                 proc.parked = Some(demand);
+                // What its restore learned of the room is the room's then:
+                // queued again ([`Self::wait_resident`]) it starts from
+                // the room as it stands. Kept, a need marked understated
+                // skipped the free runs that stood once every resident had
+                // gone, and the restore waited on evictions that could not
+                // come (Mac Pro's M5 shape C: 1861 chunks free, nothing
+                // resident, the head never tried again).
+                proc.roles_short = None;
+                proc.roles_free_retry = None;
+                proc.roles_free_short = None;
                 return true;
             }
             false
