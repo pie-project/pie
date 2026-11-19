@@ -319,11 +319,12 @@ struct Stage {
     /// lies in, its first byte there and its bytes.
     heap: (Side, u64, u64),
 
-    staging: Buffer,
-
     landing: Buffer,
 
-    dirty: Vec<(u64, u64)>,
+    /// Roots the host handed the next pass, by their offset in the heap:
+    /// written in the pass's frame ([`Frame::update_regions`]), so no pass
+    /// still on the queue is waited for.
+    staged: Vec<(u64, Vec<u8>)>,
 }
 
 /// The cells of channels the device keeps between fires, by channel: one
@@ -843,11 +844,7 @@ impl Session {
                 ),
             });
         }
-        // A pass still on the queue may not have copied its own roots out.
-        self.settle()?;
-        let stage = &mut self.stages[stage];
-        stage.staging.write(at, bytes)?;
-        stage.dirty.push((at, len));
+        self.stages[stage].staged.push((at, bytes.to_vec()));
         Ok(())
     }
 
@@ -855,13 +852,13 @@ impl Session {
         let Some(stage) = self.stages.get_mut(at_stage) else {
             return Ok(());
         };
-        let dirty: Vec<(u64, u64)> = stage.dirty.drain(..).collect();
+        let staged = std::mem::take(&mut stage.staged);
         let (heap, base) = self.heap_at(at_stage)?;
-        let staging = &self.stages[at_stage].staging;
-        for (at, len) in dirty {
-            frame.copy(staging, at, heap, base + at, len)?;
-        }
-        Ok(())
+        let regions: Vec<(u64, &[u8])> = staged
+            .iter()
+            .map(|(at, bytes)| (base + at, bytes.as_slice()))
+            .collect();
+        frame.update_regions(heap, &regions)
     }
 
     pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<()> {
@@ -1212,12 +1209,6 @@ fn build_stage(
         .iter()
         .map(|step| library.pipeline(device, step.call))
         .collect::<Result<Vec<_>>>()?;
-    let staging = Buffer::with(
-        device,
-        scratch,
-        Memory::Host,
-        engine_gpu::books::owners::GUEST,
-    )?;
     let landing = Buffer::with(
         device,
         scratch,
@@ -1239,8 +1230,7 @@ fn build_stage(
         descriptors,
         tables,
         heap,
-        staging,
         landing,
-        dirty: Vec::new(),
+        staged: Vec::new(),
     })
 }

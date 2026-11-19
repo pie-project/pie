@@ -1657,6 +1657,81 @@ impl Frame {
         self.copy_regions(source, into, &[(source_at, into_at, len)])
     }
 
+    /// Writes each `(into_at, bytes)` region into `into` in the command
+    /// stream (`vkCmdUpdateBuffer`, at most 65536 bytes a command) under one
+    /// pair of barriers: the bytes land in order with the frame's commands,
+    /// so no frame still on the queue reads a later frame's. A region starts
+    /// on a word and its last word is written whole, zero past its bytes, so
+    /// it lies in a span laid out in whole words.
+    pub fn update_regions(&mut self, into: &Buffer, regions: &[(u64, &[u8])]) -> Result<()> {
+        const MOST: usize = 65536;
+        let mut words: Vec<(u64, Vec<u8>)> = Vec::new();
+        for &(at, bytes) in regions {
+            if bytes.is_empty() {
+                continue;
+            }
+            if !at.is_multiple_of(4) {
+                return Err(Fault::Device {
+                    call: "vkCmdUpdateBuffer",
+                    why: format!("a region at byte {at}, which starts on no word"),
+                });
+            }
+            let mut padded = bytes.to_vec();
+            padded.resize(bytes.len().next_multiple_of(4), 0);
+            into.span(at, padded.len() as u64)?;
+            for (index, chunk) in padded.chunks(MOST).enumerate() {
+                words.push((at + (index * MOST) as u64, chunk.to_vec()));
+            }
+        }
+        if words.is_empty() {
+            return Ok(());
+        }
+        let d = &self.inner.core.device;
+        let cmd = self.inner.cmd();
+        let buffer = into.slab().buffer;
+        // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
+        // `into` is a live buffer of this device, each region was checked to
+        // lie inside it, starts on a word and is a whole number of words of
+        // at most 65536 bytes; the frame retains the slab below until its
+        // fence signals.
+        unsafe {
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            for (at, chunk) in &words {
+                d.cmd_update_buffer(cmd, buffer, *at, chunk);
+            }
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::TRANSFER_WRITE,
+                );
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        self.retain(into.slab());
+        Ok(())
+    }
+
     /// Copies each `(source_at, into_at, len)` region of `source` into
     /// `into` under one pair of barriers; a host-mapped `into` is made
     /// visible to the host once the frame's fence signals.
