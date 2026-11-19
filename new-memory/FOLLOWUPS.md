@@ -575,3 +575,24 @@ Levers:
 - smaller code a program (rolling, F35, does not land under 2%);
 - a libtpu change: release or make configurable the host-side program data after load (an upstream request);
 - evicting cold executables to the disk cache (parked: a reload at fire time is a fire built after ready).
+
+Draft of the upstream request (text only; filing it is the user's call):
+
+> **libtpu: release (or make configurable) a loaded executable's host-side data after it is
+> on the device.** A serving engine that loads many fixed-shape programs at startup
+> (hundreds, through `PJRT_Executable_DeserializeAndLoad`) holds about 180 MB of live host
+> memory per loaded executable on v6e (libtpu 0.0.48). That is about 7.6× the program's
+> generated code (22.5 MB of code, 38.5 MB serialized), and 380 MB when the program is
+> compiled in process instead. 652 programs hold 126 GiB of host RAM; a ladder of 1178 has
+> exhausted a 172 GB host. The engine keeps no references beyond the
+> `PJRT_LoadedExecutable` (it destroys the `PJRT_Executable` it reads), `malloc_trim`
+> returns nothing, and the flags `xla_xprof_register_llo_debug_info`,
+> `xla_tpu_impure_track_debug_metadata` and `xla_tpu_keep_hlo_proto_literals_up_to` do not
+> change it. Request:
+> - document what a loaded executable keeps on the host after its first execute;
+> - an option (a compile or load option, or a flag) to release whatever is not needed to
+>   execute the program (the optimized HLO module, buffer assignment, debug or profiling
+>   metadata, serialized form), keeping only what a re-execute needs;
+> - if the program binary itself must stay host-resident (for instruction overlays or a
+>   reload into HBM), a way to share or page it rather than hold a private copy per
+>   executable.
