@@ -159,6 +159,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
