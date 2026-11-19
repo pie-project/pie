@@ -986,6 +986,10 @@ const INJECTED: &str = "a failure injected by `fail_next_frame`";
 /// ([`Frame::commit_async`]) as failed, to its handler and to its
 /// [`Pending::wait`], whatever the device did: tests of what a failed
 /// command buffer leaves, which a real device fault can't be made to give.
+///
+/// A test seam only: nothing in serving calls it, and no config, env var
+/// or protocol path reaches it. Its flag is per thread and inert unless
+/// this is called on that thread.
 #[doc(hidden)]
 pub fn fail_next_frame() {
     FAIL_NEXT.with(|next| next.set(true));
