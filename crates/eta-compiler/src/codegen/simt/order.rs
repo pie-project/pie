@@ -396,6 +396,19 @@ const BODY_SELECT: &str = r#"
                 ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
                 : 0xFFFFFFFFFFFFFFFFull;
           __syncthreads();
+          if (merged <= blockDim.x) {
+            // A thread an entry: its rank is how many entries come before
+            // it (no two are equal, their indices differ), and the first
+            // `order_count` ranks are the select's, in order.
+            if (threadIdx.x < merged) {
+              const m1_u64 entry = sel_pool[threadIdx.x];
+              m1_u32 rank = 0u;
+              for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
+              if (rank < order_count) sel_cand[rank] = entry;
+            }
+            __syncthreads();
+            sel_sorted = sel_cand;
+          } else {
           m1_u32 sel_merge = 2u;
           while (sel_merge < merged) sel_merge <<= 1u;
           for (m1_u32 size = 2u; size <= sel_merge; size <<= 1u) {
@@ -416,6 +429,7 @@ const BODY_SELECT: &str = r#"
             }
           }
           sel_sorted = sel_pool;
+          }
         }
       }
       if (sel_lands) {
