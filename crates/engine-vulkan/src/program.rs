@@ -916,6 +916,9 @@ impl Plane {
         let inputs = PassInputs::none();
 
         #[cfg(feature = "vulkan")]
+        offered_read(seat, instance, &seats)?;
+
+        #[cfg(feature = "vulkan")]
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
@@ -1031,6 +1034,7 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        offered_read(seat, instance, &seats)?;
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
@@ -1405,16 +1409,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         })?;
         #[cfg(feature = "vulkan")]
         {
-            let session = &seat.session;
-            let unread = engine_gpu::guest::run::unread_seat(
-                &seat.plan.package,
-                |at, local| session.span(at, local).map(|(_, held)| held),
-                &seats,
-            )
-            .map_err(|fault| Refusal::Program(fault.to_string()))?;
-            if let Some((output, lane)) = unread {
-                return Err(engine_gpu::program::unread(instance, &output, lane));
-            }
+            let _ = seat;
             self.fire(instance, Stage::Epilogue, Some(device), seats)?;
             self.instances.get_mut(&instance).map_or(Ok(()), |seat| {
                 seat.session
@@ -1616,5 +1611,27 @@ mod registration_tests {
         assert!(why.contains("emits no WGSL for"), "{why}");
         assert_eq!(plane.forms.tally(), (0, 0), "the refusal is not kept");
         assert!(plane.programs.is_empty());
+    }
+}
+
+/// What a pass is offered it reads: every seat the fire read out for its
+/// lanes (the arm's seat, or rows where they lie in the fire's span) is a
+/// row of an output the program reads, else the pass is refused by name.
+#[cfg(feature = "vulkan")]
+fn offered_read(
+    seat: &Instance,
+    instance: InstanceId,
+    seats: &[Vec<crate::guest::run::Readout<'_>>],
+) -> Result<(), Refusal> {
+    let session = &seat.session;
+    let unread = engine_gpu::guest::run::unread_seat(
+        &seat.plan.package,
+        |at, local| session.span(at, local).map(|(_, held)| held),
+        seats,
+    )
+    .map_err(|fault| Refusal::Program(fault.to_string()))?;
+    match unread {
+        Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
+        None => Ok(()),
     }
 }

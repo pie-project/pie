@@ -240,7 +240,9 @@ impl Guests {
                     let spans: Vec<Vec<engine_gpu::serve::ReadSpan>> = (lane..lane + lanes as u32)
                         .map(|lane| {
                             (layout.iter())
-                                .filter(|span| span.lane == lane && span.rows > 0)
+                                .filter(|span| {
+                                    span.lane == lane && span.rows > 0 && span.seated
+                                })
                                 .copied()
                                 .collect()
                         })
