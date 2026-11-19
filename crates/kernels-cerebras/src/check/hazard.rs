@@ -638,7 +638,7 @@ fn body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 #[must_use]
 pub fn line_queues(pe: &str) -> Vec<Line> {
     let mut by: BTreeMap<(u32, String), BTreeSet<String>> = BTreeMap::new();
-    for func in ["gemm", "attend"] {
+    for func in crate::kernel::gemm_forms().map(|f| f.func) {
         let Some(b) = body(pe, func) else { continue };
         for frag in b.split("fab.iqc(").skip(1) {
             let Some(end) = frag.find(')') else { continue };
@@ -749,12 +749,29 @@ pub(crate) fn attention_orders_row(pe: &str) -> bool {
 /// A line on queues of its own (no queue rebound) has no window: nothing here.
 #[must_use]
 pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
+    use crate::kernel::LineAlong;
     use crate::stream::gemm::GOp;
     let ls = line_queues(pe);
-    let row_line = ls.iter().find(|l| l.func == "gemm");
-    let col_line = ls.iter().find(|l| l.func == "attend");
-    let att_row = attention_orders_row(pe);
-    let col_shut = col_line.is_some_and(|l| line_alternates(pe, l));
+    // each op's kernel's GEMM form and what it declares of `pe`: its line, whether it orders
+    // the row, whether a column line it rebinds alternates its first colour
+    struct Op<'f> {
+        form: &'f crate::kernel::GemmForm,
+        line: Option<&'f Line>,
+        orders: bool,
+        shut: bool,
+    }
+    let forms: Vec<Option<Op>> = (p.l.ops.iter())
+        .map(|op| {
+            let form = gemm_form(op)?;
+            let line = ls.iter().find(|l| l.func == form.func);
+            Some(Op {
+                form,
+                line,
+                orders: (form.orders_row)(pe),
+                shut: line.is_some_and(|l| line_alternates(pe, l)),
+            })
+        })
+        .collect();
     let mut out = Vec::new();
     let classes: BTreeSet<usize> = p.row_class.iter().copied().collect();
     // (a region's all-reduces over the row, as printed)
@@ -763,67 +780,97 @@ pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
         let bit = 1u16 << c;
         // (the last op since a row-wide ordering point that couples only a band)
         let mut skew: Option<(usize, &str)> = None;
-        let mut last_attend: Option<usize> = None;
+        // (each form's last op, by its function)
+        let mut last: BTreeMap<&str, usize> = BTreeMap::new();
         for (i, op) in p.l.ops.iter().enumerate() {
-            match op {
-                GOp::Gemm { mask, .. } if mask & bit != 0 => {
-                    if let (Some(l), Some((j, why))) = (row_line, skew) {
+            if let GOp::Region(r) = op {
+                if p.l.regs[*r].mask & bit != 0 && reduces(*r) > 0 {
+                    skew = None;
+                }
+                continue;
+            }
+            let Some(o) = &forms[i] else { continue };
+            let mask = match op {
+                GOp::Gemm { mask, .. } => *mask,
+                _ => u16::MAX,
+            };
+            if o.form.masked && mask & bit == 0 {
+                continue;
+            }
+            match (o.form.line, o.line) {
+                (LineAlong::Row, Some(l)) => {
+                    if let Some((j, why)) = skew {
                         out.push(format!(
-                            "class {c}: op {i}, a GEMM's row line (iq{} rebound {:?}), follows op \
+                            "class {c}: op {i}, {}'s row line (iq{} rebound {:?}), follows op \
                              {j} ({why}) with no row-wide ordering point between: its first \
                              pieces can reach PEs still in op {j} on a colour iq{} is not bound \
                              to (H2)",
-                            l.queue, l.colours, l.queue
+                            o.form.what, l.queue, l.colours, l.queue
                         ));
                     }
-                    skew = None;
                 }
-                GOp::Region(r) if p.l.regs[*r].mask & bit != 0 && reduces(*r) > 0 => {
-                    skew = None;
-                }
-                GOp::Attend { .. } => {
-                    // (no op orders a column: the tape's words are buffered, not a barrier)
-                    if let (Some(l), Some(j), false) = (col_line, last_attend, col_shut) {
+                // (no op orders a column: the tape's words are buffered, not a barrier)
+                (LineAlong::Column, Some(l)) => {
+                    if let (Some(&j), false) = (last.get(o.form.func), o.shut) {
                         out.push(format!(
-                            "op {i}: an attention after op {j}'s with no column-wide ordering \
+                            "op {i}: {} after op {j}'s with no column-wide ordering \
                              point between: the column line (iq{} rebound {:?}) leaves its PEs \
                              on its last colour, and the next one's first pieces can reach PEs \
                              still in op {j} (H2)",
-                            l.queue, l.colours
-                        ));
-                    }
-                    last_attend = Some(i);
-                    if att_row {
-                        skew = None;
-                    } else {
-                        skew = Some((
-                            i,
-                            "the attention: its key blocks over a band's reductions, a drift \
-                             growing with its key blocks",
+                            o.form.what, l.queue, l.colours
                         ));
                     }
                 }
-                _ => {}
+                (_, None) => {}
             }
+            last.insert(o.form.func, i);
+            skew = if o.orders {
+                None
+            } else {
+                Some((i, o.form.drift))
+            };
         }
     }
-    // H4: a row's bands drift apart over an attention's key blocks; past it, with no row-wide
-    // ordering point, a band ahead meets one behind in the ops after it and the row stops,
-    // lines on queues of their own or not (1558 / 1561: klein's second attention hung at 136,
-    // 272 and 576 rows; with a row all-reduce at each attention's end it ran)
-    if !att_row {
-        for (i, op) in p.l.ops.iter().enumerate() {
-            if matches!(op, GOp::Attend { .. }) && i + 1 < p.l.ops.len() {
-                out.push(format!(
-                    "op {i}: an attention with no row-wide ordering point at its end, ops after \
-                     it: its key blocks' band reductions let the row's bands drift apart (H4)"
-                ));
-            }
+    // H4: a row's bands drift apart over an op that does not order it; past it, with no
+    // row-wide ordering point, a band ahead meets one behind in the ops after it and the row
+    // stops, lines on queues of their own or not (1558 / 1561: klein's second attention hung at
+    // 136, 272 and 576 rows; with a row all-reduce at each attention's end it ran)
+    for (i, o) in forms.iter().enumerate() {
+        if let Some(o) = o
+            && !o.orders
+            && i + 1 < p.l.ops.len()
+        {
+            out.push(format!(
+                "op {i}: {} with no row-wide ordering point at its end, ops after it: {} (H4)",
+                o.form.what, o.form.drift_after
+            ));
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// The GEMM form of the kernel a GEMM-regime op is (`linear.matmul`'s GEMM, an attention's).
+fn gemm_form(op: &crate::stream::gemm::GOp) -> Option<&'static crate::kernel::GemmForm> {
+    use crate::stream::gemm::GOp;
+    let k = match op {
+        GOp::Gemm { .. } => crate::kernel::by_op("linear.matmul"),
+        GOp::Attend { .. } => crate::kernel::by_op("attn.ragged"),
+        _ => None,
+    };
+    k.and_then(|k| k.gemm())
+}
+
+/// The tiled form of the kernel a tiled-regime op is (a group norm's, a voxel attention's).
+fn tiled_form(op: &crate::stream::tiled::TOp) -> Option<&'static crate::kernel::TiledForm> {
+    use crate::stream::tiled::TOp;
+    let k = match op {
+        TOp::Norm { .. } => crate::kernel::by_op("conv.group_norm"),
+        TOp::Attend { .. } => crate::kernel::by_op("attn.voxel"),
+        _ => None,
+    };
+    k.and_then(|k| k.tiled())
 }
 
 /// Words the hub's loop holds for certain (the routers and queues from a PE's send to the hub
@@ -862,26 +909,21 @@ fn blocking_sends(text: &str) -> Vec<String> {
 /// - An attention (`attend`): a key's words (its `[k | v]` 16-bit, a word two).
 #[must_use]
 pub fn hub_loops(p: &crate::stream::tiled::TileProgram, pe: &str) -> Vec<String> {
-    use crate::stream::tiled::TOp;
     let blocking = |func: &str| {
         body(pe, func)
             .and_then(|b| before_receive(b, "q_bi"))
             .map(blocking_sends)
             .unwrap_or_default()
     };
-    let (ar, at) = (blocking("allreduce"), blocking("attend"));
     let mut out = Vec::new();
     for (i, op) in p.ops.iter().enumerate() {
-        let (what, words, sends) = match op {
-            TOp::Norm { groups, .. } => ("a norm's all-reduce", *groups, &ar),
-            TOp::Attend { q, .. } => ("an attention's key", p.vals[q].width, &at),
-            _ => continue,
-        };
+        let Some(f) = tiled_form(op) else { continue };
+        let (words, sends) = ((f.words)(p, op), blocking(f.func));
         if words > HUB_LOOP_WORDS && !sends.is_empty() {
             out.push(format!(
-                "op {i}: {what}, {words} words a PE sends before its receive of the broadcast is \
+                "op {i}: {}, {words} words a PE sends before its receive of the broadcast is \
                  posted (`{}`), past the {HUB_LOOP_WORDS} the hub's loop holds",
-                sends[0]
+                f.what, sends[0]
             ));
         }
     }

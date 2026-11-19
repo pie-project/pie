@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 
-use super::super::{Column, ColumnAsk, Kernel, R, Source, UnitKernel};
+use super::super::{Column, ColumnAsk, GemmForm, Kernel, LineAlong, R, Source, UnitKernel};
 use crate::emit::stream::{
     COMMON, Fill, HostArray, buf, cfg_decl, kv_consts, kv_joint, paging, rowp_array, rows_of,
 };
@@ -51,6 +51,10 @@ impl Kernel for Attention {
 
     fn unit(&self) -> Option<&dyn UnitKernel> {
         Some(self)
+    }
+
+    fn gemm(&self) -> Option<&'static GemmForm> {
+        Some(&GEMM)
     }
 
     fn column(&self) -> Option<&dyn Column> {
@@ -253,6 +257,20 @@ impl UnitKernel for Attention {
         Ok(true)
     }
 }
+
+/// Its GEMM form (`gemm_pe.csl`'s `attend`): its key blocks over a band's reductions, its
+/// members' order down the column line; it orders the row where its code ends in a row-wide
+/// all-reduce.
+static GEMM: GemmForm = GemmForm {
+    func: "attend",
+    what: "an attention",
+    line: LineAlong::Column,
+    masked: false,
+    orders_row: crate::check::hazard::attention_orders_row,
+    drift: "the attention: its key blocks over a band's reductions, a drift growing with its key \
+            blocks",
+    drift_after: "its key blocks' band reductions let the row's bands drift apart",
+};
 
 /// A column with no attention of its own (its block's first unit has none): the reading's,
 /// whose sizes the program's shape states.

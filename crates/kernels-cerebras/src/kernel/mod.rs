@@ -10,6 +10,7 @@
 //! [`KERNELS`].
 
 pub mod attn;
+pub mod conv;
 pub mod linear;
 pub mod ssm;
 
@@ -37,10 +38,59 @@ pub trait Kernel: Sync {
     fn unit(&self) -> Option<&dyn UnitKernel> {
         None
     }
+    /// Its op in the GEMM regime (a function of `gemm_pe.csl`), where it has one.
+    fn gemm(&self) -> Option<&'static GemmForm> {
+        None
+    }
+    /// Its op in the tiled regime (a function of `tiled_pe.csl`), where it has one.
+    fn tiled(&self) -> Option<&'static TiledForm> {
+        None
+    }
     /// Its mixer on a unit's K / V column, where it runs one (the unit regime).
     fn column(&self) -> Option<&dyn Column> {
         None
     }
+}
+
+/// The line a GEMM-regime op's function rebinds an input queue along (`check::hazard::lines`,
+/// GENERIC.md "The line windows").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineAlong {
+    /// A class's row: every PE of the row reads every other's piece.
+    Row,
+    /// A column: the op's pieces down a column.
+    Column,
+}
+
+/// A kernel's op in the GEMM regime: a function of the GEMM PE's one image (`gemm_pe.csl`), and
+/// what the hazard checks need of it (H1-H4).
+pub struct GemmForm {
+    /// Its function in the PE's code.
+    pub func: &'static str,
+    /// It, as the checks' messages name it ("a GEMM", "an attention").
+    pub what: &'static str,
+    /// The line it rebinds a queue along, where its function rebinds one.
+    pub line: LineAlong,
+    /// It runs for the classes of its op's mask alone (else for every class).
+    pub masked: bool,
+    /// Whether its code (`pe`) ends in a row-wide ordering point: no PE of the row leaves it
+    /// before every other has reached its end. Else it leaves the row's bands drifted.
+    pub orders_row: fn(pe: &str) -> bool,
+    /// Why it leaves the row drifted where it does not order it (H2's message).
+    pub drift: &'static str,
+    /// The same, with ops after it (H4's message).
+    pub drift_after: &'static str,
+}
+
+/// A kernel's op in the tiled regime: a function of the tiled PE's image (`tiled_pe.csl`), and
+/// what the hub-loop check needs of it.
+pub struct TiledForm {
+    /// Its function in the PE's code: its sends before its receive off the hub's broadcast.
+    pub func: &'static str,
+    /// It, as the check's message names it.
+    pub what: &'static str,
+    /// The words a PE sends towards the hub before its receive, for op `op` of `p`.
+    pub words: fn(p: &crate::stream::tiled::TileProgram, op: &crate::stream::tiled::TOp) -> u32,
 }
 
 /// A kernel in the unit regime (stream readings, decode through units): the steps its ops
@@ -111,7 +161,15 @@ pub static KERNELS: &[&dyn Kernel] = &[
     &attn::column::ATTENTION,
     &ssm::state::STATE,
     &linear::moe::MOE,
+    &linear::gemm::GEMM,
+    &conv::norm::GROUP_NORM,
+    &attn::voxel::VOXEL,
 ];
+
+/// The GEMM-regime forms of every kernel that has one.
+pub fn gemm_forms() -> impl Iterator<Item = &'static GemmForm> {
+    KERNELS.iter().filter_map(|k| k.gemm())
+}
 
 /// The kernel that implements the poem-ir op `op`, if one does.
 #[must_use]
