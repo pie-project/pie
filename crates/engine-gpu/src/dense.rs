@@ -14,6 +14,8 @@
 //! the rows the rung serves, `(rung / 2, rung]`, lies nearest that row
 //! count's best (the least regret at the rung's bottom and its top). A
 //! backend that fires eagerly takes the fastest at each fire's own rows.
+//! Candidates that tie are told apart by the rows a workgroup carries, the
+//! fewest taken.
 
 use engine::load::Counts;
 use engine::roofline::Constants;
@@ -71,8 +73,9 @@ impl Weighed {
     }
 
     /// The candidate whose worse ratio to the best at the rung's bottom and
-    /// top is least (the first so where they tie).
-    fn least_regret(costs: &[(Tactic, f64, f64)]) -> usize {
+    /// top is least; where candidates tie, the one whose workgroups carry
+    /// the fewest rows (`rows`, [`rows_a_workgroup`]).
+    fn least_regret(costs: &[(Tactic, f64, f64)], rows: &dyn Fn(&Tactic) -> u32) -> usize {
         let best = |of: fn(&(Tactic, f64, f64)) -> f64| {
             costs
                 .iter()
@@ -83,7 +86,11 @@ impl Weighed {
         let (bottom, top) = (best(|c| c.1), best(|c| c.2));
         let regret = |c: &(Tactic, f64, f64)| (c.1 / bottom).max(c.2 / top);
         (0..costs.len())
-            .min_by(|&a, &b| regret(&costs[a]).total_cmp(&regret(&costs[b])))
+            .min_by(|&a, &b| {
+                regret(&costs[a])
+                    .total_cmp(&regret(&costs[b]))
+                    .then(rows(&costs[a].0).cmp(&rows(&costs[b].0)))
+            })
             .unwrap_or(0)
     }
 }
@@ -109,6 +116,13 @@ impl std::fmt::Display for Weighed {
         }
         write!(f, ")")
     }
+}
+
+/// The rows one workgroup of `tactic`'s kernel carries on `target` (a
+/// vector kernel's rows, a tiled kernel's row tile): what a tie between
+/// candidates is broken by, the fewest first.
+fn rows_a_workgroup(target: Target, tactic: &Tactic) -> u32 {
+    gemm::tile_for(target, *tactic, 4096, 4096).rows_a_read()
 }
 
 /// The tiled kernels a backend can take under its tiled tactic `base`: one
@@ -202,8 +216,8 @@ pub fn choose(
             let kernel = gemm::tile_for(target, tactic, n, k);
             // The kernel's measured rate at the rows it lands, where its curve
             // reaches them: timed as it runs, every weight pass it makes (and
-            // whatever a cache spares it) in the time, so it reads the plane
-            // once beside it. Else the vector kernel's last measured rate and
+            // whatever a cache spares it) in the time: that time alone, no
+            // bandwidth floor beside it. Else the vector kernel's last measured rate and
             // a tiled kernel's on the matmul curve, its rows padded to its
             // tile, each reading the plane once a group of rows sharing a
             // read (no cache assumed).
@@ -212,8 +226,8 @@ pub fn choose(
             } else {
                 measured(tiles, kernel.row_tile().max(1), rows, &flops)
             };
-            let (compute, read) = match timed {
-                Some(ns) => (ns, bytes),
+            let work = match timed {
+                Some(ns) => ns,
                 None => {
                     let passes = f64::from(rows.div_ceil(kernel.rows_a_read().max(1)));
                     let compute = if tactic.vector > 0 {
@@ -227,10 +241,10 @@ pub fn choose(
                         let tile = kernel.row_tile().max(1);
                         flops(rows.div_ceil(tile) * tile) / c.gemm_rate(rows, n, k)
                     };
-                    (compute, passes * bytes)
+                    compute.max(passes * bytes / c.bytes_per_ns)
                 }
             };
-            ns += f64::from(count) * (c.launch_ns + compute.max(read / c.bytes_per_ns));
+            ns += f64::from(count) * (c.launch_ns + work);
         }
         ns
     };
@@ -244,7 +258,8 @@ pub fn choose(
             .into_iter()
             .map(|t| (t, cost(t, bottom), cost(t, rung)))
             .collect();
-        let taken = Weighed::least_regret(&costs);
+        let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
+        let taken = Weighed::least_regret(&costs, &rows_of);
         if records {
             by_rows.push((rung, costs[taken].0));
         } else {
@@ -252,7 +267,7 @@ pub fn choose(
                 let fastest = candidates(rows)
                     .into_iter()
                     .map(|t| (t, cost(t, rows)))
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))))
                     .map(|(t, _)| t)
                     .expect("one candidate at least");
                 by_rows.push((rows, fastest));

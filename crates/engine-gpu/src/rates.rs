@@ -645,14 +645,17 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
     // its time, keyed by its row tile.
     let mut tile_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
-    let tiled_kernels = if want.tiles {
-        crate::dense::tiled_kernels(
-            B::TARGET,
-            tactics.gemm(tier, TILE_ROWS[TILE_ROWS.len() - 1]),
-        )
-    } else {
-        Vec::new()
-    };
+    // Every tiled kernel the profile's path reaches at some timed rows (a
+    // device whose path takes the 32x32 tile below some rows and the
+    // cooperative-matrix tile above times both).
+    let mut tiled_kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
+    for m in TILE_ROWS.into_iter().filter(|_| want.tiles) {
+        for tactic in crate::dense::tiled_kernels(B::TARGET, tactics.gemm(tier, m)) {
+            if !tiled_kernels.contains(&tactic) {
+                tiled_kernels.push(tactic);
+            }
+        }
+    }
     for tactic in tiled_kernels {
         let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, w, w).row_tile();
         let mut curve = Vec::new();
