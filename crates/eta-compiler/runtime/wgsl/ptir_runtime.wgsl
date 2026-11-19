@@ -15,11 +15,11 @@ struct Cfg {
 
   value_count : u32,
 
-  temporary : u32,
-
   op_count : u32,
 
   lane : u32,
+
+  pad : u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> status  : array<u32>;
@@ -32,6 +32,13 @@ struct Cfg {
 var<private> tid : u32;
 
 var<private> lanes : u32;
+
+// The word the running node's temporary area begins at: its op's entry
+// past the values' in the offsets table, set before a call that keeps
+// something there.
+var<private> tmp_base : u32;
+
+fn node_area(p : u32) -> u32 { return offs[cfg.value_count + p] >> 2u; }
 
 // The invocation within its workgroup, the workgroup, and how many run.
 var<private> sel_lt : u32;
@@ -488,7 +495,7 @@ const PTIR_REDUCE_LEVELS : u32 = 7u;
 fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
-  return cfg.temporary + (buf * span + row * stride + c) * 2u;
+  return tmp_base + (buf * span + row * stride + c) * 2u;
 }
 
 fn red_read_buf(level : u32) -> u32 { return level % 2u; }
@@ -1062,7 +1069,7 @@ fn key_less(ah : u32, al : u32, bh : u32, bl : u32) -> bool {
 }
 
 fn sort_cell(buf : u32, n : u32, c : u32) -> u32 {
-  return cfg.temporary + ((buf * n) + c) * 2u;
+  return tmp_base + ((buf * n) + c) * 2u;
 }
 
 fn sort_rows_of(p : u32, a : u32) -> u32 {
@@ -1136,10 +1143,10 @@ fn op_sort_round(p : u32, r : u32) {
   }
 }
 
-fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }
-fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }
-fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }
-fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }
+fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }
+fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }
+fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }
+fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }
 
 const PIVOT_UNROLL : u32 = 32u;
 
@@ -1427,7 +1434,7 @@ var<workgroup> sel_wg_key : array<u32, 1024>;
 var<workgroup> sel_wg_idx : array<u32, 1024>;
 var<workgroup> sel_wg_skip : u32;
 
-fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }
+fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }
 fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
 fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
 fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }

@@ -233,6 +233,7 @@ fn reduce_finish_call(at: usize, tag: u8) -> String {
 }
 
 fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32, levels: u32) {
+    let _ = writeln!(body, "  tmp_base = node_area({at}u);");
     if is_sort(tag) {
         let _ = writeln!(body, "  ptir_sort_seed({at}u);");
         body.push_str(BARRIER);
@@ -384,7 +385,10 @@ pub struct Stepwise {
 /// 1: every step a call of the closed set, reading its node, rung and
 /// selector from a uniform; before, each stage one module with its nodes
 /// spelled in.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 2;
+/// 3: a node keeps its temporaries in an area of its own, at its op's word
+/// past the values' in the offsets table (`node_area`), in place of the
+/// stage's one area at `cfg.temporary`.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 3;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -475,11 +479,40 @@ fn call_text(call: Call) -> String {
             | Call::Finish { guarded: true, .. }
             | Call::PivotPack { guarded: true }
     );
+    // A call that may keep something in a temporary area finds its node's
+    // first (`node_area`); a plain op's named call keeps none.
+    let plain = named
+        && matches!(
+            call,
+            Call::Unary
+                | Call::Arith
+                | Call::Compare
+                | Call::Logic
+                | Call::Select
+                | Call::Cumulative
+                | Call::Broadcast
+                | Call::Copy
+                | Call::Transpose
+                | Call::Gather
+                | Call::GatherRow
+                | Call::Scatter
+                | Call::Iota
+                | Call::MaskApply
+                | Call::StructMask
+                | Call::Rng
+                | Call::Matmul
+                | Call::Const
+        );
+    let area = if plain {
+        String::new()
+    } else {
+        alloc::format!("  tmp_base = node_area({p});\n")
+    };
     if guarded {
         // The ladder runs only for a row the select handed over.
-        alloc::format!("  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
+        alloc::format!("{area}  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
     } else {
-        alloc::format!("  {body};\n")
+        alloc::format!("{area}  {body};\n")
     }
 }
 
@@ -1051,17 +1084,17 @@ mod stepwise_tests {
         assert!(selects(tags::PIVOT_THRESHOLD));
         assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
-            "return cfg.temporary + ((buf * n) + c) * 2u;",
-            "return cfg.temporary + (buf * span + row * stride + c) * 2u;",
-            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }",
-            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }",
-            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }",
-            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }",
-            "fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }",
+            "return tmp_base + ((buf * n) + c) * 2u;",
+            "return tmp_base + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
         ] {
             assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
         }
-        let named = RUNTIME.matches("cfg.temporary").count();
+        let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
         assert_eq!(named, 7, "a temporary cell this statement has not read");
         assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
     }

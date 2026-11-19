@@ -1,7 +1,8 @@
 //! A guest stage's bind-time tables, as every backend lays them: each
 //! value's descriptor ([`desc_words`], [`DESC_WORDS`] u32s), each op's
-//! params ([`OpParams`], `PARAM_WORDS` u32s), each value's word offset in
-//! the stage's scratch, and the stage's config ([`Cfg`]). A step of the
+//! params ([`OpParams`], `PARAM_WORDS` u32s), each value's byte offset in
+//! the stage's scratch and then each op's temporary area's, and the
+//! stage's config ([`Cfg`]). A step of the
 //! closed set (`eta_compiler::codegen::steps`) finds its node's operands
 //! here: the node's params name its argument and result values, whose
 //! descriptors and offsets these tables hold. [`stage_tables`] writes them
@@ -12,17 +13,21 @@ use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
-use crate::{Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out};
+use crate::{
+    Extents, Keeps, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
+};
 
 pub const DESC_WORDS: usize = 9;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cfg {
+    /// Where the offsets table's op areas begin: past each value's offset.
     pub value_count: u32,
-    pub temporary: u32,
     pub op_count: u32,
     pub lane: u32,
+    /// Holds the uniform at four words.
+    pub pad: u32,
 }
 
 const _: () = assert!(size_of::<Cfg>() == 16);
@@ -47,7 +52,7 @@ pub fn words_le(words: &[u32]) -> Vec<u8> {
 impl Cfg {
     #[must_use]
     pub fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
+        words_le(&[self.value_count, self.op_count, self.lane, self.pad])
     }
 }
 
@@ -112,37 +117,36 @@ impl Stepping {
         stepping
     }
 
-    /// The launches `descriptors` are laid over: the temporary area the
-    /// most a launched node keeps there ([`wgsl::temporary_bytes`] of its
-    /// first argument), and below it the one-row select's state where a
-    /// node runs the select ([`wgsl::selects`]), none where none does.
+    /// The launches `descriptors` are laid over, a launched node each, a
+    /// node that keeps something in the temporary area keeping an area of
+    /// its own, alive while it runs: what the runtime keeps there for it
+    /// ([`wgsl::temporary_bytes`] of its first argument), with the one-row
+    /// select's state below it where it runs the select ([`wgsl::selects`]).
+    /// No area is the stage's.
     #[must_use]
     pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
-        let temporary = self
-            .runs
-            .iter()
-            .map(|&(tag, argument)| {
-                argument
-                    .and_then(|argument| descriptors.get(argument as usize))
-                    .map_or(0, |argument| {
-                        wgsl::temporary_bytes(
-                            tag,
-                            u64::from(argument.len),
-                            u64::from(argument.rows),
-                        )
-                    })
-            })
-            .max()
-            .unwrap_or(0);
-        let selects = self.runs.iter().any(|&(tag, _)| wgsl::selects(tag));
+        let keeps = |&(tag, argument): &(u8, Option<u32>)| {
+            let bytes = argument
+                .and_then(|argument| descriptors.get(argument as usize))
+                .map_or(0, |argument| {
+                    wgsl::temporary_bytes(tag, u64::from(argument.len), u64::from(argument.rows))
+                });
+            let reserve = if wgsl::selects(tag) { SELECT_RESERVE } else { 0 };
+            (bytes > 0 || reserve > 0).then_some(Keeps { reserve, bytes })
+        };
         Launches {
-            each: self.launched.iter().map(Launch::of_node).collect(),
+            each: self
+                .launched
+                .iter()
+                .zip(&self.runs)
+                .map(|(node, run)| Launch::of_node(node, keeps(run)))
+                .collect(),
             idle: self.idle.clone(),
             staged: self.staged.clone(),
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
-            reserve: if selects { SELECT_RESERVE } else { 0 },
-            temporary,
+            reserve: 0,
+            temporary: 0,
         }
     }
 }
@@ -158,14 +162,14 @@ pub fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
     }
 }
 
-/// The bytes of a stage's tables (descriptors, op params, value offsets, config): what its
-/// value and op counts fix, whatever the extents a bind resolves.
+/// The bytes of a stage's tables (descriptors, op params, value and op area offsets,
+/// config): what its value and op counts fix, whatever the extents a bind resolves.
 #[must_use]
 pub fn table_sizes(plan: &LaunchStagePlan) -> [u64; 4] {
     [
         (plan.value_types.len() * DESC_WORDS * 4).max(DESC_WORDS * 4) as u64,
         (plan.ops.len().max(1) * size_of::<OpParams>()) as u64,
-        (plan.value_types.len().max(1) * 4) as u64,
+        ((plan.value_types.len() + plan.ops.len()).max(1) * 4) as u64,
         size_of::<Cfg>() as u64,
     ]
 }
@@ -226,16 +230,28 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             .checked_add(u32::from(op.result_count))
             .ok_or_else(|| "a guest stage's result ids past a u32".to_string())?;
     }
+    // Each node's area where it keeps one ([`Stepping::launches`]), else
+    // none: a node that keeps none reads no area.
+    let mut areas = vec![0u64; plan.ops.len()];
+    let keeping = launches
+        .each
+        .iter()
+        .filter(|launch| launch.keeps.is_some())
+        .flat_map(|launch| launch.nodes.iter().copied());
+    for (node, &at) in keeping.zip(&scratch.areas) {
+        areas[node as usize] = at;
+    }
     let offsets: Vec<u32> = scratch
         .values
         .iter()
+        .chain(&areas)
         .map(|&at| word("value offset", at))
         .collect::<Result<_, _>>()?;
     let config = Cfg {
         value_count: word("value count", plan.value_types.len() as u64)?,
-        temporary: word("temporary words", scratch.temporary / 4)?,
         op_count: word("op count", plan.ops.len() as u64)?,
         lane: 0,
+        pad: 0,
     };
     Ok(StageTables {
         descriptors,

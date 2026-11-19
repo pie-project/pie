@@ -556,16 +556,94 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 5_056_512),
-                ("top-k + top-p", 9_616_896, 5_208_832),
-                ("gumbel-max", 5_512_960, 1_900_032),
+                ("top-p", 9_312_512, 3_841_024),
+                ("top-k + top-p", 9_616_896, 3_993_344),
+                ("gumbel-max", 5_512_960, 1_824_000),
                 ("greedy", 3_688_704, 1_292_032),
-                ("top logprobs", 6_728_960, 4_862_720),
-                ("sorted", 8_551_168, 4_862_464),
-                ("beam prefill", 6_728_960, 5_469_952),
-                ("beam-4 decode", 31_647_232, 21_879_296),
+                ("top logprobs", 6_728_960, 3_040_000),
+                ("sorted", 8_551_168, 4_254_720),
+                ("beam prefill", 6_728_960, 4_254_976),
+                ("beam-4 decode", 31_647_232, 14_586_880),
             ]
         );
+    }
+
+    /// Laid over the shipped programs, no two values alive together share a
+    /// byte, a reshape read as its source lies at its source's offset and
+    /// keeps the source alive through its own readers, and no value alive
+    /// with a node's temporary area shares a byte of it or of the reserve
+    /// below it: an area takes only bytes of values dead while it is.
+    #[test]
+    fn a_shipped_program_s_live_items_share_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let four = Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        };
+        let mut programs: Vec<(&str, eta_dsl::Traced, Extents)> = shipped::all(vocab)
+            .into_iter()
+            .map(|(name, traced)| (name, traced, Extents::default()))
+            .collect();
+        programs.push(("beam prefill", shipped::beam_prefill(vocab, 4), Extents::default()));
+        programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
+        for (name, traced, extents) in &programs {
+            let package = shipped::package(traced, vocab);
+            let plan = &package.plans[0];
+            let tables = session::stage_tables(plan, extents).expect("static shapes");
+            let stepping = session::Stepping::of(plan);
+            let launches = stepping.launches(&tables.descriptors);
+            let lifetimes = eta_exec::value_lifetimes(plan, &launches).expect("every node runs");
+            let laid = eta_exec::lay_out(plan, &tables.descriptors, &launches).expect("fits");
+            let span = |value: usize| {
+                let at = tables.offsets[value];
+                (at, at + tables.descriptors[value].device_bytes())
+            };
+            let overlap = |a: eta_exec::Lifetime, b: eta_exec::Lifetime| {
+                a.last >= b.def && b.last >= a.def
+            };
+            let aliases = eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases;
+            for &(result, source) in &aliases {
+                let (result, source) = (result as usize, source as usize);
+                assert!(lifetimes[result].dead, "{name}: alias {result} takes no bytes");
+                assert_eq!(tables.offsets[result], tables.offsets[source], "{name}");
+                assert!(
+                    lifetimes[source].last >= lifetimes[result].last,
+                    "{name}: value {source} dies before its alias {result} is read"
+                );
+            }
+            let live: Vec<usize> = (0..lifetimes.len()).filter(|&v| !lifetimes[v].dead).collect();
+            for (at, &a) in live.iter().enumerate() {
+                for &b in &live[at + 1..] {
+                    let ((sa, ea), (sb, eb)) = (span(a), span(b));
+                    if overlap(lifetimes[a], lifetimes[b]) {
+                        assert!(ea <= sb || eb <= sa, "{name}: values {a} and {b} alive together");
+                    }
+                }
+            }
+            let areas = eta_exec::launch_areas(&launches);
+            assert_eq!(areas.len(), laid.areas.len(), "{name}");
+            for (at, (area, &first)) in areas.iter().zip(&laid.areas).enumerate() {
+                let low = first - area.reserve;
+                let high = first + area.bytes;
+                for &value in &live {
+                    let (start, end) = span(value);
+                    if overlap(lifetimes[value], area.life) {
+                        assert!(end <= low || high <= start, "{name}: value {value} in area {at}");
+                    }
+                }
+                for (other, (them, &their)) in areas.iter().zip(&laid.areas).enumerate().skip(at + 1) {
+                    if overlap(area.life, them.life) {
+                        assert!(
+                            high <= their - them.reserve || their + them.bytes <= low,
+                            "{name}: areas {at} and {other}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(laid.temporary_bytes, 0, "{name}: no area is the stage's");
+        }
     }
 
     /// A value the host stages or reads back that the stage's plan does not
