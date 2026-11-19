@@ -109,6 +109,53 @@ pub fn mamba2(
     m.norm(ctx, OP, y)
 }
 
+/// [`mamba2`] over each lane's carried rows then its own ([`Carry`]): each
+/// head's state steps the carried rows (their convolved `xbc` from the
+/// carried scratch, their step sizes from their buffered rows, plane 0)
+/// then the own row, and is stored at the lane's commit length; the own
+/// row's step size lands in the lane's buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_carried(
+    ctx: &Ctx,
+    xbc: Tensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    state_dim: u32,
+    y: &mut Tensor,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "attn.mamba2_step";
+    m.check(OP, xbc, dt, z, y, state_dim)?;
+    f32_state(OP, state)?;
+    seated(OP, state, "mamba2_step_carried", true, false, false)?;
+    let n = nonzero(OP, "rows", xbc.rows)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_step_carried"))
+            .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
+        &[
+            xbc.arg(),
+            dt.arg(),
+            z.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            m.d.arg(),
+            rows.arg(),
+            y.arg(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    m.norm(ctx, OP, y)
+}
+
 /// A prompt's Mamba-2 walk in sixteen-token chunks: a block a (request,
 /// head) lands `(C S + D x) * silu(z)` for each row, then the group norm.
 /// A `tail` pass (rows past a lane's commit, from the state its first pass

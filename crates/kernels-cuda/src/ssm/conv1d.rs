@@ -358,3 +358,141 @@ fn conv1d_chunked(
         ],
     )
 }
+
+/// The causal conv's decode step over each lane's carried rows then its own
+/// ([`Carry`]): `conv1d_update`'s sums a row, the window slid from the
+/// committed state through the rows, the carried rows' outputs into the
+/// carried scratch, the window stored at the lane's commit length, the own
+/// row landed in the lane's buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_carried(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d";
+    conv1d_carried(
+        ctx,
+        OP,
+        x,
+        weight,
+        bias,
+        state,
+        conv_width,
+        dilation,
+        y,
+        ConvOut::Silu,
+        carry,
+    )
+}
+
+/// [`short_conv`] over each lane's carried rows then its own, as
+/// [`causal_conv1d_carried`].
+#[allow(clippy::too_many_arguments)]
+pub fn short_conv_carried(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    y: &mut Tensor,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.short_conv";
+    conv1d_carried(
+        ctx,
+        OP,
+        x,
+        weight,
+        None,
+        state,
+        conv_width,
+        1,
+        y,
+        ConvOut::Residual,
+        carry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_carried(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    out: ConvOut,
+    carry: &Carry,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
+    let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
+    let n = nonzero(op, "rows", x.rows)?;
+    if conv_width > CONV_K_MAX {
+        return Err(refuse(
+            op,
+            format!("a {conv_width}-tap conv, past the {CONV_K_MAX} taps the step sums"),
+        ));
+    }
+    seated(op, state, "conv1d_carried", true, false, false)?;
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
+    let vectors = channels % CONV_VEC == 0
+        && dilation == 1
+        && rows.keeps(i64::from(CONV_VEC))
+        && rows.atoms().is_multiple_of(CONV_VEC)
+        && aligned16(x.ptr)
+        && aligned16(y.ptr)
+        && aligned16(weight.ptr)
+        && bias.is_none_or(|b| aligned16(b.ptr))
+        && aligned16(state.conv_slab.ptr)
+        && aligned16(carry.scratch)
+        && carry.plane_off[0].is_multiple_of(16)
+        && carry.plane_stride[0].is_multiple_of(16);
+    let mut args = vec![
+        x.arg(),
+        weight.arg(),
+        bias.map_or(ArgValue::ABSENT, |b| b.arg()),
+        rows.arg(),
+        y.arg(),
+        stated(op, n)?.arg(),
+        c.arg(),
+        k.arg(),
+    ];
+    let (entrypoint, launch) = if vectors {
+        (
+            format!("::pie::ssm::conv1d_carried_vec8{}", out.args()),
+            Launch::grid(
+                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), n, 1],
+                [CONV_BLOCK, 1, 1],
+            )
+            .programmatic(ctx.tuning().pdl()),
+        )
+    } else {
+        args.push(dil.arg());
+        (
+            format!("::pie::ssm::conv1d_carried{}", out.args()),
+            Launch::grid([channels.div_ceil(BLOCK), n, 1], [BLOCK, 1, 1]),
+        )
+    };
+    args.extend([
+        state.write_state.arg(),
+        state.write_state_mask.arg(),
+        carry.arg(),
+        ctx.stage(),
+    ]);
+    ctx.fire(
+        op,
+        Fire::at(kernel(CONV1D, &entrypoint)).apply(launch),
+        &args,
+    )
+}

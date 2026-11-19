@@ -199,6 +199,96 @@ impl Delta {
     }
 }
 
+/// The gate prep a gated-delta step's `gates` come from: its `[b | a]` rows
+/// and its banks, which a carried row's gates are derived from as
+/// `gdn_gates` derives them.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnGated {
+    pub ba: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+}
+
+/// The gated-delta decode step over each lane's carried rows then its own
+/// ([`Carry`]): the fused step's tile, loaded once, steps the carried rows
+/// (their conv outputs from the carried scratch, their gates from their
+/// buffered `[b | a]`) and the own row, and is stored at the lane's commit
+/// length; the own row's `[b | a]` lands in the lane's buffer. The fused
+/// step's shapes only: another is refused by name.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    ctx: &Ctx,
+    qkv: Tensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: &mut Tensor,
+    gated: GdnGated,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta";
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, gated.ba.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, gated.dt_bias.dtype, { Bf16 => () });
+    debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    debug_assert_eq!(gated.a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    seated(OP, state, "gdn_step_carried", true, false, false)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    if !fused_fits(&shape, state, &rows, qkv, y) || !aligned16(carry.scratch) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a lane's carried rows step in the fused tile only: {k_heads} key heads of \
+                 {k_dim} and {v_heads} value heads of {v_dim} do not lie in it"
+            ),
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let tiles = shape
+        .n
+        .checked_mul(v_heads * (v_dim / FUSED_BV))
+        .ok_or_else(|| refuse(OP, format!("{} rows of value tiles overflow a grid", shape.n)))?;
+    let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
+    let blocks = tiles.div_ceil(warps).min(sms * per_sm);
+    let entrypoint = if warps == FUSED_WARPS_WIDE {
+        "::pie::ssm::gdn_step_carried<8>"
+    } else {
+        "::pie::ssm::gdn_step_carried<4>"
+    };
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, entrypoint))
+            .apply(Launch::grid([blocks, 1, 1], [32 * warps, 1, 1]).smem(fused_smem(warps))),
+        &[
+            qkv.arg(),
+            gates.arg(),
+            gated.ba.arg(),
+            gated.dt_bias.arg(),
+            gated.a_log.arg(),
+            rows.arg(),
+            y.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            stated(OP, shape.conv_dim)?.arg(),
+            q_scale.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, tiles)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

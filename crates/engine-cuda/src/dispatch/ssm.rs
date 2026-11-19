@@ -22,9 +22,9 @@ impl Run<'_> {
                 dilation,
                 y,
             } => {
-                if self.rs_extended() {
-                    return self.conv1d_extended(
-                        "ssm.causal_conv1d",
+                #[cfg(not(feature = "rocm"))]
+                if self.rs_buffered(*x) {
+                    return self.conv1d_carried(
                         *x,
                         *weight,
                         *bias,
@@ -34,7 +34,23 @@ impl Run<'_> {
                         *y,
                     );
                 }
-                self.rs_move("ssm.causal_conv1d", *x, self.tensor(*x))?;
+                // ROCm replays a decode step's carried rows extended.
+                #[cfg(feature = "rocm")]
+                {
+                    if self.rs_extended() {
+                        return self.conv1d_extended(
+                            "ssm.causal_conv1d",
+                            *x,
+                            *weight,
+                            *bias,
+                            *state,
+                            *conv_width,
+                            *dilation,
+                            *y,
+                        );
+                    }
+                    self.rs_move("ssm.causal_conv1d", *x, self.tensor(*x))?;
+                }
                 kernels_cuda::ssm::causal_conv1d(
                     self.ctx(),
                     self.tensor(*x),
@@ -138,7 +154,10 @@ impl Run<'_> {
                 a_log,
                 gates,
             } => {
-                if self.rs_extended() {
+                // A step's `[b | a]` lands in the buffer with its recurrence
+                // (`gdn_step_carried`).
+                let step = self.rs_step_gates(*gates);
+                if self.rs_extended() && !step {
                     const OP: &str = "ssm.gdn_gates";
                     self.rs_begin();
                     let ba_ext = self.rs_extend(OP, *ba, true)?;
@@ -152,7 +171,9 @@ impl Run<'_> {
                     )?;
                     return self.rs_land(OP, gates_ext, *gates);
                 }
-                self.rs_move("ssm.gdn_gates", *ba, self.tensor(*ba))?;
+                if !step {
+                    self.rs_move("ssm.gdn_gates", *ba, self.tensor(*ba))?;
+                }
                 kernels_cuda::ssm::gdn_gates(
                     self.ctx(),
                     self.tensor(*ba),
@@ -172,6 +193,15 @@ impl Run<'_> {
                 v_dim,
                 y,
             } => {
+                #[cfg(not(feature = "rocm"))]
+                if self.rs_step_gates(*gates)
+                    && let Some(gated) = self.gdn_gated(*gates)
+                {
+                    return self.gated_delta_carried(
+                        *qkv, *gates, gated, *state, *k_heads, *v_heads, *k_dim, *v_dim, *y,
+                    );
+                }
+                #[cfg(feature = "rocm")]
                 if self.rs_extended() {
                     return self.gated_delta_extended(
                         "ssm.gated_delta",
@@ -264,12 +294,11 @@ impl Run<'_> {
                 gate_floor,
                 y,
             } => {
-                if self.rs_extended() {
-                    return self.kda_extended(
-                        "ssm.kda",
+                #[cfg(not(feature = "rocm"))]
+                if self.rs_buffered(*f) {
+                    return self.kda_carried(
                         *mixed,
-                        *f,
-                        *b,
+                        [*f, *b],
                         *dt_bias,
                         *a_log,
                         *state,
@@ -280,8 +309,27 @@ impl Run<'_> {
                         *y,
                     );
                 }
-                self.rs_move("ssm.kda", *f, self.tensor(*f))?;
-                self.rs_move("ssm.kda", *b, self.tensor(*b))?;
+                #[cfg(feature = "rocm")]
+                {
+                    if self.rs_extended() {
+                        return self.kda_extended(
+                            "ssm.kda",
+                            *mixed,
+                            *f,
+                            *b,
+                            *dt_bias,
+                            *a_log,
+                            *state,
+                            *heads,
+                            *head_dim,
+                            *norm_eps,
+                            *gate_floor,
+                            *y,
+                        );
+                    }
+                    self.rs_move("ssm.kda", *f, self.tensor(*f))?;
+                    self.rs_move("ssm.kda", *b, self.tensor(*b))?;
+                }
                 kernels_cuda::ssm::kda(
                     self.ctx(),
                     self.tensor(*mixed),
@@ -337,7 +385,11 @@ impl Run<'_> {
                     heads: *heads,
                     groups: *groups,
                 };
-                if self.rs_extended() {
+                #[cfg(not(feature = "rocm"))]
+                if !chunked && self.rs_buffered(*dt) {
+                    return self.mamba2_carried(*xbc, *dt, *z, m, *state, *state_dim, *y);
+                }
+                if (chunked || cfg!(feature = "rocm")) && self.rs_extended() {
                     return self.mamba2_extended(
                         "ssm.mamba2",
                         *xbc,
@@ -460,6 +512,169 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
+    /// The gate prep `gates` comes from: its `[b | a]`, `dt_bias` and
+    /// `A_log`.
+    #[cfg(not(feature = "rocm"))]
+    fn gdn_gated(&self, gates: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
+        let poem_ir::Def::Op(node) = self.values().get(gates.0 as usize)?.def else {
+            return None;
+        };
+        match &self.nodes().get(node as usize)?.op {
+            poem_ir::Operation::Ssm(Ssm::GdnGates {
+                ba, dt_bias, a_log, ..
+            }) => Some((*ba, *dt_bias, *a_log)),
+            _ => None,
+        }
+    }
+
+    /// A decode conv of a buffering fire: each lane's window slides through
+    /// its carried rows then its own ([`kernels_cuda::ssm::Carry`]), the
+    /// carried rows' outputs into the carried scratch for the recurrence it
+    /// feeds (none for a lone conv, whose outputs nothing reads).
+    #[cfg(not(feature = "rocm"))]
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_carried(
+        &self,
+        x: ValueId,
+        weight: ValueId,
+        bias: Option<ValueId>,
+        state: ValueId,
+        conv_width: u32,
+        dilation: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.causal_conv1d";
+        let pool = self.recurrent_absolute(state);
+        let scratch = if self.rs_lone(x) {
+            0
+        } else {
+            self.rs_carried_out(OP, y)?
+        };
+        let carry = self.rs_carry(OP, &[x], scratch, &pool)?;
+        kernels_cuda::ssm::causal_conv1d_carried(
+            self.ctx(),
+            self.tensor(x),
+            self.tensor(weight),
+            bias.map(|b| self.tensor(b)),
+            &one_token(pool),
+            conv_width,
+            dilation,
+            &mut self.tensor(y),
+            &carry,
+        )
+    }
+
+    /// A gated-delta decode step of a buffering fire, over each lane's
+    /// carried rows then its own: their conv outputs from the carried
+    /// scratch, their gates from their buffered `[b | a]`.
+    #[cfg(not(feature = "rocm"))]
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_carried(
+        &self,
+        qkv: ValueId,
+        gates: ValueId,
+        (ba, dt_bias, a_log): (ValueId, ValueId, ValueId),
+        state: ValueId,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.gated_delta";
+        let pool = self.recurrent_absolute(state);
+        let scratch = self.rs_carried_of(OP, qkv)?;
+        let carry = self.rs_carry(OP, &[ba], scratch, &pool)?;
+        kernels_cuda::ssm::gated_delta_carried(
+            self.ctx(),
+            self.tensor(qkv),
+            self.tensor(gates),
+            &one_token(pool),
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            &mut self.tensor(y),
+            kernels_cuda::ssm::GdnGated {
+                ba: self.tensor(ba),
+                dt_bias: self.tensor(dt_bias),
+                a_log: self.tensor(a_log),
+            },
+            &carry,
+        )
+    }
+
+    /// A KDA decode step of a buffering fire, over each lane's carried rows
+    /// then its own: their `[q | k | v]` from the carried scratch, their
+    /// forget and beta rows from their buffer.
+    #[cfg(not(feature = "rocm"))]
+    #[allow(clippy::too_many_arguments)]
+    fn kda_carried(
+        &self,
+        mixed: ValueId,
+        [f, b]: [ValueId; 2],
+        dt_bias: ValueId,
+        a_log: ValueId,
+        state: ValueId,
+        heads: u32,
+        head_dim: u32,
+        norm_eps: f32,
+        gate_floor: f32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.kda";
+        let pool = self.recurrent_absolute(state);
+        let scratch = self.rs_carried_of(OP, mixed)?;
+        let carry = self.rs_carry(OP, &[f, b], scratch, &pool)?;
+        kernels_cuda::ssm::kda_carried(
+            self.ctx(),
+            self.tensor(mixed),
+            self.tensor(f),
+            self.tensor(b),
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &one_token(pool),
+            heads,
+            head_dim,
+            norm_eps,
+            gate_floor,
+            &mut self.tensor(y),
+            &carry,
+        )
+    }
+
+    /// A Mamba-2 decode step of a buffering fire, over each lane's carried
+    /// rows then its own: their convolved `xbc` from the carried scratch,
+    /// their step sizes from their buffer.
+    #[cfg(not(feature = "rocm"))]
+    #[allow(clippy::too_many_arguments)]
+    fn mamba2_carried(
+        &self,
+        xbc: ValueId,
+        dt: ValueId,
+        z: ValueId,
+        m: kernels_cuda::ssm::Mamba2,
+        state: ValueId,
+        state_dim: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.mamba2";
+        let pool = self.recurrent_absolute(state);
+        let scratch = self.rs_carried_of(OP, xbc)?;
+        let carry = self.rs_carry(OP, &[dt], scratch, &pool)?;
+        kernels_cuda::ssm::mamba2_carried(
+            self.ctx(),
+            self.tensor(xbc),
+            self.tensor(dt),
+            self.tensor(z),
+            m,
+            &one_token(pool),
+            state_dim,
+            &mut self.tensor(y),
+            &carry,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
         &self,
@@ -578,8 +793,7 @@ impl Run<'_> {
 
     /// A Mamba-2 layer over extended rows: the conv landed `xbc`'s
     /// ([`Run::rs_ext_of`]), the step sizes replay from the buffer, the gate
-    /// reads only the rows the fire lands. A one-token class's step runs the
-    /// chunked scan as the gated-delta one does.
+    /// reads only the rows the fire lands.
     #[allow(clippy::too_many_arguments)]
     fn mamba2_extended(
         &self,

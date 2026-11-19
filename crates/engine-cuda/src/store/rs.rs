@@ -19,7 +19,11 @@ pub struct Plane {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Planes(HashMap<u32, Plane>, std::collections::HashSet<u32>);
+pub struct Planes(
+    HashMap<u32, Plane>,
+    std::collections::HashSet<u32>,
+    std::collections::HashSet<u32>,
+);
 
 impl Planes {
     #[must_use]
@@ -31,6 +35,15 @@ impl Planes {
     #[must_use]
     pub fn lone(&self, id: ValueId) -> bool {
         self.1.contains(&id.0)
+    }
+
+    /// Whether `gates` is a decode step's gate prep output: its recurrence
+    /// lands the step's `[b | a]` in the buffer itself (`dispatch::ssm`).
+    /// (A plane's value may be read by both forms of a layer, the two arms
+    /// of one branch; the gates are each form's own.)
+    #[must_use]
+    pub fn step_gates(&self, gates: ValueId) -> bool {
+        self.2.contains(&gates.0)
     }
 
     #[must_use]
@@ -172,8 +185,10 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
                 widest_lone = widest_lone.max(row_bytes(*x)? + row_bytes(*y)?);
                 continue;
             }
-            // A one-token class's recurrences run extended too, when a lane
-            // of its fire replays (`dispatch::ssm`).
+            // A one-token class's recurrence pairs a chunked one at its
+            // widths; its decode step reads its carried rows itself
+            // (`dispatch::ssm`), its conv's carried outputs a plane of the
+            // run.
             Operation::Ssm(
                 Ssm::GatedDeltaChunked {
                     qkv, z, gates, y, ..
@@ -270,6 +285,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
         }
 
         let mut planes: HashMap<u32, Plane> = HashMap::new();
+        let mut step_gates = std::collections::HashSet::new();
         // The elements a token of each layer, prompt forms and step forms.
         let mut widths: Vec<u64> = Vec::new();
         let mut decode_widths: Vec<u64> = Vec::new();
@@ -431,6 +447,9 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     ),
                 });
             }
+            if let (Reads::GatedDelta { gates, .. }, false) = (reads, chunked) {
+                step_gates.insert(gates.0);
+            }
             let page = u64::from(paging);
             let layer = if chunked { layers } else { decode_layers };
             let mut here = 0u64;
@@ -467,7 +486,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             return Ok(None);
         }
         let lone_rows = lone.values().map(|(x, _)| x.0).collect();
-        Ok(Some((Planes(planes, lone_rows), widths)))
+        Ok(Some((Planes(planes, lone_rows, step_gates), widths)))
     }
 }
 

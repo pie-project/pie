@@ -1,5 +1,6 @@
 #include "ssm/copy.cuh"
 #include "prim/state_rows.cuh"
+#include "ssm/carry.cuh"
 
 namespace pie::ssm {
 
@@ -374,6 +375,255 @@ __global__ void __launch_bounds__(W * 32) gdn_step_fused(
                 }
             }
             gdn_rows_sum(o);
+            if (lane < 2) {
+                float4* dst = reinterpret_cast<float4*>(
+                    out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
+                dst[0] = make_float4(o[0], o[1], o[2], o[3]);
+                dst[1] = make_float4(o[4], o[5], o[6], o[7]);
+            }
+        }
+        __syncwarp();
+        cur = nxt;
+    }
+    gdn_cp_wait_all();
+}
+
+// One step of a warp's tile of the gated delta rule from the state in its
+// registers (`gdn_step_fused`'s layout): the row's q and k (normalized here,
+// q scaled), its value slice, decay and beta. `S` the state after it, each
+// cell rounded as a fold stores it when `ROUND` (a carried row, whose state
+// the next row reads as a store and reload would hand it); `o` the row's
+// output columns, summed over the warp, where `OUT`.
+template <bool ROUND, bool OUT>
+__device__ __forceinline__ void gdn_tile_step(
+    float (&s)[8][8], float (&qi)[8], float (&ki)[8], float qs, float ks,
+    const float (&vv)[8], float g, float beta, float q_scale, float (&o)[8])
+{
+    constexpr int MR = 8;
+    constexpr int VEC = 8;
+    const float nq = rsqrtf(0.5f * warp_sum(qs) + 1e-6f) * q_scale;
+    const float nk = rsqrtf(0.5f * warp_sum(ks) + 1e-6f);
+    #pragma unroll
+    for (int m = 0; m < MR; ++m) {
+        qi[m] *= nq;
+        ki[m] *= nk;
+    }
+    float x[VEC];
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+    #pragma unroll
+    for (int m = 0; m < MR; ++m) {
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] += s[m][u] * g * ki[m];
+    }
+    gdn_rows_sum(x);
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        x[u] = (vv[u] - x[u]) * beta;
+        o[u] = 0.f;
+    }
+    #pragma unroll
+    for (int m = 0; m < MR; ++m) {
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            const float sg = __bfloat162float(__float2bfloat16(s[m][u] * g));
+            const float sn = sg + ki[m] * x[u];
+            if constexpr (OUT) o[u] += sn * qi[m];
+            s[m][u] = ROUND ? __bfloat162float(__float2bfloat16(sn)) : sn;
+        }
+    }
+    if constexpr (OUT) gdn_rows_sum(o);
+}
+
+// `gdn_step_fused` over a lane's carried rows then its own (`Carry`): the
+// warp loads its state tile once, steps each row the lane buffered past its
+// committed state (its conv outputs from the carried scratch, its `[b | a]`
+// from its rs buffer pages, gated here as `gdn_prep_ba_gates` gates them),
+// then its own row, and stores the tile once, as it stands after `commit`
+// rows of the run. Each carried step rounds the state as a store would, so
+// the state and the own row's output are the bits a fold a row would give.
+// Carried rows land no output. The own row's `[b | a]` lands in its buffer.
+template <int W>
+__global__ void __launch_bounds__(W * 32) gdn_step_carried(
+    const bf16* __restrict__ qkv_post,
+    const float* __restrict__ gates,
+    const bf16* __restrict__ ba,
+    const bf16* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    StateRows rows,
+    float* __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim,
+    float q_scale,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    int tiles,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    constexpr int MR = 8;
+    constexpr int VEC = 8;
+    extern __shared__ __align__(16) unsigned char gdn_ring[];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    unsigned char* ring = gdn_ring + warp * 2 * GDN_STREAM_STAGE;
+    const int i0 = lane >> 1;
+    const int vts = V_d / 16;
+    const int group = V_h / K_h;
+    const int K_dim = K_h * K_d;
+    const int live_rows = win != nullptr ? static_cast<int>(win[0]) : 0x7fffffff;
+    const u64 conv_bytes = static_cast<u64>(conv_dim) * sizeof(bf16);
+
+    struct Tile {
+        bool live;
+        bool fold;
+        int r_row;
+        int rl;
+        int h;
+        int j0;
+        __nv_bfloat16* cell;
+    };
+    auto plan = [&](int tile) {
+        Tile tl;
+        tl.live = false;
+        if (tile >= tiles) return tl;
+        const int vt = tile % vts;
+        const int rest = tile / vts;
+        tl.h = rest % V_h;
+        const int r = rest / V_h;
+        if (r >= live_rows) return tl;
+        tl.r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+        tl.rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        // The head's first tile lands the own row's `[b | a]` pair.
+        if (vt == 0 && lane < 2) {
+            const CarryLane cl = carry.lane(tl.rl);
+            if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+                const int at = lane * V_h + tl.h;
+                dst[at] = ba[(long long)tl.r_row * 2 * V_h + at];
+            }
+        }
+        const i32* rid = rows.row(tl.rl);
+        if (rid[0] < 0) return tl;
+        tl.live = true;
+        tl.fold = folds(write_state, write_state_mask, tl.rl);
+        tl.j0 = vt * 16 + (lane & 1) * VEC;
+        tl.cell = rows.atom<__nv_bfloat16>(rid, tl.h, (long long)K_d * V_d) + tl.j0;
+        return tl;
+    };
+    auto issue = [&](const Tile& tl, int stage) {
+        if (!tl.live) return;
+        unsigned char* st = ring + stage * GDN_STREAM_STAGE;
+        #pragma unroll
+        for (int m = 0; m < MR; ++m) {
+            if (16 * m < K_d) {
+                gdn_cp16(st + (m * 32 + lane) * 16, tl.cell + (long long)(i0 + 16 * m) * V_d, true);
+            }
+        }
+        const bf16* row = qkv_post + (long long)tl.r_row * conv_dim;
+        const int h_k = tl.h / group;
+        const int c = lane & 15;
+        if (c * 8 < K_d) {
+            const bf16* src = row + (lane < 16 ? 0 : K_dim) + (long long)h_k * K_d + c * 8;
+            gdn_cp16(st + 4096 + (lane >> 4) * 256 + c * 16, src, true);
+        }
+        if (lane < 2) {
+            gdn_cp16(st + 4608 + lane * 16, row + 2 * K_dim + (long long)tl.h * V_d + tl.j0, true);
+            gdn_cp4(st + 4640 + lane * 4, gates + (long long)tl.r_row * 2 * V_h + lane * V_h + tl.h, true);
+        }
+    };
+    auto unpack8 = [&](const uint4& raw, float (&f8)[8]) {
+        const unsigned* w32 = reinterpret_cast<const unsigned*>(&raw);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float2 f = gdn_unpack(w32[u]);
+            f8[2 * u] = f.x;
+            f8[2 * u + 1] = f.y;
+        }
+    };
+
+    const int stride = gridDim.x * W;
+    int t = blockIdx.x * W + warp;
+    Tile cur = plan(t);
+    issue(cur, 0);
+    gdn_cp_commit();
+    for (int it = 0; t < tiles; t += stride, ++it) {
+        const Tile nxt = plan(t + stride);
+        issue(nxt, (it + 1) & 1);
+        gdn_cp_commit();
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+        __syncwarp();
+        if (cur.live) {
+            const unsigned char* st = ring + (it & 1) * GDN_STREAM_STAGE;
+            float s[MR][VEC];
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                const uint4 raw = 16 * m < K_d
+                    ? *reinterpret_cast<const uint4*>(st + (m * 32 + lane) * 16)
+                    : make_uint4(0u, 0u, 0u, 0u);
+                unpack8(raw, s[m]);
+            }
+            const int h_k = cur.h / group;
+            const CarryLane cl = carry.lane(cur.rl);
+            const int n = carry.carried(cl);
+            const int commit = carry.commit(cur.rl, n + 1);
+            const bool fold = cur.fold && commit > 0;
+            auto store = [&]() {
+                #pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    if (16 * m >= K_d) break;
+                    uint4 packed;
+                    unsigned* w32 = reinterpret_cast<unsigned*>(&packed);
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) w32[u] = pack_bf16x2(s[m][2 * u], s[m][2 * u + 1]);
+                    *reinterpret_cast<uint4*>(cur.cell + (long long)(i0 + 16 * m) * V_d) = packed;
+                }
+            };
+            for (int j = 0; j < n; ++j) {
+                const bf16* row = carry.scratch_row<bf16>(cl, j, conv_bytes);
+                float qi[MR];
+                float ki[MR];
+                float qs = 0.f;
+                float ks = 0.f;
+                #pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    const int i = i0 + 16 * m;
+                    qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(row[h_k * K_d + i]) : 0.f;
+                    ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(row[K_dim + h_k * K_d + i]) : 0.f;
+                    qs += qi[m] * qi[m];
+                    ks += ki[m] * ki[m];
+                }
+                float vv[VEC];
+                unpack8(*reinterpret_cast<const uint4*>(row + 2 * K_dim + (long long)cur.h * V_d + cur.j0), vv);
+                const bf16* bar = carry.carried_row<bf16>(cl, j, 0);
+                const float bv = Elem<bf16>::to_f32(bar[cur.h]);
+                const float av = Elem<bf16>::to_f32(bar[V_h + cur.h]);
+                const float z = av + Elem<bf16>::to_f32(dt_bias[cur.h]);
+                const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+                const float g_log = -__expf(a_log[cur.h]) * sp;
+                const float beta = 1.f / (1.f + __expf(-bv));
+                float o[VEC];
+                gdn_tile_step<true, false>(s, qi, ki, qs, ks, vv, __expf(g_log), beta, q_scale, o);
+                if (fold && j + 1 == commit) store();
+            }
+            const bf16* sq = reinterpret_cast<const bf16*>(st + 4096);
+            const bf16* sk = reinterpret_cast<const bf16*>(st + 4096 + 256);
+            float qi[MR];
+            float ki[MR];
+            float qs = 0.f;
+            float ks = 0.f;
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                const int i = i0 + 16 * m;
+                qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sq[i]) : 0.f;
+                ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sk[i]) : 0.f;
+                qs += qi[m] * qi[m];
+                ks += ki[m] * ki[m];
+            }
+            float vv[VEC];
+            unpack8(*reinterpret_cast<const uint4*>(st + 4608 + (lane & 1) * 16), vv);
+            const float* sgate = reinterpret_cast<const float*>(st + 4640);
+            float o[VEC];
+            gdn_tile_step<false, true>(s, qi, ki, qs, ks, vv, __expf(sgate[0]), sgate[1], q_scale, o);
+            if (fold && commit == n + 1) store();
             if (lane < 2) {
                 float4* dst = reinterpret_cast<float4*>(
                     out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
