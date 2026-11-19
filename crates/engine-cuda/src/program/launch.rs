@@ -701,6 +701,8 @@ pub struct Prepared {
     temporary_bytes: u32,
     region_rows: Vec<u32>,
     samplers: Vec<bool>,
+    /// The selects split across a lane's blocks ([`splits`]), a region each.
+    splits: Vec<bool>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -746,11 +748,28 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
         .map(|(region, rows)| match region.kind {
             RegionKind::Generated => rows,
             kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
+            RegionKind::Library(LibraryOp::TopK) if splits(plan, region, rows) => {
+                LANE_SAMPLER_BLOCKS
+            }
             RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
             RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
             RegionKind::Library(_) => 1,
         })
         .collect()
+}
+
+/// Whether `region` is a select over a lane's one row (`rows` 1) wide enough
+/// a cut to split across the lane's blocks
+/// ([`eta_compiler::codegen::cuda::order::top_k_splits`]): it runs on as many
+/// as a sampler does, meeting in the lane arenas.
+fn splits(plan: &LaunchStagePlan, region: &LaunchRegion, rows: u32) -> bool {
+    rows == 1
+        && selects(plan, region)
+        && region
+            .nodes
+            .first()
+            .and_then(|&node| plan.ops.get(node as usize))
+            .is_some_and(|op| eta_compiler::codegen::cuda::order::top_k_splits(op.imm))
 }
 
 fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
@@ -896,10 +915,20 @@ impl Prepared {
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
         let region_rows = region_blocks(plan, &descriptors);
+        let rows_of = eta_exec::region_rows(plan, &descriptors);
+        // A sampler, or a select split across a lane's blocks: both meet in
+        // the lane arenas, on as many blocks as the device holds with the
+        // fire's lanes.
         let samplers = plan
             .fused
             .iter()
             .map(|region| lane_sampler(region.kind))
+            .collect();
+        let splits = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| splits(plan, region, rows))
             .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
@@ -999,6 +1028,7 @@ impl Prepared {
             temporary_bytes,
             region_rows,
             samplers,
+            splits,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1400,15 +1430,14 @@ impl Prepared {
             .copied()
             .unwrap_or(1)
             .max(1);
-        let sampler = self
-            .samplers
-            .get(region.region_index as usize)
-            .copied()
-            .unwrap_or(false);
+        let at = region.region_index as usize;
+        let sampler = self.samplers.get(at).copied().unwrap_or(false)
+            || self.splits.get(at).copied().unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
         // with the fire's lanes (its blocks wait on one another), in its own
         // span of the engine's lane arenas: its blocks' arenas and its
-        // gather buffers; the lanes' barrier words start at zero.
+        // gather buffers; the lanes' barrier words start at zero. A split
+        // select's lane does too, its last block merging (none waits).
         let rows = if sampler {
             let rows = lane_blocks(device_units(), self.filled).min(rows);
             let need = u64::from(self.filled) * lane_span(rows);
