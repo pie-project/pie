@@ -1134,6 +1134,12 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
         Some(64 << 10),
         engine::load::Residency {
             host_kv_budget: Some(256 << 20),
+            // State well within the kernels' index of the pool (8 GiB of
+            // 64 KiB chunks), whatever the device has: a pool whose state
+            // reaches it states every rung at the span's chunks and lends
+            // none (`store::pool::sized`), so a share of a large device
+            // would leave no narrow rung to test.
+            device_kv_budget: Some(256 << 20),
             ..engine::load::Residency::default()
         },
     ) else {
