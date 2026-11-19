@@ -115,8 +115,12 @@ export class ChannelStub {
 
 export class PipelineStub {
   closed = false;
+  retracted = 0;
   close() {
     this.closed = true;
+  }
+  retract(fires: number) {
+    this.retracted += fires;
   }
 }
 

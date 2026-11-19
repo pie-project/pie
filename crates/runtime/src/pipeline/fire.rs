@@ -3558,11 +3558,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
     {
-        if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            return fire_device_geometry(ctx, this, fwd, frame).await;
-        }
-        if ctx.resources().get(&fwd)?.float.is_some() {
-            return float::fire_float_lane(ctx, this, fwd, frame).await;
+        let placed_by_device = {
+            let pass = ctx.resources().get(&fwd)?;
+            pass.devgeo.is_some() || pass.float.is_some()
+        };
+        if placed_by_device {
+            let pipeline = this.rep();
+            let submitted = if ctx.resources().get(&fwd)?.devgeo.is_some() {
+                fire_device_geometry(ctx, this, fwd, frame).await?
+            } else {
+                float::fire_float_lane(ctx, this, fwd, frame).await?
+            };
+            if submitted.is_ok() {
+                record_writes(ctx, pipeline, None)?;
+            }
+            return Ok(submitted);
         }
         let began = crate::scheduler::probe::ProbeClock::start();
         let opened = open_pipeline(ctx, &this, &fwd).await?;
@@ -4098,6 +4108,18 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
         // The working sets a piece of this pass has moved the cursor of.
         let mut advanced = vec![false; groups.len()];
+        let mut writes = Vec::with_capacity(groups.len());
+        let set_start = |group: usize, start: u64| {
+            let (set, lanes) = (&group_sets[group], &groups[group].1);
+            SetStart {
+                model: set.model,
+                engine: set.engine,
+                kv: set.id,
+                cursor: pass_lanes.cursors[lanes[0]].clone(),
+                start,
+                recurrent: rs_ws_ids.get(lanes[0]).is_some(),
+            }
+        };
         let mut at = 0;
         while at < cuts.len() {
             if recuttable && at > 0 && at + 1 < cuts.len() {
@@ -4486,11 +4508,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let start = if advanced[group] {
                     slots.start
                 } else {
-                    lanes
+                    let start = lanes
                         .iter()
                         .map(|&lane| u64::from(landings[lane].start))
                         .min()
-                        .unwrap_or(slots.start)
+                        .unwrap_or(slots.start);
+                    writes.push(set_start(group, start));
+                    start
                 };
                 advanced[group] = true;
                 advance_cursor(
@@ -4544,8 +4568,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let (Some(end), Some(start)) = (end, start) {
                 let cell = &pass_lanes.cursors[lanes[0]];
                 advance_cursor(cell, Some(end), Some((start, Vec::new())));
+                writes.push(set_start(group, u64::from(start)));
             }
         }
+        record_writes(ctx, this.rep(), Some(writes))?;
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
@@ -4834,6 +4860,152 @@ async fn pipeline_close_inner<C: FireContext>(
 
 pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
     pipeline_close_inner(ctx, &this).await
+}
+
+/// Where one fire began writing one working set.
+#[derive(Clone)]
+pub(crate) struct SetStart {
+    model: usize,
+    engine: crate::engine::EngineId,
+    kv: crate::store::kv::page_table::WorkingSetId,
+    cursor: CursorCell,
+    start: u64,
+    /// The set keeps a recurrent state (or a window) the fire's rows fold
+    /// into.
+    recurrent: bool,
+}
+
+/// What one fire wrote, set by set: `None` where the device placed its rows.
+pub(crate) type FireWrites = Option<Vec<SetStart>>;
+
+fn record_writes<C: FireContext>(ctx: &mut C, pipeline: u32, writes: FireWrites) -> Anyhow<()> {
+    let pipeline: Resource<Pipeline> = Resource::new_borrow(pipeline);
+    ctx.resources()
+        .get(&pipeline)?
+        .written
+        .lock()
+        .unwrap()
+        .push(writes);
+    Ok(())
+}
+
+/// The row each working set the last `fires` fires wrote ends at once they
+/// are taken back: where the first of them began writing it. `Err` names
+/// what cannot be taken back.
+fn retracted_ends(written: &[FireWrites], fires: usize) -> Result<Vec<SetStart>, String> {
+    let mut ends: Vec<SetStart> = Vec::new();
+    for (at, fire) in written[written.len() - fires..].iter().enumerate() {
+        let Some(sets) = fire else {
+            return Err(format!(
+                "the {} fire from the end placed its rows where the device says, which the \
+                 host cannot take back",
+                fires - at
+            ));
+        };
+        for set in sets {
+            if set.recurrent {
+                return Err(
+                    "a recurrent state (or a window) folded the rows past the stop, and a fold \
+                     is not taken back"
+                        .to_string(),
+                );
+            }
+            match ends.iter_mut().find(|end| end.kv == set.kv) {
+                Some(end) => end.start = end.start.min(set.start),
+                None => ends.push(set.clone()),
+            }
+        }
+    }
+    Ok(ends)
+}
+
+/// Takes back what the last `fires` fires submitted on the closed pipeline
+/// `this` wrote, once every fire on it has landed: each working set they
+/// wrote ends where the first of them began writing it. A set whose rows
+/// cannot be taken back leaves the pipeline failed by that name, so the set
+/// is refused wherever it is used next rather than read past its stop.
+pub async fn pipeline_retract<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fires: u32,
+) -> Anyhow<Result<(), String>> {
+    let fires = fires as usize;
+    let (pending, failure, written, ends) = {
+        let pipeline = ctx.resources().get(&this)?;
+        if !pipeline.scope.is_closed() {
+            return Ok(Err(
+                "pipeline: retract on an open pipeline: close it first, so no fire follows the \
+                 ones taken back"
+                    .to_string(),
+            ));
+        }
+        let written = pipeline.written.lock().unwrap();
+        if fires > written.len() {
+            return Ok(Err(format!(
+                "pipeline: retract of {fires} fire(s), past the {} submitted",
+                written.len()
+            )));
+        }
+        (
+            pipeline.fires.clone(),
+            pipeline.failure.clone(),
+            written.len() - fires,
+            retracted_ends(&written, fires),
+        )
+    };
+    if fires == 0 {
+        return Ok(Ok(()));
+    }
+    // A fire that may still write is never cut under: every fire on the
+    // pipeline lands, and its fold and log settle, first.
+    finalize_all(ctx, &pending, false).await?;
+    ctx.resources()
+        .get(&this)?
+        .written
+        .lock()
+        .unwrap()
+        .truncate(written);
+    if pipeline_failed(&failure).is_some() {
+        return Ok(Ok(()));
+    }
+    let refused = match ends {
+        Err(why) => Some(why),
+        Ok(ends) => ends.iter().find_map(|end| {
+            let stores = crate::store::registry::get(end.model, end.engine);
+            let cut = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                kv.truncate(end.kv, end.start)
+            });
+            match cut {
+                Ok(()) => {
+                    retract_cursor(&end.cursor, end.start);
+                    None
+                }
+                // A set released already holds nothing to take back.
+                Err(crate::store::kv::KvStoreError::Table(
+                    crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
+                )) => None,
+                Err(error) => Some(error.to_string()),
+            }
+        }),
+    };
+    if let Some(why) = refused {
+        let mut failure = failure.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(format!(
+                "its rows past where the program stopped could not be taken back: {why}"
+            ));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// The host's record of a set's rows ends at `end`.
+fn retract_cursor(cell: &CursorCell, end: u64) {
+    let end = u32::try_from(end).unwrap_or(u32::MAX);
+    let mut cursor = cell.lock().unwrap();
+    cursor.tail = Some(end);
+    cursor.written = cursor.written.min(end);
+    cursor.spans.retain(|&(from, _, _)| from < end);
 }
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
@@ -6150,6 +6322,274 @@ pub(crate) mod lifecycle_tests {
             "every waiter registered before the settle is woken by it (three lanes, then the \
              drain)"
         );
+        Ok(())
+    }
+
+    /// A decode run ahead on a closed pipeline: `fires` fires after a
+    /// 20-token prompt, each writing one row and folding it as it is
+    /// prepared (a decode's fold, frozen at once, not sealed), their
+    /// completions pending. The set, its cursor, and the fires.
+    struct RunAhead {
+        context: TestContext,
+        pipeline: u32,
+        ws: KvWorkingSet,
+        cursor: CursorCell,
+        stores: crate::store::registry::Stores,
+        completions: Vec<crate::engine::WorkItemCompletion>,
+    }
+
+    fn run_ahead(fires: u32, recurrent: bool) -> anyhow::Result<RunAhead> {
+        let model = crate::store::registry::register_model(16, &[64], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let prompt: Vec<u32> = (0..20).map(|t| 3000 + t).collect();
+        let id = {
+            let mut kv = stores.kv.lock();
+            kv.set_keeps(true);
+            let id = kv.create_working_set();
+            kv.reserve(id, 4).expect("reserve the test sequence");
+            let mut granted = kv.reserve_device_pages(4).expect("four free pages");
+            kv::prepare_explicit_reserved(&mut kv, id, &[0, 1, 2, 3], &mut granted)
+                .expect("publish the pages");
+            kv.log_rows(id, 0, &prompt).unwrap();
+            kv.fold(id, 20, false).unwrap();
+            id
+        };
+        let ws = KvWorkingSet::new(model, 0, id, 16);
+        let cursor: CursorCell = Arc::new(Mutex::new(Default::default()));
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            tails: Vec::new(),
+        };
+        let pipeline = context.resources.push(Pipeline::new())?.rep();
+        let borrowed: Resource<Pipeline> = Resource::new_borrow(pipeline);
+        let (queue, failure) = {
+            let pipeline = context.resources.get(&borrowed)?;
+            ws.claim_pipeline_scope(&pipeline.scope)
+                .expect("the pipeline takes the set");
+            (pipeline.fires.clone(), pipeline.failure.clone())
+        };
+        let mut completions = Vec::new();
+        for at in 0..fires {
+            let start = 20 + u64::from(at);
+            let seq = {
+                let mut kv = stores.kv.lock();
+                let seq = kv.log_begin(id, start).unwrap();
+                kv.freeze(id, start + 1).unwrap();
+                seq
+            };
+            let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+            queue
+                .lock()
+                .unwrap()
+                .push_back(PendingOp::Fire(PendingFire {
+                    completion: completion.clone(),
+                    checkpoints: Vec::new(),
+                    kv: vec![FireWs {
+                        ws: id,
+                        kvtxn: KvTxnGuard::new(model, 0, None),
+                        log: Some(LogFire {
+                            seq,
+                            rows: LogRows::Known {
+                                start,
+                                tokens: vec![5000 + at],
+                            },
+                        }),
+                        lease: ws.fire_lease().expect("lease the set"),
+                        fold: Some(FoldAt {
+                            by: FoldBy::To(start + 1),
+                            decoded: true,
+                        }),
+                        reports: Vec::new(),
+                        staged: None,
+                    }],
+                    device_geometry: false,
+                    rstxn: RsTxnsGuard::new(model, 0, None),
+                    model,
+                    engine: 0,
+                    fwd_rep: u32::MAX,
+                    cells: Vec::new(),
+                    failure: failure.clone(),
+                    retired: None,
+                }));
+            advance_cursor(&cursor, Some(start as u32 + 1), None);
+            record_writes(
+                &mut context,
+                pipeline,
+                Some(vec![SetStart {
+                    model,
+                    engine: 0,
+                    kv: id,
+                    cursor: cursor.clone(),
+                    start,
+                    recurrent,
+                }]),
+            )?;
+            completions.push(completion);
+        }
+        context.resources.get(&borrowed)?.scope.close();
+        Ok(RunAhead {
+            context,
+            pipeline,
+            ws,
+            cursor,
+            stores,
+            completions,
+        })
+    }
+
+    impl RunAhead {
+        /// Folded length, log length and pages held.
+        fn length(&self) -> (u64, usize, u64) {
+            let kv = self.stores.kv.lock();
+            (
+                kv.folded(self.ws.id).unwrap(),
+                kv.logged(self.ws.id).unwrap().len(),
+                kv.mapped_len(self.ws.id).unwrap(),
+            )
+        }
+
+        fn failure(&mut self) -> Option<String> {
+            let borrowed: Resource<Pipeline> = Resource::new_borrow(self.pipeline);
+            let failure = self
+                .context
+                .resources
+                .get(&borrowed)
+                .unwrap()
+                .failure
+                .clone();
+            failure.lock().unwrap().clone()
+        }
+    }
+
+    /// A program stopped at the third token of a decode run ahead six fires
+    /// (EOS or a stop string alike: the loop breaks on the token the third
+    /// fire wrote out). The take-back waits for the fires still in flight:
+    /// nothing is cut under one. Once they land the set holds the prompt
+    /// and the three rows kept, its cursor ends there, a fork taken then
+    /// holds nothing past them, and the rows taken back are never sealed.
+    /// A run that stopped at its budget takes nothing back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> {
+        use std::future::Future;
+        let mut run = run_ahead(6, false)?;
+        for completion in &run.completions[..2] {
+            resolve_test_completion(completion, false);
+        }
+        assert_eq!(run.length().0, 26, "every fire folded as it was prepared");
+        let pipeline = run.pipeline;
+        let retract = {
+            let context = &mut run.context;
+            let mut retract =
+                Box::pin(pipeline_retract(context, Resource::new_borrow(pipeline), 3));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            for _ in 0..8 {
+                assert!(
+                    retract.as_mut().poll(&mut cx).is_pending(),
+                    "it waits on the fires in flight"
+                );
+                tokio::task::yield_now().await;
+            }
+            retract
+        };
+        drop(retract);
+        assert_eq!(
+            run.length(),
+            (26, 22, 4),
+            "nothing cut under a fire in flight"
+        );
+        for completion in &run.completions[2..] {
+            resolve_test_completion(completion, false);
+        }
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            run.length(),
+            (23, 23, 2),
+            "the prompt and the three rows kept"
+        );
+        assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+        assert_eq!(run.failure(), None);
+        let kept: Vec<u32> = (0..20).map(|t| 3000 + t).chain(5000..5003).collect();
+        {
+            let mut kv = run.stores.kv.lock();
+            assert_eq!(kv.logged(run.ws.id).unwrap(), &kept[..]);
+            let child = kv.fork(run.ws.id).unwrap();
+            assert_eq!(
+                kv.folded(child).unwrap(),
+                23,
+                "a fork holds nothing past the stop"
+            );
+            assert_eq!(kv.mapped_len(child).unwrap(), 2);
+            assert_eq!(
+                kv.sealed_in(run.ws.id, 0..2).unwrap(),
+                [0],
+                "and nothing past it sealed"
+            );
+            let epoch = kv.current_epoch();
+            kv.release_working_set(child, epoch);
+        }
+
+        let mut whole = run_ahead(6, false)?;
+        for completion in &whole.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = whole.pipeline;
+        pipeline_retract(&mut whole.context, Resource::new_borrow(pipeline), 0)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let fires = whole
+            .context
+            .resources
+            .get(&Resource::<Pipeline>::new_borrow(pipeline))?
+            .fires
+            .clone();
+        finalize_all(&mut whole.context, &fires, false).await?;
+        assert_eq!(
+            whole.length(),
+            (26, 26, 4),
+            "its budget's rows, no stray one"
+        );
+        Ok(())
+    }
+
+    /// Rows a recurrent state folded are not taken back: the pipeline fails
+    /// by that name, and its set is refused where it is used next. A
+    /// retract on an open pipeline, or past what it submitted, is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
+        let mut run = run_ahead(4, true)?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        let past = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 5).await?;
+        assert!(past.unwrap_err().contains("past the 4 submitted"));
+        let mut run = run_ahead(4, true)?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let failure = run.failure().expect("the pipeline fails");
+        assert!(failure.contains("recurrent state"), "{failure}");
+        assert_eq!(run.length().0, 24, "nothing taken back");
+        let next = crate::store::PipelineScope::failing_as(Default::default(), || true);
+        let refused = run.ws.claim_pipeline_scope(&next).unwrap_err().to_string();
+        assert!(refused.contains("could not be taken back"), "{refused}");
+
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            tails: Vec::new(),
+        };
+        let open = context.resources.push(Pipeline::new())?.rep();
+        let refused = pipeline_retract(&mut context, Resource::new_borrow(open), 1).await?;
+        assert!(refused.unwrap_err().contains("open pipeline"));
         Ok(())
     }
 

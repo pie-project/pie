@@ -23,6 +23,9 @@ pub struct Pipeline {
     /// Counted in [`ACTIVE`]: from its making, and again from each submit,
     /// until it parks or closes.
     active: AtomicBool,
+    /// Where each fire submitted on it began writing each working set, in
+    /// submission order: what `retract` takes back.
+    pub(crate) written: Mutex<Vec<fire::FireWrites>>,
 }
 
 impl Pipeline {
@@ -39,6 +42,7 @@ impl Pipeline {
             failure,
             frame_seq: std::sync::atomic::AtomicU64::new(0),
             active: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
         }
     }
 
