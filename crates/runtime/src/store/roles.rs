@@ -2887,7 +2887,7 @@ where
             && let Some(watch) = &watch
         {
             tracing::debug!(%pid, %key, "a bind waits for its pair's move to land");
-            watch.clone().freed().await;
+            crate::inferlet::process::said("bind: its pair's move", pid, watch.clone().freed()).await;
             continue;
         }
         if let Some((run, pieces)) = error

@@ -4456,9 +4456,9 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         pool.disk_free.store(64, Ordering::Relaxed);
         let free: Vec<u32> = (0..total).filter(|_| rng.below(100) < 45).collect();
         pool.free.lock().extend(free);
-        // Compaction is out of the planner's paths: none is expected.
-        pool.compactable.store(false, Ordering::Release);
-        let _ = rng.below(2);
+        // The pool could compact or not; compaction is out of the
+        // planner's paths, so no head ever waits on one (shape 1).
+        pool.compactable.store(rng.below(2) == 0, Ordering::Release);
         let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
         let head = ProcessId::new_v4();
         planner.register(head);
@@ -4603,7 +4603,17 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 proc.roles_free_short.map(|_| proc.roles_free_short_at)
             });
             let servable = stands && at.is_none_or(|at| pool.guest_free_runs(run) > at);
-            let compactable = !stands && pool.compactable.load(Ordering::Acquire);
+            let compactable = false;
+            if pool.compactions.load(Ordering::Relaxed) > 0
+                || planner.stats.compaction_waits.load(Ordering::Relaxed) > 0
+            {
+                failures.push(format!(
+                    "seed {seed} step {step}: a head asked for or waited on a compaction\n  \
+                     schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
             if (servable || compactable) && made == before && !retried && made == 0 {
                 failures.push(format!(
                     "seed {seed} step {step}: servable={servable} compactable={compactable}: no \
