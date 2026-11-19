@@ -3440,3 +3440,102 @@ async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
         assert_eq!(proc.roles_free_short, None, "no longer marked understated");
     });
 }
+
+/// Mac Pro's beam mix (no refusals): the head restore was short of two
+/// runs of four chunks for its roles, 440 such runs stood free, and the
+/// serves went flat for 191 s with every thread parked: while the fleet
+/// decoded the restore waited for a completion, never looking at the runs
+/// that stood free, and no event came to look again. Free runs of its need
+/// send it again whatever the fleet does: one plan serves it, with no
+/// further event.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_short_of_runs_goes_again_on_free_runs_while_the_fleet_decodes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restoring, decoding) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [restoring, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&decoding).unwrap().progressed = true;
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 4,
+            pieces: 2,
+            pages: 8,
+        });
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(!planner.with_inner(|inner| inner.fleet_stalled()), "the fleet decodes");
+    assert!(pool.guest_room_free(4, 2), "its runs stand free");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        planner.stats.restores.load(Ordering::Relaxed),
+        1,
+        "sent again on the free runs, no other event"
+    );
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "no one moved for it"
+    );
+}
+
+/// Mac Pro's beam mix, stall 1: a bind-suspended process was restored
+/// (the one bind-suspended restore at a time), and its bind came up short
+/// again and waited for room. The next bind-suspended restore, the queue's
+/// head, waited on that one's turn, which waited on a bind behind the
+/// head: flat, every thread parked. A restored process whose bind waits
+/// again ends its turn, and the head goes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_go() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restored, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [restored, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.bind_restoring = Some(restored);
+        inner.procs.get_mut(&head).unwrap().bind_room = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+    });
+    planner.set_bind_waiting(restored, true);
+    assert_eq!(
+        planner.with_inner(|inner| inner.bind_restoring),
+        None,
+        "its turn ends as its bind waits again"
+    );
+    planner.set_bind_waiting(restored, false);
+    planner.with_inner(|inner| inner.bind_restoring = Some(restored));
+    planner.set_bind_waiting(head, true);
+    assert_eq!(
+        planner.with_inner(|inner| inner.bind_restoring),
+        Some(restored),
+        "another's bind waiting leaves its turn"
+    );
+}

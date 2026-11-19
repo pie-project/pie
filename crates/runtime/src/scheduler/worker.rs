@@ -3100,8 +3100,21 @@ impl BatchScheduler {
                         in_flight_control.settling[index].state =
                             ControlSlotState::Ready(completion);
                     }
-                    Err(_) => {
-                        in_flight_control.settling.remove(index);
+                    // Refused on the lane (or the lane dropped it): what
+                    // waits on the copy is told now, never left waiting on
+                    // a completion that cannot come (a residency move held
+                    // its items moving for good).
+                    Err(error) => {
+                        let pending = in_flight_control.settling.remove(index);
+                        if let Some(tracked) = pending.tracked_completion.as_ref() {
+                            tracked.resolve(&Err(anyhow!("{error}")));
+                        }
+                        if let Some(logical) = pending.logical_completion.as_ref() {
+                            logical.reject_unsubmitted(format!(
+                                "pre-launch {} failed: {error}",
+                                pending.operation
+                            ));
+                        }
                     }
                 }
             }
@@ -3321,6 +3334,46 @@ mod tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 48);
         want.release();
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// A control the lane refuses or drops (a panic on the copy, the
+    /// reply lost) tells what waits on it: a residency move's copy waited
+    /// on a completion that never came, and the move held its items moving
+    /// for good (Mac Pro's M5: every restore of a pair's other holders
+    /// waited on it).
+    #[test]
+    fn a_refused_control_tells_its_tracked_completion() {
+        let tracked = crate::scheduler::ControlCompletion::new();
+        let mut controls = InFlightControls::default();
+        controls.settling.push(PendingControl {
+            state: ControlSlotState::Posted { id: 41 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(tracked.clone()),
+            operation: "tracked roles copy",
+            holds_launches: false,
+            prelaunch: false,
+        });
+        let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
+        BatchScheduler::apply_control_commit(
+            41,
+            LaneCommit::AsyncControl {
+                result: Err("the engine lane dropped this control unanswered".to_string()),
+            },
+            &mut controls,
+            &mut HashMap::new(),
+            &mut FramePolicy::new(1, 1, 1, None),
+            &rollback,
+            0,
+        );
+        assert!(controls.settling.is_empty());
+        let told = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(5), tracked.wait()).await
+        })
+        .expect("told, never left waiting");
+        let error = told.expect_err("told it failed");
+        assert!(error.to_string().contains("unanswered"), "{error}");
     }
 
     #[test]

@@ -127,7 +127,24 @@ impl LaneCommit {
 /// A step on its way through the engine: the instances it attaches, and
 /// what they name in the roles, read until it lands
 /// ([`crate::store::roles::Roles::reading`]).
-type LandingReads = (Vec<::engine::InstanceId>, Vec<crate::store::roles::Owner>);
+/// A fired step's attachments and what they name in the roles, until its
+/// landing takes them (`None` once landed: steps land in any order).
+type LandingReads = Option<(Vec<::engine::InstanceId>, Vec<crate::store::roles::Owner>)>;
+
+/// Takes step `step` of `frame`'s reads at its landing, and the frame's
+/// entry once every step of it has landed, in whatever order they land.
+fn take_landing(
+    landed: &mut HashMap<::engine::FrameId, Vec<LandingReads>>,
+    frame: ::engine::FrameId,
+    step: usize,
+) -> LandingReads {
+    let steps = landed.get_mut(&frame)?;
+    let taken = steps.get_mut(step).and_then(Option::take);
+    if steps.iter().all(Option::is_none) {
+        landed.remove(&frame);
+    }
+    taken
+}
 
 fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
@@ -725,11 +742,13 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (instances, reads) = landed_instances
-                        .get(&frame)
-                        .and_then(|steps| steps.get(step as usize))
-                        .cloned()
-                        .unwrap_or_default();
+                    // Taken, not read: a frame's steps land in any order (an
+                    // engine tells a step with no instance from its device's
+                    // completion, one with instances at a later harvest), and
+                    // each step's reads go back at its own landing.
+                    let (instances, reads) =
+                        take_landing(&mut landed_instances, frame, step as usize)
+                            .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
                         if let Err(error) = engine.publish_landed() {
                             tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
@@ -752,12 +771,7 @@ impl Lane {
                     }
                     tracing::debug!(frame = frame.0, step, "channels pumped out after landing");
                     settlements.settled(frame, step as usize, &outcome, &broker);
-                    if landed_instances
-                        .get(&frame)
-                        .is_some_and(|steps| step as usize + 1 >= steps.len())
-                    {
-                        landed_instances.remove(&frame);
-                    }
+
                 }))
                 .is_err(),
             };
@@ -767,6 +781,15 @@ impl Lane {
                      behind it rather than leaving them in flight"
                 );
                 settlements.close_all(&broker);
+                // No step of the lane's lands now: what they named is read
+                // no more, and goes back as their closes come.
+                if let Some(roles) = roles.get_or_init(|| roles_of(engine_idx)).as_ref() {
+                    let mut roles = roles.lock().unwrap();
+                    for (_, reads) in landed_instances.drain().flat_map(|(_, steps)| steps).flatten()
+                    {
+                        roles.landed(&reads);
+                    }
+                }
                 if let Some(stashed) = stash.take() {
                     fail_request(stashed, "the engine lane is down after a panic");
                 }
@@ -943,7 +966,7 @@ impl Lane {
                         ran.iter()
                             .zip(reads)
                             .map(|(step, reads)| {
-                                (step.attachments.iter().map(|a| a.instance).collect(), reads)
+                                Some((step.attachments.iter().map(|a| a.instance).collect(), reads))
                             })
                             .collect(),
                     );
@@ -1401,9 +1424,31 @@ impl Lane {
                         }
                         LaneCommit::CloseInstance { id }
                     }
+                    // The engine refused the close (an instance a failed
+                    // fire left unusable): it is closed all the same, here
+                    // as in the engine's eyes no fire of it can run again,
+                    // so its slots go back once no step on its way names it
+                    // (the roles' reads), and a pair it shares is held by
+                    // it no more. Kept, a failed process's items stayed on
+                    // the device and in its pair for good (Mac Pro's M5:
+                    // pairs of dead processes on the device and the host,
+                    // a 6-chunk bind short with 1850 chunks free).
                     Err(err) => {
-                        tracing::warn!(instance_id = id.0, ?err, "scheduler close_instance failed");
-                        LaneCommit::None
+                        tracing::warn!(
+                            instance_id = id.0,
+                            ?err,
+                            "scheduler close_instance failed; its slots go back all the same"
+                        );
+                        channels.unbind(id);
+                        if let Some(roles) = roles_of(engine_idx) {
+                            roles.lock().unwrap().close_instance(id);
+                        }
+                        if let Some(shared) =
+                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                        {
+                            shared.lock().unwrap().instance_closed(id);
+                        }
+                        LaneCommit::CloseInstance { id }
                     }
                 }
             }
@@ -1560,5 +1605,38 @@ impl Lane {
             table.deregister(wait_id);
             table.free(wait_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+
+    /// An engine tells a frame's steps in any order (one with no instance
+    /// from its device's completion, one with instances at a later
+    /// harvest): each step's reads come back at its own landing, the
+    /// frame's entry goes only once every step has landed. Taken by
+    /// position, the last step landing first dropped the frame, and the
+    /// earlier step's reads were never let go (its items never freed).
+    #[test]
+    fn a_frame_s_steps_landing_out_of_order_each_give_their_reads_back() {
+        let frame = ::engine::FrameId(7);
+        let owner = |n: u64| crate::store::roles::Owner::Instance(::engine::InstanceId(n));
+        let mut landed: HashMap<::engine::FrameId, Vec<LandingReads>> = HashMap::new();
+        landed.insert(
+            frame,
+            vec![
+                Some((vec![::engine::InstanceId(1)], vec![owner(1)])),
+                Some((Vec::new(), Vec::new())),
+            ],
+        );
+        assert_eq!(take_landing(&mut landed, frame, 1), Some((Vec::new(), Vec::new())));
+        assert!(landed.contains_key(&frame), "step 0 has not landed");
+        assert_eq!(
+            take_landing(&mut landed, frame, 0),
+            Some((vec![::engine::InstanceId(1)], vec![owner(1)]))
+        );
+        assert!(landed.is_empty(), "every step landed");
+        assert_eq!(take_landing(&mut landed, frame, 0), None, "told once");
     }
 }
