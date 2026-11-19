@@ -44,6 +44,8 @@ pub struct PlannerDiagnostics {
     pub restores_total: u64,
     pub restore_failures_total: u64,
     pub restore_roles_short_total: u64,
+    /// Role slots leaked by moves an engine could not settle.
+    pub leaked_role_slots_total: u64,
     pub gate_parks_total: u64,
     pub hog_failures_total: u64,
     pub starvations_total: u64,
@@ -172,6 +174,7 @@ impl ResidencyPlanner {
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
             restore_roles_short_total: self.stats.restore_roles_short.load(Relaxed),
+            leaked_role_slots_total: self.stats.leaked_role_slots.load(Relaxed),
             gate_parks_total: self.stats.gate_parks.load(Relaxed),
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),

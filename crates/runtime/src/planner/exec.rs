@@ -339,6 +339,43 @@ impl Move {
     }
 }
 
+/// A move whose copies the engine could not settle: its kv and state
+/// pages stay out of reuse as before (a late copy may still write them),
+/// and its role items end their move where it found them, the slots taken
+/// for them leaked by name ([`crate::store::roles::Roles::abandon`]), so a
+/// pair's other holders never wait on it.
+fn abandon(model: usize, engine: usize, txn: Move, why: &str) {
+    let roles = match txn {
+        Move::Suspend { kv, rs, roles } | Move::Restore { kv, rs, roles } => {
+            // Kept out of reuse: dropped without an abort, their pages and
+            // slots are not given back.
+            drop((kv, rs));
+            roles
+        }
+    };
+    let stores = crate::store::registry::get(model, engine);
+    let (leaked, total) = match (roles, &stores.roles) {
+        (Some(txn), Some(store)) => {
+            let mut store = store.lock().unwrap();
+            let leaked = store.abandon(txn);
+            (leaked, store.leaked())
+        }
+        _ => (0, 0),
+    };
+    if let Some(planner) = crate::planner::planner_for(model, engine) {
+        planner.note_leaked(total);
+    }
+    tracing::error!(
+        model,
+        engine,
+        why,
+        leaked_role_slots = leaked,
+        "leaked: an engine could not settle the copies of an aborted move; its kv and \
+         state pages and the role slots it took stay out of service, and its items end \
+         their move where it found them"
+    );
+}
+
 fn abort(model: usize, engine: usize, txn: Move) {
     let stores = crate::store::registry::get(model, engine);
     let roles = match txn {
@@ -448,17 +485,17 @@ impl Drop for MoveGuard {
         };
         crate::rt::spawn(async move {
             let settled = crate::scheduler::settle_copies(engine);
-            if let Err(error) =
-                crate::scheduler::abort_once_landed(in_flight, settled, || abort(model, engine, txn))
-                    .await
-            {
-                tracing::error!(
-                    model,
-                    engine,
-                    %error,
-                    "a residency move's copies did not settle; preserving its pages and \
-                     slots to avoid reuse under a copy"
-                );
+            let held = std::sync::Mutex::new(Some(txn));
+            let aborted = crate::scheduler::abort_once_landed(in_flight, settled, || {
+                if let Some(txn) = held.lock().unwrap().take() {
+                    abort(model, engine, txn);
+                }
+            })
+            .await;
+            if let Err(error) = aborted {
+                if let Some(txn) = held.lock().unwrap().take() {
+                    abandon(model, engine, txn, &error);
+                }
                 return;
             }
             if let Some(planner) = crate::planner::planner_for(model, engine) {

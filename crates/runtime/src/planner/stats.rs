@@ -19,6 +19,9 @@ pub struct PlannerStats {
     pub restore_failures: AtomicU64,
     /// Restores queued again for want of device room for their role slots.
     pub restore_roles_short: AtomicU64,
+    /// Role slots out of service for good: taken by moves whose copies an
+    /// engine could not settle ([`crate::store::roles::Roles::abandon`]).
+    pub leaked_role_slots: AtomicU64,
     pub gate_parks: AtomicU64,
     pub hog_failures: AtomicU64,
     pub starvations: AtomicU64,

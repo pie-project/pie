@@ -639,6 +639,8 @@ pub struct Roles {
     guest_waiter: Option<Holder>,
     /// The last generation handed out ([`Self::next_generation`]).
     generations: u64,
+    /// Slots out of service for good ([`Self::abandon`]).
+    leaked: u64,
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -707,6 +709,7 @@ impl Roles {
             freed: Arc::default(),
             guest_waiter: None,
             generations: 0,
+            leaked: 0,
         })
     }
 
@@ -1955,6 +1958,49 @@ impl Roles {
         // What waits on a pair's move (a bind, a restore) looks again: the
         // move ended, here as at a commit.
         self.tell_room();
+    }
+
+    /// The move failed and its copies never settled (the engine could not
+    /// say they landed): it ends all the same, each item where the move
+    /// found it, so nothing waits on it moving, but the slots it took on
+    /// the tier it was going to stay out of service for good, leaked by
+    /// name: a late copy may still write them, so they are never given
+    /// back nor reused. The slots it leaves still hold what they held (a
+    /// copy only reads them). Answers the slots leaked.
+    pub fn abandon(&mut self, txn: RoleMove) -> u64 {
+        let mut leaked = 0u64;
+        for (owner, parts) in txn.shed {
+            if !txn.out {
+                leaked += parts
+                    .iter()
+                    .filter(|part| part.dead())
+                    .map(|part| part.refs.len() as u64)
+                    .sum::<u64>();
+            }
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.tier = Tier::Device;
+            }
+            self.free_if_done(owner);
+        }
+        for (owner, parts) in txn.items {
+            leaked += parts.iter().map(|part| part.refs.len() as u64).sum::<u64>();
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.tier = if txn.out { Tier::Device } else { Tier::Host };
+            }
+            self.free_if_done(owner);
+        }
+        self.leaked += leaked;
+        // What waits on the move (a bind, a restore of a pair's other
+        // holder) looks again: it no longer moves.
+        self.tell_room();
+        leaked
+    }
+
+    /// Role slots out of service for good: taken by moves whose copies an
+    /// engine could not settle ([`Self::abandon`]).
+    #[must_use]
+    pub fn leaked(&self) -> u64 {
+        self.leaked
     }
 
     /// The host tier (`host`), else the device.

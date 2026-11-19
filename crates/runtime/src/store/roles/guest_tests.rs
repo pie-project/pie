@@ -2069,3 +2069,58 @@ fn room_beside_a_parked_process_s_own_state_is_read_and_the_pool_is_the_same_aft
     assert_eq!(roles.lock().unwrap().free_runs(1), free);
     assert_eq!(snapshot(&device), before, "the pool is the same after");
 }
+
+/// A move whose copies an engine could not settle (its `settle_copies`
+/// failed): it ends all the same, each item where the move found it, so a
+/// pair's other holders no longer wait on it moving, and are told; the
+/// slots it took on the tier it was going to stay out of service for good,
+/// counted as leaked by name, never given back nor reused. Nothing of the
+/// pair's state is lost: dead between fires, it comes back fresh.
+#[tokio::test(flavor = "current_thread")]
+async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 1);
+    park(&roles, 2);
+    // The first's restore brings its tables and the pair back: its copies
+    // never settle.
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    let taken: u64 = held(&device);
+    let watch = roles.lock().unwrap().room_watch();
+    let unparked = roles.lock().unwrap().prepare_unpark(holder(2));
+    assert!(matches!(unparked, Err(RolesError::PairParked(_))), "the pair moves");
+    let woken = tokio::spawn(watch.freed());
+    let leaked = roles.lock().unwrap().abandon(moving);
+    assert!(leaked > 0, "the slots it took on the device");
+    assert_eq!(roles.lock().unwrap().leaked(), leaked, "counted by name");
+    assert_eq!(held(&device), taken, "never given back");
+    tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+        .await
+        .expect("its waiters are told")
+        .unwrap();
+    // The move ended: both restores go, the pair's state taken fresh.
+    for (by, id) in [(1, first), (2, second)] {
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("nothing moves now")
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+        let stale = roles.lock().unwrap().stale(holder(by));
+        for rebind in stale {
+            engine.rebind_slots(rebind).unwrap();
+            roles.lock().unwrap().rebound(Owner::Instance(id));
+        }
+    }
+    roles.lock().unwrap().close_instance(first);
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
+}

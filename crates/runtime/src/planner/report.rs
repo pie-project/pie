@@ -235,6 +235,14 @@ impl ResidencyPlanner {
         self.requeue_restore(pid);
     }
 
+    /// Role slots out of service for good stand at `slots` now (an aborted
+    /// move's copies never settled): the status says so, and the plan looks
+    /// again, as the move's items no longer move.
+    pub(crate) fn note_leaked(self: &Arc<Self>, slots: u64) {
+        self.stats.leaked_role_slots.store(slots, Ordering::Relaxed);
+        self.poke();
+    }
+
     /// More of `pid`'s pages were swapped out since its restore was quoted:
     /// it is queued again, to be quoted anew when served. No failure.
     pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId) {
