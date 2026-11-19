@@ -675,6 +675,10 @@ impl PoolTarget for SharedGrow {
         self.shared.lock().unwrap().floor()
     }
 
+    fn least_mapped(&self) -> u64 {
+        self.shared.lock().unwrap().least_mapped_bytes()
+    }
+
     fn hard_limit(&self) -> u64 {
         self.shared.lock().unwrap().hard_limit()
     }
@@ -1015,9 +1019,11 @@ mod tests {
         let (first, _) = turn(&mut steer, &mut grow);
         assert_eq!(first.answer, Retarget::Reached);
 
-        // An app takes memory: 272 + 752 * 0.65 MiB comes to 6 segments of
-        // the 8 mapped. The walk has yet to look: Moving, nothing raised.
-        std::fs::write(&path, "0.35").unwrap();
+        // An app takes memory: the floor is the fewest segments the pool
+        // can map (the reserved chunk's and the span's, 384 MiB, over its
+        // byte floor of 272), and 384 + 640 * 0.55 MiB comes to 6 segments
+        // of the 8 mapped. The walk has yet to look: Moving, nothing raised.
+        std::fs::write(&path, "0.45").unwrap();
         let (pressed, signals) = turn(&mut steer, &mut grow);
         assert_eq!(pressed.segments, 6);
         assert_eq!(pressed.answer, Retarget::Moving { held: 8 });
@@ -1053,6 +1059,64 @@ mod tests {
             0,
             "no fire at all"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Yield 1 at full pressure on an empty pool whose byte floor (one
+    /// lane, the reserved chunk, the activation span) is under the fewest
+    /// segments it can map: the reserved chunk's segment and the span's.
+    /// The governor's floor is those segments, so the target is what the
+    /// pool can reach: the walk releases the rest and the pool answers
+    /// Reached, never NoRoom with nothing left to shed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_pressure_targets_the_fewest_segments_the_pool_can_map() {
+        use crate::governor::run::Steer;
+        use crate::governor::{Signal, Source, Yield};
+
+        const ENGINE: usize = 67;
+        let engines = vec![registry::EngineStores::default(); ENGINE + 1];
+        let model = registry::register_model_with_chunks(16, &engines);
+        let mut pool = super::super::tests::pool();
+        pool.committed(6);
+        let (byte_floor, least) = (pool.floor(), pool.least_mapped_bytes());
+        let segment = pool.segment_bytes();
+        assert!(
+            least > byte_floor,
+            "the layout's least ({least}) is over the byte floor ({byte_floor})"
+        );
+        assert_eq!(least % segment, 0, "whole segments");
+        assert!(pool.held() > least, "more is mapped than the least");
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |_| Ok(()));
+
+        let dir = std::env::temp_dir().join(format!("pie-govl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        std::fs::write(&path, "1").unwrap();
+        let source = Source::File(path.clone());
+        let mut reader = crate::governor::Reader::new(source.clone());
+        let mut steer = Steer::new(&grow, Yield::new(1.0).unwrap()).with_source(source.name());
+        assert_eq!(steer.governor().limits().floor, least);
+
+        let mut answers = Vec::new();
+        for _ in 0..16 {
+            let mut signals = Vec::new();
+            let turn = steer.turn(&mut grow, reader.read(), &mut |signal| signals.push(signal));
+            assert_eq!(turn.target, least, "the target is the least the pool maps");
+            assert!(
+                !signals
+                    .iter()
+                    .any(|signal| matches!(signal, Signal::TierPressure { .. })),
+                "nothing is asked of the policy: {signals:?}"
+            );
+            answers.push(turn.answer);
+            if turn.answer == Retarget::Reached {
+                break;
+            }
+            grow.walk().await;
+        }
+        assert_eq!(answers.last(), Some(&Retarget::Reached), "{answers:?}");
+        assert_eq!(grow.held(), least);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

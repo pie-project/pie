@@ -200,10 +200,18 @@ impl Regime {
 
 impl Steer {
     /// A fixed pool has nothing to give back, so no yield applies to it
-    /// whatever the deployment asked.
+    /// whatever the deployment asked: the load says so once, where it asked
+    /// for one.
     #[must_use]
     pub fn new(pool: &impl PoolTarget, yields: Yield) -> Self {
         let yields = if pool.growth() == Growth::Fixed {
+            if yields.yields() {
+                tracing::info!(
+                    yields = yields.share(),
+                    "the pool is laid whole at load; engine.memory.yield = {} is a no-op here",
+                    yields.share()
+                );
+            }
             Yield::NONE
         } else {
             yields
@@ -456,22 +464,30 @@ impl Steer {
             }
             Retarget::NoRoom { held } => {
                 if self.short.is_none() {
+                    // One measure with the read and crossing lines: the
+                    // bytes held and the rule's target; segments apart.
                     tracing::info!(
-                        held_mib = held.saturating_mul(limits.segment_bytes) >> 20,
-                        target_mib = segments.saturating_mul(limits.segment_bytes) >> 20,
+                        held_mib = pool.held() >> 20,
+                        target_mib = target >> 20,
                         held_segments = held,
                         target_segments = segments,
                         draining_segments = mapped.draining,
                         "the pool maps more than its target and has no room to evacuate into: what is left is live or idle cache only the policy can shed; tier pressure to the policy"
                     );
                 }
-                if self.short != Some(held) {
-                    self.short = Some(held);
-                    signal(Signal::TierPressure {
-                        held_bytes: held.saturating_mul(limits.segment_bytes),
-                        target_bytes: segments.saturating_mul(limits.segment_bytes),
-                    });
-                }
+                // Said every turn it stands, not only as it changes: what
+                // the policy discarded may free slots inside chunks other
+                // sets still use and give back no segment, so the
+                // shortfall stands at the same `held`. The gauge reports a
+                // standing shortfall again on its own period
+                // ([`crate::policy::pressure::AGAIN`]), and the default
+                // responder looks again, next lowest key first, until the
+                // pool can give the segments back.
+                self.short = Some(held);
+                signal(Signal::TierPressure {
+                    held_bytes: held.saturating_mul(limits.segment_bytes),
+                    target_bytes: segments.saturating_mul(limits.segment_bytes),
+                });
             }
         }
         let held = pool.held();
@@ -585,6 +601,10 @@ fn said(
         );
         return None;
     }
+    // A fixed pool's Steer said so already.
+    if pool.growth() == Growth::Fixed {
+        return None;
+    }
     if !steer.governor().yields().yields() || !shared {
         tracing::info!(
             engine,
@@ -617,9 +637,10 @@ fn said(
                 reserved_mib = mib(parts.map(|parts| parts.reserved_bytes)),
                 activation_mib = mib(parts.map(|parts| parts.act_bytes)),
                 dense_weights_mib = weights >> 20,
+                least_mapped_mib = mib(parts.map(|parts| parts.least_mapped_bytes)),
                 budget_mib = limits.hard_limit >> 20,
                 target_mib = limits.target(yields, pressure) >> 20,
-                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights"
+                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights, and no less than the fewest segments the pool can map (the reserved chunks' and the activation span's)"
             );
         }
         None => tracing::error!(
@@ -1139,8 +1160,10 @@ mod tests {
         let short = short_bytes(signals[0]);
         assert_eq!(short, 350 * MIB);
 
-        // The same reading again raises nothing new while it waits.
-        assert!(tick(&mut steer, &mut pool).is_empty());
+        // The same reading again says the same shortfall: it stands, and
+        // the gauge reports it again on its period for the responder to
+        // look again.
+        assert_eq!(tick(&mut steer, &mut pool), signals);
 
         // PLEX order: the droppable key first, then key 2 least recently
         // used first, stopping once the shortfall is covered; key 5 and the

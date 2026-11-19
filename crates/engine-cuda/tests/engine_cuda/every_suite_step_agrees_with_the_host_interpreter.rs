@@ -539,6 +539,7 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
                         suite.vocab,
                         suite.vocab,
                         0,
+                        suite.rows,
                     )
                     .expect("the logits bind");
                 planes.push(buffer);
@@ -712,6 +713,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
                 serving.vocab,
                 serving.vocab,
                 0,
+                1,
             )
             .expect("the logits bind");
         let launched = plane.stage(lane, Stage::Epilogue).expect("the lane stages");

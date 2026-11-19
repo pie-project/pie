@@ -753,7 +753,8 @@ fn plus_one(op: &Operation) -> bool {
 /// An attention prologue on the packed qkv row: split it, norm q and k per
 /// head, rotate them, and write k and v to the cache. Gemma 4's norms carry
 /// weights and v's a scaleless norm, rotated in part on a global layer;
-/// Muse Spark's are scaleless with v as it is, its global layers unturned.
+/// Qwen 3's carry weights with v as it is, rotated whole; Muse Spark's are
+/// scaleless with v as it is, its global layers unturned.
 #[must_use]
 pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
     Rule::new(
@@ -771,7 +772,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
 /// past a piece's widths is one no window of the product addresses.
 #[must_use]
 pub fn qkv_fused_padded() -> Rule {
-    let patterns: Vec<Template> = qkv_patterns().into_iter().skip(4).collect();
+    let patterns: Vec<Template> = qkv_patterns().into_iter().skip(4).take(2).collect();
     Rule::new(
         "fused.qkv_fused_qknorm_rope_vnorm_write",
         patterns,
@@ -781,10 +782,22 @@ pub fn qkv_fused_padded() -> Rule {
     .form("padded")
 }
 
-/// The qkv write's forms: Gemma's (the rotation: 0 none, 1 full, 2
-/// partial), MiMo's (no norms, v scaled, a partial rotation).
+/// How a qkv write norms q, k and v.
+#[derive(Clone, Copy)]
+enum QkvNorms {
+    /// q and k by their weights per head, v scaleless (Gemma's).
+    WeightedV,
+    /// q and k by their weights per head, v as it is (Qwen's).
+    Weighted,
+    /// q and k scaleless per head, v as it is (Muse Spark's).
+    Bare,
+}
+
+/// The qkv write's forms: Gemma's, Qwen's and Muse Spark's norms (the
+/// rotation: 0 none, 1 full, 2 partial), MiMo's (no norms, v scaled, a
+/// partial rotation; 3, or 4 with its heads padded).
 fn qkv_patterns() -> Vec<Template> {
-    let pattern = |gemma: bool, rope: u8| {
+    let pattern = |norms: QkvNorms, rope: u8| {
         template(move |p| {
             let packed = p.rows("packed", 3 * W);
             let positions = p.indices("positions");
@@ -818,18 +831,22 @@ fn qkv_patterns() -> Vec<Template> {
                 return;
             }
             let eps = p.f32("eps");
-            let (q, k, v) = if gemma {
-                (
+            let (q, k, v) = match norms {
+                QkvNorms::WeightedV | QkvNorms::Weighted => (
                     elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [W]), d, eps),
                     elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [W]), d, eps),
-                    elemwise::rmsnorm_no_scale(&v, d, eps),
-                )
-            } else {
-                (
+                    match norms {
+                        // Its own eps, which the rule admits only where it
+                        // is q's and k's: the match states the v norm.
+                        QkvNorms::WeightedV => elemwise::rmsnorm_no_scale(&v, d, p.f32("v_eps")),
+                        _ => v,
+                    },
+                ),
+                QkvNorms::Bare => (
                     elemwise::rmsnorm_no_scale(&q, d, eps),
                     elemwise::rmsnorm_no_scale(&k, d, eps),
                     v,
-                )
+                ),
             };
             let (q, k) = match rope {
                 0 => (q, k),
@@ -864,13 +881,16 @@ fn qkv_patterns() -> Vec<Template> {
             p.export("q", &q);
         })
     };
+    // MiMo's two are the fifth and sixth (`qkv_fused_padded`).
     vec![
-        pattern(true, 2),
-        pattern(true, 1),
-        pattern(false, 1),
-        pattern(false, 0),
-        pattern(false, 3),
-        pattern(false, 4),
+        pattern(QkvNorms::WeightedV, 2),
+        pattern(QkvNorms::WeightedV, 1),
+        pattern(QkvNorms::Bare, 1),
+        pattern(QkvNorms::Bare, 0),
+        pattern(QkvNorms::Bare, 3),
+        pattern(QkvNorms::Bare, 4),
+        pattern(QkvNorms::Weighted, 2),
+        pattern(QkvNorms::Weighted, 1),
     ]
 }
 
@@ -884,7 +904,7 @@ fn qkv_fused(m: &Match) -> Fused {
         positions: m.get("positions").filter(|_| rotated),
         q_norm_weight: m.get("q_norm"),
         k_norm_weight: m.get("k_norm"),
-        v_norm: m.get("q_norm").is_some(),
+        v_norm: m.get_f32("v_eps").is_some(),
         eps: m.get_f32("eps").unwrap_or(0.0),
         cache: m.value("cache"),
         write_page: m.value("write_page"),
@@ -917,6 +937,7 @@ fn qkv_admits(m: &Match) -> bool {
             span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
         })
         && m.get_u32("kv_width").is_none_or(|w| w % d == 0)
+        && m.get_f32("v_eps").is_none_or(|v| Some(v) == m.get_f32("eps"))
 }
 
 /// A row norm whose output joins the residual stream, optionally scaled and

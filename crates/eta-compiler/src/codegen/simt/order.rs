@@ -29,6 +29,7 @@ const BODY: &str = r#"
   (void)intrinsic_widths;
   (void)intrinsic_strides;
   (void)intrinsic_offsets;
+  (void)intrinsic_rows;
   (void)lane_active;
   (void)status;
 
@@ -152,6 +153,7 @@ const BODY_SELECT: &str = r#"
   (void)intrinsic_widths;
   (void)intrinsic_strides;
   (void)intrinsic_offsets;
+  (void)intrinsic_rows;
   (void)temporary;
   (void)kOrderWorkerCap;
   (void)kOrderFullRow;
@@ -172,12 +174,13 @@ const BODY_SELECT: &str = r#"
   const m1_u32 direct_stride = direct_stride_raw == 0u ? order_len : direct_stride_raw;
   const m1_u64 direct_row0 =
       direct ? (m1_u64)intrinsic_offsets[direct_index] + (m1_u64)params[kDirectNode].imm2 : 0u;
+  const m1_u32 direct_rows = direct ? intrinsic_rows[direct_index] : 0u;
   const float direct_divisor = (direct && kDirectDivisor != 0xFFFFFFFFu)
       ? m1_load_f(scratch + offsets[kDirectDivisor], 0u, descriptors[kDirectDivisor].dtype)
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode) / direct_divisor;
+      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u32 sel_hist[256];

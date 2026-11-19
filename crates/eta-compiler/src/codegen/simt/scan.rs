@@ -21,6 +21,7 @@ const BODY: &str = r#"
   (void)intrinsic_widths;
   (void)intrinsic_strides;
   (void)intrinsic_offsets;
+  (void)intrinsic_rows;
   (void)lane_active;
   (void)status;
   (void)temporary;
