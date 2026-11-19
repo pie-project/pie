@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::LaunchPackage;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
@@ -38,7 +41,7 @@ pub struct Tables<'a> {
 /// its heap binds read_write, and a WebGPU usage scope takes one buffer one
 /// way only: a stage's module declares them read_write, and its layout binds
 /// every binding read_write storage.
-const WIDENED: [(&str, &str); 4] = [
+const WIDENED: [(&str, &str); 5] = [
     (
         "@binding(1) var<storage, read>       descs",
         "@binding(1) var<storage, read_write> descs",
@@ -54,6 +57,10 @@ const WIDENED: [(&str, &str); 4] = [
     (
         "@binding(5) var<uniform>             cfg",
         "@binding(5) var<storage, read_write> cfg",
+    ),
+    (
+        "@binding(6) var<uniform> pie_step",
+        "@binding(6) var<storage, read_write> pie_step",
     ),
 ];
 
@@ -81,34 +88,77 @@ fn read_status(status: eta_exec::Status) -> std::result::Result<Option<u32>, Str
         Some(eta_exec::State::Unset) => Ok(None),
         Some(eta_exec::State::Fault) => Ok(Some(status.fault)),
         _ => Err(format!(
-            "status was overwritten: its words read {:#x} {:#x} {:#x} {:#x}, and no guest              runtime writes state {:#x}",
+            "status was overwritten: its words read {:#x} {:#x} {:#x} {:#x}, and no guest \
+             runtime writes state {:#x}",
             status.state, status.fault, status.reserved0, status.reserved1, status.state
         )),
     }
 }
 
-/// A stage's outbox: its status, then each value the stage puts (what its
-/// run reads back, `eta_exec`'s wanted set), in whole words within its heap.
-fn outbox_bytes(
-    reads: &[u32],
-    offsets: &[u64],
-    descriptors: &[ValueDesc],
-    heap_bytes: u64,
-) -> Result<u64> {
-    reads.iter().try_fold(STATUS_SPAN, |sum, &value| {
-        let at = value as usize;
-        match (offsets.get(at), descriptors.get(at)) {
-            (Some(&offset), Some(desc)) => Ok(sum
-                + desc
-                    .device_bytes()
-                    .next_multiple_of(4)
-                    .min(heap_bytes.saturating_sub(offset))),
-            _ => Err(Fault::Program {
-                at: "guest::session",
-                why: format!("the put value {value} has no span in its stage"),
-            }),
-        }
-    })
+/// What an instance's tables take in its `Instance` slots, in the order a
+/// bind places them: each stage's four bind-time tables and its steps'
+/// uniforms (`stride` apart), then the status word its stages share.
+#[must_use]
+pub fn instance_table_sizes(
+    plans: &[LaunchStagePlan],
+    code: &[engine_gpu::guest::Lowered],
+    stride: u64,
+) -> Vec<u64> {
+    let mut sizes: Vec<u64> = plans
+        .iter()
+        .zip(code)
+        .flat_map(|(plan, lowered)| {
+            let mut stage = eta_exec::tables::table_sizes(plan).to_vec();
+            stage.push(step_uniforms(&lowered.steps, stride).len() as u64);
+            stage
+        })
+        .collect();
+    sizes.push(STATUS_SPAN);
+    sizes
+}
+
+/// What each stage of `package` reads back at its collect: its status, then
+/// each value it puts, in whole words. A put is its channel's shape, fixed in
+/// the container, so this is known when the program registers.
+#[must_use]
+pub fn stage_read_bytes(package: &LaunchPackage) -> Vec<u64> {
+    package
+        .stages
+        .iter()
+        .map(|stage| {
+            STATUS_SPAN
+                + stage
+                    .puts
+                    .iter()
+                    .map(|put| {
+                        package
+                            .channels
+                            .iter()
+                            .find(|channel| channel.id == put.channel)
+                            .map_or(4, |channel| {
+                                let len = channel
+                                    .shape
+                                    .iter()
+                                    .map(|&dim| u64::from(dim))
+                                    .product::<u64>();
+                                let bytes = match channel.dtype {
+                                    eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bool) => {
+                                        len
+                                    }
+                                    _ => len * 4,
+                                };
+                                bytes.max(4).next_multiple_of(4)
+                            })
+                    })
+                    .sum::<u64>()
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The readback buffer this thread collects its stages through, taken on
+    /// its first collect.
+    static OUTBOX: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// Every guest pipeline: one a call of the closed set
@@ -125,6 +175,12 @@ pub struct Library {
     pipelines: std::sync::Mutex<Vec<std::result::Result<wgpu::ComputePipeline, String>>>,
     /// Pipelines built after the load, at a bind.
     serving: std::sync::atomic::AtomicU64,
+    /// One readback buffer for each thread that runs guest passes, made at
+    /// load: a stage's collect copies its status and puts there and maps it
+    /// on the thread that ran it (a mapped buffer takes no part in a
+    /// submission, so the threads share none).
+    outboxes: Vec<Buffer>,
+    taken: AtomicU32,
 }
 
 impl std::fmt::Debug for Library {
@@ -137,7 +193,9 @@ impl std::fmt::Debug for Library {
 }
 
 impl Library {
-    pub fn build(device: &Context) -> Result<Library> {
+    /// The guest pipelines, and `threads` readback buffers of
+    /// `outbox_bytes` each.
+    pub fn build(device: &Context, outbox_bytes: u64, threads: u32) -> Result<Library> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -152,12 +210,24 @@ impl Library {
         let pipelines: Vec<_> = (0..engine_gpu::guest::step_calls())
             .map(|call| build_call(&core, &layout, call))
             .collect();
+        let outboxes = (0..threads)
+            .map(|_| {
+                Buffer::with(
+                    device,
+                    outbox_bytes,
+                    Memory::Readback,
+                    engine_gpu::books::owners::GUEST,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let library = Library {
             core: core.clone(),
             binds,
             layout,
             pipelines: std::sync::Mutex::new(pipelines),
             serving: std::sync::atomic::AtomicU64::new(0),
+            outboxes,
+            taken: AtomicU32::new(0),
         };
         for (call, why) in library
             .pipelines
@@ -183,6 +253,30 @@ impl Library {
     pub fn built(&self) -> usize {
         let pipelines = self.pipelines.lock().expect("library lock poisoned");
         pipelines.iter().filter(|built| built.is_ok()).count()
+    }
+
+    /// The bytes one stage's collect reads back at most: each thread's
+    /// readback buffer.
+    #[must_use]
+    pub fn outbox_bytes(&self) -> u64 {
+        self.outboxes.first().map_or(0, Buffer::bytes)
+    }
+
+    /// This thread's readback buffer, taken on its first collect.
+    fn outbox(&self) -> Result<&Buffer> {
+        let at = match OUTBOX.get() {
+            Some(at) => at,
+            None => {
+                let at = self.taken.fetch_add(1, Ordering::Relaxed);
+                OUTBOX.set(Some(at));
+                at
+            }
+        };
+        self.outboxes.get(at as usize).ok_or(Fault::Ceiling {
+            what: "threads collecting a guest stage (the readback buffers made at load)",
+            need: u64::from(at) + 1,
+            have: self.outboxes.len() as u64,
+        })
     }
 
     /// The pipelines built after the load, each at a bind that found its
@@ -236,8 +330,9 @@ struct Stage {
 
     /// Its steps' pipelines, in dispatch order.
     steps: Vec<wgpu::ComputePipeline>,
-    /// Its steps' uniforms, `stride` apart ([`STEP_BINDING`]).
-    args: Buffer,
+    /// Its steps' uniforms in the instance's `Instance` slots, `stride`
+    /// apart ([`STEP_BINDING`]).
+    args: Held,
     stride: u64,
 
     groups: u32,
@@ -254,7 +349,8 @@ struct Stage {
     /// lies in, its first byte there and its bytes.
     heap: (Side, u64, u64),
 
-    outbox: Buffer,
+    /// The readback buffer its last read-back went to (its thread's).
+    outbox: Option<Buffer>,
 
     outbox_layout: Vec<(u32, u64, u64)>,
 
@@ -263,7 +359,8 @@ struct Stage {
 
 pub struct Session {
     core: Arc<Core>,
-    status: Buffer,
+    /// The status word the stages share, in the instance's `Instance` slots.
+    status: Held,
     stages: Vec<Stage>,
     /// The `Instance` slots the stages' tables lie in, in binding order,
     /// and whether they are one run.
@@ -297,7 +394,6 @@ impl Session {
         device: &Context,
         package: &LaunchPackage,
         code: &[engine_gpu::guest::Lowered],
-        args: &[StepArgs],
         library: Arc<Library>,
         extents: &Extents,
         tables: &Tables<'_>,
@@ -305,7 +401,7 @@ impl Session {
         layout: &GuestLayout,
     ) -> Result<Session> {
         let plans = &package.plans;
-        if code.len() != plans.len() || args.len() != plans.len() {
+        if code.len() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
@@ -315,14 +411,6 @@ impl Session {
                 ),
             });
         }
-
-        let mut status = Buffer::with(
-            device,
-            eta_exec::STATUS_BYTES as u64,
-            Memory::Host,
-            engine_gpu::books::owners::GUEST,
-        )?;
-        status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
         let resolved = plans
@@ -334,14 +422,27 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<StageTables>>>()?;
-        // Every stage's tables, in the instance's slots, written at once.
-        let bytes: Vec<Vec<u8>> = resolved
+        // Every stage's tables and step uniforms, then the status word, in
+        // the instance's slots ([`instance_table_sizes`]), written at once.
+        // The step uniforms lie in a pool segment beside storage, so they
+        // bind as storage too, each at an offset storage's alignment allows.
+        let stride = step_stride(device.table_align());
+        let mut bytes: Vec<Vec<u8>> = resolved
             .iter()
-            .flat_map(|stage| stage.tables.iter().cloned())
+            .zip(code)
+            .flat_map(|(stage, lowered)| {
+                let mut tables = stage.tables.to_vec();
+                tables.push(step_uniforms(&lowered.steps, stride));
+                tables
+            })
             .collect();
+        bytes.push(vec![0u8; eta_exec::STATUS_BYTES]);
         let (placed, run) =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
+        let status = placed
+            .next_back()
+            .expect("the status word is the last table placed");
         if layout.stages.len() != plans.len()
             || resolved
                 .iter()
@@ -365,27 +466,13 @@ impl Session {
         }
         let places = [&instance, &pair];
         let mut stages = Vec::with_capacity(plans.len());
-        for (at, (((lowered, resolved), args), &heap)) in code
-            .iter()
-            .zip(resolved)
-            .zip(args)
-            .zip(&layout.stages)
-            .enumerate()
-        {
+        for ((lowered, resolved), &heap) in code.iter().zip(resolved).zip(&layout.stages) {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
+            let args = placed.next().expect("a stage's step uniforms");
             let span = heap_span(places, heap)?;
-            let reads = package.stages.get(at).map_or(Ok(Vec::new()), |stage| {
-                stage
-                    .puts
-                    .iter()
-                    .filter_map(|put| {
-                        engine_gpu::guest::run::local_of(package, at, put.value).transpose()
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
             stages.push(build_stage(
-                device, &core, &library, &status, resolved, tables, lowered, args, heap, span,
-                &reads,
+                device, &core, &library, &status, resolved, tables, lowered, args, stride, heap,
+                span,
             )?);
         }
 
@@ -431,7 +518,9 @@ impl Session {
             for table in &mut stage.tables {
                 table.rebind(pools)?;
             }
+            stage.args.rebind(pools)?;
         }
+        self.status.rebind(pools)?;
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
         self.regroup()
@@ -458,16 +547,22 @@ impl Session {
                 ),
             });
         }
+        let to = |table: &Held| {
+            let at = self
+                .slots
+                .iter()
+                .position(|&slot| slot == table.slot())
+                .expect("a table lies in one of the session's slots");
+            slots[at]
+        };
         for stage in &mut self.stages {
             for table in &mut stage.tables {
-                let at = self
-                    .slots
-                    .iter()
-                    .position(|&slot| slot == table.slot())
-                    .expect("a table lies in one of the session's slots");
-                table.retarget(pools, slots[at])?;
+                table.retarget(pools, to(table))?;
             }
+            stage.args.retarget(pools, to(&stage.args))?;
         }
+        let status = to(&self.status);
+        self.status.retarget(pools, status)?;
         self.slots = slots.to_vec();
         self.instance.retarget(pools, scratch)?;
         self.pair.retarget(pools, pair)?;
@@ -582,21 +677,21 @@ impl Session {
         }
         let (heap, base, _) = self.heap_at(stage)?;
         let heap = heap.clone();
-        let Session { status, stages, .. } = self;
-        let seat = &mut stages[stage];
-        if seat.outbox.bytes() < cursor {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "stage {stage}'s read-back of {cursor} bytes is past its outbox of {},                      which holds each of its values once",
-                    seat.outbox.bytes()
-                ),
+        let outbox = self.library.outbox()?.clone();
+        if outbox.bytes() < cursor {
+            return Err(Fault::Ceiling {
+                what: "bytes one guest stage reads back (a thread's readback buffer)",
+                need: cursor,
+                have: outbox.bytes(),
             });
         }
-        frame.copy(status, 0, &seat.outbox, 0, STATUS_SPAN)?;
+        let Session { status, stages, .. } = self;
+        let seat = &mut stages[stage];
+        frame.copy(status.buffer(), status.offset(), &outbox, 0, STATUS_SPAN)?;
         for &(_, at, into, len) in &layout {
-            frame.copy(&heap, base + at, &seat.outbox, into, len)?;
+            frame.copy(&heap, base + at, &outbox, into, len)?;
         }
+        seat.outbox = Some(outbox);
         seat.outbox_layout = layout
             .into_iter()
             .map(|(value, _, into, len)| (value, into, len))
@@ -616,7 +711,13 @@ impl Session {
             .last()
             .map_or(STATUS_SPAN, |&(_, into, len)| into + len);
         let mut out = vec![0u8; span as usize];
-        seat.outbox.read(0, &mut out)?;
+        seat.outbox
+            .as_ref()
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("stage {stage} was collected before it was read back"),
+            })?
+            .read(0, &mut out)?;
         seat.collected = out;
         Ok(())
     }
@@ -666,16 +767,10 @@ impl Session {
     }
 
     pub fn clear_status(&mut self) -> Result<()> {
-        self.status.write(0, &[0u8; eta_exec::STATUS_BYTES])
+        self.status
+            .buffer()
+            .write_shared(self.status.offset(), &[0u8; eta_exec::STATUS_BYTES])
     }
-}
-
-fn whole(buffer: &Buffer) -> wgpu::BindingResource<'_> {
-    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-        buffer: &buffer.slab().buffer,
-        offset: 0,
-        size: std::num::NonZeroU64::new(buffer.bytes()),
-    })
 }
 
 fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
@@ -683,7 +778,7 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         binding: STEP_BINDING,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
             has_dynamic_offset: true,
             min_binding_size: std::num::NonZeroU64::new(u64::from(
                 eta_compiler::codegen::wgsl::STEP_BYTES,
@@ -757,10 +852,10 @@ fn span(held: &Held) -> wgpu::BindingResource<'_> {
 fn group(
     core: &Arc<Core>,
     binds: &wgpu::BindGroupLayout,
-    status: &Buffer,
+    status: &Held,
     tables: &[Held; 4],
     (heap, heap_at, heap_bytes): (&Buffer, u64, u64),
-    args: &Buffer,
+    args: &Held,
 ) -> Result<wgpu::BindGroup> {
     let [descs, params, offs, cfg] = tables;
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -769,7 +864,7 @@ fn group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: whole(status),
+                resource: span(status),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -798,8 +893,8 @@ fn group(
             wgpu::BindGroupEntry {
                 binding: STEP_BINDING,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &args.slab().buffer,
-                    offset: 0,
+                    buffer: &args.buffer().slab().buffer,
+                    offset: args.offset(),
                     size: std::num::NonZeroU64::new(u64::from(
                         eta_compiler::codegen::wgsl::STEP_BYTES,
                     )),
@@ -809,30 +904,6 @@ fn group(
     });
     core.take_error("create_bind_group")?;
     Ok(group)
-}
-
-/// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
-/// program's steps fix, so every bind of the program shares one.
-#[derive(Clone)]
-pub struct StepArgs {
-    buffer: Buffer,
-    stride: u64,
-}
-
-impl StepArgs {
-    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
-        let stride = step_stride(u64::from(
-            device.core().limits.min_uniform_buffer_offset_alignment,
-        ));
-        let uniforms = step_uniforms(&lowered.steps, stride);
-        let mut buffer = Buffer::zeroed(
-            device,
-            uniforms.len() as u64,
-            engine_gpu::books::owners::GUEST,
-        )?;
-        buffer.write(0, &uniforms)?;
-        Ok(StepArgs { buffer, stride })
-    }
 }
 
 /// Where a stage's heap (`heap`: its side, first byte and bytes) lies in
@@ -858,14 +929,14 @@ fn build_stage(
     device: &Context,
     core: &Arc<Core>,
     library: &Library,
-    status: &Buffer,
+    status: &Held,
     resolved: StageTables,
     tables: [Held; 4],
     lowered: &engine_gpu::guest::Lowered,
-    args: &StepArgs,
+    args: Held,
+    stride: u64,
     heap: (Side, u64, u64),
     span: (&Buffer, u64, u64),
-    reads: &[u32],
 ) -> Result<Stage> {
     let StageTables {
         descriptors,
@@ -877,13 +948,6 @@ fn build_stage(
         .iter()
         .map(|step| library.pipeline(step.call))
         .collect::<Result<Vec<_>>>()?;
-    let (args, stride) = (args.buffer.clone(), args.stride);
-    let outbox = Buffer::with(
-        device,
-        outbox_bytes(reads, &offsets, &descriptors, heap.2)?,
-        Memory::Readback,
-        engine_gpu::books::owners::GUEST,
-    )?;
     let group = group(core, &library.binds, status, &tables, span, &args)?;
 
     Ok(Stage {
@@ -900,7 +964,7 @@ fn build_stage(
         descriptors,
         tables,
         heap,
-        outbox,
+        outbox: None,
         outbox_layout: Vec::new(),
         collected: Vec::new(),
     })
@@ -908,38 +972,66 @@ fn build_stage(
 
 #[cfg(test)]
 mod tests {
-    use super::{STATUS_SPAN, outbox_bytes};
-    use eta_exec::ValueDesc;
+    use super::{STATUS_SPAN, stage_read_bytes};
+    use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, LaunchPut, LaunchStage};
+    use eta_ir::Dtype;
+    use eta_ir::container::ChanDType;
 
-    fn f32s(len: u32) -> ValueDesc {
-        ValueDesc {
-            len,
-            ..ValueDesc::default()
+    fn channel(id: u32, shape: &[u32], dtype: Dtype) -> LaunchChannel {
+        LaunchChannel {
+            id,
+            shape: shape.to_vec(),
+            dtype: ChanDType::Concrete(dtype),
+            ..LaunchChannel::default()
         }
     }
 
     #[test]
-    fn an_outbox_holds_the_status_and_each_put_once() {
-        let descriptors = [f32s(3), f32s(151_936), f32s(1)];
-        let offsets = [0, 16, 16 + 151_936 * 4];
-        let heap = offsets[2] + 4;
-        // Only the stage's puts are read back, not its whole heap.
+    fn a_stage_reads_back_its_status_and_each_put_by_its_channel() {
+        let package = LaunchPackage {
+            channels: vec![
+                channel(0, &[4], Dtype::F32),
+                channel(1, &[151_936], Dtype::F32),
+                channel(2, &[3], Dtype::Bool),
+                channel(3, &[], Dtype::I32),
+            ],
+            stages: vec![
+                LaunchStage {
+                    puts: vec![
+                        LaunchPut {
+                            channel: 0,
+                            value: 0,
+                        },
+                        LaunchPut {
+                            channel: 2,
+                            value: 1,
+                        },
+                        LaunchPut {
+                            channel: 3,
+                            value: 2,
+                        },
+                    ],
+                    ..LaunchStage::default()
+                },
+                LaunchStage {
+                    puts: vec![LaunchPut {
+                        channel: 1,
+                        value: 0,
+                    }],
+                    ..LaunchStage::default()
+                },
+                LaunchStage::default(),
+            ],
+            ..LaunchPackage::default()
+        };
+        // f32 x4, three bools in a word, a scalar; then a vocab row; then none.
         assert_eq!(
-            outbox_bytes(&[0, 2], &offsets, &descriptors, heap).unwrap(),
-            STATUS_SPAN + 12 + 4
-        );
-        assert_eq!(
-            outbox_bytes(&[], &offsets, &descriptors, heap).unwrap(),
-            STATUS_SPAN
-        );
-    }
-
-    #[test]
-    fn a_put_is_read_no_further_than_its_heap() {
-        let descriptors = [f32s(8)];
-        assert_eq!(
-            outbox_bytes(&[0], &[0], &descriptors, 20).unwrap(),
-            STATUS_SPAN + 20
+            stage_read_bytes(&package),
+            [
+                STATUS_SPAN + 16 + 4 + 4,
+                STATUS_SPAN + 151_936 * 4,
+                STATUS_SPAN
+            ]
         );
     }
 
@@ -958,10 +1050,5 @@ mod tests {
         // state lies are an overwritten status, not fault codes.
         assert!(read_status(status(0x3f33_3333, 0)).is_err());
         assert!(read_status(status(151_936, 0)).is_err());
-    }
-
-    #[test]
-    fn a_put_with_no_span_is_refused() {
-        assert!(outbox_bytes(&[1], &[0], &[f32s(1)], 4).is_err());
     }
 }
