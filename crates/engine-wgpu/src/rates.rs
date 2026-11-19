@@ -22,6 +22,12 @@ pub fn provenance(device: &str) -> (&'static str, String) {
     )
 }
 
+/// The bound the platform states on one GPU submission, the same the
+/// native Vulkan engine states ([`engine_gpu::rates::STATED_SUBMIT_BOUND`]):
+/// wgpu submits through the same driver, whose watchdog loses the device
+/// past it.
+pub use engine_gpu::rates::STATED_SUBMIT_BOUND;
+
 /// `tuning` with every roofline constant stated
 /// (`engine::rates::rates_at_load`, every engine's rule): as its layers
 /// state them where they state them all; else `device`'s own, measured
@@ -86,4 +92,28 @@ pub fn measure_saying(
         Ok((span, (host * 1e9) as u64))
     };
     engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, max_submit, say)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::STATED_SUBMIT_BOUND;
+
+    /// On Android a wgpu load's rates step measures under KGSL's stated 2 s
+    /// (the Rig's admission refuses a frame estimated past it); elsewhere no
+    /// bound is stated; and the load's bound is this platform's.
+    #[test]
+    fn an_android_device_measures_under_the_drivers_stated_bound() {
+        let android = engine_gpu::rates::stated_submit_bound(true);
+        assert_eq!(android, Some(Duration::from_secs(2)));
+        let admission = engine::rates::Admission::new(android);
+        assert!(admission.fits(Some(1.5e9)));
+        assert!(!admission.fits(Some(2.5e9)));
+        assert_eq!(engine_gpu::rates::stated_submit_bound(false), None);
+        assert_eq!(
+            STATED_SUBMIT_BOUND,
+            engine_gpu::rates::stated_submit_bound(cfg!(target_os = "android"))
+        );
+    }
 }

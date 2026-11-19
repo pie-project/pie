@@ -724,6 +724,13 @@ impl SlotPool {
         }
     }
 
+    /// How many times room was given back (a chunk opened for state) since
+    /// the pool was made.
+    #[must_use]
+    pub fn room_gives(&self) -> u64 {
+        self.given.gives.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// A watch on room given back from now on: what a rise short of free
     /// room waits on.
     #[must_use]
@@ -1194,6 +1201,13 @@ impl SlotPool {
     #[must_use]
     pub fn open_chunks(&self) -> Vec<u32> {
         self.open.iter_in(0, self.total).collect()
+    }
+
+    /// The open chunks a guest's state may take ([`Self::chunk_runs_for`]'s):
+    /// below the activation the rung lends and the ceiling.
+    #[must_use]
+    pub fn state_open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.state_limit().min(self.ceiling)).collect()
     }
 
     /// The logical -> physical table the engine keeps: a permutation, free
@@ -2250,13 +2264,51 @@ impl SlotPool {
         Ok(())
     }
 
-    /// Every draining segment waits on the fire at `epoch` too, where it
-    /// waited on an earlier one: the fire known, once the engine took the
-    /// evacuation, to come after its copy.
-    pub fn fence_drains(&mut self, epoch: u64) {
+    /// Takes back `evacuation`, applied with [`Self::apply_evacuation`] and
+    /// refused by the engine before its copy: each moved chunk goes back to
+    /// where it lay (the engine's table never changed), held still or let
+    /// go since, and the segment is committed again, its free chunks open.
+    pub fn undo_evacuation(&mut self, evacuation: &Evacuation) {
+        let segment = evacuation.segment;
+        if !matches!(
+            self.segments.state(segment),
+            SegmentState::Draining { .. }
+        ) {
+            return;
+        }
+        self.segments.set_state(segment, SegmentState::Committed);
+        for step in evacuation.moves.iter().rev() {
+            if self.logical_to_physical[step.logical as usize] != step.to {
+                continue;
+            }
+            let back = ChunkMove {
+                logical: step.logical,
+                from: step.to,
+                to: step.from,
+            };
+            if self.chunks[step.logical as usize].shape == NO_SHAPE {
+                // Let go since: two free chunks change places.
+                let displaced = self.physical_to_logical[back.to as usize];
+                self.logical_to_physical[back.logical as usize] = back.to;
+                self.logical_to_physical[displaced as usize] = back.from;
+                self.physical_to_logical[back.to as usize] = back.logical;
+                self.physical_to_logical[back.from as usize] = displaced;
+            } else {
+                self.move_chunk(back);
+            }
+        }
+        for chunk in self.segments.range(segment) {
+            self.reopen(chunk);
+        }
+    }
+
+    /// The draining segment planned to wait past `epoch` waits on it
+    /// instead: the engine took its copy with the fires through `epoch`
+    /// handed out, the last that may read its chunks.
+    pub fn drains_through(&mut self, epoch: u64) {
         for segment in 0..self.segments.count() {
             if let SegmentState::Draining { until } = self.segments.state(segment)
-                && until < epoch
+                && until > epoch
             {
                 self.segments
                     .set_state(segment, SegmentState::Draining { until: epoch });

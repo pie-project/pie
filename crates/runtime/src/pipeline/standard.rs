@@ -14,7 +14,7 @@
 //! and `ForwardPass` call WIT imports, so the runtime cannot trace compat
 //! itself; a change to that loop's channels or ports (not to the sampler's
 //! stage bodies) is not caught by this module's test, and its programs
-//! then build at registration, counted in `Tally::BuiltAfterReady`.
+//! then build at registration, counted in `Tally::BuiltAtRegister`.
 
 use eta_dsl::Traced;
 use eta_dsl::prelude::*;
@@ -245,7 +245,7 @@ fn registration(
     traced: Traced,
     outputs: &[OutputDecl],
 ) -> anyhow::Result<::engine::ProgramRegistration> {
-    let program = super::program::register(traced.encode(), vec![outputs.to_vec()])?;
+    let program = super::program::register(traced.encode(), vec![outputs.to_vec()], None)?;
     Ok(::engine::ProgramRegistration {
         program_hash: program.hash,
         launch: program.launch().clone(),
@@ -281,7 +281,16 @@ mod tests {
         let mut registry =
             super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
         let program = registry
-            .register(traced.encode(), vec![outputs()], EngineCaps::default())
+            .register(
+                traced.encode(),
+                vec![outputs()],
+                EngineCaps::default(),
+                eta_ir::validate::Budget {
+                    room_bytes: u64::MAX,
+                    submit: None,
+                },
+                None,
+            )
             .expect("registers");
         if backend == "wgsl" {
             let calls = wgsl::step_calls();

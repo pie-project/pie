@@ -444,6 +444,20 @@ impl Session {
     /// Refuses a fire while a seat no stage reads is bound: an output at a
     /// lane past 0 that the program reads nothing at, nor a row of its
     /// lane-0 read reaches.
+    /// Whether a stage's lane-0 read of `name` covers the instance's lane
+    /// `lane` ([`super::launch::Prepared::covers`]).
+    #[must_use]
+    pub fn covers(&self, name: &str, lane: u32) -> bool {
+        self.prepared.iter().flatten().any(|prepared| prepared.covers(name, lane))
+    }
+
+    /// Why a stage of this instance reads rows past what its lanes' seats
+    /// hold, if one does ([`super::launch::Prepared::rows_unbounded`]).
+    #[must_use]
+    pub fn rows_unbounded(&self) -> Option<String> {
+        self.prepared.iter().flatten().find_map(super::launch::Prepared::rows_unbounded)
+    }
+
     pub fn refuse_unread(&self) -> Result<()> {
         match self.unread.first() {
             None => Ok(()),
@@ -468,10 +482,11 @@ impl Session {
         dtype: eta_ir::Dtype,
         width: u32,
         stride: u32,
+        rows_held: u32,
     ) -> Result<()> {
         let mut read = false;
         for prepared in self.prepared.iter_mut().flatten() {
-            read |= prepared.bind_output(name, lane, base, offset, dtype, width, stride)?;
+            read |= prepared.bind_output(name, lane, base, offset, dtype, width, stride, rows_held)?;
         }
         self.unread.retain(|(named, at)| !(named == name && *at == lane));
         if !read && lane > 0 {
@@ -497,6 +512,30 @@ impl Session {
         at: Stage,
         scratch: Option<super::launch::ScratchAt>,
     ) -> Result<Fired> {
+        let _ = pipelines;
+        let mut frame = device.frame()?;
+        let launched = match self.encode_stages(&mut frame, compiled, plan, at, scratch)? {
+            Ok(launched) => launched,
+            Err(refused) => return Ok(refused),
+        };
+        frame.commit()?;
+        self.verdict_of_launched(plan, &launched, at)
+    }
+
+    /// The stages at `at` encoded into `frame`, each region a pass after the
+    /// one before (so they run in order, as one command buffer each did):
+    /// the stages launched, or the gate's refusal (nothing encoded). Their
+    /// verdict is read once `frame` has landed
+    /// ([`Self::verdict_of_launched`]): a step's prologues share one buffer
+    /// and one wait, not one a region an instance.
+    pub fn encode_stages(
+        &mut self,
+        frame: &mut crate::device::ctx::Frame,
+        compiled: &Compiled,
+        plan: &ExecPlan,
+        at: Stage,
+        scratch: Option<super::launch::ScratchAt>,
+    ) -> Result<std::result::Result<Vec<usize>, Fired>> {
         if self.airborne.is_some() {
             return Err(Fault::program(
                 "program::session",
@@ -507,7 +546,7 @@ impl Session {
         }
         self.refuse_unread()?;
         if let Some(refused) = self.gate(compiled, plan, at)? {
-            return Ok(refused);
+            return Ok(Err(refused));
         }
 
         let cursors = self.cursors_now();
@@ -526,12 +565,22 @@ impl Session {
                 Fault::program("program::session", "an instance fires a stage and holds no scratch")
             })?)?;
             for (at, region) in stage.regions.iter().enumerate() {
-                prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
+                prepared.encode_region(frame, region, at == 0)?;
             }
             launched.push(index);
         }
+        Ok(Ok(launched))
+    }
 
-        self.verdict(plan, &launched, at)
+    /// The verdict of stages [`Self::encode_stages`] launched, read once
+    /// their frame has landed.
+    pub fn verdict_of_launched(
+        &mut self,
+        plan: &ExecPlan,
+        launched: &[usize],
+        at: Stage,
+    ) -> Result<Fired> {
+        self.verdict(plan, launched, at)
     }
 
     pub fn prepare_airborne(

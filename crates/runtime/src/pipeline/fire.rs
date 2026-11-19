@@ -334,13 +334,20 @@ async fn acquire_grant<C: FireContext>(
     demand: crate::planner::Demand,
     windowed: bool,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
-    if demand.is_zero() {
-        return Ok(Some(crate::planner::AllocationGrant::empty()));
-    }
     let pid = ctx.process_id();
     let Some(planner) = crate::planner::planner_of(pid) else {
+        if demand.is_zero() {
+            return Ok(Some(crate::planner::AllocationGrant::empty()));
+        }
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
+    // Even an empty grant is the planner's: a process that is not resident
+    // gets none, and its fire waits for its restore.
+    if demand.is_zero()
+        && let Some(grant) = planner.grant_now(pid, demand)
+    {
+        return Ok(Some(grant));
+    }
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
             planner.note_peak(pid, demand);
@@ -1595,8 +1602,10 @@ async fn promote<C: FireContext>(
     };
     let mut guard = PromoteGuard {
         stores: stores.clone(),
+        engine,
         txn: Some(txn),
         in_flight: Vec::new(),
+        submitted: false,
     };
     let (kind, plans) = guard.txn.as_ref().map_or_else(
         || (crate::scheduler::TierKind::Kv, Vec::new()),
@@ -1618,6 +1627,7 @@ async fn promote<C: FireContext>(
         };
         let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
             .map_err(|error| format!("{error:#}"))?;
+        guard.submitted = true;
         guard.in_flight.push(completion.clone());
         completion.wait().await.map_err(|error| error.to_string())?;
     }
@@ -1634,11 +1644,14 @@ async fn promote<C: FireContext>(
 }
 
 /// Dropped before it commits, it gives back what it took once any copy it
-/// started has landed.
+/// started has landed: written its destinations, not only settled.
 struct PromoteGuard {
     stores: crate::store::registry::Stores,
+    engine: usize,
     txn: Option<crate::store::kv::KvResidencyTxn>,
     in_flight: Vec<crate::scheduler::ControlCompletion>,
+    /// A copy of the promote was handed to the engine.
+    submitted: bool,
 }
 
 impl Drop for PromoteGuard {
@@ -1656,15 +1669,30 @@ impl Drop for PromoteGuard {
                 planner.pages_freed();
             }
         };
-        if in_flight.is_empty() || !crate::rt::has_runtime() {
+        if !self.submitted {
             abort();
             return;
         }
+        if !crate::rt::has_runtime() {
+            tracing::error!(
+                "a promote dropped with a copy handed to the engine and no runtime; \
+                 preserving its pages to avoid reuse under the copy"
+            );
+            return;
+        }
+        let engine = self.engine;
         crate::rt::spawn(async move {
-            for completion in in_flight {
-                let _ = completion.wait().await;
+            let settled = crate::scheduler::settle_copies(engine);
+            if let Err(error) =
+                crate::scheduler::abort_once_landed(in_flight, settled, abort).await
+            {
+                tracing::error!(
+                    engine,
+                    %error,
+                    "a promote's copies did not settle; preserving its pages to avoid reuse \
+                     under a copy"
+                );
             }
-            abort();
         });
     }
 }
@@ -6398,10 +6426,10 @@ mod rung_wait_tests {
         let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
         ask.until_settled(&fire);
 
-        // The pool idles past the walker's patience with the fire queued:
-        // fires are cut to what is asked, never under the staged fire.
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        // A waiter is short of a slot with the fire queued: fires are cut
+        // to what is asked, never under the staged fire.
+        shared.lock().unwrap().pool_mut().wait(1, 0, 1);
+        for _ in 0..6 {
             grow.walk_rung().await;
             assert!(
                 crate::store::shared::fire_cap(ENGINE) >= 2,
@@ -6422,8 +6450,7 @@ mod rung_wait_tests {
         tokio::task::yield_now().await;
         assert!(fire.is_settled());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
-            grow.ticked_for_test();
+        for _ in 0..6 {
             grow.walk_rung().await;
         }
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);

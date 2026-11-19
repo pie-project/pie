@@ -1,4 +1,5 @@
-use eta_ir::registry::{GeometryClass, Port, PortMask};
+pub use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{Port, PortMask};
 
 use crate::fire::{Mask, Masking};
 
@@ -69,7 +70,13 @@ impl Envelope {
             }
             _ if self.host_rows.is_empty() => 0..self.tokens.as_ref().map_or(0, Vec::len),
             _ => {
-                let placed: u32 = self.host_rows.iter().sum();
+                let placed = rows_sum(&self.host_rows).ok_or_else(|| {
+                    PortError(format!(
+                        "lane {source}'s instance was placed rows past a u32 across its {} \
+                         lane(s)",
+                        self.host_rows.len()
+                    ))
+                })?;
                 if let Some(tokens) = &self.tokens
                     && tokens.len() != placed as usize
                 {
@@ -87,8 +94,14 @@ impl Envelope {
                         self.host_rows.len()
                     )));
                 };
-                let start: u32 = self.host_rows[..at].iter().sum();
-                start as usize..(start + rows) as usize
+                // `placed` summed every lane's rows: no prefix of them is past it.
+                let start = rows_sum(&self.host_rows[..at]).unwrap_or(placed);
+                let end = start.checked_add(rows).ok_or_else(|| {
+                    PortError(format!(
+                        "lane {source}'s rows {start}+{rows} run past a u32"
+                    ))
+                })?;
+                start as usize..end as usize
             }
         };
         Ok(LanePorts {
@@ -104,7 +117,11 @@ impl Envelope {
             Some(csr) if self.owns_slots() && csr.len() >= 2 => {
                 csr.last().copied().unwrap_or(0) as usize
             }
-            _ if !self.host_rows.is_empty() => self.host_rows.iter().sum::<u32>() as usize,
+            _ if !self.host_rows.is_empty() => self
+                .host_rows
+                .iter()
+                .map(|&rows| rows as usize)
+                .fold(0usize, usize::saturating_add),
             _ => self.tokens.as_ref().map_or(0, Vec::len),
         }
     }
@@ -238,10 +255,16 @@ impl LanePorts<'_> {
         if let Some(extent) = self.extent() {
             return Ok(Some(extent));
         }
-        Ok(self
-            .slots(rows)?
-            .and_then(|slots| slots.iter().max())
-            .map(|&last| last + 1))
+        let Some(&last) = self.slots(rows)?.and_then(|slots| slots.iter().max()) else {
+            return Ok(None);
+        };
+        last.checked_add(1).map(Some).ok_or_else(|| {
+            PortError(format!(
+                "lane {}'s `slots` port names slot {last}, past which no slot is counted \
+                 in a u32",
+                self.source
+            ))
+        })
     }
 
     pub fn mask(&self, rows: usize) -> Result<Option<(&[bool], usize)>> {
@@ -263,8 +286,17 @@ impl LanePorts<'_> {
                 "lane {source}'s `attn_mask` port states a zero-wide key axis"
             )));
         }
-        let (start, end) = (self.rows.start * stride, self.rows.end * stride);
-        if end > dense.len() || end - start != rows * stride {
+        let past = || {
+            PortError(format!(
+                "lane {source}'s `attn_mask` port rows {}..{} at a stride of {stride} \
+                 run past the address space",
+                self.rows.start, self.rows.end
+            ))
+        };
+        let start = self.rows.start.checked_mul(stride).ok_or_else(past)?;
+        let end = self.rows.end.checked_mul(stride).ok_or_else(past)?;
+        let want = rows.checked_mul(stride).ok_or_else(past)?;
+        if end > dense.len() || end.checked_sub(start) != Some(want) {
             return Err(PortError(format!(
                 "lane {source}'s `attn_mask` port holds rows {}..{} of a {}-cell \
                  rectangle {stride} wide, and this fire placed {rows} row(s) for it",
@@ -288,6 +320,11 @@ impl LanePorts<'_> {
             ))
         })
     }
+}
+
+/// The rows `lanes` were placed, or `None` past a u32.
+fn rows_sum(lanes: &[u32]) -> Option<u32> {
+    lanes.iter().try_fold(0u32, |sum, &rows| sum.checked_add(rows))
 }
 
 #[must_use]
@@ -362,6 +399,27 @@ mod tests {
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
         an_engine_resolves_only_what_the_program_computes_on_the_device();
         a_one_entry_fold_states_every_lane_and_a_longer_one_its_own();
+        sizes_past_their_arithmetic_are_refused_by_name();
+    }
+
+    /// A guest's slot `u32::MAX` and host rows that sum past a u32 are each
+    /// refused by name, never wrapped into a small number.
+    fn sizes_past_their_arithmetic_are_refused_by_name() {
+        let last = Envelope {
+            qo_indptr: Some(vec![0, 1]),
+            tokens: Some(vec![7]),
+            slots: Some(vec![u32::MAX]),
+            ..Envelope::default()
+        };
+        let refused = last.lane(0, 0).unwrap().reach(1).unwrap_err().to_string();
+        assert!(refused.contains("past which no slot"), "{refused}");
+
+        let rows = Envelope {
+            host_rows: vec![u32::MAX, 2],
+            ..Envelope::default()
+        };
+        let refused = rows.lane(1, 1).unwrap_err().to_string();
+        assert!(refused.contains("past a u32"), "{refused}");
     }
 
     /// A one-entry `fold` port states the fold for every lane; a longer one

@@ -11,6 +11,7 @@ use super::{ProcessId, ResidencyPlanner};
 
 impl ResidencyPlanner {
     pub(super) fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32, rs_freed: RsUnits) {
+        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             // One that left meanwhile is settled by its departure.
             let Some(proc) = inner.procs.get_mut(&pid) else {
@@ -19,6 +20,15 @@ impl ResidencyPlanner {
             inner.evicting.remove(&pid);
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            // Parked again: the next suspended bind may come back.
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
+            // Parked for a bind short of room: its restore waits for room
+            // given back past what its own park gave.
+            if proc.bind_room.is_some() {
+                proc.bind_room_after = Some(gives);
+            }
             // What waits for its move to end ([`ResidencyPlanner::wait_not_moving`]).
             proc.signal.notify_waiters();
             let demand = Demand {
@@ -141,20 +151,27 @@ impl ResidencyPlanner {
 
     pub(super) fn report_restored(self: &Arc<Self>, pid: ProcessId) {
         self.clear_host_swap_blocks();
-        let (model, engine) = self.port.locus();
-        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine) {
-            handle.unfence();
-        }
         let signal = self.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
-            proc.roles_short = false;
+            proc.roles_short = None;
+            proc.roles_free_retry = None;
+            proc.roles_free_short = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
+            proc.bind_room_after = None;
             Some(proc.signal.clone())
         });
+        // Resident first, then every set it holds now unfenced: one
+        // registered while it was away was born fenced
+        // ([`Self::register_kv_working_set`]) and is read here, and one
+        // registered from now on is born unfenced.
+        let (model, engine) = self.port.locus();
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine) {
+            handle.unfence();
+        }
         crate::scheduler::worker::notify_process_resume(pid);
         crate::policy::report(crate::policy::Event::Resumed(pid));
         self.stats.restores.fetch_add(1, Ordering::Relaxed);
@@ -202,13 +219,24 @@ impl ResidencyPlanner {
     /// a budget holds: it is queued again, a waiter like any admission, and
     /// served once a completion frees room or an eviction makes it
     /// ([`super::proc::Proc::roles_short`]). No failure.
-    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId) {
+    /// `need` is the runs of whole chunks its unpark is short.
+    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId, need: (u32, u32)) {
+        let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
         self.with_inner(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.roles_short = true;
+                proc.roles_short = Some(super::proc::PendingBind {
+                    run: need.0,
+                    pieces: need.1,
+                    pages,
+                });
+                // It went again on free runs of this need and was short all
+                // the same: the need understates its unpark.
+                if proc.roles_free_retry.take() == Some(need) {
+                    proc.roles_free_short = Some(need);
+                }
             }
         });
         self.requeue_restore(pid);
@@ -225,6 +253,9 @@ impl ResidencyPlanner {
                 return;
             }
             proc.state = Residency::Evicted;
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             inner.enqueue(
                 pid,
                 WaitKind::Restore {

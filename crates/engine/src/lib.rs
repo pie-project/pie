@@ -5,7 +5,9 @@
     clippy::mem_forget
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
-#![forbid(unsafe_code)]
+// Unsafe only where an OS reading has no safe call: `pressure`'s macOS
+// sysctl, allowed there by name.
+#![deny(unsafe_code)]
 
 pub mod adapter;
 pub mod caps;
@@ -23,6 +25,7 @@ pub mod load;
 pub mod memory;
 pub mod placement;
 pub mod ports;
+pub mod pressure;
 pub mod program;
 pub mod rates;
 pub mod roofline;
@@ -31,7 +34,7 @@ pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
-pub use caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
+pub use caps::{Capabilities, DeviceFacts, FireLimits, GuestCost, PoolFacts};
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
@@ -39,7 +42,8 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, HostRoom, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone,
+    CompletionSink, Engine, HostRoom, KvWrites, LandingSink, LaneFault, Prepared, ProgramCompile,
+    StepDone,
     StepOutcome, TapGroups, TapSink, Tapped,
 };
 pub use error::{Error, Result};

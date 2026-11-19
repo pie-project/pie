@@ -94,12 +94,45 @@ __device__ __forceinline__ long long kv_token(const Paged& p, int req, int t, in
 
 // ---------------------------------------------------------------- decode --
 
+// A fire's per-lane masks as a decode reads them (`engine-cuda`'s
+// `mask::stage`): request r's word origin[r] (its boundary; bit 31, the wide
+// bit, says nothing to a decode row, its lane's last) and its plane of bits
+// from byte indptr[r]. Its single row reads key t where t < boundary, else
+// bit t - boundary of its plane; a boundary at or past its keys (the word
+// stating none, u32::MAX >> 1) reads no bit.
+struct DecodeMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+// One lane's mask, read once a block: its boundary, and its plane only when
+// some key lies past it.
+struct LaneMask {
+    int boundary;
+    const u8* plane;
+
+    __device__ __forceinline__ bool reads(int t) const {
+        return t < boundary || ((plane[(t - boundary) >> 3] >> ((t - boundary) & 7)) & 1u);
+    }
+};
+
+template <bool MASK>
+__device__ __forceinline__ LaneMask lane_mask(const DecodeMask& m, int req, int kv_len) {
+    if constexpr (!MASK) {
+        return LaneMask{0x7fffffff, nullptr};
+    } else {
+        const int boundary = static_cast<int>(m.origin[req] & 0x7fffffffu);
+        return LaneMask{boundary, boundary < kv_len ? m.bits + m.indptr[req] : nullptr};
+    }
+}
+
 // One block per (work item, kv head), WAVES wavefronts splitting the chunk's
 // tokens. Lane i of a wavefront scores token t0 + i for every query head of
 // the GQA group, the wavefront keeps an online softmax per head, and each
 // lane accumulates its D/kWave columns of the output.
-template <int D, int G, int WAVES, bool HND, bool FP8>
-__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
+template <int D, int G, int WAVES, bool HND, bool FP8, bool MASK>
+__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int kCols = D / kWave;
     static_assert(D % kWave == 0, "a decode head is a whole number of lanes wide");
@@ -120,6 +153,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     // The window keeps keys at or after kv_len - 1 - window_left.
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n;
     for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
@@ -139,7 +173,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     for (int t0 = lo + wave * kWave; t0 < end; t0 += WAVES * kWave) {
         const int t = t0 + ln;
-        const bool live = t < end;
+        const bool live = t < end && (!MASK || mask.reads(t));
         float s[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) s[g] = 0.f;
@@ -159,7 +193,8 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             const float m_new = fmaxf(m[g], wave_max(live ? s[g] : neg_inf()));
-            const float alpha = exp2f(m[g] - m_new);
+            // (a wavefront whose keys a lane's mask hides all of keeps none)
+            const float alpha = m_new == neg_inf() ? 1.f : exp2f(m[g] - m_new);
             pr[g] = live ? exp2f(s[g] - m_new) : 0.f;
             l[g] = l[g] * alpha + wave_sum(pr[g]);
             m[g] = m_new;
@@ -244,8 +279,8 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // accumulator quads for its head instead of G × 8 floats, and a round costs
 // D/16 MFMAs instead of G·D/8 FMAs a lane. The weights round to bf16 for the
 // product, as a prefill's do.
-template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8>
-__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
+template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8, bool MASK>
+__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int SUB = 16, KT = SUB / 16, KP = D / 32;
     // Elements a value read takes: sixteen e4m3 codes (16 bytes) where the
@@ -294,6 +329,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     const int wave = threadIdx.x / kWave, l = lane();
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
     const int g = l % 16, quad = l / 16;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad. Held in
     // registers, except under QL: there every wavefront rereads them from
@@ -382,7 +418,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 const int key = t0 + kt * 16 + 4 * quad + t;
-                s[kt][t] = key < wend ? rel.score(s[kt][t], key) : neg_inf();
+                s[kt][t] = key < wend && (!MASK || mask.reads(key)) ? rel.score(s[kt][t], key) : neg_inf();
                 tmax = fmaxf(tmax, s[kt][t]);
             }
         tmax = fmaxf(tmax, __shfl_xor(tmax, 16, kWave));

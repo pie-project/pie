@@ -142,6 +142,7 @@ pub(super) fn bind_reader(
             &rings,
             &scratch,
             &pair,
+            0,
         )
         .expect("the reader binds");
     (id, slots, rings)
@@ -239,6 +240,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
                     adapter: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 })
                 .expect("the reader rebinds");
         }

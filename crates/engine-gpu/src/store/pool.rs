@@ -140,6 +140,65 @@ pub fn sized(
     })
 }
 
+/// Why a rung is no rung of this device: one of its reservations (the span,
+/// an arm's readout seat, pixel plane or inputs store) passes one binding.
+pub const PAST_ONE_BINDING: &str = "past one binding";
+
+/// Why a rung is no rung of this device: its span and one working set at
+/// the context lie in no pool the device's room leaves, cut into segments
+/// with the span whole in the last.
+pub const PAST_THE_POOL: &str = "its span and one working set past the pool the room leaves";
+
+/// A top rung as the pool weighs it: its fires' `tokens`, its span's `act`
+/// chunks, the bytes the device leaves a pool of a load cut to it, and the
+/// widest reservation one of its fires binds whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    pub tokens: u32,
+    pub act: u32,
+    pub left: u64,
+    pub widest: u64,
+}
+
+/// Why `rung` cannot be a load's top: a reservation past one `binding`
+/// ([`PAST_ONE_BINDING`]), or its span and one working set of
+/// `least_chunks` past the pool its room gives (or `kv_budget` of state
+/// beside the span), cut into segments of at most `binding` bytes with the
+/// span whole in the last ([`sized`], [`PAST_THE_POOL`]). `None`: it can.
+#[must_use]
+pub fn infeasible(
+    rung: &Rung,
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    least_chunks: u32,
+    binding: u64,
+) -> Option<&'static str> {
+    if rung.widest > binding {
+        Some(PAST_ONE_BINDING)
+    } else if sized(rung.left, kv_budget, chunk_bytes, rung.act, least_chunks, binding).is_err() {
+        Some(PAST_THE_POOL)
+    } else {
+        None
+    }
+}
+
+/// The widest of `rungs` that can be a load's top ([`infeasible`]).
+/// `None`: none can.
+#[must_use]
+pub fn widest_rung(
+    rungs: &[Rung],
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    least_chunks: u32,
+    binding: u64,
+) -> Option<u32> {
+    rungs
+        .iter()
+        .filter(|rung| infeasible(rung, kv_budget, chunk_bytes, least_chunks, binding).is_none())
+        .map(|rung| rung.tokens)
+        .max()
+}
+
 /// The u32 words of a segment of `segment_chunks` chunks of `chunk_bytes`,
 /// which every kernel reading the pool is told: a segment too long for the
 /// count is refused at the load, never stated short.
@@ -233,6 +292,12 @@ impl<B: Backend> Pool<B> {
         self.segments.len() as u32
     }
 
+    /// The buffers of the segments backed, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.segments.iter().flatten().collect()
+    }
+
     /// The segments backed from the first on, without a gap.
     #[must_use]
     pub fn committed_segments(&self) -> u32 {
@@ -250,7 +315,9 @@ impl<B: Backend> Pool<B> {
 
     #[must_use]
     pub fn growth(&self) -> Growth {
-        if self.span > 0 {
+        if !B::RESIZES_POOL {
+            Growth::Fixed
+        } else if self.span > 0 {
             Growth::TwoEnded
         } else {
             Growth::Bottom
@@ -477,7 +544,7 @@ impl<B: Backend> Pool<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{segment_chunks, segment_words};
+    use super::{PAST_ONE_BINDING, PAST_THE_POOL, Rung, segment_chunks, segment_words};
     use crate::error::Fault;
 
     /// A segment's length in words is stated whole or the load is refused:
@@ -523,6 +590,48 @@ mod tests {
         // the widest last segment.
         assert_eq!(segment_chunks(chunk, 64, 64 << 20, 16), None);
         assert_eq!(segment_chunks(chunk, 64, 1 << 30, 63), None);
+    }
+
+    /// Qwen3-0.6B on an Adreno phone: 3803136-byte chunks, a 1 GiB largest
+    /// buffer (282 chunks), one working set of 129, and the room its
+    /// capacity leaves past the weights about 400 chunks. A pool of one
+    /// binding holds no top over 153 chunks beside the working set, and two
+    /// segments each holding the span need it at most 197 (400 / 2 - 3): the
+    /// 10240 and 4096 rungs (266, 230) fit neither, and the top is the widest
+    /// below them. With the room of a desktop card every rung fits.
+    #[test]
+    fn the_top_rung_is_the_widest_whose_span_and_working_set_fit_the_pool() {
+        const GIB: u64 = 1 << 30;
+        let (chunk, binding, least) = (3_803_136u64, GIB, 129u32);
+        let left = 400 * chunk;
+        let at = |left: u64| {
+            [(1024, 120), (2048, 180), (4096, 230), (10240, 266)].map(|(tokens, act)| Rung {
+                tokens,
+                act,
+                left,
+                widest: u64::from(act) * chunk,
+            })
+        };
+        let rungs = at(left);
+        assert_eq!(super::widest_rung(&rungs, None, chunk, least, binding), Some(2048));
+        for rung in &rungs[2..] {
+            assert_eq!(
+                super::infeasible(rung, None, chunk, least, binding),
+                Some(PAST_THE_POOL),
+                "the {} rung's span of {} chunks fits no pool of this room",
+                rung.tokens,
+                rung.act
+            );
+        }
+        // Short of even the least rung's: no top.
+        assert_eq!(super::widest_rung(&at(200 * chunk), None, chunk, least, binding), None);
+        // A desktop card's room holds the widest.
+        assert_eq!(super::widest_rung(&at(8000 * chunk), None, chunk, least, binding), Some(10240));
+        // A reservation past one binding is no rung, whatever the room.
+        let mut seat = at(8000 * chunk);
+        seat[3].widest = binding + 1;
+        assert_eq!(super::infeasible(&seat[3], None, chunk, least, binding), Some(PAST_ONE_BINDING));
+        assert_eq!(super::widest_rung(&seat, None, chunk, least, binding), Some(4096));
     }
 
     /// Qwen3.5-0.8B on wgpu at a 12 GiB budget: 2304000-byte chunks, a

@@ -169,8 +169,9 @@ __global__ __launch_bounds__(256) void rmsnorm_lanes(const T* __restrict__ x,
 
 // y += x (the residual stream, rounded once), then out = rmsnorm(y) · (w [+ 1]).
 template <class T, int BLOCK, bool PLUS_ONE>
+// `y_out` may be `y` (the stream added in place) or a plane of its own.
 __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restrict__ x,
-                                                              T* __restrict__ y,
+                                                              const T* y, T* y_out,
                                                               const T* __restrict__ w,
                                                               T* __restrict__ out, int hidden,
                                                               float eps,
@@ -179,8 +180,9 @@ __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restric
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x) * hidden;
     const T* xr = x + row;
-    T* yr = y + row;
-    const bool packed = hidden % 8 == 0 && aligned16(xr) && aligned16(yr);
+    const T* yr = y + row;
+    T* yo = y_out + row;
+    const bool packed = hidden % 8 == 0 && aligned16(xr) && aligned16(yr) && aligned16(yo);
     // A row of at most PPT packs a thread stays in registers from the add to
     // the scale: no store and reload of the stream between them. The sums
     // walk the same packs in the same order as `norm_row`'s.
@@ -205,7 +207,7 @@ __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restric
         for (int p = 0; p < PPT; ++p) {
             const int i = threadIdx.x + p * BLOCK;
             if (i < packs) {
-                reinterpret_cast<Pack8<T>*>(yr)[i] = b[p];
+                reinterpret_cast<Pack8<T>*>(yo)[i] = b[p];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const float v = to_f32(b[p].v[j]);
@@ -233,17 +235,17 @@ __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restric
     if (packed) {
         for (int i = threadIdx.x; i < hidden / 8; i += BLOCK) {
             const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xr)[i];
-            Pack8<T> b = reinterpret_cast<Pack8<T>*>(yr)[i];
+            Pack8<T> b = reinterpret_cast<const Pack8<T>*>(yr)[i];
 #pragma unroll
             for (int j = 0; j < 8; ++j) b.v[j] = from_f32<T>(to_f32(b.v[j]) + to_f32(a.v[j]));
-            reinterpret_cast<Pack8<T>*>(yr)[i] = b;
+            reinterpret_cast<Pack8<T>*>(yo)[i] = b;
         }
     } else {
-        for (int i = threadIdx.x; i < hidden; i += BLOCK) yr[i] = from_f32<T>(to_f32(yr[i]) + to_f32(xr[i]));
+        for (int i = threadIdx.x; i < hidden; i += BLOCK) yo[i] = from_f32<T>(to_f32(yr[i]) + to_f32(xr[i]));
     }
     // The norm may walk the row in a different order than the add did.
     __syncthreads();
-    norm_row<T, BLOCK, PLUS_ONE>(yr, w, out + row, hidden, eps);
+    norm_row<T, BLOCK, PLUS_ONE>(yo, w, out + row, hidden, eps);
 }
 
 // y = rmsnorm(x) · w · gate(g), x and w in f32 (w absent: scaleless): the

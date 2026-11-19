@@ -130,6 +130,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
                 query_len: ROWS,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("the fold program binds an instance")
         .id
@@ -260,6 +261,7 @@ fn submit(model: &mut Model, lane: Lane, attach: Option<InstanceId>) -> engine::
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 })
                 .into_iter()
                 .collect(),
@@ -384,6 +386,7 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),

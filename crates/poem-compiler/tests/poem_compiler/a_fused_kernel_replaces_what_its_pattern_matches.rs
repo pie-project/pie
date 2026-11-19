@@ -194,6 +194,65 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
     assert!(ops(&fused).contains(&"elemwise.rope"), "{:?}", ops(&fused));
 }
 
+/// Qwen 3's attention prologue: q and k normed by their weights per head,
+/// v as it is, rotated whole.
+fn qwen_qkv_write(p: &Pattern) {
+    let positions = p.indices("positions");
+    let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
+    let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, 1e-6);
+    let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, 1e-6);
+    let (q, k) = both(elemwise::rope(
+        &q,
+        &positions,
+        64,
+        1_000_000.0,
+        Turn::Full { interleaved: false },
+        Some(&k),
+        None,
+    ));
+    let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+    attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
+    elemwise::silu(&q);
+}
+
+/// Qwen 3's form folds too: the fused write norms no v.
+#[test]
+fn the_weighted_qkv_write_with_v_as_it_is_folds() {
+    let fused = fuse(
+        trace(qwen_qkv_write),
+        &["fused.qkv_fused_qknorm_rope_vnorm_write"],
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.qkv_fused_qknorm_rope_vnorm_write", "elemwise.act"]
+    );
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
+        q_norm_weight: Some(_),
+        k_norm_weight: Some(_),
+        v_norm: false,
+        qk_norm: true,
+        rotary_dim: 64,
+        ..
+    })) = fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the first op is the fused write, weighted, v unnormed");
+    };
+}
+
+/// The padded rule (CUDA's) holds MiMo's forms alone: Qwen's and Gemma's
+/// prologues stay apart under it.
+#[test]
+fn the_padded_qkv_rule_folds_neither_qwens_nor_gemmas_prologue() {
+    let rule = poem_compiler::fuse::rules::qkv_fused_padded();
+    for (what, apart) in [
+        ("qwen", trace(qwen_qkv_write)),
+        ("gemma", trace(|p| qkv_write(p, 1e-6, 1e-6))),
+    ] {
+        let fused = poem_compiler::fuse::fuse(apart.clone(), [&rule]);
+        assert_eq!(ops(&fused), ops(&apart), "{what}: no op folds");
+    }
+}
+
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
 /// global layer's rows unturned.
 #[test]
@@ -541,6 +600,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     None,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     None,
@@ -1248,4 +1308,97 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
 /// keys it was given, an attention's output and log-sum-exp.
 fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
     (q, k.expect("an output asked for lands"))
+}
+
+const NORM_PRODUCT: &[&str] = &[
+    "fused.residual_add_rmsnorm_matmul",
+    "fused.residual_add_rmsnorm",
+    "fused.matmul_swiglu_matmul",
+];
+
+/// A residual norm whose normed rows only a product reads folds with the
+/// product; the sum stays a value of its own.
+#[test]
+fn a_residual_norm_read_only_by_its_product_folds_into_it() {
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            let z = linear::matmul(&normed, &p.weight("w", [256, 64]));
+            elemwise::silu(&z);
+            elemwise::silu(&y_out);
+        }),
+        NORM_PRODUCT,
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.residual_add_rmsnorm_matmul", "elemwise.act", "elemwise.act"]
+    );
+}
+
+/// Normed rows another op reads too (an adapter's correction beside the
+/// projection, a second product) fold with one product and land for the
+/// rest.
+#[test]
+fn a_residual_norm_read_elsewhere_too_folds_into_its_first_product() {
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            elemwise::silu(&linear::matmul(&normed, &p.weight("a", [256, 64])));
+            elemwise::silu(&linear::matmul(&normed, &p.weight("b", [256, 64])));
+        }),
+        NORM_PRODUCT,
+    );
+    let ops = ops(&fused);
+    assert_eq!(ops.iter().filter(|op| **op == "fused.residual_add_rmsnorm_matmul").count(), 1, "{ops:?}");
+    assert_eq!(ops.iter().filter(|op| **op == "linear.matmul").count(), 1, "{ops:?}");
+    assert!(!ops.contains(&"fused.residual_add_rmsnorm"), "{ops:?}");
+}
+
+/// A norm feeding a dense MLP leaves the MLP whole: its gate-up product is
+/// the MLP's, and the norm folds alone.
+#[test]
+fn a_residual_norm_before_a_dense_mlp_leaves_the_mlp_whole() {
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            let packed = linear::matmul(&normed, &p.weight("gate_up", [128, 64]));
+            let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
+            elemwise::silu(&linear::matmul(&h, &p.weight("down", [64, 64])));
+        }),
+        NORM_PRODUCT,
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul", "elemwise.act"]
+    );
+}
+
+/// A residual norm feeding a dense MLP folds with the whole MLP where the
+/// norm-and-MLP rule runs.
+#[test]
+fn a_residual_norm_before_a_dense_mlp_folds_with_it() {
+    let rules = [
+        "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+        "fused.residual_add_rmsnorm_matmul",
+        "fused.residual_add_rmsnorm",
+        "fused.matmul_swiglu_matmul",
+    ];
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            let packed = linear::matmul(&normed, &p.weight("gate_up", [128, 64]));
+            let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
+            elemwise::silu(&linear::matmul(&h, &p.weight("down", [64, 64])));
+            elemwise::silu(&y_out);
+        }),
+        &rules,
+    );
+    assert_eq!(
+        ops(&fused),
+        ["fused.residual_add_rmsnorm_matmul_swiglu_matmul", "elemwise.act", "elemwise.act"]
+    );
 }

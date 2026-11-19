@@ -73,6 +73,12 @@ pub struct DecodeParams {
     pub block_valid_mask: DevicePtr,
     pub partition_kv: bool,
     pub q_indptr: DevicePtr,
+    /// The fire's masks a custom-mask arm reads, as
+    /// [`PrefillPagedParams`]'s: bits, each request's byte offset, and
+    /// its word (`variants.cuh`); null for every other arm.
+    pub maybe_custom_mask: DevicePtr,
+    pub maybe_mask_indptr: DevicePtr,
+    pub maybe_mask_origin: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

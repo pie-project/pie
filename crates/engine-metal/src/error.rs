@@ -82,10 +82,27 @@ pub enum Fault {
         rows: u64,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
         word: u64,
-        runs_masked_arm: bool,
+    },
+
+    /// The instance attached at `lane` describes, through its geometry
+    /// ports, more lanes than its attachment owns: refused, never setting
+    /// another request's positions or kv slots.
+    GeometryLanes {
+        lane: u32,
+        instance: u64,
+        carried: u32,
+        owned: u32,
+    },
+
+    /// The instance attached at `lane` reads an output's rows past what its
+    /// lanes hold: refused, never launched into another request's rows.
+    OutputRows {
+        lane: u32,
+        instance: u64,
+        why: String,
     },
 
     Adapterless {
@@ -185,6 +202,43 @@ impl Fault {
     }
 }
 
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Positions { lane, .. }
+            | Self::MaskUnread { lane, .. }
+            | Self::GeometryLanes { lane, .. }
+            | Self::OutputRows { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. }
+            | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
+    }
+}
+
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -275,15 +329,32 @@ impl fmt::Display for Fault {
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
             ),
-            Self::MaskWord {
+            Self::GeometryLanes {
                 lane,
-                word,
-                runs_masked_arm,
+                instance,
+                carried,
+                owned,
             } => write!(
                 f,
-                "lane {lane}'s word {word:#x} {} the masked arm and its mask says the \
-                 other thing",
-                if *runs_masked_arm { "runs" } else { "skips" }
+                "the instance {instance} attached at lane {lane} is refused: its \
+                 `embed_indptr` port describes {carried} lane(s) and its attachment owns \
+                 {owned}; past them its ports would set another request's positions and kv \
+                 slots"
+            ),
+            Self::OutputRows {
+                lane,
+                instance,
+                why,
+            } => write!(
+                f,
+                "the instance {instance} attached at lane {lane} is refused: {why}; it reads \
+                 only the rows its own lanes hold"
+            ),
+            Self::MaskUnread { lane, word } => write!(
+                f,
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in: here a selection's and a bias's arms \
+                 read no per-lane mask"
             ),
             Self::Adapterless { lane } => write!(
                 f,

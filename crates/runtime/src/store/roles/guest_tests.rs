@@ -181,7 +181,9 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                per_instance,
+                resident: per_instance,
+                scratch: 0,
+                scratch_arms: 1,
                 per_pair,
                 run: 1,
             },
@@ -193,6 +195,22 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-guests"
     }
@@ -231,6 +249,7 @@ impl Engine for GuestEngine {
         &self,
         _program: ProgramId,
         _extents: &BindExtents,
+        _class: eta_ir::registry::GeometryClass,
     ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }
@@ -1816,4 +1835,93 @@ fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
     assert_eq!(slots.len(), 2, "two chunks");
     park(&roles, 1);
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
+}
+
+/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// parked guest's freed run filled by another bind, then its restore. The
+/// unpark is short and waits, naming the runs of chunks it needs (what the
+/// planner funds, `RolesError::unpark_runs`), never refused; once room
+/// comes it lands.
+#[test]
+fn a_restore_short_of_its_run_waits_with_its_need_and_lands_once_room_comes() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    let (parked, _) = bound[0];
+    park(&roles, parked);
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the freed run is taken");
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+
+    let error = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect_err("short of its run");
+    assert!(matches!(error, RolesError::UnparkShort(_)), "it waits: {error}");
+    assert_eq!(error.unpark_runs(), Some((4, 1)), "its need, named: {error}");
+
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room came")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// A Channel item that must lie in one run, short of it at a restore,
+/// waits too, its need one whole chunk (any free chunk holds the run).
+#[test]
+fn a_restore_short_of_a_channel_run_waits_for_one_chunk() {
+    let short = RolesError::UnparkShort(Box::new(RolesError::NoRun {
+        role: SlotRole::Channel,
+        slots: 2,
+    }));
+    assert_eq!(short.unpark_runs(), Some((1, 1)));
+    assert!(RolesError::NoRun { role: SlotRole::Channel, slots: 2 }.unpark_runs().is_none(), "only a waiting unpark names one");
+}
+
+/// A frame naming the last instance of a pair is on its way through the
+/// engine when that instance closes: the pair's state (its batch tables,
+/// which every grouped fire of its instances reads) and the instance's own
+/// slots stay out of the free count until the frame lands, then come free.
+/// Given back at the close, the pair's chunks went to another owner under
+/// the fire (Metal's 0xa0, FUSED_GEOMETRY_MISMATCH).
+#[test]
+fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let pair = super::FireKey {
+        program: PROGRAM,
+        extents: BindExtents::default(),
+    };
+    assert!(!roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+    let free = || device.lock().unwrap().pool().free_chunks();
+    let before = free();
+    let named = roles.lock().unwrap().reading([id]);
+    assert!(named.contains(&Owner::Pair(pair)), "the frame names the pair");
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(
+        free(),
+        before,
+        "the pair's chunks, and its instance's, wait on the frame naming them"
+    );
+    roles.lock().unwrap().landed(&named);
+    assert_eq!(
+        free(),
+        before + 3,
+        "as the frame lands: the pair's two chunks, and the one its instance's scratch run lay in"
+    );
+    assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
 }

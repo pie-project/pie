@@ -211,6 +211,21 @@ impl RolesError {
         }
     }
 
+    /// What an unpark short of room ([`Self::UnparkShort`]) needs, as runs
+    /// of whole chunks `(run, pieces)`: a guest state's runs, or one chunk
+    /// for slots in a chunk (a run of Channel slots too).
+    #[must_use]
+    pub fn unpark_runs(&self) -> Option<(u32, u32)> {
+        let Self::UnparkShort(short) = self else {
+            return None;
+        };
+        match short.as_ref() {
+            Self::GuestShort { room, .. } | Self::GuestGrow { room, .. } => Some(room.chunk_runs()),
+            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1)),
+            _ => None,
+        }
+    }
+
     /// The device pool lacks room for it now: what a park, a completion or
     /// a commit may make, not a wrong ask.
     #[must_use]
@@ -405,6 +420,17 @@ struct Item {
     /// given back, and its restore takes fresh ones in their class
     /// ([`Roles::prepare_unpark`]).
     shed: bool,
+    /// Frames on their way through the engine that name it (an instance
+    /// they attach, or the pair, channels and adapter one of those shares):
+    /// let go meanwhile, it is given back only once the last of them has
+    /// landed ([`Roles::landed`]), never under a fire still reading it.
+    reads: u32,
+    /// Which taking of its slots it lies in: a new one each time it is
+    /// given fresh slots ([`Roles::next_generation`]). A pair's is the
+    /// engine's to compare ([`::engine::InstanceBinding::pair_generation`]):
+    /// slots freed, written by another owner and taken again at the same
+    /// refs are new.
+    generation: u64,
 }
 
 impl Item {
@@ -421,6 +447,8 @@ impl Item {
             open: true,
             stale: false,
             shed: false,
+            reads: 0,
+            generation: 0,
         }
     }
 
@@ -445,9 +473,10 @@ pub struct Taken {
     /// The adapter the binding lands: its key, its slots, and whether they
     /// were taken for it (the first holder) or are another's.
     adapter: Option<(u128, Part, bool)>,
-    /// The guest pair's state: its key, its chunks, and whether they were
-    /// taken for this bind (the pair's first) or are its instances'.
-    pair: Option<(FireKey, Part, bool)>,
+    /// The guest pair's state: its key, its chunks, whether they were
+    /// taken for this bind (the pair's first) or are its instances', and
+    /// the taking they are ([`Item::generation`]).
+    pair: Option<(FireKey, Part, bool, u64)>,
     /// The slots of an `Instance` chunk: a whole part's chunks are its
     /// refs over it.
     chunk_slots: u32,
@@ -460,7 +489,7 @@ pub struct Taken {
 #[derive(Debug, Default)]
 pub struct GuestTaken {
     scratch: Option<Part>,
-    pair: Option<(FireKey, Part, bool)>,
+    pair: Option<(FireKey, Part, bool, u64)>,
 }
 
 impl Taken {
@@ -497,9 +526,17 @@ impl Taken {
     pub fn pair(&self) -> ScratchPlace {
         self.pair
             .as_ref()
-            .map_or(ScratchPlace::None, |(_, part, _)| {
+            .map_or(ScratchPlace::None, |(_, part, _, _)| {
                 place(part, self.chunk_slots)
             })
+    }
+
+    /// [`::engine::InstanceBinding::pair_generation`].
+    #[must_use]
+    pub fn pair_generation(&self) -> u64 {
+        self.pair
+            .as_ref()
+            .map_or(0, |&(_, _, _, generation)| generation)
     }
 }
 
@@ -600,6 +637,8 @@ pub struct Roles {
     /// waits on a commit. Its need is no longer counted once it binds, is
     /// refused, or its process is gone ([`Self::leave_guest_wait`]).
     guest_waiter: Option<Holder>,
+    /// The last generation handed out ([`Self::next_generation`]).
+    generations: u64,
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -635,6 +674,12 @@ impl RoomWatch {
 }
 
 impl Roles {
+    /// A generation not handed out before ([`Item::generation`]).
+    fn next_generation(&mut self) -> u64 {
+        self.generations += 1;
+        self.generations
+    }
+
     /// The roles of `device`'s pool, parked on `host`; `None` where the pool
     /// states neither shape.
     #[must_use]
@@ -661,6 +706,7 @@ impl Roles {
             stated: std::collections::HashSet::new(),
             freed: Arc::default(),
             guest_waiter: None,
+            generations: 0,
         })
     }
 
@@ -949,6 +995,44 @@ impl Roles {
         self.freed.notify.notify_waiters();
     }
 
+    /// A frame naming `instances` (its attachments) was handed to the
+    /// engine: each instance's item, and the pair, channels and adapter it
+    /// shares, are read until it lands. Answers what it named, for
+    /// [`Self::landed`]. A pair's batch tables are read by every grouped
+    /// fire of its instances: given back at the pair's last close while
+    /// one was in flight, their chunks went to another owner under the
+    /// fire (Metal's 0xa0, FUSED_GEOMETRY_MISMATCH).
+    pub fn reading(&mut self, instances: impl IntoIterator<Item = InstanceId>) -> Vec<Owner> {
+        let mut named: Vec<Owner> = Vec::new();
+        for id in instances {
+            let Some(item) = self.items.get(&Owner::Instance(id)) else {
+                continue;
+            };
+            named.push(Owner::Instance(id));
+            named.extend(item.channels.iter().map(|&channel| Owner::Channel(channel)));
+            named.extend(item.adapter.map(Owner::Adapter));
+            named.extend(item.pair.map(Owner::Pair));
+        }
+        named.retain(|owner| self.items.contains_key(owner));
+        for owner in &named {
+            if let Some(item) = self.items.get_mut(owner) {
+                item.reads += 1;
+            }
+        }
+        named
+    }
+
+    /// The frame that named `named` ([`Self::reading`]) landed: what was
+    /// let go under it goes back now.
+    pub fn landed(&mut self, named: &[Owner]) {
+        for &owner in named {
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.reads = item.reads.saturating_sub(1);
+            }
+            self.free_if_done(owner);
+        }
+    }
+
     /// `holder`'s guest bind no longer waits: it bound, was refused, or
     /// its process is gone. Where the pool counts its need, it counts it no
     /// more, so the walk commits for no one gone.
@@ -1204,12 +1288,15 @@ impl Roles {
         }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
-        if (state.per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
+        // The instance's own bytes: its resident part and every scratch arm
+        // (none taken per fire yet), placed at the bind.
+        let per_instance = state.instance_bytes();
+        if (per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
-        if state.per_instance > 0 {
+        if per_instance > 0 {
             match self.take_scratch(
-                state.per_instance,
+                per_instance,
                 run,
                 || format!("an instance of {pair}'s scratch"),
                 heads,
@@ -1224,7 +1311,7 @@ impl Roles {
         if state.per_pair > 0 {
             taken.pair = match self.items.get(&Owner::Pair(pair)) {
                 Some(item) if item.tier == Tier::Device => {
-                    Some((pair, item.parts[0].clone(), false))
+                    Some((pair, item.parts[0].clone(), false, item.generation))
                 }
                 // Parked with its instances: its contents are dead between
                 // fires, so it comes back on its own, fresh room on the
@@ -1234,10 +1321,12 @@ impl Roles {
                     let like = item.parts[0].clone();
                     match self.retake(&like) {
                         Ok(part) => {
+                            let generation = self.next_generation();
                             let item = self.items.get_mut(&Owner::Pair(pair)).expect("present");
                             item.parts = vec![part.clone()];
                             item.tier = Tier::Device;
-                            Some((pair, part, false))
+                            item.generation = generation;
+                            Some((pair, part, false, generation))
                         }
                         Err(room) => {
                             let short = RolesError::GuestShort {
@@ -1266,7 +1355,7 @@ impl Roles {
                         || format!("{pair}'s state"),
                         heads,
                     ) {
-                        Ok(part) => Some((pair, part, true)),
+                        Ok(part) => Some((pair, part, true, self.next_generation())),
                         Err(error) => {
                             self.untake_guest(taken);
                             return Err(error);
@@ -1288,10 +1377,12 @@ impl Roles {
         let pieces = |bytes: u64| self.scratch_part(bytes, run).map_or(0, |part| part.pieces);
         tracing::info!(
             %pair,
-            per_instance = state.per_instance,
+            resident = state.resident,
+            scratch = state.scratch,
+            scratch_arms = state.scratch_arms,
             per_pair = state.per_pair,
             run,
-            instance_pieces = pieces(state.per_instance),
+            instance_pieces = pieces(state.instance_bytes()),
             pair_pieces = pieces(state.per_pair),
             free_runs = self.free_runs(run),
             "a guest program's room: pieces of `run` adjacent chunks, and the free runs of that length"
@@ -1304,7 +1395,7 @@ impl Roles {
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
         }
-        if let Some((_, part, true)) = taken.pair {
+        if let Some((_, part, true, _)) = taken.pair {
             self.give(&self.device, &[part]);
         }
     }
@@ -1330,7 +1421,7 @@ impl Roles {
         if let Some(part) = &guest.scratch {
             self.give(&self.device, std::slice::from_ref(part));
         }
-        if let Some((_, part, true)) = guest.pair {
+        if let Some((_, part, true, _)) = guest.pair {
             self.give(&self.device, &[part]);
         }
     }
@@ -1355,11 +1446,12 @@ impl Roles {
             shared.attached.insert(id);
             item.adapter = Some(key);
         }
-        if let Some((key, part, _)) = taken.pair {
+        if let Some((key, part, _, generation)) = taken.pair {
             let shared = self.items.entry(Owner::Pair(key)).or_insert_with(|| {
                 let mut pair = Item::new(holder, vec![part]);
                 // Held by its instances alone: freed at the last close.
                 pair.open = false;
+                pair.generation = generation;
                 pair
             });
             shared.attached.insert(id);
@@ -1449,7 +1541,7 @@ impl Roles {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
-        if item.open || !item.attached.is_empty() || item.tier == Tier::Moving {
+        if item.open || !item.attached.is_empty() || item.tier == Tier::Moving || item.reads > 0 {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
@@ -1633,7 +1725,9 @@ impl Roles {
                 for (_, parts) in &shed {
                     self.give(&device, &taken_dead(parts));
                 }
-                if error.is_short() && self.fits_budget(&shed_owners) {
+                // It held these parts on the device before its park: the
+                // budget holds them, and the restore waits for room.
+                if error.is_short() {
                     return Err(RolesError::UnparkShort(Box::new(error)));
                 }
                 return Err(error);
@@ -1650,8 +1744,10 @@ impl Roles {
                     for (_, parts) in &shed {
                         self.give(&device, &taken_dead(parts));
                     }
-                    // Short of room the budget holds: the restore waits.
-                    if error.is_short() && self.fits_budget(&owners) {
+                    // It held these items on the device before its park: the
+                    // budget holds them, and the restore waits for room,
+                    // never failed for it.
+                    if error.is_short() {
                         return Err(RolesError::UnparkShort(Box::new(error)));
                     }
                     return Err(error);
@@ -1738,6 +1834,8 @@ impl Roles {
     /// The copies landed: each item lies at its new slots, and its old ones
     /// go back. An unparked item is stale until [`Self::rebound`].
     pub fn commit(&mut self, txn: RoleMove) {
+        // Back on the device in fresh slots: a taking of their own.
+        let generation = self.next_generation();
         for (owner, parts) in txn.shed {
             let Some(item) = self.items.get_mut(&owner) else {
                 continue;
@@ -1745,6 +1843,9 @@ impl Roles {
             let old = std::mem::replace(&mut item.parts, parts);
             item.tier = Tier::Device;
             item.shed = txn.out;
+            if !txn.out {
+                item.generation = generation;
+            }
             // Back in place: the engine is told its fresh dead parts.
             item.stale = !txn.out;
             if txn.out {
@@ -1761,6 +1862,9 @@ impl Roles {
             };
             let old = std::mem::replace(&mut item.parts, parts);
             item.tier = if txn.out { Tier::Host } else { Tier::Device };
+            if !txn.out {
+                item.generation = generation;
+            }
             item.stale = !txn.out;
             if let Some(left) = &left {
                 self.give_freeing(left, &old);
@@ -1873,6 +1977,10 @@ impl Roles {
                         .map_or(ScratchPlace::None, |pair| {
                             place(&pair.parts[0], self.chunk_slots)
                         }),
+                    pair_generation: item
+                        .pair
+                        .and_then(|key| self.items.get(&Owner::Pair(key)))
+                        .map_or(0, |pair| pair.generation),
                 })
             }))
             .collect()
@@ -2149,7 +2257,7 @@ pub fn take_bind(
         return Ok(None);
     };
     learn_program(roles, engine, binding.program)?;
-    let state = engine.guest_state(binding.program, &binding.extents)?;
+    let state = engine.guest_state(binding.program, &binding.extents, binding.geometry)?;
     let adapter = engine.adapter_key(binding)?;
     let pair = FireKey {
         program: binding.program,
@@ -2188,6 +2296,7 @@ pub fn bind_taken(
         adapter_slots: taken.adapter_slots(),
         scratch: taken.scratch(),
         pair: taken.pair(),
+        pair_generation: taken.pair_generation(),
         ..binding.clone()
     };
     match engine.bind_instance(&binding) {

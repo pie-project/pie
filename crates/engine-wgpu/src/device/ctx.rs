@@ -170,6 +170,14 @@ pub(crate) struct Core {
     /// load ([`super::memory::at_load`]), or `[engine.memory]
     /// budget_device` where stated.
     pub(crate) budget: u64,
+    /// Whether `budget` is the host's room ([`super::memory::Source::HostAvailable`]):
+    /// the device shares the host's memory, so what the host can still give
+    /// is read afresh while serving.
+    pub(crate) shares_host: bool,
+    /// The most bytes one reservation takes on this device
+    /// ([`super::memory::reservation_bound`]): every buffer made is no
+    /// larger, and one past it is refused by name, never made invalid.
+    pub(crate) bound: u64,
 }
 
 impl Core {
@@ -233,19 +241,48 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::UNIFORMS,
-        )
+    /// Stocks a uniform and a scratch chunk for each of `frames` frames in
+    /// flight, at load: a frame takes at most one of each, and gives it back
+    /// when it is dropped.
+    pub(crate) fn stock_rings(&self, frames: usize) {
+        let uniforms = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie uniforms"),
+                    size: UNIFORM_CHUNK,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::UNIFORMS,
+            )
+        });
+        self.return_uniforms(uniforms.collect());
+        let scratch = (0..frames).map(|_| {
+            self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie scratch"),
+                    size: self.pooled_scratch(),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::FRAME_SCRATCH,
+            )
+        });
+        self.return_scratch(scratch.collect());
+    }
+
+    pub(crate) fn uniform_chunk(&self) -> Result<Held> {
+        self.uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a uniform chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
@@ -255,30 +292,39 @@ impl Core {
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return chunk;
+    /// A scratch chunk for a frame, stocked at load: one holds at most
+    /// [`Core::pooled_scratch`] bytes, refused by name past it.
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
+        let pooled = self.pooled_scratch();
+        if bytes > pooled {
+            return Err(Fault::Ceiling {
+                what: "bytes of one scratch reservation",
+                need: bytes,
+                have: pooled,
+            });
         }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::FRAME_SCRATCH,
-        )
+        self.scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .pop()
+            .ok_or(Fault::Ceiling {
+                what: "frames in flight holding a scratch chunk (stocked at load)",
+                need: 1,
+                have: 0,
+            })
     }
 
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+            .extend(chunks);
+    }
+
+    /// The size of a scratch chunk the ring keeps between frames: no larger
+    /// than one reservation takes.
+    fn pooled_scratch(&self) -> u64 {
+        SCRATCH_CHUNK.min(self.bound)
     }
 }
 
@@ -308,6 +354,8 @@ impl Drop for Held {
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
+    /// The most bytes one reservation the load plans takes: the device's
+    /// bound, or a test's cap under it.
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
@@ -499,11 +547,17 @@ impl Context {
             f16: features.contains(wgpu::Features::SHADER_F16),
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
         };
-        // A slab is bound whole, so no larger than one storage binding takes:
-        // past it a fire refuses the view rather than reading a cut slab.
-        let max_buffer = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
+        // A slab is bound whole, so no larger than one storage binding takes
+        // (past it a fire refuses the view rather than reading a cut slab),
+        // nor than one allocation backs: past either, the buffer is made
+        // invalid, so every reservation is refused there by name instead.
+        let bound =
+            super::memory::reservation_bound(&limits, super::memory::allocation_limit(&adapter));
+        let max_buffer = bound;
+        // A test's cap narrows what the load plans by, never what the device
+        // can make.
+        #[cfg(feature = "test-limits")]
+        let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
@@ -521,6 +575,8 @@ impl Context {
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
+            shares_host: reading.source == super::memory::Source::HostAvailable,
+            bound,
         });
         let dummy = Raw::new(
             &core,
@@ -556,6 +612,15 @@ impl Context {
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.core.budget
+    }
+
+    /// Where the load's memory was read from the host's room, the reader of
+    /// what the host can still give the process.
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core
+            .shares_host
+            .then(engine_gpu::host_memory::room_reader)
     }
 
     /// What the driver holds for this process beside every reservation:
@@ -776,18 +841,25 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.uniform_chunk()?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        if at + bytes > UNIFORM_CHUNK {
+            return Err(Fault::Ceiling {
+                what: "bytes of uniforms one frame writes (its chunk)",
+                need: at + bytes,
+                have: UNIFORM_CHUNK,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -814,18 +886,26 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
+        if ring.chunks.is_empty() {
+            ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
+        }
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if at + bytes > room {
+            return Err(Fault::Ceiling {
+                what: "bytes one frame stages through scratch (its chunk)",
+                need: at + bytes,
+                have: room,
+            });
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -859,7 +939,7 @@ impl Frame {
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
         // wgpu refuses a copy whose ends are one buffer: it goes through
         // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
+        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
         self.encode(|encoder| match &stage {
             None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
             Some((scratch, at)) => {
@@ -1072,6 +1152,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::TEST).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
@@ -1084,5 +1165,54 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// No buffer is made past the device's bound on one reservation: a
+    /// slab or a scratch slot past it is refused by name before anything
+    /// reaches the device, and nothing invalid is made.
+    #[test]
+    fn no_buffer_is_made_past_the_bound_of_one_reservation() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        let bound = device.core.bound;
+        assert!(device.max_buffer() <= bound);
+        let past = |fault: Fault, named: &str, bound: u64| match fault {
+            Fault::Ceiling { what, need, have } => {
+                assert_eq!(what, named);
+                assert!(need > bound, "{need}");
+                assert_eq!(have, bound);
+            }
+            other => panic!("refused as {other}, not by the bound"),
+        };
+        let owner = engine_gpu::books::owners::TEST;
+        let before = device.core.books.device();
+        past(
+            Buffer::zeroed(&device, bound + 4, owner)
+                .err()
+                .expect("refused"),
+            "bytes of one device reservation",
+            bound,
+        );
+        assert_eq!(device.core.books.device(), before, "nothing was reserved");
+        // Scratch is stocked at load in chunks no larger than one
+        // reservation, and a frame takes no more than its chunk.
+        device.core.stock_rings(1);
+        let pooled = device.core.pooled_scratch();
+        assert!(pooled <= bound);
+        let held = device.core.books.device();
+        let frame = device.frame().unwrap();
+        past(
+            frame.scratch_slot(pooled + 256).err().expect("refused"),
+            "bytes of one scratch reservation",
+            pooled,
+        );
+        assert_eq!(device.core.books.device(), held, "nothing was reserved");
+        frame.commit().unwrap();
+        device.core.take_error("the refused buffers").unwrap();
     }
 }

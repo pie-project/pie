@@ -166,7 +166,7 @@ use eta_ir::Dtype;
 use eta_ir::op::tags;
 
 use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context};
+use crate::device::Buffer;
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
@@ -488,6 +488,10 @@ struct Slot {
     /// Its row pitch, in elements, and how it is stored.
     stride: u32,
     storage: u32,
+    /// The rows from `offset`, a `stride` apart, that are its lane's own:
+    /// no read of it reaches past them into another lane's (another
+    /// request's) rows.
+    rows_held: u32,
 }
 
 impl Slot {
@@ -515,6 +519,9 @@ struct OutputSeat {
     at: u64,
     storage: u32,
     stride: u32,
+    /// The rows from `at` that are its lane's own (a table's: its rows).
+    rows: u32,
+    reserved: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1546,6 +1553,7 @@ impl Prepared {
         dtype: Dtype,
         width: u32,
         stride: u32,
+        rows_held: u32,
     ) -> Result<bool> {
         let Some(named) = self.names.iter().position(|named| named == name) else {
             return Ok(false);
@@ -1584,12 +1592,15 @@ impl Prepared {
             width,
             stride,
             storage,
+            rows_held,
         };
         if first == slot {
             self.seats[slot] = OutputSeat {
                 at: address_of(base, offset)?,
                 storage,
                 stride,
+                rows: rows_held,
+                reserved: 0,
             };
             self.addresses.write(
                 (slot * size_of::<OutputSeat>()) as u64,
@@ -1602,6 +1613,50 @@ impl Prepared {
         self.seat_rows(first)?;
         self.regroup()?;
         Ok(true)
+    }
+
+    /// Whether this stage's lane-0 read of output `name` covers the row of
+    /// the instance's lane `lane`: that lane's seat is where the row is
+    /// read from, bound though the program names no read at that lane.
+    #[must_use]
+    pub fn covers(&self, name: &str, lane: u32) -> bool {
+        self.names.iter().position(|named| named == name).is_some_and(|named| {
+            lane > 0
+                && self.reads.get(named).copied().flatten().is_some()
+                && lane < self.read_rows.get(named).copied().unwrap_or(1)
+        })
+    }
+
+    /// Why a read of this stage reaches past the rows its seats hold, if
+    /// one does: a read of `n` rows takes row `r` from the instance's lane
+    /// `r` seat or from rows the seat itself holds, and a row neither holds
+    /// would be another lane's, another request's (a guest declaring more
+    /// rows than its lane holds read its neighbours' rows on Metal).
+    pub fn rows_unbounded(&self) -> Option<String> {
+        let readout_rows = self.grouped.as_ref().map_or(0, |grouped| grouped.readout_rows);
+        for (slot, seat) in self.outputs.iter().enumerate() {
+            let Some(seat) = seat else {
+                continue;
+            };
+            if self.reads.get(slot).copied().flatten().is_none() {
+                continue;
+            }
+            let mut rows = self.read_rows.get(slot).copied().unwrap_or(1).max(1);
+            if self.readout == Some(slot) {
+                rows = rows.max(readout_rows);
+            }
+            let name = &self.names[slot % self.output_slots as usize];
+            if let Some(row) = (0..rows)
+                .find(|&row| row >= seat.rows_held && !self.row_seats.contains_key(&(slot, row)))
+            {
+                return Some(format!(
+                    "a read of {rows} rows of output `{name}`, whose seat holds {} and no lane \
+                     {row} seat holds row {row}: past them it would read another lane's rows",
+                    seat.rows_held
+                ));
+            }
+        }
+        None
     }
 
     /// Every seat this stage reads, its lanes' rows among them.
@@ -1620,8 +1675,11 @@ impl Prepared {
     }
 
     /// Each row's address of the lane-0 read at `first`: row 0 at lane 0's
-    /// seat, a row seated at its lane there, and an unseated row on lane
-    /// 0's pitch.
+    /// seat, a row seated at its lane there, a row lane 0 holds on its
+    /// pitch, and a row no seat holds (yet: its lane binds later, or never)
+    /// at lane 0's own first row. Never another lane's row on lane 0's
+    /// pitch: that row is another request's. A read whose rows its seats do
+    /// not hold is refused before it launches ([`Self::rows_unbounded`]).
     fn row_addresses(&self, first: usize) -> Result<Option<Vec<u64>>> {
         let seated = self.rows_of(first);
         let Some(zero) = self.outputs.get(first).and_then(Option::as_ref) else {
@@ -1633,7 +1691,8 @@ impl Prepared {
         (0..self.read_rows[first])
             .map(|row| match seated.iter().find(|(at, _)| *at == row) {
                 Some((_, seat)) => seat.row_at(0),
-                None => zero.row_at(row),
+                None if row < zero.rows_held => zero.row_at(row),
+                None => zero.row_at(0),
             })
             .collect::<Result<Vec<u64>>>()
             .map(Some)
@@ -1662,6 +1721,8 @@ impl Prepared {
             })?,
             storage,
             stride: 0,
+            rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+            reserved: 0,
         };
         self.addresses.write(
             (first * size_of::<OutputSeat>()) as u64,
@@ -1723,6 +1784,18 @@ impl Prepared {
     }
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if crate::encode::profiling() {
+            let (_, seconds) = frame.timed(|| self.encode_one_region(frame, region))?;
+            if let Some(seconds) = seconds {
+                crate::encode::record_kernel(&guest_key(region, 1), seconds);
+            }
+            return Ok(());
+        }
+        self.encode_one_region(frame, region)
+    }
+
+    fn encode_one_region(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
             Form::Fused => {
                 let scratch = self.scratch()?;
@@ -2137,27 +2210,23 @@ impl Prepared {
 
     /// Fires `region` in a frame of its own; `zero` (a stage's first
     /// region) first poisons the seated scratch in test builds.
-    pub fn launch_region(
-        &mut self,
-        device: &Context,
-        pipelines: &crate::device::Pipelines,
-        rings: &Rings,
-        region: &Region,
-        zero: bool,
-    ) -> Result<()> {
+    /// `region` encoded into `frame` as a pass of its own after what the
+    /// frame holds (a stage's first poisons its scratch first): in order
+    /// with the regions before it, as a command buffer each was.
+    pub fn encode_region(&mut self, frame: &mut Frame, region: &Region, zero: bool) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            let _ = (pipelines, rings);
-            let mut frame = device.frame()?;
             if zero {
-                self.poison_scratch_on(&mut frame)?;
+                self.poison_scratch_on(frame)?;
             }
-            self.encode_into(&frame, region)?;
-            frame.commit()
+            frame.next_pass()?;
+            self.encode_into(frame, region)?;
+            frame.next_pass()?;
+            Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (device, pipelines, rings, region, zero);
+            let _ = (frame, region, zero);
             Err(Fault::Deviceless)
         }
     }
@@ -2627,6 +2696,28 @@ impl Batch {
             buffer.write(0, &record_bytes(words))?;
         }
         for region in regions {
+            #[cfg(target_vendor = "apple")]
+            if crate::encode::profiling() {
+                let (_, seconds) =
+                    frame.timed(|| self.encode_batched_region(frame, region, members, count))?;
+                if let Some(seconds) = seconds {
+                    crate::encode::record_kernel(&guest_key(region, count), seconds);
+                }
+                continue;
+            }
+            self.encode_batched_region(frame, region, members, count)?;
+        }
+        Ok(())
+    }
+
+    fn encode_batched_region(
+        &self,
+        frame: &Frame,
+        region: &Region,
+        members: &[&mut Prepared],
+        count: u32,
+    ) -> Result<()> {
+        {
             match region.form {
                 Form::Fused => {
                     // A fused region fires each member in its own scratch.
@@ -3131,11 +3222,11 @@ mod tests {
         let runtime = eta_compiler::codegen::metal::RUNTIME_TEMPLATE;
         assert!(
             runtime.contains(
-                "struct M1OutputSeat {\n  ulong at;\n  uint storage;\n  uint stride;\n};"
+                "struct M1OutputSeat {\n  ulong at;\n  uint storage;\n  uint stride;\n  uint rows;\n  uint reserved;\n};"
             ),
             "`OutputSeat` in this file is the host half of the emitted `M1OutputSeat`"
         );
-        assert_eq!(size_of::<OutputSeat>(), 16);
+        assert_eq!(size_of::<OutputSeat>(), 24);
     }
 
     fn the_grouped_samplers_take_the_bindings_this_file_writes() {
@@ -3173,3 +3264,15 @@ mod tests {
     }
 }
 
+
+/// The kernel profile's row for a guest region: its entry, form, steps
+/// and the lanes it ran for.
+#[cfg(target_vendor = "apple")]
+fn guest_key(region: &Region, lanes: u32) -> String {
+    format!(
+        "guest {} {:?} steps={} lanes={lanes}",
+        region.module.entry(),
+        region.form,
+        region.steps.len()
+    )
+}

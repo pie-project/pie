@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::channel::ChannelId;
 use crate::chunk::{ChunkFacts, ShapeId, SlotKind};
 use crate::error::{Error, Result};
-use crate::program::InstanceId;
+use crate::program::{InstanceId, ScratchPlace};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -280,6 +280,14 @@ pub struct Lane {
     /// `Masking::Extent`: one mask for every row. `Masking::Rows`: one per
     /// row, as many as the lane's rows. A kv-less lane's mask is over its
     /// attention group's rows, as before.
+    ///
+    /// The mask is the lane's data, never its class: a lane stating one
+    /// lands on the class it would land on stating none (`attn.attend`
+    /// reads no `fact.Mask`), and shares a fire, and a body, with lanes
+    /// stating none; each reads its own entry of the fire's masks
+    /// (`RuntimeInput::Mask`). An engine whose kernels do not read a lane's
+    /// mask where its class attends refuses the lane by name, never serves
+    /// it unmasked.
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
     #[serde(default)]
@@ -730,7 +738,7 @@ pub enum FoldLen {
 }
 
 /// A pass's program on a fire: the prologue before input staging, the epilogue after the forward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
@@ -738,6 +746,10 @@ pub struct Attachment {
     pub instance: InstanceId,
     /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
     pub adapter_only: bool,
+    /// The scratch arm the runtime took for this fire ([`crate::GuestState::scratch`]):
+    /// `None` only where the instance's scratch is 0.
+    #[serde(default)]
+    pub scratch: ScratchPlace,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1022,6 +1034,27 @@ impl FrameSubmission {
 pub struct FrameTicket {
     pub id: FrameId,
     pub steps: Vec<FireTicket>,
+    /// The lanes step `steps.len()` of the submission refused for their
+    /// own sake ([`Error::Lanes`]), where one did: the frame fired the
+    /// steps before it alone, and it and every step after it never ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<crate::LaneFault>,
+}
+
+impl FrameTicket {
+    /// Frame `id`, as its fired `steps`, stopped short where a step
+    /// refused lanes (`refusal`, an [`Error::Lanes`]) or whole.
+    #[must_use]
+    pub fn of(id: FrameId, steps: Vec<FireTicket>, refusal: Option<Error>) -> FrameTicket {
+        FrameTicket {
+            id,
+            steps,
+            refused: match refusal {
+                Some(Error::Lanes(lanes)) => lanes,
+                _ => Vec::new(),
+            },
+        }
+    }
 }
 
 /// The rows a lane read back of `output`, the last row or voxel output its
@@ -1218,6 +1251,7 @@ mod tests {
             lanes: 1,
             instance: InstanceId(7),
             adapter_only: true,
+            scratch: ScratchPlace::None,
         });
         assert!(
             step.validate_captures(captures).is_err(),

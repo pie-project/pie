@@ -26,6 +26,9 @@ pub struct Group {
     ordinals: Vec<i32>,
     poison: Poison,
     facts: Option<DeviceFacts>,
+    /// Each copy still landing on some rank, by token: how many ranks have
+    /// yet to tell it landed ([`Engine::copy_slots_landing`]).
+    landing: Arc<Mutex<std::collections::HashMap<u64, usize>>>,
 }
 
 /// The first refusal poisons the group: every later verb answers it without
@@ -169,6 +172,7 @@ pub fn open_group(boots: Vec<DeviceBoot>, contract_for: ContractFor) -> Result<G
         ordinals,
         poison: Poison::over(&held),
         facts,
+        landing: Arc::default(),
     })
 }
 
@@ -242,7 +246,14 @@ impl Group {
                     heard += 1;
                     eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
                     if refused.is_none() {
-                        self.poison_with(&format!("rank {rank} refused: {error}"));
+                        // Every rank refusing the same lanes ran nothing:
+                        // the group stays whole (`engine::Error::Lanes`).
+                        let lanes = match &error {
+                            Error::Lanes(lanes) => Some(lanes.clone()),
+                            _ => None,
+                        };
+                        let mut agreed = lanes.is_some() && answers.iter().all(Option::is_none);
+                        let first = format!("rank {rank} refused: {error}");
                         refused = Some(error);
                         let grace = std::time::Instant::now() + GRACE;
                         while heard < size {
@@ -250,13 +261,23 @@ impl Group {
                             match rx.recv_timeout(left) {
                                 Ok((rank, Err(error))) => {
                                     heard += 1;
+                                    agreed &= matches!(
+                                        (&error, &lanes),
+                                        (Error::Lanes(these), Some(first)) if these == first
+                                    );
                                     eprintln!(
                                         "engine-cuda: tensor-parallel rank {rank} refused: {error}"
                                     );
                                 }
-                                Ok(_) => heard += 1,
+                                Ok(_) => {
+                                    heard += 1;
+                                    agreed = false;
+                                }
                                 Err(_) => break,
                             }
+                        }
+                        if !(agreed && heard == size) {
+                            self.poison_with(&first);
                         }
                         break;
                     }
@@ -460,9 +481,10 @@ impl Engine for Group {
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
+        class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
-            Some(rank) => rank.guest_state(program, extents),
+            Some(rank) => rank.guest_state(program, extents, class),
             None => Err(Error::Program(
                 "a rank is busy: a program's guest state is asked between frames".to_string(),
             )),
@@ -555,8 +577,18 @@ impl Engine for Group {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let frame = frame.clone();
-        self.each(move |rank| rank.submit(&frame))
-            .map(|mut tickets| tickets.swap_remove(0))
+        let tickets = self.each(move |rank| rank.submit(&frame))?;
+        // Ranks fire one frame: a frame one rank stopped short where another
+        // did not has its ranks apart.
+        if tickets
+            .iter()
+            .any(|ticket| ticket.steps.len() != tickets[0].steps.len() || ticket.refused != tickets[0].refused)
+        {
+            let why = "the tensor-parallel ranks stopped one frame at different steps";
+            self.poison_with(why);
+            return Err(Error::Device(why.to_string()));
+        }
+        Ok(tickets.into_iter().next().expect("a group has a rank"))
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -627,6 +659,75 @@ impl Engine for Group {
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_slots(&copy))
+    }
+
+    /// Every rank's moves landed.
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.each(|rank| rank.settle_copies())?;
+        Ok(())
+    }
+
+    /// Landed once every rank's copy has: the ranks that answer it landed
+    /// inside the call count down here, the others from their own sinks
+    /// ([`Engine::on_landed`]), and whichever brings the count to nothing
+    /// tells it.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.landing
+            .lock()
+            .unwrap()
+            .insert(token, self.ranks.len());
+        let copy = copy.clone();
+        let answers = match self.each(move |rank| rank.copy_slots_landing(&copy, token)) {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.landing.lock().unwrap().remove(&token);
+                return Err(error);
+            }
+        };
+        let landed = answers.iter().filter(|landed| **landed).count();
+        let mut left = self.landing.lock().unwrap();
+        // Gone: every rank still landing told it, and their last told it on.
+        let Some(count) = left.get_mut(&token) else {
+            return Ok(false);
+        };
+        *count -= landed;
+        if *count == 0 {
+            left.remove(&token);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        let left = Arc::clone(&self.landing);
+        let each: engine::LandingSink = Arc::new(move |token| {
+            let last = {
+                let mut left = left.lock().unwrap();
+                match left.get_mut(&token) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        false
+                    }
+                    Some(_) => {
+                        left.remove(&token);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if last {
+                sink(token);
+            }
+        });
+        for shell in &self.ranks {
+            if let Ok(mut shell) = shell.try_lock() {
+                shell.on_landed(each.clone());
+            }
+        }
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {

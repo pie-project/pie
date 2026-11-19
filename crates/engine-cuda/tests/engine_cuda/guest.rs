@@ -109,6 +109,12 @@ impl Guest {
             .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint))
     }
 
+    /// Fresh `Channel` slots for an item of `footprint`: a ring a test
+    /// opens itself, as the runtime registers one.
+    pub fn channel(&mut self, footprint: &Footprint) -> Vec<u32> {
+        self.channel.take(footprint)
+    }
+
     /// Registers `registration` over the channel slots its ring facts state.
     pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
         let slots = engine
@@ -153,7 +159,7 @@ impl Guest {
         pair: (engine::ProgramId, impl std::fmt::Debug),
         state: &GuestState,
     ) -> (ScratchPlace, ScratchPlace) {
-        let scratch = self.take_state(state.per_instance, state);
+        let scratch = self.take_state(state.instance_bytes(), state);
         let pair = format!("{pair:?}");
         if let Some((_, place)) = self.pairs.iter().find(|(held, _)| *held == pair) {
             return (scratch, place.clone());
@@ -206,7 +212,7 @@ impl Guest {
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
         let state = engine
-            .guest_state(binding.program, &binding.extents)
+            .guest_state(binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
         let (scratch, pair) = self.places((binding.program, binding.extents), &state);
         engine
@@ -243,6 +249,7 @@ pub fn alone_slots(
             .collect(),
         scratch: ScratchPlace::None,
         pair: ScratchPlace::None,
+        pair_generation: 0,
     }
 }
 

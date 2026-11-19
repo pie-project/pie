@@ -555,6 +555,7 @@ impl Rig {
                     adapter_slots: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .id
@@ -591,6 +592,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

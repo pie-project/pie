@@ -328,12 +328,6 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     library: Option<Arc<crate::guest::session::Library>>,
 
-    /// Each program's stages' step uniforms, made at its first bind and
-    /// shared by every bind after: a round that binds the program afresh
-    /// makes none.
-    #[cfg(feature = "wgpu")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
-
     tally: Arc<Tally>,
 }
 
@@ -950,24 +944,10 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
-            Some(args) => args.clone(),
-            None => {
-                let args = compiled
-                    .all()
-                    .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
-                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
-                args
-            }
-        };
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
+            &plan.package,
             compiled.all(),
-            &args,
             library,
             &extents,
             &crate::guest::session::Tables {
@@ -1001,6 +981,29 @@ impl Plane {
             // Registration refuses a program with no device form.
             return Ok(ProgramFacts::default());
         }
+        #[cfg(feature = "wgpu")]
+        let sizes = {
+            let compiled = self.forms.get(program).ok_or(Refusal::Closed {
+                what: "program",
+                id: program.0,
+            })?;
+            let stride = engine_gpu::guest::session::step_stride(place.device.table_align());
+            if let Some(library) = &self.library {
+                let room = library.outbox_bytes();
+                let reads = crate::guest::session::stage_read_bytes(&plan.package)
+                    .map_err(|why| Refusal::Program(format!("program {}: {why}", program.0)))?;
+                for (stage, bytes) in reads.into_iter().enumerate() {
+                    if bytes > room {
+                        return Err(Refusal::Program(format!(
+                            "program {} stage {stage} reads back {bytes} bytes (its status and                              puts), past the {room} a guest thread's readback buffer holds",
+                            program.0
+                        )));
+                    }
+                }
+            }
+            crate::guest::session::instance_table_sizes(&plan.package.plans, compiled.all(), stride)
+        };
+        #[cfg(not(feature = "wgpu"))]
         let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
         let instance = engine_gpu::guest::held::table_footprint(
             place.pools,
@@ -1107,14 +1110,28 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
         {
-            let library = crate::guest::session::Library::build(place.device).map_err(|why| {
-                Refusal::Program(format!("the guest pipelines did not build: {why}"))
-            })?;
+            // A stage's collect reads back through its thread's buffer, a
+            // chunk of the pool each (a program whose stage reads back more
+            // is refused at registration).
+            let library = crate::guest::session::Library::build(
+                place.device,
+                place.pools.chunk_bytes(),
+                u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),
+            )
+            .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));
-            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-                Refusal::Program(format!("the readout widen did not build: {why}"))
-            })?;
+            let widen = crate::guest::widen::Widen::new(
+                place.device,
+                &place.seats,
+                &place.pools.segment_buffers(),
+                u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),
+                u64::from(place.max_lanes) * u64::from(place.planes),
+            )
+            .map_err(|why| Refusal::Program(format!("the readout widen did not build: {why}")))?;
             self.widen = Some(Arc::new(widen));
+            // The model's frames in flight, and the one a settle or a walk
+            // holds beside them.
+            place.device.core().stock_rings(place.frames + 1);
         }
         // A build with no device builds nothing, and binds no instance.
         #[cfg(not(feature = "wgpu"))]

@@ -290,6 +290,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                     adapter_slots: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .id;
@@ -298,6 +299,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             lanes: 1,
             instance,
             adapter_only: false,
+            scratch: ::engine::ScratchPlace::None,
         });
         readers.push(instance);
     }

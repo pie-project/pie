@@ -132,66 +132,96 @@ pub fn operands(nodes: &[Node], region: &Region) -> Option<(Vec<ValueId>, Vec<Va
     Some((ins, outs))
 }
 
-fn copyable(trace: &Trace, region: &Region) -> bool {
+/// What an engine's copy of a window carries beside the token rows of bf16
+/// and f32 it gathers and scatters back ([`copyable_mask`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Carries {
+    /// Each gathered row's mask (`RuntimeInput::Mask`), gathered with its
+    /// rows: the fire's masks are per row.
+    pub masks: bool,
+    /// Token rows of integers a region only reads (an adapter's routes),
+    /// gathered and never scattered back.
+    pub read_ints: bool,
+}
+
+/// Whether `region` can run over a gathered copy of its lanes' rows: every
+/// operand a kv row, a per-lane page geometry, a struct, a constant, or a
+/// tensor of token rows the copy carries (`carries`).
+fn copyable(trace: &Trace, region: &Region, carries: Carries) -> bool {
     let Some((ins, outs)) = operands(&trace.nodes, region) else {
         return false;
     };
-    ins.iter().chain(outs.iter()).all(|id| {
-        let Some(decl) = trace.values.get(id.0 as usize) else {
-            return false;
-        };
-        match &decl.def {
-            Def::Cache(c) => matches!(trace.caches.get(*c as usize), Some(CacheRow::Kv { .. })),
-            Def::Input(RuntimeInput::Geometry { kind }) => matches!(
-                kind,
-                GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
-            ),
-            Def::Input(RuntimeInput::Mask) => false,
-            _ => match &decl.ty {
-                Ty::Struct(_) => true,
-                Ty::Tensor { shape, dtype } => match shape.first() {
-                    Some(Dim::Tokens) => matches!(dtype, Dtype::Bf16 | Dtype::F32),
-                    Some(Dim::TokensTimes(_)) => false,
-                    Some(Dim::Const(_)) | None => true,
-                    Some(Dim::Lanes | Dim::LanesPlus(_) | Dim::Capturing) => false,
-                    Some(Dim::ContextTimes(_) | Dim::ContextPages) => false,
-                    Some(Dim::Readouts) => false,
-                    Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
-                    Some(Dim::Voxels | Dim::VoxelsScaled(..) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                        false
-                    }
-                },
+    ins.iter()
+        .map(|id| (id, true))
+        .chain(outs.iter().map(|id| (id, false)))
+        .all(|(id, read)| copyable_operand(trace, *id, read, carries))
+}
+
+fn copyable_operand(trace: &Trace, id: poem_ir::ValueId, read: bool, carries: Carries) -> bool {
+    let Some(decl) = trace.values.get(id.0 as usize) else {
+        return false;
+    };
+    match &decl.def {
+        Def::Cache(c) => matches!(trace.caches.get(*c as usize), Some(CacheRow::Kv { .. })),
+        Def::Input(RuntimeInput::Geometry { kind }) => matches!(
+            kind,
+            GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
+        ),
+        Def::Input(RuntimeInput::Mask) => carries.masks,
+        _ => match &decl.ty {
+            Ty::Struct(_) => true,
+            Ty::Tensor { shape, dtype } => match shape.first() {
+                Some(Dim::Tokens) => {
+                    matches!(dtype, Dtype::Bf16 | Dtype::F32)
+                        || (read && carries.read_ints && matches!(dtype, Dtype::I32))
+                }
+                Some(Dim::TokensTimes(_)) => false,
+                Some(Dim::Const(_)) | None => true,
+                Some(Dim::Lanes | Dim::LanesPlus(_) | Dim::Capturing) => false,
+                Some(Dim::ContextTimes(_) | Dim::ContextPages) => false,
+                Some(Dim::Readouts) => false,
+                Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
+                Some(Dim::Voxels | Dim::VoxelsScaled(..) | Dim::Clips | Dim::ClipsPlus(_)) => false,
             },
-        }
-    })
+        },
+    }
 }
 
 #[must_use]
-pub fn copyable_mask(trace: &Trace, compiled: &CompiledModel, mask: &ClassSet) -> bool {
+/// Whether every region of class set `mask` is [`copyable`] over a copy
+/// carrying `carries`.
+pub fn copyable_mask(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    mask: &ClassSet,
+    carries: Carries,
+) -> bool {
     compiled
         .template()
         .iter()
         .filter(|region| &region.mask == mask)
-        .all(|region| copyable(trace, region))
+        .all(|region| copyable(trace, region, carries))
 }
 
 #[must_use]
-pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
-    let mut masks: Vec<&ClassSet> = Vec::new();
+/// The class sets whose copies gather rows ([`copyable_mask`], `carries` as
+/// there).
+pub fn gathers(trace: &Trace, compiled: &CompiledModel, carries: Carries) -> usize {
+    let mut sets: Vec<&ClassSet> = Vec::new();
     for region in compiled.template() {
         let owed = compiled
             .fallback
             .rows
             .iter()
             .any(|row| region.nodes.contains(&row.node) && row.fallback == Fallback::Copy);
-        if !owed || masks.contains(&&region.mask) {
+        if !owed || sets.contains(&&region.mask) {
             continue;
         }
-        if copyable_mask(trace, compiled, &region.mask) {
-            masks.push(&region.mask);
+        if copyable_mask(trace, compiled, &region.mask, carries) {
+            sets.push(&region.mask);
         }
     }
-    masks.len()
+    sets.len()
 }
 
 #[cfg(test)]

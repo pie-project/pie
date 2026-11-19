@@ -1,3 +1,4 @@
+use crate::ports::GeometryClass;
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::AdapterRegistration;
@@ -43,7 +44,7 @@ pub struct StepOutcome {
 /// A lane of a step that faulted: lane `lane` of the step's
 /// [`crate::fire::Step::lanes`], the instance whose pass faulted where one
 /// did, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneFault {
     pub lane: u32,
     pub instance: Option<InstanceId>,
@@ -140,6 +141,11 @@ pub struct KvWrites {
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
+/// Where an engine tells that a copy it answered as still landing
+/// ([`Engine::copy_slots_landing`]) has landed: called once with the copy's
+/// token, from any thread.
+pub type LandingSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 /// A group of a tapped lane's pages, read out: each page's spans of group
 /// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
 /// that fails says so once, for its first group not told.
@@ -206,7 +212,7 @@ pub trait Engine: Send {
     /// backend's compiled guest code), without registering any: the
     /// runtime's prewarm of the programs its standard samplers register,
     /// before ready, so a registration of one of them builds nothing
-    /// (`crate::live::Tally::BuiltAfterReady`). The default builds nothing.
+    /// (`crate::live::Tally::BuiltAtRegister`). The default builds nothing.
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
         let _ = registrations;
         Ok(())
@@ -268,8 +274,16 @@ pub trait Engine: Send {
     /// at every bind, on the lane, before it is sent. The default states
     /// none: an engine that lays its guests' scratch in the fire's span
     /// ([`Self::fire_facts`]) states it there until it moves it here.
-    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
-        let _ = (program, extents);
+    /// `class` is the geometry class the instance is bound at
+    /// ([`InstanceBinding::geometry`]): the engine states its scratch arms
+    /// per class ([`GuestState::scratch_arms`]).
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &BindExtents,
+        class: GeometryClass,
+    ) -> Result<GuestState> {
+        let _ = (program, extents, class);
         Ok(GuestState::default())
     }
 
@@ -400,6 +414,15 @@ pub trait Engine: Send {
     /// what such a step left. A position an engine keeps by slot
     /// still goes back where a refused step found it: the slot outlives
     /// the set, and its next tenant must not meet it.
+    ///
+    /// A refusal a step's lanes earn for their own sake (a lane's word,
+    /// mask, positions, adapter or payload this load does not serve as
+    /// stated) names those lanes, never the frame: refused at the frame's
+    /// first step it is [`Error::Lanes`], nothing of the frame having run;
+    /// refused at a later step, the frame stops there and answers a ticket
+    /// of the steps before it with the lanes in
+    /// [`FrameTicket::refused`]. The runtime fails those lanes' fires alone
+    /// and submits what is left again.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
     /// Backs the pool's first `segments` segments
@@ -412,7 +435,9 @@ pub trait Engine: Send {
     }
 
     /// Gives back every segment at and past `segments`. The runtime has
-    /// evacuated their chunks and waited out every frame that named them.
+    /// evacuated their chunks and waited out every frame that named them;
+    /// an [`Self::evacuate`] copy that still reads them, the engine waits
+    /// out here.
     fn release_segments(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Err(self.unsupported("release_segments"))
@@ -463,7 +488,10 @@ pub trait Engine: Send {
 
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
-    /// before the next fire; the slot refs the runtime holds stand.
+    /// before the next fire; the slot refs the runtime holds stand. The
+    /// copy has a completion of its own, which [`Self::release_segments`]
+    /// waits on before the evacuated segment goes: the runtime waits on no
+    /// later fire for it, so an idle engine's segment goes too.
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))
@@ -485,12 +513,38 @@ pub trait Engine: Send {
     /// of its kv slot file. Token runs are device to device only. Each copy
     /// is ordered after every fire submitted before it and before every one
     /// after (a stream-ordered copy, or a drain), and copies in submission
-    /// order: the runtime reuses a source slot and names a destination
-    /// again as soon as the call returns.
+    /// order: the runtime names a destination again as soon as the call
+    /// returns. A source slot's memory may go to any other slot, of any
+    /// shape, which anything the engine does may write (a bind's seeds, a
+    /// channel's cells, a guest's stage, not a fire alone), so the runtime
+    /// gives a source slot back only once the copy has read it: at once
+    /// after this call, or when [`Engine::copy_slots_landing`] tells it.
     fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
         let _ = copy;
         Err(self.unsupported("copy_slots"))
     }
+
+    /// [`Engine::copy_slots`], answering whether its source slots may go
+    /// back now (`true`): the copy has read them, or every write that could
+    /// reach them after they go back is ordered behind the copy. `false`:
+    /// the copy may still read them, and the engine calls the sink
+    /// [`Engine::on_landed`] gave it with `token` once it has read every
+    /// source slot. Every engine
+    /// states it: an answer of `true` for a copy still reading its sources
+    /// hands their memory to its next owner under the copy.
+    fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> Result<bool>;
+
+    /// Where [`Engine::copy_slots_landing`] tells a copy landed.
+    fn on_landed(&mut self, sink: LandingSink) {
+        let _ = sink;
+    }
+
+    /// Returns once every copy submitted so far has read its sources and
+    /// written its destinations: what a move that gives back slots a copy
+    /// was still writing (an aborted restore's destinations) waits for, so
+    /// no late write reaches them once they are another's. Every engine
+    /// states it.
+    fn settle_copies(&mut self) -> Result<()>;
 
     /// Which atoms of the streamable weights
     /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next

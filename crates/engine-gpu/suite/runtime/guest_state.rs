@@ -125,6 +125,7 @@ fn fire(
             lanes: 1,
             instance,
             adapter_only: false,
+            scratch: ::engine::ScratchPlace::None,
         })
         .collect();
     let mut ticket = engine
@@ -209,11 +210,11 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
         "a guest's state lies in no fire's span"
     );
     let state = engine
-        .guest_state(program, &EXTENTS)
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     eprintln!("guest state: {state:?}");
     assert!(
-        state.per_instance + state.per_pair > 0,
+        state.instance_bytes() + state.per_pair > 0,
         "the epilogue's heap is state of its instance or its pair"
     );
     let span = |engine: &backend::Engine| {
@@ -270,9 +271,9 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
     assert_eq!(ids, [argmax(&planes, 5)], "the first pass reads its row");
 
     let state = engine
-        .guest_state(program, &EXTENTS)
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
-    let scratch = slots.state(state.per_instance, state.run);
+    let scratch = slots.state(state.instance_bytes(), state.run);
     let pair = slots.state(state.per_pair, state.run);
     // Bytes `bytes` of `place` filled with `fill`, where it holds any.
     let fill = |engine: &backend::Engine, place: &ScratchPlace, bytes: u64, fill: u8| {
@@ -294,7 +295,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             .expect("the room fills");
     };
     // Fresh room is dead: whatever lies there.
-    fill(&engine, &scratch, state.per_instance, 0x7f);
+    fill(&engine, &scratch, state.instance_bytes(), 0x7f);
     fill(&engine, &pair, state.per_pair, 0x7f);
     engine
         .rebind_slots(Rebind::Instance {
@@ -304,10 +305,11 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             adapter: Vec::new(),
             scratch: scratch.clone(),
             pair: pair.clone(),
+            pair_generation: 0,
         })
         .expect("the unpark rebinds its state");
     // The old room is someone else's now.
-    fill(&engine, &binding.scratch, state.per_instance, 0x3c);
+    fill(&engine, &binding.scratch, state.instance_bytes(), 0x3c);
     fill(&engine, &binding.pair, state.per_pair, 0x3c);
     for token in [5, 9, 2] {
         let ids = fire(&mut engine, word, t_input, &bound, &[token]);
