@@ -906,6 +906,24 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_slots(copy))
     }
 
+    fn settle_copies(&mut self) -> EngineResult<()> {
+        self.with(|cuda| cuda.settle_copies())
+    }
+
+    fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        self.with(|cuda| cuda.copy_slots_landing(copy, token))
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        if let Ok(mut cuda) = self.cuda() {
+            cuda.on_landed(sink);
+        }
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.group.ranks[self.rank]
             .try_lock()
