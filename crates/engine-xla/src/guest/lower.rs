@@ -1143,9 +1143,20 @@ impl Lower<'_> {
     #[allow(clippy::too_many_lines)]
     fn op(&mut self, op: &LaunchOp) -> Lowering<()> {
         if op.tag == tags::SINK_CALL {
-            // A library sink (`lora`, `metal.discard`): the interpreter does
-            // nothing for it, and neither does the device.
-            return Ok(());
+            // `lora` applies in the forward, through the adapter the
+            // attachment names (`adapter.rs`): the pass runs nothing for it.
+            // Any other sink this shell runs nothing for anywhere, so a
+            // program calling one is refused by name at its registration,
+            // never answered as if the sink had run.
+            let name = (self.package.names.get(op.name_index as usize))
+                .map_or("<unnamed>", String::as_str);
+            if name == crate::adapter::LORA {
+                return Ok(());
+            }
+            return refuse(format!(
+                "calls sink `{name}`, which this engine does not run: its program would \
+                 answer as if the sink had acted"
+            ));
         }
         let result = op.result_id;
         if result as usize >= self.package.values.len() {

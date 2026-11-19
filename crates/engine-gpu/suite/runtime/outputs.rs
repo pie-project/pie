@@ -251,7 +251,7 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 /// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
 pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;

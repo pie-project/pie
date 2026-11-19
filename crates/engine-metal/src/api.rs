@@ -180,7 +180,12 @@ fn fault(fault: Fault) -> Error {
         | Fault::Maskless { .. }
         | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::GeometryLanes { .. }
+        | Fault::OutputRows { .. } => {
+            Error::Invalid(fault.to_string())
+        }
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,

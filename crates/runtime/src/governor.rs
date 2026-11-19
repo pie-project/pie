@@ -131,11 +131,13 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The limits `pool` states.
+    /// The limits `pool` states. The floor is its byte floor, or the
+    /// fewest segments it can map where those come to more: a target under
+    /// them is one no shed reaches.
     #[must_use]
     pub fn of(pool: &impl PoolTarget) -> Self {
         Self {
-            floor: pool.floor(),
+            floor: pool.floor().max(pool.least_mapped()).min(pool.hard_limit()),
             hard_limit: pool.hard_limit(),
             segment_bytes: pool.segment_bytes().max(1),
         }
@@ -210,6 +212,12 @@ pub trait PoolTarget {
     /// Bytes below which one lane cannot run: one working set at the
     /// declared context, and the activation of the smallest rung.
     fn floor(&self) -> u64;
+    /// The bytes of the fewest segments the pool can map, as its own
+    /// layout states them (what no shed brings it under); 0 where its
+    /// layout sets no such bound.
+    fn least_mapped(&self) -> u64 {
+        0
+    }
     /// The whole of what the pool can take, in bytes.
     fn hard_limit(&self) -> u64;
     /// What the pool holds now, in bytes.

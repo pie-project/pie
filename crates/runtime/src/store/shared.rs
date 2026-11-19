@@ -2353,6 +2353,30 @@ impl SharedPool {
         u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()
     }
 
+    /// The bytes of the fewest segments this pool can map, as its layout
+    /// has them: every segment holding a reserved chunk (no evacuation
+    /// moves them) and every segment under the activation span's chunks,
+    /// the largest rung's as [`Self::floor`] counts it. However much is
+    /// shed, no shrink maps fewer.
+    #[must_use]
+    pub fn least_mapped_bytes(&self) -> u64 {
+        let segments = self.pool.segments();
+        let total = self.pool.total_chunks();
+        let act = self.pool.act_max().max(self.pool.act_reserved()).min(total);
+        let reserved = self.pool.reserved_chunks().min(total);
+        let mut least = std::collections::BTreeSet::new();
+        if reserved > 0 {
+            least.extend(0..=segments.of(reserved - 1));
+        }
+        if act > 0 {
+            least.extend(segments.of(total - act)..=segments.of(total - 1));
+        }
+        least
+            .into_iter()
+            .map(|segment| u64::from(segments.len(segment)) * self.pool.chunk_bytes())
+            .sum()
+    }
+
     /// What [`Self::floor`] is made of, for the load log.
     #[must_use]
     pub fn floor_parts(&self) -> FloorParts {
@@ -2363,6 +2387,7 @@ impl SharedPool {
             max_context: self.max_context,
             reserved_bytes: u64::from(self.pool.reserved_chunks()) * chunk,
             act_bytes: u64::from(act) * chunk,
+            least_mapped_bytes: self.least_mapped_bytes(),
         }
     }
 
@@ -2405,6 +2430,8 @@ pub struct FloorParts {
     pub max_context: u32,
     pub reserved_bytes: u64,
     pub act_bytes: u64,
+    /// The fewest segments the pool can map ([`SharedPool::least_mapped_bytes`]).
+    pub least_mapped_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

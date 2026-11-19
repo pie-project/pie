@@ -113,8 +113,7 @@ impl<'a> OnDevice<'a> {
                 locals.push(local);
             }
         }
-        self.session
-            .read_back(self.device, &mut frame, at, &locals)?;
+        self.session.read_back(&mut frame, at, &locals)?;
         let pending = frame.commit_async(None)?;
         self.session.collect(at)?;
         pending.wait()?;
