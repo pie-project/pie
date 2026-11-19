@@ -1439,6 +1439,37 @@ struct SealOnLanding {
 }
 
 impl SealOnLanding {
+    /// Seals once every one of the pass's `fires` has settled, whatever
+    /// order they land in, if each landed; a hook never run (its fire gone
+    /// unresolved, or the runtime with it) counts as not landed, or drops
+    /// the claims as the last hook goes.
+    fn on_landing(self, fires: &[crate::engine::WorkItemCompletion]) {
+        struct Countdown {
+            left: std::sync::atomic::AtomicUsize,
+            whole: std::sync::atomic::AtomicBool,
+            sealing: Mutex<Option<SealOnLanding>>,
+        }
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let countdown = Arc::new(Countdown {
+            left: std::sync::atomic::AtomicUsize::new(fires.len()),
+            whole: std::sync::atomic::AtomicBool::new(true),
+            sealing: Mutex::new(Some(self)),
+        });
+        for fire in fires {
+            let countdown = Arc::clone(&countdown);
+            fire.on_settled_landed(move |landed| {
+                if !landed {
+                    countdown.whole.store(false, Release);
+                }
+                if countdown.left.fetch_sub(1, AcqRel) == 1
+                    && let Some(sealing) = countdown.sealing.lock().unwrap().take()
+                {
+                    sealing.landed(countdown.whole.load(Acquire));
+                }
+            });
+        }
+    }
+
     fn landed(self, landed: bool) {
         if landed && pipeline_failed(&self.failure).is_none() {
             let sealed =
@@ -1573,7 +1604,8 @@ fn supply(
         }
     }
     let total = held + rows;
-    let found = (run.len() as u64 * page).min(total - 1);
+    // As far as it could map: whole pages short of the last row's.
+    let found = (run.len() as u64).min(limit) * page;
     let mapped_rows = mapped * page;
     let passes = SUPPLIED.passes.fetch_add(1, Relaxed) + 1;
     let tokens = SUPPLIED.tokens.fetch_add(total, Relaxed) + total;
@@ -4476,11 +4508,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // The claims on what this pass computes stand until its last piece
         // settles, its pages sealed if it landed; a pass that ends early
         // drops them.
-        if let (Some(sealing), Some((last, earlier))) = (sealing.take(), submitted.split_last()) {
-            let earlier = earlier.to_vec();
-            last.on_settled_landed(move |landed| {
-                sealing.landed(landed && earlier.iter().all(|fire| fire.landed()));
-            });
+        if let Some(sealing) = sealing.take()
+            && !submitted.is_empty()
+        {
+            sealing.on_landing(&submitted);
         }
         // A set no piece wrote (its lanes carry no rows) ends where they land.
         for (group, (_, lanes)) in groups.iter().enumerate() {
@@ -7956,6 +7987,84 @@ pub(crate) mod fold_tests {
                 .unwrap();
             let supplied = supply(&stores, ws, &rows(0, &tokens), &slots, Attach::Kv, 65, 16);
             assert_eq!(supplied.rows, 64, "all four sealed pages mapped in");
+        }
+    }
+
+    /// A pass cut into fires that land out of order (the last first) seals
+    /// once all of them have landed, and its waiters map it all in; one
+    /// whose fire failed seals nothing, however the others landed, and a
+    /// waiter computes the pages.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_whose_fires_land_out_of_order_seals_once_all_have() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        for (case, failed) in [(0u32, None), (1, Some(0usize))] {
+            let prompt = move |tail: u32| -> Vec<u32> {
+                (0..64)
+                    .map(|t| 2100 + case * 100 + t)
+                    .chain([tail])
+                    .collect()
+            };
+            let (first, slots) = keyed_pass(&stores, &prompt(1));
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+                .await
+                .unwrap();
+            let waiters = waiting_on(&stores, prompt);
+            written(&stores, first, &prompt(1));
+            stores.kv.lock().freeze(first, 65).unwrap();
+            let fires: Vec<_> = (0..3)
+                .map(|at| crate::engine::WorkItemCompletion::new(900 + at, 0))
+                .collect();
+            SealOnLanding {
+                claims,
+                stores: stores.clone(),
+                ws: first,
+                start: 0,
+                slots,
+                page_size: 16,
+                failure: PipelineFailure::default(),
+            }
+            .on_landing(&fires);
+            let cached = || {
+                let (probe, probe_slots) = keyed_pass(&stores, &prompt(9));
+                let keys = crate::store::kv::KvStore::fresh_page_keys(&probe_slots, 16);
+                let found = stores.kv.lock().cached_run(&keys).len();
+                stores.kv.lock().release_working_set(probe, 0);
+                found
+            };
+            for at in [2, 0] {
+                resolve_test_completion(&fires[at], failed == Some(at));
+                settle_tasks().await;
+                assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+                assert_eq!(cached(), 0, "case {case}: not all landed, nothing sealed");
+            }
+            resolve_test_completion(&fires[1], false);
+            settle_tasks().await;
+            if failed.is_none() {
+                for (ws, tokens, waiting) in waiters {
+                    assert!(waiting.await.unwrap().is_none());
+                    let slots = stores
+                        .kv
+                        .lock()
+                        .slot_hashes(ws, 0, &tokens, 16)
+                        .unwrap()
+                        .unwrap();
+                    let supplied =
+                        supply(&stores, ws, &rows(0, &tokens), &slots, Attach::Kv, 65, 16);
+                    assert_eq!(supplied.rows, 64, "all four sealed pages mapped in");
+                }
+            } else {
+                assert_eq!(cached(), 0, "a fire failed: nothing sealed");
+                let finished: Vec<_> = waiters
+                    .into_iter()
+                    .filter(|(_, _, waiting)| waiting.is_finished())
+                    .collect();
+                assert_eq!(finished.len(), 1, "one waiter claims the pages");
+                for (_, _, waiting) in finished {
+                    assert!(waiting.await.unwrap().is_some());
+                }
+            }
         }
     }
 
