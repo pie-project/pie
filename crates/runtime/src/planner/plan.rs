@@ -215,7 +215,18 @@ impl ResidencyPlanner {
                     // runs stand free past its gathered kv, else idle cache
                     // first, then, the fleet stalled, a resident parked
                     // for it by the planner's victim choice.
-                    if self.port.guest_room_free(need.run, need.pieces) {
+                    // Runs that stand free only by what its own park gave
+                    // back are what its restore retakes: room must have come
+                    // free since ([`super::proc::Proc::bind_room_after`]).
+                    let moved = self.with_inner(|inner| {
+                        inner
+                            .queue
+                            .get(&key)
+                            .and_then(|waiter| inner.procs.get(&waiter.pid))
+                            .and_then(|proc| proc.bind_room_after)
+                    })
+                    .is_none_or(|after| self.port.room_gives() > after);
+                    if moved && self.port.guest_room_free(need.run, need.pieces) {
                         room_stood = Some(key);
                         continue;
                     }

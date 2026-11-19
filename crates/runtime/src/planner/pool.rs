@@ -196,6 +196,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pids;
         ChunkMap::default()
     }
+    /// The device pool's count of room given back (a chunk opened for
+    /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
+    /// a read, room has come free since.
+    fn room_gives(&self) -> u64 {
+        0
+    }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
     /// state. `None` where the kv pages are a pool of their own.
@@ -361,6 +367,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| shared.lock().unwrap().pool().free_chunk_runs(run) >= pieces)
+    }
+
+    fn room_gives(&self) -> u64 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(0, |shared| shared.lock().unwrap().pool().room_gives())
     }
 
     fn chunk_occupants(&self, pids: &[ProcessId]) -> ChunkMap {

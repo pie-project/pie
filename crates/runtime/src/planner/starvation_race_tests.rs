@@ -2420,6 +2420,8 @@ struct BindRoomPool {
     /// The process whose state holds the chunks, if one does
     /// ([`PoolPort::chunk_occupants`]): each chunk of the pool, whole.
     occupant: parking_lot::Mutex<Option<ProcessId>>,
+    /// The pool's count of room given back (`room_gives`).
+    gives: std::sync::atomic::AtomicU64,
 }
 
 impl BindRoomPool {
@@ -2431,6 +2433,7 @@ impl BindRoomPool {
             host,
             model: 0,
             occupant: parking_lot::Mutex::new(None),
+            gives: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2493,6 +2496,9 @@ impl PoolPort for BindRoomPool {
     }
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
+    }
+    fn room_gives(&self) -> u64 {
+        self.gives.load(Ordering::Relaxed)
     }
     fn chunk_occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
         let Some(occupant) = *self.occupant.lock() else {
@@ -3173,4 +3179,55 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
         0,
         "and no restore was sent on the understated need"
     );
+}
+
+/// The M1 beam-stress freeze: a bind short of room suspended its own
+/// process, whose restore was served straight back into the room its park
+/// gave back, retook its items, and the bind came up short again: suspend,
+/// restore, short, 750 times a second. Runs standing free only by what its
+/// own park gave back are no room for its bind: its restore waits until
+/// room has come free since (the pool's count of room given back moved
+/// past the park's end), reclaiming idle cache meanwhile; once it has, it
+/// is sent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_park() {
+    for moved in [false, true] {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let pool = Arc::new(BindRoomPool::new(8, 0..2, 64));
+        pool.free.lock().extend(4..8);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 1,
+                pieces: 1,
+                pages: 1,
+            });
+            proc.bind_room_after = Some(0);
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        });
+        pool.gives.store(u64::from(moved), Ordering::Relaxed);
+        assert!(pool.guest_room_free(1, 1), "runs stand free");
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+        if moved {
+            assert!(!pool.cache.lock().is_empty(), "room came free since: it is sent, nothing reclaimed");
+        } else {
+            assert!(
+                pool.cache.lock().is_empty(),
+                "only its own park's room stands: not sent, the idle cache goes for it"
+            );
+        }
+    }
 }
