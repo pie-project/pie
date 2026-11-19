@@ -1069,6 +1069,23 @@ impl Shell {
             &compiled,
             &|param| weights.member_of(param).or_else(|| bank_of(param)),
             &|param| streamed.streams(param as usize),
+            &|row| {
+                let laid = pools.kv_laid(row)?;
+                let view = |t: crate::handle::Tensor| -> u64 {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (handles.locate(t.buf), handles.order_of(t.buf), t.rows, t.width).hash(&mut h);
+                    format!("{:?}", t.dtype).hash(&mut h);
+                    h.finish()
+                };
+                Some(crate::roll::KvLaid {
+                    views: [view(laid[0].0), view(laid[1].0)],
+                    maps: [
+                        (laid[0].1.stride, laid[0].1.offset),
+                        (laid[1].1.stride, laid[1].1.offset),
+                    ],
+                })
+            },
         );
         tracing::info!(plan = %rolling.line(), "xla layer stack");
         if timing() {
@@ -3629,14 +3646,9 @@ impl Shell {
             at: "serve::roll_block",
             why: "a rolled block's loop opened with no counter".into(),
         })?;
-        // Each cache row's page maps at the counter's pass.
+        // Each cache row's page maps at the counter's pass (the load's plan
+        // checked every pass's row lies a whole step on, `roll::Plan`).
         let mut pools: BTreeMap<usize, crate::store::CachePool> = BTreeMap::new();
-        // Two handles of one root, from one row, read alike.
-        let same_view = |a: crate::handle::Tensor, b: crate::handle::Tensor| {
-            self.handles.locate(a.buf) == self.handles.locate(b.buf)
-                && (a.rows, a.width, a.dtype) == (b.rows, b.width, b.dtype)
-                && self.handles.order_of(a.buf) == self.handles.order_of(b.buf)
-        };
         for (&row, each) in &rows {
             let maps = |r: usize| match run.cache_row(r) {
                 Some(crate::store::CachePool::Kv(p)) => Some((*p, p.keys_map, p.values_map)),
@@ -3654,28 +3666,6 @@ impl Shell {
                 second.1.offset - base.1.offset,
                 second.2.offset - base.2.offset,
             );
-            for (k, &r) in each.iter().enumerate() {
-                let m = maps(r).ok_or_else(|| Fault::Program {
-                    at: "serve::roll_block",
-                    why: format!("cache row {r} is no kv pool"),
-                })?;
-                let k = k as i64;
-                let affine = m.1.stride == base.1.stride
-                    && m.2.stride == base.2.stride
-                    && m.1.offset == base.1.offset + k * dk
-                    && m.2.offset == base.2.offset + k * dv
-                    && same_view(m.0.keys, base.0.keys)
-                    && same_view(m.0.values, base.0.values);
-                if !affine {
-                    return Err(Fault::Program {
-                        at: "serve::roll_block",
-                        why: format!(
-                            "cache row {r}'s pages do not lie a whole step on from row {row}'s: \
-                             a rolled block's rows lie at one stride"
-                        ),
-                    });
-                }
-            }
             let last = i64::from(block.repeats - 1);
             let dynamic = |offset: i64, step: i64| -> Result<kernels_xla::tensor::PageMap> {
                 tracer.with(|f| -> Result<kernels_xla::tensor::PageMap> {

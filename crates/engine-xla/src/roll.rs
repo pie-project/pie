@@ -428,6 +428,7 @@ impl Plan {
         compiled: &poem_compiler::CompiledModel,
         member: &dyn Fn(u32) -> Option<(u32, u32)>,
         streams: &dyn Fn(u32) -> bool,
+        kv: &dyn Fn(usize) -> Option<KvLaid>,
     ) -> Plan {
         let layers = layer_count(trace);
         let blocks = (blocks(trace, compiled).into_iter())
@@ -508,6 +509,9 @@ impl Plan {
                         step[j] = d;
                     }
                 }
+                if checked.is_ok() {
+                    checked = kv_steps(trace, compiled, &block, kv);
+                }
                 let checked = checked.map(|()| {
                     (first.iter().zip(&step))
                         .filter_map(|(&p, step)| Some((member(p)?.0, (*step)?)))
@@ -545,6 +549,74 @@ impl Plan {
         }
         line
     }
+}
+
+/// A kv cache row's planes as the load lays them: each plane's view (one
+/// identity a view of the pool, its row order and its form) and its page
+/// map's stride and offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLaid {
+    pub views: [u64; 2],
+    pub maps: [(i64, i64); 2],
+}
+
+/// Whether every cache row `block`'s passes read lies where a loop can
+/// address it by its counter: in block 0's row's views, at its strides, its
+/// offsets a whole step on each pass.
+fn kv_steps(
+    trace: &Trace,
+    compiled: &poem_compiler::CompiledModel,
+    block: &Block,
+    kv: &dyn Fn(usize) -> Option<KvLaid>,
+) -> Result<(), String> {
+    let template = compiled.template();
+    let nodes = |k: u32| -> Vec<usize> {
+        let lo = block.start + k as usize * block.regions;
+        (lo..lo + block.regions)
+            .flat_map(|r| template[r].nodes.clone())
+            .map(|n| n as usize)
+            .collect()
+    };
+    let passes: Vec<Vec<usize>> = (0..block.repeats).map(nodes).collect();
+    let inputs = |n: usize| {
+        let mut ins = Vec::new();
+        poem_ir::Operands::inputs(&trace.nodes[n].op, &mut ins);
+        ins
+    };
+    let row_of = |v: ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+        Some(Def::Cache(row)) => Some(*row as usize),
+        _ => None,
+    };
+    for (j, &n0) in passes[0].iter().enumerate() {
+        for (at, &v) in inputs(n0).iter().enumerate() {
+            let Some(row) = row_of(v) else { continue };
+            let Some(first) = kv(row) else { continue };
+            let rows: Vec<Option<usize>> = (passes.iter())
+                .map(|p| inputs(p[j]).get(at).copied().and_then(row_of))
+                .collect();
+            let second = rows[1].and_then(kv);
+            for (k, r) in rows.iter().enumerate() {
+                let laid = r.and_then(kv);
+                let step = |plane: usize| second.map(|s| s.maps[plane].1 - first.maps[plane].1);
+                let whole = laid.is_some_and(|l| {
+                    l.views == first.views
+                        && (0..2).all(|p| {
+                            l.maps[p].0 == first.maps[p].0
+                                && step(p)
+                                    .is_some_and(|d| l.maps[p].1 == first.maps[p].1 + k as i64 * d)
+                        })
+                });
+                if !whole {
+                    return Err(format!(
+                        "cache row {}'s pages do not lie a whole step on from row {row}'s, in \
+                         its views at its strides",
+                        r.map_or_else(|| "?".to_string(), |r| r.to_string())
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The weights `regions`' nodes read, in the order they first read them.

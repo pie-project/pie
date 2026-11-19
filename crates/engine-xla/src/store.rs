@@ -1482,6 +1482,16 @@ impl Pools {
         }
     }
 
+    /// Kv cache row `row`'s keys and values planes as the load lays them:
+    /// each a view of the pool and the map from a page to its own.
+    #[must_use]
+    pub fn kv_laid(&self, row: usize) -> Option<[(Tensor, Map); 2]> {
+        match self.seats.get(row)? {
+            Seat::Kv { keys, values, .. } => Some([*keys, *values]),
+            Seat::State { .. } => None,
+        }
+    }
+
     /// The pools as kernel handles, with this fire's page geometry and each
     /// record piece's slot id table (`slots`, by [`Pools::records`]).
     pub fn table(&self, seats: &[TableSeat], slots: &[Tensor]) -> Result<CacheTable> {
