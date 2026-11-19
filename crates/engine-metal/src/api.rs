@@ -1228,7 +1228,15 @@ impl Engine for Metal {
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
+        self.loaded_mut()?
+            .program_instance_taking(instance, channel)
+            .map_err(fault)?
+            .ok_or(Error::Closed {
+                what: "instance",
+                id: instance.0,
+            })?
+            .take(channel)
+            .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -1465,6 +1473,8 @@ impl Metal {
                     pages: pages_of[at].as_deref().unwrap_or(&[]),
                     held: pages_of[at].is_some().then_some(lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
