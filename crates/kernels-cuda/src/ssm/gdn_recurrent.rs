@@ -209,11 +209,12 @@ pub struct GdnGated {
     pub a_log: Tensor,
 }
 
-/// The gated-delta decode step over each lane's carried rows then its own
-/// ([`Carry`]): the fused step's tile, loaded once, steps the carried rows
-/// (their conv outputs from the carried scratch, their gates from their
-/// buffered `[b | a]`) and the own row, and is stored at the lane's commit
-/// length; the own row's `[b | a]` lands in the lane's buffer. The fused
+/// The gated-delta decode step over each lane's buffered rows then its own
+/// ([`Carry`]: planes `[b | a]`, keys, corrected values): the fused step's
+/// tile, loaded once, folds the carried rows the lane commits, reads the
+/// rest as a linear attention for the own row's corrected value and output,
+/// folds the own row where it commits too, and is stored once; the own
+/// row's `[b | a]` and corrected value land in the lane's buffer. The fused
 /// step's shapes only: another is refused by name.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_carried(
@@ -283,6 +284,76 @@ pub fn gated_delta_carried(
             state.write_state.arg(),
             state.write_state_mask.arg(),
             stated(OP, tiles)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The rows a chunked gated-delta fire's lanes land in their buffer past
+/// their commit, made ready for a later decode ([`gated_delta_carried`]):
+/// each row's corrected value and keys into the lane's buffer (planes 2 and
+/// 1; its `[b | a]`, plane 0, the gate prep lands), stepped in order from
+/// the state the fire left. `qkv` and `gates` are the fire's own rows by
+/// `qo_indptr`, or with `ext` its extended rows (row `RsLane::ext + j`).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_tail(
+    ctx: &Ctx,
+    qkv: Tensor,
+    gates: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_chunked";
+    const WARPS: u32 = 4;
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    if !(k_dim.is_multiple_of(16) && k_dim <= FUSED_BK && v_dim.is_multiple_of(FUSED_BV)) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a buffered row's corrected value steps in the fused tile only: key heads of \
+                 {k_dim} and value heads of {v_dim} do not lie in it"
+            ),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    let tiles = v_heads * (v_dim / FUSED_BV);
+    let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_tail_corrected<4>"))
+            .apply(Launch::grid([tiles.div_ceil(WARPS), lanes, 1], [32 * WARPS, 1, 1])),
+        &[
+            qkv.arg(),
+            gates.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            rows.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            stated(OP, conv_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
             carry.arg(),
             ctx.stage(),
         ],

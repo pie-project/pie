@@ -23,7 +23,19 @@ pub struct Planes(
     HashMap<u32, Plane>,
     std::collections::HashSet<u32>,
     std::collections::HashSet<u32>,
+    HashMap<u32, Corrected>,
+    HashMap<u32, (Plane, u32)>,
 );
+
+/// A gated-delta layer's corrected planes (`ChunkProfile::rs_corrected`):
+/// each buffered row's keys (the conv output's key heads, bf16) and its
+/// corrected values (`u = beta (v - g S^T k)`, the value its delta rule
+/// writes, f32: `width` counts bf16 elements, two a value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Corrected {
+    pub k: Plane,
+    pub u: Plane,
+}
 
 impl Planes {
     #[must_use]
@@ -44,6 +56,19 @@ impl Planes {
     #[must_use]
     pub fn step_gates(&self, gates: ValueId) -> bool {
         self.2.contains(&gates.0)
+    }
+
+    /// The corrected planes of the gated-delta recurrence landing `y`.
+    #[must_use]
+    pub fn corrected(&self, y: ValueId) -> Option<Corrected> {
+        self.3.get(&y.0).copied()
+    }
+
+    /// Where a decode conv landing `y` (a gated-delta layer's `q k v`) lands
+    /// its row's keys: their plane, and the channel of `y` they start at.
+    #[must_use]
+    pub fn keys_of(&self, y: ValueId) -> Option<(Plane, u32)> {
+        self.4.get(&y.0).copied()
     }
 
     #[must_use]
@@ -258,6 +283,11 @@ enum Reads {
     GatedDelta {
         qkv: ValueId,
         gates: ValueId,
+        /// Its output, which names its corrected planes, and the elements
+        /// a row of its keys and of its values.
+        y: ValueId,
+        keys: u64,
+        values: u64,
     },
     Kda {
         mixed: ValueId,
@@ -286,6 +316,8 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
 
         let mut planes: HashMap<u32, Plane> = HashMap::new();
         let mut step_gates = std::collections::HashSet::new();
+        let mut corrected = HashMap::new();
+        let mut keys_of = HashMap::new();
         // The elements a token of each layer, prompt forms and step forms.
         let mut widths: Vec<u64> = Vec::new();
         let mut decode_widths: Vec<u64> = Vec::new();
@@ -344,17 +376,41 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                 continue;
             }
             let (reads, chunked) = match &node.op {
-                Operation::Ssm(Ssm::GatedDeltaChunked { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDeltaChunked {
+                    qkv,
+                    gates,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
+                        y: *y,
+                        keys: u64::from(k_heads * k_dim),
+                        values: u64::from(v_heads * v_dim),
                     },
                     true,
                 ),
-                Operation::Ssm(Ssm::GatedDelta { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDelta {
+                    qkv,
+                    gates,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
+                        y: *y,
+                        keys: u64::from(k_heads * k_dim),
+                        values: u64::from(v_heads * v_dim),
                     },
                     false,
                 ),
@@ -465,6 +521,29 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                 );
                 here += width;
             }
+            // The keys and corrected values after them, as the recipe's
+            // rs row lays them (`rs_corrected`).
+            if let Reads::GatedDelta {
+                y, keys, values, ..
+            } = reads
+            {
+                let k = Plane {
+                    layer,
+                    at: page * here,
+                    width: keys,
+                };
+                here += keys;
+                let u = Plane {
+                    layer,
+                    at: page * here,
+                    width: 2 * values,
+                };
+                here += 2 * values;
+                corrected.insert(y.0, Corrected { k, u });
+                if let Reads::GatedDelta { qkv, .. } = reads {
+                    keys_of.insert(qkv.0, (k, u32::try_from(keys).unwrap_or(u32::MAX)));
+                }
+            }
             if chunked {
                 widths.push(here);
                 layers += 1;
@@ -486,7 +565,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             return Ok(None);
         }
         let lone_rows = lone.values().map(|(x, _)| x.0).collect();
-        Ok(Some((Planes(planes, lone_rows, step_gates), widths)))
+        Ok(Some((Planes(planes, lone_rows, step_gates, corrected, keys_of), widths)))
     }
 }
 

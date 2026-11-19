@@ -3308,8 +3308,10 @@ fn unsettle(
 /// recurrent state or windows: each group's no further than where the rows
 /// its program has accepted end ([`Cursor::accepted`], bounded by the
 /// run-ahead window), so the rows past them stay buffered and a stop takes
-/// them back. A fold the device counts, or over a folded length the host
-/// does not know, stays as stated.
+/// them back; and none until the accepted rows past the fold fill the
+/// run-ahead window, which a fold then takes whole. A fold the device
+/// counts, or over a folded length the host does not know, stays as
+/// stated.
 ///
 /// [`Cursor::accepted`]: crate::inferlet::host::working_set::Cursor::accepted
 fn lagged_fold(
@@ -3335,6 +3337,14 @@ fn lagged_fold(
             .unwrap()
             .accepted(landings[first].start, bound);
         let room = accepted.saturating_sub(place.folded);
+        // The accepted rows stay buffered until they fill the window: a
+        // decode reads its buffered rows and the committed state, and
+        // writes the state back only as a fold lands, once a window.
+        let room = if room >= u32::try_from(bound).unwrap_or(u32::MAX) {
+            room
+        } else {
+            0
+        };
         for &lane in group {
             counts[lane] = counts[lane].min(room);
         }

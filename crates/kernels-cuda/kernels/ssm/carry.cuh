@@ -35,8 +35,8 @@ struct Carry {
     const u32* replay_tok;
     const int* commit_len;
     u8* scratch;
-    u64 plane_off[2];
-    u64 plane_stride[2];
+    u64 plane_off[3];
+    u64 plane_stride[3];
     u32 page_tokens;
     u32 pad_;
 

@@ -388,61 +388,72 @@ __global__ void __launch_bounds__(W * 32) gdn_step_fused(
     gdn_cp_wait_all();
 }
 
-// One step of a warp's tile of the gated delta rule from the state in its
-// registers (`gdn_step_fused`'s layout): the row's q and k (normalized here,
-// q scaled), its value slice, decay and beta. `S` the state after it, each
-// cell rounded as a fold stores it when `ROUND` (a carried row, whose state
-// the next row reads as a store and reload would hand it); `o` the row's
-// output columns, summed over the warp, where `OUT`.
-template <bool ROUND, bool OUT>
-__device__ __forceinline__ void gdn_tile_step(
-    float (&s)[8][8], float (&qi)[8], float (&ki)[8], float qs, float ks,
-    const float (&vv)[8], float g, float beta, float q_scale, float (&o)[8])
+// The gated delta rule over a lane's buffered rows as a linear attention
+// (`Carry`). A row's step is `S_s = g_s S_{s-1} + k_s u_s^T`, with its
+// corrected value `u_s = beta_s (v_s - g_s S_{s-1}^T k_s)`; from the
+// committed state `S`, after buffered rows `1..m`,
+//   S_t = G_{0,t} S + sum_s G_{s,t} k_s u_s^T,   G_{s,t} = prod_{s<i<=t} g_i,
+// so a row's output and its own `u` read the state once and each buffered
+// row as two dots: `S_t^T q = G_{0,t} S^T q + sum_s G_{s,t} (k_s . q) u_s`.
+// A buffered row keeps its keys and its `u` (planes 1 and 2 of the lane's rs
+// buffer pages; its `[b | a]`, plane 0, gives its gate), written once, when
+// it is a fire's own row; a fold applies `S <- g S + k u^T` a committed row.
+// The decays are formed in f32 from per-row log-gates, never as a ratio.
+
+// A warp's tile keys from a key row (lane `l` its rows `l / 2 + 16 m`),
+// normalized as the fused step normalizes them, times `scale`.
+__device__ __forceinline__ void gdn_keys(const bf16* __restrict__ row, int i0, int K_d,
+                                         float scale, float (&ki)[8])
 {
-    constexpr int MR = 8;
-    constexpr int VEC = 8;
-    const float nq = rsqrtf(0.5f * warp_sum(qs) + 1e-6f) * q_scale;
-    const float nk = rsqrtf(0.5f * warp_sum(ks) + 1e-6f);
+    float ks = 0.f;
     #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        qi[m] *= nq;
-        ki[m] *= nk;
+    for (int m = 0; m < 8; ++m) {
+        ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(row[i0 + 16 * m]) : 0.f;
+        ks += ki[m] * ki[m];
     }
-    float x[VEC];
+    const float nk = rsqrtf(0.5f * warp_sum(ks) + 1e-6f) * scale;
     #pragma unroll
-    for (int u = 0; u < VEC; ++u) x[u] = 0.f;
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) x[u] += s[m][u] * g * ki[m];
-    }
-    gdn_rows_sum(x);
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        x[u] = (vv[u] - x[u]) * beta;
-        o[u] = 0.f;
-    }
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            const float sg = __bfloat162float(__float2bfloat16(s[m][u] * g));
-            const float sn = sg + ki[m] * x[u];
-            if constexpr (OUT) o[u] += sn * qi[m];
-            s[m][u] = ROUND ? __bfloat162float(__float2bfloat16(sn)) : sn;
-        }
-    }
-    if constexpr (OUT) gdn_rows_sum(o);
+    for (int m = 0; m < 8; ++m) ki[m] *= nk;
 }
 
-// `gdn_step_fused` over a lane's carried rows then its own (`Carry`): the
-// warp loads its state tile once, steps each row the lane buffered past its
-// committed state (its conv outputs from the carried scratch, its `[b | a]`
-// from its rs buffer pages, gated here as `gdn_prep_ba_gates` gates them),
-// then its own row, and stores the tile once, as it stands after `commit`
-// rows of the run. Each carried step rounds the state as a store would, so
-// the state and the own row's output are the bits a fold a row would give.
-// Carried rows land no output. The own row's `[b | a]` lands in its buffer.
+// A buffered row's log-gate from its `[b | a]`, as `gdn_prep_ba_gates`
+// forms it.
+__device__ __forceinline__ float gdn_log_gate(const bf16* __restrict__ ba, int h, int V_h,
+                                              const bf16* __restrict__ dt_bias,
+                                              const float* __restrict__ a_log)
+{
+    const float z = Elem<bf16>::to_f32(ba[V_h + h]) + Elem<bf16>::to_f32(dt_bias[h]);
+    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+    return -__expf(a_log[h]) * sp;
+}
+
+// A warp's columns of a buffered row's `u` (f32, eight from `j0`).
+__device__ __forceinline__ void gdn_u8(const float* __restrict__ u, float (&uu)[8])
+{
+    const float4 a = reinterpret_cast<const float4*>(u)[0];
+    const float4 b = reinterpret_cast<const float4*>(u)[1];
+    uu[0] = a.x; uu[1] = a.y; uu[2] = a.z; uu[3] = a.w;
+    uu[4] = b.x; uu[5] = b.y; uu[6] = b.z; uu[7] = b.w;
+}
+
+// The fold of one row into the warp's tile: `S <- g S + k u^T`.
+__device__ __forceinline__ void gdn_fold_row(float (&s)[8][8], float g, const float (&ki)[8],
+                                             const float (&uu)[8])
+{
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) s[m][u] = g * s[m][u] + ki[m] * uu[u];
+    }
+}
+
+// `gdn_step_fused` over a lane's buffered rows then its own: the warp loads
+// its state tile once, folds the rows the lane commits among its carried
+// ones (`commit`), reads the rest as a linear attention for its own row's
+// `u` and output, folds the own row where the lane commits it too, and
+// stores the tile once if it folded any. The own row's `[b | a]` and `u`
+// land in its buffer (its keys land with the conv's output). The state is
+// rounded to bf16 only as it is stored.
 template <int W>
 __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     const bf16* __restrict__ qkv_post,
@@ -471,7 +482,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     const int group = V_h / K_h;
     const int K_dim = K_h * K_d;
     const int live_rows = win != nullptr ? static_cast<int>(win[0]) : 0x7fffffff;
-    const u64 conv_bytes = static_cast<u64>(conv_dim) * sizeof(bf16);
 
     struct Tile {
         bool live;
@@ -566,7 +576,103 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             const int n = carry.carried(cl);
             const int commit = carry.commit(cur.rl, n + 1);
             const bool fold = cur.fold && commit > 0;
-            auto store = [&]() {
+            // The carried rows the lane commits fold first.
+            const int folded = fold ? min(commit, n) : 0;
+            for (int j = 0; j < folded; ++j) {
+                float ki[MR];
+                gdn_keys(carry.carried_row<bf16>(cl, j, 1) + (long long)h_k * K_d, i0, K_d, 1.f, ki);
+                float uu[VEC];
+                gdn_u8(carry.carried_row<float>(cl, j, 2) + (long long)cur.h * V_d + cur.j0, uu);
+                const float g = __expf(gdn_log_gate(carry.carried_row<bf16>(cl, j, 0), cur.h, V_h, dt_bias, a_log));
+                gdn_fold_row(s, g, ki, uu);
+            }
+            // The own row: q (scaled), k, v, its log-gate and beta.
+            const bf16* sq = reinterpret_cast<const bf16*>(st + 4096);
+            const bf16* sk = reinterpret_cast<const bf16*>(st + 4096 + 256);
+            float qi[MR];
+            float ki[MR];
+            gdn_keys(sq, i0, K_d, q_scale, qi);
+            gdn_keys(sk, i0, K_d, 1.f, ki);
+            float vv[VEC];
+            unpack8(*reinterpret_cast<const uint4*>(st + 4608 + (lane & 1) * 16), vv);
+            const float* sgate = reinterpret_cast<const float*>(st + 4640);
+            const float glog_n = sgate[0];
+            const float beta = sgate[1];
+            // S^T q and S^T k over the tile.
+            float xq[VEC];
+            float xk[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) {
+                xq[u] = 0.f;
+                xk[u] = 0.f;
+            }
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    xq[u] += s[m][u] * qi[m];
+                    xk[u] += s[m][u] * ki[m];
+                }
+            }
+            gdn_rows_sum(xq);
+            gdn_rows_sum(xk);
+            // The decay from the state to the own row: the unfolded carried
+            // rows' log-gates and its own.
+            float total = glog_n;
+            for (int j = folded; j < n; ++j) {
+                total += gdn_log_gate(carry.carried_row<bf16>(cl, j, 0), cur.h, V_h, dt_bias, a_log);
+            }
+            const float g0 = __expf(total);
+            float a[VEC];
+            float o[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) {
+                a[u] = g0 * xk[u];
+                o[u] = g0 * xq[u];
+            }
+            float run = 0.f;
+            for (int j = folded; j < n; ++j) {
+                const bf16* krow = carry.carried_row<bf16>(cl, j, 1) + (long long)h_k * K_d;
+                float kj[MR];
+                gdn_keys(krow, i0, K_d, 1.f, kj);
+                float dk = 0.f;
+                float dq = 0.f;
+                #pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    dk += kj[m] * ki[m];
+                    dq += kj[m] * qi[m];
+                }
+                dk = 0.5f * warp_sum(dk);
+                dq = 0.5f * warp_sum(dq);
+                run += gdn_log_gate(carry.carried_row<bf16>(cl, j, 0), cur.h, V_h, dt_bias, a_log);
+                const float w = __expf(total - run);
+                float uu[VEC];
+                gdn_u8(carry.carried_row<float>(cl, j, 2) + (long long)cur.h * V_d + cur.j0, uu);
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    a[u] += w * dk * uu[u];
+                    o[u] += w * dq * uu[u];
+                }
+            }
+            float kq = 0.f;
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) kq += ki[m] * qi[m];
+            kq = 0.5f * warp_sum(kq);
+            float un[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) {
+                un[u] = beta * (vv[u] - a[u]);
+                o[u] += kq * un[u];
+            }
+            if (lane < 2) {
+                if (float* dst = carry.own_row<float>(cl, 0, 2)) {
+                    float4* d4 = reinterpret_cast<float4*>(dst + (long long)cur.h * V_d + cur.j0);
+                    d4[0] = make_float4(un[0], un[1], un[2], un[3]);
+                    d4[1] = make_float4(un[4], un[5], un[6], un[7]);
+                }
+            }
+            if (fold) {
+                if (commit == n + 1) gdn_fold_row(s, __expf(glog_n), ki, un);
                 #pragma unroll
                 for (int m = 0; m < MR; ++m) {
                     if (16 * m >= K_d) break;
@@ -576,54 +682,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     for (int u = 0; u < 4; ++u) w32[u] = pack_bf16x2(s[m][2 * u], s[m][2 * u + 1]);
                     *reinterpret_cast<uint4*>(cur.cell + (long long)(i0 + 16 * m) * V_d) = packed;
                 }
-            };
-            for (int j = 0; j < n; ++j) {
-                const bf16* row = carry.scratch_row<bf16>(cl, j, conv_bytes);
-                float qi[MR];
-                float ki[MR];
-                float qs = 0.f;
-                float ks = 0.f;
-                #pragma unroll
-                for (int m = 0; m < MR; ++m) {
-                    const int i = i0 + 16 * m;
-                    qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(row[h_k * K_d + i]) : 0.f;
-                    ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(row[K_dim + h_k * K_d + i]) : 0.f;
-                    qs += qi[m] * qi[m];
-                    ks += ki[m] * ki[m];
-                }
-                float vv[VEC];
-                unpack8(*reinterpret_cast<const uint4*>(row + 2 * K_dim + (long long)cur.h * V_d + cur.j0), vv);
-                const bf16* bar = carry.carried_row<bf16>(cl, j, 0);
-                const float bv = Elem<bf16>::to_f32(bar[cur.h]);
-                const float av = Elem<bf16>::to_f32(bar[V_h + cur.h]);
-                const float z = av + Elem<bf16>::to_f32(dt_bias[cur.h]);
-                const float sp = (z > 20.f) ? z : log1pf(__expf(z));
-                const float g_log = -__expf(a_log[cur.h]) * sp;
-                const float beta = 1.f / (1.f + __expf(-bv));
-                float o[VEC];
-                gdn_tile_step<true, false>(s, qi, ki, qs, ks, vv, __expf(g_log), beta, q_scale, o);
-                if (fold && j + 1 == commit) store();
             }
-            const bf16* sq = reinterpret_cast<const bf16*>(st + 4096);
-            const bf16* sk = reinterpret_cast<const bf16*>(st + 4096 + 256);
-            float qi[MR];
-            float ki[MR];
-            float qs = 0.f;
-            float ks = 0.f;
-            #pragma unroll
-            for (int m = 0; m < MR; ++m) {
-                const int i = i0 + 16 * m;
-                qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sq[i]) : 0.f;
-                ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sk[i]) : 0.f;
-                qs += qi[m] * qi[m];
-                ks += ki[m] * ki[m];
-            }
-            float vv[VEC];
-            unpack8(*reinterpret_cast<const uint4*>(st + 4608 + (lane & 1) * 16), vv);
-            const float* sgate = reinterpret_cast<const float*>(st + 4640);
-            float o[VEC];
-            gdn_tile_step<false, true>(s, qi, ki, qs, ks, vv, __expf(sgate[0]), sgate[1], q_scale, o);
-            if (fold && commit == n + 1) store();
             if (lane < 2) {
                 float4* dst = reinterpret_cast<float4*>(
                     out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
@@ -635,6 +694,138 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         cur = nxt;
     }
     gdn_cp_wait_all();
+}
+
+// The buffered rows a chunked fire's lanes land past their commit, made
+// ready for a later decode's linear attention: each row's corrected value
+// `u` (plane 2) and its keys (plane 1), from the state as the fire left it
+// (folded through the lane's commit, or as it stood where the lane folds
+// nothing), stepping the lane's rows past the commit in order (a carried
+// one by its stored `u`, an own one forming its `u`). The state stays as it
+// was. A warp a 16-column tile of a (lane, head), the own rows' `q k v`
+// rows (`qkv_post`) and gates read where the fire lays them: the lane's
+// extended rows (`ext`: row `RsLane::ext + j`) or its own rows
+// (`qo_indptr`, the window's row offset `win[1]`).
+template <int W>
+__global__ void __launch_bounds__(W * 32) gdn_tail_corrected(
+    const bf16* __restrict__ qkv_post,
+    const float* __restrict__ gates,
+    const bf16* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    StateRows rows,
+    const u32* __restrict__ qo_indptr,
+    bool ext,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    int lanes_stated,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    constexpr int MR = 8;
+    constexpr int VEC = 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int i0 = lane >> 1;
+    const int vts = V_d / 16;
+    const int group = V_h / K_h;
+    const int K_dim = K_h * K_d;
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = blockIdx.y;
+    if (r >= lanes) return;
+    const int tile = blockIdx.x * W + warp;
+    if (tile >= V_h * vts) return;
+    const int vt = tile % vts;
+    const int h = tile / vts;
+    const int h_k = h / group;
+    const int j0 = vt * 16 + (lane & 1) * VEC;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, write_state_mask, rl) ? carry.commit(rl, run) : 0;
+    if (start >= run) return;
+    const __nv_bfloat16* cell = rows.atom<__nv_bfloat16>(rid, h, (long long)K_d * V_d) + j0;
+    float s[MR][VEC];
+    #pragma unroll
+    for (int m = 0; m < MR; ++m) {
+        if (16 * m < K_d) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(cell + (long long)(i0 + 16 * m) * V_d);
+            const unsigned* w32 = reinterpret_cast<const unsigned*>(&raw);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float2 f = gdn_unpack(w32[u]);
+                s[m][2 * u] = f.x;
+                s[m][2 * u + 1] = f.y;
+            }
+        } else {
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) s[m][u] = 0.f;
+        }
+    }
+    for (int j = start; j < run; ++j) {
+        float ki[MR];
+        float uu[VEC];
+        float g;
+        if (j < n) {
+            gdn_keys(carry.carried_row<bf16>(cl, j, 1) + (long long)h_k * K_d, i0, K_d, 1.f, ki);
+            gdn_u8(carry.carried_row<float>(cl, j, 2) + (long long)h * V_d + j0, uu);
+            g = __expf(gdn_log_gate(carry.carried_row<bf16>(cl, j, 0), h, V_h, dt_bias, a_log));
+        } else {
+            const int e = j - n;
+            const long long at = ext ? static_cast<long long>(cl.ext) + j
+                                     : static_cast<long long>(row0) + qo_indptr[r] + e;
+            const bf16* row = qkv_post + at * conv_dim;
+            const bf16* krow = row + K_dim + (long long)h_k * K_d;
+            gdn_keys(krow, i0, K_d, 1.f, ki);
+            // The key head's first tile lands the row's keys.
+            if (vt == 0 && h % group == 0 && (lane & 1) == 0) {
+                if (bf16* dst = carry.own_row<bf16>(cl, e, 1)) {
+                    #pragma unroll
+                    for (int m = 0; m < MR; ++m) {
+                        if (16 * m < K_d) dst[(long long)h_k * K_d + i0 + 16 * m] = krow[i0 + 16 * m];
+                    }
+                }
+            }
+            const float* gr = gates + at * 2 * V_h;
+            const float glog = gr[h];
+            const float beta = gr[V_h + h];
+            g = __expf(glog);
+            float vv[VEC];
+            const uint4 vraw = *reinterpret_cast<const uint4*>(row + 2 * K_dim + (long long)h * V_d + j0);
+            const unsigned* w32 = reinterpret_cast<const unsigned*>(&vraw);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float2 f = gdn_unpack(w32[u]);
+                vv[2 * u] = f.x;
+                vv[2 * u + 1] = f.y;
+            }
+            float xk[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) xk[u] = 0.f;
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) xk[u] += s[m][u] * ki[m];
+            }
+            gdn_rows_sum(xk);
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) uu[u] = beta * (vv[u] - g * xk[u]);
+            if (lane < 2) {
+                if (float* dst = carry.own_row<float>(cl, e, 2)) {
+                    float4* d4 = reinterpret_cast<float4*>(dst + (long long)h * V_d + j0);
+                    d4[0] = make_float4(uu[0], uu[1], uu[2], uu[3]);
+                    d4[1] = make_float4(uu[4], uu[5], uu[6], uu[7]);
+                }
+            }
+        }
+        gdn_fold_row(s, g, ki, uu);
+    }
 }
 
 }

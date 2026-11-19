@@ -1362,6 +1362,38 @@ impl<'c> Run<'c> {
                 .is_some_and(|seat| seat.buffers.planes().step_gates(gates))
     }
 
+    /// Value `id`'s buffered plane.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_plane(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<crate::store::rs::Plane, kernels_cuda::Error> {
+        self.rs
+            .as_ref()
+            .and_then(|seat| seat.buffers.planes().of(id))
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no plane this load buffers, so a lane's carried rows have \
+                     nowhere to be read from",
+                    id.0
+                ),
+            })
+    }
+
+    /// The window's qo boundaries as its recurrent kernels read them.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_qo_indptr(&self) -> Tensor {
+        self.rs_indptr().0
+    }
+
+    /// This load's buffered planes, where the fire buffers.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_planes(&self) -> Option<&'c crate::store::rs::Planes> {
+        self.rs.as_ref().map(|seat| seat.buffers.planes())
+    }
+
     /// The carried rows a decode step of this window reads: the staged
     /// tables, the commit lengths of `pool`, the places of the step's
     /// buffered `planes` (in the order its kernel reads them) and the
@@ -1370,7 +1402,7 @@ impl<'c> Run<'c> {
     pub(crate) fn rs_carry(
         &self,
         op: &'static str,
-        planes: &[ValueId],
+        planes: &[crate::store::rs::Plane],
         scratch: u64,
         pool: &RecurrentPool,
     ) -> Result<kernels_cuda::ssm::Carry, kernels_cuda::Error> {
@@ -1387,19 +1419,7 @@ impl<'c> Run<'c> {
             page_tokens: tables.page_tokens.max(1),
             ..kernels_cuda::ssm::Carry::NONE
         };
-        for (at, &id) in planes.iter().enumerate() {
-            let plane = seat
-                .buffers
-                .planes()
-                .of(id)
-                .ok_or_else(|| kernels_cuda::Error::Backend {
-                    op,
-                    detail: format!(
-                        "value {} is no plane this load buffers, so a lane's carried rows have \
-                         nowhere to be read from",
-                        id.0
-                    ),
-                })?;
+        for (at, &plane) in planes.iter().enumerate() {
             let place = seat
                 .buffers
                 .place(plane)

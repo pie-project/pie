@@ -732,15 +732,17 @@ __global__ void conv1d_update_vec8(
     *reinterpret_cast<uint4*>(state + (long long)span * cs + ci) = xv.raw;
 }
 
-// A decode step over a lane's carried rows then its own (`Carry`): the
-// window slides from the committed state through the rows the lane
-// buffered past it, read from its rs buffer pages, then its own row, which
-// lands in its buffer too. The carried rows' outputs go to the carried
-// scratch (where the fire's recurrence reads them; none for a lone conv),
-// the own row's to `y`, and the window is stored as it stands after
-// `commit` rows of the run: never past a row the lane has not committed.
-// Each row's sum is `conv1d_update`'s, in its order, so a carried row
-// answers what it answered when it ran. A thread a channel, any dilation.
+// A decode step over a lane's carried rows then its own (`Carry`). Row t of
+// the lane's run is a carried row (t < n, its input read from the lane's rs
+// buffer pages, plane 0) or its own (t = n), and positions below 0 are the
+// committed window's cells. The own row's output is the sum over its window,
+// `conv1d_update`'s in its order, from at most `K - 1` carried rows; where a
+// recurrence re-steps the carried rows (`carry.scratch`), their outputs land
+// there too. The window is stored as it stands after `commit` rows of the
+// run, never past a row the lane has not committed. The own row's input
+// lands in its buffer (plane 0), and the channels `[k_off, k_off + k_len)`
+// of its output in plane 1 (a gated-delta layer's keys). A thread a channel,
+// any dilation.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void conv1d_carried(
     const T* __restrict__ x,
@@ -752,6 +754,7 @@ __global__ void conv1d_carried(
     bool write_state,
     const u8* __restrict__ write_state_mask,
     Carry carry,
+    int k_off, int k_len,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.y;
@@ -770,8 +773,6 @@ __global__ void conv1d_carried(
     T* state = rows.piece<T>(rid, c / cs);
     const int n = carry.carried(lane);
     const int span = (K - 1) * dil + 1;
-    // Row t of the run: the state's window below 0, the carried rows, then
-    // the own row.
     auto at = [&](int t) -> float {
         if (t < 0) return Elem<T>::to_f32(state[(span + t) * cs + ci]);
         if (t < n) return Elem<T>::to_f32(carry.carried_row<T>(lane, t, 0)[c]);
@@ -779,7 +780,7 @@ __global__ void conv1d_carried(
     };
     const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
     const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
-    for (int t = 0; t <= n; ++t) {
+    for (int t = carry.scratch != nullptr ? 0 : n; t <= n; ++t) {
         float acc = bias_v;
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
@@ -790,7 +791,10 @@ __global__ void conv1d_carried(
         const T out = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, at(t)));
         if (t == n) {
             y[(long long)r_row * C + c] = out;
-        } else if (carry.scratch != nullptr) {
+            if (c >= k_off && c < k_off + k_len) {
+                if (T* dst = carry.own_row<T>(lane, 0, 1)) dst[c - k_off] = out;
+            }
+        } else {
             carry.scratch_row<T>(lane, t, row_bytes)[c] = out;
         }
     }
@@ -804,9 +808,10 @@ __global__ void conv1d_carried(
 }
 
 // `conv1d_carried` eight channels a thread, `conv1d_update_vec8`'s sums: a
-// dilation of one, at most eight taps. The window rides in registers, the
-// state's whole `K` cells (the oldest too, which the step keeps but never
-// reads), so the stored window is the one a fold a row would store.
+// dilation of one, at most eight taps. The window's `K` cells (the oldest
+// too, which the step keeps but never reads) are gathered from the state
+// and the carried rows, so the stored window is the one a fold a row would
+// store.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void conv1d_carried_vec8(
     const T* __restrict__ x,
@@ -818,6 +823,7 @@ __global__ void conv1d_carried_vec8(
     bool write_state,
     const u8* __restrict__ write_state_mask,
     Carry carry,
+    int k_off, int k_len,
     const u32* __restrict__ win)
 {
     pdl_wait();
@@ -855,17 +861,38 @@ __global__ void conv1d_carried_vec8(
         if (t < K) wv[t].raw = w[t];
     }
     const T* wflat = &wv[0].e[0];
-    // Cells 0..K-1 of the window, the newest last.
-    Vec h[K_MAX];
+    // The committed window's cells, positions -K..-1, the newest last.
+    Vec hs[K_MAX];
     #pragma unroll
     for (int k = 0; k < K_MAX; ++k) {
-        if (k < K) h[k].raw = *reinterpret_cast<const uint4*>(state + (long long)k * cs + ci);
+        if (k < K) hs[k].raw = *reinterpret_cast<const uint4*>(state + (long long)k * cs + ci);
     }
     const int n = carry.carried(lane);
     const int commit = carry.commit(rl, n + 1);
     const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
     const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
-    auto step = [&](const Vec& xv) {
+    // Run position t's input: a committed cell, a carried row or the own row.
+    auto cell = [&](int t) {
+        Vec v;
+        if (t < 0) {
+            #pragma unroll
+            for (int k = 0; k < K_MAX; ++k) {
+                if (k == K + t) v = hs[k];
+            }
+        } else if (t < n) {
+            v.raw = *reinterpret_cast<const uint4*>(carry.carried_row<T>(lane, t, 0) + c0);
+        } else {
+            v = xo;
+        }
+        return v;
+    };
+    // Position t's output from its window (cells t - K + 1 .. t).
+    auto step = [&](int t) {
+        Vec win_[K_MAX];
+        #pragma unroll
+        for (int k = 0; k < K_MAX; ++k) {
+            if (k < K) win_[k] = cell(t - (K - 1) + k);
+        }
         float acc[VEC];
         #pragma unroll
         for (int u = 0; u < VEC; ++u) {
@@ -876,46 +903,46 @@ __global__ void conv1d_carried_vec8(
             if (k >= span) break;
             #pragma unroll
             for (int u = 0; u < VEC; ++u) {
-                acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(h[k + 1].e[u]);
+                acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(win_[k].e[u]);
             }
-        }
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(xv.e[u]);
         }
         Vec yv;
         #pragma unroll
         for (int u = 0; u < VEC; ++u) {
-            yv.e[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(xv.e[u])));
-        }
-        #pragma unroll
-        for (int k = 0; k < K_MAX - 1; ++k) {
-            if (k < span) h[k] = h[k + 1];
-        }
-        #pragma unroll
-        for (int k = 0; k < K_MAX; ++k) {
-            if (k == span) h[k] = xv;
+            #pragma unroll
+            for (int k = 0; k < K_MAX; ++k) {
+                if (k == span) {
+                    acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(win_[k].e[u]);
+                    yv.e[u] = Elem<T>::from_f32(
+                        conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(win_[k].e[u])));
+                }
+            }
         }
         return yv;
     };
-    auto store = [&]() {
-        #pragma unroll
-        for (int k = 0; k < K_MAX; ++k) {
-            if (k < K) *reinterpret_cast<uint4*>(state + (long long)k * cs + ci) = h[k].raw;
-        }
-    };
-    for (int j = 0; j < n; ++j) {
-        Vec xj;
-        xj.raw = *reinterpret_cast<const uint4*>(carry.carried_row<T>(lane, j, 0) + c0);
-        const Vec yj = step(xj);
-        if (carry.scratch != nullptr) {
+    if (carry.scratch != nullptr) {
+        for (int j = 0; j < n; ++j) {
+            const Vec yj = step(j);
             *reinterpret_cast<uint4*>(carry.scratch_row<T>(lane, j, row_bytes) + c0) = yj.raw;
         }
-        if (fold && j + 1 == commit) store();
     }
-    const Vec yo = step(xo);
+    const Vec yo = step(n);
     *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yo.raw;
-    if (fold && commit == n + 1) store();
+    if (c0 >= k_off && c0 < k_off + k_len) {
+        if (T* dst = carry.own_row<T>(lane, 0, 1)) {
+            *reinterpret_cast<uint4*>(dst + (c0 - k_off)) = yo.raw;
+        }
+    }
+    if (!fold) return;
+    Vec out[K_MAX];
+    #pragma unroll
+    for (int k = 0; k < K_MAX; ++k) {
+        if (k < K) out[k] = cell(commit - K + k);
+    }
+    #pragma unroll
+    for (int k = 0; k < K_MAX; ++k) {
+        if (k < K) *reinterpret_cast<uint4*>(state + (long long)k * cs + ci) = out[k].raw;
+    }
 }
 
 }

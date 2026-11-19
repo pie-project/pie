@@ -360,10 +360,12 @@ fn conv1d_chunked(
 }
 
 /// The causal conv's decode step over each lane's carried rows then its own
-/// ([`Carry`]): `conv1d_update`'s sums a row, the window slid from the
-/// committed state through the rows, the carried rows' outputs into the
-/// carried scratch, the window stored at the lane's commit length, the own
-/// row landed in the lane's buffer.
+/// ([`Carry`]): `conv1d_update`'s sums a row, the own row's window from the
+/// committed cells and at most `conv_width - 1` carried rows, the carried
+/// rows' outputs into the carried scratch where it is laid (a recurrence
+/// that re-steps them), the window stored at the lane's commit length; the
+/// own row's input lands in the lane's buffer (plane 0), and its output's
+/// channels `keys` (offset, count: a gated-delta layer's keys) in plane 1.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_carried(
     ctx: &Ctx,
@@ -375,6 +377,7 @@ pub fn causal_conv1d_carried(
     dilation: u32,
     y: &mut Tensor,
     carry: &Carry,
+    keys: Option<(u32, u32)>,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d";
     conv1d_carried(
@@ -389,6 +392,7 @@ pub fn causal_conv1d_carried(
         y,
         ConvOut::Silu,
         carry,
+        keys,
     )
 }
 
@@ -417,6 +421,7 @@ pub fn short_conv_carried(
         y,
         ConvOut::Residual,
         carry,
+        None,
     )
 }
 
@@ -433,6 +438,7 @@ fn conv1d_carried(
     y: &mut Tensor,
     out: ConvOut,
     carry: &Carry,
+    keys: Option<(u32, u32)>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
@@ -456,8 +462,9 @@ fn conv1d_carried(
         && bias.is_none_or(|b| aligned16(b.ptr))
         && aligned16(state.conv_slab.ptr)
         && aligned16(carry.scratch)
-        && carry.plane_off[0].is_multiple_of(16)
-        && carry.plane_stride[0].is_multiple_of(16);
+        && carry.plane_off.iter().all(|off| off.is_multiple_of(16))
+        && carry.plane_stride.iter().all(|stride| stride.is_multiple_of(16))
+        && keys.is_none_or(|(off, len)| off % CONV_VEC == 0 && len % CONV_VEC == 0);
     let mut args = vec![
         x.arg(),
         weight.arg(),
@@ -488,6 +495,8 @@ fn conv1d_carried(
         state.write_state.arg(),
         state.write_state_mask.arg(),
         carry.arg(),
+        stated(op, keys.map_or(0, |(off, _)| off))?.arg(),
+        stated(op, keys.map_or(0, |(_, len)| len))?.arg(),
         ctx.stage(),
     ]);
     ctx.fire(

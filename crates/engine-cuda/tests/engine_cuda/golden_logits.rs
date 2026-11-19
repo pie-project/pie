@@ -1585,10 +1585,12 @@ fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u
 }
 
 /// A lane folding `lag` rows behind its decodes answers, step for step,
-/// the bits the lane folding each row as it lands answers: its decode step
-/// replays the carried rows from the committed state in its own kernels,
-/// rounding the state as a store and reload would, in the body that
-/// buffers.
+/// what the lane folding each row as it lands answers, to the tolerance of
+/// the two forms of the recurrence: its decode step reads the buffered rows
+/// as a linear attention over their stored keys and corrected values from
+/// the committed state (rounded to bf16 only as a fold stores it), where
+/// the folding lane re-steps and stores the state a row. Its greedy tokens
+/// are the folding lane's but where the two lie within that tolerance.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
 fn golden_lagged() {
@@ -1609,6 +1611,7 @@ fn golden_lagged() {
         assert_eq!(lagged.len(), folded.len());
         let mut worst = 0f32;
         let mut moved = 0usize;
+        let mut flips = 0usize;
         for (lagged, folded) in lagged.iter().zip(&folded) {
             let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
             let apart = lagged
@@ -1617,19 +1620,35 @@ fn golden_lagged() {
                 .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
             worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
             moved += usize::from(lagged != folded);
+            let (a, b) = (argmax(lagged), argmax(folded));
+            if a != b {
+                let mut sorted = folded.clone();
+                sorted.sort_by(|x, y| y.total_cmp(x));
+                let gap = (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE);
+                if gap > 0.02 {
+                    flips += 1;
+                }
+            }
             if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
                 println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
             }
         }
         println!(
             "golden {model}-lagged lag {lag}: {} steps, {moved} differ, logits apart by \
-             {worst:e} of their scale, {unbodied} decode(s) walked with no body",
+             {worst:e} of their scale, {flips} greedy token(s) flipped off a near tie, \
+             {unbodied} decode(s) walked with no body",
             lagged.len()
         );
-        assert_eq!(
-            moved, 0,
+        // The two forms round apart: the folding lane's step rounds the
+        // decayed state to bf16 before its update and stores it a row, the
+        // lagged lane's sums in f32 and rounds as a fold stores. On this
+        // miniature they lie 0.012 to 0.023 of their scale apart, the own
+        // row's step alone as much as a lag of eleven (the chunked replay's
+        // band beside the scan's is 0.013 to 0.035, `golden_buffered_carrying`).
+        assert!(
+            worst < 0.05 && flips == 0,
             "at a lag of {lag} the lagged lane's logits lie {worst:e} of their scale from the \
-             folded lane's"
+             folded lane's, {flips} greedy token(s) flipped"
         );
         assert_eq!(unbodied, 0, "a lagged decode walked with no body");
     }
