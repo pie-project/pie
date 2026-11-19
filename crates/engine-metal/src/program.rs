@@ -365,6 +365,7 @@ impl Plane {
             pooled,
             self.rows,
             capture,
+            self.arms,
         ) {
             Ok(mut session) => {
                 // A decode envelope's next pass is staged while this one
@@ -755,6 +756,7 @@ impl Plane {
             program.plan.package.channels.len(),
             self.rows,
             self.capture_of(program),
+            self.arms,
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
         if layout.slots > instance_per_chunk {
@@ -914,6 +916,35 @@ impl Plane {
             return Ok(None);
         };
         bound.session.token_cell(&program.plan)
+    }
+
+    /// Passes of instance `id` that may fly while its next is staged:
+    /// none unless it runs ahead ([`Session::ahead_depth`]).
+    #[must_use]
+    pub fn ahead_depth(&self, id: InstanceId) -> usize {
+        self.instances
+            .get(&id)
+            .filter(|bound| bound.session.runs_ahead())
+            .map_or(0, |bound| bound.session.ahead_depth())
+    }
+
+    /// Whether the host may take from instance `id`'s channel `channel`
+    /// while its passes are still in flight: it runs ahead, and no stage of
+    /// its program takes from that channel (a pass in flight puts there at
+    /// most, past the committed cell the host takes, and its commit moves
+    /// the tail, not the head).
+    #[must_use]
+    pub fn takes_ahead(&self, id: InstanceId, channel: u32) -> bool {
+        let Some(bound) = self.instances.get(&id) else {
+            return false;
+        };
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return false;
+        };
+        bound.session.runs_ahead()
+            && ![Attach::Prologue, Attach::Epilogue]
+                .into_iter()
+                .any(|at| program.plan.takes_channel(channel, at))
     }
 
     /// Whether instance `id` keeps two passes in flight

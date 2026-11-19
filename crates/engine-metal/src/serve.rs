@@ -2957,6 +2957,36 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
+    /// The session the host takes from `channel` of: the frames that landed
+    /// harvested (their commits in), and, where the instance runs ahead and
+    /// its program never takes from that channel, its passes still in
+    /// flight left flying ([`crate::program::Plane::takes_ahead`]): what it
+    /// takes is a committed cell, which a pass in flight does not touch
+    /// (it puts past it, and its commit moves the tail). The runtime takes
+    /// on each landing; waiting out the next pass there held a lane to one
+    /// frame in flight. Any other access waits out every pass of it.
+    pub fn program_instance_taking(
+        &mut self,
+        instance_id: engine::InstanceId,
+        channel: u32,
+    ) -> Result<Option<&mut crate::program::Session>> {
+        if self.programs.takes_ahead(instance_id, channel) {
+            self.reap()?;
+            return Ok(self.programs.instance_mut(instance_id));
+        }
+        self.program_instance(instance_id)
+    }
+
+    /// Frames in flight carrying instance `id` (tests: what a take left
+    /// flying).
+    #[must_use]
+    pub fn frames_carrying(&self, id: engine::InstanceId) -> usize {
+        self.inflight
+            .iter()
+            .filter(|flight| flight.attached.iter().any(|(held, _)| *held == id))
+            .count()
+    }
+
     /// Releases a registered program no instance binds.
     pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
         self.programs.close_program(id)
@@ -3826,12 +3856,11 @@ impl Shell {
             })
             .collect();
         let allowed = |programs: &crate::program::Plane, held: &engine::InstanceId| -> usize {
-            usize::from(
-                ahead
-                    && !cohort.contains(held)
-                    && alone.get(held).copied().unwrap_or(false)
-                    && programs.runs_ahead(*held),
-            )
+            if ahead && !cohort.contains(held) && alone.get(held).copied().unwrap_or(false) {
+                programs.ahead_depth(*held)
+            } else {
+                0
+            }
         };
         loop {
             let mut carried: BTreeMap<engine::InstanceId, usize> = BTreeMap::new();
