@@ -87,6 +87,14 @@ pub enum Fault {
         word: u64,
     },
 
+    /// The instance attached at `lane` reads an output's rows past what its
+    /// lanes hold: refused, never launched into another request's rows.
+    OutputRows {
+        lane: u32,
+        instance: u64,
+        why: String,
+    },
+
     Adapterless {
         lane: u32,
     },
@@ -198,6 +206,7 @@ impl Fault {
             | Self::MaskRows { lane, .. }
             | Self::Positions { lane, .. }
             | Self::MaskUnread { lane, .. }
+            | Self::OutputRows { lane, .. }
             | Self::Adapterless { lane, .. }
             | Self::AdapterWord { lane, .. } => Some(*lane),
             Self::Fire(error) => error.lane(),
@@ -308,6 +317,15 @@ impl fmt::Display for Fault {
                 f,
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
+            ),
+            Self::OutputRows {
+                lane,
+                instance,
+                why,
+            } => write!(
+                f,
+                "the instance {instance} attached at lane {lane} is refused: {why}; it reads \
+                 only the rows its own lanes hold"
             ),
             Self::MaskUnread { lane, word } => write!(
                 f,

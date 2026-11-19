@@ -444,6 +444,20 @@ impl Session {
     /// Refuses a fire while a seat no stage reads is bound: an output at a
     /// lane past 0 that the program reads nothing at, nor a row of its
     /// lane-0 read reaches.
+    /// Whether a stage's lane-0 read of `name` covers the instance's lane
+    /// `lane` ([`super::launch::Prepared::covers`]).
+    #[must_use]
+    pub fn covers(&self, name: &str, lane: u32) -> bool {
+        self.prepared.iter().flatten().any(|prepared| prepared.covers(name, lane))
+    }
+
+    /// Why a stage of this instance reads rows past what its lanes' seats
+    /// hold, if one does ([`super::launch::Prepared::rows_unbounded`]).
+    #[must_use]
+    pub fn rows_unbounded(&self) -> Option<String> {
+        self.prepared.iter().flatten().find_map(super::launch::Prepared::rows_unbounded)
+    }
+
     pub fn refuse_unread(&self) -> Result<()> {
         match self.unread.first() {
             None => Ok(()),
@@ -468,10 +482,11 @@ impl Session {
         dtype: eta_ir::Dtype,
         width: u32,
         stride: u32,
+        rows_held: u32,
     ) -> Result<()> {
         let mut read = false;
         for prepared in self.prepared.iter_mut().flatten() {
-            read |= prepared.bind_output(name, lane, base, offset, dtype, width, stride)?;
+            read |= prepared.bind_output(name, lane, base, offset, dtype, width, stride, rows_held)?;
         }
         self.unread.retain(|(named, at)| !(named == name && *at == lane));
         if !read && lane > 0 {
