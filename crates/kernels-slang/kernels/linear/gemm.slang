@@ -82,7 +82,9 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
 #ifndef PIE_NLANES
 #define PIE_NLANES 8u
 #endif
+#ifndef PIE_VROWS
 #define PIE_VROWS 4u
+#endif
 
 groupshared float partial[PIE_NLANES * PIE_VROWS * PIE_KLANES];
 
@@ -322,5 +324,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate linear_gemm_gemv_bf16 PIE_GEMV=1 PIE_TARGET=spirv
 // pie:instantiate linear_gemm_gemv_v_bf16 PIE_GEMV_V=1 PIE_TARGET=spirv
+// pie:instantiate linear_gemm_gemv_v8_bf16 PIE_GEMV_V=1 PIE_VROWS=8u PIE_TARGET=spirv
+// pie:instantiate linear_gemm_gemv_v16_bf16 PIE_GEMV_V=1 PIE_VROWS=16u PIE_TARGET=spirv
 // pie:instantiate linear_gemm_tiled_bf16 PIE_TARGET=spirv
 // pie:instantiate linear_gemm_tiled_bm_64_bf16 PIE_TIER=coopmat PIE_TARGET=spirv

@@ -93,6 +93,8 @@ fn axes(entry: &str, target: Target, s: Shape) -> [(u32, u32); 3] {
     match entry {
         // A workgroup a tile, from `SV_GroupID`: columns on x, rows on y.
         "linear_gemm_gemv_v_bf16" => [(s.n, 8), (s.m, 4), one],
+        "linear_gemm_gemv_v8_bf16" => [(s.n, 8), (s.m, 8), one],
+        "linear_gemm_gemv_v16_bf16" => [(s.n, 8), (s.m, 16), one],
         "linear_gemm_tiled_bm_64_bf16" => [(s.n, 64), (s.m, 64), one],
         // `gemm_register.slang`: `PIE_BN` columns, 32 lanes of eight rows.
         "linear_gemm_register_bf16" => [(s.n, 64), (s.m, 256), one],
@@ -211,7 +213,7 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
                 }
                 let rec = Recorder::new(target);
                 let shape = Shape::dense(m, n, k);
-                for vector in [false, true] {
+                for vector in [0, 4, 8, 16] {
                     gemm::matmul(
                         &rec,
                         gemm::Tactic { tier, vector },
@@ -241,6 +243,8 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
     }
     for form in [
         "linear_gemm_gemv_v_bf16",
+        "linear_gemm_gemv_v8_bf16",
+        "linear_gemm_gemv_v16_bf16",
         "linear_gemm_gemv_bf16",
         "linear_gemm_tiled_bm_64_bf16",
         "linear_gemm_register_bf16",

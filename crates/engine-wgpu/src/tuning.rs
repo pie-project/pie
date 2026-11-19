@@ -287,7 +287,7 @@ impl engine_gpu::backend::Tactics for Tuning {
     fn gemm(&self, tier: kernels_slang::Tier, _rows: u32) -> kernels_slang::linear::gemm::Tactic {
         kernels_slang::linear::gemm::Tactic {
             tier,
-            vector: false,
+            vector: 0,
         }
     }
 
@@ -299,7 +299,7 @@ impl engine_gpu::backend::Tactics for Tuning {
     ) -> Vec<kernels_slang::linear::gemm::Tactic> {
         vec![kernels_slang::linear::gemm::Tactic {
             tier,
-            vector: false,
+            vector: 0,
         }]
     }
 

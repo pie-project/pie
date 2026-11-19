@@ -2,7 +2,9 @@
 //! ones, whichever the estimate (`engine::roofline`) weighs faster over the
 //! model's dense planes at the rung's rows, from the device's measured
 //! rates (the vector kernels at `few_row_tflops`, the tiled ones on the
-//! `gemm_tflops_by_rows` curve, each plane's rows padded to its tile). A
+//! `gemm_tflops_by_rows` curve, each plane's rows padded to its tile), each
+//! kernel reading its plane once a group of rows that share a read
+//! (`gemm::Kernel::rows_a_read`): no cache is assumed to hold it. A
 //! matmul runs its rung's kernel whatever rows it lands, so a rung's
 //! kernels are one set: a fire of fewer rows than its rung pays the rung's
 //! kernel.
@@ -89,7 +91,8 @@ pub fn choose(
         .collect();
     if counts.readout_flops > 0 {
         let depth = counts.readout_depth.max(1);
-        let vocab = u32::try_from(counts.readout_flops / (2 * u64::from(depth))).unwrap_or(u32::MAX);
+        let vocab =
+            u32::try_from(counts.readout_flops / (2 * u64::from(depth))).unwrap_or(u32::MAX);
         planes.push((vocab, depth, 1, counts.head_bytes as f64));
     }
     let mut chosen = Vec::with_capacity(rungs.len());
@@ -97,13 +100,25 @@ pub fn choose(
     for &rows in rungs {
         let tactic = tiled(rows);
         let (mut vector_ns, mut tiled_ns) = (0.0, 0.0);
+        // The vector kernel a rung takes: its workgroups carry the rung's
+        // rows over one read where the kernel holds that many.
+        let vector = Tactic {
+            vector: gemm::vector_rows(rows),
+            ..tactic
+        };
         for &(n, k, count, bytes) in &planes {
             let flops = |rows: u32| 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
-            let tile = gemm::tile_for(target, tactic, rows, n, k).row_tile().max(1);
+            // Each kernel reads the plane once its rows sharing a read.
+            let read = |kernel: gemm::Kernel| {
+                f64::from(rows.div_ceil(kernel.rows_a_read().max(1))) * bytes
+            };
+            let tiles = gemm::tile_for(target, tactic, rows, n, k);
+            let tile = tiles.row_tile().max(1);
             let padded = rows.div_ceil(tile) * tile;
             let count = f64::from(count);
-            tiled_ns += count * c.dispatch_ns(flops(padded), c.gemm_rate(rows, n, k), bytes);
-            vector_ns += count * c.dispatch_ns(flops(rows), few, bytes);
+            tiled_ns += count * c.dispatch_ns(flops(padded), c.gemm_rate(rows, n, k), read(tiles));
+            let vectors = gemm::tile_for(target, vector, rows, n, k);
+            vector_ns += count * c.dispatch_ns(flops(rows), few, read(vectors));
         }
         let w = Weighed {
             rows,
@@ -113,7 +128,7 @@ pub fn choose(
         chosen.push((
             rows,
             Tactic {
-                vector: w.vector(),
+                vector: if w.vector() { vector.vector } else { 0 },
                 ..tactic
             },
         ));
@@ -165,7 +180,7 @@ mod tests {
     fn tiled(_: u32) -> Tactic {
         Tactic {
             tier: Tier::Coopmat,
-            vector: false,
+            vector: 0,
         }
     }
 
@@ -178,17 +193,26 @@ mod tests {
         let (dense, weighed) =
             choose(Target::Spirv, &rungs, tiled, &rates(Some(5.0)), &counts()).unwrap();
         let vector: Vec<bool> = weighed.iter().map(Weighed::vector).collect();
-        // Below the 64-row tile the vector kernels read the plane once at
-        // its bandwidth; from 256 rows the curve outruns 5 TFLOP/s.
+        // To 4 rows the vector kernel reads the plane once, as the 64-row
+        // tile does; from 256 rows its 64 reads and 5 TFLOP/s lose.
         assert!(vector[..4].iter().all(|&v| v), "{weighed:?}");
         assert!(vector[8..].iter().all(|&v| !v), "{weighed:?}");
         for (i, &rows) in rungs.iter().enumerate() {
-            assert_eq!(dense.at(rows).vector, vector[i]);
-            assert_eq!(dense.at(rows.div_ceil(2) + 1).vector, vector[i], "{rows}");
+            assert_eq!(dense.at(rows).vector > 0, vector[i]);
+            assert_eq!(
+                dense.at(rows.div_ceil(2) + 1).vector > 0,
+                vector[i],
+                "{rows}"
+            );
         }
-        assert_eq!(dense.at(3).vector, vector[2]);
-        assert_eq!(dense.at(5000).vector, vector[rungs.len() - 1]);
-        assert!(weighed[2].to_string().starts_with("rung 4: gemv by the estimate ("));
+        assert_eq!(dense.at(3).vector, 4);
+        assert_eq!(dense.at(12).vector, if vector[4] { 16 } else { 0 });
+        assert_eq!(dense.at(5000).vector > 0, vector[rungs.len() - 1]);
+        assert!(
+            weighed[2]
+                .to_string()
+                .starts_with("rung 4: gemv by the estimate (")
+        );
     }
 
     /// A profile stating no vector rate is refused by its key.

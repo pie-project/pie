@@ -18,9 +18,20 @@ const PAIRS: &str = "linear/gemm_pairs.slang";
 
 const LANE: &str = "linear/gemm_lane.slang";
 
-/// The rows one workgroup of the eight-column vector kernel carries (the
-/// shader's `PIE_VROWS`): its grid takes a row of workgroups a four rows.
-const VECTOR_ROWS: u32 = 4;
+/// The rows one workgroup of the eight-column vector kernel can carry over
+/// one read of the weight (the shader's `PIE_VROWS`, one entry each): its
+/// grid takes a row of workgroups a block of them.
+pub const VECTOR_ROWS: [u32; 3] = [4, 8, 16];
+
+/// The rows a vector workgroup carries for a matmul of `rows`: the fewest
+/// of [`VECTOR_ROWS`] that hold them, the most past them all.
+#[must_use]
+pub fn vector_rows(rows: u32) -> u32 {
+    VECTOR_ROWS
+        .into_iter()
+        .find(|&held| held >= rows)
+        .unwrap_or(VECTOR_ROWS[VECTOR_ROWS.len() - 1])
+}
 
 const REGISTER: &str = "linear/gemm_register.slang";
 
@@ -38,10 +49,11 @@ pub struct Tactic {
     /// `Tier::Coopmat`, WGSL's vector kernel folds by shuffles at
     /// `Tier::Subgroup`.
     pub tier: Tier,
-    /// The vector kernels, each weight row read once a few activation
-    /// rows, at whatever rows the matmul lands; else the tiled kernels. A
-    /// load chooses it a rung, by the estimate (`engine_gpu::dense`).
-    pub vector: bool,
+    /// The vector kernels, a workgroup carrying this many activation rows
+    /// (one of [`VECTOR_ROWS`]) over one read of the weight, at whatever
+    /// rows the matmul lands; 0 for the tiled kernels. A load chooses it a
+    /// rung, by the estimate (`engine_gpu::dense`).
+    pub vector: u32,
 }
 
 pub fn matmul(
@@ -71,8 +83,9 @@ pub fn lm_head(
 /// together), and [`padded_rows`] counts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kernel {
-    /// SPIR-V's vector kernel, eight columns a group (`k` a multiple of 8).
-    GemvV,
+    /// SPIR-V's vector kernel, eight columns a group (`k` a multiple of 8),
+    /// `rows` activation rows a workgroup.
+    GemvV { rows: u32 },
     /// SPIR-V's vector kernel.
     Gemv,
     /// SPIR-V's cooperative-matrix tile, 64 rows.
@@ -95,11 +108,23 @@ impl Kernel {
     #[must_use]
     pub fn row_tile(self) -> u32 {
         match self {
-            Kernel::GemvV | Kernel::Gemv | Kernel::PairsGemv => 1,
+            Kernel::GemvV { .. } | Kernel::Gemv | Kernel::PairsGemv => 1,
             Kernel::Coopmat | Kernel::Pairs64 => 64,
             Kernel::Register { cols, per } => 256 / (cols / per) * 8,
             Kernel::Tiled => 32,
             Kernel::Pairs16 => 16,
+        }
+    }
+    /// The rows that share one read of the weight: a workgroup's rows. A
+    /// matmul of `m` rows reads its weight `ceil(m / rows_a_read)` times
+    /// (the plain vector kernels once a row, the eight-column one once a
+    /// workgroup's rows, a tiled kernel once a row tile).
+    #[must_use]
+    pub fn rows_a_read(self) -> u32 {
+        match self {
+            Kernel::Gemv | Kernel::PairsGemv => 1,
+            Kernel::GemvV { rows } => rows,
+            _ => self.row_tile(),
         }
     }
 }
@@ -108,8 +133,10 @@ impl Kernel {
 #[must_use]
 pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kernel {
     match target {
-        Target::Spirv if tactic.vector && k.is_multiple_of(8) => Kernel::GemvV,
-        Target::Spirv if tactic.vector => Kernel::Gemv,
+        Target::Spirv if tactic.vector > 0 && k.is_multiple_of(8) => Kernel::GemvV {
+            rows: vector_rows(tactic.vector),
+        },
+        Target::Spirv if tactic.vector > 0 => Kernel::Gemv,
         Target::Spirv if tactic.tier == Tier::Coopmat => Kernel::Coopmat,
         // Sixty-four columns a tile at eight a lane, or thirty-two at four
         // when that leaves none idle.
@@ -121,7 +148,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
             }
         }
         Target::Spirv => Kernel::Tiled,
-        Target::Wgsl if tactic.vector => Kernel::PairsGemv,
+        Target::Wgsl if tactic.vector > 0 => Kernel::PairsGemv,
         Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
         Target::Wgsl => Kernel::Pairs64,
     }
@@ -184,15 +211,17 @@ pub fn kernels(
     k: u32,
 ) -> Result<Vec<Fire>, Error> {
     let tiled = Tactic {
-        vector: false,
+        vector: 0,
         ..tactic
     };
     let mut all = every(&ROW_BREAKS, |m| kernel(target, tiled, op, m, n, k))?;
-    let vector = Tactic {
-        vector: true,
-        ..tactic
-    };
-    crate::encode::distinct(&mut all, kernel(target, vector, op, 1, n, k)?);
+    for rows in VECTOR_ROWS {
+        let vector = Tactic {
+            vector: rows,
+            ..tactic
+        };
+        crate::encode::distinct(&mut all, kernel(target, vector, op, 1, n, k)?);
+    }
     Ok(all)
 }
 
@@ -206,12 +235,18 @@ fn kernel(
     k: u32,
 ) -> Result<Fire, Error> {
     Ok(match target {
-        Target::Spirv if tactic.vector && k.is_multiple_of(8) => {
-            Fire::at(GEMM, "linear_gemm_gemv_v_bf16")
-                .groups([n.div_ceil(8), m.div_ceil(VECTOR_ROWS), 1])
+        Target::Spirv if tactic.vector > 0 && k.is_multiple_of(8) => {
+            let rows = vector_rows(tactic.vector);
+            let entry = match rows {
+                4 => "linear_gemm_gemv_v_bf16",
+                8 => "linear_gemm_gemv_v8_bf16",
+                _ => "linear_gemm_gemv_v16_bf16",
+            };
+            Fire::at(GEMM, entry)
+                .groups([n.div_ceil(8), m.div_ceil(rows), 1])
                 .group([32, 8, 1])
         }
-        Target::Spirv if tactic.vector => Fire::at(GEMM, "linear_gemm_gemv_bf16")
+        Target::Spirv if tactic.vector > 0 => Fire::at(GEMM, "linear_gemm_gemv_bf16")
             .groups([1, n.div_ceil(8), m])
             .group([32, 8, 1]),
         Target::Spirv if tactic.tier == Tier::Coopmat => {
@@ -252,7 +287,7 @@ fn kernel(
                     ),
                 ));
             }
-            if tactic.vector {
+            if tactic.vector > 0 {
                 Fire::at(PAIRS, "linear_gemm_pairs_gemv_bf16")
                     .tier(if tactic.tier == Tier::Subgroup {
                         Tier::Subgroup
@@ -355,7 +390,7 @@ mod tests {
     fn the_kernels_a_projection_names_hold_the_kernel_of_every_row_count() {
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for vector in [false, true] {
+                for vector in [0, 4, 8, 16] {
                     let tactic = Tactic { tier, vector };
                     for (n, k) in [(64, 64), (1024, 1024), (1030, 1001), (48, 16), (8, 24)] {
                         let named: Vec<(&str, Tier)> =
@@ -390,7 +425,7 @@ mod tile_tests {
         // `tile_for`'s row tile.
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for vector in [false, true] {
+                for vector in [0, 4, 8, 16] {
                     let tactic = Tactic { tier, vector };
                     for m in [1, 4, 8, 16, 47, 48, 64, 255, 256, 1024, 4096] {
                         for (n, k) in [(1024, 1024), (96, 4096), (4096, 1000)] {

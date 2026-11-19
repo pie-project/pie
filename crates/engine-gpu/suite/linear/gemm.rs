@@ -1,6 +1,6 @@
 //! The dense matmuls on the first device against an f64 host reference: the
-//! vector kernels at a few rows and past the eight-column kernel's four (an
-//! even contraction in eight-wide loads, an odd one; odd column counts on
+//! vector kernels at 1 to 16 rows on each workgroup's rows (an even
+//! contraction in eight-wide loads, an odd one; odd column counts on
 //! SPIR-V; at the subgroup tier too where every subgroup is 32 lanes), the
 //! tiled kernel over ragged tiles, the register tile from 96 rows at its
 //! 64- and 32-column forms, the cooperative-matrix tier where the device has
@@ -49,27 +49,30 @@ fn the_dense_matmuls_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    // (rows, columns, contraction, tier, vector)
+    // (rows, columns, contraction, tier, vector rows a workgroup; 0 tiled)
     let mut cases = vec![
-        (1usize, 24usize, 64usize, kernels_slang::Tier::Baseline, true),
-        (3, 21, 60, kernels_slang::Tier::Baseline, true),
-        (3, 22, 64, kernels_slang::Tier::Baseline, true),
-        (2, 22, 61, kernels_slang::Tier::Baseline, true),
-        // Past the eight-column kernel's four rows: three rows of its
-        // workgroups, the last one row; and the plain kernel's.
-        (9, 22, 64, kernels_slang::Tier::Baseline, true),
-        (9, 22, 61, kernels_slang::Tier::Baseline, true),
-        (40, 50, 70, kernels_slang::Tier::Baseline, false),
-        (70, 66, 33, kernels_slang::Tier::Baseline, false),
+        (3usize, 21usize, 60usize, kernels_slang::Tier::Baseline, 4u32),
+        (2, 22, 61, kernels_slang::Tier::Baseline, 4),
+        // The plain vector kernel past four rows.
+        (9, 22, 61, kernels_slang::Tier::Baseline, 16),
+        (40, 50, 70, kernels_slang::Tier::Baseline, 0),
+        (70, 66, 33, kernels_slang::Tier::Baseline, 0),
         // The register tile from 96 rows: its 64- and 32-column forms.
-        (130, 70, 48, kernels_slang::Tier::Baseline, false),
-        (100, 96, 32, kernels_slang::Tier::Baseline, false),
+        (130, 70, 48, kernels_slang::Tier::Baseline, 0),
+        (100, 96, 32, kernels_slang::Tier::Baseline, 0),
     ];
+    // The eight-column kernel at 1 to 16 rows on each workgroup's rows:
+    // a block of them, the last part-filled, past them.
+    for m in 1..=16 {
+        for vector in kernels_slang::linear::gemm::VECTOR_ROWS {
+            cases.push((m, 22, 64, kernels_slang::Tier::Baseline, vector));
+        }
+    }
     if gpu.subgroup() >= 32 {
-        cases.push((3, 22, 64, kernels_slang::Tier::Subgroup, true));
+        cases.push((3, 22, 64, kernels_slang::Tier::Subgroup, 4));
     }
     if gpu.coopmat() {
-        cases.push((70, 64, 96, kernels_slang::Tier::Coopmat, false));
+        cases.push((70, 64, 96, kernels_slang::Tier::Coopmat, 0));
     }
     for (m, n, k, tier, vector) in cases {
         if !crate::gpu::lands(n) {

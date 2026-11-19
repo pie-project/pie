@@ -496,17 +496,18 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     }
     // `few_row_tflops`: the vector kernels at decode-shaped rows of the
-    // widest plane. Their time is their launch and the longer of their
-    // weight reads and their flops at that rate, so flops over time reaches
-    // the rate where the weights no longer bind them and stays under it
-    // everywhere: the rate is the most any of the rows reaches.
-    let vector = kernels_slang::linear::gemm::Tactic {
-        vector: true,
-        ..tactics.gemm(tier, 1)
-    };
+    // widest plane, each row count on the workgroup rows a rung of it takes
+    // (`gemm::vector_rows`). Their time is their launch and the longer of
+    // their weight reads and their flops at that rate, so flops over time
+    // reaches the rate where the weights no longer bind them and stays
+    // under it everywhere: the rate is the most any of the rows reaches.
     let mut few_row = 0f64;
     let w = engine::rates::GEMM_WIDTH;
     for m in FEW_ROWS {
+        let vector = kernels_slang::linear::gemm::Tactic {
+            vector: kernels_slang::linear::gemm::vector_rows(m),
+            ..tactics.gemm(tier, 1)
+        };
         let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
         rig.release();
         let Some(rate) = dropped(&rig, rate, say)? else {
