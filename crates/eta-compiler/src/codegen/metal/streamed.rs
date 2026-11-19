@@ -175,9 +175,19 @@ fn length_key(value_types: &[SymbolicType], value: u32) -> Vec<Dimension> {
         .unwrap_or_default()
 }
 
+/// The wire tag of a bf16 value: computed as a float, stored two bytes an
+/// element, rounded to nearest even where it is defined (a register holding
+/// one holds the rounded f32).
+const BF16: u8 = eta_ir::types::WIRE_BF16;
+
+/// The dtype a value's arithmetic runs in: a bf16 value's is f32.
+fn computed(dtype: u8) -> u8 {
+    if dtype == BF16 { 0 } else { dtype }
+}
+
 fn msl_type(dtype: u8) -> &'static str {
     match dtype {
-        0 => "float",
+        0 | BF16 => "float",
         1 => "int",
         2 => "uint",
         _ => "bool",
@@ -186,7 +196,7 @@ fn msl_type(dtype: u8) -> &'static str {
 
 fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
     let load = match want {
-        0 => "m1_load_f",
+        0 | BF16 => "m1_load_f",
         1 => "m1_load_i",
         2 => "m1_load_u",
         _ => "m1_load_b",
@@ -196,12 +206,12 @@ fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
 
 fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
     let as_own = match own {
-        0 => format!("as_type<float>({bits})"),
+        0 | BF16 => format!("as_type<float>({bits})"),
         1 => format!("int({bits})"),
         2 => format!("({bits})"),
         _ => format!("(({bits}) != 0u)"),
     };
-    if want == own {
+    if want == own || (want == BF16 && own == 0) || (want == 0 && own == BF16) {
         return as_own;
     }
     match (want, own) {
@@ -209,7 +219,7 @@ fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
         (1, 3) => format!("({as_own} ? 1 : 0)"),
         (2, 3) => format!("({as_own} ? 1u : 0u)"),
         (3, _) => format!("({as_own} != 0)"),
-        (0, _) => format!("float({as_own})"),
+        (0 | BF16, _) => format!("float({as_own})"),
         (1, _) => format!("int({as_own})"),
         _ => format!("uint({as_own})"),
     }
@@ -218,6 +228,7 @@ fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
 fn bits_of(ty: u8, value: &str) -> String {
     match ty {
         0 => format!("as_type<uint>({value})"),
+        BF16 => format!("as_type<uint>(m1_round_bf16({value}))"),
         1 => format!("uint({value})"),
         2 => value.to_string(),
         _ => format!("({value} ? 1u : 0u)"),
@@ -280,6 +291,7 @@ fn direct_wide(
     let decl = format!("      {} {v} = {}(0);\n", msl_type(dout), msl_type(dout));
     let store_fn = match dout {
         0 => "m1_store_f",
+        BF16 => "m1_store_h",
         1 => "m1_store_i",
         2 => "m1_store_u",
         _ => "m1_store_b",
@@ -303,12 +315,13 @@ fn direct_wide(
             let _ = writeln!(compute, "{v} = {expr};");
         }
         tags::NEG | tags::ABS | tags::SIGN => {
-            let d0 = d0?;
-            if d0 == 3 {
+            let own = d0?;
+            if own == 3 {
                 return None;
             }
+            let d0 = computed(own);
             let s0 = stride(0, &mut pre);
-            let x = load(0, d0, d0, &s0);
+            let x = load(0, d0, own, &s0);
             let expr = match (d0, op.tag) {
                 (0, tags::NEG) => "-x",
                 (0, tags::ABS) => "abs(x)",
@@ -338,13 +351,15 @@ fn direct_wide(
         | tags::MAX_ELEM
         | tags::MIN_ELEM
         | tags::REM => {
-            let (d0, d1) = (d0?, d1?);
-            if d0 == 3 {
+            let (own, d1) = (d0?, d1?);
+            if own == 3 {
                 return None;
             }
+            // Float operands mix f32 and bf16 and compute in f32.
+            let d0 = computed(own);
             let s0 = stride(0, &mut pre);
             let s1 = stride(1, &mut pre);
-            let x = load(0, d0, d0, &s0);
+            let x = load(0, d0, own, &s0);
             let y = load(1, d0, d1, &s1);
             let expr = match (d0, op.tag) {
                 (0, tags::ADD) => "x + y",
@@ -379,7 +394,7 @@ fn direct_wide(
             let (d0, d1) = (d0?, d1?);
             let s0 = stride(0, &mut pre);
             let s1 = stride(1, &mut pre);
-            let ty = if d0 == 3 { 2 } else { d0 };
+            let ty = if d0 == 3 { 2 } else { computed(d0) };
             let x = load(0, ty, d0, &s0);
             let y = load(1, ty, d1, &s1);
             let cmp = match op.tag {
