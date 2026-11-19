@@ -351,3 +351,34 @@ role slots into one file slot (an offset inside it, aligned for the
 file's direct I/O) would cut that; measure the file's room under the M1 /
 M5 loads first. With guest scratch held only while a fire is in flight,
 only the small resident part (tables, rings) parks at all.
+
+role slots (Instance, Channel, Adapter) go down to the kv slot file, one
+kv list slot of the file a role slot (`Roles::prepare_park_down`,
+`DiskSlots`, CONTRACT-BC 22 in `Engine::copy_slots`): exact and with no
+file or budget of their own, but a 4 KiB Instance slot holds a whole kv
+page's slot (≈1–2 MiB), so 500 parked processes of 8 role slots take
+4000 of the file's slots. Packing several role slots into one file slot
+(an offset inside it, aligned for the file's direct I/O) or a role slot
+file per shape would cut that; measure the file's room under the M1 / M5
+loads first. A role slot larger than a kv slot is never moved to disk
+(it stays parked on the device and is no movable room).
+
+
+## F31. Metal syncs and drains the host waits on (audits on 5355faa9a)
+Each turns depth into depth 1 or adds host work per step; CUDA does the same in queue order.
+- A fresh recurrent-state record is zeroed after draining every frame in flight
+  (engine-metal serve.rs:4540-4544): every hybrid / SSM admission runs at depth 1, uncounted. Zero it in queue
+  order, as a fill in the next command buffer (CUDA: serve/enqueue.rs:447-448).
+- Tier moves drain on every `copy_slots` (serve.rs:2003) and `read_tier_slots` (serve.rs:2025). Copies go in
+  queue order and land through the command buffer's completion (with `copy_slots_landing`), no drain.
+- Device-geometry programs: `fence_instances` waits on the last fire, then reads each port per lane on the host
+  (serve.rs:3604, program/ports.rs:20). On unified memory they can be read in place, without the wait.
+- Each prologue region commits and calls waitUntilCompleted (program/launch.rs:2140), once per instance per
+  region: O(lanes) syncs a step.
+- `admit_list_page` for every page of every lane each step (serve.rs:4523): ~64k calls at 256 lanes x 256
+  pages, ~1-3 ms.
+- The walk re-encodes ~1700 launches a step with a SipHash lookup per launch (serve.rs:5474,
+  device/library.rs:151).
+- kernels-metal has the VECTOR_MAX_ROWS = 4 GEMM cliff (linear/gemm.rs:33), and the qmv fold only folds
+  divisors <= 8, so 11 rows take ~11 weight passes (linear/qmv/rows.rs:60).
+- Metal never counts the Refused tally.
