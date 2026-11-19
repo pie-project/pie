@@ -34,13 +34,28 @@ pub struct Bound {
     pub seat: Seat,
 }
 
-/// Where an instance attached at the fire's lane `lane` reads every output
-/// `plan` reads, when each binds on the device.
-#[must_use]
-pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Bound>> {
-    let bound: Vec<Bound> = (plan.outputs().into_iter())
+/// Where an instance attached at the fire's lanes `lane..lane + lanes`
+/// reads every output `plan` reads, when each binds on the device. Its
+/// seats are its own lanes' rows: a program reading a lane past the ones
+/// it is attached over is refused by name, and no seat runs into the
+/// next attachment's lanes.
+pub fn bound(
+    plan: &ExecPlan,
+    kept: Option<&Kept>,
+    lane: u32,
+    lanes: u32,
+) -> Result<Option<Vec<Bound>>, String> {
+    let outputs = plan.outputs();
+    if let Some((name, k)) = outputs.iter().find(|(_, k)| *k >= lanes) {
+        return Err(format!(
+            "its program reads output `{name}` of its lane {k}, and it is attached over \
+             {lanes} lane(s)"
+        ));
+    }
+    let end = (lane + lanes) as usize;
+    let bound: Option<Vec<Bound>> = (outputs.into_iter())
         .map(|(name, k)| {
-            let (plane, seat) = kept?.bound(lane as usize + k as usize, name)?;
+            let (plane, seat) = kept?.bound(lane as usize + k as usize, end, name)?;
             Some(Bound {
                 name: name.to_string(),
                 lane: k,
@@ -48,13 +63,16 @@ pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Boun
                 seat,
             })
         })
-        .collect::<Option<_>>()?;
+        .collect();
+    let Some(bound) = bound else {
+        return Ok(None);
+    };
     let binds = plan
         .package
         .values
         .iter()
         .all(|v| v.source != ValueOrigin::Output || device_binds(v, kept, &bound));
-    binds.then_some(bound)
+    Ok(binds.then_some(bound))
 }
 
 /// A lowered stage, compiled; `program` is `None` for a stage that puts

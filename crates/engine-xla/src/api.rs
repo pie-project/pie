@@ -1181,6 +1181,15 @@ impl Xla {
                 .map(|lane| lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            let owned = attached.lanes.max(1) as usize;
+            if carried > owned {
+                return Err(program(format!(
+                    "instance {} is attached over {owned} lane(s) at lane {first} and its \
+                     `embed_indptr` port describes {carried}: a program's ports state its own \
+                     lanes' geometry, never the next request's",
+                    attached.instance
+                )));
+            }
             if first + carried > lanes.len() {
                 return Err(program(format!(
                     "instance {} is attached at lane {first} and its `embed_indptr` port \
@@ -1325,13 +1334,13 @@ impl Xla {
         submission: &engine::fire::Step,
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<()> {
-        let prologues: Vec<(InstanceId, u32)> = submission
+        let prologues: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| {
                 !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
             })
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         if prologues.is_empty() {
             return Ok(());
@@ -1852,11 +1861,11 @@ impl Xla {
             }
         }
 
-        let attached: Vec<(InstanceId, u32)> = submission
+        let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| !attachment.adapter_only)
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {
