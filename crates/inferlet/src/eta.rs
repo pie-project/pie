@@ -469,6 +469,9 @@ pub struct StateGeometry<'a> {
     /// Per lane, how many slots the lane reads.
     pub kv_len: Option<&'a Channel>,
     pub fold: Fold<'a>,
+    /// `[lanes]` u32: per lane, the beam of the fire before it continues; the
+    /// engine keeps the beams' own page lists (`forward.wit`, `crate::beam`).
+    pub parents: Option<&'a Channel>,
 }
 
 impl StateGeometry<'_> {
@@ -718,6 +721,7 @@ impl ForwardPass {
             (Port::Slots, geom.slots.copied()),
             (Port::KvLen, geom.kv_len.copied()),
             (Port::Fold, fold),
+            (Port::Parents, geom.parents.copied()),
         ];
         if !rebind {
             let ports: Vec<Port> = stated
@@ -740,6 +744,7 @@ impl ForwardPass {
                 slots: wits[1].as_deref(),
                 kv_len: wits[2].as_deref(),
                 fold: wits[3].as_deref(),
+                parents: wits[4].as_deref(),
             },
         )?;
         let mut inner = self.inner.borrow_mut();

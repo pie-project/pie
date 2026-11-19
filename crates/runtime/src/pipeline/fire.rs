@@ -2856,6 +2856,41 @@ fn working_set_flat_table(
     .map_err(|error| format!("pipeline: KV page translation: {error}"))
 }
 
+/// Hands each lane that states its own page list its working set's whole
+/// table: the pages its list names lie in it (`engine::fire::Lane::reserve`).
+/// Its own list stays its rows' pages, which the engine stages and the
+/// device then resolves over.
+fn stamp_lane_reserve(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    groups: &LaneGroups,
+) -> Result<(), String> {
+    for (ws, lanes) in groups {
+        let table = working_set_flat_table(stores, *ws)?;
+        for &lane in lanes {
+            if let Some(lane) = req.lanes.get_mut(lane) {
+                lane.lane.reserve.clone_from(&table);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `fwd`'s program states each beam's parent (its lanes hold their
+/// own page lists of their set's reserve).
+fn binds_pages<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
+    Ok(ctx
+        .resources()
+        .get(fwd)?
+        .instance
+        .program
+        .bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::Parents))
+}
+
 fn stamp_lane_translation(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -3644,6 +3679,46 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|(_, lanes)| pass_lanes.kv[lanes[0]].clone())
             .collect();
+        // Lanes that state their own page lists (beam search) write pages of
+        // their sets' reserve the device names: every page from the frozen
+        // full pages to what `reserve` granted is backed, and the engine is
+        // handed each set's whole table to resolve them in.
+        let paged_reserve: Option<Vec<Vec<u64>>> = if binds_pages(ctx, &fwd)? {
+            let page = u64::from(page_size.max(1));
+            let mut reserves = Vec::with_capacity(groups.len());
+            for (_, lanes) in &groups {
+                let lane = lanes[0];
+                let folded = pass_lanes.places[lane].folded;
+                let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
+                if reserved <= folded {
+                    return Ok(Err(format!(
+                        "pipeline: lane {lane} states its own page list, whose pages lie in \
+                         what `reserve` granted; its working set reserved {reserved} slot(s) \
+                         and froze {folded}. Reserve the pages its lanes may write"
+                    )));
+                }
+                // Only the pool pages the beams can name by this fire are
+                // backed: the step hands out the lowest free pages, so every
+                // page named or pending lies below `B (c + 2) + B F + 1`
+                // (BEAM-PAGE-LISTS.md §3), `c` this fire's column and `F`
+                // the engine's frames in flight.
+                let f0 = u64::from(folded) / page;
+                let last = lanes
+                    .iter()
+                    .map(|&lane| u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1)
+                    .max()
+                    .unwrap_or(u64::from(folded));
+                let beams = lanes.len() as u64;
+                let frames = crate::scheduler::configured_dispatch_depth().max(1) as u64;
+                let column = (last / page).saturating_sub(f0);
+                let named = beams * (column + 2) + beams * frames + 1;
+                let end = u64::from(reserved).div_ceil(page).min(f0 + named);
+                reserves.push((f0..end).collect());
+            }
+            Some(reserves)
+        } else {
+            None
+        };
         if let Err(refusal) = crate::inferlet::process::said(
             "seat the lanes",
             ctx.process_id(),
@@ -4172,7 +4247,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let present = written_groups(&piece_groups);
             let sets: Vec<(&KvWorkingSet, Written)> = present
                 .iter()
-                .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
+                .map(|&group| {
+                    let written = match &paged_reserve {
+                        Some(reserves) => Written::Pages(reserves[group].clone()),
+                        None => Written::Span(spans[group].1.clone()),
+                    };
+                    (&group_sets[group], written)
+                })
                 .collect();
             let rs_plan = || {
                 if windowed {
@@ -4208,6 +4289,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // Every fire logs what it writes where its tokens are known; what
             // it folds seals once it settles.
             let reports = pass_slots.is_none()
+                && paged_reserve.is_none()
                 && decode_envelope.is_some()
                 && !wide
                 && plain
@@ -4280,6 +4362,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 };
                 // A piece carrying media is not its tokens' alone.
                 let rows = match (&pass_slots, pages) {
+                    // A lane's own page list holds its slots apart from the
+                    // set's: the set's rows there are no one token's.
+                    _ if paged_reserve.is_some() => LogRows::Unknown,
                     (Some(_), _) if !req.media.is_empty() => LogRows::Unknown,
                     (Some(_), _) => LogRows::Known {
                         start: slots.start,
@@ -4306,6 +4391,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 });
             }
             if let Err(refusal) = map_lane_pages(&mut req, &stores, &piece_groups) {
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
+                return Ok(Err(refusal));
+            }
+            if paged_reserve.is_some()
+                && let Err(refusal) = stamp_lane_reserve(&mut req, &stores, &piece_groups)
+            {
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
                 return Ok(Err(refusal));
             }

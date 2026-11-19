@@ -42,6 +42,7 @@ pub use wit_bindgen;
 
 pub use pie::inferlet::types;
 
+pub mod beam;
 pub mod eta;
 /// The standard sampler's stage bodies ([`eta_dsl::sampler`]).
 pub use eta_dsl::sampler;
@@ -58,7 +59,7 @@ pub mod model {
         ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity, draft_block,
         draft_depth,
         frame_size, kv_page_size, lane, latent, max_pass_rows, name, output_vocab_size,
-        rs_state_size, run_ahead_window, schedule, submit_deadline_us, switches,
+        frames_in_flight, rs_state_size, run_ahead_window, schedule, submit_deadline_us, switches,
     };
 
     /// What a lane under these `(name, value)` switches binds.

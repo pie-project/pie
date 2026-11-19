@@ -398,6 +398,10 @@ impl Shell {
         let mut mask_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         // The lanes whose positions the program computes on the device.
         let mut positions_on_device = vec![false; lanes.len()];
+        // A decode envelope's beam groups (`serve::pages`): each one's lanes,
+        // its parents cell and its state; and each lane's group.
+        let mut page_groups: Vec<super::pages::PageGroup> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
@@ -465,6 +469,42 @@ impl Shell {
                     mask_src_of[first + lane] = Some((mask_src + u64::from(at * keys), keys));
                     at += seated.lane.tokens.len() as u32;
                 }
+            }
+            if envelope_class
+                && let Some((parents, native)) =
+                    self.programs.parents_device_source(attached.instance)?
+            {
+                let Some((state, layout)) = self.programs.beam_state(attached.instance) else {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} states parents and holds no beam state",
+                            attached.instance
+                        ),
+                    ));
+                };
+                if native != layout.lanes * 4 || spanned.len() as u32 != layout.lanes {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} states parents for {} beam(s) in a {native}-byte cell \
+                             and runs {} lane(s); every beam runs every fire",
+                            attached.instance,
+                            layout.lanes,
+                            spanned.len()
+                        ),
+                    ));
+                }
+                for lane in 0..spanned.len() {
+                    group_of[first + lane] = Some(page_groups.len());
+                }
+                page_groups.push(super::pages::PageGroup {
+                    instance: attached.instance,
+                    parents,
+                    state,
+                    layout,
+                    lanes: Vec::new(),
+                });
             }
             if can_runahead && envelope_class {
                 if first < lanes.len() {
@@ -1091,6 +1131,7 @@ impl Shell {
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
         let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
+
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -1150,6 +1191,15 @@ impl Shell {
             };
             if begins {
                 fresh.push(seated.rs_slot.unwrap_or(lane.slot));
+            }
+            if let Some(group) = group_of[source] {
+                page_groups[group].lanes.push(super::pages::GroupLane {
+                    source,
+                    seat: seats.len(),
+                    row_offset: row.row_offset,
+                    have,
+                    rows: row.rows,
+                });
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -1723,7 +1773,45 @@ impl Shell {
             self.pools.page_ids(list, &mut geometry.indices)?;
             self.pools.page_ids(list, &mut geometry.write_page)?;
         }
-
+        let page_work = if page_groups.is_empty() {
+            super::pages::PageWork::default()
+        } else {
+            // A group's lanes are seated in lane order: its beams.
+            for group in &mut page_groups {
+                group.lanes.sort_by_key(|lane| lane.source);
+                let Some(first) = group.lanes.first() else {
+                    continue;
+                };
+                let seated = &lanes[first.source];
+                let f0 = (seated.folded / paging.page_size.max(1)) as usize;
+                if let Some(whole) = seated.translation.get(f0..) {
+                    let backed = super::pages::backed(
+                        group.layout.lanes,
+                        first.have,
+                        seated.folded,
+                        paging.page_size,
+                        group.layout.frames,
+                        whole.len() as u32,
+                    );
+                    self.pools.seat_kv_pages(&whole[..backed as usize])?;
+                }
+            }
+            let windowed =
+                (0..device_geometries.len()).any(|table| self.pools.geometry_window(table).is_some());
+            let planes = self.pools.page_planes();
+            let pools = &self.pools;
+            super::pages::plan(
+                &page_groups,
+                &device_geometries,
+                windowed,
+                paging.page_size,
+                &|source| lanes[source].translation.to_vec(),
+                &|source| lanes[source].folded,
+                &planes,
+                &mut |ids| pools.page_ids(0, ids),
+                &mut |page| pools.page_base(0, page),
+            )?
+        };
         super::btrace::mark("admit");
         let bucket = self
             .budget
@@ -2093,6 +2181,8 @@ impl Shell {
             lengths: staged_lens,
             token_injects,
             mask_injects,
+            page_work,
+            page_faults: None,
             kv_reports,
             bodied,
             unbodied,

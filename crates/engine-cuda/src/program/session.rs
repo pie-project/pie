@@ -90,6 +90,12 @@ pub struct Session {
     /// A decode envelope's device-computed mask is packed into the staged
     /// mask on the device and never read on the host ([`Self::resolve_on`]).
     mask_on_device: bool,
+    /// A decode envelope's lanes state each beam's parent in a cell only the
+    /// device writes: the engine keeps the beams' page lists over it
+    /// ([`Self::parents_device_source`]).
+    parents_on_device: bool,
+    /// Where the instance's item keeps a beam group's page lists.
+    beam: Option<super::launch::BeamLayout>,
     /// The channels that are only a `lora` sink's planes: the bank is landed
     /// from their seeds at bind, so a fire never pulls their cells again.
     sink_planes: Vec<usize>,
@@ -112,6 +118,7 @@ impl Session {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        held: super::launch::Held,
         place: &super::launch::Place,
         shadow: bool,
         stream: *mut core::ffi::c_void,
@@ -127,18 +134,14 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(
-            &shapes,
-            endpoints,
-            super::launch::Held::of(&plan.package.channels),
-            place,
-            stream,
-        )?;
+        let beam = held.beam;
+        let rings = Rings::allocate(&shapes, endpoints, held, place, stream)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
 
         let mut session = Session {
+            beam,
             rings,
             shapes,
             cursors,
@@ -154,6 +157,7 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
+            parents_on_device: false,
             sink_planes: crate::adapter::sink_of(&plan.package)
                 .ok()
                 .flatten()
@@ -396,6 +400,50 @@ impl Session {
             && class == GeometryClass::DecodeEnvelope
             && engine::ports::engine_resolves(class, device, Port::AttnMask)
             && self.port_device_source(plan, Port::AttnMask).is_some();
+        self.parents_on_device = class == GeometryClass::DecodeEnvelope
+            && engine::ports::engine_resolves(class, device, Port::Parents);
+    }
+
+    /// Where the instance's item keeps its beam group's page lists, laid how.
+    #[must_use]
+    pub fn beam(&self) -> Option<super::launch::BeamLayout> {
+        self.beam
+    }
+
+    /// Where the instance's item lies now.
+    #[must_use]
+    pub fn instance_base(&self) -> u64 {
+        self.rings.instance_base()
+    }
+
+    /// The device cell a decode envelope's beams' parents are read from,
+    /// `(address, bytes)`: `[lanes]` u32, read by the engine's beam step on
+    /// the device, never on the host. `Err` where the program computes them
+    /// in a cell the host also writes.
+    pub fn parents_device_source(&self, plan: &ExecPlan) -> Result<Option<(u64, u32)>> {
+        self.device_only_source(plan, Port::Parents)
+    }
+
+    fn device_only_source(&self, plan: &ExecPlan, port: Port) -> Result<Option<(u64, u32)>> {
+        if !self.parents_on_device
+            || !plan
+                .package
+                .ports
+                .iter()
+                .any(|binding| binding.port == port && !binding.is_const)
+        {
+            return Ok(None);
+        }
+        self.port_device_source(plan, port).map(Some).ok_or_else(|| {
+            crate::error::Fault::program(
+                "program::session",
+                format!(
+                    "the program states its lanes' {} in a channel the host writes too; a beam's \
+                     parents are read on the device from a cell only the device writes",
+                    port.name()
+                ),
+            )
+        })
     }
 
     /// Whether this instance resolves `port` under `class`
@@ -768,6 +816,7 @@ impl Session {
             .filter(|binding| !binding.is_const && self.resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
             .filter(|binding| !(binding.port == Port::AttnMask && mask_on_device))
+            .filter(|binding| binding.port != Port::Parents)
             .map(|binding| binding.channel)
             .collect()
     }

@@ -564,4 +564,314 @@ __global__ void rs_ext_land(
     }
 }
 
+// The fault a lane's page list states (its `fault` word): an entry past its
+// working set's reserve, a list shorter than the pages the lane reads, a
+// row written below the set's frozen slots, a copy out of its bounds.
+#define PIE_PAGES_PAST_RESERVE 1u
+#define PIE_PAGES_SHORT 2u
+#define PIE_PAGES_BELOW_FLOOR 3u
+#define PIE_PAGES_COPY_BOUNDS 4u
+
+// A lane's page copy in one page list (the copy `beam_step` left in its
+// group's state): `[src, dst, tokens]` at `copy`, reserve pages `f0 + src` and `f0 + dst`
+// at `base[src]` and `base[dst]`, its planes `planes` of the plane table.
+struct PageCopyRun {
+    const u32* copy;
+    const u64* base;
+    u32* fault;
+    u32 reserve;
+    u32 page;
+    u32 floor_rel;
+    u32 plane_at;
+    u32 planes;
+    u32 pad;
+};
+
+static_assert(sizeof(PageCopyRun) == 48, "PageCopyRun: the Rust `channel::PageCopyRun` mirrors this layout");
+
+// Where a plane lies in a page and the bytes a token holds in it.
+struct PagePlane {
+    u64 offset;
+    u64 cell;
+};
+
+static_assert(sizeof(PagePlane) == 16, "PagePlane: the Rust `channel::PagePlane` mirrors this layout");
+
+// Copies each run's first `tokens` slots of page `src` to page `dst`, a
+// block a (run, plane): ahead of the fire's appends and reads, in stream
+// order. A copy out of its bounds (a page past the reserve, more tokens
+// than a page, a destination slot below the frozen ones) copies nothing
+// and states the lane's fault.
+__global__ void copy_pages(
+    const PageCopyRun* __restrict__ runs,
+    const PagePlane* __restrict__ planes,
+    u32 run_count)
+{
+    const u32 run = blockIdx.x;
+    if (run >= run_count) return;
+    const PageCopyRun r = runs[run];
+    if (blockIdx.y >= r.planes) return;
+    const u32 src = r.copy[0];
+    const u32 dst = r.copy[1];
+    const u32 tokens = r.copy[2];
+    if (tokens == 0u || src == dst) return;
+    if (src >= r.reserve || dst >= r.reserve || tokens > r.page
+        || static_cast<u64>(dst) * r.page < r.floor_rel) {
+        if (blockIdx.y == 0 && threadIdx.x == 0) atomicMax(r.fault, PIE_PAGES_COPY_BOUNDS);
+        return;
+    }
+    const PagePlane plane = planes[r.plane_at + blockIdx.y];
+    const u64 bytes = static_cast<u64>(tokens) * plane.cell;
+    const u8* from = reinterpret_cast<const u8*>(r.base[src] + plane.offset);
+    u8* to = reinterpret_cast<u8*>(r.base[dst] + plane.offset);
+    if ((bytes & 15u) == 0u && ((r.base[src] + plane.offset) & 15u) == 0u
+        && ((r.base[dst] + plane.offset) & 15u) == 0u) {
+        const uint4* f = reinterpret_cast<const uint4*>(from);
+        uint4* t = reinterpret_cast<uint4*>(to);
+        for (u64 at = threadIdx.x; at < bytes / 16u; at += blockDim.x) t[at] = f[at];
+    } else {
+        for (u64 at = threadIdx.x; at < bytes; at += blockDim.x) to[at] = from[at];
+    }
+}
+
+// Beam page lists (new-memory/designs/BEAM-PAGE-LISTS.md): one group's step.
+// The group's resident state, u32 words: a header (primed, fires run), its
+// lists twice (the fire's and the one before, by the fire count's parity),
+// its free pages, a ring of `frames` pending pages (a page freed by fire t
+// joins the free ones at fire t + frames + 1), and this fire's copies.
+#define PIE_BEAM_HEADER 4u
+#define PIE_PAGES_PARENT 5u
+#define PIE_PAGES_EXHAUSTED 6u
+
+// A lane's page table to resolve: its staged indices from entry `f0`, its
+// rows' staged write pages and offsets.
+struct BeamListRun {
+    i32* indices;
+    i32* write_page;
+    const i32* write_offset;
+    u32 lane;
+    u32 entries;
+    u32 rows;
+    u32 pad;
+};
+
+static_assert(sizeof(BeamListRun) == 40, "BeamListRun: the Rust `channel::BeamListRun` mirrors this layout");
+
+// A group's step: its state, the parents its last epilogue wrote, its pool's
+// device ids, its lanes' list runs and fault words, and the numbers of §3.
+struct BeamStepRun {
+    u32* state;
+    const u32* parents;
+    const i32* trans;
+    const BeamListRun* lists;
+    u32* faults;
+    u32 lanes;
+    u32 cap;
+    u32 reserve;
+    u32 page;
+    u32 folded;
+    u32 slot;
+    u32 list_count;
+    u32 frames;
+    u32 backed;
+    u32 pad;
+};
+
+static_assert(sizeof(BeamStepRun) == 80, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
+
+#define PIE_BEAM_MAX_LANES 64u
+
+// One block a group (blockIdx.x). §5 on the group's first fire, §6.1-6.3
+// after, then §6.5 over its lanes' staged tables; leaves this fire's copies
+// (§6.4) in its state for `copy_pages`.
+__global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
+{
+    if (blockIdx.x >= run_count) return;
+    const BeamStepRun r = runs[blockIdx.x];
+    const u32 B = r.lanes, cap = r.cap, Q = r.reserve, S = r.page;
+    const u32 F = r.frames == 0u ? 1u : r.frames;
+    // The pool pages the fire stages (`reserve` is the pool's whole): the
+    // lowest-free rule keeps every page the step names below them.
+    const u32 K = r.backed < Q ? r.backed : Q;
+    if (B == 0u || B > PIE_BEAM_MAX_LANES || Q > cap) return;
+    u32* header = r.state;
+    const u32 primed = header[0];
+    const u32 fired = header[1];
+    const u32 parity = fired & 1u;
+    u32* map_old = r.state + PIE_BEAM_HEADER + parity * B * cap;
+    u32* map_new = r.state + PIE_BEAM_HEADER + (parity ^ 1u) * B * cap;
+    u32* free_pages = r.state + PIE_BEAM_HEADER + 2u * B * cap;
+    u32* pend = free_pages + cap + (fired % F) * cap;
+    u32* copies = free_pages + cap + F * cap;
+    const u32 f0 = r.folded / S, tail = r.folded % S;
+    const u32 c = r.slot / S - f0, o = r.slot % S;
+    const u32 cp = r.slot == 0u ? 0u : (r.slot - 1u) / S - f0;
+
+    __shared__ u32 parent_of[PIE_BEAM_MAX_LANES];
+    __shared__ u32 need[PIE_BEAM_MAX_LANES];
+    __shared__ u32 rank_of[PIE_BEAM_MAX_LANES];
+    __shared__ u32 fresh[PIE_BEAM_MAX_LANES];
+    __shared__ u32 hand[PIE_BEAM_MAX_LANES];
+    __shared__ u32 counts[256];
+    __shared__ u32 needed;
+    __shared__ u32 handed;
+
+    if (primed == 0u) {
+        // §5: beam b on pool page b; page 0 is the prompt's where it ends
+        // mid-page, which beam 0 keeps and every other beam copies.
+        for (u32 at = threadIdx.x; at < B * cap; at += blockDim.x)
+            map_new[at] = (at % cap) == 0u ? at / cap : 0u;
+        for (u32 q = threadIdx.x; q < cap; q += blockDim.x)
+            free_pages[q] = (q < Q && q >= B && !(q == 0u && tail > 0u)) ? 1u : 0u;
+        for (u32 at = threadIdx.x; at < F * cap; at += blockDim.x) free_pages[cap + at] = 0u;
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
+            const bool copy = b > 0u && tail > 0u && o > 0u;
+            copies[b * 3u + 0u] = 0u;
+            copies[b * 3u + 1u] = copy ? b : 0u;
+            copies[b * 3u + 2u] = copy ? tail : 0u;
+            if (c != 0u) atomicMax(&r.faults[b], PIE_PAGES_SHORT);
+            if (B > Q) atomicMax(&r.faults[b], PIE_PAGES_EXHAUSTED);
+        }
+    } else {
+        // §6.1-6.2.
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
+            const u32 p = r.parents[b];
+            if (p >= B) {
+                atomicMax(&r.faults[b], PIE_PAGES_PARENT);
+                parent_of[b] = b;
+            } else {
+                parent_of[b] = p;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            u32 k = 0u;
+            for (u32 b = 0u; b < B; ++b) {
+                bool first = true;
+                for (u32 e = 0u; e < b; ++e) first = first && parent_of[e] != parent_of[b];
+                need[b] = (o == 0u || !first) ? 1u : 0u;
+                rank_of[b] = k;
+                k += need[b];
+            }
+            needed = k;
+        }
+        __syncthreads();
+        // The lowest free pages, in order: each thread counts its stretch.
+        const u32 threads = blockDim.x < 256u ? blockDim.x : 256u;
+        const u32 per = (cap + threads - 1u) / threads;
+        const u32 lo = threadIdx.x * per, hi = lo + per < cap ? lo + per : cap;
+        u32 own = 0u;
+        if (threadIdx.x < threads) {
+            for (u32 q = lo; q < hi; ++q) own += free_pages[q] != 0u ? 1u : 0u;
+            counts[threadIdx.x] = own;
+        }
+        __syncthreads();
+        // The stretches' running counts, a scan over the block.
+        for (u32 off = 1u; off < threads; off <<= 1u) {
+            u32 add = 0u;
+            if (threadIdx.x < threads && threadIdx.x >= off) add = counts[threadIdx.x - off];
+            __syncthreads();
+            if (threadIdx.x < threads) counts[threadIdx.x] += add;
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) {
+            const u32 run = counts[threads - 1u];
+            handed = run < needed ? run : needed;
+        }
+        if (threadIdx.x < threads) counts[threadIdx.x] -= own;
+        __syncthreads();
+        if (threadIdx.x < threads) {
+            u32 k = counts[threadIdx.x];
+            for (u32 q = lo; q < hi && k < needed; ++q) {
+                if (free_pages[q] != 0u) {
+                    hand[k] = q;
+                    ++k;
+                }
+            }
+        }
+        __syncthreads();
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
+            const bool gets = need[b] != 0u && rank_of[b] < handed;
+            if (need[b] != 0u && !gets) atomicMax(&r.faults[b], PIE_PAGES_EXHAUSTED);
+            fresh[b] = gets ? hand[rank_of[b]] : 0xFFFFFFFFu;
+        }
+        __syncthreads();
+        // Only the columns up to this fire's are live (later ones are
+        // unspecified, §4).
+        const u32 live = c + 1u < cap ? c + 1u : cap;
+        for (u32 at = threadIdx.x; at < B * live; at += blockDim.x) {
+            const u32 b = at / live, j = at % live;
+            const u32 inherited = map_old[parent_of[b] * cap + j];
+            map_new[b * cap + j] = (j == c && fresh[b] != 0xFFFFFFFFu) ? fresh[b] : inherited;
+        }
+        __syncthreads();
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
+            const bool copy = fresh[b] != 0xFFFFFFFFu && o > 0u;
+            copies[b * 3u + 0u] = copy ? map_old[parent_of[b] * cap + c] : 0u;
+            copies[b * 3u + 1u] = copy ? fresh[b] : 0u;
+            copies[b * 3u + 2u] = copy ? o : 0u;
+        }
+        // §6.3: the pages freed `frames` fires ago join the free ones; this
+        // fire's take their slot of the ring.
+        for (u32 q = threadIdx.x; q < cap; q += blockDim.x) {
+            bool taken = false;
+            for (u32 b = 0u; b < B; ++b) taken = taken || fresh[b] == q;
+            u32 f = ((free_pages[q] != 0u && !taken) || pend[q] != 0u) ? 1u : 0u;
+            if ((q == 0u && tail > 0u) || q >= Q) f = 0u;
+            free_pages[q] = f;
+        }
+        __syncthreads();
+        for (u32 q = threadIdx.x; q < cap; q += blockDim.x) pend[q] = 0u;
+        __syncthreads();
+        // An old entry no new row names in its column is freed (a lane that
+        // faulted PARENT keeps its own row, so its pages stay named).
+        const u32 held_cols = cp + 1u < cap ? cp + 1u : cap;
+        for (u32 at = threadIdx.x; at < B * held_cols; at += blockDim.x) {
+            const u32 p = at / held_cols, j = at % held_cols;
+            const u32 page = map_old[p * cap + j];
+            bool held = false;
+            for (u32 b = 0u; b < B && !held; ++b) held = map_new[b * cap + j] == page;
+            if (!held && page < cap && !(page == 0u && tail > 0u)) pend[page] = 1u;
+        }
+    }
+    __syncthreads();
+    // §6.5: each lane's staged entries past `f0` and its rows' write pages.
+    for (u32 i = 0u; i < r.list_count; ++i) {
+        const BeamListRun l = r.lists[i];
+        const u32* list = map_new + l.lane * cap;
+        if (l.entries > cap) {
+            if (threadIdx.x == 0u) atomicMax(&r.faults[l.lane], PIE_PAGES_SHORT);
+            continue;
+        }
+        for (u32 j = threadIdx.x; j < l.entries; j += blockDim.x) {
+            const u32 q = list[j];
+            if (q >= K) {
+                atomicMax(&r.faults[l.lane], q >= Q ? PIE_PAGES_PAST_RESERVE : PIE_PAGES_EXHAUSTED);
+                continue;
+            }
+            l.indices[j] = r.trans[q];
+        }
+        for (u32 row = threadIdx.x; row < l.rows; row += blockDim.x) {
+            const u32 slot = r.slot + row;
+            const u32 col = slot / S - f0;
+            if (col >= cap) {
+                atomicMax(&r.faults[l.lane], PIE_PAGES_SHORT);
+                continue;
+            }
+            const u32 q = list[col];
+            const u64 at = (static_cast<u64>(f0) + q) * S + static_cast<u32>(l.write_offset[row]);
+            if (q >= K || at < r.folded || at >= (static_cast<u64>(f0) + Q) * S) {
+                atomicMax(&r.faults[l.lane], PIE_PAGES_BELOW_FLOOR);
+                continue;
+            }
+            l.write_page[row] = r.trans[q];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        header[0] = 1u;
+        header[1] = fired + 1u;
+    }
+}
+
 }  // namespace pie::channel

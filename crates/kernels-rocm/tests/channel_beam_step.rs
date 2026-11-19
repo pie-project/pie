@@ -1,0 +1,217 @@
+//! A beam group's head step (`channel::beam_step`) against the host replay
+//! of `new-memory/designs/BEAM-PAGE-LISTS.md` (`engine::beam::step`), fire
+//! by fire: widths 2, 4 and 8, a prompt ending mid-page and one ending on a
+//! page, parents with forks and retirements; and the state moved to another
+//! allocation mid-search (a suspend and restore of the instance's bytes),
+//! after which the search goes on identically.
+#![allow(unsafe_code)]
+#![cfg(feature = "rocm")]
+
+mod common;
+
+use common::Gpu;
+use engine::beam::{self, Fire, State};
+use kernels_rocm::runtime::channel::{self, BeamListRun, BeamStepRun};
+
+const PAGE: u32 = 16;
+const FRAMES: u32 = 2;
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+
+    /// Each beam's parent: none moved, or sorted draws (forks where one
+    /// repeats, retirements where one is skipped).
+    fn parents(&mut self, lanes: u32) -> Vec<u32> {
+        if self.next() % 4 == 0 {
+            return (0..lanes).collect();
+        }
+        let mut parents: Vec<u32> = (0..lanes).map(|_| self.next() % lanes).collect();
+        parents.sort_unstable();
+        parents
+    }
+}
+
+/// The device id the synthetic translation gives pool page `q`.
+fn device_id(q: u32) -> i32 {
+    1000 + q as i32
+}
+
+fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
+    let ctx = gpu.ctx();
+    let f0 = folded / PAGE;
+    let columns = (folded + steps - 1) / PAGE - f0 + 1;
+    let reserve = lanes * columns + lanes + lanes * FRAMES + u32::from(folded % PAGE > 0);
+    let cap = reserve + 8;
+    let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
+    let mut state_at = gpu.up(&vec![0u32; words]);
+    let trans: Vec<i32> = (0..reserve).map(device_id).collect();
+    let trans_at = gpu.up(&trans);
+    // A table each beam: its entries from `f0`, one row.
+    let indices_at = gpu.up(&vec![-1i32; (lanes * cap) as usize]);
+    let write_page_at = gpu.up(&vec![-1i32; lanes as usize]);
+    let mut replay = State::new(lanes, cap, FRAMES);
+    let mut rng = Lcg(seed);
+    for t in 0..steps {
+        if t == steps / 2 {
+            // Suspend and restore: the state's bytes at another address.
+            let held: Vec<u32> = gpu.down(state_at, words);
+            state_at = gpu.up(&held);
+        }
+        let slot = folded + t;
+        let c = slot / PAGE - f0;
+        let o = slot % PAGE;
+        let parents = rng.parents(lanes);
+        let parents_at = gpu.up(&parents);
+        let offset_at = gpu.up(&vec![o as i32; lanes as usize]);
+        let faults_at = gpu.up(&vec![0u32; lanes as usize]);
+        let lists: Vec<BeamListRun> = (0..lanes)
+            .map(|b| BeamListRun {
+                indices: indices_at + u64::from(b * cap) * 4,
+                write_page: write_page_at + u64::from(b) * 4,
+                write_offset: offset_at + u64::from(b) * 4,
+                lane: b,
+                entries: c + 1,
+                rows: 1,
+                _pad: 0,
+            })
+            .collect();
+        let lists_at = gpu.up(&lists);
+        let run = BeamStepRun {
+            state: state_at,
+            parents: parents_at,
+            trans: trans_at,
+            lists: lists_at,
+            faults: faults_at,
+            lanes,
+            cap,
+            reserve,
+            page: PAGE,
+            folded,
+            slot,
+            list_count: lanes,
+            frames: FRAMES,
+            // The pages the engine stages: the lowest-free rule keeps every
+            // page the step names below them, or a lane faults.
+            backed: (lanes * (c + 2) + lanes * FRAMES + 1).min(reserve),
+            _pad: 0,
+        };
+        let run_at = gpu.up(&[run]);
+        channel::beam_step(&ctx, run_at, 1).expect("beam_step launches");
+        gpu.sync();
+        let want = beam::step(
+            &mut replay,
+            &parents,
+            Fire {
+                page: PAGE,
+                folded,
+                reserve,
+                slot,
+            },
+        );
+        let held: Vec<u32> = gpu.down(state_at, words);
+        let at = format!("lanes {lanes} folded {folded} seed {seed} fire {t}");
+        assert_eq!(held[0], 1, "{at}: primed");
+        assert_eq!(held[1], replay.fired, "{at}: fires run");
+        let map = 4 + (replay.fired as usize & 1) * (lanes * cap) as usize;
+        for b in 0..lanes as usize {
+            let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
+            assert_eq!(row, &want.lists[b][..], "{at}: beam {b}'s list");
+        }
+        let free = 4 + 2 * (lanes * cap) as usize;
+        let device_free: Vec<bool> = held[free..free + cap as usize].iter().map(|&w| w != 0).collect();
+        assert_eq!(device_free, replay.free, "{at}: free pages");
+        let pending = free + cap as usize;
+        let device_pending: Vec<bool> = held[pending..pending + (FRAMES * cap) as usize]
+            .iter()
+            .map(|&w| w != 0)
+            .collect();
+        assert_eq!(device_pending, replay.pending, "{at}: pending pages");
+        let copies = pending + (FRAMES * cap) as usize;
+        for b in 0..lanes as usize {
+            let copy = [held[copies + 3 * b], held[copies + 3 * b + 1], held[copies + 3 * b + 2]];
+            let wanted = if want.copies[b][2] == 0 { [0, 0, 0] } else { want.copies[b] };
+            assert_eq!(copy, wanted, "{at}: beam {b}'s copy");
+        }
+        let faults: Vec<u32> = gpu.down(faults_at, lanes as usize);
+        assert_eq!(faults, want.faults, "{at}: faults");
+        let resolved: Vec<i32> = gpu.down(indices_at, (lanes * cap) as usize);
+        let writes: Vec<i32> = gpu.down(write_page_at, lanes as usize);
+        for b in 0..lanes as usize {
+            let list: Vec<i32> = want.lists[b].iter().map(|&q| device_id(q)).collect();
+            let entries = &resolved[b * cap as usize..b * cap as usize + c as usize + 1];
+            assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
+            assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
+        }
+    }
+}
+
+#[test]
+fn the_beam_step_follows_the_spec() {
+    let Some(gpu) = Gpu::open() else { return };
+    for lanes in [2, 4, 8] {
+        for folded in [37, 32] {
+            for seed in 0..3 {
+                search(&gpu, lanes, folded, 3 * PAGE + 9, seed);
+            }
+        }
+    }
+}
+
+/// A parent past the group faults that lane alone, which continues itself:
+/// its pages stay named.
+#[test]
+fn a_parent_past_the_group_faults_its_lane() {
+    let Some(gpu) = Gpu::open() else { return };
+    let (lanes, folded) = (4u32, 37u32);
+    let ctx = gpu.ctx();
+    let reserve = 4 * 4 + 4 + 4 * FRAMES + 1;
+    let cap = reserve;
+    let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
+    let state_at = gpu.up(&vec![0u32; words]);
+    let trans_at = gpu.up(&(0..reserve).map(device_id).collect::<Vec<_>>());
+    let mut replay = State::new(lanes, cap, FRAMES);
+    for (t, parents) in [vec![0, 1, 2, 3], vec![0, 0, 9, 1]].into_iter().enumerate() {
+        let slot = folded + t as u32;
+        let faults_at = gpu.up(&vec![0u32; lanes as usize]);
+        let run = BeamStepRun {
+            state: state_at,
+            parents: gpu.up(&parents),
+            trans: trans_at,
+            lists: gpu.up(&[BeamListRun::default()]),
+            faults: faults_at,
+            lanes,
+            cap,
+            reserve,
+            page: PAGE,
+            folded,
+            slot,
+            list_count: 0,
+            frames: FRAMES,
+            backed: reserve,
+            _pad: 0,
+        };
+        channel::beam_step(&ctx, gpu.up(&[run]), 1).expect("beam_step launches");
+        gpu.sync();
+        let want = beam::step(
+            &mut replay,
+            &parents,
+            Fire {
+                page: PAGE,
+                folded,
+                reserve,
+                slot,
+            },
+        );
+        let faults: Vec<u32> = gpu.down(faults_at, lanes as usize);
+        assert_eq!(faults, want.faults, "fire {t}");
+    }
+    assert_eq!(replay.fired, 2);
+}

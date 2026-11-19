@@ -122,6 +122,8 @@ pub struct StateBinding {
     pub slots: Option<u32>,
     pub kv_len: Option<u32>,
     pub fold: Option<u32>,
+    /// Per lane, the beam it continues (`forward.wit` `state-geometry.parents`).
+    pub parents: Option<u32>,
 }
 
 #[derive(Default)]

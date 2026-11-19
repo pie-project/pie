@@ -182,6 +182,9 @@ pub struct Handles {
     pub lane_of_row: Tensor,
     /// The fire's rs tables, when it buffers recurrent rows.
     pub rs: Option<RsHandles>,
+    /// Where the fire's pages-bound lanes' fault words lie, a word each in
+    /// `PageWork::faults` order.
+    pub page_faults: Option<u64>,
 }
 
 /// Where a fire's staged rs tables lie on the device: a
@@ -555,6 +558,146 @@ fn inject_masks(
     Ok(())
 }
 
+/// Stages a fire's beam groups' work in the slab (`serve::pages`) and
+/// launches it over the staged `tables`, ahead of the fire's appends and
+/// reads in stream order: each group's step (its lists reordered by its
+/// parents, its lanes' entries and write pages resolved over them), then the
+/// copies the steps left. Returns where the lanes' fault words lie (frame
+/// slot `slot`'s, cleared before the launches that state them).
+fn stage_pages(
+    device: &crate::device::Context,
+    store: &mut Buffer,
+    at: PagesAt,
+    tables: &[TableHandles],
+    work: &crate::serve::pages::PageWork,
+    slot: u32,
+) -> Result<Option<u64>> {
+    use kernels_cuda::runtime::channel::{BeamListRun, BeamStepRun, PageCopyRun, PagePlane};
+    if work.is_empty() {
+        return Ok(None);
+    }
+    let stream = device.stream();
+    if crate::device::alloc::is_capturing(stream) {
+        return Err(crate::error::Fault::program(
+            "inputs::commit",
+            "a beam group's step is staged inside a stream capture, which would keep one \
+             fire's parents and slots for every replay",
+        ));
+    }
+    let fits = |what: &'static str, need: usize, have: u64| -> Result<()> {
+        if need as u64 > have {
+            return Err(crate::error::Fault::Ceiling {
+                what,
+                need: need as u64,
+                have,
+            });
+        }
+        Ok(())
+    };
+    fits("beam pool pages in one fire", work.trans.len(), at.trans_cap)?;
+    fits("beam pool pages copied in one fire", work.bases.len(), at.bases_cap)?;
+    fits("kv planes a page copy spans", work.planes.len(), at.planes_cap)?;
+    fits("beam list runs in one fire", work.lists.len(), at.lists_cap)?;
+    fits("beam groups in one fire", work.groups.len(), at.groups_cap)?;
+    fits("beam copies in one fire", work.copies.len(), at.copies_cap)?;
+    fits("beam lanes in one fire", work.faults.len(), at.faults_cap)?;
+    let base = store.ptr();
+    let faults = at.faults + u64::from(slot) * at.faults_cap * 4;
+    let bytes_of = |ptr: *const u8, len: usize| -> &[u8] {
+        // SAFETY: `ptr` spans `len` bytes of plain `repr(C)` data.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    };
+    store.stage(stream, at.trans, bytes_of(work.trans.as_ptr().cast(), work.trans.len() * 4))?;
+    store.stage(stream, at.bases, bytes_of(work.bases.as_ptr().cast(), work.bases.len() * 8))?;
+    store.stage(
+        stream,
+        at.planes,
+        bytes_of(
+            work.planes.as_ptr().cast(),
+            work.planes.len() * size_of::<PagePlane>(),
+        ),
+    )?;
+    store.stage(stream, faults, &vec![0u8; work.faults.len() * 4])?;
+    let mut lists: Vec<BeamListRun> = Vec::with_capacity(work.lists.len());
+    for list in &work.lists {
+        let table = tables.get(list.table as usize).ok_or_else(|| {
+            crate::error::Fault::program(
+                "inputs::commit",
+                format!("a beam list names page table {} the fire stages none of", list.table),
+            )
+        })?;
+        lists.push(BeamListRun {
+            indices: table.indices.ptr + u64::from(list.indices_at) * 4,
+            write_page: table.write_page.ptr + u64::from(list.write_row) * 4,
+            write_offset: table.write_offset.ptr + u64::from(list.write_row) * 4,
+            lane: list.lane,
+            entries: list.entries,
+            rows: list.rows,
+            _pad: 0,
+        });
+    }
+    store.stage(
+        stream,
+        at.lists,
+        bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()),
+    )?;
+    let groups: Vec<BeamStepRun> = work
+        .groups
+        .iter()
+        .map(|group| BeamStepRun {
+            state: group.state,
+            parents: group.parents,
+            trans: base + at.trans + u64::from(group.trans_at) * 4,
+            lists: base + at.lists + u64::from(group.lists_at) * size_of::<BeamListRun>() as u64,
+            faults: base + faults + u64::from(group.fault_at) * 4,
+            lanes: group.lanes,
+            cap: group.cap,
+            reserve: group.reserve,
+            page: group.page,
+            folded: group.folded,
+            slot: group.slot,
+            list_count: group.list_count,
+            frames: group.frames,
+            backed: group.backed,
+            _pad: 0,
+        })
+        .collect();
+    store.stage(
+        stream,
+        at.groups,
+        bytes_of(groups.as_ptr().cast(), groups.len() * size_of::<BeamStepRun>()),
+    )?;
+    kernels_cuda::runtime::channel::beam_step(device.ctx(), base + at.groups, groups.len() as u32)?;
+    let copies: Vec<PageCopyRun> = work
+        .copies
+        .iter()
+        .map(|copy| PageCopyRun {
+            copy: copy.copy,
+            base: base + at.bases + u64::from(copy.bases_at) * 8,
+            fault: base + faults + u64::from(copy.fault) * 4,
+            reserve: copy.reserve,
+            page: copy.page,
+            floor_rel: copy.floor_rel,
+            plane_at: 0,
+            planes: work.planes.len() as u32,
+            _pad: 0,
+        })
+        .collect();
+    store.stage(
+        stream,
+        at.copies,
+        bytes_of(copies.as_ptr().cast(), copies.len() * size_of::<PageCopyRun>()),
+    )?;
+    kernels_cuda::runtime::channel::copy_pages(
+        device.ctx(),
+        base + at.copies,
+        base + at.planes,
+        copies.len() as u32,
+        work.planes.len() as u32,
+    )?;
+    Ok(Some(base + faults))
+}
+
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -600,6 +743,9 @@ pub struct Inputs {
     inject_runs: u64,
     /// The staged run table of [`inject_masks`] in the slab: a run a lane.
     mask_runs: u64,
+    /// Where the slab holds a fire's lanes' own page lists' work
+    /// ([`stage_pages`]).
+    pages_at: PagesAt,
     /// Where the slab holds the fires' group masks, one stretch a ragged
     /// attention: a body captured over them reads each fire's at the same
     /// addresses.
@@ -612,6 +758,30 @@ pub struct Inputs {
     staged_mask_indptr: Vec<u8>,
     staged_mask_origin: Vec<u8>,
 }
+
+/// The slab's stretch for lanes' own page lists (`serve::pages`): the
+/// reserves' device ids and page addresses, the plane table, the runs and a
+/// fault word a lane, each up to its cap.
+#[derive(Debug, Clone, Copy)]
+struct PagesAt {
+    trans: u64,
+    trans_cap: u64,
+    bases: u64,
+    bases_cap: u64,
+    planes: u64,
+    planes_cap: u64,
+    lists: u64,
+    lists_cap: u64,
+    groups: u64,
+    groups_cap: u64,
+    copies: u64,
+    copies_cap: u64,
+    faults: u64,
+    faults_cap: u64,
+}
+
+/// The kv planes a page holds that one copy run may span.
+const PAGE_PLANES_CAP: u64 = 64;
 
 /// The slab's group-mask stretches: stretch `i` (the load's `i`th ragged
 /// attention) holds its byte offsets a group from `at + i * stride`, then
@@ -693,6 +863,33 @@ impl Inputs {
         // A lane feeds its tokens, and its mask, from the device in one run.
         let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
+        let pages_at = {
+            use kernels_cuda::runtime::channel::{
+                BeamListRun, BeamStepRun, PageCopyRun, PagePlane,
+            };
+            // A group's pool spans at most a sequence's pages, a lane's.
+            let reserve = lanes * u64::from(paging.pages_per_slot);
+            let lists_cap = lanes * page_tables as u64;
+            // A fire's lanes' fault words, a set a fire in flight: the next
+            // fire's step runs before this one's settle reads them.
+            let in_flight = u64::from(runahead.staging_depth().max(1) as u32);
+            PagesAt {
+                trans: take(reserve * 4),
+                trans_cap: reserve,
+                bases: take(reserve * 8),
+                bases_cap: reserve,
+                planes: take(PAGE_PLANES_CAP * size_of::<PagePlane>() as u64),
+                planes_cap: PAGE_PLANES_CAP,
+                lists: take(lists_cap * size_of::<BeamListRun>() as u64),
+                lists_cap,
+                groups: take(lanes * size_of::<BeamStepRun>() as u64),
+                groups_cap: lanes,
+                copies: take(lanes * size_of::<PageCopyRun>() as u64),
+                copies_cap: lanes,
+                faults: take(lanes * 4 * in_flight),
+                faults_cap: lanes,
+            }
+        };
         let mask_indptr = take((lanes + 1) * 8);
         let mask_origin = take(lanes * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
@@ -846,6 +1043,7 @@ impl Inputs {
             max_rows: budget.max_tokens,
             inject_runs,
             mask_runs,
+            pages_at,
             group_masks,
             staged_windows: Vec::new(),
             staged_mask_indptr: Vec::new(),
@@ -1393,6 +1591,7 @@ impl Inputs {
         staged: &Staged,
         token_injects: &[TokenInject],
         mask_injects: &[MaskInject],
+        pages: &crate::serve::pages::PageWork,
     ) -> Result<Handles> {
         let Staged {
             rows,
@@ -1447,6 +1646,7 @@ impl Inputs {
             staging,
             inject_runs,
             mask_runs,
+            pages_at,
             staged_windows,
             staged_mask_indptr,
             staged_mask_origin,
@@ -1574,6 +1774,10 @@ impl Inputs {
             base + at_mask,
             mask_injects,
         )?;
+        // Over the page tables just staged, ahead of the fire's appends and
+        // reads in stream order: the copies first, then the lists.
+        let page_faults =
+            stage_pages(device, &mut *store, *pages_at, &page_tables, pages, slot.at())?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),
@@ -1595,6 +1799,7 @@ impl Inputs {
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
             rs,
+            page_faults,
         })
     }
 

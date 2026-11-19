@@ -333,6 +333,11 @@ pub struct Lane {
     /// translation its program's page indexes address.
     #[serde(default)]
     pub list: ListKind,
+    /// A lane stating its own page list (`state-geometry.pages`): its
+    /// working set's whole kv list table (slot refs), whose pages past the
+    /// frozen full ones its list's entries name. Empty for any other lane.
+    #[serde(default)]
+    pub reserve: Vec<u32>,
     /// The lane's recurrent-state record. The runtime states one for every
     /// lane of a load that holds recurrent state, a record or none.
     #[serde(default)]

@@ -607,7 +607,11 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
+                positions=wits[0],
+                slots=wits[1],
+                kv_len=wits[2],
+                fold=wits[3],
+                parents=None,
             ),
             what="state",
         )

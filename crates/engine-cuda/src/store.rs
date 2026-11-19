@@ -2586,6 +2586,47 @@ impl Pools {
             .collect()
     }
 
+    /// Seats and backs the full-context kv pages `pages` (a lane's working
+    /// set's reserve its own page list names, `serve::pages`).
+    pub fn seat_kv_pages(&mut self, pages: &[u32]) -> Result<()> {
+        self.ensure_kv_pages(pages)
+    }
+
+    /// The address kv page `page` of list `list` starts at, seated.
+    pub fn page_base(&self, list: u8, page: u32) -> Result<u64> {
+        self.chunks.span(Kind::paged(list), page, 0, 1)
+    }
+
+    /// The planes a full-context kv page holds, as [`Self::copy_kv`] copies
+    /// them: where each lies in the page and the bytes a token holds in it.
+    #[must_use]
+    pub fn page_planes(&self) -> Vec<kernels_cuda::runtime::channel::PagePlane> {
+        let mut planes = Vec::new();
+        for shape in &self.shapes {
+            let Shape::Kv {
+                windowed: false,
+                dtype,
+                keys_width,
+                values_width,
+                values_plane,
+                offsets,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            let element = u64::from(elem_size(dtype));
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
+                let width = if at == 0 { keys_width } else { values_width };
+                planes.push(kernels_cuda::runtime::channel::PagePlane {
+                    offset,
+                    cell: width * element,
+                });
+            }
+        }
+        planes
+    }
+
     /// Copies `moves` in the full rows and `windowed` (whole pages) in the
     /// windowed ones, whose page ids are their own.
     pub fn copy_kv(

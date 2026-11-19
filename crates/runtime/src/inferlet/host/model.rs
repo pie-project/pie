@@ -174,6 +174,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::channel_capacity() as u32)
     }
 
+    async fn frames_in_flight(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::configured_dispatch_depth().max(1) as u32)
+    }
+
     async fn run_ahead_window(&mut self) -> Result<u32> {
         Ok(crate::scheduler::run_ahead_window() as u32)
     }

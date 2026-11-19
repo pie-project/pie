@@ -69,10 +69,36 @@ impl Program {
             .any(|(name, _)| crate::scores::captured(name))
     }
 
-    /// What an instance keeps in the pool: its item, and past it a
-    /// capturing lane's rows of `score_bytes` where it reads them.
-    fn held(&self, score_bytes: u64) -> Held {
-        let held = Held::of(&self.plan.package.channels);
+    /// The lanes of a beam group, where the program states each beam's parent
+    /// (`Port::Parents`, `[lanes]` u32 in a channel).
+    fn beam_lanes(&self) -> Option<u32> {
+        let binding = self
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
+        let channel = self.plan.package.channels.get(binding.channel as usize)?;
+        Some(ChannelShape::of(channel).numel as u32)
+    }
+
+    /// What an instance keeps in the pool: its item, a beam group's page
+    /// lists past it where it states parents (laid for `beam`'s pages and
+    /// frames), and past that a capturing lane's rows of `score_bytes`
+    /// where it reads them.
+    fn held(&self, score_bytes: u64, beam: (u32, u32)) -> Held {
+        let mut held = Held::of(&self.plan.package.channels);
+        if let Some(lanes) = self.beam_lanes() {
+            // A group's pool holds its beams' pages (each at most a
+            // sequence's), the pages a fire hands out, those pending over the
+            // frames in flight and the prompt's own page (BEAM-PAGE-LISTS §3).
+            let (pages, frames) = beam;
+            let cap = lanes
+                .saturating_mul(pages)
+                .saturating_add(lanes.saturating_mul(frames + 1))
+                .saturating_add(1);
+            held = held.with_beam(lanes, cap, frames);
+        }
         if self.reads_scores() {
             held.with_scores(score_bytes)
         } else {
@@ -274,6 +300,8 @@ pub struct Plane {
     /// A capturing lane's rows, which a program reading them keeps in its
     /// instance's item (`crate::scores`); 0 where the load captures none.
     score_bytes: u64,
+    /// The pages and frames a beam group's state is laid for.
+    beam_bounds: (u32, u32),
 }
 
 /// What a flight of one program at one bind's extents lays: every stage's
@@ -415,6 +443,7 @@ impl Plane {
             fire_lanes: 0,
             arenas: launch::Arenas::default(),
             score_bytes: 0,
+            beam_bounds: (0, 1),
         }
     }
 
@@ -428,6 +457,21 @@ impl Plane {
     /// A capturing lane's rows take `bytes` of a reader's item.
     pub fn set_score_bytes(&mut self, bytes: u64) {
         self.score_bytes = bytes;
+    }
+
+    /// The pages a beam group's lists and pool are laid for (the context's)
+    /// and the frames its pending pages wait (the frames in flight).
+    pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
+        self.beam_bounds = (pages, frames.max(1));
+    }
+
+    /// Where instance `id`'s beam group keeps its page lists now, and how it
+    /// is laid; `None` for an instance whose program states no parents.
+    #[must_use]
+    pub fn beam_state(&self, id: InstanceId) -> Option<(u64, super::program::launch::BeamLayout)> {
+        let bound = self.instances.get(&id)?;
+        let layout = bound.session.beam()?;
+        Some((bound.session.instance_base() + layout.at, layout))
     }
 
     /// Where instance `id`'s capturing lane's rows lie now, its key row
@@ -677,9 +721,10 @@ impl Plane {
             batch.stale = true;
         }
         let program = &*program;
-        let held = program.held(self.score_bytes);
+        let held = program.held(self.score_bytes, self.beam_bounds);
         let place = slots.place(&held, span)?;
         let scores = held.score_at.map(|at| place.instance + at);
+        let full = held.clone();
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let mut session = match Session::bind(
@@ -688,6 +733,7 @@ impl Plane {
             seeds,
             extents,
             endpoints,
+            full,
             &place,
             self.shadow,
             stream,
@@ -726,7 +772,7 @@ impl Plane {
     pub fn held(&self, program_id: ProgramId) -> Result<Held> {
         self.programs
             .get(&program_id)
-            .map(|program| program.held(self.score_bytes))
+            .map(|program| program.held(self.score_bytes, self.beam_bounds))
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
@@ -737,7 +783,7 @@ impl Plane {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
-            let held = program.held(self.score_bytes);
+            let held = program.held(self.score_bytes, self.beam_bounds);
             let place = bound.slots.place(&held, span)?;
             bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
@@ -770,7 +816,7 @@ impl Plane {
         // Every address the new slots lie at, before anything changes: a
         // rebind refused here leaves the instance as it stood, never half
         // pointed at the new slots and half at the old.
-        let held = program.held(self.score_bytes);
+        let held = program.held(self.score_bytes, self.beam_bounds);
         let place = slots.place(&held, span)?;
         let scores = held.score_at.map(|at| place.instance + at);
         let extents = bound.session.extents();
@@ -844,6 +890,18 @@ impl Plane {
         let bound = self.instances.get(&id)?;
         let program = self.programs.get(&bound.program_id)?;
         bound.session.mask_device_source(&program.plan)
+    }
+
+    /// The device cell instance `id`'s beams' parents are read from
+    /// ([`Session::parents_device_source`]).
+    pub fn parents_device_source(&self, id: InstanceId) -> Result<Option<(u64, u32)>> {
+        let Some(bound) = self.instances.get(&id) else {
+            return Ok(None);
+        };
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.parents_device_source(&program.plan)
     }
 
     /// Whether instance `id` resolves `port` ([`Session::resolves`]).

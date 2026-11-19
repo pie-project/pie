@@ -1,26 +1,25 @@
-//! On-device beam search with logical ancestry masks.
+//! On-device beam search over per-beam page lists.
 //!
 //! The prompt — chat-templated, or `prompt_tokens` as given — is every beam's
-//! common ancestry. It is prefilled ONCE into the head of a working set, and
+//! common ancestry. It is prefilled ONCE into a working set and folded, and
 //! that fire's epilogue picks the first `beams` tokens (the top of the
 //! prompt's next-token distribution), as greedy decoding picks its first.
 //!
-//! The beams then share that ONE working set, a pool repeated for every lane.
-//! Each surviving beam appends its new token at the next free pool slot
-//! (`slot = fill + lane`, computed on the device), and its ancestry is encoded
-//! in the per-beam mask — inherit the parent's mask (`gather(mask, parent)`)
-//! then set the one new cell (`eq(col, slot)`). That is the entire fork/prune
-//! mechanism. The prompt is folded, so it is committed: every beam reads it
-//! and no mask speaks of it. A mask's column `c` is pool slot `n + c`, the
-//! cells past the prompt. A beam's lane reads the pool up to its own slot, as
-//! every lane the host places does (it states no `kv_len`): its ancestors all
-//! stand at earlier steps' slots, below this step's, and its mask hides the
-//! other beams' cells among them.
+//! The beams then share that working set's frozen prompt, and each keeps its
+//! own list of the pages its generated slots lie in (`inferlet::beam`): a
+//! beam's rows read the prompt and its own pages only, a read extent of its
+//! own length, with no mask. Every decode fire's epilogue picks the next
+//! `beams` (parent, token) pairs and reorders the lists by the parents
+//! (`BeamGroup::reorder`): a child shares its parent's full pages; the
+//! parent's first child keeps its tail page, every other child has the tail
+//! copied into a free page before the next fire appends. Pages no beam reads
+//! any more are freed a fire late.
 //!
 //! The search runs `max_tokens` steps: a beam is not retired at end of
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
 //! length (the beam identity, checked every step against the raw argmax).
 
+use inferlet::beam::BeamGroup;
 use inferlet::chat;
 use inferlet::eta::prelude::*;
 use serde::Deserialize;
@@ -117,16 +116,8 @@ async fn main(input: Input) -> Result<String> {
         return Err("empty prompt".into());
     }
     let n = u32::try_from(prompt.len()).map_err(|_| "the prompt exceeds the u32 range")?;
-    // The prompt's slots, then one slot per beam per decode step.
     let decodes = max_steps - 1;
-    let pool_len = u32::try_from(decodes)
-        .ok()
-        .and_then(|steps| steps.checked_mul(b))
-        .and_then(|cells| cells.checked_add(n))
-        .ok_or("beams * max_tokens exceeds the u32 range")?;
     let ws = WorkingSet::new();
-    // The device chooses the beams' slots, so the pool is reserved up front.
-    ws.reserve(pool_len).context("ws.reserve pool")?;
 
     let pipeline = Pipeline::new();
 
@@ -178,31 +169,13 @@ async fn main(input: Input) -> Result<String> {
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &lanes_b)?;
         let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
+        // Every beam reads the folded prompt and its own pages: beam `i`'s
+        // first decode writes slot `n` on its own first page.
+        let decodes_u32 = u32::try_from(decodes).map_err(|_| "max_tokens exceeds u32")?;
+        let group = BeamGroup::new(&ws, b, n, decodes_u32).context("reserve the beams' pages")?;
 
-        // The first decode writes beam `i`'s token at slot `n + i`, column
-        // `i` of the cells past the committed prompt; it sees the prompt and
-        // its own cell.
-        let cells = pool_len - n;
-        let init_mask: Vec<bool> = (0..b)
-            .flat_map(|lane| (0..cells).map(move |c| c == lane))
-            .collect();
-        let mask = Channel::from_shaped([b, cells], init_mask);
-        let slots = Channel::from_iter(n..n + b);
-        // A beam's RoPE position is its depth in the sequence, not its pool slot.
-        let pos = Channel::from(vec![n; b as usize]);
-        // Where the fire after this one writes its first beam.
-        let fill = Channel::from([n + b]);
-        fwd.mask(&mask)?;
-        fwd.state(
-            &pool,
-            StateGeometry {
-                positions: Some(&pos),
-                slots: Some(&slots),
-                kv_len: None,
-                fold: Fold::None,
-            },
-        )
-        .context("bind the beam pool")?;
+        fwd.state(&pool, group.geometry())
+            .context("bind the beams' page lists")?;
         fwd.epilogue(move || {
             // `logits()` squeezes a one-row fire to `[v]`: reshape so `beams == 1` meets `[B, 1]` scores.
             let logits = reshape(intrinsics::output(0, "logits"), [b, v]);
@@ -219,23 +192,7 @@ async fn main(input: Input) -> Result<String> {
             // Cross-check: at `beams == 1` the raw-logit argmax must equal the beam pick every step.
             out_greedy.put(reshape(reduce_argmax(&logits), [b]));
 
-            let base = fill.take(); // [1]
-            let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]
-            let wpos = &base_b + iota(b); // [B]
-
-            let inherited = gather(mask.take(), &parent); // bool [B,cells]
-            // Column `c` is slot `n + c`.
-            let col = broadcast(reshape(iota(cells) + n, [1, cells]), [b, cells]);
-            let wpos_b = broadcast(reshape(&wpos, [b, 1]), [b, cells]);
-            let newpos = eq(col, wpos_b); // bool [B,cells]
-            mask.put(or(inherited, &newpos));
-
-            // Device-resolved geometry is loop-carried: the host never drains
-            // these rings, so every fire's values are re-put here.
-            let filled = &base + b; // [1]
-            slots.put(&wpos);
-            pos.put(pos.take() + 1u32);
-            fill.put(&filled);
+            group.reorder(&cast(&parent, dtype::u32));
         });
 
         let mut step = 0usize;
@@ -310,6 +267,7 @@ async fn main(input: Input) -> Result<String> {
                     .take_host::<Vec<u32>>()
                     .await
                     .with_context(|| format!("@{step}"))?;
+
                 final_scores = out_scr
                     .take_host::<Vec<f32>>()
                     .await

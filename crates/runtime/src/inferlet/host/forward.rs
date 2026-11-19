@@ -111,6 +111,9 @@ fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'s
     if existing.fold != next.fold {
         return Some("fold");
     }
+    if existing.parents != next.parents {
+        return Some("parents");
+    }
     None
 }
 
@@ -507,6 +510,7 @@ impl ProcessCtx {
             slots,
             kv_len,
             fold,
+            parents,
         } = geom;
         if lanes.is_empty() {
             return Ok(Err(
@@ -516,7 +520,26 @@ impl ProcessCtx {
         for lane in &lanes {
             let _ = self.ctx().table.get(lane)?;
         }
-        for channel in [&positions, &slots, &kv_len, &fold].into_iter().flatten() {
+        if parents.is_some() {
+            if lanes.windows(2).any(|pair| pair[0].rep() != pair[1].rep()) {
+                return Ok(Err(
+                    "forward pass state binds parents and its lanes name more than one working \
+                     set; a beam search's lanes share one, whose pool their page lists hold"
+                        .to_string(),
+                ));
+            }
+            if kv_len.is_some() || fold.is_some() {
+                return Ok(Err(
+                    "forward pass state binds parents beside kv-len or fold; a beam's rows read \
+                     their own pages to their own slot and fold nothing"
+                        .to_string(),
+                ));
+            }
+        }
+        for channel in [&positions, &slots, &kv_len, &fold, &parents]
+            .into_iter()
+            .flatten()
+        {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
@@ -534,6 +557,7 @@ impl ProcessCtx {
             slots: slots.map(|resource| resource.rep()),
             kv_len: kv_len.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
+            parents: parents.map(|resource| resource.rep()),
         };
         let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
@@ -916,7 +940,13 @@ impl ProcessCtx {
             };
             if reads_state
                 && let Some(state) = &state
-                && [state.positions, state.slots, state.kv_len, state.fold]
+                && [
+                    state.positions,
+                    state.slots,
+                    state.kv_len,
+                    state.fold,
+                    state.parents,
+                ]
                     .iter()
                     .any(Option::is_some)
             {
@@ -1103,6 +1133,7 @@ impl ProcessCtx {
                 (Port::KvLen, geometry(|state| state.kv_len)),
                 (Port::AttnMask, mask),
                 (Port::Fold, geometry(|state| state.fold)),
+                (Port::Parents, geometry(|state| state.parents)),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
@@ -1780,6 +1811,7 @@ mod tests {
             slots: None,
             kv_len: Some(4),
             fold: Some(6),
+            parents: None,
         };
         let forks = StateBinding {
             lanes: vec![7, 8],

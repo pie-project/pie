@@ -8,6 +8,7 @@ mod lanes;
 mod load;
 mod measured;
 pub use load::Staged;
+pub(crate) mod pages;
 mod prepare;
 mod segments;
 mod settle;
@@ -1354,6 +1355,10 @@ pub struct Prepared<'a> {
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
     mask_injects: Vec<crate::inputs::MaskInject>,
+    /// What the fire's pages-bound lanes have the device resolve and copy.
+    page_work: pages::PageWork,
+    /// Where the staged fire's page-list fault words lie, read at settle.
+    page_faults: Option<u64>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
     /// Why not, in a load that records bodies: the key and the reason.

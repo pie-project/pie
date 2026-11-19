@@ -200,7 +200,13 @@ pub fn load_wave_kernels() -> Result<(), Error> {
 /// device-carried mask bits, a table of them) on the current device now:
 /// a serving fire fires them, and nothing builds after ready.
 pub fn load_gather_kernels() -> Result<(), Error> {
-    for name in ["gather_words", "gather_bits", "gather_bit_runs"] {
+    for name in [
+        "gather_words",
+        "gather_bits",
+        "gather_bit_runs",
+        "beam_step",
+        "copy_pages",
+    ] {
         kernel(FILE, &format!("::pie::channel::{name}")).load()?;
     }
     Ok(())
@@ -638,4 +644,156 @@ mod tests {
         );
         assert_eq!((lane.taken_count, lane.put_count), (2, 1));
     }
+}
+
+/// A lane's page copy in one page list (`channel.hip`'s `PageCopyRun`):
+/// its `[src, dst, tokens]` at `copy`, the reserve pages' base addresses at
+/// `base`, its planes `planes` entries of the plane table from `plane_at`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageCopyRun {
+    pub copy: DevicePtr,
+    pub base: DevicePtr,
+    pub fault: DevicePtr,
+    pub reserve: u32,
+    pub page: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<PageCopyRun>() == 48);
+
+/// Where a kv plane lies in a page, and the bytes one token holds in it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagePlane {
+    pub offset: u64,
+    pub cell: u64,
+}
+
+const _: () = assert!(size_of::<PagePlane>() == 16);
+
+/// The fault a lane's page list states in its fault word: an entry past its
+/// set's reserve, a list shorter than the pages it reads, a row written below
+/// the set's frozen slots, a copy out of its bounds (`channel.hip`).
+pub const PAGES_PAST_RESERVE: u32 = 1;
+pub const PAGES_SHORT: u32 = 2;
+pub const PAGES_BELOW_FLOOR: u32 = 3;
+pub const PAGES_COPY_BOUNDS: u32 = 4;
+
+const PAGES_BLOCK: u32 = 128;
+
+/// Copies each of `run_count` [`PageCopyRun`]s at `runs` over its planes of
+/// `planes`, a block a (run, plane); `max_planes` is the most a run spans.
+pub fn copy_pages(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    planes: DevicePtr,
+    run_count: u32,
+    max_planes: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.copy_pages";
+    if run_count == 0 || max_planes == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::copy_pages"))
+            .apply(Launch::grid([run_count, max_planes, 1], [PAGES_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(planes),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
+/// A lane's staged page table [`beam_step`] resolves over its group's list
+/// (`channel.hip`'s `BeamListRun`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamListRun {
+    pub indices: DevicePtr,
+    pub write_page: DevicePtr,
+    pub write_offset: DevicePtr,
+    pub lane: u32,
+    pub entries: u32,
+    pub rows: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<BeamListRun>() == 40);
+
+/// One beam group's step (`new-memory/designs/BEAM-PAGE-LISTS.md`,
+/// `channel.hip`'s `BeamStepRun`): its resident state, the parents its
+/// last epilogue wrote, its pool's device ids, its lanes' list runs and
+/// fault words, and its numbers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamStepRun {
+    pub state: DevicePtr,
+    pub parents: DevicePtr,
+    pub trans: DevicePtr,
+    pub lists: DevicePtr,
+    pub faults: DevicePtr,
+    pub lanes: u32,
+    /// The list width and pool pages the state is laid for.
+    pub cap: u32,
+    /// The pool's pages now (`reserved` pages past `f0`).
+    pub reserve: u32,
+    pub page: u32,
+    pub folded: u32,
+    /// The slot every beam writes this fire.
+    pub slot: u32,
+    pub list_count: u32,
+    /// The ring of pending pages: a page freed at fire t is handed out from
+    /// fire t + frames + 1.
+    pub frames: u32,
+    /// The pool pages the fire stages, from the first: every page the step
+    /// names lies below them (the lowest-free rule), and one that does not
+    /// faults its lane.
+    pub backed: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<BeamStepRun>() == 80);
+
+/// The most beams one group holds.
+pub const BEAM_MAX_LANES: u32 = 64;
+/// A lane's parent past its group (`beam_step`).
+pub const PAGES_PARENT: u32 = 5;
+/// A fire found fewer free pages than it hands out (exact sizing makes it
+/// unreachable: a bug where it happens).
+pub const PAGES_EXHAUSTED: u32 = 6;
+
+/// The u32 words a group of `lanes` beams keeps for lists of `cap` columns
+/// over `cap` pool pages and `frames` pending rings
+/// (`channel.hip`'s state layout).
+#[must_use]
+pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
+    4 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64 + 3 * lanes as u64
+}
+
+/// The state words where a group's copies for this fire lie.
+#[must_use]
+pub const fn beam_copies_word(lanes: u32, cap: u32, frames: u32) -> u64 {
+    4 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64
+}
+
+const BEAM_BLOCK: u32 = 256;
+
+/// Runs each of `run_count` [`BeamStepRun`]s at `runs`, a block a group.
+pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32) -> Result<(), Error> {
+    const OP: &str = "channel.beam_step";
+    if run_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::beam_step"))
+            .apply(Launch::grid([run_count, 1, 1], [BEAM_BLOCK, 1, 1])),
+        &[ArgValue::Ptr(runs), ArgValue::U32(run_count)],
+    )
 }

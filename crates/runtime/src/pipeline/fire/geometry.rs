@@ -215,10 +215,36 @@ pub fn classify_decode_envelope_why(
             ));
         }
     }
+    // Each beam's parent (beam search): device data beside slots the host
+    // places, over which the engine keeps the beams' own page lists.
+    let device_parents = device(Port::Parents);
+    if device_parents {
+        let declaration = container
+            .channels
+            .get(channel_index(Port::Parents).unwrap_or(usize::MAX))
+            .ok_or_else(|| "decode envelope parents channel is out of range".to_string())?;
+        if declaration.shape.dims() != [lane_count]
+            || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+        {
+            return Err(format!(
+                "a device parents channel must be a [{lane_count}] u32 vector; this one is {:?}",
+                declaration.shape.dims()
+            ));
+        }
+    } else if channel_for(Port::Parents).is_some() {
+        return decline(
+            "it binds parents the host derives; a beam's parent is picked on the device"
+                .to_string(),
+        );
+    }
     if let Some(port) = taint.device_dependent_ports.iter().find(|port| {
         !matches!(
             port,
-            Port::EmbedTokens | Port::Positions | Port::Fold | Port::AttnMask
+            Port::EmbedTokens
+                | Port::Positions
+                | Port::Fold
+                | Port::AttnMask
+                | Port::Parents
         )
     }) {
         return decline(format!("{port:?} is computed on the device"));
@@ -232,6 +258,9 @@ pub fn classify_decode_envelope_why(
     }
     if device_mask {
         required = required.with(Port::AttnMask);
+    }
+    if device_parents {
+        required = required.with(Port::Parents);
     }
     Ok(Some(required))
 }

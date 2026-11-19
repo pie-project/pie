@@ -457,7 +457,9 @@ impl FireCtx<'_> {
             &p.lengths,
             &p.token_injects,
             &p.mask_injects,
+            &p.page_work,
         )?;
+        p.page_faults = handles.page_faults;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);

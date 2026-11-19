@@ -857,7 +857,8 @@ impl Engine for Cuda {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle,
             media_encode: false,
@@ -1784,7 +1785,7 @@ impl Cuda {
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
-                        &[]
+                        &lane.reserve
                     },
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     more_windows: &more_windows[at],
