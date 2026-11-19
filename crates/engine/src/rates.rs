@@ -1009,8 +1009,8 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let (rows, width) = ELEMENTWISE_SHAPE;
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' shapes (matmul m x \
-         w x w, w {:?}, m {:?}; attention keys x keys, keys {:?}, {}/{} heads of \
-         128; per-row ops {rows} x {width}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
+         w x w, w {:?}, m {:?}; attention keys x keys, keys {:?}, {}/{} heads \
+         {:?} wide; per-row ops {rows} x {width}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
         GEMM_WIDTHS,
@@ -1018,6 +1018,7 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
         ATTN_KEYS,
         ATTN_SHAPE.q_heads,
         ATTN_SHAPE.kv_heads,
+        ATTN_DIMS,
         SCAN_SHAPE.tokens,
         SCAN_SHAPE.k_heads,
         SCAN_SHAPE.v_heads,

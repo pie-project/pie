@@ -6,7 +6,7 @@ assumes = { coopmat = true }
 
 [provenance]
 measured = ["kernel.gemm.path"]
-rates = "pie tune vulkan --rates on 2026-11-18 (pie 0.6.0, commits 271067756 and 2a33bd37a, identical on Vulkan), NVIDIA RTX PRO 4500 Blackwell, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, the host's clock around each frame, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there (the plain tiled kernel below 96 rows, the cooperative-matrix tile from 96, as gemm.path states), the median rate past its weight reads; the tiled attention by keys; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over 82 cores; operands: engine::rates' pattern. Spread over the five runs: matmul points at most 4.9% (4096 at 362 rows), attention 1.1%, launch 0.3%, copy 3.6%, per-row ops 2.9%, scan 10.8% (one run 151.8 G/s, four 137.0-137.6), few-row 0.5%, workgroups a core 0.7%"
+rates = "pie tune vulkan --rates on 2026-11-19 (pie 0.6.0, commit 0e6cf65bb), NVIDIA RTX PRO 4500 Blackwell, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there, the median rate past its weight reads; the tiled attention by keys at head widths 64, 128 and 256; the conv and the gated-delta scan each timed on its own; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over 82 cores; operands: engine::rates' pattern. Spread over the five runs: matmul and attention points at most 6.3%, launch 1.8%, copy 2.4%, per-row ops 1.8%, scan 0.6%, few-row 0.9%, workgroups a core 0.4%"
 
 [kernel]
 # `pie tune --quick` over Qwen3-0.6B's and Qwen3-8B's bf16 projections: below
@@ -16,19 +16,19 @@ rates = "pie tune vulkan --rates on 2026-11-18 (pie 0.6.0, commits 271067756 and
 gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]
 
 [rates]
-launch_ns = 2188
+launch_ns = 2189
 gemm_tflops_by_rows = [
-  [1024, [[256, 7.1], [362, 10.1], [512, 14.2], [724, 16.4], [1024, 18.4], [1448, 15.3], [2048, 18.4], [2896, 19.1], [4096, 20.7], [5793, 22.6], [8192, 23.6]]],
-  [2048, [[256, 12.6], [362, 17.2], [512, 18.5], [724, 14.4], [1024, 18.3], [1448, 20.0], [2048, 21.1], [2896, 23.2], [4096, 24.1], [5793, 24.8], [8192, 24.8]]],
-  [4096, [[256, 18.6], [362, 16.3], [512, 18.0], [724, 20.0], [1024, 21.1], [1448, 23.3], [2048, 24.1], [2896, 24.6], [4096, 25.0], [5793, 25.2], [8192, 25.4]]],
+  [1024, [[256, 7.1], [362, 10.1], [512, 14.2], [724, 16.2], [1024, 18.3], [1448, 15.1], [2048, 18.3], [2896, 18.9], [4096, 20.6], [5793, 22.6], [8192, 23.3]]],
+  [2048, [[256, 12.5], [362, 17.1], [512, 18.3], [724, 14.3], [1024, 18.2], [1448, 19.9], [2048, 21.0], [2896, 22.9], [4096, 23.9], [5793, 24.3], [8192, 24.4]]],
+  [4096, [[256, 18.5], [362, 16.0], [512, 17.9], [724, 19.8], [1024, 20.9], [1448, 23.1], [2048, 23.7], [2896, 24.2], [4096, 24.5], [5793, 24.7], [8192, 25.0]]],
 ]
-# The d 128 curve as measured before the curve was timed at every head
-# width; the 64- and 256-wide ones come with this device's re-measure.
 attn_tflops_by_dim_keys = [
-  [128, [[512, 4.65], [1024, 5.88], [2048, 6.47], [4096, 6.76], [8192, 6.91]]],
+  [64, [[512, 2.94], [1024, 3.71], [2048, 4.2], [4096, 4.44], [8192, 4.55]]],
+  [128, [[512, 4.74], [1024, 5.93], [2048, 6.54], [4096, 6.86], [8192, 7.02]]],
+  [256, [[512, 7.17], [1024, 8.54], [2048, 9.18], [4096, 9.51], [8192, 9.68]]],
 ]
-hbm_gbps = 789.9
-elementwise_gbps = 826.1
-scan_gelems = 137.3
-few_row_tflops = 4.52
-workgroups_per_core = 4.03
+hbm_gbps = 781.2
+elementwise_gbps = 827.5
+scan_gelems = 187.7
+few_row_tflops = 4.47
+workgroups_per_core = 4.02

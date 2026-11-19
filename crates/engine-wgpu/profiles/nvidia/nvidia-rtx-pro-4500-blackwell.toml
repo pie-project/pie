@@ -4,22 +4,22 @@ api = 1
 device = "NVIDIA RTX PRO 4500 Blackwell"
 
 [provenance]
-rates = "pie tune wgpu --rates on 2026-11-18 (pie 0.6.0, commit 2a33bd37a), NVIDIA RTX PRO 4500 Blackwell through wgpu's Vulkan backend, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, the adapter's timestamps, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there, the median rate past its weight reads; the tiled attention by keys; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over the 16 cores wgpu sizes an adapter that reports no count by (UNREPORTED_CORES: 43.4 a core is 694 workgroups for the device); operands: engine::rates' pattern. Spread over the five runs: matmul points at most 5.7% (4096 at 362 rows), attention 2.3%, launch 2.9%, copy 6.7%, per-row ops 2.0%, scan 4.6%, few-row 1.4%, workgroups a core 1.3%"
+rates = "pie tune wgpu --rates on 2026-11-19 (pie 0.6.0, commit 0e6cf65bb), NVIDIA RTX PRO 4500 Blackwell through wgpu's Vulkan backend, driver 595.112.07: the median of five runs, each its own process on a fresh PIE_HOME and shader cache, under the GPU lock with no build running (nr_throttled +0 in every run); each kernel through the dispatch serving runs, frames doubled until two successive doublings agree within AGREEMENT; the matmul at n = k = 1024, 2048, 4096 by half octaves of rows, 256 to 8192; the few-row matmul at 4 to 256 rows on the kernel serving picks there, the median rate past its weight reads; the tiled attention by keys at head widths 64, 128 and 256; the conv and the gated-delta scan each timed on its own; workgroups a core from one 16-row tile a head of 16 over 8192 keys against the curve's rate there, over the 16 cores wgpu sizes an adapter that reports no count by (UNREPORTED_CORES: 39.1 a core is 625 workgroups for the device); operands: engine::rates' pattern. Spread over the five runs: matmul and attention points at most 3.7%, launch 4.4%, copy 9.4% (one run 719, the others 749-792 GB/s), per-row ops 2.6%, scan 0.3%, few-row 1.1%, workgroups a core 0.3%"
 
 [rates]
-launch_ns = 4113
+launch_ns = 4129
 gemm_tflops_by_rows = [
-  [1024, [[256, 3.1], [362, 4.3], [512, 5.9], [724, 7.2], [1024, 9.1], [1448, 10.7], [2048, 9.1], [2896, 11.3], [4096, 11.0], [5793, 12.1], [8192, 12.0]]],
-  [2048, [[256, 5.7], [362, 7.4], [512, 9.1], [724, 10.8], [1024, 9.0], [1448, 11.4], [2048, 11.1], [2896, 12.1], [4096, 12.0], [5793, 12.3], [8192, 12.2]]],
-  [4096, [[256, 9.0], [362, 10.7], [512, 8.6], [724, 10.7], [1024, 11.0], [1448, 12.0], [2048, 11.9], [2896, 12.0], [4096, 12.3], [5793, 12.3], [8192, 12.4]]],
+  [1024, [[256, 3.1], [362, 4.2], [512, 5.9], [724, 7.2], [1024, 9.0], [1448, 10.5], [2048, 9.0], [2896, 11.2], [4096, 10.8], [5793, 11.9], [8192, 11.8]]],
+  [2048, [[256, 5.6], [362, 7.4], [512, 9.1], [724, 10.7], [1024, 8.9], [1448, 11.3], [2048, 11.0], [2896, 12.0], [4096, 12.0], [5793, 12.3], [8192, 12.2]]],
+  [4096, [[256, 9.0], [362, 10.8], [512, 8.6], [724, 10.6], [1024, 10.8], [1448, 11.9], [2048, 11.8], [2896, 12.0], [4096, 12.2], [5793, 12.2], [8192, 12.3]]],
 ]
-# The d 128 curve as measured before the curve was timed at every head
-# width; the 64- and 256-wide ones come with this device's re-measure.
 attn_tflops_by_dim_keys = [
-  [128, [[512, 1.35], [1024, 2.39], [2048, 3.08], [4096, 3.45], [8192, 3.6]]],
+  [64, [[512, 1.19], [1024, 1.94], [2048, 2.35], [4096, 2.57], [8192, 2.67]]],
+  [128, [[512, 1.38], [1024, 2.28], [2048, 2.85], [4096, 3.16], [8192, 3.28]]],
+  [256, [[512, 1.33], [1024, 1.87], [2048, 2.18], [4096, 2.36], [8192, 2.43]]],
 ]
-hbm_gbps = 772.5
-elementwise_gbps = 822.5
-scan_gelems = 71.4
-few_row_tflops = 0.99
-workgroups_per_core = 43.38
+hbm_gbps = 777.5
+elementwise_gbps = 824.7
+scan_gelems = 66.6
+few_row_tflops = 1.0
+workgroups_per_core = 39.08
