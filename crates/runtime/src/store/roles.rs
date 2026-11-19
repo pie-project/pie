@@ -211,6 +211,21 @@ impl RolesError {
         }
     }
 
+    /// What an unpark short of room ([`Self::UnparkShort`]) needs, as runs
+    /// of whole chunks `(run, pieces)`: a guest state's runs, or one chunk
+    /// for slots in a chunk (a run of Channel slots too).
+    #[must_use]
+    pub fn unpark_runs(&self) -> Option<(u32, u32)> {
+        let Self::UnparkShort(short) = self else {
+            return None;
+        };
+        match short.as_ref() {
+            Self::GuestShort { room, .. } | Self::GuestGrow { room, .. } => Some(room.chunk_runs()),
+            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1)),
+            _ => None,
+        }
+    }
+
     /// The device pool lacks room for it now: what a park, a completion or
     /// a commit may make, not a wrong ask.
     #[must_use]
@@ -1273,12 +1288,15 @@ impl Roles {
         }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
-        if (state.per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
+        // The instance's own bytes: its resident part and every scratch arm
+        // (none taken per fire yet), placed at the bind.
+        let per_instance = state.instance_bytes();
+        if (per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
-        if state.per_instance > 0 {
+        if per_instance > 0 {
             match self.take_scratch(
-                state.per_instance,
+                per_instance,
                 run,
                 || format!("an instance of {pair}'s scratch"),
                 heads,
@@ -1359,10 +1377,12 @@ impl Roles {
         let pieces = |bytes: u64| self.scratch_part(bytes, run).map_or(0, |part| part.pieces);
         tracing::info!(
             %pair,
-            per_instance = state.per_instance,
+            resident = state.resident,
+            scratch = state.scratch,
+            scratch_arms = state.scratch_arms,
             per_pair = state.per_pair,
             run,
-            instance_pieces = pieces(state.per_instance),
+            instance_pieces = pieces(state.instance_bytes()),
             pair_pieces = pieces(state.per_pair),
             free_runs = self.free_runs(run),
             "a guest program's room: pieces of `run` adjacent chunks, and the free runs of that length"
@@ -1705,7 +1725,9 @@ impl Roles {
                 for (_, parts) in &shed {
                     self.give(&device, &taken_dead(parts));
                 }
-                if error.is_short() && self.fits_budget(&shed_owners) {
+                // It held these parts on the device before its park: the
+                // budget holds them, and the restore waits for room.
+                if error.is_short() {
                     return Err(RolesError::UnparkShort(Box::new(error)));
                 }
                 return Err(error);
@@ -1722,8 +1744,10 @@ impl Roles {
                     for (_, parts) in &shed {
                         self.give(&device, &taken_dead(parts));
                     }
-                    // Short of room the budget holds: the restore waits.
-                    if error.is_short() && self.fits_budget(&owners) {
+                    // It held these items on the device before its park: the
+                    // budget holds them, and the restore waits for room,
+                    // never failed for it.
+                    if error.is_short() {
                         return Err(RolesError::UnparkShort(Box::new(error)));
                     }
                     return Err(error);
@@ -2233,7 +2257,7 @@ pub fn take_bind(
         return Ok(None);
     };
     learn_program(roles, engine, binding.program)?;
-    let state = engine.guest_state(binding.program, &binding.extents)?;
+    let state = engine.guest_state(binding.program, &binding.extents, binding.geometry)?;
     let adapter = engine.adapter_key(binding)?;
     let pair = FireKey {
         program: binding.program,

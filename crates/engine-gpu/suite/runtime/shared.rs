@@ -100,7 +100,7 @@ fn program() -> TraceContainer {
 
 #[test]
 fn a_chain_of_rows_answers_the_host_cell_for_cell() {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
@@ -289,6 +289,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

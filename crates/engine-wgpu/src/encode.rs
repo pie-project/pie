@@ -504,7 +504,10 @@ impl Sink<'_> {
             }
             let uniform;
             if let Some(binding) = pipeline.uniform {
-                let (chunk, at) = self.frame.uniform_slot(uniform_bytes);
+                let (chunk, at) = self
+                    .frame
+                    .uniform_slot(uniform_bytes)
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
                 let mut padded = words.clone();
                 padded.resize(uniform_bytes as usize, 0);
                 core.queue.write_buffer(&chunk, at, &padded);

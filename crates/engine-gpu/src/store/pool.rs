@@ -292,6 +292,12 @@ impl<B: Backend> Pool<B> {
         self.segments.len() as u32
     }
 
+    /// The buffers of the segments backed, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.segments.iter().flatten().collect()
+    }
+
     /// The segments backed from the first on, without a gap.
     #[must_use]
     pub fn committed_segments(&self) -> u32 {

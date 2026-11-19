@@ -316,11 +316,16 @@ impl ProcessCtx {
     }
 
     pub(crate) fn register_kv_working_set(&self, ws: &crate::store::kv::working_set::KvWorkingSet) {
-        self.residency
-            .lock()
-            .unwrap()
-            .kv_working_sets
-            .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+        match crate::planner::planner_for(ws.model, ws.engine) {
+            Some(planner) => planner.register_kv_working_set(self.id(), &self.residency, ws),
+            None => {
+                self.residency
+                    .lock()
+                    .unwrap()
+                    .kv_working_sets
+                    .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+            }
+        }
         if let Some(departure) = &self.departure {
             ws.hold_departure(departure.clone());
         }

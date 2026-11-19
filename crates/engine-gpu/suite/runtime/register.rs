@@ -146,6 +146,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

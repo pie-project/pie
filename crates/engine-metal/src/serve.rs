@@ -1474,7 +1474,7 @@ impl PreparedLoad<'_> {
             }
         }
         let (span_view, span_at, span_bytes) = pools.span_view();
-        let arena = Arena::over(
+        let mut arena = Arena::over(
             span_view.clone(),
             (span_at, span_bytes),
             scratch.bytes(),
@@ -1483,6 +1483,19 @@ impl PreparedLoad<'_> {
             rs_room,
             arms as u64,
         );
+        // The runtime holds, from the start, the widest rung whose activation
+        // the smallest rung's chunks hold (`SlotPool::rung` over this `act`),
+        // and sends no notice for it: frames stage in that rung's regions
+        // from the load, or its first fires, cut to it, find the floor's
+        // (the M1 stress: "this fire wants 2 token rows ... the load
+        // reserved 1" at rung 2, until the first raise).
+        if let Some(boot) = act
+            .first()
+            .map(|&(_, floor)| floor)
+            .and_then(|floor| act.iter().filter(|&&(_, chunks)| chunks <= floor).map(|&(tokens, _)| tokens).max())
+        {
+            arena.set_current(boot);
+        }
         if crate::diag::on().tier_trace {
             let layout = pools.layout();
             eprintln!(
@@ -1496,9 +1509,10 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // The smallest rung's fire is backed from the load, so a raise the
-        // system refuses always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach())?;
+        // The rung the load starts at is backed from the load (the smallest
+        // rung's chunks, which it shares), so a raise the system refuses
+        // always has a rung in hand to cut back to.
+        pools.cover(arena.floor_reach().max(arena.rung_reach(arena.current_tokens())))?;
         // Every rung's staged regions laid in the span; the floor's hosted,
         // where frames stage until the runtime raises.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
@@ -1597,7 +1611,7 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
-            rung: arena.floor_tokens(),
+            rung: arena.current_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
             arena,
@@ -1866,24 +1880,34 @@ impl Shell {
         if moved || to < from {
             self.drain()?;
         }
+        // A refused move leaves the rung as it was: the runtime keeps `from`
+        // on a refusal (`lower_refused`), so a switch made before a step that
+        // failed is undone, or Metal would stage in `to`'s regions while the
+        // runtime cuts fires to `from` (the M1 stress: "this fire wants 2
+        // token rows ... the load reserved 1" at rung 2).
+        let left = self.arena.current();
         if moved {
-            let left = self.arena.current();
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 left,
                 false,
-            )?;
+            ) {
+                self.rehost(left);
+                return Err(fault);
+            }
             self.arena.set_current(to);
-            host_rung(
+            if let Err(fault) = host_rung(
                 &self.pools,
                 &mut self.inputs,
                 &mut self.readout,
                 index,
                 true,
-            )?;
-            self.rung = to;
+            ) {
+                self.unswitch(from, index, left);
+                return Err(fault);
+            }
         }
         if to >= from {
             self.rung = to;
@@ -1892,9 +1916,33 @@ impl Shell {
         // SAFETY: drained just above, on the one thread that submits; the
         // runtime lowers only once every fire wider than `to` retired, and
         // the rung's regions lie inside what stays.
-        unsafe { self.pools.narrow(reach)? };
+        if let Err(fault) = unsafe { self.pools.narrow(reach) } {
+            if moved {
+                self.unswitch(from, index, left);
+            }
+            return Err(fault);
+        }
         self.rung = to;
         Ok(())
+    }
+
+    /// Hosts rung `slot`'s regions again after a move that failed; a failure
+    /// here leaves the load unable to stage, and says so.
+    fn rehost(&mut self, slot: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true) {
+            tracing::error!(%fault, "metal: a refused rung move could not host the rung it kept");
+        }
+    }
+
+    /// Undoes a rung switch to `index` whose next step failed: `index`'s
+    /// regions let go, the arena back on `from` and its regions (`left`)
+    /// hosted again.
+    fn unswitch(&mut self, from: u32, index: usize, left: usize) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false) {
+            tracing::error!(%fault, "metal: a refused rung move could not let go of the rung it tried");
+        }
+        self.arena.set_current(from);
+        self.rehost(left);
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
@@ -3355,6 +3403,16 @@ impl Shell {
         ))
     }
 
+    /// The voxels lane `lane` holds.
+    fn lane_voxels(prepared: &Prepared<'_>, lane: usize) -> u32 {
+        prepared
+            .composition
+            .lanes()
+            .iter()
+            .find(|row| row.source as usize == lane)
+            .map_or(0, |row| row.voxels)
+    }
+
     fn first_voxel(prepared: &Prepared<'_>, lane: usize) -> u32 {
         prepared
             .composition
@@ -3408,10 +3466,12 @@ impl Shell {
         lane_rows: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
-        // A lane's row of an output: for one gathered at the readout rows,
-        // its first among them; for one written over every token row, its
-        // first named row, else its last.
-        let row_of = |lane: usize, gathered: bool| -> Result<u32> {
+        // A lane's row of an output, and how many rows from it are the
+        // lane's own: for one gathered at the readout rows, its first among
+        // them and its readout rows; for one written over every token row,
+        // its first named row and the lane's rows from there, else its last
+        // row alone.
+        let row_of = |lane: usize, gathered: bool| -> Result<(u32, u32)> {
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             if owned == 0 {
                 return Err(Fault::Ceiling {
@@ -3428,11 +3488,14 @@ impl Shell {
                         have: 0,
                     });
                 }
-                return Ok(prepared.readout_first.get(lane).copied().unwrap_or(0));
+                return Ok((
+                    prepared.readout_first.get(lane).copied().unwrap_or(0),
+                    prepared.readout_count.get(lane).copied().unwrap_or(0),
+                ));
             }
             let last = first_row[lane] + owned - 1;
             match prepared.lanes.get(lane).and_then(|seated| seated.readout) {
-                None => Ok(last),
+                None => Ok((last, 1)),
                 Some(rows) => {
                     for &row in rows {
                         if row >= owned {
@@ -3443,7 +3506,9 @@ impl Shell {
                             });
                         }
                     }
-                    Ok(rows.first().map_or(last, |&row| first_row[lane] + row))
+                    Ok(rows
+                        .first()
+                        .map_or((last, 1), |&row| (first_row[lane] + row, owned - row)))
                 }
             }
         };
@@ -3463,14 +3528,16 @@ impl Shell {
                 };
                 for out in 0..self.outputs.len() {
                     let decl = &self.outputs[out].decl;
+                    // Read at this lane, or its row read by the lane-0 read:
+                    // either way from this lane's own seat, never on lane
+                    // 0's pitch into rows another request may hold.
                     if !self.outputs[out].classes.contains(row.class as usize)
-                        || !reads
-                            .iter()
-                            .any(|(name, lane)| *name == decl.name && *lane == k)
+                        || !(reads.iter().any(|(name, lane)| *name == decl.name && *lane == k)
+                            || self.programs.covers(attached.instance, &decl.name, k)?)
                     {
                         continue;
                     }
-                    let (base, offset, width, dtype, stride) = match decl.name.as_str() {
+                    let (base, offset, width, dtype, stride, rows_held) = match decl.name.as_str() {
                         // A capturing lane's rows are its reader
                         // instance's state, not the arena's.
                         name @ ("attn.scores" | "attn.scores.pages") => {
@@ -3502,12 +3569,13 @@ impl Shell {
                                         .as_ref()
                                         .map_or(0, |layout| capture_row_bytes(layout.keys, 0).0)
                             };
-                            (buffer, offset, decl.width, eta_ir::Dtype::F32, decl.width)
+                            // Its own score row.
+                            (buffer, offset, decl.width, eta_ir::Dtype::F32, decl.width, 1)
                         }
                         _ => {
-                            let (offset, width, dtype, stride) =
+                            let (offset, width, dtype, stride, held) =
                                 self.output_seat(prepared, out, at, fire_lane, &row_of)?;
-                            (self.arena.store().clone(), offset, width, dtype, stride)
+                            (self.arena.store().clone(), offset, width, dtype, stride, held)
                         }
                     };
                     let name = self.outputs[out].decl.name.clone();
@@ -3520,8 +3588,18 @@ impl Shell {
                         dtype,
                         width,
                         stride,
+                        rows_held,
                     )?;
                 }
+            }
+            // Every lane bound: a read past the rows its lanes hold would
+            // read other requests' rows. Refused, its lane alone.
+            if let Some(why) = self.programs.rows_unbounded(attached.instance)? {
+                return Err(Fault::OutputRows {
+                    lane: attached.lane,
+                    instance: attached.instance.0,
+                    why,
+                });
             }
             staged.push(attached.instance);
         }
@@ -3552,8 +3630,8 @@ impl Shell {
         out: usize,
         at: usize,
         fire_lane: usize,
-        row_of: &dyn Fn(usize, bool) -> Result<u32>,
-    ) -> Result<(u64, u32, Dtype, u32)> {
+        row_of: &dyn Fn(usize, bool) -> Result<(u32, u32)>,
+    ) -> Result<(u64, u32, Dtype, u32, u32)> {
         let output = &self.outputs[out];
         let name = &output.decl.name;
         let (offset, width, dtype) = self.plane_row(prepared, output.values[0])?;
@@ -3580,23 +3658,24 @@ impl Shell {
                     }
                     stride = u32::try_from(gap / element).unwrap_or(u32::MAX);
                 }
-                (at_row(fire_lane as u64), width, dtype, stride)
+                // Its layers, one plane after another.
+                let layers = u32::try_from(output.values.len()).unwrap_or(u32::MAX).max(1);
+                (at_row(fire_lane as u64), width, dtype, stride, layers)
             }
-            poem_ir::InputAxis::Row => (
-                at_row(u64::from(row_of(at, output.decl.readout)?)),
-                width,
-                dtype,
-                width,
-            ),
+            poem_ir::InputAxis::Row => {
+                let (row, held) = row_of(at, output.decl.readout)?;
+                (at_row(u64::from(row)), width, dtype, width, held)
+            }
             poem_ir::InputAxis::Voxel if output.grid.is_some() => {
                 let (offset, width, dtype) = self.grid_seat(prepared, at, out)?;
-                (offset, width, dtype, width)
+                (offset, width, dtype, width, Self::lane_voxels(prepared, at))
             }
             poem_ir::InputAxis::Voxel => (
                 at_row(u64::from(Self::first_voxel(prepared, at))),
                 width,
                 dtype,
                 width,
+                Self::lane_voxels(prepared, at),
             ),
         })
     }
@@ -3624,23 +3703,29 @@ impl Shell {
     }
 
     /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
+    /// The step's prologues in one command buffer and one wait
+    /// (`Programs::fire_batched`): their status and the cells they put are
+    /// read on the host before the forward is encoded (each prologue's
+    /// verdict, the descriptor ports and input feeds), so the wait stays,
+    /// once a step rather than once a region an instance.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        for attached in attachments.iter().filter(|a| !a.adapter_only) {
-            if !self.programs.prologue_runs(attached.instance) {
-                continue;
-            }
-            match self
-                .programs
-                .fire(&self.device, attached.instance, Stage::Prologue)?
-            {
+        let ids: Vec<engine::InstanceId> = attachments
+            .iter()
+            .filter(|a| !a.adapter_only && self.programs.prologue_runs(a.instance))
+            .map(|a| a.instance)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for (instance, fired) in self.programs.fire_batched(&self.device, &ids, Stage::Prologue)? {
+            match fired {
                 crate::Fired::Committed => {}
                 other => {
                     return Err(Fault::program(
                         "serve::prologue",
                         format!(
-                            "instance {}'s prologue did not commit ({other:?}), so the \
-                             forward has no cells to read",
-                            attached.instance
+                            "instance {instance}'s prologue did not commit ({other:?}), so the \
+                             forward has no cells to read"
                         ),
                     ));
                 }
@@ -3752,6 +3837,17 @@ impl Shell {
                     .map(|seated| seated.lane.tokens.len() as u32)
                     .collect();
                 let carried = envelope.lanes();
+                // Its ports describe its own lanes only: past them they
+                // would set another request's positions and kv slots.
+                let owned = attached.lanes.max(1) as usize;
+                if carried > owned {
+                    return Err(Fault::GeometryLanes {
+                        lane: attached.lane,
+                        instance: attached.instance.0,
+                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
+                        owned: owned as u32,
+                    });
+                }
                 if first + carried > lanes.len() {
                     return Err(Fault::program(
                         "serve::prepare",
@@ -4537,12 +4633,11 @@ impl Shell {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
-            self.drain()?;
-        }
-        for record in beginning.iter().filter(|_| !self.warming) {
-            self.pools.clear(record)?;
-        }
+        // A fresh record is zeroed by the fire that first reads it, at the
+        // head of its own command buffer (`walk`): in queue order behind the
+        // frames before it. Zeroed on the host, it drained every frame in
+        // flight first, and each hybrid / SSM admission ran at depth 1.
+        let zeroed: Vec<Vec<u32>> = if self.warming { Vec::new() } else { beginning };
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
         let slot_of_row: Vec<i32> = row_bands.concat();
@@ -5152,6 +5247,7 @@ impl Shell {
         };
 
         Ok(Prepared {
+            zeroed,
             capture_rows,
             ends,
             lanes,
@@ -5479,6 +5575,13 @@ impl Shell {
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
         }
+        if !dry && !p.zeroed.is_empty() {
+            for record in &p.zeroed {
+                self.pools.clear_into(&mut frame, record)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         self.feed_inputs(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         {
@@ -5626,6 +5729,9 @@ pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 pub struct Prepared<'a> {
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
+    /// The fresh state records its lanes begin, zeroed at the head of its
+    /// command buffer.
+    zeroed: Vec<Vec<u32>>,
     /// What the fire reports where it settles: each port-placed reporting
     /// lane's written end.
     ends: Vec<engine::KvWrites>,
@@ -5739,6 +5845,7 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        self.pools.weights_ready()?;
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.stage(step)

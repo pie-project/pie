@@ -6,6 +6,8 @@ mod a_cold_registration_compiles_while_lanes_fire;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
 mod a_faulted_epilogue_fails_its_own_lanes_alone;
+mod a_few_row_dense_matmul_reads_each_weight_once;
+mod a_guest_reads_only_its_own_lanes_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
@@ -132,9 +134,9 @@ pub(crate) fn guest_places(
         }
     };
     let pair_at = layout.free_chunk() + 8;
-    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.per_instance);
-    let places = (place(state.per_instance, own_at), place(state.per_pair, pair_at));
-    let end = own_at + chunks_of(state.per_instance);
+    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
+    let end = own_at + chunks_of(state.instance_bytes());
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
         .expect("the guest state's segments commit");

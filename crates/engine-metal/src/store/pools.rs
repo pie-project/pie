@@ -580,6 +580,11 @@ pub struct Pools {
     tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
     weight_caches: Vec<super::streamed::Cache>,
+    /// An evacuation moved the pool's table and restaging the weight
+    /// caches' tables after it failed: the evacuation stands (the runtime
+    /// counts it done), and every later fire is refused by this fault
+    /// rather than read weights through tables that name moved chunks.
+    weights_stale: Option<String>,
     /// The runtime holds the weight set for the load's life.
     weights_held: bool,
 }
@@ -766,6 +771,7 @@ impl Pools {
             parked: None,
             tier: None,
             weight_caches: Vec::new(),
+            weights_stale: None,
             weights_held: false,
             table_run: (
                 layout.chunk_bytes,
@@ -1891,6 +1897,21 @@ impl Pools {
 
     /// Zeroes the record whose physical pieces are `record`: a fresh lane's
     /// state.
+    /// A fresh record zeroed on the device in `frame` ([`Self::clear`]'s, in
+    /// queue order): the fire that first reads it zeroes it first, and no
+    /// frame in flight is drained for it.
+    pub fn clear_into(&self, frame: &mut crate::device::ctx::Frame, record: &[u32]) -> Result<()> {
+        if !self.has_state() {
+            return Ok(());
+        }
+        let fixed = *self.shape(FIXED)?;
+        for &piece in record {
+            let at = self.physical_slot_at(&fixed, piece)?;
+            self.pool.zero_in(frame, at, fixed.slot_bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self, record: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
@@ -2214,9 +2235,35 @@ impl Pools {
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table; the weight cache's address
     /// tables follow (no frame is in flight: the caller drained them).
+    /// A refusal from the pool's own evacuate moved nothing (its table is
+    /// swapped only once every copy is encoded): the runtime takes the
+    /// evacuation back. Past it the table has moved, so the evacuation is
+    /// done whatever follows: a weight cache that fails to restage is a
+    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
+    /// would have the runtime roll back a move this engine made.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
-        self.restage_weights()
+        if let Err(fault) = self.restage_weights() {
+            tracing::error!(
+                %fault,
+                "metal: an evacuation moved the pool's chunks and the weight caches' tables could \
+                 not follow; every later fire is refused"
+            );
+            self.weights_stale = Some(fault.to_string());
+        }
+        Ok(())
+    }
+
+    /// Refused once an evacuation left the weight caches' tables naming
+    /// chunks it moved ([`Self::evacuate`]): read before every fire.
+    pub fn weights_ready(&self) -> Result<()> {
+        match &self.weights_stale {
+            None => Ok(()),
+            Some(why) => Err(Fault::Residency(format!(
+                "an evacuation moved the pool's chunks and restaging the weight caches' tables \
+                 after it failed ({why}): their tables name moved chunks, so no fire reads them"
+            ))),
+        }
     }
 
     /// Takes the weight cache's row-streamed tables (`super::rows`).

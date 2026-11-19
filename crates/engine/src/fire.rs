@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::channel::ChannelId;
 use crate::chunk::{ChunkFacts, ShapeId, SlotKind};
 use crate::error::{Error, Result};
-use crate::program::InstanceId;
+use crate::program::{InstanceId, ScratchPlace};
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -738,7 +738,7 @@ pub enum FoldLen {
 }
 
 /// A pass's program on a fire: the prologue before input staging, the epilogue after the forward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
@@ -746,6 +746,10 @@ pub struct Attachment {
     pub instance: InstanceId,
     /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
     pub adapter_only: bool,
+    /// The scratch arm the runtime took for this fire ([`crate::GuestState::scratch`]):
+    /// `None` only where the instance's scratch is 0.
+    #[serde(default)]
+    pub scratch: ScratchPlace,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1247,6 +1251,7 @@ mod tests {
             lanes: 1,
             instance: InstanceId(7),
             adapter_only: true,
+            scratch: ScratchPlace::None,
         });
         assert!(
             step.validate_captures(captures).is_err(),

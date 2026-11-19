@@ -229,16 +229,22 @@ pub(super) fn spawn_restore(
 
 struct FenceGuard {
     handles: Vec<KvSuspendHandle>,
+    /// Whose sets: an eviction rolled back unfences every set its process
+    /// holds then, one born fenced meanwhile included.
+    pid: ProcessId,
+    locus: (usize, usize),
     armed: bool,
 }
 
 impl FenceGuard {
-    fn raise(handles: Vec<KvSuspendHandle>) -> Self {
+    fn raise(handles: Vec<KvSuspendHandle>, pid: ProcessId, locus: (usize, usize)) -> Self {
         for handle in &handles {
             handle.fence();
         }
         Self {
             handles,
+            pid,
+            locus,
             armed: true,
         }
     }
@@ -253,7 +259,9 @@ impl Drop for FenceGuard {
         if !self.armed {
             return;
         }
-        for handle in &self.handles {
+        let (model, engine) = self.locus;
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(self.pid, model, engine)
+        {
             handle.unfence();
         }
     }
@@ -477,13 +485,22 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
     let rs_working_sets =
         crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
-    if working_sets.is_empty() && rs_working_sets.is_empty() {
+    // A process with no kv or state yet (a prompt not seated) may still hold
+    // guest state on the device, the room a bind short of runs was chosen to
+    // free (a chunk's occupant): it parks all the same, its guest scratch
+    // given back. Found nothing, the M1 stress froze with eleven binds short
+    // of runs and every chosen occupant "found no working set".
+    let holds_guest = crate::store::registry::get(model, engine)
+        .roles
+        .as_ref()
+        .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+    if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
         tracing::debug!(pid = %pid, "planner: eviction found no working set");
         planner.eviction_failed(pid);
         return;
     }
     let began = Instant::now();
-    let mut fence = FenceGuard::raise(handles);
+    let mut fence = FenceGuard::raise(handles, pid, (model, engine));
     crate::scheduler::worker::notify_process_suspend(pid);
     drain_detachable(pid).await;
     let drained = began.elapsed();
@@ -761,9 +778,9 @@ async fn restore(
             );
             // Room the budget holds but nothing has freed yet: the restore
             // waits, queued, as an admission does.
-            if matches!(error, crate::store::roles::RolesError::UnparkShort(_)) {
+            if let Some(need) = error.unpark_runs() {
                 tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
-                planner.requeue_restore_roles(pid);
+                planner.requeue_restore_roles(pid, need);
                 return;
             }
             // Its pair is on its way back with another process's restore:
@@ -789,7 +806,7 @@ async fn restore(
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
         tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid);
+        planner.requeue_restore_roles(pid, (need.run, need.pieces));
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });

@@ -315,7 +315,7 @@ pub fn flight_lanes(members: u32) -> u32 {
 /// flight of its most lanes (each lane's scratch base among them, the
 /// grouped kernels' `lane_scratch`), and the room the wave's own tables
 /// take for a fire of the most lanes, where a fire carrying the pair may
-/// lay them. Each instance (`per_instance`): its lane's value scratch, one
+/// lay them. Each instance (`resident`): its lane's value scratch, one
 /// contiguous piece. Sized once from the load's lanes, so neither grows as
 /// instances bind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -909,12 +909,13 @@ impl Plane {
         width: u32,
         row_stride: u32,
         row_offset: u32,
+        rows: u32,
     ) -> Result<()> {
         self.instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_output(name, lane, base, storage, width, row_stride, row_offset)
+            .bind_output(name, lane, base, storage, width, row_stride, row_offset, rows)
     }
 
     /// The outputs instance `id`'s program reads, by name and lane.
@@ -1013,9 +1014,27 @@ impl Plane {
                 format!("instance {id} names program {program_id}, which is gone"),
             )
         })?;
-        let launched = bound
-            .session
-            .stage(&program.compiled, &program.plan, wave, at)?;
+        // What the pair's stages that run at `at` read of each output.
+        let extents = bound.session.extents();
+        let rows_read: Vec<(&str, u32, u32)> = program
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map(|batch| {
+                batch
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| program.plan.runs_at(*index, at))
+                    .filter_map(|(_, prepared)| prepared.as_ref())
+                    .flat_map(Prepared::rows_read)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let launched =
+            bound
+                .session
+                .stage(&program.compiled, &program.plan, &rows_read, wave, at)?;
         if matches!(launched, Launched::Airborne) {
             staged.push((program_id, bound.session.extents(), id));
         }

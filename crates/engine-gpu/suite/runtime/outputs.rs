@@ -251,7 +251,7 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 /// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
 pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -449,6 +449,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),
@@ -606,6 +607,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),

@@ -89,7 +89,20 @@ pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u
     )
     .validate(&module)
     .map_err(|e| refuse(e.emit_to_string(source)))?;
-    naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+    // Restrict clamps every index into its binding, as wgpu's checked naga does:
+    // the heap binding is this instance's range of a pool segment it shares, and
+    // robustBufferAccess, where present, only keeps a stray access in the buffer.
+    let restrict = naga::proc::BoundsCheckPolicy::Restrict;
+    let options = naga::back::spv::Options {
+        bounds_check_policies: naga::proc::BoundsCheckPolicies {
+            index: restrict,
+            buffer: restrict,
+            image_load: restrict,
+            binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+        },
+        ..naga::back::spv::Options::default()
+    };
+    naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| refuse(e.to_string()))
 }
 

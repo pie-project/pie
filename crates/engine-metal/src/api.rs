@@ -180,7 +180,12 @@ fn fault(fault: Fault) -> Error {
         | Fault::Maskless { .. }
         | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::GeometryLanes { .. }
+        | Fault::OutputRows { .. } => {
+            Error::Invalid(fault.to_string())
+        }
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
@@ -694,6 +699,9 @@ impl Engine for Metal {
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // Metal states no bound on one submission yet
+            // (`crate::rates::at_load`).
+            guest_cost: engine::GuestCost::default(),
         };
 
         // Every pipeline the load's rungs dispatch is built now, before
@@ -1048,6 +1056,8 @@ impl Engine for Metal {
         &self,
         program: ProgramId,
         at: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
     ) -> EngineResult<engine::GuestState> {
         self.loaded()?
             .guest_state(program, &extents(at))

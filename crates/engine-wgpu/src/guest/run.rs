@@ -62,6 +62,17 @@ impl<'a> OnDevice<'a> {
     ) -> Result<()> {
         let plan = &package.plans[at];
         let mut frame = self.device.frame()?;
+        // The stage's bf16 rows, widened together once its roots are seen:
+        // a seat, the byte there, the byte into the heap, and the values.
+        let mut widened: Vec<(&'a crate::device::Buffer, u64, u64, u32)> = Vec::new();
+        let heap_of = self
+            .session
+            .heap(at)
+            .map(|(heap, base)| (heap.clone(), base))
+            .ok_or_else(|| Fault::Program {
+                at: "guest::run",
+                why: format!("stage {at} has no heap"),
+            })?;
 
         for &global in roots {
             let Some(local) = local_of(package, at, global)? else {
@@ -77,10 +88,7 @@ impl<'a> OnDevice<'a> {
                 // Row `r` of a root read at lane `k` is lane `k + r`'s
                 // readout row, each through its own seat.
                 let rows = engine_gpu::guest::run::row_seats(&self.seats, root, values)?;
-                let (heap, base) = self.session.heap(at).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!("stage {at} has no heap"),
-                })?;
+                let (heap, base) = (&heap_of.0, heap_of.1);
                 let (into, _) = self
                     .session
                     .span(at, local)
@@ -90,8 +98,7 @@ impl<'a> OnDevice<'a> {
                     if seat.dtype != Dtype::Bf16 {
                         frame.copy(seat.seat, seat.at, heap, into, u64::from(values) * 4)?;
                     } else {
-                        self.widen
-                            .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                        widened.push((seat.seat, seat.at, into, values));
                     }
                     into += u64::from(values) * 4;
                 }
@@ -105,21 +112,31 @@ impl<'a> OnDevice<'a> {
             self.session.stage_in(at, local, &bytes)?;
         }
 
+        let rows: Vec<super::widen::Row<'_>> = widened
+            .iter()
+            .map(|&(src, src_at, dst_at, lanes)| super::widen::Row {
+                src,
+                src_at,
+                dst: &heap_of.0,
+                dst_at,
+                lanes,
+            })
+            .collect();
+        self.widen.encode(&frame, &rows)?;
         self.session.flush(&mut frame, at)?;
         self.session.dispatch(&frame, at)?;
-        let mut locals = Vec::with_capacity(wanted.len());
-        for &global in wanted {
-            if let Some(local) = local_of(package, at, global)? {
-                locals.push(local);
-            }
-        }
-        self.session
-            .read_back(self.device, &mut frame, at, &locals)?;
+        // The set its bind checked against the stage's heap.
+        let locals = super::session::device_puts(package, at)?;
+        self.session.read_back(&mut frame, at, &locals)?;
         let pending = frame.commit_async(None)?;
         self.session.collect(at)?;
         pending.wait()?;
 
-        if let Some(code) = self.session.status(at)? {
+        let status = self.session.status(at);
+        if status.is_err() {
+            self.session.clear_status()?;
+        }
+        if let Some(code) = status? {
             self.session.clear_status()?;
             return Err(Fault::Program {
                 at: "guest::run",

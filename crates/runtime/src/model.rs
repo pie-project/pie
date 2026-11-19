@@ -274,7 +274,7 @@ impl RsCaps {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EtaCaps {
     pub draft_block: u32,
     pub draft_mask_token: u32,
@@ -284,6 +284,49 @@ pub struct EtaCaps {
     pub adapter_attachments: bool,
     /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.
     pub rs_snapshots: u32,
+    /// What a guest program's registration binds within
+    /// ([`eta_ir::validate::bind_within`]): the least of the engines'
+    /// ([`guest_budget`]).
+    pub budget: eta_ir::validate::Budget,
+}
+
+/// The budget a guest program binds within on an engine whose pools
+/// `chunks` states and whose guest stages `cost` holds: an instance's state
+/// room is its state chunks' bytes less what the engine holds back of them;
+/// where the device states a bound on one submission, a stage is held to it
+/// at the rates the load measured, which must then be stated (refused by
+/// name otherwise: a bound with nothing to cost against it holds nothing).
+pub fn guest_budget(
+    chunks: &::engine::chunk::ChunkFacts,
+    cost: &::engine::GuestCost,
+) -> Result<eta_ir::validate::Budget, String> {
+    let submit = match cost.submit_bound_ns {
+        None => None,
+        Some(bound_ns) => {
+            let launch_ns = cost.launch_ns.ok_or(
+                "the device states a bound on one submission and its load measured no \
+                 launch_ns to cost a guest stage against it",
+            )?;
+            let gbps = cost
+                .elementwise_gbps
+                .filter(|gbps| *gbps > 0.0)
+                .ok_or(
+                    "the device states a bound on one submission and its load measured no \
+                     elementwise_gbps to cost a guest stage against it",
+                )?;
+            Some(eta_ir::validate::SubmitBound {
+                bound_ns,
+                launch_ns: launch_ns as f64,
+                elementwise_bytes_per_ns: gbps,
+            })
+        }
+    };
+    Ok(eta_ir::validate::Budget {
+        room_bytes: u64::from(chunks.state_chunks())
+            .saturating_mul(chunks.chunk_bytes)
+            .saturating_sub(chunks.held_bytes),
+        submit,
+    })
 }
 
 impl std::fmt::Debug for Model {

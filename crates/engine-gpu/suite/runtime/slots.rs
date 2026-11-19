@@ -156,9 +156,9 @@ impl Slots {
             .collect();
         // Its state and its pair's, the pair's taken once.
         let state = engine
-            .guest_state(binding.program, &binding.extents)
+            .guest_state(binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
-        let scratch = self.state(state.per_instance, state.run);
+        let scratch = self.state(state.instance_bytes(), state.run);
         let key = (binding.program, binding.extents);
         let pair = match self.pairs.iter().find(|(held, _)| *held == key) {
             Some((_, place)) => place.clone(),

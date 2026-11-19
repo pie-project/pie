@@ -1036,6 +1036,7 @@ impl ResidencyPlanner {
             pieces,
             pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
         };
+
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",
@@ -1191,6 +1192,9 @@ impl ResidencyPlanner {
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             let charged = departed.as_ref().is_some_and(|proc| proc.charged);
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
