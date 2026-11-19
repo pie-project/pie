@@ -661,6 +661,8 @@ impl Shell {
                 pages: &lane.pages,
                 held: lane.held,
                 folded: 0,
+                readable: 0,
+                set: 0,
                 kv_less: false,
                 translation: &[],
                 window: &lane.window,

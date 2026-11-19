@@ -43,11 +43,14 @@ impl FrameShell for Shell {
         // A step refused here fires nothing: what its lanes' device-counted
         // folds left ahead goes back to where the step found it.
         let ahead = self.rs_ahead.clone();
+        // Nor does it carry any set's written end.
+        let written = self.written.clone();
         let built = kernels_cuda::tally::counts().built;
         let prepared = self.prepare_step(step);
         self.count_built_in_fire(built);
         if prepared.is_err() {
             self.rs_ahead = ahead;
+            self.written = written;
         }
         prepared
     }
@@ -1091,6 +1094,8 @@ impl Shell {
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
         let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
+        // What each lane writes and reads of its set (`engine::extent`).
+        let mut extents = engine::extent::FireExtents::default();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -1446,7 +1451,35 @@ impl Shell {
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
+            if !seated.kv_less {
+                let reach = have.saturating_add(row.rows);
+                let set = (seated.set, seated.readable);
+                match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+                    Some(Some(slots)) => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                        reach,
+                    ),
+                    _ => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        std::iter::once(have..reach),
+                        reach,
+                    ),
+                }
+            }
         }
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written.
+        extents
+            .check()
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        self.written.commit(extents);
 
         let mut mrope_positions = if !self.mrope_seat {
             Vec::new()

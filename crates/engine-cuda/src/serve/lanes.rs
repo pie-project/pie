@@ -18,6 +18,10 @@ pub struct Seated<'a> {
     /// The set's committed boundary (`KvDelta::folded`): the lane's mask
     /// speaks of the keys from it on.
     pub folded: u32,
+    /// The set's written end the runtime states, and the set
+    /// (`KvDelta::readable`, `KvDelta::set`): what its rows may read.
+    pub readable: u32,
+    pub set: u64,
     pub kv_less: bool,
     pub translation: &'a [u32],
     pub window: &'a [u32],
@@ -51,6 +55,8 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             folded: 0,
+            readable: 0,
+            set: 0,
             kv_less: false,
             translation: &[],
             window: &[],
