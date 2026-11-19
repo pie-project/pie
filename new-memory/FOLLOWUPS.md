@@ -698,3 +698,28 @@ Next:
 - the ~30 µs host / channel / sampling share at four lanes;
 - the duplication switch is a scratch patch: a profile probe that times a kernel in place
   (in a captured body) would make it a standing instrument.
+
+## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
+
+`runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
+(Windows on Arm, NVIDIA driver) in about half its runs, on wgpu-Vulkan and on native Vulkan,
+on memory-redesign (04df99f24) as on the branches after it. It passes on Linux (RTX PRO 4500).
+One fire stalls 100 to 600 ms; the lane fires once inside the compile window instead of
+~100 times. Measured in-process (no nsys on the Spark):
+
+- The time is inside the submit: wgpu's `queue.submit`, or the native submit. The fire's
+  settle (its fence wait) is ~1.5 ms.
+- It is not the compile and not a lock in pie. `program::adopt` is host-only and
+  single-threaded, ~46 ms, and the stall outlasts it by up to 470 ms. With the off-lane thread
+  replaced by a pure spin, a spin that yields every millisecond, or a thread that only
+  sleeps, the stall still shows (1 of 3, 3 of 5, 3 of 5 runs).
+- It is not native Vulkan's pipeline-cache write either. In the test the cache has no file,
+  so `PipelineCache::persist` never reads the driver's data, and a run still stalled 601 ms.
+- It lands on one submit early in the engine's life. Three or more fires between building
+  the registration and the compile window avoid it in every variant run (16 of 16), and the
+  fires after the stalled one take ~1 ms.
+
+Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, landing on
+whichever submit is in flight; the test catches it when that submit overlaps the compile.
+The test stays strict, known on this device. Owed: driver-level tracing on that box (not
+nsys, which bluescreens it), or a driver update that moves it.
