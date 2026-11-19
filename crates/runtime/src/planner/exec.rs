@@ -339,6 +339,34 @@ impl Move {
     }
 }
 
+/// A dropped move whose copies were handed to the engine: aborted once
+/// they have landed and the engine says it settled them (`settled`), or,
+/// where it cannot, abandoned ([`abandon`]): either way it ends.
+async fn settle_or_abandon(
+    model: usize,
+    engine: usize,
+    in_flight: Vec<crate::scheduler::ControlCompletion>,
+    settled: impl std::future::Future<Output = anyhow::Result<()>>,
+    txn: Move,
+) {
+    let held = std::sync::Mutex::new(Some(txn));
+    let aborted = crate::scheduler::abort_once_landed(in_flight, settled, || {
+        if let Some(txn) = held.lock().unwrap().take() {
+            abort(model, engine, txn);
+        }
+    })
+    .await;
+    if let Err(error) = aborted {
+        if let Some(txn) = held.lock().unwrap().take() {
+            abandon(model, engine, txn, &error);
+        }
+        return;
+    }
+    if let Some(planner) = crate::planner::planner_for(model, engine) {
+        planner.pages_freed();
+    }
+}
+
 /// A move whose copies the engine could not settle: its kv and state
 /// pages stay out of reuse as before (a late copy may still write them),
 /// and its role items end their move where it found them, the slots taken
@@ -485,22 +513,7 @@ impl Drop for MoveGuard {
         };
         crate::rt::spawn(async move {
             let settled = crate::scheduler::settle_copies(engine);
-            let held = std::sync::Mutex::new(Some(txn));
-            let aborted = crate::scheduler::abort_once_landed(in_flight, settled, || {
-                if let Some(txn) = held.lock().unwrap().take() {
-                    abort(model, engine, txn);
-                }
-            })
-            .await;
-            if let Err(error) = aborted {
-                if let Some(txn) = held.lock().unwrap().take() {
-                    abandon(model, engine, txn, &error);
-                }
-                return;
-            }
-            if let Some(planner) = crate::planner::planner_for(model, engine) {
-                planner.pages_freed();
-            }
+            settle_or_abandon(model, engine, in_flight, settled, txn).await;
         });
     }
 }
@@ -1040,5 +1053,97 @@ impl Drop for PersistGuard {
                  keeping its slots to avoid reuse during the copy"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod abandon_tests {
+    use super::*;
+    use crate::store::roles::tests::{FakeEngine, PROGRAM, holder, pools};
+    use crate::store::roles::{RolesError, bind_instance, learn_program};
+
+    /// A restore's move whose copies the engine cannot settle (its
+    /// `settle_copies` fails): the dropped move takes the abandon path. It
+    /// ends, each item where it lay; the slots it took are leaked by name and
+    /// counted in the planner's status; and both holders' restores go after
+    /// it, the planner serving on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_move_the_engine_cannot_settle_ends_its_slots_leaked_and_counted() {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let pools = pools();
+        let model = crate::store::registry::register_model_with_chunks(
+            16,
+            &[crate::store::registry::EngineStores {
+                shared: Some(pools.device.clone()),
+                tiers: crate::store::shared::Tiers {
+                    host: Some(pools.host.clone()),
+                    disk_slots: 0,
+                },
+                max_context: 256,
+                ..Default::default()
+            }],
+        );
+        let planner = super::super::ResidencyPlanner::new(Arc::new(
+            super::super::pool::RegistryPool::new(model, 0, true),
+        ));
+        super::super::global::init_planner(model, 0, planner);
+        let roles = crate::store::registry::get(model, 0).roles.expect("roles");
+        let mut engine = FakeEngine::default();
+        learn_program(&roles, &mut engine, PROGRAM).unwrap();
+        let mut ids = Vec::new();
+        for by in [1, 2] {
+            let binding = ::engine::InstanceBinding {
+                program: PROGRAM,
+                ..::engine::InstanceBinding::default()
+            };
+            ids.push(
+                bind_instance(Some(&roles), &mut engine, &binding, Some(holder(by)), |_| false)
+                    .unwrap()
+                    .id,
+            );
+        }
+        for by in [1, 2] {
+            let park = roles.lock().unwrap().prepare_park(holder(by)).unwrap();
+            roles.lock().unwrap().commit(park);
+        }
+        // The first's restore: its copies handed to the engine, never settled.
+        let unpark = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .unwrap()
+            .expect("it unparks");
+        let txn = Move::Restore {
+            kv: None,
+            rs: None,
+            roles: Some(unpark),
+        };
+        settle_or_abandon(model, 0, Vec::new(), async {
+            Err(anyhow::anyhow!("the device was lost"))
+        }, txn)
+        .await;
+        let leaked = roles.lock().unwrap().leaked();
+        assert!(leaked > 0, "the slots it took, leaked");
+        let planner = super::super::global::planner_for(model, 0).expect("the planner");
+        assert_eq!(
+            planner.stats.leaked_role_slots.load(std::sync::atomic::Ordering::Relaxed),
+            leaked,
+            "counted in the status"
+        );
+        assert_eq!(planner.diagnostics().leaked_role_slots_total, leaked);
+        // The move ended: both restores go.
+        for by in [1, 2] {
+            let back = roles.lock().unwrap().prepare_unpark(holder(by));
+            assert!(
+                !matches!(back, Err(RolesError::PairParked(_))),
+                "nothing moves now"
+            );
+            let back = back.expect("it unparks").expect("it comes back");
+            roles.lock().unwrap().commit(back);
+        }
+        for id in ids {
+            roles.lock().unwrap().close_instance(id);
+        }
+        assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
     }
 }

@@ -993,32 +993,42 @@ impl Roles {
 
     /// Whether `pieces` free runs of `run` adjacent `Instance` chunks stand
     /// beside where `holder`'s unpark puts its parked dead parts back
-    /// (guest scratch and pair state, given back at its park): a read of
-    /// the device pool under its lock, nothing taken
+    /// (guest scratch and pair state, given back at its park), each placed
+    /// as the unpark's take would place it, in the unpark's order: a read
+    /// of the device pool under its lock, nothing taken
     /// ([`super::slots::SlotPool::chunk_runs_beside`]), so the room its own
     /// park gave back never counts toward its bind.
     #[must_use]
     pub fn fits_beside_unpark(&self, holder: Holder, run: u32, pieces: u32) -> bool {
-        let mut own: Vec<(u32, u32)> = Vec::new();
-        let mut slot_runs = 0u32;
+        use super::slots::OwnPiece;
+        let Some(shape) = self.shapes.of(SlotRole::Instance) else {
+            return true;
+        };
+        let mut own: Vec<OwnPiece> = Vec::new();
         for (owner, item) in &self.items {
             let parked = item.tier == Tier::Host || (item.tier == Tier::Device && item.shed);
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
             for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
-                if part.pieces > 0 {
-                    own.push((part.chunks, part.pieces));
+                own.push(if part.pieces > 0 {
+                    OwnPiece::Chunks {
+                        run: part.chunks,
+                        pieces: part.pieces,
+                    }
                 } else {
-                    slot_runs += 1;
-                }
+                    OwnPiece::Slots {
+                        shape: shape.pool,
+                        slots: part.run,
+                    }
+                });
             }
         }
         self.device
             .lock()
             .unwrap()
             .pool()
-            .chunk_runs_beside(&own, slot_runs, run, pieces)
+            .chunk_runs_beside(&own, run, pieces)
     }
 
     /// The free runs of `run` adjacent `Instance` chunks inside one

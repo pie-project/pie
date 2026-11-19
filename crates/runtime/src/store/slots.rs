@@ -62,6 +62,15 @@ pub use super::segments::{ChunkMove, Evacuation, SegmentError, SegmentState, Seg
 /// A slot shape's id: its index in [`SlotPoolFacts::shapes`].
 pub type ShapeId = u16;
 
+/// A piece of a parked guest state its restore retakes, as
+/// [`SlotPool::chunk_runs_beside`] places it on its view: `pieces` runs of
+/// `run` whole chunks, or one run of `slots` slots of `shape` in a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnPiece {
+    Chunks { run: u32, pieces: u32 },
+    Slots { shape: ShapeId, slots: u32 },
+}
+
 /// Fixed sets each working set holds: the one its fires read. Derived, not
 /// configured.
 pub const FIXED_SETS_PER_WORKING_SET: u32 = 1;
@@ -423,11 +432,13 @@ impl ShapeState {
 
     /// The lowest slot of frame `frame` that starts `n` free slots in a
     /// row, if one does.
-    fn free_run(&self, frame: u32, n: u32) -> Option<u32> {
+    /// The slots `held` reads as held count as taken too: a view of what
+    /// runs placed on it would leave ([`SlotPool::chunk_runs_beside`]).
+    fn free_run_beside(&self, frame: u32, n: u32, held: impl Fn(u32) -> bool) -> Option<u32> {
         let base = frame as usize * self.words;
         let free = |index: u32| {
             let (word, bit) = Bits::locate(index);
-            self.free[base + word] & bit != 0
+            self.free[base + word] & bit != 0 && !held(index)
         };
         let mut start = 0;
         let mut length = 0;
@@ -1500,15 +1511,7 @@ impl SlotPool {
             return Ok(Vec::new());
         }
         let n = n as u32;
-        // A run lies only among runs of its own length: a run's hole left
-        // behind is one the next run of that length takes exactly, and a
-        // chunk whose runs all leave is free whole again.
-        let found = state.partial.get(&n).and_then(|chunks| {
-            chunks.iter().find_map(|&(_, _, logical)| {
-                let frame = self.chunks[logical as usize].frame;
-                state.free_run(frame, n).map(|first| (logical, first))
-            })
-        });
+        let found = self.partial_run(shape, n, |_, _| false);
         let (chunk, first) = match found {
             Some(found) => found,
             None if self.free_chunks() > 0 => (self.open_chunk(shape, n), 0),
@@ -1524,6 +1527,25 @@ impl SlotPool {
         self.fill_run(chunk, holder.is_live(), first, n, &mut taken);
         *self.holders.entry(holder).or_default() += u64::from(n);
         Ok(taken)
+    }
+
+    /// Where a run of `n` slots of `shape` lies in a chunk already open for
+    /// runs of its length, the slots `held(logical, index)` reads as held
+    /// taken too: its logical chunk and first slot. A run lies only among
+    /// runs of its own length: a run's hole left behind is one the next run
+    /// of that length takes exactly, and a chunk whose runs all leave is
+    /// free whole again. What [`Self::acquire_run`] takes, and what
+    /// [`Self::chunk_runs_beside`] places on its view.
+    fn partial_run(&self, shape: ShapeId, n: u32, held: impl Fn(u32, u32) -> bool) -> Option<(u32, u32)> {
+        let state = self.shapes.get(shape as usize)?;
+        state.partial.get(&n).and_then(|chunks| {
+            chunks.iter().find_map(|&(_, _, logical)| {
+                let frame = self.chunks[logical as usize].frame;
+                state
+                    .free_run_beside(frame, n, |index| held(logical, index))
+                    .map(|first| (logical, first))
+            })
+        })
     }
 
     /// The free runs of `run` adjacent chunks state may open now, each
@@ -1565,38 +1587,78 @@ impl SlotPool {
     }
 
     /// Whether `pieces` free runs of `run` adjacent chunks would stand
-    /// once `own` has been placed first, read only: `own` the pieces a
-    /// restore's parked guest state retakes, each `(run, pieces)` of whole
-    /// chunks placed as [`Self::acquire_chunk_runs`] would (lowest first),
-    /// and `slot_runs` runs of slots inside one chunk, each counted as
-    /// taking a free chunk of its own (where it would share a partly
-    /// filled one this reads short, never long). Nothing is taken: the
-    /// pool is the same after.
+    /// once `own` has been placed first, in order, exactly where the takes
+    /// would put it, read only: a [`OwnPiece::Chunks`] as
+    /// [`Self::acquire_chunk_runs`] places it (the lowest free runs), a
+    /// [`OwnPiece::Slots`] as [`Self::acquire_run`] does (a chunk open for
+    /// runs of its length first, else the lowest free chunk, which runs of
+    /// its length placed after it share). Nothing is taken: the pool is the
+    /// same after.
     #[must_use]
-    pub fn chunk_runs_beside(&self, own: &[(u32, u32)], slot_runs: u32, run: u32, pieces: u32) -> bool {
-        let mut taken: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    pub fn chunk_runs_beside(&self, own: &[OwnPiece], run: u32, pieces: u32) -> bool {
+        use std::collections::{BTreeSet, HashMap};
+        // Physical chunks the view has opened, and the slots it has placed
+        // in logical chunks (those open before, and those it opened, by
+        // their class).
+        let mut opened: BTreeSet<u32> = BTreeSet::new();
+        let mut placed: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+        let mut fresh: Vec<(ShapeId, u32, u32)> = Vec::new();
         let mut room = self.headroom();
-        for &(own_run, own_pieces) in own {
-            let own_run = own_run.max(1);
-            let firsts =
-                self.runs_where(own_run, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk));
-            if firsts.len() < own_pieces as usize {
-                return false;
+        for piece in own {
+            match *piece {
+                OwnPiece::Chunks { run: own_run, pieces: own_pieces } => {
+                    let own_run = own_run.max(1);
+                    let firsts =
+                        self.runs_where(own_run, room, |c| self.open.get(c) && !opened.contains(&c));
+                    if firsts.len() < own_pieces as usize {
+                        return false;
+                    }
+                    for &first in &firsts[..own_pieces as usize] {
+                        opened.extend(first..first + own_run);
+                    }
+                    room = room.saturating_sub(own_run * own_pieces);
+                }
+                OwnPiece::Slots { shape, slots } => {
+                    let Some(state) = self.shapes.get(shape as usize) else {
+                        return false;
+                    };
+                    if slots == 0 {
+                        continue;
+                    }
+                    if slots > state.spc() {
+                        return false;
+                    }
+                    let held = |logical: u32, index: u32| {
+                        placed.get(&logical).is_some_and(|slots| slots.contains(&index))
+                    };
+                    if let Some((logical, first)) = self.partial_run(shape, slots, held) {
+                        placed.entry(logical).or_default().extend(first..first + slots);
+                        continue;
+                    }
+                    // A chunk the view opened for runs of this length.
+                    let spc = state.spc();
+                    if let Some(entry) = fresh
+                        .iter_mut()
+                        .find(|(s, class, used)| *s == shape && *class == slots && used + slots <= spc)
+                    {
+                        entry.2 += slots;
+                        continue;
+                    }
+                    let Some(physical) =
+                        self.open_chunks().into_iter().find(|c| !opened.contains(c))
+                    else {
+                        return false;
+                    };
+                    if room == 0 {
+                        return false;
+                    }
+                    opened.insert(physical);
+                    fresh.push((shape, slots, slots));
+                    room -= 1;
+                }
             }
-            for &first in &firsts[..own_pieces as usize] {
-                taken.extend(first..first + own_run);
-            }
-            room = room.saturating_sub(own_run * own_pieces);
         }
-        for _ in 0..slot_runs {
-            let firsts = self.runs_where(1, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk));
-            let Some(&first) = firsts.first() else {
-                return false;
-            };
-            taken.insert(first);
-            room = room.saturating_sub(1);
-        }
-        self.runs_where(run, room, |chunk| self.open.get(chunk) && !taken.contains(&chunk))
+        self.runs_where(run, room, |c| self.open.get(c) && !opened.contains(&c))
             .len()
             >= pieces as usize
     }
@@ -2822,6 +2884,49 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// What a restore's parked pieces leave of the free runs, read where
+    /// the takes would put them: a run of slots goes back into a partly
+    /// filled chunk of its length (no free chunk taken), a whole-chunk
+    /// piece takes a free chunk; nothing is taken, and the real take puts
+    /// the run where the view did.
+    #[test]
+    fn a_parked_run_that_shares_a_partly_filled_chunk_leaves_the_free_runs_standing() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let (holder, other) = (Holder::WorkingSet(1), Holder::WorkingSet(2));
+        // Two runs of 2 share a chunk; one leaves: its hole is a run of 2
+        // in a partly filled chunk.
+        let kept = pool.acquire_run(other, 0, 2).unwrap();
+        let gone = pool.acquire_run(holder, 0, 2).unwrap();
+        assert_eq!(kept[0].chunk, gone[0].chunk, "one chunk");
+        pool.release(holder, &gone, 0);
+        let free = pool.free_chunk_runs(1);
+        let snapshot = |pool: &SlotPool| {
+            (
+                pool.open_chunks(),
+                pool.free_chunks(),
+                pool.room_gives(),
+                (1..=4).map(|run| pool.free_chunk_runs(run)).collect::<Vec<_>>(),
+            )
+        };
+        let before = snapshot(&pool);
+        let own = [OwnPiece::Slots { shape: 0, slots: 2 }];
+        assert!(
+            pool.chunk_runs_beside(&own, 1, free),
+            "the run goes back into the hole: every free chunk stands beside it"
+        );
+        assert!(!pool.chunk_runs_beside(&own, 1, free + 1));
+        // A whole-chunk piece takes a free chunk.
+        let whole = [OwnPiece::Chunks { run: 1, pieces: 1 }];
+        assert!(!pool.chunk_runs_beside(&whole, 1, free));
+        assert!(pool.chunk_runs_beside(&whole, 1, free - 1));
+        assert_eq!(snapshot(&pool), before, "read only: the pool is the same after");
+        // And the real take puts it where the view did.
+        let back = pool.acquire_run(holder, 0, 2).unwrap();
+        assert_eq!(back[0].chunk, kept[0].chunk);
+        assert_eq!(pool.free_chunk_runs(1), free);
     }
 
     /// Runs of adjacent chunks are taken inside one segment, lowest first,
