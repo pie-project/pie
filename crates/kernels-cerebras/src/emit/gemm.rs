@@ -2,7 +2,8 @@
 //! host arrays.
 //!
 //! - **Every PE** (`gpe.csl`, one file; its place, class and weight segment its config words)
-//!   runs the program's ops in order, an interpreter over a table of 16-bit words.
+//!   runs the program's ops in order, an interpreter over a table of 16-bit words (its stamps:
+//!   the start, the end, and the cycles it spent in the launch's attentions).
 //! - **`gseg.csl`**: the all-reduces over a row (a row's sums) or a head's band (a head's
 //!   sums, the attention's scores and probabilities), the printed regions' `seg`.
 //! - **The tapes** (`gtape.csl`, rows below the array): a column's weight stream, each PE

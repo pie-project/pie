@@ -76,6 +76,10 @@ fn csend(cf: u16, cb: u16, src: mem1d_dsd, n: u16, rev: bool) void {
 }
 // the attentions run this launch (their members' order alternates)
 var NATT: u16 = 0;
+// the cycles this PE spent in the launch's attentions (its stamps' third word: the attention's
+// own time, which the tape's stamps cannot split from the ops around it)
+var ATT_CY: u32 = 0;
+fn now32() u32 { timestamp.get_timestamp(&ts); return @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
 
 // The column's weight stream: its tape's words up the column (a tree: every PE of the
 // column takes every word), in op order.
@@ -175,6 +179,7 @@ fn vred(o: u16, n: u16, mx: bool) f32 {
 // The joint attention: every row's [k | v] along the column, KB keys a block; the band's
 // partial scores and probabilities all-reduced; an online softmax a query.
 fn attend(a: u16) void {
+  const att0 = now32();
   const b = a + 2;
   const ns = prog[b];
   var me: u16 = 0;
@@ -286,6 +291,7 @@ fn attend(a: u16) void {
     @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), math.recip(ll[t]));
     if (rd != 0) { rnd(oo + t * lo, nc); }
   }
+  ATT_CY += now32() - att0;
 }
 
 // The host's value into its slot; a value out to the host's.
@@ -322,6 +328,7 @@ fn run_op(a: u16) void {
 // code and length), then the rest (an even count of 16-bit words).
 fn run_all() void {
   NATT = 0;
+  ATT_CY = 0;
   var i: u16 = 0;
   while (i < NOPS) : (i += 1) {
     @mov32(@set_dsd_length(D_progw, 1), fab.fin(q_wi, 1));
@@ -329,5 +336,6 @@ fn run_all() void {
     if (n > 1) { @mov32(@set_dsd_length(@increment_dsd_offset(D_progw, 1, u32), n - 1), fab.fin(q_wi, n - 1)); }
     run_op(0);
   }
+  tsc[2] = ATT_CY;
 }
 // ---- end of the ops ----

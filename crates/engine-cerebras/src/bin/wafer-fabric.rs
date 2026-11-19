@@ -62,6 +62,7 @@ fn serve(
                 entry: None,
                 statics: None,
                 group: None,
+                rowbcast: req["rowbcast"].as_bool().unwrap_or(false),
             };
             fab.write(&a, words)?;
             Ok((json!({"ok": true}), Vec::new()))

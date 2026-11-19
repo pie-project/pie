@@ -66,6 +66,9 @@ pub struct Array {
     /// The weight group whose launch it is written before (a grid program in groups: a run of
     /// passes' tiles and their range), every step.
     pub group: Option<usize>,
+    /// Each row's PEs take the same words (its first PE's): written a row's words a row,
+    /// broadcast along it (host.json's `rowbcast`; a GEMM program's row scalars, `hsc`).
+    pub rowbcast: bool,
 }
 
 impl Array {
@@ -338,6 +341,9 @@ pub struct Reading {
     pub host_only: bool,
     /// Whether a launch reads its PEs' stamps back (its cycles): a served decode step reads none.
     pub stamped: bool,
+    /// Whether a launch is timed to its end: a one-word read of its first PE right after the
+    /// call, which comes back once the program has run there (`IoStats::done`).
+    pub poll: bool,
     /// Its PEs' first column and row in a program of co-resident readings (`stream::coresident`).
     pub origin: (i32, i32),
     /// The id its launch takes in a program of co-resident readings (`None`: a program its own).
@@ -477,6 +483,7 @@ impl Reading {
                 entry,
                 statics,
                 group: a["group"].as_u64().map(|g| g as usize),
+                rowbcast: a["rowbcast"].as_bool().unwrap_or(false),
             });
         }
         let backs = |key: &str| -> R<Vec<Back>> {
@@ -552,6 +559,7 @@ impl Reading {
             causal: host["causal"].as_bool().unwrap_or(false),
             host_only: false,
             stamped: true,
+            poll: false,
             origin: (
                 host["origin"][0].as_i64().unwrap_or(0) as i32,
                 host["origin"][1].as_i64().unwrap_or(0) as i32,
@@ -615,6 +623,7 @@ impl Reading {
             causal: false,
             host_only: true,
             stamped: true,
+            poll: false,
             origin: (0, 0),
             rd: None,
             clip: None,
@@ -1432,6 +1441,20 @@ impl Fabric for Runtime {
             "cerebras: an array written"
         );
         let row = (a.rect.w.max(1) as usize) * a.len.max(1);
+        // (each row's PEs the same words: the row's first PE's, broadcast along it, the
+        // rectangle's words written once a row, not once a PE)
+        if a.rowbcast && words.len() == row * a.rect.h.max(0) as usize {
+            let firsts: Vec<u32> = words
+                .chunks(row)
+                .flat_map(|r| r[..a.len].iter().copied())
+                .collect();
+            match self.memcpy_h2d_rowbcast(&a.sym, &firsts, a.rect, a.len, dt) {
+                Ok(()) => return Ok(()),
+                // (an SDK with no row broadcast: every PE's words, as any array's)
+                Err(crate::sdk::Error::MissingSymbol(..)) => {}
+                Err(x) => return Err(x.to_string()),
+            }
+        }
         let band = (MEMCPY_WORDS / row).max(1);
         let mut y = 0;
         while y < a.rect.h as usize {
@@ -1479,7 +1502,22 @@ impl Fabric for Runtime {
         let e = |x: crate::sdk::Error| x.to_string();
         self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
+        let t0 = std::time::Instant::now();
         self.launch("run", &args).map_err(e)?;
+        if reading.poll && self.rpc().symbols().contains_key("tsc") {
+            // (a word of the first PE's stamps: the read waits on the launch there)
+            let mut one = [0u32; 1];
+            let rect = Rect {
+                x: reading.origin.0,
+                y: reading.origin.1,
+                w: 1,
+                h: 1,
+            };
+            self.memcpy_d2h("tsc", &mut one, rect, 1, Order::RowMajor, DataType::Bits32)
+                .map_err(e)?;
+            self.io.done.0 += 1;
+            self.io.done.1 += t0.elapsed().as_nanos() as u64;
+        }
         let mut got = Vec::new();
         // a run of one-PE reads along a row (a head's column roots, the logits) one memcpy
         for run in runs(&reading.d2h) {
@@ -1572,6 +1610,7 @@ fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R
             entry: None,
             statics: None,
             group: None,
+            rowbcast: false,
         };
         let n = (r.w * r.h) as usize;
         let all: Vec<u32> = (0..n).flat_map(|_| words.iter().copied()).collect();

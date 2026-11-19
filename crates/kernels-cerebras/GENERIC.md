@@ -4006,7 +4006,21 @@ refusal of the program where any is open):
   - **The attention** reads no stream words, so the tape does not split it: what the array's
     163.4M leaves past the GEMMs as measured and the regions and the host's ops at price is
     ~47.2M, against 28.0M priced (29.0k a key block, 17.2k priced). `KEY_BLOCK` (11,770 a
-    block) holds the difference, unattributed until the attention's own stamps split it.
+    block) holds the difference. The attention's own stamp (1574: each array PE's `tsc[2]`, the
+    cycles it spent in `attend`) reads 44.36M on every PE (44.34-44.39M, by row and band alike,
+    four steps the same): the gap is the attention's own work (its rescales, band reductions
+    and key-block loop), no PE waiting on another; 128²'s 1.11M of 32.28M.
+  - **The launch's arrival skew is paid a step.** `wafer-bench --poll 1` (a one-word read of
+    the first PE right after the launch: the launch's end on the device) reads 239.6 ms at
+    1024², 750 MHz times the stamps' whole span (179.5M), not the array's 163.4M: ~16M cycles
+    (~21 ms, 9%) a step between the tape's start and the array's. It tracks the step's host
+    writes (8.36M words, 23 ms; 128²'s 1.87M words, 5.4 ms, for ~2.0M), which the array's PEs
+    take before their run and the tape, taking none, does not. 76% of them are `hsc`, a row's
+    scalars at each of its 384 PEs: an entry array whose rows' PEs all take the same words is
+    marked `rowbcast` in host.json and written a row's words a row (`memcpy_h2d_rowbcast`).
+    1575 (the same linked program, A/B in one session): h2d 23.1 -> 6.8 ms, done 239.6 ->
+    220.7-222.9 ms (-7%), wall 297 -> 264-267 ms (-11%), the stamps' span 179.6M -> 165.4-167.1M
+    (the array's 163.5M); every velocity and latent the same bit for bit.
   - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
     (chip 1.858M, 1.71M before); the 576-row one 168.7M.
 - **A PE's low data** (`check::lo_dsds`, `LO_DSDS`). cslc keeps every constant DSD value a PE

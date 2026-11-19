@@ -2116,11 +2116,19 @@ pub(crate) fn host_arrays(
             }
             GridFill::Entry(_) => {
                 let mut words: Vec<u32> = Vec::new();
+                // (each row's PEs taking the same words, the row's first PE's: a write of a
+                // row's words, broadcast along it, `rowbcast`)
+                let mut rows: BTreeMap<u32, &Vec<crate::stream::host::Word>> = BTreeMap::new();
+                let mut along = w > 1;
                 for &m in &members {
                     let GridFill::Entry(v) = &ins[m].fill else {
                         return Err(format!("`{}`: an entry beside other fills", a0.sym));
                     };
                     words.extend(v.iter().flatten());
+                    along &= rows.entry(ins[m].at.y).or_insert(v) == &v;
+                }
+                if along {
+                    item["rowbcast"] = json!(true);
                 }
                 let file = format!("entries/{k}.npy");
                 crate::npy::write_u32(

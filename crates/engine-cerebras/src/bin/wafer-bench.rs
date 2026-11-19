@@ -62,7 +62,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
-                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir> | --checkpoint <dir | .zt>] [--stamps <dir>] \
+                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir> | --checkpoint <dir | .zt>] [--stamps <dir>] [--poll 1] \
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir | .zt> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
@@ -629,7 +629,10 @@ fn save_tsc(
 fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     use engine_cerebras::reading::{Denoise, Reading};
     let need = |k: &str| get.get(k).cloned().ok_or_else(|| USAGE.to_string());
-    let reading = Reading::open(Path::new(&need("reading")?))?;
+    let mut reading = Reading::open(Path::new(&need("reading")?))?;
+    // (`--poll 1`: each launch timed to its end on the device, `done_ms`, the reads after it
+    // aside)
+    reading.poll = get.get("poll").is_some_and(|v| v == "1");
     let trace = reading.trace()?;
     let grid: Option<[u32; 3]> = match get.get("grid") {
         Some(g) => {
@@ -960,7 +963,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             json!({"h2d_ms": ms(b.h2d.1, a.h2d.1), "h2d_calls": b.h2d.0 - a.h2d.0,
                 "h2d_words": b.h2d.2 - a.h2d.2, "launch_ms": ms(b.launch.1, a.launch.1),
                 "d2h_ms": ms(b.d2h.1, a.d2h.1), "d2h_calls": b.d2h.0 - a.d2h.0,
-                "d2h_words": b.d2h.2 - a.d2h.2})
+                "d2h_words": b.d2h.2 - a.d2h.2, "done_ms": ms(b.done.1, a.done.1)})
         });
         let back = reading.rows_back(&got)?;
         let back = if reading.batch > 1 {
