@@ -397,16 +397,16 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         ..
     } = loaded;
     let state = engine
-        .guest_state(program, &EXTENTS)
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
-    assert!(state.per_instance > 0, "the epilogue's heap is its instance's");
+    assert!(state.instance_bytes() > 0, "the epilogue's heap is its instance's");
     let word = trace.facts.word(&Request::new(ROWS, false));
 
     let (a, a_channels, a_binding) = bind(&mut engine, &mut slots, program, 1);
     let ids = fire(&mut engine, word, t_input, &[(a, a_channels)], &[5]);
     assert_eq!(ids, [argmax(&planes, 5)], "A's pass reads its row");
     // Whatever A's launches left, A's bytes are in its room as it closes.
-    fill_room(&engine, &a_binding.scratch, state.per_instance, 0xa5);
+    fill_room(&engine, &a_binding.scratch, state.instance_bytes(), 0xa5);
     fill_room(&engine, &a_binding.pair, state.per_pair, 0xa5);
     engine.close_instance(a).expect("A closes");
 
@@ -414,7 +414,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         bind_in(&mut engine, &mut slots, program, 4, Some(&a_binding));
     assert_eq!(b_binding.scratch, a_binding.scratch, "B takes A's room");
     assert!(
-        read_room(&engine, &b_binding.scratch, state.per_instance)
+        read_room(&engine, &b_binding.scratch, state.instance_bytes())
             .iter()
             .all(|&byte| byte == 0),
         "B's heap holds none of A's bytes"
@@ -432,7 +432,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     if state.per_pair > 0 {
         fill_room(&engine, &b_binding.pair, state.per_pair, 0x11);
         let sibling = InstanceBinding {
-            scratch: slots.state(state.per_instance, state.run),
+            scratch: slots.state(state.instance_bytes(), state.run),
             ..b_binding.clone()
         };
         let (c, _, _) = bind_in(&mut engine, &mut slots, program, 7, Some(&sibling));
@@ -446,9 +446,9 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     }
 
     // An unpark: fresh room holding garbage reads zero once B is there.
-    let scratch = slots.state(state.per_instance, state.run);
+    let scratch = slots.state(state.instance_bytes(), state.run);
     let pair = slots.state(state.per_pair, state.run);
-    fill_room(&engine, &scratch, state.per_instance, 0x7f);
+    fill_room(&engine, &scratch, state.instance_bytes(), 0x7f);
     fill_room(&engine, &pair, state.per_pair, 0x7f);
     engine
         .rebind_slots(Rebind::Instance {
@@ -462,7 +462,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         })
         .expect("the unpark rebinds its state");
     assert!(
-        read_room(&engine, &scratch, state.per_instance)
+        read_room(&engine, &scratch, state.instance_bytes())
             .iter()
             .all(|&byte| byte == 0),
         "the unparked heap holds none of the room's last bytes"
@@ -495,7 +495,7 @@ fn guest_bind_close_rounds_timed() {
         .and_then(|rounds| rounds.parse().ok())
         .unwrap_or(200);
     let state = engine
-        .guest_state(program, &EXTENTS)
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     let (first, _, room) = bind(&mut engine, &mut slots, program, 1);
     engine.close_instance(first).expect("closes");
@@ -509,7 +509,7 @@ fn guest_bind_close_rounds_timed() {
     eprintln!(
         "guest bind+close: {rounds} rounds, {:.1} us a round, state {} B an instance + {} B its pair",
         took.as_secs_f64() * 1e6 / rounds as f64,
-        state.per_instance,
+        state.instance_bytes(),
         state.per_pair
     );
     drop(engine);
