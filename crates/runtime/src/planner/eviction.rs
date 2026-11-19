@@ -280,6 +280,16 @@ impl ResidencyPlanner {
                 "planner: a bind short of whole chunks: the occupants of the cheapest it could \
                  take, or none qualified (every chunk holds a slot no candidate moves)"
             );
+            // None qualified: what stands between the free chunks and a run,
+            // the planner's map and the pool's own count, so a stall names
+            // its cause.
+            if picks.is_empty() {
+                tracing::debug!(
+                    map = %map.as_ref().map(|map| map.explain(run)).unwrap_or_default(),
+                    pool = %self.port.chunk_census(run),
+                    "planner: no run for the head and no one to move: census"
+                );
+            }
         }
         if !unhostable.is_empty() {
             self.with_inner(|inner| {
@@ -721,6 +731,13 @@ fn chunk_picks(
         .zip(map)
         .and_then(|((run, pieces), map)| map.cheapest_runs(run, pieces))
         .filter(|occupants| !occupants.is_empty());
+    // Short of whole chunks with the map read and no runs its candidates
+    // could empty: no one is moved by pages counted anywhere, which frees
+    // no run (Mac Pro's soak: one resident evicted a line, each freeing
+    // nothing the run could take, until none was resident).
+    if occupants.is_none() && shape.is_some() && map.is_some() {
+        return (Vec::new(), deficit, Vec::new());
+    }
     match occupants {
         Some(occupants) => (
             candidates
@@ -819,9 +836,51 @@ mod chunk_picks_tests {
         let (kept, same, _) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
         assert_eq!(kept.len(), 3);
         assert_eq!(same, deficit);
+        // No chunk empties: no one is moved by pages counted anywhere,
+        // which frees no run (Mac Pro's cascade).
         let none = ChunkMap::default();
-        let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), Some(&none));
-        assert_eq!((kept.len(), same), (3, deficit), "no chunk empties: as before");
+        let (kept, _, occupants) =
+            chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&none));
+        assert!(kept.is_empty() && occupants.is_empty(), "no run its eviction makes: none moved");
+        // Without a map (no shared pool) the candidates stand as before.
+        let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), None);
+        assert_eq!((kept.len(), same), (3, deficit));
+    }
+
+    /// Mac Pro's soak, the dominant shape: 1867 chunks free and runs of 4
+    /// standing in the planner's map (cost 0), the head short all the same
+    /// (its need understated what its unpark takes). The cheapest runs were
+    /// "no one", so the plan fell back to evicting by pages: one resident a
+    /// line, each freeing nothing the run could take, until none was
+    /// resident. A run standing free moves no one; nor does a map where no
+    /// candidate's eviction empties a run.
+    #[test]
+    fn a_head_short_of_a_run_moves_no_one_whose_eviction_makes_none() {
+        let rank = |seq: u64| super::super::rank::Rank::of(0, seq);
+        let candidates = vec![(pid(1), rank(1)), (pid(2), rank(2))];
+        let deficit = Reclaim::default();
+        // Free 4..8 and 12..16: runs of 4 stand; the residents hold 9 and 11.
+        let standing = ChunkMap {
+            held: vec![held(9, 2, &[(1, 2)]), held(11, 1, &[(2, 1)])],
+            free: (4..8).chain(12..16).collect(),
+            headroom: Some(64),
+            segment_chunks: 0,
+        };
+        assert_eq!(standing.cheapest_runs(4, 1), Some(vec![]), "a run stands");
+        let (kept, _, occupants) =
+            chunk_picks(candidates.clone(), deficit, Some((4, 1)), Some(&standing));
+        assert!(kept.is_empty() && occupants.is_empty(), "a free run: no one moved");
+        // No candidate's chunk lies where a run could form: none moved.
+        let scattered = ChunkMap {
+            held: vec![held(1, 3, &[(1, 1)]), held(3, 3, &[(2, 1)])],
+            free: vec![0, 2, 4],
+            headroom: Some(64),
+            segment_chunks: 0,
+        };
+        assert_eq!(scattered.cheapest_runs(3, 1), None, "their chunks do not empty");
+        let (kept, _, _) = chunk_picks(candidates, deficit, Some((3, 1)), Some(&scattered));
+        assert!(kept.is_empty(), "evicting them makes no run: none moved");
+        assert!(scattered.explain(3).contains("stuck=2"), "{}", scattered.explain(3));
     }
 
     /// Mac Pro's M5 shape B: the cheapest runs stood free, yet the head

@@ -87,6 +87,48 @@ impl ChunkMap {
         self.segment_chunks = self.segment_chunks.max(other.segment_chunks);
     }
 
+    /// Why runs of `run` adjacent chunks do or do not stand in this map,
+    /// in one line: free chunks, held ones emptiable by the candidates and
+    /// not, the headroom, the segment's length, the longest stretch of
+    /// free-or-emptiable chunks inside one segment, and the cheapest
+    /// window's cost.
+    #[must_use]
+    pub fn explain(&self, run: u32) -> String {
+        let run = run.max(1);
+        let free: std::collections::BTreeSet<u32> = self.free.iter().copied().collect();
+        let emptiable: std::collections::BTreeSet<u32> = self
+            .held
+            .iter()
+            .filter(|chunk| chunk.emptiable())
+            .map(|chunk| chunk.chunk)
+            .collect();
+        let stuck = self.held.len() - emptiable.len();
+        let candidates: std::collections::BTreeSet<ProcessId> = self
+            .held
+            .iter()
+            .flat_map(|chunk| chunk.by.iter().map(|&(pid, _)| pid))
+            .collect();
+        let (mut longest, mut stretch, mut last) = (0u32, 0u32, None::<u32>);
+        for &chunk in free.union(&emptiable) {
+            let same = self.segment_chunks == 0
+                || last.is_some_and(|last| last / self.segment_chunks == chunk / self.segment_chunks);
+            stretch = if last == Some(chunk.wrapping_sub(1)) && same { stretch + 1 } else { 1 };
+            longest = longest.max(stretch);
+            last = Some(chunk);
+        }
+        format!(
+            "map: run={run} free={} held={} emptiable={} stuck={stuck} candidates={} \
+             headroom={:?} segment_chunks={} longest_usable_stretch={longest} cheapest={:?}",
+            free.len(),
+            self.held.len(),
+            emptiable.len(),
+            candidates.len(),
+            self.headroom,
+            self.segment_chunks,
+            self.cheapest_runs(run, 1).map(|pids| pids.len()),
+        )
+    }
+
     /// The processes whose eviction empties the cheapest `pieces` disjoint
     /// runs of `run` adjacent chunks, each chunk free or emptiable
     /// ([`ChunkHeld::emptiable`]), cost the pages moved; `None` where no
@@ -260,6 +302,13 @@ pub trait PoolPort: Send + Sync + 'static {
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
         let _ = (run, pieces);
         false
+    }
+    /// The pool's census for a head short of runs of `run` chunks
+    /// ([`crate::store::slots::SlotPool::census`]); empty where the pool
+    /// keeps no guest state.
+    fn chunk_census(&self, run: u32) -> String {
+        let _ = run;
+        String::new()
     }
     /// The device pages that, moved out whole, free `chunks` chunks for a
     /// guest's state, as [`Self::rs_as_pages`] for state.
@@ -482,6 +531,13 @@ impl PoolPort for RegistryPool {
             Some(roles) => roles.lock().unwrap().fits_beside_unpark(pid, run, pieces),
             None => self.guest_room_free(run, pieces),
         }
+    }
+
+    fn chunk_census(&self, run: u32) -> String {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map(|shared| shared.lock().unwrap().pool().census(run))
+            .unwrap_or_default()
     }
 
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {

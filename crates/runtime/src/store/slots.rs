@@ -1267,6 +1267,67 @@ impl SlotPool {
         self.compacted.clear();
     }
 
+    /// What stands between free chunks and a run of `run` adjacent ones,
+    /// said in one line for a head short of a run (the soaks' "free chunks
+    /// and no run" stalls): the budget's terms and its headroom, the free
+    /// and open chunks, chunks opened for a shape and holding no slot,
+    /// fenced chunks, the segment's length, each committed segment's
+    /// longest open stretch (the five longest), the open runs of `run`,
+    /// and what a compaction would move.
+    #[must_use]
+    pub fn census(&self, run: u32) -> String {
+        let limit = self.state_limit().min(self.ceiling);
+        let free = (0..self.total).filter(|&chunk| self.free.get(chunk)).count();
+        let open = self.open.iter_in(0, self.total).count();
+        let fenced = (0..self.total).filter(|&chunk| self.fenced.get(chunk)).count();
+        let empty_opened = self
+            .chunks
+            .iter()
+            .filter(|meta| meta.shape != NO_SHAPE && meta.used == 0)
+            .count();
+        let mut by_shape: BTreeMap<ShapeId, (u32, u32)> = BTreeMap::new();
+        for meta in self.chunks.iter().filter(|meta| meta.shape != NO_SHAPE) {
+            let entry = by_shape.entry(meta.shape).or_default();
+            entry.0 += 1;
+            if meta.used == 0 {
+                entry.1 += 1;
+            }
+        }
+        let mut stretches: Vec<(u32, u32)> = Vec::new();
+        for segment in 0..self.segments.count() {
+            if self.segments.state(segment) != SegmentState::Committed {
+                continue;
+            }
+            let range = self.segments.range(segment);
+            let (mut longest, mut stretch) = (0u32, 0u32);
+            for chunk in range.start..range.end.min(limit) {
+                stretch = if self.open.get(chunk) { stretch + 1 } else { 0 };
+                longest = longest.max(stretch);
+            }
+            stretches.push((longest, segment));
+        }
+        stretches.sort_unstable_by(|a, b| b.cmp(a));
+        stretches.truncate(5);
+        let compaction = self.plan_compaction(run).map(|moves| moves.len());
+        format!(
+            "run={run} committed={} reserved={} held={} act={} headroom={} free={free} \
+             open={open} fenced={fenced} opened_empty={empty_opened} \
+             shapes(opened,empty)={by_shape:?} segment_chunks={} state_limit={} ceiling={} \
+             longest_open_by_segment={stretches:?} open_runs={} compaction_moves={compaction:?} \
+             compacting={}",
+            self.committed_chunks(),
+            self.reserved,
+            self.held,
+            self.act,
+            self.headroom(),
+            self.segments.segment_chunks(),
+            self.state_limit(),
+            self.ceiling,
+            self.free_chunk_runs(run),
+            self.compacting(),
+        )
+    }
+
     /// Whether the chunks the last compaction moved off are still fenced:
     /// the run it clears is on its way. A rung raise's fence is not one.
     #[must_use]
