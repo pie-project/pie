@@ -777,6 +777,7 @@ pub fn measure(
         gemm_tflops_by_rows: Some(gemm),
         attn_tflops_by_keys: Some(attn),
         hbm_gbps: Some(bytes),
+        cached_gbps: None,
         elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
         few_row_tflops: few_row,

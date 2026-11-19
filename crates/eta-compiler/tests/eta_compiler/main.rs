@@ -15,6 +15,7 @@ mod emitter_version;
 mod eta_examples;
 mod eta_golden;
 mod extended_golden;
+mod an_integer_scatter_add_runs_on_every_thread;
 mod gumbel_argmax_scans_the_logits_once;
 mod launch_package;
 mod op_table_drift;

@@ -1370,6 +1370,7 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
             hbm_gbps: Some(700.0),
+            cached_gbps: Some(20000.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
@@ -1567,6 +1568,7 @@ mod tests {
     fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
         let measured = profile::fire::Rates {
             hbm_gbps: Some(700.0),
+            cached_gbps: None,
             ..profile::fire::Rates::default()
         };
         let how = ("rates", "\"measured at load\"".to_string());
@@ -1875,7 +1877,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.contains(
-                "measured no [\"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
             ),
             "{err}"
         );
@@ -2202,6 +2204,7 @@ mod tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
             hbm_gbps: Some(800.0),
+            cached_gbps: None,
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
