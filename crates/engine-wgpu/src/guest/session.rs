@@ -1199,4 +1199,111 @@ mod tests {
         assert!(read_status(status(0x3f33_3333, 0)).is_err());
         assert!(read_status(status(151_936, 0)).is_err());
     }
+    /// A guest's write past its heap, run on the device: an `op_copy` into a
+    /// value whose offset lies at its heap's end. The runtime refuses every
+    /// store (the heap is bound at its exact span, beside words it must not
+    /// reach), and the first fault's status reads Fault, OUT_OF_BOUNDS, the
+    /// index and the limit.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_guest_write_past_its_heap_faults_out_of_bounds_and_lands_nowhere() {
+        use super::{Library, STEP_BINDING};
+        use crate::device::{Buffer, Context, present};
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&crate::api::DeviceBoot::default(), allowance).unwrap();
+        let library = Library::build(&device, 4096, 1).unwrap();
+        let call = eta_compiler::codegen::wgsl::step_calls()
+            .iter()
+            .position(|text| text.contains("op_copy("))
+            .expect("a copy step");
+        let pipeline = library.pipeline(u32::try_from(call).unwrap()).unwrap();
+
+        let words = |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let owner = engine_gpu::books::owners::TEST;
+        let buffer = |bytes: &[u8]| {
+            let mut buffer = Buffer::zeroed(&device, bytes.len() as u64, owner).unwrap();
+            buffer.write(0, bytes).unwrap();
+            buffer
+        };
+        // Two f32 values of four: `a` at the heap's start, `o` at its end.
+        const HEAP: u64 = 64;
+        const SENTINEL: u32 = 0xdead_beef;
+        let f32_tag = u32::from(eta_ir::types::to_wire(eta_ir::Dtype::F32).expect("f32 has a wire tag"));
+        let desc = |len: u32| [len, 1, len, 1, f32_tag, len, 1, 1, 1];
+        let descs = buffer(&words(&[desc(4), desc(4)].concat()));
+        let mut op = [0u32; 16];
+        op[1] = 0; // a
+        op[4] = 1; // o
+        let params = buffer(&words(&op));
+        let offs = buffer(&words(&[0, u32::try_from(HEAP).unwrap()]));
+        let heap_words = u32::try_from(HEAP / 4).unwrap();
+        let cfg = buffer(&words(&[2, 0, 1, 0, heap_words, 0, 0, 0]));
+        let mut heap_image: Vec<u32> = vec![0; 32];
+        heap_image[..4].copy_from_slice(&[1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits(), 4.0f32.to_bits()]);
+        heap_image[16..].fill(SENTINEL);
+        let heap = buffer(&words(&heap_image));
+        let status = buffer(&[0u8; 16]);
+        let step = buffer(&[0u8; 256]);
+
+        fn whole(buffer: &Buffer, size: u64) -> wgpu::BindingResource<'_> {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer.slab().buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(size),
+            })
+        }
+        let entry = |binding: u32, resource| wgpu::BindGroupEntry { binding, resource };
+        let group = device.core().device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pie guest bounds test"),
+            layout: &library.binds,
+            entries: &[
+                entry(0, whole(&status, 16)),
+                entry(1, whole(&descs, descs.bytes())),
+                entry(2, whole(&params, params.bytes())),
+                entry(3, whole(&offs, offs.bytes())),
+                // The heap at its exact span, the sentinel words past it.
+                entry(4, whole(&heap, HEAP)),
+                entry(5, whole(&cfg, cfg.bytes())),
+                entry(
+                    STEP_BINDING,
+                    whole(&step, u64::from(eta_compiler::codegen::wgsl::STEP_BYTES)),
+                ),
+            ],
+        });
+        device.core().take_error("create_bind_group").unwrap();
+        let frame = device.frame().unwrap();
+        frame
+            .dispatch_at("bounds test", &pipeline, &group, &[0], [1, 1, 1])
+            .unwrap();
+        frame.commit().unwrap();
+
+        let read = |buffer: &Buffer, n: usize| -> Vec<u32> {
+            let mut bytes = vec![0u8; n * 4];
+            buffer.read(0, &mut bytes).unwrap();
+            bytes
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect()
+        };
+        let status = read(&status, 4);
+        assert_eq!(status[0], 3, "the stage faulted: {status:x?}");
+        assert_eq!(
+            status[1],
+            eta_compiler::codegen::fault::OUT_OF_BOUNDS,
+            "{status:x?}"
+        );
+        assert!(
+            (heap_words..heap_words + 4).contains(&status[2]),
+            "the index of a refused store of `o`: {status:x?}"
+        );
+        assert_eq!(status[3], heap_words, "the limit: {status:x?}");
+        let heap = read(&heap, 32);
+        assert!(heap[16..].iter().all(|&w| w == SENTINEL), "nothing past the heap: {heap:x?}");
+        assert_eq!(heap[0], 1.0f32.to_bits(), "`a` stands: {heap:x?}");
+    }
 }
