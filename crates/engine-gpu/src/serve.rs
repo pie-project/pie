@@ -5746,13 +5746,11 @@ impl<B: Serve> Shell<B> {
             .map(|&(class, rows)| {
                 let mut lane = self.naming_lane(class, rows)?;
                 if lanes.len() > self.held.len() {
-                    // Seat 0's pages, and the null record: a bind-only fire
-                    // reads and writes none of them.
+                    // Refs the pool takes as any lane's: a bind-only fire
+                    // reads and writes none, and a load need lay no seat
+                    // runs ([`Pools::walk_refs`]).
                     let page = self.pools.paging().page_size.max(1);
-                    lane.by_ref = Some((
-                        self.pools.seat_refs(0, rows.div_ceil(page).max(1))?,
-                        vec![0; self.pools.pieces() as usize],
-                    ));
+                    lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                 }
                 Ok(lane)
             })

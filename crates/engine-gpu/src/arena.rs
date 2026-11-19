@@ -424,6 +424,16 @@ impl<B: Backend> Span<B> {
                             have: rect.room,
                         });
                     }
+                    // The carve lies in the chunks the rung holds, and the
+                    // span below it is lent to state (a guest's among it):
+                    // a room past the carve would reach that state.
+                    Some(rect) if rect.offset + rect.room > at.map.bytes => {
+                        return Err(Fault::Ceiling {
+                            what: "bytes of a rung's carve a value's room reaches",
+                            need: rect.offset + rect.room,
+                            have: at.map.bytes,
+                        });
+                    }
                     Some(rect) => Some(Tensor::new(
                         handles.bind(buffer, base + rect.offset, rect.room)?,
                         rect.rows,

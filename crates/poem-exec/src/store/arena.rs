@@ -87,9 +87,10 @@ mod tests {
         }
     }
 
-    /// A value's room is its own placement at every rung, holds what a fire
-    /// of the rung's rows takes, and no value live beside it reaches into it:
-    /// a view bound at its room confines a kernel to the value's own bytes.
+    /// A value's room is its own placement at every rung, lies inside the
+    /// rung's carve, holds what a fire of the rung's rows takes, and no value
+    /// live beside it reaches into it: a view bound at its room confines a
+    /// kernel to the value's own bytes.
     #[test]
     fn a_room_is_the_value_s_own_placement_and_no_co_live_value_s() {
         let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
@@ -112,6 +113,9 @@ mod tests {
                     panic!("value {at} has a rectangle and no arena placement");
                 };
                 assert_eq!((rect.offset, rect.room), (*offset, *bytes));
+                // Inside the rung's carve: below it, the span is lent to state
+                // while the rung serves.
+                assert!(rect.offset + rect.room <= map.bytes);
                 assert!(
                     rect.bytes <= rect.room,
                     "value {at}: a fire of the rung's rows takes {} bytes of a room of {}",

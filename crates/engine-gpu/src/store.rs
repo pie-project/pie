@@ -826,17 +826,27 @@ impl<B: Backend> Pools<B> {
         refs.iter().map(|&r| self.units(LIST, r)).collect()
     }
 
-    /// Seat `slot`'s first `pages` pages as slot refs of the list shape, as
-    /// a lane by refs names them (none where the pool lists no pages).
-    pub fn seat_refs(&self, slot: u32, pages: u32) -> Result<Vec<u32>> {
-        if self.layout.list.is_none() {
-            return Ok(Vec::new());
-        }
-        let list = *self.shape(LIST)?;
-        let first = u64::from(slot) * u64::from(self.paging.pages_per_slot);
-        (0..pages)
-            .map(|page| list.seat_ref(u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX)))
-            .collect()
+    /// What a lane of a bind-only fire names by ref: `pages` slot refs of
+    /// the list shape and a record (a slot ref of the fixed shape a piece),
+    /// each in the first chunk past the null chunk. The fire reads and writes
+    /// none of them; the pool takes them as any lane's (none of a shape the
+    /// pool holds not).
+    pub fn walk_refs(&self, pages: u32) -> Result<(Vec<u32>, Vec<u32>)> {
+        let first = |id: ShapeId, count: u32| -> Result<Vec<u32>> {
+            let per_chunk = self.shape(id)?.per_chunk.max(1);
+            Ok((0..count).map(|at| per_chunk + at % per_chunk).collect())
+        };
+        let pages = if self.layout.list.is_some() {
+            first(LIST, pages)?
+        } else {
+            Vec::new()
+        };
+        let record = if self.has_state() {
+            first(FIXED, self.pieces())?
+        } else {
+            vec![0; self.pieces() as usize]
+        };
+        Ok((pages, record))
     }
 
     /// The physical page explicit write descriptor page `page` names.
