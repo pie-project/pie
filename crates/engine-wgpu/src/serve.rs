@@ -36,8 +36,8 @@ impl Serve for Api {
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
-    const MAX_BUFFER_SOURCE: &'static str =
-        "the least of wgpu::Limits::max_buffer_size and max_storage_buffer_binding_size";
+    const MAX_BUFFER_SOURCE: &'static str = "the least of wgpu::Limits::max_buffer_size, \
+        max_storage_buffer_binding_size and, on Vulkan, maxMemoryAllocationSize";
 
     const RECORDS: bool = false;
 

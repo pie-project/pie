@@ -140,6 +140,56 @@ fn host_room() -> std::result::Result<u64, String> {
     )
 }
 
+/// The most bytes one reservation takes: the least of the device's
+/// `max_buffer_size`, `max_storage_buffer_binding_size` (a slab is bound
+/// whole) and, where the backend states it, the most one allocation backs
+/// (`allocation`: Vulkan's `maxMemoryAllocationSize`). A limit stated as
+/// zero states nothing.
+#[must_use]
+pub fn reservation_bound(limits: &wgpu::Limits, allocation: Option<u64>) -> u64 {
+    [Some(limits.max_storage_buffer_binding_size), allocation]
+        .into_iter()
+        .flatten()
+        .filter(|&limit| limit > 0)
+        .fold(limits.max_buffer_size, u64::min)
+}
+
+/// The most bytes one allocation of `adapter` backs, where its backend
+/// states it: Vulkan's `maxMemoryAllocationSize` (core from 1.1).
+#[must_use]
+pub fn allocation_limit(adapter: &wgpu::Adapter) -> Option<u64> {
+    match adapter.get_info().backend {
+        #[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+        wgpu::Backend::Vulkan => vulkan_allocation(adapter),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+fn vulkan_allocation(adapter: &wgpu::Adapter) -> Option<u64> {
+    use ash::vk;
+    // SAFETY: the native adapter is only read, and the guard is dropped
+    // before `adapter` is.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let shared = hal.shared_instance();
+    let caps = hal.physical_device_capabilities();
+    if caps.properties().api_version < vk::API_VERSION_1_1
+        || shared.instance_api_version() < vk::API_VERSION_1_1
+    {
+        return None;
+    }
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+    // SAFETY: the physical device belongs to the live instance, both at
+    // Vulkan 1.1, and both structs outlive the call.
+    unsafe {
+        shared
+            .raw_instance()
+            .get_physical_device_properties2(hal.raw_physical_device(), &mut props);
+    }
+    Some(maintenance3.max_memory_allocation_size)
+}
+
 /// What a load on `adapter` takes: `budget_device` where stated, else the
 /// adapter's own reading, refused by name where its backend states none.
 pub fn at_load(adapter: &wgpu::Adapter, allowance: engine::Allowance) -> Result<Reading> {
@@ -323,6 +373,20 @@ mod tests {
             line(Source::DxgiLocal),
             "device memory: 16.0 GiB from DXGI QueryVideoMemoryInfo local"
         );
+    }
+
+    /// An Adreno 840's: 1 GiB to one allocation, 2 GiB to one storage
+    /// binding, 4 GiB to one buffer.
+    #[test]
+    fn one_reservation_takes_the_least_of_the_three_limits() {
+        let limits = wgpu::Limits {
+            max_buffer_size: 4 * GIB,
+            max_storage_buffer_binding_size: 2 * GIB,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(reservation_bound(&limits, Some(GIB)), GIB);
+        assert_eq!(reservation_bound(&limits, None), 2 * GIB);
+        assert_eq!(reservation_bound(&limits, Some(0)), 2 * GIB);
     }
 
     #[test]
