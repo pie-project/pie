@@ -2033,9 +2033,10 @@ impl Shell {
     /// back now. A copy on the device is encoded into a command buffer the
     /// device may still be running when this returns: `false`, and
     /// `landed`'s sink is called with its token from that buffer's
-    /// completion (with no sink, it waits for it, and answers `true`). A
-    /// move to or from the host tier or the slot files is a host copy done
-    /// here, past the drain: `true`.
+    /// completion; with no sink installed (the runtime installs it before
+    /// any copy) it is refused by name, before anything is encoded. A move
+    /// to or from the host tier or the slot files is a host copy done here,
+    /// past the drain: `true`.
     pub fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
@@ -2046,11 +2047,14 @@ impl Shell {
             self.copy_slots(copy)?;
             return Ok(true);
         }
-        let Some(frame) = self.encode_copy(copy)? else {
-            return Ok(true);
-        };
         let Some((sink, token)) = landed else {
-            frame.commit()?;
+            return Err(Fault::Unbound {
+                what: "a copy on the device with no landing sink installed \
+                       (Engine::on_landed comes before any copy_slots_landing)"
+                    .into(),
+            });
+        };
+        let Some(frame) = self.encode_copy(copy)? else {
             return Ok(true);
         };
         // Told once the buffer retires, faulted or not: a faulted copy has
