@@ -109,6 +109,12 @@ impl Guest {
             .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint))
     }
 
+    /// Fresh `Channel` slots for an item of `footprint`: a ring a test
+    /// opens itself, as the runtime registers one.
+    pub fn channel(&mut self, footprint: &Footprint) -> Vec<u32> {
+        self.channel.take(footprint)
+    }
+
     /// Registers `registration` over the channel slots its ring facts state.
     pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
         let slots = engine
