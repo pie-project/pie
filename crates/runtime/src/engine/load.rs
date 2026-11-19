@@ -469,55 +469,18 @@ pub fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
     }
 }
 
+/// The contract `trace`'s params land from `checkpoint` by, as this build's
+/// catalog reads it (`Catalog::contract_for`).
 pub fn contract_for(
     trace: &Trace,
     checkpoint: &Path,
 ) -> std::result::Result<ModelContract, String> {
-    let said = |error: &dyn std::fmt::Display| format!("{error:#}");
-    let source = open_source(checkpoint).map_err(|e| said(&e))?;
-    if stamp_of(checkpoint).map_err(|e| said(&e))?.is_some() {
-        let package = carried(checkpoint).map_err(|e| said(&e))?;
-        let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
-            format!(
-                "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
-                trace.name,
-                package.name()
-            )
-        })?;
-        let tp = deploy.tp;
-        return poem::import::own_contract(&source, &trace.params, tp, trace.platform).map_err(
-            |error| {
-                format!(
-                    "{checkpoint:?} does not hold every plane of {:?}: {error}",
-                    trace.name
-                )
-            },
-        );
+    // an artifact whose package the catalog lacks: refused here, naming the
+    // models directory the catalog reads
+    if matches!(stamp_of(checkpoint), Ok(Some(_))) {
+        carried(checkpoint).map_err(|error| format!("{error:#}"))?;
     }
-    let deployment = catalog().parse(&trace.name).ok_or_else(|| {
-        format!(
-            "{:?} names no deployment of a model this build ships, so a checkpoint's tensors \
-             cannot be mapped onto its params",
-            trace.name
-        )
-    })?;
-    let ranks = deployment.deploy.tp.max(deployment.deploy.ep);
-    if ranks > 1 {
-        return Err(format!(
-            "{:?} is a {ranks}-rank deployment and {checkpoint:?} is an unconverted checkpoint: \
-             the ranks band their shares out of a stamped artifact, so convert it first (`pie \
-             model import`) and serve the artifact",
-            trace.name
-        ));
-    }
-    deployment
-        .contract(&source, trace.platform)
-        .map_err(|error| {
-            format!(
-                "the import contract for {:?} does not fit {checkpoint:?}: {error}",
-                trace.name
-            )
-        })
+    catalog().contract_for(trace, checkpoint)
 }
 
 /// The load of the deployment `checkpoint` states, under the config's

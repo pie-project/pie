@@ -164,21 +164,22 @@ fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
         );
 
         let mini = trace(MINI, platform);
-        assert!(
-            mini.caches.is_empty(),
-            "{platform:?}: the miniature holds nothing between fires"
+        assert_eq!(
+            mini.caches.len(),
+            2,
+            "{platform:?}: the miniature holds its text encoder's two layers' pages, nothing else"
         );
         let mini_seams = seams(&mini);
-        assert!(
-            mini_seams.contains("velocity"),
-            "{platform:?}: {mini_seams:?}"
-        );
-        for absent in ["logits", "hidden", "pixels"] {
+        for want in ["hidden", "velocity", "pixels"] {
             assert!(
-                !mini_seams.contains(absent),
-                "{platform:?}: a denoiser alone, and `{absent}` was planted"
+                mini_seams.contains(want),
+                "{platform:?}: the miniature reads out `{want}` too; seams are {mini_seams:?}"
             );
         }
+        assert!(
+            !mini_seams.contains("logits"),
+            "{platform:?}: the miniature has no logits"
+        );
     }
 }
 
@@ -275,7 +276,11 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
             .declared("reading")
             .map(|s| s.values.clone())
     };
-    assert_eq!(readings(MINI), Some(vec!["denoise".to_string()]));
+    assert_eq!(
+        readings(MINI),
+        readings(KLEIN),
+        "the miniature is a whole pipeline too"
+    );
     assert_eq!(
         readings(KLEIN),
         Some(

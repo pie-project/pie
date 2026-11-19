@@ -16,8 +16,8 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-def qwen3(id, layers, **kwargs):
-    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936, **kwargs)
+def qwen3(id, layers, vocab = 151936, **kwargs):
+    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = vocab, **kwargs)
 
 MODELS = [
     qwen3("qwen3-0.6b", layers = 28),
@@ -25,6 +25,12 @@ MODELS = [
     qwen3("qwen3-8b", layers = 36, drafters = ["mtp"]),
     qwen3("qwen3-14b", layers = 40),
     qwen3("qwen3-32b", layers = 64),
+    # A random-weight architecture slice for the simulator gate (its golden: Hugging Face's
+    # forward on the same weights).
+    qwen3("qwen3-sim", layers = 2, vocab = 512),
+    # The same at four q heads a K / V head: the search replicates each K / V head over
+    # columns (a head root's tiles past its budget), the simulator gate of the replicas.
+    qwen3("qwen3-sim4", layers = 2, vocab = 512),
 ]
 
 F8 = dtype.e4m3tile128a8
@@ -32,6 +38,8 @@ F8 = dtype.e4m3tile128a8
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-1.7b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-sim", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-sim4", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
@@ -67,7 +75,7 @@ DEPLOYMENTS = [
 # is its projections'; the embedding and head stay at its compute dtype, as
 # an AWQ or GPTQ export keeps them.
 
-def dims(hidden, layers, q_heads, kv_heads, inter, tied):
+def dims(hidden, layers, q_heads, kv_heads, inter, tied, vocab = 151936):
     return struct(
         hidden = hidden,
         layers = layers,
@@ -76,7 +84,7 @@ def dims(hidden, layers, q_heads, kv_heads, inter, tied):
         inter = inter,
         tied = tied,
         head_dim = 128,
-        vocab = 151936,
+        vocab = vocab,
         theta = 1000000.0,
         norm_eps = 1e-6,
     )
@@ -87,6 +95,8 @@ DIMS = {
     "qwen3-8b": dims(hidden = 4096, layers = 36, q_heads = 32, kv_heads = 8, inter = 12288, tied = False),
     "qwen3-14b": dims(hidden = 5120, layers = 40, q_heads = 40, kv_heads = 8, inter = 17408, tied = False),
     "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
+    "qwen3-sim": dims(hidden = 256, layers = 2, q_heads = 2, kv_heads = 1, inter = 256, tied = True, vocab = 512),
+    "qwen3-sim4": dims(hidden = 256, layers = 2, q_heads = 4, kv_heads = 1, inter = 256, tied = True, vocab = 512),
 }
 
 # A release whose projections a deployment keeps as released (Qwen's block

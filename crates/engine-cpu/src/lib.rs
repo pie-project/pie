@@ -12,7 +12,8 @@
 //! It also runs a poem trace's forward on the host ([`Forward`]), rank by
 //! rank of an expert- or tensor-parallel group whose collectives meet in memory
 //! ([`Exchange`]): one rank and `N` simulated ranks answer the same bits,
-//! the check a group's lowering is held to without a cluster.
+//! the check a group's lowering is held to without a cluster. A stream step
+//! runs a diffusion transformer's denoise reading the same way.
 
 pub mod exchange;
 pub mod forward;

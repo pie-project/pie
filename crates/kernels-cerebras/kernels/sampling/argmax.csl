@@ -1,0 +1,60 @@
+// wafer/ops/argmax.csl: a head row's argmax (README.md): the largest of the row's VR logits and
+// its first index (ties to the lower id, as a scalar scan). VARG 2: block maxima of the VR / 8
+// blocks of 8 (strided vector maxes), their max by a halving tree, then the first block holding it
+// and the first index in it; 1: the halving tree over the row, then a first-match scan; 0: the
+// scalar scan. A row with no match (NaNs) gives index 0 and its first logit.
+//
+// Params: VR, VARG, t (the row), t_d (the row, VR words), tb_d (its every 8th word, VR / 8).
+param VR: u16;
+param VARG: u16;
+param t: [*]f32;
+param t_d: mem1d_dsd;
+param tb_d: mem1d_dsd;
+
+var tm: [VR]f32 align(16) = @zeros([VR]f32);
+const tm_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> tm[i] });
+var bm = @zeros([VR / 8 + 1]f32);
+const bm_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR / 8} -> bm[i] });
+
+var best: f32 = 0.0;   // the row's largest logit
+var at: u16 = 0;       // its first index
+
+inline fn find() void {
+  best = t[0];
+  var bi: u16 = 0;
+  var j: u16 = 1;
+  if (VARG == 2 and VR % 8 == 0) {
+    const NB: u16 = VR / 8;
+    @fmovs(bm_d, tb_d);
+    var k: u16 = 1;
+    while (k < 8) : (k += 1) { @fmaxs(bm_d, bm_d, @increment_dsd_offset(tb_d, @as(i16, k), f32)); }
+    @fmovs(@set_dsd_length(tm_d, NB), bm_d);
+    var n: u16 = NB;
+    while (n > 1) : (n -= n / 2) {
+      const h = n / 2;
+      @fmaxs(@set_dsd_length(tm_d, h), @set_dsd_length(tm_d, h), @set_dsd_length(@increment_dsd_offset(tm_d, @as(i16, n - h), f32), h));
+    }
+    best = tm[0];
+    var b: u16 = 0;
+    while (b < NB and bm[b] != best) : (b += 1) {}
+    j = 8 * b;
+    while (j < VR and t[j] != best) : (j += 1) {}
+    bi = if (j < VR) j else 0;
+    if (j >= VR) { best = t[0]; }
+  } else if (VARG == 1) {
+    @fmovs(tm_d, t_d);
+    var n: u16 = VR;
+    while (n > 1) : (n -= n / 2) {
+      const h = n / 2;
+      @fmaxs(@set_dsd_length(tm_d, h), @set_dsd_length(tm_d, h), @set_dsd_length(@increment_dsd_offset(tm_d, @as(i16, n - h), f32), h));
+    }
+    best = tm[0];
+    j = 0;
+    while (j < VR and t[j] != best) : (j += 1) {}
+    bi = if (j < VR) j else 0;
+    if (j >= VR) { best = t[0]; }
+  } else {
+    while (j < VR) : (j += 1) { if (t[j] > best) { best = t[j]; bi = j; } }
+  }
+  at = bi;
+}

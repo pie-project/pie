@@ -1,0 +1,41 @@
+// wafer/ops/red.csl: one two-level chain reduction, as a member PE or its root runs it. Members
+// add their partial to what comes in and send it on; a group end merges level 1 (through a FIFO)
+// and level 2; the root merges the two last ends and sends the sum to its own loopback.
+//
+// A member's role (`role`, a host word): 0 the chain's start, 2 a group end, 1 / 3 add-forward.
+// Each reduction has its own FIFO (a FIFO shared across reductions gave wrong sums on the CS-3). A
+// weight PE's row reduction runs its async ops on microthreads 2 / 3, its column's on 4 / 5 (the
+// row reduction on 4 / 5 went wrong on the CS-3).
+//
+// Params: fab, IN1 a member's input (the root: level 1's end), IN2 a group end's level 2 input
+// (the root: level 2's end), OUT the send, LOOP the root's loopback, UT1 / UT2 the FIFO op's and
+// the send's microthreads, FIFOW the FIFO's depth.
+param fab: imported_module;
+param IN1: input_queue;
+param IN2: input_queue;
+param OUT: output_queue;
+param LOOP: input_queue = IN2;
+param UT1: ut_id;
+param UT2: ut_id;
+param FIFOW: u16 = 32;
+
+var fifo_buf = @zeros([FIFOW]f32);
+const fifo = @allocate_fifo(fifo_buf);
+var role: u16 = 0;
+
+// A member's partial d (n words) into the chain.
+inline fn send(d: mem1d_dsd, n: u16) void {
+  const A = .{ .async = true, .ut_id = UT2 };
+  if (role == 0) { @fmovs(fab.fout(OUT, n), d, A); }
+  else if (role == 2) {
+    @fadds(fifo, fab.fin(IN1, n), d, .{ .async = true, .ut_id = UT1 });
+    @fadds(fab.fout(OUT, n), fab.fin(IN2, n), fifo, A);
+  } else { @fadds(fab.fout(OUT, n), fab.fin(IN1, n), d, A); }
+}
+
+// The root: the chain's sum (n words) into d.
+inline fn root(d: mem1d_dsd, n: u16) void {
+  @fmovs(fifo, fab.fin(IN1, n), .{ .async = true, .ut_id = UT1 });
+  @fadds(fab.fout(OUT, n), fab.fin(IN2, n), fifo, .{ .async = true, .ut_id = UT2 });
+  @fmovs(d, fab.fin(LOOP, n));
+}

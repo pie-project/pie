@@ -12,12 +12,14 @@ TOKENIZER = tokenizer(markers = [QWEN_STOP])
 MODELS = [
     model("flux2-klein-4b", template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 27, vocab = 151936),
     model("flux2-mini", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),
+    model("flux2-mini-gqa", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),
 ]
 
 DEPLOYMENTS = [
     deployment("flux2-klein-4b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("flux2-klein-4b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("flux2-mini", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("flux2-mini-gqa", weights = dtype.bf16, kv = dtype.bf16),
 ]
 
 # The weights of FLUX.2: double-stream blocks over text and image, then
@@ -39,6 +41,16 @@ TRAIN_STEPS = 1000
 TE_TAPS = [9, 18, 27]
 TE_MAX_TOKENS = 512
 
+MINI_DIMS = struct(
+    dim = 256,
+    heads = 2,
+    inter = 256 * MLP_RATIO,
+    context_in = 192,
+    double_blocks = 2,
+    single_blocks = 2,
+    guidance_embeds = True,
+)
+
 DIMS = {
     "flux2-klein-4b": struct(
         dim = 3072,
@@ -49,16 +61,48 @@ DIMS = {
         single_blocks = 20,
         guidance_embeds = False,
     ),
-    "flux2-mini": struct(
-        dim = 256,
-        heads = 2,
-        inter = 256 * MLP_RATIO,
-        context_in = 192,
-        double_blocks = 2,
-        single_blocks = 2,
-        guidance_embeds = True,
-    ),
+    "flux2-mini": MINI_DIMS,
+    "flux2-mini-gqa": MINI_DIMS,
 }
+
+# The miniature's text encoder: a Qwen3 of two layers on the tokenizer's
+# vocabulary, its last layer the context (192 wide, the context embedder's
+# input); and its VAE: the ladder of 32-channel blocks, a resnet an encoder
+# block, at the full one's compression.
+QWEN3_MINI = struct(
+    hidden = 192,
+    vocab = QWEN3_4B.vocab,
+    q_heads = 2,
+    kv_heads = 2,
+    head_dim = HEAD_DIM,
+    inter = 384,
+    theta = QWEN3_4B.theta,
+    eps = QWEN3_4B.eps,
+)
+MINI_TE_TAPS = [2]
+
+# klein's encoder in miniature: grouped-query attention (4 q heads over 2 kv heads), three
+# tapped layers projected into the context as klein's are.
+QWEN3_MINI_GQA = struct(
+    hidden = 256,
+    vocab = QWEN3_4B.vocab,
+    q_heads = 4,
+    kv_heads = 2,
+    head_dim = HEAD_DIM,
+    inter = 384,
+    theta = QWEN3_4B.theta,
+    eps = QWEN3_4B.eps,
+)
+
+# Each model's text encoder: its config, its tapped layers, and whether the taps are projected
+# into the context here (klein's: its context embedder's column blocks) or handed to the
+# denoiser's context embedder side by side (the miniature's).
+TEXT = {
+    "flux2-klein-4b": struct(config = QWEN3_4B, taps = TE_TAPS, project = True),
+    "flux2-mini": struct(config = QWEN3_MINI, taps = MINI_TE_TAPS, project = False),
+    "flux2-mini-gqa": struct(config = QWEN3_MINI_GQA, taps = [1, 2, 3], project = True),
+}
+MINI_VAE = struct(blocks = [32, 32, 32, 32], layers_per_block = 1, groups = 8)
 
 def attn(d, banks):
     dim = d.dim
@@ -114,11 +158,13 @@ def layout(id, deploy):
         fail("plain MHA over 128-wide heads: heads × 128 is the width")
     dim = d.dim
     klein = id == "flux2-klein-4b"
-    te = encoder(QWEN3_4B, TE_TAPS[-1], banks, dtype.bf16) if klein else None
+    text = TEXT[id]
+    taps = text.taps
+    te = encoder(text.config, taps[-1], banks, dtype.bf16)
     te_context = [
-        weight([dim, QWEN3_4B.hidden], banks)
-        for i in range(len(TE_TAPS))
-    ] if klein else None
+        weight([dim, text.config.hidden], banks)
+        for i in range(len(taps))
+    ] if text.project else None
     return struct(
         dims = d,
         in_channels = IN_CHANNELS,
@@ -131,7 +177,7 @@ def layout(id, deploy):
         t_freq_dim = T_FREQ_DIM,
         dit = struct(
             x_embed = weight([dim, IN_CHANNELS], banks),
-            context_embed = weight([dim, d.context_in], banks) if te == None else None,
+            context_embed = weight([dim, d.context_in], banks) if te_context == None else None,
             t_embed = embedder(d, banks),
             g_embed = embedder(d, banks) if d.guidance_embeds else None,
             mod_img = weight([DOUBLE_MOD_SLICES * dim, dim], banks),
@@ -149,9 +195,16 @@ def layout(id, deploy):
             proj_out = weight([IN_CHANNELS, dim], banks),
         ),
         te = te,
-        te_taps = TE_TAPS,
+        te_taps = taps,
         te_context = te_context,
-        vae = flux_vae(VAE_CHANNELS, 2 * VAE_CHANNELS, vae_latent) if klein else None,
+        vae = flux_vae(VAE_CHANNELS, 2 * VAE_CHANNELS, vae_latent) if klein else flux_vae(
+            VAE_CHANNELS,
+            2 * VAE_CHANNELS,
+            vae_latent,
+            MINI_VAE.blocks,
+            MINI_VAE.layers_per_block,
+            MINI_VAE.groups,
+        ),
     )
 
 A1 = 8.73809524e-5
@@ -220,7 +273,7 @@ def read(m, reads, prefix):
     if m.te != None:
         te_read(reads, m.te, "te.model.")
         hidden = m.te.hidden
-        for i, w in enumerate(m.te_context):
+        for i, w in enumerate(m.te_context or []):
             column_block(reads, w, "dit.context_embedder.weight", hidden * i, hidden)
     if m.vae != None:
         vae(reads, m.vae)
@@ -341,16 +394,25 @@ def forward(m, inputs):
         encode(reading("vae.encode"), m)
 
 def text(arm, m):
-    """The context: the encoder's tapped layers, each projected and summed."""
+    """The context: the encoder's tapped layers, each projected and summed;
+    with no projections here (the denoiser's context embedder takes them),
+    the tapped layers' rows side by side."""
     total = [None]
+    rows = []
 
     def tap(l, y):
         if l + 1 not in m.te_taps:
             return
         i = m.te_taps.index(l + 1)
+        last = i + 1 == len(m.te_taps)
+        if m.te_context == None:
+            rows.append(y)
+            if last:
+                output("hidden", rows[0] if len(rows) == 1 else ops.gather.concat_cols(rows))
+            return
         part = ops.linear.matmul(y, m.te_context[i])
         total[0] = part if total[0] == None else ops.elemwise.residual_add(part, total[0])
-        if i + 1 == len(m.te_taps):
+        if last:
             output("hidden", total[0])
 
     qwen3_encode(arm, m.te, tap)

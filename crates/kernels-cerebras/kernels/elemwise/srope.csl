@@ -1,0 +1,178 @@
+// wafer/ops/srope.csl: the stream regions' rotation tables, ops/rope.csl's tables() as DSD ops:
+// each level is a run of NROT-wide vector products over the pairs. The host's tables are
+// rope.csl's: per table set, LV levels of 2^BITS digits of [cos | sin][NROT].
+//
+// The levels' products (`pre`) and each call's last position (`last`) are kept: a row recomputes
+// only the levels from the highest changed digit, by the same products in the same order, so the
+// result is bit for bit the whole computation's.
+//
+// DIRECT (positions past what digit tables hold): rot is each table set's frequencies, and each
+// angle p f is computed in f32, reduced by 2 pi in two parts (Cody-Waite), cos / sin by series to
+// degree 16 / 15 (|error| < 1e-6 over [-pi, pi]).
+// STEP (DIRECT's, a power of two; 0: none): a position one past the last advances cos / sin by
+// one rotation, re-anchored by DIRECT at each multiple of STEP so the f32 drift stays in budget
+// (emit::region::ROPE_ANCHOR). Any other move is computed DIRECT.
+//
+// Params: rot, rc, rs (the region's tables and the current position's cos / sin), NROT (a table
+// row's pairs), LV, BITS, DIRECT, STEP.
+param rot: [*]f32;
+param rc: [*]f32;
+param rs: [*]f32;
+param NROT: u16;
+param LV: u16;
+param BITS: u16;
+param DIRECT: bool = false;
+param STEP: u16 = 0;
+
+const RB: u16 = 1 << BITS;
+// the kept products of levels 0 .. LV - 2, [cos | sin][NROT] a level
+const NPRE: u16 = if (LV > 1) (LV - 1) * 2 * NROT else 1;
+const NONE: u32 = 0xffffffff;
+
+var t1: [NROT]f32 align(16) = @zeros([NROT]f32);
+var t2: [NROT]f32 align(16) = @zeros([NROT]f32);
+var pre: [NPRE]f32 align(16) = @zeros([NPRE]f32);
+var last = @constants([NROT]u32, NONE);
+const T1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> t1[i] });
+const T2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> t2[i] });
+
+fn digit(p: u32, lv: u16) u16 {
+  return @as(u16, (p >> @as(u16, BITS * (LV - 1 - lv))) & @as(u32, RB - 1));
+}
+
+// 2 pi in two parts (6.28125 exact in a few bits: k C1 exact for any position's k), 1 / 2 pi,
+// and 1.5 2^23 (added and taken away, it rounds an f32 below 2^22 to the nearest whole)
+const C1: f32 = 6.28125;
+const C2: f32 = 0.0019353071795864769;
+const INV2PI: f32 = 0.15915494309189535;
+const MAGIC: f32 = 12582912.0;
+// sin's series past r (r^3 .. r^15 over r^3, highest first) and cos's past 1 (r^2 .. r^16 over r^2)
+const SIN = [7]f32 { -7.6471637318198164759e-13, 1.6059043836821614599e-10, -2.5052108385441718775e-8,
+  2.7557319223985890653e-6, -1.9841269841269841270e-4, 8.3333333333333333333e-3, -1.6666666666666666667e-1 };
+const COS = [8]f32 { 4.7794773323873852974e-14, -1.1470745597729724714e-11, 2.0876756987868098979e-9,
+  -2.7557319223985890653e-7, 2.4801587301587301587e-5, -1.3888888888888888889e-3, 4.1666666666666666667e-2, -0.5 };
+const ND: u16 = if (DIRECT) NROT else 1;
+var t3: [ND]f32 align(16) = @zeros([ND]f32);
+var t4: [ND]f32 align(16) = @zeros([ND]f32);
+const T3 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ND} -> t3[i] });
+const T4 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ND} -> t4[i] });
+
+// cos / sin of p f for the n frequencies at base, into rc / rs from out, as DSD operations over
+// the n: a = p f; k = round(a / 2 pi); r = a - k C1 - k C2; each series by Horner in r^2
+fn direct(pf: f32, base: u16, out: u16, n: u16) void {
+  const f = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rot), n), @as(i16, base), f32);
+  const r = @set_dsd_length(T1, n);
+  const k = @set_dsd_length(T2, n);
+  const x2 = @set_dsd_length(T3, n);
+  const acc = @set_dsd_length(T4, n);
+  const cd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rc), n), @as(i16, out), f32);
+  const sd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rs), n), @as(i16, out), f32);
+  @fmuls(r, f, pf);
+  @fmuls(k, r, INV2PI);
+  @fadds(k, k, MAGIC);
+  @fsubs(k, k, MAGIC);
+  @fmacs(r, r, k, -C1);
+  @fmacs(r, r, k, -C2);
+  @fmuls(x2, r, r);
+  // sin = r + r x2 S(x2)
+  @fmuls(acc, x2, SIN[0]);
+  var i: u16 = 1;
+  while (i < 7) : (i += 1) {
+    @fadds(acc, acc, SIN[i]);
+    if (i < 6) { @fmuls(acc, acc, x2); }
+  }
+  @fmuls(acc, acc, x2);
+  @fmuls(acc, acc, r);
+  @fadds(sd, acc, r);
+  // cos = 1 + x2 C(x2)
+  @fmuls(acc, x2, COS[0]);
+  i = 1;
+  while (i < 8) : (i += 1) {
+    @fadds(acc, acc, COS[i]);
+    if (i < 7) { @fmuls(acc, acc, x2); }
+  }
+  @fmuls(acc, acc, x2);
+  @fadds(cd, acc, 1.0);
+}
+
+// the cos / sin at out advanced one position: the product by each pair's (cos f, sin f) at base
+fn advance(base: u16, out: u16, n: u16) void {
+  const c1 = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rot), n), @as(i16, NROT + base), f32);
+  const s1 = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rot), n), @as(i16, 2 * NROT + base), f32);
+  const a = @set_dsd_length(T1, n);
+  const b = @set_dsd_length(T2, n);
+  const cd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rc), n), @as(i16, out), f32);
+  const sd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rs), n), @as(i16, out), f32);
+  @fmuls(a, sd, s1);
+  @fmuls(b, cd, s1);
+  @fmuls(cd, cd, c1);
+  @fsubs(cd, cd, a);
+  @fmuls(sd, sd, c1);
+  @fadds(sd, sd, b);
+}
+
+// cos / sin of position p for pairs j < n of the table set at base, into rc / rs from out:
+// c' = c c2 - s s2, s' = s c2 + c s2 a level, the first level's (c2, s2) taken as they are.
+fn tables(p: u32, base: u16, out: u16, n: u16) void {
+  const q = last[out];
+  if (p == q) { return; }
+  if (DIRECT) {
+    last[out] = p;
+    if (STEP > 0 and q != NONE) {
+      if (p == q + 1 and (p & @as(u32, STEP - 1)) != 0) {
+        advance(base, out, n);
+        return;
+      }
+    }
+    direct(@as(f32, p), base, out, n);
+    return;
+  }
+  var from: u16 = 0;
+  if (q != NONE) {
+    from = LV;
+    var k: u16 = 0;
+    while (k < LV) : (k += 1) {
+      if (digit(p, k) != digit(q, k)) { from = k; break; }
+    }
+    if (from == LV) { return; }
+  }
+  last[out] = p;
+  const tab = @set_dsd_length(@set_dsd_base_addr(T1, rot), n);
+  const a = @set_dsd_length(T1, n);
+  const b = @set_dsd_length(T2, n);
+  const kept = @ptrcast([*]f32, &pre);
+  var lv: u16 = from;
+  while (lv < LV) : (lv += 1) {
+    // (below RB as digit() makes it: a position the host writes, bounded for the check)
+    const d = digit(p, lv) % RB;
+    const o = base + ((lv * RB + d) * 2) * NROT;
+    const c2 = @increment_dsd_offset(tab, @as(i16, o), f32);
+    const s2 = @increment_dsd_offset(tab, @as(i16, o + NROT), f32);
+    // this level's product: kept above the last level, rc / rs at it
+    var cp: [*]f32 = rc;
+    var sp: [*]f32 = rs;
+    var co: u16 = out;
+    var so: u16 = out;
+    if (lv + 1 < LV) {
+      cp = kept;
+      sp = kept;
+      co = lv * 2 * NROT + out;
+      so = (lv * 2 + 1) * NROT + out;
+    }
+    const cd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, cp), n), @as(i16, co), f32);
+    const sd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, sp), n), @as(i16, so), f32);
+    if (lv == 0) {
+      @fmovs(cd, c2);
+      @fmovs(sd, s2);
+    } else {
+      const cs = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, kept), n), @as(i16, (lv - 1) * 2 * NROT + out), f32);
+      const ss = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, kept), n), @as(i16, ((lv - 1) * 2 + 1) * NROT + out), f32);
+      @fmuls(a, ss, s2);
+      @fmuls(b, cs, s2);
+      @fmuls(cd, cs, c2);
+      @fsubs(cd, cd, a);
+      @fmuls(sd, ss, c2);
+      @fadds(sd, sd, b);
+    }
+  }
+}

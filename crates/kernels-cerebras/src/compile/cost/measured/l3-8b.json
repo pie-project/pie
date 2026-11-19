@@ -1,0 +1,9 @@
+{
+  "name": "l3-8b",
+  "kernels": "own",
+  "ms": 0.47,
+  "source": "Llama 3.1 8B: the bare step at G2=11 (0.485 at G2=16)",
+  "measured_on": [4096, 32, 14336],
+  "keys": {"G2": 11, "HR": 1149, "K": 4, "NE": 32, "PX": 256, "PY": 256, "UNX": 2, "UNY": 4, "VR": 112, "WL": 1},
+  "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
+}

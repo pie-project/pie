@@ -1,0 +1,758 @@
+//! The stream regime's layer program: a reading that runs whole sequences a step (a diffusion
+//! transformer's denoise, an encoder's prefill) read into the phases a spatial target runs.
+//!
+//! A step's `T` rows flow through each layer's unit one after another, through the same phases
+//! as decode ([`super::lower`]), except: rows come in classes, each class's [`Side`] its own
+//! unit unless the phases match; `attn.ragged` is [`Mixer::Joint`], a [`Phase::Barrier`]
+//! between storing and attending; one-row-a-request values are computed once a step (`lanes`);
+//! ops that only reorder rows run on the host ([`Host`]). Ops outside the layers are [`Stage`]s.
+
+use poem_ir::{Attn, Conv, Def, Dim, Gather, Linear, Operands, Operation, Trace, Ty};
+use serde::Serialize;
+
+use super::{At, Axis, Body, Claim, Claims, LayerBody, Mixer, Op, Phase, R, Reader};
+use crate::analysis::Analysis;
+
+/// A class of a stream step's rows: its name, its request word ([`poem_ir::Facts::word`]) and
+/// its rows a step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RowClass {
+    pub name: String,
+    pub word: u64,
+    pub rows: u32,
+}
+
+/// Where in the reading a stage of units runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Stage {
+    /// The rows' ops before the first layer.
+    Entry,
+    /// Layer `layer` of the `stack`-th run of layers (a poem's `fold_layers`, in order).
+    Layer { stack: u32, layer: u32 },
+    /// The rows' ops between the `stack`-th run of layers and the next.
+    Between { stack: u32 },
+    /// The rows' ops after the last layer.
+    Exit,
+}
+
+/// The classes whose rows run one body at a stage: one unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Side {
+    /// Indices into [`StreamProgram::classes`].
+    pub classes: Vec<usize>,
+    /// Index into [`StreamProgram::bodies`].
+    pub body: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StageProgram {
+    pub stage: Stage,
+    pub sides: Vec<Side>,
+    /// Each side's trace nodes (its first class's), in trace order, for a target that lowers a
+    /// side node by node ([`crate::fuse::chain::lower_run`]).
+    pub nodes: Vec<Vec<u32>>,
+}
+
+/// What a host op does to the step's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum HostKind {
+    /// It reorders rows the units read or write: the order they are streamed in or out.
+    Rows,
+    /// A table the units read where they are, as a decode layer's positions.
+    Table,
+}
+
+/// An op the host runs on the step's rows.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Host {
+    /// Its trace node.
+    pub node: u32,
+    pub op: Op,
+    pub kind: HostKind,
+}
+
+/// A stream reading as a spatial target runs a step.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StreamProgram {
+    /// The residual's width: what a layer's unit hands the next.
+    pub hidden: u32,
+    pub classes: Vec<RowClass>,
+    /// The host's ops, in trace order.
+    pub host: Vec<Host>,
+    /// The lane vectors' phases, once a step before the rows flow.
+    pub lanes: LayerBody,
+    /// The lane vectors' trace nodes, in trace order.
+    pub lane_nodes: Vec<u32>,
+    pub bodies: Vec<LayerBody>,
+    /// The stages the rows flow through, in order: entry, each layer (and between stacks), exit.
+    pub stages: Vec<StageProgram>,
+}
+
+impl StreamProgram {
+    /// The units the rows flow through: a side of each stage.
+    #[must_use]
+    pub fn units(&self) -> usize {
+        self.stages.iter().map(|s| s.sides.len()).sum()
+    }
+
+    /// The bodies the layers' sides run (not the entry's or exit's), distinct.
+    #[must_use]
+    pub fn layer_bodies(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for s in &self.stages {
+            if matches!(s.stage, Stage::Layer { .. }) {
+                for side in &s.sides {
+                    if !out.contains(&side.body) {
+                        out.push(side.body);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Whether `op` only reorders a step's rows: on the host, the order rows enter and leave a unit.
+fn permutes(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Conv(
+            Conv::Patchify { .. }
+                | Conv::Unpatchify { .. }
+                | Conv::PixelShuffle { .. }
+                | Conv::PixelUnshuffle { .. }
+        ) | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
+    )
+}
+
+/// Whether `op` selects the rows a reading reads out (`gather.rows` by the readout rows).
+fn readout(trace: &Trace, op: &Operation) -> bool {
+    match op {
+        Operation::Gather(Gather::Rows { rows, .. }) => matches!(
+            trace.values.get(rows.0 as usize).map(|d| &d.def),
+            Some(Def::Input(poem_ir::RuntimeInput::ReadoutRows))
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `ty` is a row a request (a lane vector).
+fn per_lane(ty: &Ty) -> bool {
+    matches!(ty, Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_))))
+}
+
+impl Reader<'_> {
+    /// Where a value made outside its reading body is, in the stream regime: a lane vector or host
+    /// table anywhere; host rows or a unit's output at the row roots.
+    pub(super) fn streamed(&self, v: poem_ir::ValueId) -> At {
+        if self
+            .trace
+            .values
+            .get(v.0 as usize)
+            .is_some_and(|d| per_lane(&d.ty))
+        {
+            return At::Any;
+        }
+        match self.def(v) {
+            Some(Def::Input(poem_ir::RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Row,
+                ..
+            })) => At::Root(Axis::Row),
+            Some(Def::Op(n)) => match self.host.get(*n as usize).copied().flatten() {
+                Some(false) => At::Any,
+                _ => At::Root(Axis::Row),
+            },
+            _ => At::Any,
+        }
+    }
+}
+
+impl Body<'_, '_> {
+    /// A node the stream regime adds a phase for.
+    pub(super) fn stream_node(
+        &mut self,
+        node: &Operation,
+        op: Op,
+        acts: &[poem_ir::ValueId],
+        outs: &[poem_ir::ValueId],
+    ) -> R<()> {
+        match node {
+            // a shared expert's gated add: a root op as an elementwise one is
+            Operation::Linear(Linear::MoeSigmoidGateAdd { .. }) => self.elementwise(op, acts, outs),
+            // a non-gated activation (relu²): a root op as an elementwise one is
+            Operation::Linear(Linear::Relu2 { .. }) => self.elementwise(op, acts, outs),
+            // every elementwise op is a root op (whether it prints is the unit lowering's question)
+            Operation::Elemwise(_) => self.elementwise(op, acts, outs),
+            // the head's logits: a matvec as any other, over the vocabulary's rows
+            Operation::Linear(Linear::Matmul {
+                act, logits: true, ..
+            }) => self.matvec(self.r.resolve(*act), op, None, outs),
+            // the order keys and values are stored in
+            Operation::Gather(Gather::PackRows { .. }) => self.mixer(op, None, acts, outs),
+            // each row's output back in its place: with the attention that made it
+            Operation::Gather(Gather::UnpackRows { .. }) => self.elementwise(op, acts, outs),
+            // the rows a reading reads out: a row selection commutes with each row's own ops,
+            // so the rows flow on and the host keeps the ones it names
+            Operation::Gather(Gather::Rows { .. }) if readout(self.r.trace, node) => {
+                self.elementwise(op, acts, outs)
+            }
+            Operation::Attn(Attn::Ragged {
+                q,
+                head_dim,
+                kv_heads,
+                ..
+            }) => {
+                let kind = Mixer::Joint {
+                    q_heads: self.r.width(*q) / (*head_dim).max(1),
+                    kv_heads: *kv_heads,
+                    head_dim: *head_dim,
+                    causal: false,
+                };
+                // every row's keys and values are stored before any query reads them
+                self.joint(op, kind, outs)
+            }
+            // a prefill over its own layer's pages: the step's rows attend each other
+            Operation::Attn(Attn::Prefill {
+                q,
+                cache,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                window: None,
+                head_dim,
+                kv_heads,
+                causal,
+                selected: None,
+                rel: None,
+                ..
+            }) => {
+                if self.r.owner.get(cache).is_some_and(|&l| l != self.layer) {
+                    return Err(format!(
+                        "{} reads a cache another layer appends: a stream step holds no cache",
+                        op.op
+                    ));
+                }
+                self.joint(
+                    op,
+                    Mixer::Joint {
+                        q_heads: self.r.width(*q) / (*head_dim).max(1),
+                        kv_heads: *kv_heads,
+                        head_dim: *head_dim,
+                        causal: *causal,
+                    },
+                    outs,
+                )
+            }
+            // a decode step's attention over its own layer's cache: the row stored at its
+            // position, then attending every row at or before it; the cache persists
+            Operation::Attn(Attn::Decode {
+                q,
+                plan,
+                cache,
+                selection: None,
+                bias: None,
+                head_dim,
+                selected: None,
+                ..
+            }) => {
+                if self.r.owner.get(cache).is_some_and(|&l| l != self.layer) {
+                    return Err(format!(
+                        "{} reads a cache another layer appends: no shared cache yet",
+                        op.op
+                    ));
+                }
+                let kv_heads = match self.r.maker(*plan) {
+                    Some(Operation::Attn(Attn::PlanDecode { kv_heads, .. })) => *kv_heads,
+                    _ => return Err(format!("{}: its plan is no decode plan", op.op)),
+                };
+                self.joint(
+                    op,
+                    Mixer::Joint {
+                        q_heads: self.r.width(*q) / (*head_dim).max(1),
+                        kv_heads,
+                        head_dim: *head_dim,
+                        causal: true,
+                    },
+                    outs,
+                )
+            }
+            // an op the target lowers by a kernel of its own, where its claim says
+            _ => match self.r.claims.and_then(|c| c(node)) {
+                Some(Claim::Root) => self.elementwise(op, acts, outs),
+                None => Err(format!("{} has no spatial lowering", op.op)),
+            },
+        }
+    }
+
+    /// The attend phase of a joint attention `kind` after its store phase, a barrier between.
+    fn joint(&mut self, op: Op, kind: Mixer, outs: &[poem_ir::ValueId]) -> R<()> {
+        match self.phases.last_mut() {
+            Some(Phase::Mixer { mixer, .. }) => *mixer = kind.clone(),
+            _ => return Err(format!("{} attends no stored rows", op.op)),
+        }
+        self.push(Phase::Barrier);
+        self.push(Phase::Mixer {
+            mixer: kind,
+            ops: vec![op],
+        });
+        for &o in outs {
+            self.set(o, At::Tiles(Axis::Col));
+        }
+        Ok(())
+    }
+}
+
+/// `trace`'s stream program for a step of `classes`' rows: the nodes each class's word runs.
+/// A node no phase runs is refused by name: `<trace>: <stage> <class> node N: <op> has no
+/// spatial lowering`.
+pub fn lower(
+    trace: &Trace,
+    analysis: &Analysis,
+    classes: &[RowClass],
+) -> Result<StreamProgram, String> {
+    lower_with(trace, analysis, classes, &|_| None)
+}
+
+/// [`lower`], each op the target `claims` given the phase its claim states.
+pub fn lower_with(
+    trace: &Trace,
+    analysis: &Analysis,
+    classes: &[RowClass],
+    claims: Claims<'_>,
+) -> Result<StreamProgram, String> {
+    let name = &trace.name;
+    if classes.is_empty() {
+        return Err(format!("{name}: a stream step of no rows"));
+    }
+    let nodes = trace.nodes.len();
+    let per: Vec<Vec<bool>> = classes
+        .iter()
+        .map(|c| trace.nodes.iter().map(|n| n.guard.holds(c.word)).collect())
+        .collect();
+    let any: Vec<bool> = (0..nodes).map(|at| per.iter().any(|r| r[at])).collect();
+
+    // each running node's stage: a layer number below the last starts the next stack
+    let mut stage_of: Vec<Option<Stage>> = vec![None; nodes];
+    let (mut stack, mut prev) = (0u32, None);
+    for at in (0..nodes).filter(|&at| any[at]) {
+        if let Some(l) = analysis.layers[at] {
+            if prev.is_some_and(|p| l < p) {
+                stack += 1;
+            }
+            prev = Some(l);
+            stage_of[at] = Some(Stage::Layer { stack, layer: l });
+        }
+    }
+    let first = stage_of.iter().position(Option::is_some);
+    let last = stage_of.iter().rposition(Option::is_some);
+    let (Some(first), Some(last)) = (first, last) else {
+        return Err(format!("{name}: the stream step runs no layers"));
+    };
+    // a row selection commutes only with each row's own ops: none across rows after it
+    if let Some(at) = (0..nodes).find(|&at| any[at] && readout(trace, &trace.nodes[at].op))
+        && let Some(after) = (at + 1..nodes).find(|&n| {
+            any[n]
+                && matches!(
+                    trace.nodes[n].op,
+                    Operation::Attn(_)
+                        | Operation::Ssm(_)
+                        | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
+                )
+        })
+    {
+        return Err(format!(
+            "{name}: node {after}: {} after the rows node {at} reads out: a row selection \
+             commutes with each row's own ops only",
+            trace.nodes[after].op.name()
+        ));
+    }
+
+    let out_ty = |at: usize| {
+        let mut outs = Vec::new();
+        trace.nodes[at].op.outputs(&mut outs);
+        outs.first()
+            .and_then(|v| trace.values.get(v.0 as usize))
+            .map(|d| &d.ty)
+    };
+    let lane: Vec<bool> = (0..nodes)
+        .map(|at| any[at] && out_ty(at).is_some_and(per_lane))
+        .collect();
+
+    // the host's nodes: outside the layers, no weight read, every input the host's own
+    let mut host: Vec<Option<bool>> = vec![None; nodes];
+    let mut ins = Vec::new();
+    for at in 0..nodes {
+        let looked_up = matches!(
+            trace.nodes[at].op,
+            Operation::Gather(Gather::Embed { weights: None, .. })
+        );
+        if !any[at] || lane[at] || (analysis.layers[at].is_some() && !looked_up) {
+            continue;
+        }
+        let node = &trace.nodes[at];
+        let permutes = permutes(&node.op);
+        ins.clear();
+        node.op.inputs(&mut ins);
+        let own = |v: &poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+            Some(Def::Input(_)) => true,
+            Some(Def::Op(n)) => host[*n as usize].is_some(),
+            Some(Def::Merge(arms)) => {
+                arms.iter().all(
+                    |(a, _)| match trace.values.get(a.0 as usize).map(|d| &d.def) {
+                        Some(Def::Op(n)) => !any[*n as usize] || host[*n as usize].is_some(),
+                        Some(Def::Input(_)) => true,
+                        _ => false,
+                    },
+                )
+            }
+            _ => false,
+        };
+        let matmul = matches!(node.op, Operation::Linear(Linear::Matmul { .. }));
+        let weight = |v: &poem_ir::ValueId| {
+            matches!(
+                trace.values.get(v.0 as usize).map(|d| &d.def),
+                Some(Def::Weight(_))
+            )
+        };
+        // a token embedding is a host lookup: its rows enter the units as a host input's do
+        let embed = matches!(
+            node.op,
+            Operation::Gather(Gather::Embed { weights: None, .. })
+        );
+        // a permutation of a unit's rows is the host's too; so is any non-matvec op over host
+        // values and checkpoint constants alone
+        if permutes || (!matmul && ins.iter().all(|v| own(v) || weight(v))) {
+            host[at] = Some(permutes || embed);
+        }
+    }
+
+    let hidden_of = |at: usize| match out_ty(at) {
+        Some(Ty::Tensor { shape, .. }) => match shape.last() {
+            Some(Dim::Const(n)) => *n as u32,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let first_stage = stage_of[first];
+    let hidden = (0..nodes)
+        .rev()
+        .find(|&at| stage_of[at] == first_stage)
+        .map_or(0, hidden_of);
+
+    let reader = |runs: Vec<bool>| Reader {
+        trace,
+        runs,
+        hidden,
+        owner: std::collections::HashMap::new(),
+        layers: &analysis.layers,
+        host: host.clone(),
+        stream: true,
+        claims: Some(claims),
+    };
+    let body = |r, layer| Body {
+        r,
+        layer,
+        phases: Vec::new(),
+        at: std::collections::HashMap::new(),
+        made: std::collections::HashMap::new(),
+        cast: std::collections::HashSet::new(),
+        matvec_of: None,
+        glu: None,
+    };
+
+    // each row node's stage, the stages in order; the lane vectors once
+    let mut row_stage: Vec<Option<Stage>> = vec![None; nodes];
+    let mut order: Vec<Stage> = Vec::new();
+    let mut after = 0;
+    for at in 0..nodes {
+        if let Some(Stage::Layer { stack, .. }) = stage_of[at] {
+            after = stack;
+        }
+        if !any[at] || host[at].is_some() || lane[at] {
+            continue;
+        }
+        let s = match stage_of[at] {
+            Some(s) => s,
+            None if at < first => Stage::Entry,
+            None if at > last => Stage::Exit,
+            None => Stage::Between { stack: after },
+        };
+        row_stage[at] = Some(s);
+        if !order.contains(&s) {
+            order.push(s);
+        }
+    }
+    let layer_of = |s: Stage| match s {
+        Stage::Layer { layer, .. } => layer,
+        Stage::Entry | Stage::Between { .. } | Stage::Exit => u32::MAX,
+    };
+    let describe = |s: Stage| match s {
+        Stage::Entry => "entry".to_string(),
+        Stage::Layer { stack, layer } => format!("stack {stack} layer {layer}"),
+        Stage::Between { stack } => format!("after stack {stack}"),
+        Stage::Exit => "exit".to_string(),
+    };
+
+    let any_reader = reader(any.clone());
+    let mut lanes = body(&any_reader, u32::MAX);
+    let lane_nodes: Vec<u32> = (0..nodes)
+        .filter(|&at| lane[at])
+        .map(|at| at as u32)
+        .collect();
+    for at in (0..nodes).filter(|&at| lane[at]) {
+        lanes
+            .node(at)
+            .map_err(|e| format!("{name}: lanes node {at}: {e}"))?;
+    }
+    let lanes = lanes.finish().map_err(|e| format!("{name}: lanes: {e}"))?;
+
+    let readers: Vec<Reader> = per.iter().map(|r| reader(r.clone())).collect();
+    // each class's body at each stage
+    let mut read: Vec<Vec<Body>> = readers
+        .iter()
+        .map(|r| order.iter().map(|&s| body(r, layer_of(s))).collect())
+        .collect();
+    let mut run: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); order.len()]; classes.len()];
+    for at in 0..nodes {
+        let Some(s) = row_stage[at] else {
+            continue;
+        };
+        let i = order.iter().position(|&o| o == s).unwrap_or(0);
+        for (c, class) in classes.iter().enumerate() {
+            if !per[c][at] {
+                continue;
+            }
+            read[c][i]
+                .node(at)
+                .map_err(|e| format!("{name}: {} {} node {at}: {e}", describe(s), class.name))?;
+            run[c][i].push(at as u32);
+        }
+    }
+
+    let mut bodies: Vec<LayerBody> = Vec::new();
+    let mut stages: Vec<StageProgram> = order
+        .iter()
+        .map(|&stage| StageProgram {
+            stage,
+            sides: Vec::new(),
+            nodes: Vec::new(),
+        })
+        .collect();
+    for (c, class_bodies) in read.into_iter().enumerate() {
+        for (i, b) in class_bodies.into_iter().enumerate() {
+            if b.phases.is_empty() {
+                continue;
+            }
+            let body = b
+                .finish()
+                .map_err(|e| format!("{name}: {} {}: {e}", describe(order[i]), classes[c].name))?;
+            let at = match bodies.iter().position(|o| *o == body) {
+                Some(at) => at,
+                None => {
+                    bodies.push(body);
+                    bodies.len() - 1
+                }
+            };
+            let stage = &mut stages[i];
+            match stage.sides.iter_mut().find(|s| s.body == at) {
+                Some(side) => side.classes.push(c),
+                None => {
+                    stage.sides.push(Side {
+                        classes: vec![c],
+                        body: at,
+                    });
+                    stage.nodes.push(std::mem::take(&mut run[c][i]));
+                }
+            }
+        }
+    }
+
+    let host = (0..nodes)
+        .filter_map(|at| {
+            let kind = match host[at]? {
+                true => HostKind::Rows,
+                false => HostKind::Table,
+            };
+            Some(Host {
+                node: at as u32,
+                op: Op {
+                    op: trace.nodes[at].op.name(),
+                    width: hidden_of(at),
+                    params: Vec::new(),
+                },
+                kind,
+            })
+        })
+        .collect();
+    Ok(StreamProgram {
+        hidden,
+        classes: classes.to_vec(),
+        host,
+        lanes,
+        lane_nodes,
+        bodies,
+        stages,
+    })
+}
+
+/// A decode step's one row class: the single-token request's word, `rows` rows of one token.
+#[must_use]
+pub fn decode_classes(trace: &Trace, rows: u32) -> Vec<RowClass> {
+    vec![RowClass {
+        name: "decode".to_string(),
+        word: trace.facts.word(&poem_ir::Request::new(1, false)),
+        rows,
+    }]
+}
+
+/// The row classes of a diffusion poem's `reading` step: `context` and `latents` by its `stream`
+/// switch, each `rows` rows; one class where no `stream` value changes the reading.
+#[must_use]
+pub fn classes(trace: &Trace, reading: &str, rows: u32) -> Vec<RowClass> {
+    let request = |stream: Option<&str>| {
+        let r = poem_ir::Request::new(rows, false).switched("reading", reading);
+        match stream {
+            Some(s) => r.switched("stream", s),
+            None => r,
+        }
+    };
+    let streams: Vec<&str> = ["context", "latents"]
+        .into_iter()
+        .filter(|v| {
+            trace.facts.table.iter().any(|f| {
+                matches!(f, poem_ir::Fact::Switch { name, value } if name == "stream" && value == v)
+            }) || trace
+                .facts
+                .declared("stream")
+                .is_some_and(|d| d.values.iter().any(|x| x == v))
+        })
+        .collect();
+    let runs = |s: Option<&str>| -> Vec<bool> {
+        let w = trace.facts.word(&request(s));
+        trace.nodes.iter().map(|n| n.guard.holds(w)).collect()
+    };
+    let alone = runs(None);
+    if streams.is_empty() || streams.iter().all(|s| runs(Some(s)) == alone) {
+        return vec![RowClass {
+            name: reading.to_string(),
+            word: trace.facts.word(&request(None)),
+            rows,
+        }];
+    }
+    streams
+        .into_iter()
+        .map(|s| RowClass {
+            name: s.to_string(),
+            word: trace.facts.word(&request(Some(s))),
+            rows,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::form;
+    use super::*;
+    use crate::analysis::analyze;
+
+    fn program(name: &str) -> Result<StreamProgram, String> {
+        let t = crate::catalog::repository()
+            .parse(name)
+            .unwrap_or_else(|| panic!("{name} parses"))
+            .trace(poem_ir::Platform::Cerebras);
+        let a = analyze(&t).unwrap();
+        lower(&t, &a, &classes(&t, "denoise", 64))
+    }
+
+    /// The miniature's denoise: entry a unit a class; double blocks a body a class, joint attention
+    /// between a barrier; single blocks one shared body; the exit the image rows' only.
+    #[test]
+    fn flux_2_minis_denoise_lowers_a_unit_a_layer_side() {
+        let p = program("flux2-mini-bf16-kv-bf16").unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<&str> = p.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["context", "latents"]);
+        assert_eq!(p.hidden, 256);
+        let stages: Vec<Stage> = p.stages.iter().map(|s| s.stage).collect();
+        assert_eq!(
+            stages,
+            [
+                Stage::Entry,
+                Stage::Layer { stack: 0, layer: 0 },
+                Stage::Layer { stack: 0, layer: 1 },
+                Stage::Layer { stack: 1, layer: 0 },
+                Stage::Layer { stack: 1, layer: 1 },
+                Stage::Exit,
+            ]
+        );
+        let sides: Vec<usize> = p.stages.iter().map(|s| s.sides.len()).collect();
+        assert_eq!(sides, [2, 2, 2, 1, 1, 1]);
+        assert_eq!(p.units(), 9);
+        assert_eq!(p.layer_bodies().len(), 3);
+        // the double blocks share their bodies across layers, a body a class
+        assert_eq!(p.stages[1].sides, p.stages[2].sides);
+        assert_eq!(p.stages[3].sides, p.stages[4].sides);
+        assert_eq!(p.stages[3].sides[0].classes, [0, 1]);
+        assert_eq!(p.stages[5].sides[0].classes, [1]);
+
+        let double = p.bodies[p.stages[1].sides[0].body].clone();
+        assert_eq!(
+            form(&double),
+            "Rr2 Cr Mr1 Rc4 Cc X3 B X2 Mc1 Rr3 Cr Mr1 Rc1 Cc Mc1 Rr1"
+        );
+        assert_eq!(
+            double.mixers().next(),
+            Some(&Mixer::Joint {
+                q_heads: 2,
+                kv_heads: 2,
+                head_dim: 128,
+                causal: false
+            })
+        );
+        let single = &p.bodies[p.stages[3].sides[0].body];
+        assert_eq!(form(single), "Rr2 Cr Mr1 Rc4 Cc X3 B X2 Mc1 Rc1 Cc Mc1 Rr2");
+        assert_eq!(form(&p.bodies[p.stages[5].sides[0].body]), "Rr2 Cr Mr1");
+        // the timestep's and guidance's embeddings, the modulations: once a step
+        assert!(p.lanes.has("elemwise.sinusoid"));
+        let hosts: Vec<(&str, HostKind)> = p.host.iter().map(|h| (h.op.op, h.kind)).collect();
+        assert_eq!(
+            hosts,
+            [
+                ("conv.cells", HostKind::Table),
+                ("gather.split_rows", HostKind::Table),
+                ("conv.patchify", HostKind::Rows),
+                ("conv.unpatchify", HostKind::Rows),
+            ]
+        );
+    }
+
+    /// Klein's denoise has the miniature's layer bodies, over 5 double and 20 single blocks.
+    #[test]
+    fn klein_s_denoise_lowers_to_the_miniature_s_bodies() {
+        let p = program("flux2-klein-4b-bf16-kv-bf16").unwrap_or_else(|e| panic!("{e}"));
+        let mini = program("flux2-mini-bf16-kv-bf16").unwrap();
+        assert_eq!(p.layer_bodies().len(), mini.layer_bodies().len());
+        assert_eq!(p.stages.len(), 1 + 5 + 20 + 1);
+        assert_eq!(p.hidden, 3072);
+        let forms = |p: &StreamProgram| -> Vec<String> {
+            p.layer_bodies()
+                .iter()
+                .map(|&b| form(&p.bodies[b]))
+                .collect()
+        };
+        assert_eq!(forms(&p), forms(&mini));
+    }
+
+    /// A decode trace has no stream reading's rows: its layers' nodes run for no class.
+    #[test]
+    fn a_reading_with_no_rows_is_refused() {
+        let t = crate::catalog::repository()
+            .parse("flux2-mini-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let a = analyze(&t).unwrap();
+        let e = lower(&t, &a, &classes(&t, "nothing", 64)).unwrap_err();
+        assert!(e.contains("runs no layers"), "{e}");
+        assert!(lower(&t, &a, &[]).is_err());
+    }
+}
