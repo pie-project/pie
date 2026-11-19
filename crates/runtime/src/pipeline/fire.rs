@@ -8361,6 +8361,91 @@ pub(crate) mod fold_tests {
         Ok(())
     }
 
+    /// A device-geometry fire that fails, finalized by a bind's settle
+    /// ([`settle_process_fires`]) rather than by its guest, latches its
+    /// failure as the eviction's drain does ([`finalize_op_detached`]): its
+    /// pipeline is failed by name, so the guest's next submit on it (which
+    /// reads the pipeline's failure before its pass's, and a pass never
+    /// submits on another pipeline) is refused by that name, and its
+    /// readers are poisoned with it. Never success, never a silent drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_fire_settled_by_a_bind_latches_its_failure_as_the_eviction_s_drain_does()
+    -> Anyhow<()> {
+        use crate::inferlet::process::residency::{ResidentPipeline, register_residency};
+        use crate::pipeline::channel::ChannelCell;
+        // `by_bind`: the bind's settle finalizes it; else the eviction's drain.
+        let mut outcomes = Vec::new();
+        for by_bind in [true, false] {
+            let model = crate::store::registry::register_model(4, &[8], &[1]);
+            let stores = crate::store::registry::get(model, 0);
+            let id = {
+                let mut kv = stores.kv.lock();
+                let id = kv.create_working_set();
+                kv.fold(id, 4, false).unwrap();
+                id
+            };
+            let kv = KvWorkingSet::new(model, 0, id, 8);
+            let mut ctx = Flight::context();
+            let pipeline = ctx.resources.push(Pipeline::new())?;
+            let (fires, failure, scope) = {
+                let pipeline = ctx.resources.get(&pipeline)?;
+                (
+                    pipeline.fires.clone(),
+                    pipeline.failure.clone(),
+                    pipeline.scope.clone(),
+                )
+            };
+            let pid = uuid::Uuid::new_v4();
+            let residency = Arc::new(Mutex::new(
+                crate::inferlet::process::ProcessResidency::default(),
+            ));
+            residency.lock().unwrap().pipelines.push(ResidentPipeline {
+                scope: scope.clone(),
+                fires: Arc::downgrade(&fires),
+            });
+            register_residency(pid, Arc::downgrade(&residency));
+            assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
+            let reader = Arc::new(Mutex::new(ChannelCell::new(vec![1], eta_ir::types::Dtype::U32, 2)));
+            reader.lock().unwrap().role = Some(HostRole::Reader);
+            let (completion, _, mut fire, unqueued) =
+                stage(&kv, None, &cursor(12), &failure, &geometry::Fold::Device);
+            fire.cells = vec![reader.clone()];
+            assert!(fire.device_geometry);
+            // The bind settles a device-geometry fire; the eviction drains only
+            // a host one.
+            fire.device_geometry = by_bind;
+            unqueued.queue(&fires, fire);
+            let handle = kv.suspend_handle();
+            // The engine fails the fire.
+            resolve_test_completion(&completion, true);
+            if by_bind {
+                settle_process_fires(pid).await;
+            } else {
+                let op = fires.lock().unwrap().pop_front().expect("queued");
+                assert!(op.is_preemption_detachable());
+                finalize_op_detached(op).await?;
+            }
+            assert!(fires.lock().unwrap().is_empty(), "finalized, not dropped unread");
+            assert_eq!(handle.active_leases(), 0, "its lease is back");
+            let latched = failure.lock().unwrap().clone().expect("the failure is latched");
+            assert!(latched.contains("test callback failure"), "{latched}");
+            // The guest's next submit on the pipeline: refused by name.
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+            let next = open_pipeline(&mut ctx, &Resource::new_borrow(pipeline.rep()), &fwd).await?;
+            let Err(refused) = next else {
+                panic!("a failed pipeline takes no submit");
+            };
+            assert!(refused.contains(&latched), "{refused}");
+            // Its reader: poisoned by the same name.
+            let read = reader.lock().unwrap().take();
+            assert_eq!(read, Err(ChannelError::Poisoned(latched.clone())));
+            outcomes.push((latched, refused));
+            drop(residency);
+        }
+        assert_eq!(outcomes[0], outcomes[1], "the bind's settle and the eviction's drain alike");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn what_copies_or_moves_a_set_waits_for_the_fold_the_device_counts() -> Anyhow<()> {
         let flight = in_flight(&geometry::Fold::Device, true);
