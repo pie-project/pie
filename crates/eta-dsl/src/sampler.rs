@@ -6,12 +6,6 @@
 //! greedy. Asked for logprobs, a step also lands the sampled token's
 //! log-probability under the model's raw logits and the likeliest tokens'.
 //!
-//! The vocabulary-sized values a step computes (the penalized and masked
-//! logits, the probabilities, the truncation's row, the perturbed row, the
-//! log-probabilities) are bf16 (`eta_ir::types`' rules: computed in f32,
-//! each rounded once on its store, every reduction over them in f32). A
-//! greedy step that changes no logit reads the model's f32 logits whole.
-//!
 //! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
 //! a program's regions are keyed by their text, which the knobs' values
 //! (they ride in channels, or are constants the text does not hold) do not
@@ -200,39 +194,24 @@ pub fn sample(
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
-    let model = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| cast(&model, dtype::bf16));
-    // A step that changes the logits works on a bf16 copy of them; a plain
-    // greedy step reads the model's f32 row.
-    let changes = histogram.is_some() || mask.is_some() || k.temperature.is_some();
-    let mut logits = if changes {
-        cast(&model, dtype::bf16)
-    } else {
-        model
-    };
-    // A knob is one value, an f32 scalar every op mixes in unrounded.
-    let knob = |t: &Tensor| {
-        if t.shape().is_scalar() {
-            t.clone()
-        } else {
-            reshape(t, [])
-        }
-    };
+    let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+    let raw = k.logprobs.map(|_| logits.clone());
     if let Some((counts, present)) = histogram {
-        let seen_out = gt(counts, 0.0f32);
-        let seen_prompt = gt(present, 0.5f32);
+        let zero = broadcast(0.0f32, [vocab]);
+        let seen_out = gt(counts, &zero);
+        let seen_prompt = gt(present, broadcast(0.5f32, [vocab]));
         let seen = or(&seen_out, &seen_prompt);
         if let Some(rep) = &k.repetition {
-            let rp = knob(rep);
-            let positive = gt(&logits, 0.0f32);
+            let rp = broadcast(rep, [vocab]);
+            let positive = gt(&logits, &zero);
             let repenalized = select(&positive, &logits / &rp, &logits * &rp);
             logits = select(&seen, &repenalized, &logits);
         }
         if let Some(freq) = &k.frequency {
-            logits = &logits - cast(counts, dtype::bf16) * knob(freq);
+            logits = &logits - broadcast(freq, [vocab]) * counts;
         }
         if let Some(pres) = &k.presence {
-            logits = &logits - cast(&seen_out, dtype::bf16) * knob(pres);
+            logits = &logits - broadcast(pres, [vocab]) * cast(&seen_out, dtype::f32);
         }
     }
     if let Some(mask) = mask {
@@ -246,8 +225,8 @@ pub fn sample(
             if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
                 let probs = softmax(&scaled);
                 if let Some(min_p) = &k.min_p {
-                    let floor = reduce_max(&probs) * knob(min_p);
-                    keep = Some(ge(&probs, floor));
+                    let floor = reduce_max(&probs) * min_p;
+                    keep = Some(ge(&probs, broadcast(&floor, [vocab])));
                 }
                 if let Some(top_k) = &k.top_k {
                     let ranked = pivot_threshold(&probs, rank_le(top_k));
@@ -274,10 +253,7 @@ pub fn sample(
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
     let landed = raw.zip(k.logprobs).map(|(raw, top)| {
         let lp = log_softmax(&raw);
-        let chosen = cast(
-            reshape(scalar_gather(&lp, reshape(&token, [1])), [1]),
-            dtype::f32,
-        );
+        let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
         if top == 0 {
             return Landed {
                 logprobs: chosen,
@@ -285,7 +261,6 @@ pub fn sample(
             };
         }
         let (values, ids) = top_k(&lp, top);
-        let values = cast(&values, dtype::f32);
         Landed {
             logprobs: concat_f32(&chosen, &values, top),
             ids: Some(cast(&ids, dtype::i32)),
