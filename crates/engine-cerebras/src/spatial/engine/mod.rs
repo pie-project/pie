@@ -124,6 +124,7 @@ impl Engine for Spatial {
             residency,
             ordinal: _,
             frames_in_flight: _,
+            frame_size: _,
         } = request;
         // The program keeps one sequence's cache and every lane's as host
         // tokens: there is no device pool to back with a slot file or to
@@ -668,6 +669,7 @@ mod tests {
                 residency: Residency::default(),
                 ordinal: 0,
                 frames_in_flight: 1,
+                frame_size: 1,
             })
             .expect_err("the load is refused");
         assert!(refused.to_string().contains("no float output"), "{refused}");

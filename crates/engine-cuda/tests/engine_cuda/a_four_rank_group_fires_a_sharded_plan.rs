@@ -234,6 +234,7 @@ fn four_ranks_land_what_one_rank_lands() {
             },
             ordinal: -1,
             frames_in_flight: 1,
+            frame_size: 1,
         })
         .expect("the sharded plan loads on four ranks");
     assert!(

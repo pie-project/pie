@@ -576,6 +576,9 @@ pub fn request(
         residency,
         ordinal,
         frames_in_flight,
+        // The frame size the scheduler seals frames at, from the one place
+        // it is configured (`scheduler::configured_frame_size`).
+        frame_size: u8::try_from(crate::scheduler::configured_frame_size()).unwrap_or(u8::MAX),
     })
 }
 

@@ -193,6 +193,10 @@ pub struct LoadRequest {
     pub residency: Residency,
     pub ordinal: i32,
     pub frames_in_flight: u8,
+    /// The runtime's configured steps a frame (`runtime.frame_size`, what
+    /// its frame sealing reads): the steps an engine may hold in flight are
+    /// `frames_in_flight × frame_size`.
+    pub frame_size: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

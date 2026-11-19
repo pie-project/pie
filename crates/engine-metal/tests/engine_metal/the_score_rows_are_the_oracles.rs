@@ -41,6 +41,7 @@ fn the_score_rows_are_the_oracles() {
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
+        frame_size: 1,
         residency: engine_metal::ResidencyPlan::default(),
         profiles: None,
         top: engine_metal::Top::EveryRung,

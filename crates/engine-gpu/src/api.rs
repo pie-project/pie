@@ -725,6 +725,7 @@ where
             residency,
             ordinal,
             frames_in_flight,
+            frame_size: _,
         } = request;
 
         if ordinal > 0 {

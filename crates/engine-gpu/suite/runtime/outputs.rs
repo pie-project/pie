@@ -295,6 +295,7 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
             },
             ordinal: 0,
             frames_in_flight: 1,
+            frame_size: 1,
         })
         .expect("the miniature loads");
     Some(Loaded {

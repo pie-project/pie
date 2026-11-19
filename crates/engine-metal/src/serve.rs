@@ -51,6 +51,9 @@ pub struct Boot<'a> {
     /// Nothing else of it is read here: Metal measures.
     pub allowance: engine::Allowance,
     pub runahead: Runahead,
+    /// The runtime's steps a frame (`engine::LoadRequest::frame_size`): a
+    /// load keeps `frames × frame_size` steps in flight, an arm each.
+    pub frame_size: u8,
     pub residency: Plan,
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
     /// reads only the checked-in ones.
@@ -952,7 +955,7 @@ impl PreparedLoad<'_> {
         let page_tables = rows.tables.len();
         // A step in flight takes an arm (its staged inputs); a step that
         // reads rows back also takes a readout seat, one a frame in flight.
-        let arms = boot.runahead.frames().max(1);
+        let arms = boot.runahead.frames().max(1) * usize::from(boot.frame_size.max(1));
         let readout_seats = boot.runahead.frames().max(1);
         let gathers = fallback::gathers(&boot.trace, &compiled, crate::window::CARRIES);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {

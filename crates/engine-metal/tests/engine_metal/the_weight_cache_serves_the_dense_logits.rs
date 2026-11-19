@@ -45,6 +45,7 @@ fn load_as(fixture: &Fixture, whole: bool, held: bool, checkpoint: &std::path::P
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
+        frame_size: 1,
         residency: if whole {
             residency.with_whole_weights()
         } else {

@@ -348,6 +348,7 @@ pub(super) fn load_ahead(
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         runahead,
+        frame_size: 1,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,

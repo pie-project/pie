@@ -635,6 +635,7 @@ impl Engine for Cuda {
             residency,
             ordinal,
             frames_in_flight,
+            frame_size: _,
         } = request;
 
         // A rank of an expert-parallel group of `size` holds part of a bank

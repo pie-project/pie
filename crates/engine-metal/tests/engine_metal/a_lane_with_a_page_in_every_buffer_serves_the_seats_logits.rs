@@ -34,6 +34,7 @@ fn load(fixture: &Fixture, kv_budget: Option<u64>) -> Shell {
         kv_budget,
         allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
+        frame_size: 1,
         residency: engine_metal::ResidencyPlan::default(),
         profiles: None,
         top: engine_metal::Top::EveryRung,

@@ -466,6 +466,7 @@ impl Engine for Xla {
             residency,
             ordinal,
             frames_in_flight,
+            frame_size: _,
         } = request;
         let mut boot = self.boot.clone();
         // A fire's inputs wait in the staging ring until it runs: one slot

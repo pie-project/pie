@@ -1786,6 +1786,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             residency: load::Residency::default(),
             ordinal: 0,
             frames_in_flight: 1,
+            frame_size: 1,
         })
         .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let facts = loaded.caps.chunks.clone();

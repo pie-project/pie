@@ -441,6 +441,7 @@ impl Engine for Metal {
             residency,
             ordinal,
             frames_in_flight,
+            frame_size,
         } = request;
 
         if ordinal > 0 {
@@ -573,6 +574,7 @@ impl Engine for Metal {
                     kv_budget: residency.device_kv_budget,
                     allowance: residency.device,
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
+                    frame_size,
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
                     top: crate::Top::Ruled,

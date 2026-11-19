@@ -250,6 +250,7 @@ fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
         context: 128,
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
+        frame_size: 1,
         residency: engine_metal::ResidencyPlan::default(),
         allowance: engine::Allowance::WHOLE,
         profiles: None,

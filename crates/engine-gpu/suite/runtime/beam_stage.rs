@@ -260,6 +260,7 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            frame_size: 1,
         })
         .expect("the miniature loads");
     for case in beam_stage() {

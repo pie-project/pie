@@ -167,6 +167,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            frame_size: 1,
         })
         .expect("the miniature loads");
 

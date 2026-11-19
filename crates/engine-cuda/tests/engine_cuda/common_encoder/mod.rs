@@ -401,6 +401,7 @@ impl Rig {
                 },
                 ordinal: 0,
                 frames_in_flight: 1,
+                frame_size: 1,
             })
             .expect("the layer loads");
         Rig {

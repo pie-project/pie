@@ -42,6 +42,10 @@ pub(crate) fn load_model_engines(
     home: &Path,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
+    // The frame size the scheduler will seal frames at, set before any
+    // engine loads: a load request states it (`engine::LoadRequest::
+    // frame_size`), read from the same place the scheduler reads it.
+    runtime::scheduler::set_frame_size(user_cfg.runtime.frame_size as usize);
     let (engine_groups, metadata) = {
         let m = &user_cfg.model;
         let e = &user_cfg.engine;

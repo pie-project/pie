@@ -171,6 +171,7 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
         },
         ordinal: -1,
         frames_in_flight: 1,
+        frame_size: 1,
     }
 }
 

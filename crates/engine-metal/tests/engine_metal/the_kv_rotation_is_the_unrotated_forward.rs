@@ -235,6 +235,7 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
         context: 128,
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
+        frame_size: 1,
         residency: engine_metal::ResidencyPlan::default(),
         allowance: engine::Allowance::WHOLE,
         profiles: None,

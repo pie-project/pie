@@ -482,6 +482,7 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
             },
             ordinal: 0,
             frames_in_flight: frames,
+            frame_size: 1,
         })
         .expect("the miniature loads");
     let asynchronous = engine.settles_asynchronously();
