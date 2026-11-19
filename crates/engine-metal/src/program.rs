@@ -980,12 +980,34 @@ impl Plane {
         dtype: eta_ir::Dtype,
         width: u32,
         stride: u32,
+        rows_held: u32,
     ) -> Result<()> {
         self.instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_output(name, lane, base, offset, dtype, width, stride)
+            .bind_output(name, lane, base, offset, dtype, width, stride, rows_held)
+    }
+
+    /// Whether instance `id`'s lane-0 read of `name` covers its lane `lane`.
+    pub fn covers(&self, id: InstanceId, name: &str, lane: u32) -> Result<bool> {
+        Ok(self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .session
+            .covers(name, lane))
+    }
+
+    /// Why instance `id` reads rows past what its lanes' seats hold, if it
+    /// does: its binding is refused, never launched into other lanes' rows.
+    pub fn rows_unbounded(&self, id: InstanceId) -> Result<Option<String>> {
+        Ok(self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .session
+            .rows_unbounded())
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<session::Blocked>> {
@@ -1503,7 +1525,7 @@ mod tests {
             .expect("the instance binds");
         let logits = crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a plane");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
             .expect("the logits bind");
         let readers = [
             ("gather of rows", index(gathered)),
@@ -1714,7 +1736,7 @@ mod tests {
         let bytes: Vec<u8> = values.iter().flat_map(|&v| bf16_of(v).to_le_bytes()).collect();
         logits.write(0, &bytes).expect("the logits write");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
             .expect("the logits bind");
         // One fire to build the pipelines, one timed.
         let _ = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
@@ -1988,6 +2010,7 @@ mod tests {
                     eta_ir::Dtype::Bf16,
                     seat.width,
                     seat.row_stride,
+                    1,
                 )
                 .expect("the logits seat binds");
         }
@@ -2142,6 +2165,7 @@ mod tests {
                 eta_ir::Dtype::Bf16,
                 case.vocab,
                 case.vocab,
+                1,
             )
             .expect("a seat binds; the fire refuses it");
         let why = plane
@@ -2668,7 +2692,7 @@ mod tests {
                         .copy_from_slice(&0x3f80u16.to_le_bytes());
                     logits.write(0, &bf16).expect("the logits write");
                     plane
-                        .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                        .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                         .expect("the logits bind");
                     planes.push(logits);
                     id
@@ -2830,7 +2854,7 @@ mod tests {
             let logits_plane = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
                 .expect("a logits plane");
             plane
-                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                 .expect("the logits bind");
             let fired = plane
                 .fire(&context, id, Attach::Epilogue)
@@ -2901,6 +2925,7 @@ mod tests {
                         eta_ir::Dtype::Bf16,
                         VOCAB,
                         VOCAB,
+                        1,
                     )
                     .expect("the logits bind");
                 id
@@ -3023,7 +3048,7 @@ mod tests {
                     .copy_from_slice(&0x3f80u16.to_le_bytes());
                 logits.write(0, &bf16).expect("the logits write");
                 plane
-                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                     .expect("the logits bind");
                 (id, logits)
             })
@@ -3117,6 +3142,7 @@ mod tests {
                     eta_ir::Dtype::Bf16,
                     VOCAB,
                     VOCAB,
+                    1,
                 )
                 .expect("the logits bind");
             id
@@ -3386,7 +3412,7 @@ mod tests {
             )
             .expect("the instance binds");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
             .expect("the logits bind");
         let fire = |plane: &mut Plane, logits: &mut crate::device::Buffer, at: u32| -> i32 {
             let mut bf16 = vec![0u8; VOCAB as usize * 2];
