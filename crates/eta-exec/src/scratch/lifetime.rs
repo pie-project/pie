@@ -3,14 +3,13 @@
 
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{Dimension, RegionKind, is_row_vector, same_rows, value_rows};
-use eta_ir::Dtype;
 use eta_ir::op::tags;
 use eta_ir::types::MAX_RANK;
 
 use super::{
     ChunkLayout, Layout, Lifetime, Pieces, TooLarge, layout, layout_chunked, layout_reusing,
 };
-use crate::extent::{Extents, Unresolvable, ValueDesc, describe};
+use crate::extent::{Extents, Unresolvable, ValueDesc, describe, element_bytes};
 
 /// Nodes of a stage an engine runs together. A node may lie in several
 /// launches (a reduction whose partial pass and final pass are dispatched
@@ -159,7 +158,7 @@ pub fn value_lifetimes(plan: &LaunchStagePlan, run: &Launches<'_>) -> Option<Vec
         let Some(ty) = plan.value_types.get(value as usize) else {
             return 0;
         };
-        let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
+        let elem = element_bytes(ty.dtype);
         let alias = launch.row_alias;
         if ty.axes.len() >= 2
             && value_rows(&ty.axes).is_some_and(|shape| same_rows(shape, geometry, alias))
@@ -427,6 +426,7 @@ mod tests {
     use super::*;
     use crate::scratch::SELECT_RESERVE;
     use eta_compiler::codegen::launch::{LaunchOp, LaunchPlanValue};
+    use eta_ir::Dtype;
 
     const WIDE: u32 = 1024;
 

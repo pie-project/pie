@@ -34,7 +34,7 @@ pub use cache::{
 };
 pub use channel::{ChannelState, HostOp, InterpInstance, host_put, host_take, make_host_instance};
 pub use emitted::{Duplicate, Emitted, Slot};
-pub use extent::{Extents, Role, Unresolvable, ValueDesc, describe};
+pub use extent::{Extents, Role, Unresolvable, ValueDesc, describe, element_bytes};
 pub use identity::{
     Backend, COMPILER_VERSION, REGION_PLAN_VERSION, Versions, cache_identity, combined_signature,
 };
