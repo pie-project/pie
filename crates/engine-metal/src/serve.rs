@@ -2048,8 +2048,21 @@ impl Shell {
 
     /// See `Engine::copy_slots`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if let Some(frame) = self.encode_copy(copy)? {
+            self.grafted = Some(frame.commit_async(None)?);
+        }
+        Ok(())
+    }
+
+    /// `copy` drained behind every frame and encoded (a host copy to or
+    /// from the host tier or the slot files done here); the frame to
+    /// commit, `None` for an empty copy.
+    fn encode_copy(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> Result<Option<Frame>> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.drain()?;
         // Every fold has landed and been told once drained: a record moved
@@ -2064,7 +2077,49 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
-        self.grafted = Some(frame.commit_async(None)?);
+        Ok(Some(frame))
+    }
+
+    /// See `Engine::copy_slots_landing`: whether `copy`'s sources may go
+    /// back now. A copy on the device is encoded into a command buffer the
+    /// device may still be running when this returns: `false`, and
+    /// `landed`'s sink is called with its token from that buffer's
+    /// completion; with no sink installed (the runtime installs it before
+    /// any copy) it is refused by name, before anything is encoded. A move
+    /// to or from the host tier or the slot files is a host copy done here,
+    /// past the drain: `true`.
+    pub fn copy_slots_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        landed: Option<(engine::LandingSink, u64)>,
+    ) -> Result<bool> {
+        let device = engine::MemoryDomain::MetalShared;
+        if copy.src != device || copy.dst != device {
+            self.copy_slots(copy)?;
+            return Ok(true);
+        }
+        let Some((sink, token)) = landed else {
+            return Err(Fault::Unbound {
+                what: "a copy on the device with no landing sink installed \
+                       (Engine::on_landed comes before any copy_slots_landing)"
+                    .into(),
+            });
+        };
+        let Some(frame) = self.encode_copy(copy)? else {
+            return Ok(true);
+        };
+        // Told once the buffer retires, faulted or not: a faulted copy has
+        // stopped reading its sources too, and its fault reaches the next
+        // drain.
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        Ok(false)
+    }
+
+    /// See `Engine::settle_copies`: the last copy's command buffer retires.
+    pub fn settle_copies(&mut self) -> Result<()> {
+        if let Some(grafted) = self.grafted.take() {
+            grafted.wait()?;
+        }
         Ok(())
     }
 
@@ -2289,37 +2344,44 @@ impl Shell {
         // ones' are the capture's, which no rung's rows key.
         let rungs = self.arena.rung_tokens();
         let octaves = engine::load::armed::scored_buckets(&rungs);
+        // Beside each rung's own rows, every band start of the matmul
+        // routing below it and above the rung before
+        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
+        // a fire's rows reach every band its rungs span, and each band's
+        // kernel is built here, not refused while serving.
+        let mut below = 0u32;
+        let sized: Vec<(u32, Vec<u32>)> = rungs
+            .iter()
+            .map(|&rung| {
+                let mut sizes = vec![rung];
+                sizes.extend(
+                    kernels_metal::linear::gemm::ROW_BANDS
+                        .iter()
+                        .copied()
+                        .filter(|&band| band > below && band < rung),
+                );
+                below = rung;
+                (rung, sizes)
+            })
+            .collect();
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
-            for rung in rungs {
+            for (rung, sizes) in sized {
                 self.set_rung(self.rung, rung)?;
-                for &form in forms
-                    .iter()
-                    .filter(|(_, scores)| !scores || octaves.contains(&rung))
-                {
-                    for (verb, held) in &verbs {
-                        let prompt = rung
-                            .min(self.budgets.tokens.max_tokens)
-                            .min(context.saturating_sub(*held))
-                            .max(1);
-                        let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                        let prompt_tokens = vec![0u32; prompt as usize];
-                        let one = [0u32];
-                        let prefill = [Seated {
-                            held: Some(*held),
-                            rs: verb,
-                            refs: true,
-                            pages: &kv_pages,
-                            record: (!record.is_empty()).then_some(&record[..]),
-                            windows: &windows,
-                            ..Seated::of(Lane {
-                                slot: 0,
-                                word: word(prompt, form),
-                                tokens: &prompt_tokens,
-                            })
-                        }];
-                        let decode: Vec<Seated<'_>> = (0..lanes)
-                            .map(|slot| Seated {
+                for size in sizes {
+                    for &form in forms
+                        .iter()
+                        .filter(|(_, scores)| !scores || octaves.contains(&rung))
+                    {
+                        for (verb, held) in &verbs {
+                            let prompt = size
+                                .min(self.budgets.tokens.max_tokens)
+                                .min(context.saturating_sub(*held))
+                                .max(1);
+                            let lanes = size.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                            let prompt_tokens = vec![0u32; prompt as usize];
+                            let one = [0u32];
+                            let prefill = [Seated {
                                 held: Some(*held),
                                 rs: verb,
                                 refs: true,
@@ -2327,34 +2389,49 @@ impl Shell {
                                 record: (!record.is_empty()).then_some(&record[..]),
                                 windows: &windows,
                                 ..Seated::of(Lane {
-                                    slot,
-                                    word: word(1, form),
-                                    tokens: &one,
+                                    slot: 0,
+                                    word: word(prompt, form),
+                                    tokens: &prompt_tokens,
                                 })
-                            })
-                            .collect();
-                        for lanes in [&prefill[..], &decode[..]] {
-                            // Each dropped fire's command buffer goes back
-                            // with its own pool: left to the thread's, a
-                            // walk of more fires than the queue holds
-                            // command buffers blocks making the next one.
-                            let walked = pooled(|| -> Result<()> {
-                                let prepared = FrameShell::prepare(
-                                    self,
-                                    StepView {
-                                        lanes,
-                                        attachments: &[],
-                                        media: &[],
-                                        clips: &[],
-                                        done: None,
-                                    },
-                                    None,
-                                )?;
-                                drop(self.walk(&prepared, true)?);
-                                Ok(())
-                            });
-                            walked?;
-                            fires += 1;
+                            }];
+                            let decode: Vec<Seated<'_>> = (0..lanes)
+                                .map(|slot| Seated {
+                                    held: Some(*held),
+                                    rs: verb,
+                                    refs: true,
+                                    pages: &kv_pages,
+                                    record: (!record.is_empty()).then_some(&record[..]),
+                                    windows: &windows,
+                                    ..Seated::of(Lane {
+                                        slot,
+                                        word: word(1, form),
+                                        tokens: &one,
+                                    })
+                                })
+                                .collect();
+                            for lanes in [&prefill[..], &decode[..]] {
+                                // Each dropped fire's command buffer goes back
+                                // with its own pool: left to the thread's, a
+                                // walk of more fires than the queue holds
+                                // command buffers blocks making the next one.
+                                let walked = pooled(|| -> Result<()> {
+                                    let prepared = FrameShell::prepare(
+                                        self,
+                                        StepView {
+                                            lanes,
+                                            attachments: &[],
+                                            media: &[],
+                                            clips: &[],
+                                            done: None,
+                                        },
+                                        None,
+                                    )?;
+                                    drop(self.walk(&prepared, true)?);
+                                    Ok(())
+                                });
+                                walked?;
+                                fires += 1;
+                            }
                         }
                     }
                 }
@@ -2868,7 +2945,7 @@ impl Shell {
         &mut self,
         instance_id: engine::InstanceId,
     ) -> Result<Option<&mut crate::program::Session>> {
-        self.fence_instances(&[instance_id])?;
+        self.fence_instances(&[instance_id], false)?;
         Ok(self.programs.instance_mut(instance_id))
     }
 
@@ -2878,7 +2955,13 @@ impl Shell {
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
-        self.fence_instances(&[instance_id])?;
+        // A close goes through whatever its fence met: a frame of the
+        // instance whose buffer failed has let its pass go at that harvest,
+        // and nothing of it is left to wait for.
+        // Each refusal is a harvested frame, so this ends.
+        while let Err(fault) = self.fence_instances(&[instance_id], false) {
+            tracing::warn!(instance = %instance_id, %fault, "closing an instance past a failed frame");
+        }
         self.programs.close_instance(instance_id)?;
         Ok(())
     }
@@ -3231,6 +3314,11 @@ impl Shell {
                         other => Err(refused(&other, *instance)),
                     });
                 if let Err(fault) = outcome {
+                    if flight.told.is_none() {
+                        // The handler told this step from the epilogue's
+                        // status words; the full report is here.
+                        tracing::warn!(instance = %instance, %fault, "an attached epilogue did not commit");
+                    }
                     faulted.push((lanes.clone(), *instance, fault.to_string()));
                 }
             }
@@ -3254,6 +3342,22 @@ impl Shell {
         });
         if let Err(fault) = waited {
             self.arms.give(flight.arm);
+            // Nothing the buffer ran committed: each attached instance's
+            // pass is let go, so the instance stands where it stood before
+            // the fire and its next fire stages afresh (an airborne pass
+            // left set refused every later staging and fire of it).
+            for (instance, _) in &flight.attached {
+                self.programs.abandon_launched(*instance);
+            }
+            self.forgotten.remove(&flight.seq);
+            if flight.told.is_none() {
+                // The completion handler told the sink the step was lost:
+                // whoever harvests next (another submit's staging, a close's
+                // fence) is not the frame that failed and is not refused
+                // for it.
+                tracing::warn!(seq = flight.seq, %fault, "a frame's command buffer failed; its step was told lost");
+                return Ok(());
+            }
             return Err(match fault {
                 Fault::Device { call, why } => Fault::Device {
                     call,
@@ -3687,26 +3791,68 @@ impl Shell {
         })
     }
 
-    fn fence_instances(&mut self, instances: &[engine::InstanceId]) -> Result<()> {
+    /// Waits out the frames carrying `instances` (and those sharing a ring
+    /// with them). With `ahead`, an instance that runs ahead
+    /// ([`crate::program::Session::runs_ahead`]) keeps its newest frame in
+    /// flight, its next pass staged in its other set of tables while that
+    /// one runs; every other is held to none, its next fire staged only
+    /// once its last landed. A close waits out every one (`ahead` false).
+    fn fence_instances(&mut self, instances: &[engine::InstanceId], ahead: bool) -> Result<()> {
         if instances.is_empty() {
             return Ok(());
         }
         let cohort = self.programs.cohort(instances);
         self.reap()?;
-        while let Some(seq) = self
+        // An instance runs ahead only while no sharer of its rings fires in
+        // this step or has a frame in flight: its next pass is staged on its
+        // own commits, and a sharer's would move the cursors under it.
+        let in_flight: Vec<engine::InstanceId> = self
             .inflight
             .iter()
-            .find(|flight| {
-                flight
-                    .attached
+            .flat_map(|flight| flight.attached.iter().map(|(held, _)| *held))
+            .collect();
+        let alone: BTreeMap<engine::InstanceId, bool> = instances
+            .iter()
+            .map(|&held| {
+                let sharers = self.programs.cohort(&[held]);
+                let busy = sharers
                     .iter()
-                    .any(|(held, _)| instances.contains(held) || cohort.contains(held))
+                    .any(|sharer| instances.contains(sharer) || in_flight.contains(sharer));
+                (held, !busy)
             })
-            .map(|flight| flight.seq)
-        {
+            .collect();
+        let allowed = |programs: &crate::program::Plane, held: &engine::InstanceId| -> usize {
+            usize::from(
+                ahead
+                    && !cohort.contains(held)
+                    && alone.get(held).copied().unwrap_or(false)
+                    && programs.runs_ahead(*held),
+            )
+        };
+        loop {
+            let mut carried: BTreeMap<engine::InstanceId, usize> = BTreeMap::new();
+            for flight in &self.inflight {
+                for (held, _) in &flight.attached {
+                    if instances.contains(held) || cohort.contains(held) {
+                        *carried.entry(*held).or_insert(0) += 1;
+                    }
+                }
+            }
+            // The oldest frame carrying an instance past what it may keep.
+            let over = self
+                .inflight
+                .iter()
+                .find(|flight| {
+                    flight.attached.iter().any(|(held, _)| {
+                        carried.get(held).is_some_and(|&n| n > allowed(&self.programs, held))
+                    })
+                })
+                .map(|flight| flight.seq);
+            let Some(seq) = over else {
+                return Ok(());
+            };
             self.harvest_through(seq)?;
         }
-        Ok(())
     }
 
     /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
@@ -3747,7 +3893,7 @@ impl Shell {
         }
 
         let instances: Vec<engine::InstanceId> = attachments.iter().map(|a| a.instance).collect();
-        self.fence_instances(&instances)?;
+        self.fence_instances(&instances, true)?;
 
         for (index, attached) in attachments.iter().enumerate() {
             if attached.lane as usize >= lanes.len() {
@@ -3827,11 +3973,13 @@ impl Shell {
         })?;
 
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
+        // Each resolved envelope's instance, by the same index.
+        let mut resolved_of: Vec<engine::InstanceId> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<engine::InstanceId> =
                 attachments.iter().map(|a| a.instance).collect();
-            self.fence_instances(&instances)?;
+            self.fence_instances(&instances, true)?;
             for attached in attachments {
                 let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
                     continue;
@@ -3885,6 +4033,7 @@ impl Shell {
                     envelope_of[first + lane] = Some((held, lane));
                 }
                 resolved.push(envelope);
+                resolved_of.push(attached.instance);
             }
         }
 
@@ -4119,6 +4268,9 @@ impl Shell {
         let mut window_tables: Vec<Vec<Vec<u32>>> =
             vec![Vec::with_capacity(lanes.len()); window_lists];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Token rows copied from a cell on the device before the forward:
+        // the row, and the cell's buffer and byte offset.
+        let mut token_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each row's stated position, the mrope table's fill where a row
@@ -4516,6 +4668,20 @@ impl Shell {
             match ports.as_ref() {
                 Some(ports) => {
                     ports.check_extent(have.saturating_add(row.rows))?;
+                    // A pass of its instance still in flight puts the token
+                    // this one reads: copied from that cell on the device
+                    // before the forward, not read on the host.
+                    let in_flight = match envelope_of[source] {
+                        Some((held, at)) => resolved_of
+                            .get(held)
+                            .and_then(|&instance| self.programs.token_cell(instance).transpose())
+                            .transpose()?
+                            .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
+                        None => None,
+                    };
+                    if let Some((buffer, cell)) = in_flight {
+                        token_feeds.push((tokens.len() as u32, buffer, cell));
+                    }
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
@@ -5259,6 +5425,7 @@ impl Shell {
             ends,
             lanes,
             input_feeds,
+            token_feeds,
             merge_lands,
             attachments,
             done,
@@ -5418,6 +5585,21 @@ impl Shell {
                 ))
             })
             .collect()
+    }
+
+    /// Copies each token row a pass in flight put into the fire's token
+    /// seat, on the device, ahead of the forward: the queue runs it after
+    /// that pass, so the cell holds its token by then.
+    fn feed_tokens(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.token_feeds.is_empty() {
+            return Ok(());
+        }
+        let (seat, base) = self.inputs[self.arena.current()][p.arm].tokens_seat();
+        for (row, buffer, cell) in &p.token_feeds {
+            frame.copy_span(buffer, *cell, seat, base + 4 * u64::from(*row), 4)?;
+        }
+        frame.next_pass()?;
+        Ok(())
     }
 
     fn feed_inputs(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
@@ -5590,6 +5772,7 @@ impl Shell {
             frame.next_pass()?;
         }
         self.feed_inputs(&mut frame, p)?;
+        self.feed_tokens(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
@@ -5744,6 +5927,9 @@ pub struct Prepared<'a> {
     ends: Vec<engine::KvWrites>,
     lanes: &'a [Seated<'a>],
     input_feeds: Vec<InputFeedPlan>,
+    /// Token rows a pass in flight puts: the row, and its cell
+    /// ([`Shell::feed_tokens`]).
+    token_feeds: Vec<(u32, crate::device::Buffer, u64)>,
     merge_lands: Vec<MergeLand>,
     attachments: &'a [Attached],
     done: Option<Done>,
@@ -5891,7 +6077,7 @@ impl engine::frame::Shell for Shell {
             for (name, ns, launches) in profile.iter().take(crate::diag::on().kernel_profile.rows())
             {
                 eprintln!(
-                    "  {:>9.1} ms  {:>5} launch(es)  {name}",
+                    "  {:>9.3} ms  {:>5} launch(es)  {name}",
                     *ns as f64 / 1e6,
                     launches
                 );
@@ -5968,18 +6154,45 @@ impl engine::frame::Shell for Shell {
         // One frame in flight: the engine settles inside submit, and the sink
         // has each step's reports before submit returns, told from the
         // harvest on this thread once the buffer completed. More: the
-        // completion handler tells it, unless a program is attached: its
-        // epilogue's verdict is read and committed on this thread, at the
-        // harvest, and the sink hears which lanes faulted from there.
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 || !attached.is_empty() {
+        // completion handler tells it, so a landing never waits on the
+        // lane's next activity. An attached instance's epilogue is read
+        // there from its status words and the commit its harvest will make
+        // (one pass airborne an instance, so nothing commits between); the
+        // harvest commits it on this thread when the runtime publishes the
+        // landed step (`Engine::publish_landed`).
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
             (None, Some(tell))
         } else {
-            (Some(tell), None)
+            let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
+                .iter()
+                .map(|(instance, lanes)| {
+                    (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
+                })
+                .collect();
+            (Some((tell, checks)), None)
         };
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
-            if let Some(tell) = in_handler.as_ref() {
-                tell(refused, &[]);
+            if let Some((tell, checks)) = in_handler.as_ref() {
+                // Each pass's verdict, told where a pass staged after it reads
+                // it (a failed frame commits none of them).
+                let mut faulted: Vec<Faulted> = Vec::new();
+                for (lanes, instance, check) in checks {
+                    let Some(check) = check.as_ref() else {
+                        continue;
+                    };
+                    let fault = match &refused {
+                        Some(why) => Some(why.clone()),
+                        None => check.fault(),
+                    };
+                    check.tell(fault.clone());
+                    if refused.is_none()
+                        && let Some(why) = fault
+                    {
+                        faulted.push((lanes.clone(), *instance, why));
+                    }
+                }
+                tell(refused, &faulted);
             }
         })));
         let pending = match pending {

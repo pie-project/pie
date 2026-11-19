@@ -195,6 +195,22 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle_copies(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_slots_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        self.copy_slots(copy)?;
+        Ok(true)
+    }
+
     fn kind(&self) -> &'static str {
         "fake-guests"
     }
@@ -1908,4 +1924,112 @@ fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
         "as the frame lands: the pair's two chunks, and the one its instance's scratch run lay in"
     );
     assert!(roles.lock().unwrap().slots(Owner::Pair(pair)).is_empty());
+}
+
+/// A pair moving with another process's instances holds a restore back
+/// (`RolesError::PairParked`) until that move ends; an aborted move ends it
+/// as a committed one does, and what waits on it is told (a bind's or a
+/// restore's room watch). Told only at a commit, a move that failed left
+/// them waiting for good. And a pair whose holders all closed (a failed
+/// process's close included) is freed, nothing left of it on the device.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_pair_move_wakes_its_waiters_and_a_pair_of_closed_holders_is_freed() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 1);
+    // The second parks: its pair moves with it.
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(2))
+        .expect("the second and the pair park");
+    // The first's restore meanwhile: its pair is moving.
+    let watch = roles.lock().unwrap().room_watch();
+    assert!(matches!(
+        roles.lock().unwrap().prepare_unpark(holder(1)),
+        Err(RolesError::PairParked(_))
+    ));
+    let woken = tokio::spawn(watch.freed());
+    tokio::task::yield_now().await;
+    assert!(!woken.is_finished(), "the move is under way");
+    roles.lock().unwrap().abort(moving);
+    tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+        .await
+        .expect("an aborted move tells its waiters")
+        .unwrap();
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .expect("the pair stands still now")
+        .expect("it unparks");
+    roles.lock().unwrap().commit(back);
+
+    // Both holders close (a failed process's close included): nothing of
+    // them or their pair is left.
+    roles.lock().unwrap().close_instance(first);
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(held(&device), before, "the pair freed with its last holder");
+}
+
+/// Over-demand with a pair four processes share, every one parked: the
+/// first restore brings the pair back with it, and while those copies are
+/// on their way each other holder's restore finds the pair moving
+/// (`pair_moving` names the instances it moves with) and waits once on
+/// the move's end, told by the commit; then each comes back, the pair
+/// where the first's brought it, and every holder closes leaving nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let ids: Vec<InstanceId> = (1..=4).map(|by| bind(&roles, &mut engine, by).unwrap()).collect();
+    for by in 1..=4 {
+        park(&roles, by);
+    }
+    let moving = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("the first brings the pair back");
+    let mut waits = 0;
+    let mut watches = Vec::new();
+    for by in 2..=4 {
+        let watch = roles.lock().unwrap().room_watch();
+        let unparked = roles.lock().unwrap().prepare_unpark(holder(by));
+        match unparked {
+            Err(RolesError::PairParked(pair)) => {
+                let named = roles.lock().unwrap().pair_moving(pair).expect("moving");
+                assert_eq!(named.len(), 4, "the instances it moves with: {named:?}");
+                waits += 1;
+                watches.push(tokio::spawn(watch.freed()));
+            }
+            other => panic!("the pair is moving: {other:?}"),
+        }
+    }
+    assert_eq!(waits, 3, "one wait each");
+    roles.lock().unwrap().commit(moving);
+    for watch in watches {
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+            .await
+            .expect("the move's end tells each")
+            .unwrap();
+    }
+    for by in 2..=4 {
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("the pair stands still")
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+    }
+    for id in ids {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(held(&device), before);
 }

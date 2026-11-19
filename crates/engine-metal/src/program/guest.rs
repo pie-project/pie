@@ -81,12 +81,17 @@ pub fn guest_state(pair_sets: &[u64], instance_sets: &[u64], room: Room) -> Gues
     let (scratch, instance_run) = state_of(instance_sets, room);
     GuestState {
         // An instance keeps nothing in guest state between fires: its
-        // tables and rings lie in its own `Instance` and `Channel` slots.
+        // tables and rings lie in its own `Instance` and `Channel` slots, as
+        // the program's facts size them. Those tables are two sets (what the
+        // host writes for a fire, a set a pass in flight: `Session::sets`),
+        // counted there, in the instance's slots, not here and not as
+        // scratch.
         resident: 0,
         // One fire's value scratch, given with the fire
-        // (`engine::fire::Attachment::scratch`): an instance's next fire is
-        // staged only once its last has landed (`fence_instances`), so one
-        // arm whatever the class.
+        // (`engine::fire::Attachment::scratch`). One arm whatever the class:
+        // a decode envelope keeps two passes in flight (`fence_instances`),
+        // and the queue runs the second's kernels after the first's, so they
+        // never hold the scratch at once; the host reads none of it.
         scratch,
         scratch_arms: 1,
         // A set a frame in flight (`Plane::pair_sets`): consecutive frames

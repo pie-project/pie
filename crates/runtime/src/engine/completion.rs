@@ -159,6 +159,9 @@ fn classify_terminal_outcome(value: u32) -> TerminalOutcome {
 #[derive(Debug)]
 enum SubmissionCompletionMode {
     Terminal { cell: OwnedTerminalCell },
+    /// Settled once published: a copy's landing, which has no outcome of
+    /// its own to tell.
+    Landed,
 }
 
 #[derive(Debug)]
@@ -213,12 +216,14 @@ impl SubmissionCompletionState {
                     "engine operation published invalid terminal outcome {value}"
                 ))),
             },
+            SubmissionCompletionMode::Landed => Some(Ok(())),
         }
     }
 
     fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.mode {
             SubmissionCompletionMode::Terminal { cell } => Some(cell.as_mut_ptr()),
+            SubmissionCompletionMode::Landed => None,
         }
     }
 
@@ -268,6 +273,14 @@ impl CompletionBroker {
                 cell: OwnedTerminalCell::new(),
             },
         )
+    }
+
+    /// A completion that settles once [`Self::notify`] publishes its wait
+    /// id at `target_epoch`: a copy the engine answered as still landing
+    /// ([`::engine::Engine::copy_slots_landing`]), its wait id the copy's
+    /// token.
+    pub fn landing_completion(&self, target_epoch: u64) -> SubmissionCompletion {
+        self.make_submission_completion(target_epoch, SubmissionCompletionMode::Landed)
     }
 
     pub fn notify(&self, wait_id: u64, epoch: u64) {
@@ -760,6 +773,19 @@ impl WorkItemCompletion {
         }
         drop(hooks);
         hook();
+    }
+
+    /// [`Self::on_settled`], told whether it landed: never where no handle
+    /// on it is left by the time the hook runs, which holds none of its own.
+    pub fn on_settled_landed(&self, hook: impl FnOnce(bool) + Send + 'static) {
+        let state = Arc::downgrade(&self.state);
+        self.on_settled(move || {
+            hook(
+                state
+                    .upgrade()
+                    .is_some_and(|state| matches!(state.result(), Some(Ok(())))),
+            );
+        });
     }
 
     pub fn same_request(&self, other: &Self) -> bool {

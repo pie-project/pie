@@ -384,7 +384,20 @@ impl Plane {
             self.rows,
             capture,
         ) {
-            Ok(session) => session,
+            Ok(mut session) => {
+                // A decode envelope's next pass is staged while this one
+                // runs: its pages and slots are the host's, its token the
+                // device's.
+                if geometry == GeometryClass::DecodeEnvelope {
+                    session.allow_run_ahead(&program.compiled, &program.plan, geometry, device);
+                    tracing::debug!(
+                        program = program_id.0,
+                        runs_ahead = session.runs_ahead(),
+                        "metal: a decode envelope bound"
+                    );
+                }
+                session
+            }
             Err(why) => {
                 release_seats(&adopted);
                 return Err(why);
@@ -944,6 +957,29 @@ impl Plane {
         })
     }
 
+    /// Where instance `id`'s next pass reads its token, while a pass of it
+    /// is in flight (that pass puts it): `None` with none in flight, the
+    /// host then reading the committed cell.
+    pub fn token_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        let Some(bound) = self.instances.get(&id) else {
+            return Ok(None);
+        };
+        if bound.session.in_flight() == 0 {
+            return Ok(None);
+        }
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.token_cell(&program.plan)
+    }
+
+    /// Whether instance `id` keeps two passes in flight
+    /// ([`Session::runs_ahead`]).
+    #[must_use]
+    pub fn runs_ahead(&self, id: InstanceId) -> bool {
+        self.instances.get(&id).is_some_and(|bound| bound.session.runs_ahead())
+    }
+
     #[must_use]
     pub fn cohort(&self, instances: &[InstanceId]) -> Vec<InstanceId> {
         let held: Vec<&Arc<SharedRing>> = instances
@@ -1310,6 +1346,7 @@ impl Plane {
                         let rings = rings_of.get(&None).map(Vec::as_slice).unwrap_or(&[]);
                         #[cfg(target_vendor = "apple")]
                         if group.len() > 1
+                            && !crate::encode::profiling()
                             && rings_disjoint(rings)
                             && stage.regions.iter().all(|region| region.form == compile::Form::Streamed)
                         {
@@ -1379,6 +1416,15 @@ impl Plane {
             )
         })?;
         bound.session.settle_launched(&program.plan)
+    }
+
+    /// Instance `id`'s airborne pass as its frame's completion handler
+    /// reads it ([`session::EpilogueCheck`]); `None` with nothing airborne.
+    #[must_use]
+    pub fn epilogue_check(&self, id: InstanceId) -> Option<session::EpilogueCheck> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        bound.session.epilogue_check(&program.plan)
     }
 
     pub fn abandon_launched(&mut self, id: InstanceId) {
@@ -3187,6 +3233,7 @@ mod tests {
             "the two lanes share their rings"
         );
         let members: Vec<InstanceId> = lanes.iter().map(|(id, _)| *id).collect();
+        let members = plane.placed(&pools, &members).expect("the members' scratch");
         let mut frame = context.frame().expect("a frame");
         let _ = plane.stage_batched(&mut frame, &members, 0);
     }
