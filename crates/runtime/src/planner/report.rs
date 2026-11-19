@@ -20,6 +20,10 @@ impl ResidencyPlanner {
             inner.evicting.remove(&pid);
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            // Parked again: the next suspended bind may come back.
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             // Parked for a bind short of room: its restore waits for room
             // given back past what its own park gave.
             if proc.bind_room.is_some() {
@@ -249,6 +253,9 @@ impl ResidencyPlanner {
                 return;
             }
             proc.state = Residency::Evicted;
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             inner.enqueue(
                 pid,
                 WaitKind::Restore {

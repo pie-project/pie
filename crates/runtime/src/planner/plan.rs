@@ -218,14 +218,17 @@ impl ResidencyPlanner {
                     // Runs that stand free only by what its own park gave
                     // back are what its restore retakes: room must have come
                     // free since ([`super::proc::Proc::bind_room_after`]).
-                    let moved = self.with_inner(|inner| {
-                        inner
-                            .queue
-                            .get(&key)
-                            .and_then(|waiter| inner.procs.get(&waiter.pid))
-                            .and_then(|proc| proc.bind_room_after)
-                    })
-                    .is_none_or(|after| self.port.room_gives() > after);
+                    // And one such restore at a time ([`Inner::bind_restoring`]).
+                    let (after, other_restoring) = self.with_inner(|inner| {
+                        let pid = inner.queue.get(&key).map(|waiter| waiter.pid);
+                        (
+                            pid.and_then(|pid| inner.procs.get(&pid))
+                                .and_then(|proc| proc.bind_room_after),
+                            inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid),
+                        )
+                    });
+                    let moved = !other_restoring
+                        && after.is_none_or(|after| self.port.room_gives() > after);
                     if moved && self.port.guest_room_free(need.run, need.pieces) {
                         room_stood = Some(key);
                         continue;
@@ -464,6 +467,10 @@ impl ResidencyPlanner {
                         }
                         if (inner.accum.len() as u32) < need.kv_pages {
                             return Board::Replan;
+                        }
+                        // Suspended for a bind: the one restored at a time.
+                        if inner.procs.get(&pid).is_some_and(|proc| proc.bind_room.is_some()) {
+                            inner.bind_restoring = Some(pid);
                         }
                         let Some(proc) = inner.procs.get_mut(&pid) else {
                             inner.queue.remove(&key);

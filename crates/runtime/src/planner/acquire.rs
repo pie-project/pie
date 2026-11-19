@@ -425,16 +425,31 @@ impl ResidencyPlanner {
     pub async fn wait_resident(self: &Arc<Self>, pid: ProcessId) -> Result<(), PlannerError> {
         let mut left_pipeline = false;
         loop {
-            let signal = {
-                let inner = self.lock_inner();
-                let Some(proc) = inner.procs.get(&pid) else {
+            let (signal, asked) = {
+                let mut inner = self.lock_inner();
+                let Some(proc) = inner.procs.get_mut(&pid) else {
                     return Err(PlannerError::Cancelled);
                 };
                 if proc.state == Residency::Resident {
                     return Ok(());
                 }
-                proc.signal.clone()
+                // Parked owing its restore (a short one gave up, or it went
+                // idle): a process waiting to be resident asks for it again.
+                // Left parked, nothing queues it, and the wait never ends
+                // (the M1 / M5 stress: the earliest admitted sat evicted
+                // with no restore queued once the rest drained).
+                let demand = (proc.state == Residency::Evicted)
+                    .then(|| proc.parked.take())
+                    .flatten();
+                let signal = proc.signal.clone();
+                if let Some(demand) = demand {
+                    inner.enqueue(pid, WaitKind::Restore { demand });
+                }
+                (signal, demand.is_some())
             };
+            if asked {
+                self.poke();
+            }
             if !left_pipeline {
                 left_pipeline = true;
                 crate::scheduler::worker::notify_process_suspend(pid);

@@ -1192,6 +1192,9 @@ impl ResidencyPlanner {
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            if inner.bind_restoring == Some(pid) {
+                inner.bind_restoring = None;
+            }
             let charged = departed.as_ref().is_some_and(|proc| proc.charged);
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
