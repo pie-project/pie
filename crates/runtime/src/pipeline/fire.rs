@@ -3896,7 +3896,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // no further than the rows the program has accepted, so a stop can
         // take back the rest; a fire whose tokens the host places is
         // accepted as it is submitted, and everything before it with it.
-        let fold = match (rs_ws_ids.is_empty(), decode_envelope.is_some()) {
+        // A state that buffers no row folds every row as before.
+        let lags = !rs_ws_ids.is_empty() && stores.rs.lock().unwrap().holds_unfolded();
+        let fold = match (!lags, decode_envelope.is_some()) {
             (true, _) => fold,
             (false, true) => lagged_fold(&fold, &pass_lanes, &groups, &landings),
             (false, false) => {
@@ -4600,7 +4602,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             // A run-ahead fire's rows on a set with a recurrent state or
             // windows wait for the program to take what it publishes.
-            let run_ahead_reads = (last && decode_envelope.is_some() && !rs_ws_ids.is_empty())
+            let run_ahead_reads = (last && decode_envelope.is_some() && lags)
                 .then(|| host_reads(&cells, &accesses));
 
             let scheduler_clock = crate::scheduler::probe::ProbeClock::start();
@@ -6526,7 +6528,14 @@ pub(crate) mod lifecycle_tests {
     /// and its decodes fold nothing (the lagged fold: the program accepted
     /// none of them yet).
     fn run_ahead(fires: u32, state: Option<u32>) -> anyhow::Result<RunAhead> {
-        let model = crate::store::registry::register_model(16, &[64], &[1]);
+        let model = crate::store::registry::register_model_with_swap(
+            16,
+            &[64],
+            &[0],
+            &[0],
+            &[crate::store::registry::StatePool { slots: 1, pages: 4 }],
+            &[0],
+        );
         let stores = crate::store::registry::get(model, 0);
         let rs = state.map(|frozen| {
             let mut rs = stores.rs.lock().unwrap();

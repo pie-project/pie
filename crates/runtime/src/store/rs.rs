@@ -117,6 +117,11 @@ pub enum RsError {
          back"
     )]
     FoldedPastCut { committed: u32, cut: u32 },
+    #[error(
+        "its state buffers no row (a short conv state, which no buffered plane carries): every \
+         row folds as it is written, and a fold is not taken back"
+    )]
+    Unbuffered,
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -566,6 +571,14 @@ impl RsStore {
     /// and the window pools.
     pub fn is_window(&self) -> bool {
         !self.window.is_empty()
+    }
+
+    /// Rows can stand unfolded in a set: in its buffer pages, or past its
+    /// windows' committed position. A state with neither (a pool with no rs
+    /// list: Inkling's short conv state, which no buffered plane carries)
+    /// folds every row a fire writes.
+    pub fn holds_unfolded(&self) -> bool {
+        self.is_window() || self.pages.capacity() > 0
     }
 
     /// The window lists, in their order.
@@ -2021,6 +2034,10 @@ impl RsStore {
     /// Refused where the state, or the windows' committed position, holds
     /// rows past `cut`.
     pub fn truncate(&mut self, ws: RsWorkingSetId, cut: u32) -> Result<(), RsError> {
+        if !self.holds_unfolded() {
+            self.entry(ws)?;
+            return Err(RsError::Unbuffered);
+        }
         let page = self.page_tokens(self.entry(ws)?);
         let lists = self.window.clone();
         let base = self.buffer_base(self.entry(ws)?);

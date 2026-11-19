@@ -294,6 +294,10 @@ fn a_truncate_takes_back_the_buffer_past_its_cut() {
     assert_eq!(s.buffer_size(ws), Ok(2));
     s.truncate(ws, 2).unwrap();
     assert_eq!(s.buffer_size(ws), Ok(1), "the page the state ends in stays");
+    // A state that buffers no row (no rs list) is refused by name.
+    let mut bare = RsStore::new(4, 0);
+    let ws = bare.create_working_set(geom());
+    assert_eq!(bare.truncate(ws, 0), Err(RsError::Unbuffered));
 }
 
 fn a_state_others_read_is_folded_into_a_copy() {
