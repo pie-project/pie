@@ -264,6 +264,7 @@ fn placeholder(ty: eta_ir::types::ValueType) -> Value {
         eta_ir::types::Dtype::I32 => Value::I32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::U32 => Value::U32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::Bool => Value::Bool(alloc::vec::Vec::new()),
+        eta_ir::types::Dtype::Bf16 => Value::Bf16(alloc::vec::Vec::new()),
         _ => crate::eval::interp::no_interpreter_lane(ty.dtype),
     }
 }
