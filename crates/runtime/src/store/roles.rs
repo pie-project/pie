@@ -988,6 +988,36 @@ impl Roles {
         }
     }
 
+    /// Whether `pieces` free runs of `run` adjacent `Instance` chunks stand
+    /// once `holder`'s unpark has retaken its parked dead parts (guest
+    /// scratch and pair state, given back at its park): tried, and given
+    /// back, nothing kept. Read as the pool stands now, whatever gave the
+    /// room.
+    #[must_use]
+    pub fn fits_beside_unpark(&self, holder: Holder, run: u32, pieces: u32) -> bool {
+        let device = Arc::clone(&self.device);
+        let mut taken: Vec<Part> = Vec::new();
+        let mut fits = true;
+        'items: for (owner, item) in &self.items {
+            let parked = item.tier == Tier::Host || (item.tier == Tier::Device && item.shed);
+            if !parked || !self.unparks_with(*owner, item, holder) {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
+                match self.retake(part) {
+                    Ok(part) => taken.push(part),
+                    Err(_) => {
+                        fits = false;
+                        break 'items;
+                    }
+                }
+            }
+        }
+        let fits = fits && self.free_runs(run) >= pieces;
+        self.give(&device, &taken);
+        fits
+    }
+
     /// The free runs of `run` adjacent `Instance` chunks inside one
     /// segment the device pool holds now: how many more pieces of a guest
     /// state that lies in runs of that length it could place.

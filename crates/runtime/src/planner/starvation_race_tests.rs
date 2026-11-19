@@ -2414,6 +2414,9 @@ struct BindRoomPool {
     occupant: parking_lot::Mutex<Option<ProcessId>>,
     /// The pool's count of room given back (`room_gives`).
     gives: std::sync::atomic::AtomicU64,
+    /// The free chunks a restore's own parked guest state retakes first
+    /// ([`PoolPort::room_beside_own`]).
+    own: parking_lot::Mutex<Vec<u32>>,
 }
 
 impl BindRoomPool {
@@ -2426,6 +2429,7 @@ impl BindRoomPool {
             model: 0,
             occupant: parking_lot::Mutex::new(None),
             gives: std::sync::atomic::AtomicU64::new(0),
+            own: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -2491,6 +2495,14 @@ impl PoolPort for BindRoomPool {
     }
     fn room_gives(&self) -> u64 {
         self.gives.load(Ordering::Relaxed)
+    }
+    fn room_beside_own(&self, _pid: ProcessId, run: u32, pieces: u32) -> bool {
+        let own = self.own.lock().clone();
+        let kept: Vec<u32> = self.free.lock().iter().copied().filter(|c| !own.contains(c)).collect();
+        let saved = std::mem::replace(&mut *self.free.lock(), kept);
+        let fits = self.runs_free(run, pieces);
+        *self.free.lock() = saved;
+        fits
     }
     fn chunk_occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
         let Some(occupant) = *self.occupant.lock() else {
@@ -3259,10 +3271,10 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
 /// process, whose restore was served straight back into the room its park
 /// gave back, retook its items, and the bind came up short again: suspend,
 /// restore, short, 750 times a second. Runs standing free only by what its
-/// own park gave back are no room for its bind: its restore waits until
-/// room has come free since (the pool's count of room given back moved
-/// past the park's end), reclaiming idle cache meanwhile; once it has, it
-/// is sent.
+/// own restore retakes are no room for its bind: it waits, reclaiming idle
+/// cache meanwhile; runs beside its own are, read from the pool as it is
+/// (not from room given back since its park, which never comes once the
+/// fleet waits on it), and it is sent.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_park() {
     for moved in [false, true] {
@@ -3281,7 +3293,6 @@ async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_p
                 pieces: 1,
                 pages: 1,
             });
-            proc.bind_room_after = Some(0);
             inner.enqueue(
                 pid,
                 WaitKind::Restore {
@@ -3289,7 +3300,10 @@ async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_p
                 },
             );
         });
-        pool.gives.store(u64::from(moved), Ordering::Relaxed);
+        // Not moved: the free runs are only what its own restore retakes.
+        if !moved {
+            pool.own.lock().extend(4..8);
+        }
         assert!(pool.guest_room_free(1, 1), "runs stand free");
         planner.poke();
         for _ in 0..200 {
@@ -3333,7 +3347,6 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
                 pieces: 1,
                 pages: 1,
             });
-            proc.bind_room_after = Some(0);
             inner.enqueue(
                 pid,
                 WaitKind::Restore {
@@ -3537,5 +3550,56 @@ async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_g
         planner.with_inner(|inner| inner.bind_restoring),
         Some(restored),
         "another's bind waiting leaves its turn"
+    );
+}
+
+/// Mac Pro's beam mix (two of two): a bind short of room suspended its own
+/// process, the eviction completed, and the serves went flat with every
+/// thread parked: the restore waited for room given back since its park,
+/// and with the fleet waiting on it as the head nothing gave any, though
+/// runs stood free beside what it retakes. The runs beside its own, read as
+/// the pool stands, send it with no further event.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_suspended_restore_goes_on_runs_beside_its_own_with_no_room_given_since() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    // Its own retakes chunks 0 and 1; 4..8 stand beside them. No room has
+    // been given back since its park.
+    pool.free.lock().extend([0, 1, 4, 5, 6, 7]);
+    pool.own.lock().extend([0, 1]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 2,
+            pieces: 2,
+            pages: 4,
+        });
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        planner.stats.restores.load(Ordering::Relaxed),
+        1,
+        "sent on the runs beside its own, no further event"
     );
 }

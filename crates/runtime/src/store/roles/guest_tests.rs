@@ -2033,3 +2033,26 @@ async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() 
     }
     assert_eq!(held(&device), before);
 }
+
+/// What a bind-suspended restore asks before it goes: runs for its bind
+/// beside the guest state its unpark retakes first, tried and given back,
+/// nothing kept.
+#[test]
+fn room_beside_a_parked_process_s_own_state_is_tried_and_nothing_is_kept() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    bind(&roles, &mut engine, 1).unwrap();
+    park(&roles, 1);
+    let free = roles.lock().unwrap().free_runs(1);
+    let held_now = held(&device);
+    assert!(free >= 3, "{free} free chunks");
+    // Its scratch retakes two whole chunks (and its pair a run of slots in
+    // a chunk): the rest stand beside it.
+    assert!(roles.lock().unwrap().fits_beside_unpark(holder(1), 1, 1));
+    assert!(
+        !roles.lock().unwrap().fits_beside_unpark(holder(1), 1, free),
+        "every free chunk is no room beside what it retakes"
+    );
+    assert_eq!(held(&device), held_now, "nothing kept");
+    assert_eq!(roles.lock().unwrap().free_runs(1), free);
+}

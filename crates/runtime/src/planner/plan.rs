@@ -219,21 +219,26 @@ impl ResidencyPlanner {
                     // runs stand free past its gathered kv, else idle cache
                     // first, then, the fleet stalled, a resident parked
                     // for it by the planner's victim choice.
-                    // Runs that stand free only by what its own park gave
-                    // back are what its restore retakes: room must have come
-                    // free since ([`super::proc::Proc::bind_room_after`]).
-                    // And one such restore at a time ([`Inner::bind_restoring`]).
-                    let (after, other_restoring) = self.with_inner(|inner| {
+                    // Its restore retakes its own parked guest state first:
+                    // the runs must stand beside that
+                    // ([`super::pool::PoolPort::room_beside_own`]), read
+                    // from the pool as it is, never from room given back
+                    // since its park (nothing gives any once the fleet
+                    // waits on this head: Mac Pro's beam mix, flat after a
+                    // bind-suspend with 861 chunks free). And one such
+                    // restore at a time ([`Inner::bind_restoring`]).
+                    let (pid, other_restoring) = self.with_inner(|inner| {
                         let pid = inner.queue.get(&key).map(|waiter| waiter.pid);
                         (
-                            pid.and_then(|pid| inner.procs.get(&pid))
-                                .and_then(|proc| proc.bind_room_after),
+                            pid,
                             inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid),
                         )
                     });
-                    let moved = !other_restoring
-                        && after.is_none_or(|after| self.port.room_gives() > after);
-                    if moved && self.port.guest_room_free(need.run, need.pieces) {
+                    if !other_restoring
+                        && pid.is_some_and(|pid| {
+                            self.port.room_beside_own(pid, need.run, need.pieces)
+                        })
+                    {
                         room_stood = Some(key);
                         continue;
                     }

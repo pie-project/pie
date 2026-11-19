@@ -11,7 +11,6 @@ use super::{ProcessId, ResidencyPlanner};
 
 impl ResidencyPlanner {
     pub(super) fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32, rs_freed: RsUnits) {
-        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             // One that left meanwhile is settled by its departure.
             let Some(proc) = inner.procs.get_mut(&pid) else {
@@ -23,11 +22,6 @@ impl ResidencyPlanner {
             // Parked again: the next suspended bind may come back.
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
-            }
-            // Parked for a bind short of room: its restore waits for room
-            // given back past what its own park gave.
-            if proc.bind_room.is_some() {
-                proc.bind_room_after = Some(gives);
             }
             // What waits for its move to end ([`ResidencyPlanner::wait_not_moving`]).
             proc.signal.notify_waiters();
@@ -161,7 +155,6 @@ impl ResidencyPlanner {
             proc.roles_free_short = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
-            proc.bind_room_after = None;
             Some(proc.signal.clone())
         });
         // Resident first, then every set it holds now unfenced: one

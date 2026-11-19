@@ -213,6 +213,16 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (run, pieces);
         false
     }
+    /// Whether `pieces` free runs of `run` adjacent chunks stand beside
+    /// the guest state `pid`'s restore retakes first (its parked dead
+    /// parts, [`crate::store::roles::Roles::fits_beside_unpark`]): room for
+    /// the bind that suspended it, past its own (the M1 freeze: restored
+    /// straight back into the room its park gave, short again, 750 times
+    /// a second). Where the pool keeps no guest state, the runs alone.
+    fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {
+        let _ = pid;
+        self.guest_room_free(run, pieces)
+    }
     /// The device pages that, moved out whole, free `chunks` chunks for a
     /// guest's state, as [`Self::rs_as_pages`] for state.
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
@@ -398,6 +408,13 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| shared.lock().unwrap().pool().free_chunk_runs(run) >= pieces)
+    }
+
+    fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {
+        match crate::store::registry::try_get(self.model, self.engine).and_then(|s| s.roles) {
+            Some(roles) => roles.lock().unwrap().fits_beside_unpark(pid, run, pieces),
+            None => self.guest_room_free(run, pieces),
+        }
     }
 
     fn room_gives(&self) -> u64 {
