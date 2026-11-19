@@ -1323,11 +1323,20 @@ impl FireCtx<'_> {
                 width,
                 width,
                 0,
+                1,
             );
         }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;
+        // The lane's own rows of the fire's: its token rows and its voxels.
+        let own = p
+            .composition
+            .lanes()
+            .iter()
+            .find(|row| row.source as usize == at)
+            .copied()
+            .unwrap_or_default();
         match out.decl.axis {
             poem_ir::InputAxis::Lane => {
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
@@ -1359,6 +1368,7 @@ impl FireCtx<'_> {
                     width,
                     stride,
                     0,
+                    u32::try_from(out.values.len()).unwrap_or(u32::MAX),
                 )
             }
             // A row output read whole from the lane's first token row where
@@ -1370,14 +1380,17 @@ impl FireCtx<'_> {
                         .and_then(|seated| seated.readout)
                         .is_none_or(<[u32]>::is_empty) =>
             {
-                let first = p
-                    .composition
-                    .lanes()
-                    .iter()
-                    .find(|row| row.source as usize == at)
-                    .map_or(0, |row| row.row_offset);
-                self.programs
-                    .bind_output(instance, name, k, plane.ptr, storage, width, width, first)
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    plane.ptr,
+                    storage,
+                    width,
+                    width,
+                    own.row_offset,
+                    own.rows,
+                )
             }
             // A row output's rows, gathered or the lane's own token rows
             // (`rows`, as its readout names them).
@@ -1395,6 +1408,7 @@ impl FireCtx<'_> {
                         rows[..stated.len()].to_vec()
                     }
                 };
+                let held = u32::try_from(wanted.len()).unwrap_or(u32::MAX);
                 let consecutive = wanted
                     .windows(2)
                     .all(|pair| pair[1] == pair[0].wrapping_add(1));
@@ -1408,6 +1422,7 @@ impl FireCtx<'_> {
                         width,
                         width,
                         wanted.first().copied().unwrap_or(0),
+                        held,
                     );
                 }
                 if plane.dtype != Dtype::Bf16 {
@@ -1438,6 +1453,7 @@ impl FireCtx<'_> {
                     width,
                     width,
                     0,
+                    held,
                 )
             }
             poem_ir::InputAxis::Voxel => self.programs.bind_output(
@@ -1449,6 +1465,7 @@ impl FireCtx<'_> {
                 width,
                 width,
                 first_voxel,
+                own.voxels,
             ),
         }
     }

@@ -652,6 +652,7 @@ pub fn emit_fused_region(
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset += lane_row;\n");
+            source.push_str("    p.intrinsic_rows = intrinsic_rows[intrinsic_index];\n");
             slots.a0 =
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
@@ -842,6 +843,7 @@ fn emit_body(
                 "        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
 ",
             );
+            source.push_str("        intrinsic_rows[gumbel_intrinsic_index],\n");
             let _ = writeln!(source, "        {},", chain.state);
             let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
             match (&chain.divisor, chain.divisor_desc) {
@@ -880,7 +882,8 @@ fn emit_body(
             source.push_str("        descriptors[p.a0],\n");
             source.push_str("        intrinsic_modes[direct_intrinsic_index],\n");
             source.push_str("        intrinsic_strides[direct_intrinsic_index],\n");
-            source.push_str("        intrinsic_offsets[direct_intrinsic_index] + lane_row);\n");
+            source.push_str("        intrinsic_offsets[direct_intrinsic_index] + lane_row,\n");
+            source.push_str("        intrinsic_rows[direct_intrinsic_index]);\n");
         } else {
             let _ = writeln!(
                 source,

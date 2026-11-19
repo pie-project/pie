@@ -86,14 +86,15 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
     const m1_u32 rows = output_desc.len / width;
     const bool vec = (width & 3u) == 0u && m1_aligned16(output) &&
                      m1_intrinsic_row_vectorable(
-                         input, first_row, stride, p.intrinsic_dtype);
+                         input, first_row, stride, p.intrinsic_dtype, p.intrinsic_rows);
     for (m1_u32 row = 0u; row < rows; ++row) {
       m1_u8* row_out = output + (m1_u64)row * (m1_u64)width * 4ull;
       if (vec) {
         const m1_u32 quads = width >> 2u;
         for (m1_u32 q = threadIdx.x; q < quads; q += blockDim.x) {
           const float4 v = m1_intrinsic_row_load4(
-              input, first_row + row, q << 2u, stride, p.intrinsic_dtype);
+              input, first_row + row, q << 2u, stride, p.intrinsic_dtype,
+              p.intrinsic_rows);
           m1_store4_f(row_out, q, v);
         }
       } else {
@@ -102,7 +103,8 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
               row_out,
               col,
               m1_intrinsic_row_load(
-                  input, first_row + row, col, stride, p.intrinsic_dtype));
+                  input, first_row + row, col, stride, p.intrinsic_dtype,
+                  p.intrinsic_rows));
         }
       }
     }
@@ -112,7 +114,8 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
     // One row: its columns, no division an element.
     for (m1_u32 index = threadIdx.x; index < output_desc.len; index += blockDim.x)
       m1_store_f(output, index,
-                 m1_intrinsic_row_load(input, first_row, index, stride, p.intrinsic_dtype));
+                 m1_intrinsic_row_load(input, first_row, index, stride, p.intrinsic_dtype,
+                                       p.intrinsic_rows));
     return;
   }
   for (m1_u32 index = threadIdx.x;
@@ -128,7 +131,8 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
             first_row + row,
             column,
             stride,
-            p.intrinsic_dtype));
+            p.intrinsic_dtype,
+            p.intrinsic_rows));
   }
 }
 
@@ -1876,23 +1880,27 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
     const M1ValueDesc input_desc,
     m1_u32 mode,
     m1_u32 stride,
-    m1_u32 row_offset) {
+    m1_u32 row_offset,
+    m1_u32 held_rows) {
   __shared__ M1ArgmaxCandidate candidates[32];
   int* result = reinterpret_cast<int*>(output);
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
 
+  // Rows past the `held_rows` the lane holds are not read.
+  const m1_u32 readable = held_rows > row_offset ? held_rows - row_offset : 0u;
+  const m1_u32 read_rows = input_desc.rows < readable ? input_desc.rows : readable;
   if (mode == 3u) {
     const m1_u64* rows = reinterpret_cast<const m1_u64*>(input);
-    for (m1_u32 row = threadIdx.x; row < input_desc.rows; row += blockDim.x) {
+    for (m1_u32 row = threadIdx.x; row < read_rows; row += blockDim.x) {
       result[row] = *reinterpret_cast<const int*>(
           rows[(m1_u64)row_offset + row]);
     }
     __syncthreads();
     return;
   }
-  for (m1_u32 row = 0; row < input_desc.rows; ++row) {
+  for (m1_u32 row = 0; row < read_rows; ++row) {
     const m1_u8* row_base = m1_intrinsic_row_base(
         input, (m1_u64)row_offset + row, stride, mode);
     const m1_u32 last = input_desc.last;
@@ -1985,6 +1993,7 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
     m1_u32 mode,
     m1_u32 stride,
     m1_u32 row_offset,
+    m1_u32 held_rows,
     const m1_u8* state,
     const M1ValueDesc state_desc,
     const m1_u8* divisor,
@@ -1999,7 +2008,9 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
   const bool scaled = divisor != nullptr;
   const float divide_by =
       scaled ? m1_load_f(divisor, 0u, divisor_desc.dtype) : 1.0f;
-  for (m1_u32 row = 0; row < input_desc.rows; ++row) {
+  const m1_u32 readable = held_rows > row_offset ? held_rows - row_offset : 0u;
+  const m1_u32 read_rows = input_desc.rows < readable ? input_desc.rows : readable;
+  for (m1_u32 row = 0; row < read_rows; ++row) {
     const m1_u8* row_base = m1_intrinsic_row_base(
         input, (m1_u64)row_offset + row, stride, mode);
     const m1_u32 last = input_desc.last;
