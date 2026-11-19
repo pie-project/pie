@@ -1371,6 +1371,14 @@ mod blocked_tests {
             said(stage, quick, std::future::ready(())).await;
             assert!(!crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&quick));
         }
+        // Evicted while its guest is between waits (in no said() at all):
+        // the eviction's suspension parks its lanes, and its complete frame
+        // goes at once all the same (the od-2 dump: its bind wait had ended
+        // 6 s before its eviction began).
+        assert!(
+            FramePolicy::parked_owner_frame_goes_at_once_by(ProcessId::new_v4(), true),
+            "suspended between waits: its complete frame waits on no boundary"
+        );
         for request in ["bind", "bind: the lane's bind", "bind: register the program"] {
             assert!(!blocks_on_planner(request), "{request} is the engine's lane, no wait on the planner");
         }

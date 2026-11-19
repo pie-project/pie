@@ -678,6 +678,14 @@ impl FramePolicy {
     /// it waits, its frame goes at once.
     #[cfg(test)]
     pub(crate) fn parked_owner_frame_goes_at_once(owner: ProcessId) -> bool {
+        Self::parked_owner_frame_goes_at_once_by(owner, false)
+    }
+
+    /// As [`Self::parked_owner_frame_goes_at_once`], the owner parked by
+    /// its suspension (`suspend`: an eviction, its guest between waits)
+    /// rather than by a wait of its own.
+    #[cfg(test)]
+    pub(crate) fn parked_owner_frame_goes_at_once_by(owner: ProcessId, suspend: bool) -> bool {
         let mut policy =
             Self::new(1, 64, 4096, None).with_submit_deadline(std::time::Duration::from_secs(86_400));
         let other = ProcessId::new_v4();
@@ -700,7 +708,11 @@ impl FramePolicy {
             policy.plan_dispatch(&queued, &HashSet::new(), false, now),
             FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
         );
-        policy.on_owner_waits(owner);
+        if suspend {
+            policy.on_process_suspend(owner);
+        } else {
+            policy.on_owner_waits(owner);
+        }
         let goes = matches!(
             policy.plan_dispatch(&queued, &HashSet::new(), false, now),
             FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
@@ -1587,7 +1599,9 @@ mod tests {
         let mut failures = Vec::new();
         for seed in 0..1000u64 {
             let mut rng = Rng(seed);
-            let mut policy = FramePolicy::new(1, 64, 4096, None)
+            // One frame or two in flight per lane (the dumps' k=2).
+            let k = 1 + rng.below(2) as usize;
+            let mut policy = FramePolicy::new(k, 64, 4096, None)
                 .with_submit_deadline(Duration::from_secs(86_400));
             let lanes: Vec<ProcessId> = (0..2 + rng.below(4)).map(|_| pid()).collect();
             let mut seq = vec![0u64; lanes.len()];
@@ -1597,7 +1611,7 @@ mod tests {
             // 0 submitting, 1 waiting on the planner (silent, awaited), 2 parked.
             let mut state = vec![0u8; lanes.len()];
             let mut parked_fires: Vec<u64> = Vec::new();
-            let mut schedule = vec![format!("lanes={}", lanes.len())];
+            let mut schedule = vec![format!("k={k} lanes={}", lanes.len())];
             let mut failed = None;
             for round in 0..10 {
                 for (at, &lane) in lanes.iter().enumerate() {
