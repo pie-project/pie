@@ -83,6 +83,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     )
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    // The product times the device's profile holds choose between the
+    // kernels that can serve a decode product; arming notes the shapes it
+    // lacks, measured once it has armed (`Staged::finish`).
+    #[cfg(feature = "rocm")]
+    device.set_routes(std::sync::Arc::new(kernels_cuda::linear::routes::Routes::of(
+        chip.rates().product_ns.as_deref().unwrap_or_default(),
+    )));
     let engine = crate::chip::Engine::of(&chip);
     // The most rows one prompt lays: its context, where the model keeps a
     // lane's rows (kv or recurrent state); a model that keeps none (a
@@ -1806,6 +1813,7 @@ impl Shell {
             weights_held: boot.knobs.weights_held,
             device_total,
             free_before,
+            profiles: boot.knobs.profiles.clone(),
         })
     }
 }
@@ -1928,6 +1936,9 @@ pub struct Staged {
     weights_held: bool,
     device_total: u64,
     free_before: u64,
+    /// Where the device's user profile lies (the product times a load
+    /// measures are saved there).
+    profiles: Option<std::path::PathBuf>,
 }
 
 impl Staged {
@@ -1940,7 +1951,10 @@ impl Staged {
             weights_held,
             device_total,
             free_before,
+            profiles,
         } = self;
+        #[cfg(not(feature = "rocm"))]
+        let _ = &profiles;
         if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -1982,6 +1996,8 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
+            #[cfg(feature = "rocm")]
+            shell.routes_measured(profiles.as_deref())?;
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
             }
@@ -2142,6 +2158,58 @@ impl Shell {
     }
 
     /// A measuring load's second fit: the bodies armed over the least range
+    /// The decode product shapes the armed bodies met with no measured time
+    /// (`kernels_cuda::linear::routes`): each chosen by its decode body's
+    /// time under each kernel (`Shell::routes_by_body`), saved in the
+    /// device's user profile, and the lattice left armed under the choices.
+    /// A load whose profile holds every shape measures nothing.
+    #[cfg(feature = "rocm")]
+    fn routes_measured(&mut self, profiles: Option<&std::path::Path>) -> Result<()> {
+        let Some(routes) = self.device.ctx().routes().cloned() else {
+            return Ok(());
+        };
+        let wanted = routes.wanted();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let measured = self.routes_by_body(routes, &wanted)?;
+        let saved = crate::rates::save_product_times(profiles, self.device.name(), &measured)
+            .map_err(Fault::Card)?;
+        let chosen = self.device.ctx().routes().cloned();
+        let said: Vec<String> = wanted
+            .keys()
+            .map(|s| {
+                let us = |kernel| {
+                    measured
+                        .iter()
+                        .find(|(shape, k, ..)| shape == s && *k == kernel)
+                        .map_or(f64::NAN, |&(.., ns, _)| ns / 1e3)
+                };
+                let pick = chosen.as_ref().map(|c| c.pick(*s, 0));
+                format!(
+                    "{:?} {}x{} m{}: step {:.1} us skinny / {:.1} us turned -> {:?}",
+                    s.kind,
+                    s.rows,
+                    s.k,
+                    s.m,
+                    us(kernels_cuda::linear::routes::Kernel::Skinny),
+                    us(kernels_cuda::linear::routes::Kernel::Turned),
+                    pick.unwrap_or(kernels_cuda::linear::routes::Kernel::Skinny),
+                )
+            })
+            .collect();
+        eprintln!(
+            "engine-cuda: chose the kernel of {} decode product shapes by their bodies' times in \
+             {:.1} s ({}); {}",
+            said.len(),
+            started.elapsed().as_secs_f64(),
+            saved.map_or_else(|| "not saved: no profile directory".to_string(), |p| format!("saved to {p}")),
+            said.join("; "),
+        );
+        Ok(())
+    }
+
     /// took `bodies_took`; they are forgotten, the range is fitted to what
     /// the card has past that hold, and the lattice armed again over it.
     /// Its record holds the figure, so a later boot fits once.

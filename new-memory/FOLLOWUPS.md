@@ -727,6 +727,28 @@ What replaces it: turn vs skinny priced per (n, k, m) from device durations. Eit
 that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
 slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
 
+Resolved: the decision is gone. Inside the turn rows, a bank both kernels cover takes the kernel
+its decode body is measured faster on. At the first boot that meets a shape, the lattice is
+armed with that bank on each kernel and the m-lane decode body replayed (9 rounds of 20 fires).
+The turned kernel is kept where it is faster past the rounds' interquartile spread, else the
+skinny kernel. The step times are saved in the device's user profile (`[rates] product_ns`,
+keyed by kind, bank rows, K and m), so later boots measure nothing.
+
+On qwen3-0.6b / MI300X the first boot chose 5 shapes in 7.5 s:
+- o-proj at m = 4: skinny;
+- gate-up at m = 4, the lm head at m = 4, and o-proj at m = 8: turned;
+- qkv at m = 4: skinny (22 µs within its 26 µs spread).
+
+The second boot: 4-parallel 1.463 ms a step, beam-4 2.138 (against 1.475 / 2.15 with the
+constant); greedy, c64, prefill flat.
+
+Per-product graph bursts were tried first and mispredict. One product back to back over its
+layers' weights put gate-up at m = 4 on skinny (8.74 vs 8.89 µs); the step has turn 20 µs
+faster. A product's cost is measured in its real neighbourhood (F40).
+
+Open: the first boot's 7.5 s re-arms the whole lattice once per choice. Arming only the
+buckets a shape's rows name would cut it to the decode bodies'.
+
 ## F40. ROCm 4-row decode: where the 4-parallel step's ~170 µs over 1 greedy goes (MI300X, qwen3-0.6b)
 
 At short context 1 greedy is 1.31 ms a step and 4 parallel 1.48 (after the turned norm
@@ -774,6 +796,12 @@ Tried, none kept (4-parallel ms a step, against 1.475–1.484):
 - turn_min_n removed (o-proj on turn): 1.510 (F39);
 - the turned kernel's tiles spread evenly (192 two-tile blocks for gate-up's 384 tiles over
   304 CUs): 1.498–1.505.
+
+Instruments, ranked by fidelity, for a kernel's cost in a decode step:
+- the step's own replay, the body armed each way (F39), or duplication of the kernel inside it;
+- graph bursts of one product (a different neighbourhood: they reversed gate-up's order);
+- the attach kernel trace (kernels ~290 µs apart);
+- stream-timed microbenchmarks (dispatch-capped near 5 µs).
 
 Next:
 - gated turned product at m = 4: why its walk streams at 1.4 TB/s (latency per tile under
