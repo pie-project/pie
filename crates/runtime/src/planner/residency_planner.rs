@@ -30,6 +30,10 @@ pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
+/// The key a demote's pages are expected under while it moves: they come
+/// back once its copy has landed, and a shortfall read meanwhile counts them
+/// arriving instead of evicting another process for room on its way.
+const DEMOTE: ProcessId = ProcessId::max();
 
 pub struct ResidencyPlanner {
     pub(super) inner: parking_lot::Mutex<Inner>,
@@ -389,6 +393,17 @@ impl ResidencyPlanner {
             self.demoting.store(false, Ordering::Release);
             return false;
         };
+        let pages = txn.page_count() as u32;
+        ptrace!("demote begins pages={}", pages);
+        self.with_inner(|inner| {
+            inner.evicting.insert(
+                DEMOTE,
+                Reclaim {
+                    pages,
+                    rs: RsUnits::default(),
+                },
+            )
+        });
         exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
         true
     }
@@ -403,6 +418,8 @@ impl ResidencyPlanner {
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {
+        ptrace!("demote done moved={}", moved);
+        self.with_inner(|inner| inner.settle_eviction(DEMOTE));
         self.demoting.store(false, Ordering::Release);
         if moved {
             self.re_arm_idle_reclaim();

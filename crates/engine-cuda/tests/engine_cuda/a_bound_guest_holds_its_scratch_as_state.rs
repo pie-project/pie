@@ -218,7 +218,7 @@ fn a_bound_guest_holds_its_scratch_as_state() {
     let state = shell
         .guest_state(program, extents)
         .expect("the program's guest state");
-    assert!(state.per_instance > 0, "{state:?}");
+    assert!(state.instance_bytes() > 0, "{state:?}");
     assert!(state.per_pair > 0, "{state:?}");
 
     let rungs = shell.chunk_facts().expect("the chunk facts").act_chunks;

@@ -511,6 +511,24 @@ impl Frame {
         self.committed.borrow_mut().push(then);
     }
 
+    /// Runs `body`'s encoding in a command buffer of its own (the frame's work
+    /// before it flushed ahead, the frame's after it in the next buffer) and
+    /// waits for it: its device seconds, or `None` where a blit pass is open
+    /// and the frame can't flush. The kernel profile's guest regions.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn timed<R>(&self, body: impl FnOnce() -> Result<R>) -> Result<(R, Option<f64>)> {
+        if !self.flush()? {
+            return Ok((body()?, None));
+        }
+        let out = body()?;
+        if !self.flush()? {
+            return Ok((out, None));
+        }
+        let buffer = self.flushed.borrow().last().cloned().expect("a flush keeps its buffer");
+        buffer.waitUntilCompleted();
+        Ok((out, Some(buffer.GPUEndTime() - buffer.GPUStartTime())))
+    }
+
     /// Commits what is encoded so far and opens a fresh buffer on the same
     /// queue for the rest, so the device starts on the head of a long fire
     /// while its tail is still being encoded. The queue runs the two in

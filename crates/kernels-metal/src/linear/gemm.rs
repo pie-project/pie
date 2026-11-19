@@ -97,6 +97,41 @@ pub fn lm_head(
 /// `act . w^T` for bf16 activations and weights. On a GPU with tensor ops,
 /// rows from the tensor-op tile's 8 up take it where the shape fits its
 /// tiles; every other GPU and shape takes the simdgroup-matrix kernels.
+/// The first row count of each band the routing of [`act_x_wt`] keeps one
+/// kernel over, at every shape and on either tier: one row; the few-row
+/// forms unrolled for 2, 4 and 8 rows (2; 3-4; 5-8); the tensor-op tile
+/// from 8 and its wider column tile past [`MPP_NARROW_ROWS`]; the row tiles
+/// past [`VECTOR_MAX_ROWS`] and from [`TILE_M`]. A load builds every
+/// pipeline a fire can be routed to by walking each of these row counts its
+/// rungs reach beside the rungs' own (a walk of the rungs alone missed the
+/// 8-row vector form on a tensor-op GPU, where rows 5-7 take it and the
+/// 8-row rung takes the tensor-op tile).
+pub const ROW_BANDS: [u32; 8] = [1, 2, 3, 5, 8, VECTOR_MAX_ROWS, TILE_M, MPP_NARROW_ROWS + 1];
+
+/// The kernel [`act_x_wt`] fires for `rows` rows into `columns` columns
+/// over `contraction` (`f32_out`: f32 columns): what the dispatch takes,
+/// and what a load's walk must have built.
+#[must_use]
+pub fn route(tuning: &Tuning, rows: u32, columns: u32, contraction: u32, f32_out: bool) -> String {
+    if f32_out {
+        KSPLIT_F32_ENTRY.to_string()
+    } else if rows == 1 && columns <= KSPLIT_MAX_COLUMNS {
+        KSPLIT_ENTRY.to_string()
+    } else if rows == 1 {
+        VECTOR_ENTRY.to_string()
+    } else if few_rows(tuning, rows, columns, contraction) && columns <= KSPLIT_MAX_COLUMNS {
+        KSPLIT_ROWS_ENTRY[unrolled(rows)].to_string()
+    } else if few_rows(tuning, rows, columns, contraction) {
+        ROWS_ENTRY[unrolled(rows)].to_string()
+    } else if let Some((bm, bn)) = mpp_fit(tuning, rows, columns, contraction) {
+        format!("dense_gemm_mpp_m{bm}_n{bn}_s4")
+    } else if rows < TILE_M {
+        NARROW_ENTRY.to_string()
+    } else {
+        TILE_ENTRY.to_string()
+    }
+}
+
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tuning: &Tuning,
@@ -134,6 +169,11 @@ pub fn act_x_wt(
             tile_grid(op, rows, columns, TILE_M, TILE_GROUP)?,
         )
     };
+    debug_assert_eq!(
+        entry,
+        route(tuning, rows, columns, contraction, y.dtype == dtype::Dtype::F32),
+        "the dispatch and its route part"
+    );
     ctx.fire(
         Fire::at(FILE, entry).apply(grid),
         &[
@@ -289,4 +329,62 @@ fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error>
             )
         })?;
     Ok(Grid::of([lanes, rows, 1], [VECTOR_GROUP, 1, 1]))
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::{ROW_BANDS, route};
+    use crate::Tuning;
+
+    fn tunings() -> [Tuning; 2] {
+        let mut registry = profile::Registry::new("metal", &[], &["rows"]);
+        crate::tuning::register(&mut registry);
+        let profile = registry.with_overrides("");
+        let plain = Tuning::new(profile, false, None);
+        [plain.clone(), plain.with_family(10)]
+    }
+
+    /// Every row count up to a load's top rung is routed to a kernel the
+    /// load's walk builds (its rungs' row counts and every band start below
+    /// the top), on a GPU with tensor ops and without, at a layer's and a
+    /// head's shapes, narrow and wide, f32 columns too. A walk of the rungs
+    /// alone left rows 5-7 on a tensor-op GPU on the 8-row vector form no
+    /// rung reached: every such fire was refused.
+    #[test]
+    fn every_row_count_is_routed_to_a_kernel_the_walk_builds() {
+        let shapes = [
+            (1024u32, 4096u32),
+            (2048, 1024),
+            (1024, 6144),
+            (3072, 1024),
+            (512, 192),
+            (1024, 151_936),
+            (1023, 640),
+        ];
+        for top in [8u32, 64, 512] {
+            let rungs: Vec<u32> = (0..).map(|p| 1u32 << p).take_while(|&r| r <= top).collect();
+            let walked: Vec<u32> = rungs
+                .iter()
+                .copied()
+                .chain(ROW_BANDS.iter().copied().filter(|&b| b <= top))
+                .collect();
+            for tuning in tunings() {
+                for &(k, n) in &shapes {
+                    for f32_out in [false, true] {
+                        let built: std::collections::BTreeSet<String> =
+                            walked.iter().map(|&rows| route(&tuning, rows, n, k, f32_out)).collect();
+                        for rows in 1..=top {
+                            let kernel = route(&tuning, rows, n, k, f32_out);
+                            assert!(
+                                built.contains(&kernel),
+                                "rows {rows} at K={k} N={n} (tensor ops {}, top {top}) take {kernel}, \
+                                 which the walk of {walked:?} does not build",
+                                tuning.tensor_ops()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

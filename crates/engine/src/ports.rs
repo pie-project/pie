@@ -1,4 +1,5 @@
-use eta_ir::registry::{GeometryClass, Port, PortMask};
+pub use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{Port, PortMask};
 
 use crate::fire::{Mask, Masking};
 
