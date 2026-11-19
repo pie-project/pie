@@ -402,3 +402,7 @@ partials summed by the last block). On MI300X a ticket tail (stores through
 the L2, the atomic's round trip, reads past the L2) costs more than the
 ~1.6 us node it removes. Fusions that cut nodes there want one block to own
 the whole row (no tail), not a last-block reduction.
+
+## F34. Tensor-parallel score capture: the score row's reduce across ranks
+Since Dim::Capturing (9e78d2281) a capturing lane's key row is summed over the layers in place, so under tensor parallelism each rank holds a partial row and the shard pass emits one all_reduce on it, in place on the Capture-placed row (the arena's one exact Capture-to-Capture share; `sc/gpu-poem-suite-mask`). Guest epilogues read that row on the device (CUDA: the reading guest's instance slots, `engine-cuda/src/scores.rs`; engine-gpu: the pair's score room), so it can't be summed at host readout. The rows are scattered one per capturing lane, outside the arena, so engine-cuda (CUDA / ROCm) and engine-gpu (the band collective) refuse a tensor-parallel load that captures scores, by name, instead of reducing the wrong memory. Metal (collectives unsupported) and XLA (single replica) never see it; the CPU oracle sums correctly.
+What's owed: a reduce that sums each lane's row (and its page sums) across ranks through the row tables, under graph capture (gather, reduce, scatter, or a reduce that walks the row table), then the refusal lifted. Needs a box with 2+ GPUs per backend to build and test; none of the current machines has one (L40S: 1 GPU; AMD: one MI300X VF).
