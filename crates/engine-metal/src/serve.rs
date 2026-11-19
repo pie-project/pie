@@ -3655,23 +3655,29 @@ impl Shell {
     }
 
     /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
+    /// The step's prologues in one command buffer and one wait
+    /// (`Programs::fire_batched`): their status and the cells they put are
+    /// read on the host before the forward is encoded (each prologue's
+    /// verdict, the descriptor ports and input feeds), so the wait stays,
+    /// once a step rather than once a region an instance.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        for attached in attachments.iter().filter(|a| !a.adapter_only) {
-            if !self.programs.prologue_runs(attached.instance) {
-                continue;
-            }
-            match self
-                .programs
-                .fire(&self.device, attached.instance, Stage::Prologue)?
-            {
+        let ids: Vec<engine::InstanceId> = attachments
+            .iter()
+            .filter(|a| !a.adapter_only && self.programs.prologue_runs(a.instance))
+            .map(|a| a.instance)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for (instance, fired) in self.programs.fire_batched(&self.device, &ids, Stage::Prologue)? {
+            match fired {
                 crate::Fired::Committed => {}
                 other => {
                     return Err(Fault::program(
                         "serve::prologue",
                         format!(
-                            "instance {}'s prologue did not commit ({other:?}), so the \
-                             forward has no cells to read",
-                            attached.instance
+                            "instance {instance}'s prologue did not commit ({other:?}), so the \
+                             forward has no cells to read"
                         ),
                     ));
                 }
