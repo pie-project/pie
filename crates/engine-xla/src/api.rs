@@ -583,6 +583,8 @@ impl Engine for Xla {
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
             classes: shell.classes(),
+            // XLA states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
@@ -663,6 +665,7 @@ impl Engine for Xla {
             .programs
             .register(registration, device)
             .map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -695,6 +698,7 @@ impl Engine for Xla {
         };
         let Compiled { pending, staged } = *compiled;
         let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.forget_evicted();
         self.refused(registered)
     }
 
@@ -1141,6 +1145,17 @@ struct DeviceLane {
 }
 
 impl Xla {
+    /// Drops from the device's cache the compiled stages the guest stage
+    /// cache evicted, so their memory is freed with them.
+    fn forget_evicted(&mut self) {
+        let evicted = self.programs.take_evicted();
+        if let Some(shell) = &self.shell {
+            for key in &evicted {
+                shell.device().forget_key(key);
+            }
+        }
+    }
+
     /// Resolves every lane an instance bound in `DeviceGeometry` describes
     /// on its descriptor ports: its tokens, positions, KV extent, the slots
     /// its rows land in (whose page table and write descriptor come from
@@ -1181,6 +1196,15 @@ impl Xla {
                 .map(|lane| lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            let owned = attached.lanes.max(1) as usize;
+            if carried > owned {
+                return Err(program(format!(
+                    "instance {} is attached over {owned} lane(s) at lane {first} and its \
+                     `embed_indptr` port describes {carried}: a program's ports state its own \
+                     lanes' geometry, never the next request's",
+                    attached.instance
+                )));
+            }
             if first + carried > lanes.len() {
                 return Err(program(format!(
                     "instance {} is attached at lane {first} and its `embed_indptr` port \
@@ -1325,13 +1349,13 @@ impl Xla {
         submission: &engine::fire::Step,
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<()> {
-        let prologues: Vec<(InstanceId, u32)> = submission
+        let prologues: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| {
                 !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
             })
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         if prologues.is_empty() {
             return Ok(());
@@ -1852,11 +1876,11 @@ impl Xla {
             }
         }
 
-        let attached: Vec<(InstanceId, u32)> = submission
+        let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| !attachment.adapter_only)
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {

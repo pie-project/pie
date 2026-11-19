@@ -869,6 +869,9 @@ impl Engine for Cuda {
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // CUDA states no bound on one submission (no watchdog on a
+            // compute device).
+            guest_cost: engine::GuestCost::default(),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a

@@ -149,6 +149,7 @@ impl Build {
                 q,
                 plan,
                 cache,
+                mask: None,
                 window: None,
                 head_dim: 4,
                 sm_scale: 1.0,

@@ -20,7 +20,7 @@ use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
 use super::lower::{self, Batch, Feed, Layout, Read, Slot};
-use crate::device::{Admission, Device, Program, available_memory};
+use crate::device::{Admission, Device, Program, available_memory, compile_need, hold_bytes};
 use crate::pjrt::{Arg, Buffer};
 use crate::readout::{Kept, Seat};
 
@@ -34,13 +34,28 @@ pub struct Bound {
     pub seat: Seat,
 }
 
-/// Where an instance attached at the fire's lane `lane` reads every output
-/// `plan` reads, when each binds on the device.
-#[must_use]
-pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Bound>> {
-    let bound: Vec<Bound> = (plan.outputs().into_iter())
+/// Where an instance attached at the fire's lanes `lane..lane + lanes`
+/// reads every output `plan` reads, when each binds on the device. Its
+/// seats are its own lanes' rows: a program reading a lane past the ones
+/// it is attached over is refused by name, and no seat runs into the
+/// next attachment's lanes.
+pub fn bound(
+    plan: &ExecPlan,
+    kept: Option<&Kept>,
+    lane: u32,
+    lanes: u32,
+) -> Result<Option<Vec<Bound>>, String> {
+    let outputs = plan.outputs();
+    if let Some((name, k)) = outputs.iter().find(|(_, k)| *k >= lanes) {
+        return Err(format!(
+            "its program reads output `{name}` of its lane {k}, and it is attached over \
+             {lanes} lane(s)"
+        ));
+    }
+    let end = (lane + lanes) as usize;
+    let bound: Option<Vec<Bound>> = (outputs.into_iter())
         .map(|(name, k)| {
-            let (plane, seat) = kept?.bound(lane as usize + k as usize, name)?;
+            let (plane, seat) = kept?.bound(lane as usize + k as usize, end, name)?;
             Some(Bound {
                 name: name.to_string(),
                 lane: k,
@@ -48,13 +63,16 @@ pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Boun
                 seat,
             })
         })
-        .collect::<Option<_>>()?;
+        .collect();
+    let Some(bound) = bound else {
+        return Ok(None);
+    };
     let binds = plan
         .package
         .values
         .iter()
         .all(|v| v.source != ValueOrigin::Output || device_binds(v, kept, &bound));
-    binds.then_some(bound)
+    Ok(binds.then_some(bound))
 }
 
 /// A lowered stage, compiled; `program` is `None` for a stage that puts
@@ -62,6 +80,14 @@ pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Boun
 pub struct Staged {
     pub program: Option<Arc<Program>>,
     pub layout: Layout,
+    /// The device's cache key of `program`'s text: what an eviction drops
+    /// there too, so the compiled form is freed and not only unlisted.
+    pub text_key: Option<[u8; 32]>,
+    /// The host memory the compiled program holds ([`hold_bytes`]) and what
+    /// compiling it took ([`compile_need`]): what the stage cache charges
+    /// and yields against the host's room.
+    pub held: u64,
+    pub need: u64,
 }
 
 /// Compiled stages by (program content, stage, batch shape): a pass that
@@ -72,6 +98,13 @@ type StageKey = ([u8; 32], usize, Batch, Vec<u32>);
 #[derive(Default)]
 pub struct Stages {
     map: HashMap<StageKey, Arc<Staged>>,
+    /// When each program's stages last ran or were installed, by program
+    /// content: the order an eviction takes them in ([`Stages::yield_room`]).
+    last_used: HashMap<[u8; 32], u64>,
+    clock: u64,
+    /// Compiled forms an eviction dropped from the map, whose device cache
+    /// entries the engine drops next ([`Stages::take_evicted`]).
+    evicted: Vec<[u8; 32]>,
     /// Stage executions and lanes they carried, for the tally.
     pub runs: u64,
     pub lanes: u64,
@@ -170,6 +203,15 @@ fn stage(
     {
         let _ = std::fs::write(path, &lowered.text);
     }
+    let (text_key, held, need) = if lowered.layout.runs() {
+        (
+            Some(*blake3::hash(lowered.text.as_bytes()).as_bytes()),
+            hold_bytes(&lowered.text),
+            compile_need(&lowered.text),
+        )
+    } else {
+        (None, 0, 0)
+    };
     let program = if !lowered.layout.runs() {
         None
     } else {
@@ -189,6 +231,9 @@ fn stage(
     Ok(Arc::new(Staged {
         program,
         layout: lowered.layout,
+        text_key,
+        held,
+        need,
     }))
 }
 
@@ -207,6 +252,8 @@ impl Stages {
         carried: &[u32],
     ) -> Result<Arc<Staged>, String> {
         let slot = (key, at, batch.clone(), carried.to_vec());
+        self.clock += 1;
+        self.last_used.insert(key, self.clock);
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
@@ -221,6 +268,7 @@ impl Stages {
         );
         let staged = stage(device, package, at, batch, carried, self.pool_rows, None)?;
         self.map.insert(slot, Arc::clone(&staged));
+        self.yield_room(key, available_memory());
         Ok(staged)
     }
 
@@ -330,7 +378,69 @@ impl Stages {
         for ((at, batch, c), staged) in wanted.into_iter().zip(staged) {
             self.map.insert((key, at, batch, c), staged);
         }
+        self.clock += 1;
+        self.last_used.insert(key, self.clock);
         tracing::info!(programs = count, "guest stages compiled at registration");
+        self.yield_room(key, available_memory());
+    }
+
+    /// The stage cache's eviction rule, tied to the host-memory ledger its
+    /// compiles are admitted against ([`Admission`] over `available`, the
+    /// host's `MemAvailable`): it holds compiled stages only while the host
+    /// keeps room for the largest compile it has run, so a registration's
+    /// compile is never starved by the stages of programs registered
+    /// before it. Past that, the stages of the program run least recently
+    /// (never `keep`'s, just installed or run) go first, each freeing the
+    /// host bytes it held ([`Staged::held`]), until the room is back or
+    /// nothing else is held. A program evicted and run again compiles in
+    /// its fire, counted (`fire_compiles`). `None` (a host with no reading)
+    /// admits every compile, as [`Admission`] does, and evicts nothing.
+    /// Returns the bytes freed.
+    pub fn yield_room(&mut self, keep: [u8; 32], available: Option<u64>) -> u64 {
+        let Some(available) = available else {
+            return 0;
+        };
+        let need = self.map.values().map(|staged| staged.need).max().unwrap_or(0);
+        let mut freed = 0u64;
+        while available.saturating_add(freed) < need {
+            let Some(victim) = self
+                .last_used
+                .iter()
+                .filter(|(key, _)| **key != keep)
+                .min_by_key(|&(_, &at)| at)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.last_used.remove(&victim);
+            let slots: Vec<StageKey> = self
+                .map
+                .keys()
+                .filter(|slot| slot.0 == victim)
+                .cloned()
+                .collect();
+            for slot in slots {
+                if let Some(staged) = self.map.remove(&slot) {
+                    freed = freed.saturating_add(staged.held);
+                    self.evicted.extend(staged.text_key);
+                }
+            }
+            tracing::info!(
+                freed,
+                available,
+                need,
+                "guest stages of the program run least recently evicted: the host's \
+                 room for the next compile"
+            );
+        }
+        freed
+    }
+
+    /// The device cache keys of the compiled forms evicted since the last
+    /// call: the engine drops them from the device's cache
+    /// ([`Device::forget_key`]) so their memory is freed.
+    pub fn take_evicted(&mut self) -> Vec<[u8; 32]> {
+        std::mem::take(&mut self.evicted)
     }
 
     /// What a pass of the program `key` names takes on the device beyond
@@ -1341,4 +1451,56 @@ fn commit(
         }
     }
     (StepOutcome::Committed, left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Batch, Layout, Staged, Stages};
+    use std::sync::Arc;
+
+    fn staged(held: u64, need: u64, text: u8) -> Arc<Staged> {
+        Arc::new(Staged {
+            program: None,
+            layout: Layout::default(),
+            text_key: Some([text; 32]),
+            held,
+            need,
+        })
+    }
+
+    fn one(lanes: u32) -> Vec<super::Want> {
+        vec![(0, Batch { lanes, reads: Vec::new() }, Vec::new())]
+    }
+
+    /// The stage cache holds what it compiled while the host keeps room for
+    /// its largest compile; short of it, the program run least recently
+    /// goes first (never the one just installed), its compiled forms handed
+    /// to the device cache to drop, until the room is back.
+    #[test]
+    fn the_stage_cache_yields_the_least_recent_program_to_the_hosts_room() {
+        let mut stages = Stages::default();
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        stages.install(a, one(1), vec![staged(100, 1000, 1)]);
+        stages.install(b, one(1), vec![staged(300, 1000, 2)]);
+        stages.install(c, one(1), vec![staged(500, 1000, 3)]);
+        stages.take_evicted();
+        assert_eq!(stages.len(), 3);
+
+        // Room for the largest compile: nothing goes.
+        assert_eq!(stages.yield_room(c, Some(1000)), 0);
+        assert_eq!(stages.len(), 3);
+
+        // 700 short of it... a (100) then b (300) go, c stays.
+        assert_eq!(stages.yield_room(c, Some(600)), 400);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages.take_evicted(), vec![[1u8; 32], [2u8; 32]]);
+
+        // Only the kept program is left: it stays however short the room.
+        assert_eq!(stages.yield_room(c, Some(0)), 0);
+        assert_eq!(stages.len(), 1);
+
+        // No reading of the host: nothing is evicted.
+        assert_eq!(stages.yield_room([9; 32], None), 0);
+        assert_eq!(stages.len(), 1);
+    }
 }

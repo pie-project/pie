@@ -1058,7 +1058,11 @@ impl ProcessCtx {
             )
         };
         {
-            let prog = match crate::pipeline::program::register(container_bytes, readouts) {
+            let prog = match crate::pipeline::program::register(
+                container_bytes,
+                readouts,
+                Some(self.id()),
+            ) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
