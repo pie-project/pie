@@ -146,7 +146,9 @@ fn a_carried_history_copies_none_of_the_pool() {
         pixels: (String::new(), Vec::new()),
         host: None,
     };
-    let bound = engine_xla::guest::run::bound(&plan, Some(&kept), 0).expect("the lane binds");
+    let bound = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 1)
+        .expect("the program reads its own lane")
+        .expect("the lane binds");
     let batch = engine_xla::guest::run::batch_of(&plan.package, 0, 1, Some(&kept), &bound);
     let mut stages = engine_xla::guest::run::Stages::default();
     stages.pool_rows = POOL_ROWS;

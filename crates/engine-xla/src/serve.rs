@@ -2398,7 +2398,7 @@ impl Shell {
         let mask_width = (paging.pages_per_slot.max(1) * paging.page_size.max(1))
             .max(256)
             .next_power_of_two();
-        let staged = crate::mask::stage(&masks, mask_width)?;
+        let staged = crate::mask::stage(&masks, mask_width).map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {

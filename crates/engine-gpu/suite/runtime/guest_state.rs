@@ -304,6 +304,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             adapter: Vec::new(),
             scratch: scratch.clone(),
             pair: pair.clone(),
+            pair_generation: 0,
         })
         .expect("the unpark rebinds its state");
     // The old room is someone else's now.

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
@@ -74,9 +74,29 @@ fn widened(call: usize, source: String) -> std::result::Result<String, String> {
 
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
-const OUTBOX_FLOOR: u64 = 256;
-
-const OUTBOX_KIND: Memory = Memory::Host;
+/// A stage's outbox: its status, then each value the stage puts (what its
+/// run reads back, `eta_exec`'s wanted set), in whole words within its heap.
+fn outbox_bytes(
+    reads: &[u32],
+    offsets: &[u64],
+    descriptors: &[ValueDesc],
+    heap_bytes: u64,
+) -> Result<u64> {
+    reads.iter().try_fold(STATUS_SPAN, |sum, &value| {
+        let at = value as usize;
+        match (offsets.get(at), descriptors.get(at)) {
+            (Some(&offset), Some(desc)) => Ok(sum
+                + desc
+                    .device_bytes()
+                    .next_multiple_of(4)
+                    .min(heap_bytes.saturating_sub(offset))),
+            _ => Err(Fault::Program {
+                at: "guest::session",
+                why: format!("the put value {value} has no span in its stage"),
+            }),
+        }
+    })
+}
 
 /// Every guest pipeline: one a call of the closed set
 /// ([`engine_gpu::guest::step_calls`]), each from a module of its own, all
@@ -262,7 +282,7 @@ impl std::fmt::Debug for Session {
 impl Session {
     pub fn new(
         device: &Context,
-        plans: &[LaunchStagePlan],
+        package: &LaunchPackage,
         code: &[engine_gpu::guest::Lowered],
         args: &[StepArgs],
         library: Arc<Library>,
@@ -271,6 +291,7 @@ impl Session {
         [instance, pair]: [Pair; 2],
         layout: &GuestLayout,
     ) -> Result<Session> {
+        let plans = &package.plans;
         if code.len() != plans.len() || args.len() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
@@ -331,13 +352,27 @@ impl Session {
         }
         let places = [&instance, &pair];
         let mut stages = Vec::with_capacity(plans.len());
-        for (((lowered, resolved), args), &heap) in
-            code.iter().zip(resolved).zip(args).zip(&layout.stages)
+        for (at, (((lowered, resolved), args), &heap)) in code
+            .iter()
+            .zip(resolved)
+            .zip(args)
+            .zip(&layout.stages)
+            .enumerate()
         {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let span = heap_span(places, heap)?;
+            let reads = package.stages.get(at).map_or(Ok(Vec::new()), |stage| {
+                stage
+                    .puts
+                    .iter()
+                    .filter_map(|put| {
+                        engine_gpu::guest::run::local_of(package, at, put.value).transpose()
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
             stages.push(build_stage(
                 device, &core, &library, &status, resolved, tables, lowered, args, heap, span,
+                &reads,
             )?);
         }
 
@@ -520,13 +555,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn read_back(
-        &mut self,
-        device: &Context,
-        frame: &mut Frame,
-        stage: usize,
-        values: &[u32],
-    ) -> Result<()> {
+    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, values: &[u32]) -> Result<()> {
         let mut layout = Vec::with_capacity(values.len());
         let mut cursor = STATUS_SPAN;
         for &value in values {
@@ -543,12 +572,13 @@ impl Session {
         let Session { status, stages, .. } = self;
         let seat = &mut stages[stage];
         if seat.outbox.bytes() < cursor {
-            seat.outbox = Buffer::with(
-                device,
-                cursor,
-                OUTBOX_KIND,
-                engine_gpu::books::owners::GUEST,
-            )?;
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "stage {stage}'s read-back of {cursor} bytes is past its outbox of {},                      which holds each of its values once",
+                    seat.outbox.bytes()
+                ),
+            });
         }
         frame.copy(status, 0, &seat.outbox, 0, STATUS_SPAN)?;
         for &(_, at, into, len) in &layout {
@@ -815,6 +845,7 @@ fn build_stage(
     args: &StepArgs,
     heap: (Side, u64, u64),
     span: (&Buffer, u64, u64),
+    reads: &[u32],
 ) -> Result<Stage> {
     let StageTables {
         descriptors,
@@ -829,8 +860,8 @@ fn build_stage(
     let (args, stride) = (args.buffer.clone(), args.stride);
     let outbox = Buffer::with(
         device,
-        OUTBOX_FLOOR,
-        OUTBOX_KIND,
+        outbox_bytes(reads, &offsets, &descriptors, heap.2)?,
+        Memory::Readback,
         engine_gpu::books::owners::GUEST,
     )?;
     let group = group(core, &library.binds, status, &tables, span, &args)?;
@@ -853,4 +884,47 @@ fn build_stage(
         outbox_layout: Vec::new(),
         collected: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STATUS_SPAN, outbox_bytes};
+    use eta_exec::ValueDesc;
+
+    fn f32s(len: u32) -> ValueDesc {
+        ValueDesc {
+            len,
+            ..ValueDesc::default()
+        }
+    }
+
+    #[test]
+    fn an_outbox_holds_the_status_and_each_put_once() {
+        let descriptors = [f32s(3), f32s(151_936), f32s(1)];
+        let offsets = [0, 16, 16 + 151_936 * 4];
+        let heap = offsets[2] + 4;
+        // Only the stage's puts are read back, not its whole heap.
+        assert_eq!(
+            outbox_bytes(&[0, 2], &offsets, &descriptors, heap).unwrap(),
+            STATUS_SPAN + 12 + 4
+        );
+        assert_eq!(
+            outbox_bytes(&[], &offsets, &descriptors, heap).unwrap(),
+            STATUS_SPAN
+        );
+    }
+
+    #[test]
+    fn a_put_is_read_no_further_than_its_heap() {
+        let descriptors = [f32s(8)];
+        assert_eq!(
+            outbox_bytes(&[0], &[0], &descriptors, 20).unwrap(),
+            STATUS_SPAN + 20
+        );
+    }
+
+    #[test]
+    fn a_put_with_no_span_is_refused() {
+        assert!(outbox_bytes(&[1], &[0], &[f32s(1)], 4).is_err());
+    }
 }

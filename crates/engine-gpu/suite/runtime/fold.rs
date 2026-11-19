@@ -145,6 +145,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
             },
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );
@@ -449,7 +450,7 @@ impl Model {
 
 /// The miniature loaded with `frames` in flight.
 fn load(frames: u8) -> Option<(Model, InstanceId)> {
-    let boot = backend::DeviceBoot::default();
+    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;

@@ -342,6 +342,7 @@ impl Plane {
         pooled: session::Pooled<'_>,
         scratch: &engine::ScratchPlace,
         pair: &engine::ScratchPlace,
+        pair_generation: u64,
     ) -> Result<InstanceId> {
         let pools = pooled.pools;
         let program = self
@@ -385,7 +386,10 @@ impl Plane {
         );
         // Its pair's batch sets and its own scratch are laid now, in the
         // state the runtime took for them: refused here rather than at a fire.
-        if let Err(why) = self.join_pair(context, pools, id, pair).and_then(|()| self.lay_scratch(pools, id)) {
+        if let Err(why) = self
+            .join_pair(context, pools, id, pair, pair_generation)
+            .and_then(|()| self.lay_scratch(pools, id))
+        {
             let _ = self.close_instance(id);
             return Err(why);
         }
@@ -458,7 +462,7 @@ impl Plane {
         };
         let scratch = take(state.per_instance);
         self.bind(
-            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair,
+            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )
     }
 
@@ -471,6 +475,7 @@ impl Plane {
         pools: &Pools,
         id: InstanceId,
         place: &engine::ScratchPlace,
+        generation: u64,
     ) -> Result<()> {
         let (program, extents) = self
             .instances
@@ -483,7 +488,18 @@ impl Plane {
             .find(|held| held.program == program && held.extents == extents);
         let pair = if let Some(held) = held {
             held.bound += 1;
-            held.id
+            // Its state another taking of slots than its sets were laid in
+            // (given back while its instances stayed bound, written by
+            // another owner, taken again, perhaps at the same refs): laid
+            // again there, over whatever the other owner left. The same
+            // live slots bound again lay nothing.
+            let pair = held.id;
+            if held.place != *place || held.generation != generation {
+                held.place = place.clone();
+                held.generation = generation;
+                self.lay_pair(pools, pair)?;
+            }
+            pair
         } else {
             let pair = self.next_pair;
             self.next_pair += 1;
@@ -493,6 +509,7 @@ impl Plane {
                 extents,
                 bound: 1,
                 place: place.clone(),
+                generation,
             });
             if let Some(bound) = self.instances.get_mut(&id) {
                 bound.pair = pair;
@@ -787,6 +804,7 @@ impl Plane {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => {
                 let bound = self
@@ -805,6 +823,7 @@ impl Plane {
                 if !matches!(pair, engine::ScratchPlace::None) {
                     if let Some(held) = self.pairs.iter_mut().find(|held| held.id == owner) {
                         held.place = pair.clone();
+                        held.generation = *pair_generation;
                     }
                     self.lay_pair(pools, owner)?;
                 }
@@ -961,12 +980,34 @@ impl Plane {
         dtype: eta_ir::Dtype,
         width: u32,
         stride: u32,
+        rows_held: u32,
     ) -> Result<()> {
         self.instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_output(name, lane, base, offset, dtype, width, stride)
+            .bind_output(name, lane, base, offset, dtype, width, stride, rows_held)
+    }
+
+    /// Whether instance `id`'s lane-0 read of `name` covers its lane `lane`.
+    pub fn covers(&self, id: InstanceId, name: &str, lane: u32) -> Result<bool> {
+        Ok(self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .session
+            .covers(name, lane))
+    }
+
+    /// Why instance `id` reads rows past what its lanes' seats hold, if it
+    /// does: its binding is refused, never launched into other lanes' rows.
+    pub fn rows_unbounded(&self, id: InstanceId) -> Result<Option<String>> {
+        Ok(self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .session
+            .rows_unbounded())
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<session::Blocked>> {
@@ -1301,6 +1342,9 @@ struct Pair {
     extents: Extents,
     bound: u32,
     place: engine::ScratchPlace,
+    /// Which taking of `place` its sets were laid in
+    /// (`engine::InstanceBinding::pair_generation`).
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -1481,7 +1525,7 @@ mod tests {
             .expect("the instance binds");
         let logits = crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a plane");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
             .expect("the logits bind");
         let readers = [
             ("gather of rows", index(gathered)),
@@ -1692,7 +1736,7 @@ mod tests {
         let bytes: Vec<u8> = values.iter().flat_map(|&v| bf16_of(v).to_le_bytes()).collect();
         logits.write(0, &bytes).expect("the logits write");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
             .expect("the logits bind");
         // One fire to build the pipelines, one timed.
         let _ = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
@@ -1966,6 +2010,7 @@ mod tests {
                     eta_ir::Dtype::Bf16,
                     seat.width,
                     seat.row_stride,
+                    1,
                 )
                 .expect("the logits seat binds");
         }
@@ -2120,6 +2165,7 @@ mod tests {
                 eta_ir::Dtype::Bf16,
                 case.vocab,
                 case.vocab,
+                1,
             )
             .expect("a seat binds; the fire refuses it");
         let why = plane
@@ -2646,7 +2692,7 @@ mod tests {
                         .copy_from_slice(&0x3f80u16.to_le_bytes());
                     logits.write(0, &bf16).expect("the logits write");
                     plane
-                        .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                        .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                         .expect("the logits bind");
                     planes.push(logits);
                     id
@@ -2808,7 +2854,7 @@ mod tests {
             let logits_plane = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
                 .expect("a logits plane");
             plane
-                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                 .expect("the logits bind");
             let fired = plane
                 .fire(&context, id, Attach::Epilogue)
@@ -2879,6 +2925,7 @@ mod tests {
                         eta_ir::Dtype::Bf16,
                         VOCAB,
                         VOCAB,
+                        1,
                     )
                     .expect("the logits bind");
                 id
@@ -3001,7 +3048,7 @@ mod tests {
                     .copy_from_slice(&0x3f80u16.to_le_bytes());
                 logits.write(0, &bf16).expect("the logits write");
                 plane
-                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
                     .expect("the logits bind");
                 (id, logits)
             })
@@ -3095,6 +3142,7 @@ mod tests {
                     eta_ir::Dtype::Bf16,
                     VOCAB,
                     VOCAB,
+                    1,
                 )
                 .expect("the logits bind");
             id
@@ -3231,6 +3279,7 @@ mod tests {
                     adapter: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .expect("the slots rebind");
@@ -3310,6 +3359,7 @@ mod tests {
                     adapter: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .expect("the slots rebind");
@@ -3362,7 +3412,7 @@ mod tests {
             )
             .expect("the instance binds");
         plane
-            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
             .expect("the logits bind");
         let fire = |plane: &mut Plane, logits: &mut crate::device::Buffer, at: u32| -> i32 {
             let mut bf16 = vec![0u8; VOCAB as usize * 2];

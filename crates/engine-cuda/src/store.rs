@@ -2798,6 +2798,9 @@ impl Pools {
     ) -> Result<()> {
         self.fence_all_swaps(stream)?;
         self.chunks.evacuate(stream, evacuation)?;
+        // The copy's own completion: `release_segments` settles it before
+        // the evacuated segment goes, so no later fire need retire first.
+        self.hold_until(stream, Vec::new(), Vec::new())?;
         // A cached atom's chunk may have moved: its table entry with it.
         self.stage_row_tables(stream)?;
         self.stage_expert_tables(stream)

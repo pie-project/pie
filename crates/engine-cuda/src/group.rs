@@ -242,7 +242,14 @@ impl Group {
                     heard += 1;
                     eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
                     if refused.is_none() {
-                        self.poison_with(&format!("rank {rank} refused: {error}"));
+                        // Every rank refusing the same lanes ran nothing:
+                        // the group stays whole (`engine::Error::Lanes`).
+                        let lanes = match &error {
+                            Error::Lanes(lanes) => Some(lanes.clone()),
+                            _ => None,
+                        };
+                        let mut agreed = lanes.is_some() && answers.iter().all(Option::is_none);
+                        let first = format!("rank {rank} refused: {error}");
                         refused = Some(error);
                         let grace = std::time::Instant::now() + GRACE;
                         while heard < size {
@@ -250,13 +257,23 @@ impl Group {
                             match rx.recv_timeout(left) {
                                 Ok((rank, Err(error))) => {
                                     heard += 1;
+                                    agreed &= matches!(
+                                        (&error, &lanes),
+                                        (Error::Lanes(these), Some(first)) if these == first
+                                    );
                                     eprintln!(
                                         "engine-cuda: tensor-parallel rank {rank} refused: {error}"
                                     );
                                 }
-                                Ok(_) => heard += 1,
+                                Ok(_) => {
+                                    heard += 1;
+                                    agreed = false;
+                                }
                                 Err(_) => break,
                             }
+                        }
+                        if !(agreed && heard == size) {
+                            self.poison_with(&first);
                         }
                         break;
                     }
@@ -555,8 +572,18 @@ impl Engine for Group {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let frame = frame.clone();
-        self.each(move |rank| rank.submit(&frame))
-            .map(|mut tickets| tickets.swap_remove(0))
+        let tickets = self.each(move |rank| rank.submit(&frame))?;
+        // Ranks fire one frame: a frame one rank stopped short where another
+        // did not has its ranks apart.
+        if tickets
+            .iter()
+            .any(|ticket| ticket.steps.len() != tickets[0].steps.len() || ticket.refused != tickets[0].refused)
+        {
+            let why = "the tensor-parallel ranks stopped one frame at different steps";
+            self.poison_with(why);
+            return Err(Error::Device(why.to_string()));
+        }
+        Ok(tickets.into_iter().next().expect("a group has a rank"))
     }
 
     fn settles_asynchronously(&self) -> bool {

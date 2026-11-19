@@ -12,7 +12,7 @@ use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
-use super::{Demand, Growth, PoolTarget, Retarget, Signal};
+use super::{Growth, Mapped, PoolTarget, Retarget, Signal};
 
 /// Today's pools of one engine, and the slots its weight shapes take; or
 /// the shared pool an engine that states one runs on, the weight shapes'
@@ -60,6 +60,14 @@ impl EnginePool {
     #[must_use]
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
+    }
+
+    /// What the shared pool's floor is made of; `None` on a pinned pool.
+    #[must_use]
+    pub fn floor_parts(&self) -> Option<crate::store::shared::FloorParts> {
+        self.shared
+            .as_ref()
+            .map(|grow| grow.shared().lock().unwrap().floor_parts())
     }
 
     /// See [`SharedGrow::held_back`]; a pinned pool holds nothing back.
@@ -112,17 +120,16 @@ impl EnginePool {
 }
 
 impl PoolTarget for EnginePool {
-    fn demand(&mut self) -> Demand {
-        self.target_mut()
-            .map_or(Demand { wanted: 0, live: 0 }, PoolTarget::demand)
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.target().map_or(1, PoolTarget::segment_bytes)
     }
 
     fn floor(&self) -> u64 {
         self.target().map_or(0, PoolTarget::floor)
+    }
+
+    fn least_mapped(&self) -> u64 {
+        self.target().map_or(0, PoolTarget::least_mapped)
     }
 
     /// What the pool may map where the engine holds part of its range back
@@ -144,6 +151,10 @@ impl PoolTarget for EnginePool {
 
     fn held(&self) -> u64 {
         self.target().map_or(0, PoolTarget::held)
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.target().map_or_else(Mapped::default, PoolTarget::mapped)
     }
 
     fn growth(&self) -> Growth {
@@ -278,10 +289,6 @@ impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<We
 }
 
 impl<P: PoolTarget> PoolTarget for Shared<P> {
-    fn demand(&mut self) -> Demand {
-        self.0.lock().demand()
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.0.lock().segment_bytes()
     }
@@ -290,12 +297,20 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
         self.0.lock().floor()
     }
 
+    fn least_mapped(&self) -> u64 {
+        self.0.lock().least_mapped()
+    }
+
     fn hard_limit(&self) -> u64 {
         self.0.lock().hard_limit()
     }
 
     fn held(&self) -> u64 {
         self.0.lock().held()
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.0.lock().mapped()
     }
 
     fn growth(&self) -> Growth {

@@ -2731,6 +2731,7 @@ impl Shell {
         ring_slots: &[engine::RingSlots],
         scratch: &engine::ScratchPlace,
         pair: &engine::ScratchPlace,
+        pair_generation: u64,
     ) -> Result<engine::InstanceId> {
         let pooled = crate::program::session::Pooled {
             pools: &self.pools,
@@ -2751,6 +2752,7 @@ impl Shell {
             pooled,
             scratch,
             pair,
+            pair_generation,
         )?;
         if crate::diag::on().tier_trace {
             eprintln!(
@@ -3353,6 +3355,16 @@ impl Shell {
         ))
     }
 
+    /// The voxels lane `lane` holds.
+    fn lane_voxels(prepared: &Prepared<'_>, lane: usize) -> u32 {
+        prepared
+            .composition
+            .lanes()
+            .iter()
+            .find(|row| row.source as usize == lane)
+            .map_or(0, |row| row.voxels)
+    }
+
     fn first_voxel(prepared: &Prepared<'_>, lane: usize) -> u32 {
         prepared
             .composition
@@ -3406,10 +3418,12 @@ impl Shell {
         lane_rows: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
-        // A lane's row of an output: for one gathered at the readout rows,
-        // its first among them; for one written over every token row, its
-        // first named row, else its last.
-        let row_of = |lane: usize, gathered: bool| -> Result<u32> {
+        // A lane's row of an output, and how many rows from it are the
+        // lane's own: for one gathered at the readout rows, its first among
+        // them and its readout rows; for one written over every token row,
+        // its first named row and the lane's rows from there, else its last
+        // row alone.
+        let row_of = |lane: usize, gathered: bool| -> Result<(u32, u32)> {
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             if owned == 0 {
                 return Err(Fault::Ceiling {
@@ -3426,11 +3440,14 @@ impl Shell {
                         have: 0,
                     });
                 }
-                return Ok(prepared.readout_first.get(lane).copied().unwrap_or(0));
+                return Ok((
+                    prepared.readout_first.get(lane).copied().unwrap_or(0),
+                    prepared.readout_count.get(lane).copied().unwrap_or(0),
+                ));
             }
             let last = first_row[lane] + owned - 1;
             match prepared.lanes.get(lane).and_then(|seated| seated.readout) {
-                None => Ok(last),
+                None => Ok((last, 1)),
                 Some(rows) => {
                     for &row in rows {
                         if row >= owned {
@@ -3441,7 +3458,9 @@ impl Shell {
                             });
                         }
                     }
-                    Ok(rows.first().map_or(last, |&row| first_row[lane] + row))
+                    Ok(rows
+                        .first()
+                        .map_or((last, 1), |&row| (first_row[lane] + row, owned - row)))
                 }
             }
         };
@@ -3461,14 +3480,16 @@ impl Shell {
                 };
                 for out in 0..self.outputs.len() {
                     let decl = &self.outputs[out].decl;
+                    // Read at this lane, or its row read by the lane-0 read:
+                    // either way from this lane's own seat, never on lane
+                    // 0's pitch into rows another request may hold.
                     if !self.outputs[out].classes.contains(row.class as usize)
-                        || !reads
-                            .iter()
-                            .any(|(name, lane)| *name == decl.name && *lane == k)
+                        || !(reads.iter().any(|(name, lane)| *name == decl.name && *lane == k)
+                            || self.programs.covers(attached.instance, &decl.name, k)?)
                     {
                         continue;
                     }
-                    let (base, offset, width, dtype, stride) = match decl.name.as_str() {
+                    let (base, offset, width, dtype, stride, rows_held) = match decl.name.as_str() {
                         // A capturing lane's rows are its reader
                         // instance's state, not the arena's.
                         name @ ("attn.scores" | "attn.scores.pages") => {
@@ -3500,12 +3521,13 @@ impl Shell {
                                         .as_ref()
                                         .map_or(0, |layout| capture_row_bytes(layout.keys, 0).0)
                             };
-                            (buffer, offset, decl.width, eta_ir::Dtype::F32, decl.width)
+                            // Its own score row.
+                            (buffer, offset, decl.width, eta_ir::Dtype::F32, decl.width, 1)
                         }
                         _ => {
-                            let (offset, width, dtype, stride) =
+                            let (offset, width, dtype, stride, held) =
                                 self.output_seat(prepared, out, at, fire_lane, &row_of)?;
-                            (self.arena.store().clone(), offset, width, dtype, stride)
+                            (self.arena.store().clone(), offset, width, dtype, stride, held)
                         }
                     };
                     let name = self.outputs[out].decl.name.clone();
@@ -3518,8 +3540,18 @@ impl Shell {
                         dtype,
                         width,
                         stride,
+                        rows_held,
                     )?;
                 }
+            }
+            // Every lane bound: a read past the rows its lanes hold would
+            // read other requests' rows. Refused, its lane alone.
+            if let Some(why) = self.programs.rows_unbounded(attached.instance)? {
+                return Err(Fault::OutputRows {
+                    lane: attached.lane,
+                    instance: attached.instance.0,
+                    why,
+                });
             }
             staged.push(attached.instance);
         }
@@ -3550,8 +3582,8 @@ impl Shell {
         out: usize,
         at: usize,
         fire_lane: usize,
-        row_of: &dyn Fn(usize, bool) -> Result<u32>,
-    ) -> Result<(u64, u32, Dtype, u32)> {
+        row_of: &dyn Fn(usize, bool) -> Result<(u32, u32)>,
+    ) -> Result<(u64, u32, Dtype, u32, u32)> {
         let output = &self.outputs[out];
         let name = &output.decl.name;
         let (offset, width, dtype) = self.plane_row(prepared, output.values[0])?;
@@ -3578,23 +3610,24 @@ impl Shell {
                     }
                     stride = u32::try_from(gap / element).unwrap_or(u32::MAX);
                 }
-                (at_row(fire_lane as u64), width, dtype, stride)
+                // Its layers, one plane after another.
+                let layers = u32::try_from(output.values.len()).unwrap_or(u32::MAX).max(1);
+                (at_row(fire_lane as u64), width, dtype, stride, layers)
             }
-            poem_ir::InputAxis::Row => (
-                at_row(u64::from(row_of(at, output.decl.readout)?)),
-                width,
-                dtype,
-                width,
-            ),
+            poem_ir::InputAxis::Row => {
+                let (row, held) = row_of(at, output.decl.readout)?;
+                (at_row(u64::from(row)), width, dtype, width, held)
+            }
             poem_ir::InputAxis::Voxel if output.grid.is_some() => {
                 let (offset, width, dtype) = self.grid_seat(prepared, at, out)?;
-                (offset, width, dtype, width)
+                (offset, width, dtype, width, Self::lane_voxels(prepared, at))
             }
             poem_ir::InputAxis::Voxel => (
                 at_row(u64::from(Self::first_voxel(prepared, at))),
                 width,
                 dtype,
                 width,
+                Self::lane_voxels(prepared, at),
             ),
         })
     }
@@ -3750,6 +3783,17 @@ impl Shell {
                     .map(|seated| seated.lane.tokens.len() as u32)
                     .collect();
                 let carried = envelope.lanes();
+                // Its ports describe its own lanes only: past them they
+                // would set another request's positions and kv slots.
+                let owned = attached.lanes.max(1) as usize;
+                if carried > owned {
+                    return Err(Fault::GeometryLanes {
+                        lane: attached.lane,
+                        instance: attached.instance.0,
+                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
+                        owned: owned as u32,
+                    });
+                }
                 if first + carried > lanes.len() {
                     return Err(Fault::program(
                         "serve::prepare",
@@ -4621,7 +4665,7 @@ impl Shell {
         )?;
         let boundaries = windows.packed();
 
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();
