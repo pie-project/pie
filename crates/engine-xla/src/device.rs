@@ -434,7 +434,16 @@ impl Device {
                     // Room for it, made only of programs this load holds no
                     // claim on; the load's own set is never evicted.
                     self.make_room(dir, bytes.len() as u64)?;
-                    let tmp = file.with_extension("tmp");
+                    // A name of this write's own: two registrations of one
+                    // program compile it side by side and each lands its
+                    // copy, the second rename replacing the first.
+                    static WRITES: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let tmp = file.with_extension(format!(
+                        "tmp.{}.{}",
+                        std::process::id(),
+                        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
                     std::fs::write(&tmp, &bytes)
                         .and_then(|()| std::fs::rename(&tmp, file))
                         .map_err(|why| Fault::Unbound {

@@ -949,10 +949,13 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
             scan_gelems: Some(3000.0),
             hbm_gbps: Some(400.0),
+            cached_gbps: None,
             elementwise_gbps: None,
             launch_ns: None,
             few_row_tflops: None,
             workgroups_per_core: None,
+            tile_tflops_by_rows: None,
+            vector_tflops_by_rows: None,
         }
     );
 
@@ -1016,12 +1019,12 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`few_row_tflops` and `workgroups_per_core`, not `flops`",
+            "`tile_tflops_by_rows` and `vector_tflops_by_rows`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`workgroups_per_core`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`vector_tflops_by_rows`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",

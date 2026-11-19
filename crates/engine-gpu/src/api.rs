@@ -219,6 +219,23 @@ pub fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Rang
     attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
+/// Why an attachment whose program's `embed_indptr` port describes
+/// `described` lanes is refused, where that is more than it spans: its
+/// ports would state the next request's tokens and mask. `None`: they
+/// describe its own lanes.
+#[must_use]
+pub fn overreach(attachment: &engine::fire::Attachment, described: usize) -> Option<String> {
+    let lanes = attachment_lanes(attachment);
+    (described > lanes.len()).then(|| {
+        format!(
+            "instance {} is attached over lanes {}..{} and its `embed_indptr` port describes \
+             {described} lane(s): a program's ports state its own lanes' geometry, never the \
+             next request's",
+            attachment.instance, lanes.start, lanes.end
+        )
+    })
+}
+
 /// The runtime's engine over a backend's device: one shell, its program
 /// plane, and the frame in flight.
 pub struct Gpu<B: Host> {
@@ -302,6 +319,13 @@ impl<B: Host> Gpu<B> {
         for kernel in built {
             self.live.tally(engine::live::Tally::BuiltInFire, 1);
             self.warn_in_fire(kernel);
+        }
+        // What a dispatch binds, built on the fire's path: the load's walk
+        // built every one it reached.
+        let bound = self.shell.as_mut().map_or(0, Shell::bound_serving);
+        if bound > 0 {
+            self.live.tally(engine::live::Tally::BoundInFire, bound);
+            self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
         }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
@@ -476,7 +500,7 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         max_lanes: shell.budget().max_lanes,
         planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
             .unwrap_or(u32::MAX),
-        frames: shell.frames_in_flight(),
+        shelf: &shell.shelf,
     }
 }
 
@@ -784,8 +808,19 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        let started = std::time::Instant::now();
+        let walked = shell.walk_binds().map_err(fault)?;
+        if walked > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                walked,
+                ms = started.elapsed().as_millis() as u64,
+                "every fire shape the load serves walked bind-only: what a dispatch binds is built"
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
+        shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -1607,7 +1642,17 @@ impl<B: Host> Gpu<B> {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
-        for lane in &submission.lanes {
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            // This load places every row itself (no `slots` port): a lane
+            // whose table is a working set's whole, for its program to
+            // place rows through, would land them in pages not its own.
+            if lane.list == engine::fire::ListKind::Translation {
+                return Err(Error::lane(
+                    u32::try_from(at).unwrap_or(u32::MAX),
+                    "its kv table is a translation its program places rows through, and this \
+                     load resolves no `slots` port: it places no row a program states",
+                ));
+            }
             pages_of.push(
                 lane.tables
                     .iter()

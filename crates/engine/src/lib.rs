@@ -18,6 +18,7 @@ pub mod chunk;
 pub mod disk;
 pub mod engine;
 pub mod error;
+pub mod extent;
 pub mod fire;
 pub mod fit;
 pub mod frame;

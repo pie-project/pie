@@ -222,8 +222,9 @@ mod tests {
                     lse: Some(_),
                     ..
                 } => counts.1 += 1,
+                // The fire's masks are an operand of either arm (per-lane
+                // data, not a class), so a rewritten decode carries them.
                 Attn::Prefill {
-                    mask: None,
                     selection: None,
                     bias: None,
                     lse: Some(_),

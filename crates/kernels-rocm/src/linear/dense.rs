@@ -43,9 +43,9 @@ enum Route {
 
 /// Whether the diagonal kernels' vector reads take these planes: each one
 /// there, and the weight and the activation 16-byte aligned.
-/// [`act_x_wt`] over rows normed where the skinny kernel stages them
-/// (`super::gemv::skinny_norm_bf16`), where the product takes the skinny
-/// kernel; `Ok(false)` otherwise or where the fold does not pay.
+/// [`act_x_wt`] over rows normed where the skinny or turned kernel stages
+/// them (`super::gemv::skinny_norm_bf16`, `skinnyt_norm`), where the product
+/// takes either; `Ok(false)` otherwise or where the fold does not pay.
 pub(crate) fn act_x_wt_normed(
     ctx: &Ctx,
     w: u64,
@@ -55,14 +55,18 @@ pub(crate) fn act_x_wt_normed(
     k: i32,
     norm: super::gemv::SkinnyNorm,
 ) -> Result<bool, Error> {
-    if m <= 0 || n <= 0 || k <= 0 || route(ctx, m, n, k, vector_operands(w, norm.x, y)) != Route::Skinny {
+    if m <= 0 || n <= 0 || k <= 0 {
         return Ok(false);
     }
-    super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store)
+    match route(ctx, m, n, k, vector_operands(w, norm.x, y)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        _ => Ok(false),
+    }
 }
 
-/// [`act_x_wt_swiglu`] over rows normed where the skinny kernel stages them,
-/// where the gated product takes the skinny kernel; `Ok(false)` otherwise or
+/// [`act_x_wt_swiglu`] over rows normed where the skinny or turned kernel
+/// stages them, where the gated product takes either; `Ok(false)` otherwise or
 /// where the fold does not pay.
 pub(crate) fn act_x_wt_swiglu_normed(
     ctx: &Ctx,
@@ -73,14 +77,15 @@ pub(crate) fn act_x_wt_swiglu_normed(
     k: i32,
     norm: super::gemv::SkinnyNorm,
 ) -> Result<bool, Error> {
-    if m <= 0
-        || intermediate <= 0
-        || k <= 0
-        || route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, norm.x, h)) != Route::Skinny
-    {
+    if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, intermediate, k, norm, SkinnyEpilogue::Swiglu)
+    let (i, e) = (intermediate, SkinnyEpilogue::Swiglu);
+    match route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, norm.x, h)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, i, k, norm, e),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, gate_up, h, m, i, k, norm, e),
+        _ => Ok(false),
+    }
 }
 
 fn vector_operands(w: u64, act: u64, y: u64) -> bool {

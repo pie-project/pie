@@ -397,6 +397,10 @@ pub struct Tuning {
     /// redundant reads prices both with them.
     pub launch_ns: u32,
     pub hbm_gbps: u32,
+    /// The reads the last-level caches serve, in GB/s (`[rates]
+    /// cached_gbps`; 0 unmeasured): a normed skinny product's redundant
+    /// reads of its rows, which every block reads, are priced at it.
+    pub cached_gbps: u32,
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
     pub compressed_prefill_from: u32,
@@ -706,6 +710,7 @@ impl Tuning {
         gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
         launch_ns: 0,
         hbm_gbps: 0,
+        cached_gbps: 0,
         compressed_prefill_from: 0,
         compressed_replay: false,
     };
@@ -769,6 +774,7 @@ impl Tuning {
                 .launch_ns
                 .map_or(0, |ns| u32::try_from(ns).unwrap_or(u32::MAX)),
             hbm_gbps: profile.rates().hbm_gbps.map_or(0, |gbps| gbps as u32),
+            cached_gbps: profile.rates().cached_gbps.map_or(0, |gbps| gbps as u32),
             compressed_prefill_from: 0,
             compressed_replay: false,
         }

@@ -104,6 +104,41 @@ fn the_epilogue_streams_through_registers_every_case() {
     the_row_parallel_epilogue_fuses_into_streams();
     a_reshaped_row_vector_broadcasts_through_the_stream();
     a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing();
+    the_row_kinds_lie_in_constant_memory();
+}
+
+/// A row-parallel kernel reads which values its block narrows by value
+/// index: a table in constant memory, never a kernel-local array (which a
+/// compiler places in a thread's private memory once the program has many
+/// values, and which a HIP kernel asks the runtime to grow at its first
+/// launch, after the load).
+fn the_row_kinds_lie_in_constant_memory() {
+    let bound = served().bind(subject()).expect("the subject binds");
+    let stages = compile_bound(&bound);
+    let stage = stages.first().expect("one stage");
+    let mut checked = 0;
+    for (index, region) in stage.fused.regions.iter().enumerate() {
+        if region.row_value.is_none() {
+            continue;
+        }
+        let name = format!("k{index}");
+        for emitted in [
+            emit_fused_region(&name, stage, region).expect("cuda emits"),
+            eta_compiler::codegen::hip::emit_region(&name, stage, region).expect("hip emits"),
+        ] {
+            let entry = emitted.find("__global__").expect("the entry point");
+            assert!(
+                emitted[..entry].contains("__constant__ m1_u8 ptir_rowkind["),
+                "the row-kind table is not in constant memory"
+            );
+            assert!(
+                !emitted[entry..].contains("m1_u8 ptir_rowkind["),
+                "the row-kind table is a kernel-local array"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no row-parallel region");
 }
 
 fn the_row_parallel_epilogue_fuses_into_streams() {
