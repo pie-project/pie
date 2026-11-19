@@ -75,6 +75,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::outside(self)
     }
 
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        Context::host_room(self)
+    }
+
     fn left(&self) -> u64 {
         Context::left(self)
     }

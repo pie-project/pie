@@ -170,6 +170,10 @@ pub(crate) struct Core {
     /// load ([`super::memory::at_load`]), or `[engine.memory]
     /// budget_device` where stated.
     pub(crate) budget: u64,
+    /// Whether `budget` is the host's room ([`super::memory::Source::HostAvailable`]):
+    /// the device shares the host's memory, so what the host can still give
+    /// is read afresh while serving.
+    pub(crate) shares_host: bool,
 }
 
 impl Core {
@@ -521,6 +525,7 @@ impl Context {
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
+            shares_host: reading.source == super::memory::Source::HostAvailable,
         });
         let dummy = Raw::new(
             &core,
@@ -556,6 +561,15 @@ impl Context {
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.core.budget
+    }
+
+    /// Where the load's memory was read from the host's room, the reader of
+    /// what the host can still give the process.
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core
+            .shares_host
+            .then(engine_gpu::host_memory::room_reader)
     }
 
     /// What the driver holds for this process beside every reservation:

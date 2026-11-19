@@ -18,8 +18,14 @@ pub enum Source {
     Config,
     /// `VK_EXT_memory_budget`'s `heapBudget` of this device-local heap.
     VulkanBudget(usize),
-    /// The size of this device-local heap, without `VK_EXT_memory_budget`.
+    /// The size of this device-local heap, without `VK_EXT_memory_budget`,
+    /// on a device with memory of its own.
     VulkanHeap(usize),
+    /// What the host's memory has available, less what lmkd keeps free
+    /// past it and the floor ([`engine_gpu::host_memory`]), plus what this
+    /// process already holds: a device that shares the host's memory,
+    /// without `VK_EXT_memory_budget`, whose heap size is the host's RAM.
+    HostAvailable,
     /// `IDXGIAdapter3::QueryVideoMemoryInfo`'s local segment `Budget`.
     DxgiLocal,
 }
@@ -30,6 +36,7 @@ impl fmt::Display for Source {
             Source::Config => write!(f, "config budget_device"),
             Source::VulkanBudget(heap) => write!(f, "VK_EXT_memory_budget heap {heap}"),
             Source::VulkanHeap(heap) => write!(f, "Vulkan heap {heap} size"),
+            Source::HostAvailable => write!(f, "the host's available memory (unified)"),
             Source::DxgiLocal => write!(f, "DXGI QueryVideoMemoryInfo local"),
         }
     }
@@ -50,27 +57,87 @@ impl fmt::Display for Reading {
     }
 }
 
+/// Whether a Vulkan device shares the host's memory: an integrated or CPU
+/// device does, a discrete one does not (resizable BAR maps its heap, but
+/// the memory is its own), and any other where the host maps its largest
+/// device-local heap (`mapped`). The native engine's rule.
+#[must_use]
+pub fn shares_host(device: wgpu::DeviceType, mapped: bool) -> bool {
+    match device {
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu => true,
+        wgpu::DeviceType::DiscreteGpu => false,
+        wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => mapped,
+    }
+}
+
 /// Of Vulkan's memory heaps, `(size, device-local)` each, the largest
 /// device-local one, which device reservations take: its budget where
-/// `VK_EXT_memory_budget` states `budgets`, else its size.
-#[must_use]
-pub fn vulkan_heaps(heaps: &[(u64, bool)], budgets: Option<&[u64]>) -> Option<Reading> {
+/// `VK_EXT_memory_budget` states `budgets`; else, on a device that shares
+/// the host's memory, whose heap is the host's RAM, what the host has
+/// available (`host`); else its size.
+///
+/// # Errors
+///
+/// Names the reading that could not be taken: no device-local heap, or
+/// the host's room.
+pub fn vulkan_heaps(
+    heaps: &[(u64, bool)],
+    budgets: Option<&[u64]>,
+    shares_host: bool,
+    host: impl FnOnce() -> std::result::Result<u64, String>,
+) -> std::result::Result<Reading, String> {
     let (heap, size) = heaps
         .iter()
         .enumerate()
         .filter(|&(_, &(_, local))| local)
         .map(|(at, &(size, _))| (at, size))
-        .max_by_key(|&(_, size)| size)?;
-    Some(match budgets {
+        .max_by_key(|&(_, size)| size)
+        .ok_or("the Vulkan adapter has no device-local heap")?;
+    Ok(match budgets {
         Some(budgets) => Reading {
             bytes: budgets[heap],
             source: Source::VulkanBudget(heap),
+        },
+        None if shares_host => Reading {
+            bytes: host()?,
+            source: Source::HostAvailable,
         },
         None => Reading {
             bytes: size,
             source: Source::VulkanHeap(heap),
         },
     })
+}
+
+/// What the host gives a load on a device that shares its memory: its room
+/// now, plus what this process already holds, which that room counts as
+/// taken.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn host_room() -> std::result::Result<u64, String> {
+    let room = engine_gpu::host_memory::room().map_err(|fault| fault.to_string())?;
+    let held = engine_gpu::books::process_reserved();
+    tracing::info!(
+        available = room.available,
+        defended = room.defended,
+        floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
+        room = room.room,
+        held,
+        "the device shares the host's memory, so the load takes what it has available, \
+         less what lmkd keeps free past it, less the floor"
+    );
+    Ok(room.room.saturating_add(held))
+}
+
+#[cfg(all(
+    not(any(target_os = "linux", target_os = "android")),
+    not(any(target_arch = "wasm32", target_vendor = "apple"))
+))]
+fn host_room() -> std::result::Result<u64, String> {
+    Err(
+        "the Vulkan device shares the host's memory without VK_EXT_memory_budget, and \
+         this host has no reader of its available memory"
+            .to_string(),
+    )
 }
 
 /// What a load on `adapter` takes: `budget_device` where stated, else the
@@ -138,8 +205,23 @@ fn vulkan(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
         .iter()
         .map(|h| (h.size, h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)))
         .collect();
-    vulkan_heaps(&heaps, budgeted.then_some(&budget.heap_budget[..count]))
-        .ok_or_else(|| "the Vulkan adapter has no device-local heap".to_string())
+    let largest = (0..count)
+        .filter(|&at| heaps[at].1)
+        .max_by_key(|&at| heaps[at].0);
+    let mapped = memory.memory_types[..memory.memory_type_count as usize]
+        .iter()
+        .any(|t| {
+            Some(t.heap_index as usize) == largest
+                && t.property_flags.contains(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                )
+        });
+    vulkan_heaps(
+        &heaps,
+        budgeted.then_some(&budget.heap_budget[..count]),
+        shares_host(adapter.get_info().device_type, mapped),
+        host_room,
+    )
 }
 
 #[cfg(windows)]
@@ -165,11 +247,15 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
+    fn unread() -> std::result::Result<u64, String> {
+        panic!("the host's room is read only on a unified device without a budget")
+    }
+
     #[test]
     fn the_largest_device_local_heap_is_read_at_its_budget() {
         let heaps = [(46 * GIB, true), (64 * GIB, false), (GIB / 4, true)];
         let budgets = [GIB * 47 / 2, 60 * GIB, GIB / 8];
-        let read = vulkan_heaps(&heaps, Some(&budgets)).unwrap();
+        let read = vulkan_heaps(&heaps, Some(&budgets), true, unread).unwrap();
         assert_eq!(read.bytes, GIB * 47 / 2);
         assert_eq!(
             read.to_string(),
@@ -180,7 +266,7 @@ mod tests {
     #[test]
     fn without_the_budget_extension_the_heap_size_is_read() {
         let heaps = [(64 * GIB, false), (GIB / 4, true), (24 * GIB, true)];
-        let read = vulkan_heaps(&heaps, None).unwrap();
+        let read = vulkan_heaps(&heaps, None, false, unread).unwrap();
         assert_eq!(read.bytes, 24 * GIB);
         assert_eq!(
             read.to_string(),
@@ -190,7 +276,34 @@ mod tests {
 
     #[test]
     fn no_device_local_heap_reads_nothing() {
-        assert_eq!(vulkan_heaps(&[(64 * GIB, false)], None), None);
+        let why = vulkan_heaps(&[(64 * GIB, false)], None, true, unread).unwrap_err();
+        assert!(why.contains("no device-local heap"), "{why}");
+    }
+
+    /// An Adreno 840's: one device-local heap that is all of RAM, mapped,
+    /// and no `VK_EXT_memory_budget`.
+    #[test]
+    fn a_unified_device_without_the_budget_reads_the_hosts_room() {
+        let heaps = [(GIB * 116 / 10, true)];
+        assert!(shares_host(wgpu::DeviceType::IntegratedGpu, true));
+        let read = vulkan_heaps(&heaps, None, true, || Ok(GIB * 57 / 10)).unwrap();
+        assert_eq!(read.bytes, GIB * 57 / 10);
+        assert_eq!(
+            read.to_string(),
+            "device memory: 5.7 GiB from the host's available memory (unified)"
+        );
+        let why = vulkan_heaps(&heaps, None, true, || Err("no MemAvailable".into())).unwrap_err();
+        assert_eq!(why, "no MemAvailable");
+    }
+
+    #[test]
+    fn which_devices_share_the_hosts_memory() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
+        assert!(shares_host(IntegratedGpu, false));
+        assert!(shares_host(Cpu, false));
+        assert!(!shares_host(DiscreteGpu, true));
+        assert!(shares_host(Other, true));
+        assert!(!shares_host(VirtualGpu, false));
     }
 
     #[test]
