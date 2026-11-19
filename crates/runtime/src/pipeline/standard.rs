@@ -14,7 +14,7 @@
 //! and `ForwardPass` call WIT imports, so the runtime cannot trace compat
 //! itself; a change to that loop's channels or ports (not to the sampler's
 //! stage bodies) is not caught by this module's test, and its programs
-//! then build at registration, counted in `Tally::BuiltAfterReady`.
+//! then build at registration, counted in `Tally::BuiltAtRegister`.
 
 use eta_dsl::Traced;
 use eta_dsl::prelude::*;

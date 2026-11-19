@@ -164,6 +164,28 @@ pub enum Fault {
     },
 }
 
+impl Fault {
+    /// The lane of the fire a fault refuses for its own sake, where one
+    /// does: what it states (its word, its media, its mask) is what this
+    /// fire cannot seat, and every other lane could be.
+    #[must_use]
+    pub const fn lane(&self) -> Option<u32> {
+        match self {
+            Self::UnknownWord { lane, .. }
+            | Self::EmptyLane { lane }
+            | Self::Towerless { lane }
+            | Self::NoPatchLadder { lane }
+            | Self::Vaeless { lane }
+            | Self::NoVoxelLadder { lane }
+            | Self::ClipGeometry { lane, .. }
+            | Self::PatchGeometry { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::MaskPatches { lane, .. } => Some(*lane),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

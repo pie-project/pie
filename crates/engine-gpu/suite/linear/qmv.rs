@@ -1,9 +1,11 @@
 //! The vector points of the affine-quantized matmul on the first device
 //! against an f64 host reference. The vector point at 2, 4 and 8 bits,
 //! groups of 32 to 128, one to eight activation rows a workgroup over row
-//! counts that leave a workgroup part full, and an odd column count where
-//! it lands (SPIR-V). The one-row point (SPIR-V's) at every lane split the
-//! device's subgroups hold, one and two columns a lane.
+//! counts that leave a workgroup part full (eight a workgroup at 8, 9, 17
+//! and 25 rows: past 128 held floats a lane, the Adreno 840 read back half
+//! zeros), and an odd column count where it lands (SPIR-V). The one-row
+//! point (SPIR-V's) at every lane split the device's subgroups hold, one
+//! and two columns a lane.
 
 use kernels_slang::linear::qmm::{self, Qmm};
 use kernels_slang::{Bank, Tensor};
@@ -86,7 +88,16 @@ fn the_vector_point_answers_the_reference() {
             continue;
         }
         let (w, weights) = bank(&mut gpu, (bits, group, n, k));
-        for (m, vecs) in [(1usize, 1u32), (3, 2), (5, 4), (9, 8), (6, 4)] {
+        for (m, vecs) in [
+            (1usize, 1u32),
+            (3, 2),
+            (5, 4),
+            (6, 4),
+            (8, 8),
+            (9, 8),
+            (17, 8),
+            (25, 8),
+        ] {
             let (x, xr) = gpu.up(&noise(7 + m as u64, m * k));
             let xt = t(x, m, k, Dtype::Bf16);
             let want = reference(&xr, &weights, m, n, k);

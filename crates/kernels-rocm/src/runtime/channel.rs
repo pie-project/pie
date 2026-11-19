@@ -196,6 +196,16 @@ pub fn load_wave_kernels() -> Result<(), Error> {
     Ok(())
 }
 
+/// Loads the kernels a fire's staging gathers with (a tap's words, a lane's
+/// device-carried mask bits, a table of them) on the current device now:
+/// a serving fire fires them, and nothing builds after ready.
+pub fn load_gather_kernels() -> Result<(), Error> {
+    for name in ["gather_words", "gather_bits", "gather_bit_runs"] {
+        kernel(FILE, &format!("::pie::channel::{name}")).load()?;
+    }
+    Ok(())
+}
+
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,

@@ -7,7 +7,7 @@ use poem_ir::ops::Elemwise;
 use poem_ir::{NormAxis, NormWeight};
 
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096, false)
 }
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,

@@ -145,6 +145,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
             },
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );

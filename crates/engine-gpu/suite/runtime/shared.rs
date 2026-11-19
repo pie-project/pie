@@ -251,6 +251,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
+            pair_generation: 0,
         },
         &channels,
     );

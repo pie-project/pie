@@ -1247,6 +1247,20 @@ impl<'c> Run<'c> {
             if handle.buf == self.fire.tables.request_of_token.buf {
                 return gathered.request_of_token;
             }
+            // The fire's mask rows, gathered by the copy as words
+            // (`dispatch::copy`): read as the fire's tables are typed.
+            if handle.buf == self.fire.tables.mask.buf || handle.buf == self.fire.tables.mask_enabled.buf {
+                let tight = self
+                    .address(handle.buf)
+                    .and_then(|key| self.copy.tight(key))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "a copied window reads the fire's masks and its copy carries none; \
+                             `dispatch::copy` gathers them wherever the fire stages any"
+                        )
+                    });
+                return Tensor::new(tight.buf, tight.rows, handle.width, handle.dtype);
+            }
         }
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
@@ -1331,6 +1345,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn set_copy(&mut self, plan: CopyPlan) {
         self.copy = plan;
+    }
+
+    pub(crate) fn fire_tables(&self) -> &FireTables {
+        &self.fire.tables
     }
 
     pub(crate) fn staged_copy(&self) -> &CopyPlan {

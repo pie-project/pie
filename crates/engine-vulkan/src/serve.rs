@@ -55,6 +55,10 @@ impl Serve for Api {
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
+    const MAX_BUFFER_SOURCE: &'static str = "the least of VkPhysicalDeviceLimits::\
+        maxStorageBufferRange, maxMemoryAllocationSize (Vulkan 1.1) and maxBufferSize \
+        (Vulkan 1.3)";
+
     const RECORDS: bool = true;
 
     /// A pass keeps the cells only the device reads in `Channel` slots
@@ -384,8 +388,25 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     // The rung names where its carve and rooms lie in the span: a fire of
     // another rung binds other bytes under the same handles.
     key.shown(&p.rung);
-    key.hashed(&p.caches);
-    key.shown(&p.bindings);
+    // Not how many pages the fire's tables name: a view binds its buffer
+    // to the end, and no dispatch is sized by the pages: a decode's splits
+    // are the shape's, each row's walker splitting its own keys, and a
+    // prefill's dispatches bound no work (`Tactic::prefill_work` is 0 here).
+    // So a recording replays as the fire's keys grow.
+    let mut caches = p.caches.clone();
+    for pool in &mut caches.0 {
+        if let engine_gpu::run::CachePool::Kv(kv) = pool {
+            kv.page_indices.rows = 0;
+        }
+    }
+    key.hashed(&caches);
+    let mut bindings = p.bindings.clone();
+    for geometry in &mut bindings.geometry {
+        if let Some(indices) = geometry.indices.as_mut() {
+            indices.rows = 0;
+        }
+    }
+    key.shown(&bindings);
     key.shown(&p.windows);
     // Not the fire's demand: the pool only checks it against what is
     // committed (a commit forgets every recording), so a recording reads

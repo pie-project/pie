@@ -1006,6 +1006,7 @@ mod tests {
                 adapter_slots: Vec::new(),
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
+                pair_generation: 0,
             })
             .expect("the instance binds")
             .id;
@@ -1024,6 +1025,6 @@ mod tests {
             "the first of the largest"
         );
         assert_eq!(live.tallied(Tally::Fallback), 1, "one interpreted pass");
-        assert_eq!(live.tallied(Tally::BuiltAfterReady), 0);
+        assert_eq!(live.tallied(Tally::BuiltInFire), 0);
     }
 }

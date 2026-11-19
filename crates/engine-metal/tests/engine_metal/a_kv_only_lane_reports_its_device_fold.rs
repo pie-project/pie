@@ -153,6 +153,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
             &rings,
             &scratch,
             &pair,
+            0,
         )
         .expect("the device-geometry instance binds");
     shell.open(slot).expect("the slot opens");

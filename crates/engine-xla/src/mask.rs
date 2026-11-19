@@ -32,11 +32,12 @@ pub struct Staged {
 }
 
 /// The fire's byte plane: a row a lane row, a byte a key position (`stride`
-/// a power of two of 256 and more, past every lane's `have + rows`). A lane's
+/// the load's: `width`, a power of two of 256 and more past every key a lane
+/// can hold, so the plane's shape is the load's and not the fire's). A lane's
 /// mask speaks of its keys from `folded` on: its committed keys (`0..folded`)
 /// are admitted under the causal bound, and mask column `c` lands at key
 /// `folded + c`. Among the lane's own rows the bound is the row order.
-pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
+pub fn stage(lanes: &[LaneMask<'_>], width: u32) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
     }
@@ -70,12 +71,14 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         }
         widest = widest.max(kv);
     }
-    let widest = widest.max(256).next_power_of_two();
-    let stride = u32::try_from(widest).map_err(|_| Fault::Ceiling {
-        what: "key positions in one mask row",
-        need: widest,
-        have: u64::from(u32::MAX),
-    })?;
+    if widest > u64::from(width) {
+        return Err(Fault::Ceiling {
+            what: "key positions in one mask row",
+            need: widest,
+            have: u64::from(width),
+        });
+    }
+    let stride = width;
 
     let rows: u64 = lanes.iter().map(|lane| u64::from(lane.rows)).sum();
     let cells = rows.saturating_mul(u64::from(stride));
@@ -187,7 +190,10 @@ mod tests {
             rows: 600,
             wide,
         };
-        assert_eq!(stage(&[lane(true), lane(false), lane(true)]).unwrap(), None);
+        assert_eq!(
+            stage(&[lane(true), lane(false), lane(true)], 1024).unwrap(),
+            None
+        );
     }
 
     /// A lane's mask speaks of its keys from its set's committed boundary
@@ -207,14 +213,21 @@ mod tests {
             rows: 2,
             wide: false,
         };
-        let staged = stage(&[lane]).unwrap().expect("a plane");
+        let staged = stage(&[lane], 256).unwrap().expect("a plane");
         let stride = staged.stride as usize;
         let row = |q: usize| &staged.bytes[q * stride..q * stride + 6];
         assert_eq!(row(0), &[1, 1, 0, 1, 1, 0], "row 0: committed, buffer, itself");
         assert_eq!(row(1), &[1, 1, 0, 1, 1, 1], "row 1: and row 0, itself");
         assert_eq!(staged.enabled, vec![1, 1]);
         let short = Masking::Extent(Mask { runs: vec![0, 3], total: 3 });
-        let refused = stage(&[LaneMask { mask: Some(&short), ..lane }]).unwrap_err();
+        let refused = stage(
+            &[LaneMask {
+                mask: Some(&short),
+                ..lane
+            }],
+            256,
+        )
+        .unwrap_err();
         assert!(
             matches!(refused, crate::error::Fault::Mask { extent: 4, .. }),
             "refused with the buffer's extent: {refused:?}"

@@ -166,9 +166,18 @@ pub(crate) struct Core {
     pub(crate) name: String,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
-    /// `[engine.memory] budget_device`: what the load takes, all of it
-    /// together. The environment reports no memory size, so it is stated.
+    /// What the load takes, all of it together: the device memory read at
+    /// load ([`super::memory::at_load`]), or `[engine.memory]
+    /// budget_device` where stated.
     pub(crate) budget: u64,
+    /// Whether `budget` is the host's room ([`super::memory::Source::HostAvailable`]):
+    /// the device shares the host's memory, so what the host can still give
+    /// is read afresh while serving.
+    pub(crate) shares_host: bool,
+    /// The most bytes one reservation takes on this device
+    /// ([`super::memory::reservation_bound`]): every buffer made is no
+    /// larger, and one past it is refused by name, never made invalid.
+    pub(crate) bound: u64,
 }
 
 impl Core {
@@ -254,30 +263,47 @@ impl Core {
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
+    /// A scratch chunk that holds `bytes`, refused by name past the most
+    /// one reservation takes.
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
+        if bytes > self.bound {
+            return Err(Fault::Ceiling {
+                what: "bytes of one scratch reservation",
+                need: bytes,
+                have: self.bound,
+            });
+        }
+        let pooled = self.pooled_scratch();
+        if bytes <= pooled
             && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
         {
-            return chunk;
+            return Ok(chunk);
         }
-        self.held(
+        Ok(self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
+                size: bytes.max(pooled),
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             },
             engine_gpu::books::owners::FRAME_SCRATCH,
-        )
+        ))
     }
 
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
-        self.scratch
-            .lock()
-            .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+        self.scratch.lock().expect("scratch lock poisoned").extend(
+            chunks
+                .into_iter()
+                .filter(|c| c.size() == self.pooled_scratch()),
+        );
+    }
+
+    /// The size of a scratch chunk the ring keeps between frames: no larger
+    /// than one reservation takes.
+    fn pooled_scratch(&self) -> u64 {
+        SCRATCH_CHUNK.min(self.bound)
     }
 }
 
@@ -307,6 +333,8 @@ impl Drop for Held {
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
+    /// The most bytes one reservation the load plans takes: the device's
+    /// bound, or a test's cap under it.
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
@@ -443,42 +471,45 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
-/// `allowance.budget`, refused where the operator states none.
-fn stated(allowance: engine::Allowance) -> Result<u64> {
-    allowance.budget.ok_or_else(|| {
-        Fault::Residency(
-            "wgpu: the environment reports no memory size; state \
-             `[engine.memory] budget_device` for what the load may take"
+/// Refuses a load on a target with no native wgpu backend: macOS, as on
+/// wgpu's Metal backend a large first submission never completes.
+fn native() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Err(Fault::NoDevice {
+            detail: "engine type wgpu has no backend on macOS in this build; use type = \"metal\""
                 .to_string(),
-        )
-    })
+        });
+    }
+    Ok(())
 }
 
 impl Context {
-    /// The device `boot` names, of which a load takes `allowance.budget`,
-    /// which must be stated.
+    /// The device `boot` names, of which a load takes what it states it
+    /// has, or `allowance.budget` where stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
-        stated(allowance)?;
+        native()?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes
-    /// `allowance.budget`, which must be stated: WebGPU reports no memory
-    /// size.
+    /// A device the host already holds, of which a load takes what its
+    /// adapter states it has, or `allowance.budget` where stated; refused
+    /// where neither states it.
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
-        let budget = stated(allowance)?;
         let Handed {
             adapter,
             device,
             queue,
         } = handed;
         let info = adapter.get_info();
+        let reading = super::memory::at_load(&adapter, allowance)?;
+        tracing::info!(device = %info.name, "{reading}");
+        let budget = reading.bytes;
         let features = device.features();
         let limits = device.limits();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -495,11 +526,17 @@ impl Context {
             f16: features.contains(wgpu::Features::SHADER_F16),
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
         };
-        // A slab is bound whole, so no larger than one storage binding takes:
-        // past it a fire refuses the view rather than reading a cut slab.
-        let max_buffer = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
+        // A slab is bound whole, so no larger than one storage binding takes
+        // (past it a fire refuses the view rather than reading a cut slab),
+        // nor than one allocation backs: past either, the buffer is made
+        // invalid, so every reservation is refused there by name instead.
+        let bound =
+            super::memory::reservation_bound(&limits, super::memory::allocation_limit(&adapter));
+        let max_buffer = bound;
+        // A test's cap narrows what the load plans by, never what the device
+        // can make.
+        #[cfg(feature = "test-limits")]
+        let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
@@ -517,6 +554,8 @@ impl Context {
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
+            shares_host: reading.source == super::memory::Source::HostAvailable,
+            bound,
         });
         let dummy = Raw::new(
             &core,
@@ -548,10 +587,19 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
-    /// What the device has for this load: the operator's budget.
+    /// What the device has for this load, as read at load.
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.core.budget
+    }
+
+    /// Where the load's memory was read from the host's room, the reader of
+    /// what the host can still give the process.
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core
+            .shares_host
+            .then(engine_gpu::host_memory::room_reader)
     }
 
     /// What the driver holds for this process beside every reservation:
@@ -810,18 +858,19 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if ring.chunks.is_empty() || at + bytes > room {
+            ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -855,7 +904,7 @@ impl Frame {
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
         // wgpu refuses a copy whose ends are one buffer: it goes through
         // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
+        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
         self.encode(|encoder| match &stage {
             None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
             Some((scratch, at)) => {
@@ -1060,15 +1109,6 @@ mod tests {
     use crate::device::Buffer;
 
     #[test]
-    fn a_load_without_budget_device_is_refused() {
-        let why = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE)
-            .unwrap_err()
-            .to_string();
-        assert!(why.contains("reports no memory size"), "{why}");
-        assert!(why.contains("[engine.memory] budget_device"), "{why}");
-    }
-
-    #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
         if !present() {
             return;
@@ -1089,5 +1129,45 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// No buffer is made past the device's bound on one reservation: a
+    /// slab or a scratch slot past it is refused by name before anything
+    /// reaches the device, and nothing invalid is made.
+    #[test]
+    fn no_buffer_is_made_past_the_bound_of_one_reservation() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        let bound = device.core.bound;
+        assert!(device.max_buffer() <= bound);
+        let past = |fault: Fault, named: &str| match fault {
+            Fault::Ceiling { what, need, have } => {
+                assert_eq!(what, named);
+                assert!(need > bound, "{need}");
+                assert_eq!(have, bound);
+            }
+            other => panic!("refused as {other}, not by the bound"),
+        };
+        let owner = engine_gpu::books::owners::TEST;
+        let held = device.core.books.device();
+        past(
+            Buffer::zeroed(&device, bound + 4, owner)
+                .err()
+                .expect("refused"),
+            "bytes of one device reservation",
+        );
+        let frame = device.frame().unwrap();
+        past(
+            frame.scratch_slot(bound + 256).err().expect("refused"),
+            "bytes of one scratch reservation",
+        );
+        assert_eq!(device.core.books.device(), held, "nothing was reserved");
+        frame.commit().unwrap();
+        device.core.take_error("the refused buffers").unwrap();
     }
 }
