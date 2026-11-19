@@ -14,7 +14,7 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
 use eta_ir::container::{ChanDType, HostRole};
-use eta_ir::registry::{GeometryClass, Port, Stage};
+use eta_ir::registry::{GeometryClass, Port, PortMask, Stage};
 
 use engine_gpu::program::Refusal;
 use engine_gpu::program::{decode, numel_of};
@@ -26,6 +26,9 @@ struct Instance {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
+    /// The ports its program computes on the device
+    /// (`InstanceBinding::device_resolved`).
+    device: PortMask,
 
     #[cfg(feature = "vulkan")]
     session: crate::guest::session::Session,
@@ -378,6 +381,7 @@ impl Plane {
                 plan,
                 inst,
                 geometry: binding.geometry,
+                device: binding.device_resolved,
                 #[cfg(feature = "vulkan")]
                 session,
                 #[cfg(feature = "vulkan")]
@@ -675,6 +679,38 @@ impl Plane {
             &seat.landing,
             &seat.faulted,
         )
+    }
+
+    /// What `instance`'s descriptor ports hold at the fire, once the pass
+    /// that put each cell landed it.
+    pub fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        for channel in engine_gpu::program::descriptor_channels(&seat.plan, seat.geometry, seat.device)
+        {
+            let ring = &seat.inst.channels[channel as usize];
+            seat.landing.wait((channel, ring.head()), &seat.faulted);
+        }
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        engine_gpu::program::descriptor_ports(
+            &seat.plan,
+            &seat.inst,
+            seat.geometry,
+            seat.device,
+            instance,
+        )
+    }
+
+    #[must_use]
+    pub fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        self.instances.get(&instance).map(|seat| seat.geometry)
     }
 
     pub fn envelope_tokens(
@@ -1037,7 +1073,9 @@ impl Plane {
         offered_read(seat, instance, &seats)?;
         let inputs = PassInputs::none();
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
+            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred(
+                engine_gpu::program::read_at_fire(seat.geometry, seat.device),
+            );
         let outcome = eta_exec::step_with(
             &mut seat.inst,
             &seat.plan,
@@ -1074,6 +1112,7 @@ impl Plane {
             frame,
             landing,
             landings,
+            ..
         } = deferral;
         let Some(frame) = frame else {
             if let Some(done) = done {
@@ -1378,6 +1417,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         Plane::envelope_fold(self, instance)
+    }
+
+    fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        Plane::geometry(self, instance)
+    }
+
+    fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        Plane::descriptor_ports(self, instance)
     }
 
     fn publish(

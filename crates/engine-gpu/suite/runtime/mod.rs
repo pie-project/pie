@@ -1,6 +1,7 @@
 mod beam_stage;
 mod bool_gather;
 mod bool_moves;
+mod device_geometry;
 mod fold;
 mod guest_state;
 mod hosted;

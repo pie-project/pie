@@ -4,72 +4,72 @@
 //! A program whose geometry ports the host cannot derive from what it wrote
 //! (the tokens, positions, slots, KV extent, fold or mask a guest stage
 //! computes) is served as device geometry or as a decode envelope when the
-//! engine reads those ports from the device. Otherwise its geometry is
-//! host-resolved: the host evaluates the guest's ops on the settled values,
-//! so each fire waits for the one before it to settle (its fires
-//! serialize). That happens for one of two reasons, each named at bind
-//! ([`HostGeometry::bind_message`]) and both counted per fire in the model
-//! status's `host_geometry_fires` ([`fires`]):
+//! engine reads those ports from the device. Where the engine's port mask
+//! (`EngineCaps::ports`) lacks a port the program's device class needs, the
+//! bind is refused by name ([`EngineLacks`]): an engine limit is never
+//! served by resolving the geometry on the host instead.
 //!
-//! - **An engine limit** ([`HostGeometry::EngineLacks`]): the program is
-//!   device geometry or a decode envelope, and the engine's port mask lacks
-//!   a port it needs. It serves for now; a bind refusal replaces it once
-//!   engine-gpu carries device geometry.
-//! - **The program's one class** ([`HostGeometry::Program`]): the program
-//!   is neither (not a decode envelope, or its device-dependent geometry is
-//!   not one), on any engine. Host-evaluated is its class, not a fallback.
+//! A program that is neither (not a decode envelope, or its
+//! device-dependent geometry is not one) is host-evaluated on any engine
+//! ([`HostGeometry`]): the host evaluates the guest's ops on the settled
+//! values, so each fire waits for the one before it to settle (its fires
+//! serialize). That is its class, not a fallback; bind names it
+//! ([`HostGeometry::bind_message`]) and each fire is counted in the model
+//! status's `host_geometry_fires` ([`fires`]).
 //!
-//! Which geometry ports each engine's mask lacks today (`EngineCaps::ports`;
-//! a decode envelope needs `embed_tokens` plus what the program computes,
-//! device geometry `embed_tokens`, `positions`, `slots`, `kv_len`, and
-//! `attn_mask` when a channel feeds it; `embed_indptr` no class requires):
+//! Which geometry ports each engine's mask carries (a decode envelope needs
+//! `embed_tokens` plus what the program computes, device geometry
+//! `embed_tokens`, `positions`, `slots`, `kv_len`, and `attn_mask` when a
+//! channel feeds it; `embed_indptr` no class requires):
 //!
 //! | engine            | mask                                      | lacks                                     |
 //! |-------------------|-------------------------------------------|-------------------------------------------|
 //! | cuda (and ROCm)   | device geometry + attn_mask + fold        | embed_indptr                              |
 //! | metal             | device geometry + attn_mask + fold        | embed_indptr                              |
 //! | xla               | device geometry + attn_mask + fold        | embed_indptr                              |
+//! | vulkan, wgpu      | device geometry + attn_mask + fold        | embed_indptr                              |
 //! | cerebras          | device geometry                           | attn_mask, fold, embed_indptr             |
-//! | vulkan            | embed_tokens + fold                       | positions, kv_len, slots, attn_mask, embed_indptr |
-//! | wgpu              | embed_tokens + fold + attn_mask           | positions, kv_len, slots, embed_indptr    |
-//!
-//! So on Vulkan and wgpu no device-geometry program (beam search's, for
-//! one) binds as device geometry: its fires are host-resolved, an engine
-//! limit, until engine-gpu carries device geometry.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 
-/// Why a pass whose geometry the host cannot derive has its geometry
-/// resolved by the host.
+/// A pass whose program alone decides that the host evaluates its
+/// geometry: host-evaluated is its class.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HostGeometry {
-    /// The engine's port mask lacks `lacks`, ports the program's device
-    /// class needs: a stated engine limit.
-    EngineLacks {
-        engine: &'static str,
-        lacks: PortMask,
-    },
-    /// The program alone decides it: host-evaluated is its class.
-    Program { why: String },
+pub struct HostGeometry {
+    pub why: String,
 }
 
 impl HostGeometry {
     /// What bind says of the pass, `program` its container hash.
     #[must_use]
     pub fn bind_message(&self, program: u64) -> String {
-        match self {
-            HostGeometry::EngineLacks { engine, lacks } => format!(
-                "engine {engine} lacks geometry port(s) {} that program {program:016x} needs; \
-                 its fires serialize (host-resolved geometry)",
-                port_names(*lacks)
-            ),
-            HostGeometry::Program { why } => format!(
-                "program {program:016x}'s geometry is host-evaluated ({why}): its fires \
-                 serialize"
-            ),
-        }
+        format!(
+            "program {program:016x}'s geometry is host-evaluated ({}): its fires serialize",
+            self.why
+        )
+    }
+}
+
+/// The engine's port mask lacks `lacks`, ports the program's device class
+/// needs: the bind is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineLacks {
+    pub engine: &'static str,
+    pub lacks: PortMask,
+}
+
+impl EngineLacks {
+    /// Why bind refuses the pass, `program` its container hash.
+    #[must_use]
+    pub fn refusal(&self, program: u64) -> String {
+        format!(
+            "pipeline: engine {} does not read geometry port(s) {} from the device, and \
+             program {program:016x}'s geometry is computed there; the engine cannot serve it",
+            self.engine,
+            port_names(self.lacks)
+        )
     }
 }
 
@@ -82,8 +82,8 @@ fn minus(needs: PortMask, has: PortMask) -> PortMask {
 }
 
 /// How a pass binds: the device-geometry pass's rows, the ports a decode
-/// envelope reads from the device, the class, and why the host resolves it
-/// when it does while its geometry is not host-derivable.
+/// envelope reads from the device, the class, and why the host evaluates it
+/// when its program is host-evaluated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindGeometry {
     pub devgeo: Option<Vec<u32>>,
@@ -107,9 +107,12 @@ pub struct ProgramGeometry {
 }
 
 /// The class a program binds as on an engine with port mask `device` named
-/// `engine`.
-#[must_use]
-pub fn classify(program: ProgramGeometry, device: PortMask, engine: &'static str) -> BindGeometry {
+/// `engine`, or why the engine cannot serve it.
+pub fn classify(
+    program: ProgramGeometry,
+    device: PortMask,
+    engine: &'static str,
+) -> Result<BindGeometry, EngineLacks> {
     let host = |host| BindGeometry {
         devgeo: None,
         decode_envelope: None,
@@ -117,7 +120,7 @@ pub fn classify(program: ProgramGeometry, device: PortMask, engine: &'static str
         host,
     };
     if program.host_derivable {
-        return host(None);
+        return Ok(host(None));
     }
     let devgeo_needs = if program.needs_mask_port {
         PortMask::DEVICE_GEOMETRY.with(Port::AttnMask)
@@ -133,41 +136,41 @@ pub fn classify(program: ProgramGeometry, device: PortMask, engine: &'static str
         // the device before it stages, so it is only the pass for programs
         // the envelope declines.
         Some(qo_indptr) if device.covers(devgeo_needs) && !envelope_covered => {
-            return BindGeometry {
+            return Ok(BindGeometry {
                 devgeo: Some(qo_indptr),
                 decode_envelope: None,
                 class: GeometryClass::DeviceGeometry,
                 host: None,
-            };
+            });
         }
         Some(_) if !envelope_covered => {
-            return host(Some(HostGeometry::EngineLacks {
+            return Err(EngineLacks {
                 engine,
                 lacks: minus(devgeo_needs, device),
-            }));
+            });
         }
         _ => {}
     }
     match program.envelope {
-        Ok(Some(required)) if device.covers(required) => BindGeometry {
+        Ok(Some(required)) if device.covers(required) => Ok(BindGeometry {
             devgeo: None,
             decode_envelope: Some(required),
             class: GeometryClass::DecodeEnvelope,
             host: None,
-        },
-        Ok(Some(required)) => host(Some(HostGeometry::EngineLacks {
+        }),
+        Ok(Some(required)) => Err(EngineLacks {
             engine,
             lacks: minus(required, device),
-        })),
-        Ok(None) => host(Some(HostGeometry::Program {
+        }),
+        Ok(None) => Ok(host(Some(HostGeometry {
             why: format!("not a decode envelope: {}", program.why),
-        })),
-        Err(reason) => host(Some(HostGeometry::Program {
+        }))),
+        Err(reason) => Ok(host(Some(HostGeometry {
             why: format!(
                 "device-dependent geometry that is not a decode envelope: {reason}; a fire \
                  blocks on values the host cannot derive"
             ),
-        })),
+        }))),
     }
 }
 
@@ -202,56 +205,52 @@ mod tests {
         }
     }
 
-    const VULKAN: PortMask = PortMask::DECODE_ENVELOPE.with(Port::Fold);
+    const DECODE_ONLY: PortMask = PortMask::DECODE_ENVELOPE.with(Port::Fold);
     const CUDA: PortMask = PortMask::DEVICE_GEOMETRY
         .with(Port::AttnMask)
         .with(Port::Fold);
 
     #[test]
     fn host_geometry_every_case() {
-        a_capability_limited_bind_is_named_and_counted();
+        a_capability_limited_bind_is_refused_by_name();
         a_program_only_host_class_is_named_and_counted();
         device_classes_and_host_derivable_name_nothing();
     }
 
-    fn a_capability_limited_bind_is_named_and_counted() {
+    fn a_capability_limited_bind_is_refused_by_name() {
         // A device-geometry program on an engine without device geometry.
-        let bound = classify(program(Some(vec![0, 2]), Ok(None)), VULKAN, "vulkan");
-        assert_eq!(bound.class, GeometryClass::Host);
-        let Some(host @ HostGeometry::EngineLacks { lacks, .. }) = bound.host.clone() else {
-            panic!("an engine limit: {bound:?}");
-        };
+        let refused = classify(program(Some(vec![0, 2]), Ok(None)), DECODE_ONLY, "stub")
+            .expect_err("an engine limit refuses the bind");
         assert_eq!(
-            lacks,
+            refused.lacks,
             PortMask::of(&[Port::Positions, Port::KvLen, Port::Slots])
         );
-        let message = host.bind_message(0xabc);
-        assert!(
-            message.contains("engine vulkan lacks geometry port(s)"),
-            "{message}"
-        );
+        let message = refused.refusal(0xabc);
+        assert!(message.contains("engine stub does not read"), "{message}");
         assert!(message.contains("positions"), "{message}");
-        assert!(
-            message.contains("program 0000000000000abc needs"),
-            "{message}"
-        );
-        assert!(message.contains("its fires serialize"), "{message}");
-        assert!(!message.contains("falling back"), "{message}");
+        assert!(message.contains("program 0000000000000abc"), "{message}");
+        assert!(!message.contains("serialize"), "{message}");
 
         // A decode envelope whose required ports the engine lacks.
         let required = PortMask::DECODE_ENVELOPE.with(Port::Positions);
-        let bound = classify(program(None, Ok(Some(required))), VULKAN, "vulkan");
         assert_eq!(
-            bound.host,
-            Some(HostGeometry::EngineLacks {
-                engine: "vulkan",
+            classify(program(None, Ok(Some(required))), DECODE_ONLY, "stub"),
+            Err(EngineLacks {
+                engine: "stub",
                 lacks: PortMask::of(&[Port::Positions])
             })
         );
 
-        let before = fires();
-        count_fire();
-        assert!(fires() > before);
+        // A channel-fed mask needs the mask port too.
+        let mut masked = program(Some(vec![0, 1]), Ok(None));
+        masked.needs_mask_port = true;
+        assert_eq!(
+            classify(masked, PortMask::DEVICE_GEOMETRY, "cerebras"),
+            Err(EngineLacks {
+                engine: "cerebras",
+                lacks: PortMask::of(&[Port::AttnMask])
+            })
+        );
     }
 
     fn a_program_only_host_class_is_named_and_counted() {
@@ -260,9 +259,9 @@ mod tests {
             Err("its slots follow a sampled token".to_string()),
         ] {
             // On any engine, one with device geometry among them.
-            let bound = classify(program(None, envelope), CUDA, "cuda");
+            let bound = classify(program(None, envelope), CUDA, "cuda").expect("binds");
             assert_eq!(bound.class, GeometryClass::Host);
-            let Some(host @ HostGeometry::Program { .. }) = bound.host else {
+            let Some(host) = bound.host else {
                 panic!("the program's class");
             };
             let message = host.bind_message(0xabc);
@@ -279,32 +278,27 @@ mod tests {
     }
 
     fn device_classes_and_host_derivable_name_nothing() {
-        let bound = classify(program(Some(vec![0, 2]), Ok(None)), CUDA, "cuda");
+        let bound = classify(program(Some(vec![0, 2]), Ok(None)), CUDA, "cuda").expect("binds");
         assert_eq!(bound.class, GeometryClass::DeviceGeometry);
         assert_eq!(bound.devgeo, Some(vec![0, 2]));
         assert_eq!(bound.host, None);
 
         // The envelope runs ahead of device geometry where it covers.
         let envelope = Ok(Some(PortMask::DECODE_ENVELOPE));
-        let bound = classify(program(Some(vec![0, 1]), envelope), VULKAN, "vulkan");
+        let bound =
+            classify(program(Some(vec![0, 1]), envelope), DECODE_ONLY, "stub").expect("binds");
         assert_eq!(bound.class, GeometryClass::DecodeEnvelope);
         assert_eq!(bound.host, None);
 
         let mut derivable = program(None, Ok(None));
         derivable.host_derivable = true;
-        let bound = classify(derivable, VULKAN, "vulkan");
+        let bound = classify(derivable, DECODE_ONLY, "stub").expect("binds");
         assert_eq!((bound.class, bound.host), (GeometryClass::Host, None));
 
-        // A channel-fed mask needs the mask port too.
+        // A channel-fed mask on an engine that reads it binds as device geometry.
         let mut masked = program(Some(vec![0, 1]), Ok(None));
         masked.needs_mask_port = true;
-        let bound = classify(masked, PortMask::DEVICE_GEOMETRY, "cerebras");
-        assert_eq!(
-            bound.host,
-            Some(HostGeometry::EngineLacks {
-                engine: "cerebras",
-                lacks: PortMask::of(&[Port::AttnMask])
-            })
-        );
+        let bound = classify(masked, CUDA, "vulkan").expect("binds");
+        assert_eq!(bound.class, GeometryClass::DeviceGeometry);
     }
 }

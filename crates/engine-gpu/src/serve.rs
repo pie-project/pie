@@ -469,6 +469,11 @@ pub struct Seated<'a, B: Serve> {
 
     pub positions: &'a [u32],
 
+    /// The slot of its working set each row lands at, where its program
+    /// places a one-row lane off the run `held..held + rows` (device
+    /// geometry): `pages` names the slots' pages. `None` appends the run.
+    pub slots: Option<&'a [u32]>,
+
     pub readout: Option<&'a [u32]>,
 
     /// Whether the host reads back what the lane reads out (its readout
@@ -533,6 +538,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             mask: None,
             adapter: None,
             positions: &[],
+            slots: None,
             readout: None,
             hosts: true,
             reads: &[],
@@ -4010,7 +4016,13 @@ impl<B: Serve> Shell<B> {
                         request_of_token.push(at_lane);
                         slot_of_row.extend_from_slice(&state);
                     }
-                    writes.extend(std::iter::repeat_n(None, rows_here));
+                    match seated.slots {
+                        None => writes.extend(std::iter::repeat_n(None, rows_here)),
+                        Some(slots) => {
+                            let placed = self.placed_writes(source, seated, slots, rows_here)?;
+                            writes.extend(placed.into_iter().map(Some));
+                        }
+                    }
                 }
             }
         }
@@ -5512,6 +5524,68 @@ fn span_copies(
                 })
         })
         .collect()
+}
+
+impl<B: Serve> Shell<B> {
+    /// The explicit write descriptor, `(page, offset)` in the kv list, of
+    /// each of lane `source`'s `rows` rows its program lands at `slots` of
+    /// its working set, whose pages `seated.pages` names.
+    fn placed_writes(
+        &self,
+        source: usize,
+        seated: &Seated<'_, B>,
+        slots: &[u32],
+        rows: usize,
+    ) -> Result<Vec<(i32, i32)>> {
+        if slots.len() != rows {
+            return Err(program(
+                "serve::stage",
+                format!(
+                    "lane {source} places {} slot(s) for its {rows} row(s)",
+                    slots.len()
+                ),
+            ));
+        }
+        if !seated.refs {
+            return Err(program(
+                "serve::stage",
+                format!(
+                    "lane {source} places its rows at working-set slots and is seat-addressed: \
+                     a seat has no working set whose pages the slots index"
+                ),
+            ));
+        }
+        if self.pools.tables().iter().any(|paged| paged.window().is_some()) {
+            return Err(program(
+                "serve::stage",
+                format!(
+                    "lane {source} places its rows at slots {slots:?}, off the run its fire \
+                     appends, and this load keeps window lists, which page that run alone"
+                ),
+            ));
+        }
+        let page = self.pools.paging().page_size.max(1);
+        slots
+            .iter()
+            .map(|&slot| {
+                let named = seated.pages.get((slot / page) as usize).ok_or_else(|| {
+                    program(
+                        "serve::stage",
+                        format!(
+                            "lane {source} places a row at slot {slot}, on page {} of its \
+                             working set, and its table names {} page(s)",
+                            slot / page,
+                            seated.pages.len()
+                        ),
+                    )
+                })?;
+                Ok((
+                    narrow(u64::from(self.pools.kv_page(*named)?)),
+                    narrow(u64::from(slot % page)),
+                ))
+            })
+            .collect()
+    }
 }
 
 fn narrow(n: u64) -> i32 {

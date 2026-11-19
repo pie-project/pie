@@ -35,6 +35,9 @@ pub struct Deferral {
     /// The read-back buffer the frame lands into, lent by the session.
     pub landing: Option<Buffer>,
     pub landings: Vec<Landing>,
+    /// The ports the host reads off the rings at the next fire
+    /// ([`engine_gpu::program::read_at_fire`]): their puts land.
+    pub reads: eta_ir::registry::PortMask,
 }
 
 /// A put the host reads, landing in the stage's read-back buffer.
@@ -76,8 +79,11 @@ impl<'a> OnDevice<'a> {
     /// Records the pass into a frame of its own for the caller to submit,
     /// instead of running each stage to completion.
     #[must_use]
-    pub fn deferred(mut self) -> OnDevice<'a> {
-        self.deferral = Some(Deferral::default());
+    pub fn deferred(mut self, reads: eta_ir::registry::PortMask) -> OnDevice<'a> {
+        self.deferral = Some(Deferral {
+            reads,
+            ..Deferral::default()
+        });
         self
     }
 
@@ -99,7 +105,7 @@ impl<'a> OnDevice<'a> {
         vals: &mut [Value],
     ) -> Result<()> {
         let plan = &package.plans[at];
-        let deferring = self.deferral.is_some();
+        let deferring = self.deferral.as_ref().map(|deferral| deferral.reads);
         let mut frame = match self.deferral.as_mut().and_then(|d| d.frame.take()) {
             Some(frame) => frame,
             None => self.device.frame()?,
@@ -164,10 +170,9 @@ impl<'a> OnDevice<'a> {
             };
             let channel = put.channel;
             let bytes = self.session.span(at, local).map_or(0, |(_, l)| l);
-            let on_device = if deferring {
-                host_reads_not(package, channel)
-            } else {
-                keeps(package, channel, bytes)
+            let on_device = match deferring {
+                Some(reads) => host_reads_not(package, channel, reads),
+                None => keeps(package, channel, bytes),
             };
             if on_device {
                 self.session
@@ -321,15 +326,15 @@ fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
 }
 
 /// Whether a deferred pass keeps `channel`'s puts on the device: every one the
-/// host does not read, at the fire (a `fold` count, an `attn_mask`) or after.
-fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
+/// host does not read, at the fire (a port of `reads`: a `fold` count, an
+/// `attn_mask`, a device-geometry descriptor) or after.
+fn host_reads_not(
+    package: &LaunchPackage,
+    channel: u32,
+    reads: eta_ir::registry::PortMask,
+) -> bool {
     let read_at_fire = package.ports.iter().any(|binding| {
-        binding.channel == channel
-            && !binding.is_const
-            && matches!(
-                binding.port,
-                eta_ir::registry::Port::Fold | eta_ir::registry::Port::AttnMask
-            )
+        binding.channel == channel && !binding.is_const && reads.contains(binding.port)
     });
     !read_at_fire
         && package

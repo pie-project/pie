@@ -878,7 +878,7 @@ where
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
 
             ports: B::ports(),
-            geometry: GeometryClass::DecodeEnvelope,
+            geometry: GeometryClass::DeviceGeometry,
 
             kv_handle: None,
             media_encode: false,
@@ -1489,6 +1489,7 @@ impl<B: Host> Gpu<B> {
             feeds: vec![None; lanes],
         };
         B::envelope(self, submission, &mut envelope, &mut faulted)?;
+        let device = self.device_lanes(submission, &mut envelope, &mut faulted);
         if let Some(vocab) = self.vocab {
             out_of_range_tokens(submission, &mut envelope, vocab, &mut faulted);
         }
@@ -1726,14 +1727,21 @@ impl<B: Host> Gpu<B> {
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
                 pages: pages_of[at].as_deref().unwrap_or(&[]),
-                held: pages_of[at].is_some().then_some(lane.kv.held),
+                held: match device[at].as_ref().and_then(|placed| placed.have) {
+                    Some(have) => Some(have),
+                    None => pages_of[at].is_some().then_some(lane.kv.held),
+                },
                 folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 
                 adapter: lane_adapters[at].or(lane.adapter),
-                positions: &lane.positions,
+                positions: device[at]
+                    .as_ref()
+                    .and_then(|placed| placed.positions.as_deref())
+                    .unwrap_or(&lane.positions),
+                slots: device[at].as_ref().and_then(|placed| placed.slots.as_deref()),
 
                 readout: match &lane.readout {
                     Readout::Rows(rows) => Some(rows.as_slice()),
@@ -1841,6 +1849,72 @@ impl<B: Host> Gpu<B> {
                 fed,
             },
         ))
+    }
+}
+
+impl<B: Host> Gpu<B> {
+    /// Each lane's geometry as its instance's descriptor ports resolve it
+    /// ([`crate::program::device_lanes`]): device geometry's tokens,
+    /// positions, extent, slots and mask, and a decode envelope's positions
+    /// where its program computes them. The tokens and mask land in
+    /// `envelope`; an attachment whose ports refuse faults its own lanes.
+    fn device_lanes(
+        &self,
+        step: &Step,
+        envelope: &mut Envelope<B>,
+        faulted: &mut engine::StepOutcome,
+    ) -> Vec<Option<crate::program::DeviceLane>> {
+        let mut out: Vec<Option<crate::program::DeviceLane>> = vec![None; step.lanes.len()];
+        for attachment in program_attachments(step) {
+            let first = (attachment.lane as usize).min(step.lanes.len());
+            let end = attachment_lanes(attachment).end as usize;
+            let stated = &step.lanes[first..end.min(step.lanes.len())];
+            let resolved = self
+                .programs
+                .descriptor_ports(attachment.instance)
+                .and_then(|ports| match ports {
+                    Some(mut ports) => crate::program::device_lanes(
+                        &mut ports,
+                        stated,
+                        first,
+                        attachment.instance,
+                    )
+                    .map(Some),
+                    None => Ok(None),
+                });
+            match resolved {
+                Ok(None) => {}
+                Ok(Some(lanes)) => {
+                    for (at, placed) in lanes.into_iter().enumerate() {
+                        let at = first + at;
+                        if out[at].is_some() {
+                            envelope.refused(
+                                step,
+                                attachment,
+                                &format!(
+                                    "lane {at} is claimed by two attached instances; a lane's \
+                                     descriptor ports have one author"
+                                ),
+                                faulted,
+                            );
+                            break;
+                        }
+                        if let Some(tokens) = &placed.tokens {
+                            envelope.tokens[at] = Some(tokens.clone());
+                            envelope.feeds[at] = None;
+                        }
+                        if placed.mask.is_some() {
+                            envelope.masks[at].clone_from(&placed.mask);
+                        }
+                        out[at] = Some(placed);
+                    }
+                }
+                Err(refused) => {
+                    envelope.refused(step, attachment, &refused.to_string(), faulted);
+                }
+            }
+        }
+        out
     }
 }
 
