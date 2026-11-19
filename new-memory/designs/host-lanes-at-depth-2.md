@@ -104,34 +104,44 @@ At depth 2, step N+1 is submitted before step N's take.
   - The prologue gate (`blocked_at`) then holds the depth honestly. An instance whose ring is full
     waits, it doesn't overwrite.
 
-### 4.3 Each engine: two status words a session, two scratch arms for the class
+### 4.3 Each engine: what the host writes a fire, doubled by parity (the value scratch is not)
 
-- **Status words.** A session alternates two status words (and two launched-stage records) by fire
-  parity.
-  - Fire N writes word N mod 2. Its verdict is read at N's harvest from that word, through the
-    completion-handler check 21e887e7f added (`EpilogueCheck`, which already carries its status
-    regions).
+Revised after GPU's note on CUDA's one arm.
+
+- **The value scratch needs no second arm.** On CUDA all guest work is ordered on the context's single
+  stream (side streams fork after the wave's pull and join before the land). On Metal, command buffers
+  on one queue run in order. So N+1's guest kernels start only after N's finish, and a fire's value
+  scratch (GPU-written, dead outside its fire) is per fire in time, not in space.
+  - `scratch_arms` stays 1 for every class, as long as the host never reads N's scratch after N+1 is
+    enqueued.
+  - Metal: it doesn't. The verdict is read from the status word, which is resident, and channel cells
+    are in the rings.
+  - CUDA: GPU's agent is confirming.
+  - This keeps a beam instance at 22.8 MB on Metal, not 45.6.
+- **What does need two sets: the state the host writes while staging a fire, which N still reads while
+  N+1 is staged.** On Metal (engine-metal `program/launch.rs`) that is:
+  - the status word, which `refresh_cells` resets to "ready" before each fire, and from which the fire's
+    verdict is read at its harvest;
+  - the pending flags, which the host zeroes before each fire (`zero_span`);
+  - the instance's grouped slot tables, which `grouped.refresh` rewrites with the fire's bound cells.
+  - The pair's batch tables are already one set a frame in flight.
+  - These three regions are small (words and tables), so the resident bytes grow by one copy of them. Fire
+    N uses set N mod 2, and N's verdict is read from its set at its harvest, through the
+    completion-handler check 21e887e7f added (`EpilogueCheck` already carries the status regions it
+    reads).
   - `fence_instances` holds an instance only to fire N−1's landing (depth 2), not N's.
-- **Scratch.** The class's `scratch_arms` is 2 for a run-ahead class (DecodeEnvelope, and the samplers
-  that become envelopes). N and N+1 are in flight together, each with its own value scratch.
-  - The pair's batch tables are already one set a frame in flight (F31: cutting them broke beam
-    --verify).
-  - Memory: +1 instance scratch for each run-ahead instance. A standard sampler's is small (kilobytes;
-    Metal states it per bind). A beam instance's is 22.8 MB on Metal after the halving, so a beam
-    instance at depth 2 holds 45.6 MB (its pre-halving figure).
-  - Funding and the planner already count `instance_bytes = resident + scratch × arms`.
 - **Ports.** The device token source of N+1 is N's put cell, the pending cell of the token channel's
   ring at the cursor N will leave. Same queue, so N's epilogue has finished before N+1's prologue reads
-  it (Metal: command buffers on one queue run in order; CUDA: one stream).
+  it.
 
 ### 4.4 Per engine
 
 | engine | needs |
 |---|---|
 | runtime | samplers as envelopes (4.1); submit a run-ahead lane's N+1 before N's take; stop one step late with N+1 dropped and its KV / slot rolled back (4.2); fault of N abandons N+1; token ring capacity ≥ 2 checked at bind |
-| engine-metal | two status words a session by parity; `fence_instances` to depth 2 for run-ahead classes; `scratch_arms` 2 for them; the verdict check per parity (the `EpilogueCheck` path); token source = N's pending cell |
-| engine-cuda / ROCm | already runs envelopes ahead (`can_runahead`); `scratch_arms` 2 for the class if a fire's value scratch is per fire there (today 1: check whether CUDA's envelope run-ahead shares one scratch across N and N+1, and if so, why it's safe) |
-| engine-gpu (wgpu / Vulkan) | `guest_state` arms per class as above; its envelope path (`api.rs` binds `DecodeEnvelope`) to run ahead, or stay depth 1 and keep correctness (the runtime asks the engine's depth, it doesn't assume it) |
+| engine-metal | status word, pending flags and grouped slot tables doubled by fire parity (resident grows by those); `fence_instances` to depth 2 for run-ahead classes; the verdict check per parity (the `EpilogueCheck` path); token source = N's pending cell; `scratch_arms` stays 1 (queue order) |
+| engine-cuda / ROCm | already runs envelopes ahead (`can_runahead`); one arm is safe by single-stream order (GPU confirming that the host reads no scratch of N after N+1 is enqueued); the same audit for host-written per-fire state (status words, cells) |
+| engine-gpu (wgpu / Vulkan) | the same audit: one queue's order for the value scratch, parity sets for what the host writes a fire; its envelope path (`api.rs` binds `DecodeEnvelope`) to run ahead, or stay depth 1 and keep correctness (the runtime asks the engine's depth, it doesn't assume it) |
 
 ## 5. Alternatives considered
 
@@ -159,7 +169,8 @@ At depth 2, step N+1 is submitted before step N's take.
   - beam --verify clean;
   - the failed-buffer test extended to a pair in flight (N faults, so N+1 is abandoned, the instance
     recovers);
-  - memory: instance bytes before and after, per class.
+  - memory: instance bytes before and after, per class (expected: resident + the parity copy of the
+  status word, flags and slot tables; scratch unchanged).
 
 ## 7. Questions for GPU
 
@@ -167,7 +178,8 @@ At depth 2, step N+1 is submitted before step N's take.
    slot)? If yes, 4.2 is only ring capacity and the fault pairing.
 2. Do the standard samplers have a reason to route the token through the host (`HostRole::Reader`),
    beyond the take for streaming? If not, 4.1 is a program declaration change in the sampler library.
-3. CUDA's envelope run-ahead with `scratch_arms` 1: is a fire's value scratch per fire there, or is
-   N+1 safe on one arm for another reason?
+3. (Answered in part: single-stream order makes one arm safe for the value scratch.) Does CUDA's host
+   write any per-fire state of an instance (status words, cells, tables) that fire N still reads while
+   N+1 is staged? On Metal three regions qualify (4.3).
 4. Order: Metal's two status words first (needed for beam to run ahead on Metal at all: today it's
    depth 1 there), then 4.1 and 4.2 together.
