@@ -171,6 +171,70 @@ pub fn lm_head_live(
     act_x_wt(ctx, OP, act, w, None, y)
 }
 
+/// `z = rmsnorm(x + y) · wᵀ` in one launch where that pays
+/// (`ResidualAddRmsnormMatmul`): `x + y` lands in `y_out` and the normed
+/// rows in `out`, each block norming its own copy where it stages them for
+/// the product. `Ok(false)`, landing nothing, where the product would not take
+/// the skinny kernel or the blocks' redundant norms cost more than the
+/// launch they save; the caller then runs the norm and the product apart.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_matmul(
+    ctx: &Ctx,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    w: Tensor,
+    y_out: &mut Tensor,
+    out: &mut Tensor,
+    z: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.residual_add_rmsnorm_matmul";
+    if [x.dtype, y.dtype, weight.dtype, w.dtype, y_out.dtype, out.dtype, z.dtype]
+        .iter()
+        .any(|&d| d != Dtype::Bf16)
+        || x.rows != y.rows
+        || x.rows != z.rows
+        || x.width != y.width
+        // The norm's weight as a load lays it (k rows of one) or one row.
+        || u64::from(weight.rows) * u64::from(weight.width) != u64::from(x.width)
+        || w.width != x.width
+        || w.rows != z.width
+        || z.rows == 0
+    {
+        return Ok(false);
+    }
+    let n = count(OP, "the columns this projection lands", z.width)?;
+    let k = count(OP, "the contraction this projection walks", x.width)?;
+    let m = ctx.opaque_rows(stated(OP, z.rows)?);
+    #[cfg(feature = "rocm")]
+    {
+        dense::act_x_wt_normed(
+            ctx,
+            w.ptr,
+            z.ptr,
+            m,
+            n,
+            k,
+            super::gemv::SkinnyNorm {
+                x: x.ptr,
+                y: y.ptr,
+                w: weight.ptr,
+                y_out: y_out.ptr,
+                out: out.ptr,
+                eps,
+                plus_one: i32::from(plus_one),
+            },
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, plus_one, eps, y_out, out, m, n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
 pub fn act_x_wt(
     ctx: &Ctx,
     op: &'static str,

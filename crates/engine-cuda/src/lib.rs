@@ -91,6 +91,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::rmsnorm_residual_add(),
+            rules::residual_add_rmsnorm_matmul(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),

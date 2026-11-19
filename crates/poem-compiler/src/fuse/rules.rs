@@ -57,7 +57,6 @@ pub fn all() -> Vec<Rule> {
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
-        residual_add_rmsnorm(),
         matmul_swiglu_matmul(),
         matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
         moe_mega(),
@@ -67,6 +66,10 @@ pub fn all() -> Vec<Rule> {
         matmul_bias(),
         matmul_moe_route(),
         matmul_split_rows(),
+        // After every product's own rules (a product they fold keeps them),
+        // before the residual norm alone takes the norm.
+        residual_add_rmsnorm_matmul(),
+        residual_add_rmsnorm(),
         gated_residual_norm_modulate(),
         norm_modulate(),
         norm_rope(Rotated::First),
@@ -1079,6 +1082,37 @@ pub fn residual_add_rmsnorm() -> Rule {
             plus_one: plus_one(m.op("out")),
             eps: m.f32("eps"),
             out: m.value("out"),
+        }
+    })
+}
+
+/// A residual add whose sum is normed and a product of the normed rows: a
+/// backend may norm them where it stages them for the product, landing them
+/// too for their other readers (an adapter's correction reads them beside
+/// the projection).
+#[must_use]
+pub fn residual_add_rmsnorm_matmul() -> Rule {
+    let chain = |norm: Norm| {
+        template(move |p| {
+            let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
+            p.export("y_out", &y_out);
+            let out = norm.apply(p, &y_out, "weight", "eps");
+            p.export("out", &out);
+            let z = linear::matmul(&out, &p.weight("w", [W, W]));
+            p.export("z", &z);
+        })
+    };
+    Rule::new("fused.residual_add_rmsnorm_matmul", Norm::BOTH.map(chain), |m| {
+        Fused::ResidualAddRmsnormMatmul {
+            x: m.value("x"),
+            y: m.value("y"),
+            y_out: m.value("y_out"),
+            weight: m.value("weight"),
+            plus_one: plus_one(m.op("out")),
+            eps: m.f32("eps"),
+            out: m.value("out"),
+            w: m.value("w"),
+            z: m.value("z"),
         }
     })
 }
