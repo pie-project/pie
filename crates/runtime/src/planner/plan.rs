@@ -111,6 +111,20 @@ impl ResidencyPlanner {
         true
     }
 
+    /// Whether chunk moves will stand `pieces` free runs of `run` for the
+    /// head (free chunks enough, none adjacent: F21), the pool's walk asked
+    /// to make them ([`super::pool::PoolPort::compaction_comes`]). Moving
+    /// chunks moves no process: a holder keeps its refs whatever it waits
+    /// on, so it is asked before any resident is moved for the head.
+    pub(super) fn waits_on_compaction(&self, run: u32, pieces: u32) -> bool {
+        if !self.port.compaction_comes(run, pieces) {
+            return false;
+        }
+        self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(run, pieces, "planner: the head waits on a compaction of scattered free chunks");
+        true
+    }
+
     /// One pass; true where it ends waiting on a grow.
     fn plan_once(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
@@ -252,8 +266,7 @@ impl ResidencyPlanner {
                     // Free chunks enough but scattered: chunks are moved
                     // until its runs stand (the walk carries it out, room
                     // given back wakes it), no one parked for it.
-                    if self.port.compaction_comes(run, pieces) {
-                        ptrace!("plan waits on a compaction run={} pieces={}", run, pieces);
+                    if self.waits_on_compaction(run, pieces) {
                         return false;
                     }
                     // Parked state lying on the device moves down a tier
@@ -290,6 +303,11 @@ impl ResidencyPlanner {
                     }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
+                    }
+                    // Free chunks enough but scattered: chunks move until
+                    // its runs stand, no one moved, whatever the fleet does.
+                    if self.waits_on_compaction(need.run, need.pieces) {
+                        return false;
                     }
                     // Parked state lying on the device moves down a tier for
                     // it, no one running on it (the M1 stress: every
@@ -331,6 +349,12 @@ impl ResidencyPlanner {
                             inner.roles_retry_head();
                         });
                         continue;
+                    }
+                    // Free chunks enough but scattered: chunks move until
+                    // its runs stand; moving chunks moves no one, so it needs
+                    // no funding.
+                    if self.waits_on_compaction(run, pieces) {
+                        return false;
                     }
                     // Not funded yet: it waits for a completion (one that
                     // frees room pokes the plan, which looks again here).

@@ -573,6 +573,9 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
+    /// The chunks the last compaction moved off ([`Self::apply_compaction`]),
+    /// fenced until its copy's fire retires.
+    compacted: Vec<u32>,
     /// Told each time a chunk comes free for state ([`Self::room_watch`]).
     given: std::sync::Arc<RoomGiven>,
 }
@@ -668,6 +671,7 @@ impl SlotPool {
             free,
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
+            compacted: Vec::new(),
             fenced: Bits::new(total, false),
             ceiling: total,
             segments,
@@ -1139,7 +1143,7 @@ impl SlotPool {
     pub fn plan_compaction(&self, run: u32) -> Option<Vec<ChunkMove>> {
         let run = run.max(1);
         if run > self.segments.segment_chunks()
-            || !self.fences.is_empty()
+            || self.compacting()
             || !self.runs_where(run, run, |chunk| self.open.get(chunk)).is_empty()
         {
             return None;
@@ -1240,6 +1244,7 @@ impl SlotPool {
                 .or_default()
                 .extend(moves.iter().map(|step| step.from));
         }
+        self.compacted = moves.iter().map(|step| step.from).collect();
         Ok(())
     }
 
@@ -1259,13 +1264,14 @@ impl SlotPool {
             });
         }
         self.fences.retain(|_, chunks| !chunks.is_empty());
+        self.compacted.clear();
     }
 
-    /// Whether chunks moved off by a compaction (or a rung raise) are
-    /// still fenced: the run it clears is on its way.
+    /// Whether the chunks the last compaction moved off are still fenced:
+    /// the run it clears is on its way. A rung raise's fence is not one.
     #[must_use]
     pub fn compacting(&self) -> bool {
-        !self.fences.is_empty()
+        self.compacted.iter().any(|&chunk| self.fenced.get(chunk))
     }
 
     /// Re-fences the chunks a compaction fenced until `from` to `to`: the

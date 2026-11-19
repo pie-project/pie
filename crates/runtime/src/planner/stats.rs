@@ -31,6 +31,8 @@ pub struct PlannerStats {
     pub restore_absorb_short: AtomicU64,
     /// Plans that ended waiting on a grow the segment walk was promised.
     pub grow_waits: AtomicU64,
+    /// Plans that ended waiting on a compaction of scattered free chunks.
+    pub compaction_waits: AtomicU64,
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.
     pub grow_parked: AtomicU64,

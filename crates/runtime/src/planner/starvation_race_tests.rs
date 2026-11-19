@@ -4358,3 +4358,112 @@ async fn a_bind_whose_run_a_compaction_stands_moves_no_resident_and_is_served_af
         assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
     }
 }
+
+/// The 500-at-once livelock (run 2, 3 minutes): the head a bind-suspended
+/// restore asking a run of 3, 262 chunks free and no 3 of them adjacent,
+/// every resident waiting on a grant (no candidate, picks=[]), nothing
+/// in flight. The chunk branch looked for occupants to move and found
+/// none, ten times a second. Moving chunks moves no process: the planner
+/// asks for a compaction for the restore head, moves no one, and the run
+/// it stands sends the restore. Control: where no compaction stands it,
+/// nothing is asked of one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_head_among_residents_waiting_on_grants_is_served_after_a_compaction() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for compactable in [false, true] {
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let pool = Arc::new(BindRoomPool {
+            model,
+            ..BindRoomPool::new(12, 0..0, 0)
+        });
+        // Scattered: no two adjacent; every other chunk a resident's.
+        pool.free.lock().extend([0, 2, 4, 6, 8, 10]);
+        pool.compactable.store(compactable, Ordering::Release);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        let residents: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+        for &pid in &residents {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&head).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 3,
+                pieces: 1,
+                pages: 3,
+            });
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+            // Every resident waits on a grant behind it.
+            for &pid in &residents {
+                inner.enqueue(
+                    pid,
+                    WaitKind::Allocation {
+                        demand: Demand {
+                            kv_pages: 1,
+                            rs: RsUnits::default(),
+                        },
+                        notify: Arc::new(Notify::new()),
+                        outcome: None,
+                        yielded: false,
+                        rise: false,
+                    },
+                );
+            }
+        });
+        assert!(planner.with_inner(|inner| inner.nothing_in_flight()));
+        assert_eq!(
+            planner.with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid)),
+            Some(head),
+            "the restore heads the queue"
+        );
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if pool.compactions.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        if !compactable {
+            assert_eq!(pool.compactions.load(Ordering::Relaxed), 0);
+            assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 0, "no run: not sent");
+            continue;
+        }
+        assert!(pool.compactions.load(Ordering::Relaxed) > 0, "a compaction is asked");
+        assert!(planner.stats.compaction_waits.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            planner.stats.evictions_started.load(Ordering::Relaxed),
+            0,
+            "no resident moved for it"
+        );
+        assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 0, "it waits for the run");
+        // The compaction lands: 3 moved to 0, 7 to 2; 3..6 stand free...
+        // modelled as the pool's free ids after the moves.
+        {
+            let mut free = pool.free.lock();
+            free.clear();
+            free.extend([3, 4, 5, 7, 8, 10]);
+        }
+        planner.pages_freed();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            planner.stats.restores.load(Ordering::Relaxed),
+            1,
+            "the run it stood sends the restore"
+        );
+        assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
+    }
+}
