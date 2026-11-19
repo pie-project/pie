@@ -53,6 +53,13 @@ struct Input {
     /// its siblings'.
     #[serde(default)]
     verify: bool,
+    /// A negative control of `verify`, a beam broken on purpose: `parent`
+    /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
+    /// % beams`) while its hypothesis keeps its own, so its rows read
+    /// another beam's cells; `score` moves lane 0's last step by 1.0 on the
+    /// host. Either must fail `verify`.
+    #[serde(default)]
+    corrupt: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -183,6 +190,7 @@ async fn main(input: Input) -> Result<String> {
         let out_greedy = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
         let lanes_b = Channel::from_iter(0u32..=b);
 
+        let corrupt_parent = input.corrupt.as_deref() == Some("parent");
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &lanes_b)?;
         let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
@@ -231,7 +239,11 @@ async fn main(input: Input) -> Result<String> {
             let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]
             let wpos = &base_b + iota(b); // [B]
 
-            let inherited = gather(mask.take(), &parent); // bool [B,cells]
+            let inherited = if corrupt_parent {
+                gather(mask.take(), (&parent + 1u32) % b)
+            } else {
+                gather(mask.take(), &parent)
+            }; // bool [B,cells]
             // Column `c` is slot `n + c`.
             let col = broadcast(reshape(iota(cells) + n, [1, cells]), [b, cells]);
             let wpos_b = broadcast(reshape(&wpos, [b, 1]), [b, cells]);
@@ -353,19 +365,27 @@ async fn main(input: Input) -> Result<String> {
         ));
     }
     let text = model::decode(&hypotheses[best_lane])?;
+    if input.corrupt.as_deref() == Some("score")
+        && let Some(last) = scored.first_mut().and_then(|lane| lane.last_mut())
+    {
+        *last += 1.0;
+    }
     let verified = if input.verify {
         let mut worst = 0f32;
+        // The most of its room any step came to (apart / room).
+        let mut closest = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis).await?;
             // Each step's log-probability as the beam took it (its score's
             // step), against the hypothesis's own, within that step's room:
-            // the bf16 quanta its log-probability and logits round to, and
-            // the quanta of the beam's scores either side of it.
+            // the quanta its log-probability and logits round to, and the
+            // quanta of the beam's scores either side of it.
             let mut before = 0f32;
             for (at, (&after, &(step, room))) in scored[lane].iter().zip(&alone).enumerate() {
                 let took = after - before;
-                let room = room + bf16_quantum(after) + if at > 0 { bf16_quantum(before) } else { 0.0 };
+                let room = room + quantum(after) + if at > 0 { quantum(before) } else { 0.0 };
                 let apart = (took - step).abs();
+                closest = closest.max(apart / room);
                 if apart > room {
                     return Err(format!(
                         "beam {lane} took {took:.4} at step {at}, and its hypothesis alone \
@@ -378,7 +398,10 @@ async fn main(input: Input) -> Result<String> {
             let total: f32 = alone.iter().map(|&(step, _)| step).sum();
             worst = worst.max((total - final_scores[lane]).abs());
         }
-        format!(" verified={} worst_apart={worst:.4}", hypotheses.len())
+        format!(
+            " verified={} worst_apart={worst:.4} worst_step={closest:.3}",
+            hypotheses.len()
+        )
     } else {
         String::new()
     };
@@ -388,18 +411,24 @@ async fn main(input: Input) -> Result<String> {
     ))
 }
 
-/// The quantum of bf16 at `x`: the gap between it and the next bf16 away
-/// from zero (8 significant bits).
-fn bf16_quantum(x: f32) -> f32 {
-    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
-    2f32.powi(exponent.max(-126) - 7)
+/// The quantum of `x` in the dtype it was stored in: the gap between it and
+/// the next value away from zero, of bf16 (8 significant bits) where `x` is
+/// a bf16 widened (its low 16 bits zero), else of f32 (24). The logits are
+/// bf16; the scores and log-probabilities come off f32 channels, f32 or bf16
+/// as the program computed them. An f32 that is a bf16 by chance (one in
+/// 65536) is given bf16's room.
+fn quantum(x: f32) -> f32 {
+    let bits = x.abs().to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let significant = if bits & 0xffff == 0 { 7 } else { 23 };
+    2f32.powi(exponent.max(-126) - significant)
 }
 
 /// Each step's log-probability of `hypothesis` after `prompt`, teacher-forced
 /// one token a fire on a working set of its own: what a beam that read only
 /// its own ancestry takes; and the room a beam's step has from it. The
-/// logits and log-probabilities are bf16, and the beam's fires run other
-/// kernels than these (more rows), which round their sums elsewhere: a
+/// logits are bf16, and the beam's fires run other kernels than these
+/// (more rows), which round their sums elsewhere: a
 /// logit may land a bf16 quantum apart (0.125 at a logit of 16 to 32), so
 /// a step's log-probability may move by the target's logit's quantum and
 /// the largest logit's (the log-sum-exp moves with it), and by its own
@@ -438,8 +467,8 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<Vec<(f32, f32)>> 
         let step = got.first().copied().ok_or("the rescoring fire returned nothing")?;
         let picked = picked.take_host::<Vec<f32>>().await.context("rescore drain")?;
         let largest = largest.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        let room = bf16_quantum(step)
-            + picked.iter().chain(&largest).map(|&l| bf16_quantum(l)).sum::<f32>();
+        let room =
+            quantum(step) + picked.iter().chain(&largest).map(|&l| quantum(l)).sum::<f32>();
         steps.push((step, room));
     }
     pipeline.close();
