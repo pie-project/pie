@@ -979,6 +979,7 @@ pub struct Pending {
 thread_local! {
     static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+#[cfg(target_vendor = "apple")]
 const INJECTED: &str = "a failure injected by `fail_next_frame`";
 
 /// Answers the next frame this thread commits with a completion handler
