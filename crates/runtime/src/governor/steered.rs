@@ -128,6 +128,10 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
+    fn least_mapped(&self) -> u64 {
+        self.target().map_or(0, PoolTarget::least_mapped)
+    }
+
     /// What the pool may map where the engine holds part of its range back
     /// for fires and bodies ([`::engine::chunk::ChunkFacts::held_bytes`],
     /// the span directly under the activation): the prefix segments wholly
@@ -291,6 +295,10 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
 
     fn floor(&self) -> u64 {
         self.0.lock().floor()
+    }
+
+    fn least_mapped(&self) -> u64 {
+        self.0.lock().least_mapped()
     }
 
     fn hard_limit(&self) -> u64 {
