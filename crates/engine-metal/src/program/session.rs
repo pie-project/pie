@@ -101,9 +101,9 @@ pub struct Session {
     rings: Rings,
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
-    /// Each launching stage's tables, twice ([`SETS`]): a pass is staged
-    /// in one set while the pass before it, still in flight, reads the
-    /// other. What the host writes for a fire (the status word reset to
+    /// Each launching stage's tables, a set a step the load keeps in
+    /// flight (its arms, at least two): a pass is staged in a set no pass
+    /// still in flight reads. What the host writes for a fire (the status word reset to
     /// ready, the pending flags, the grouped lane table and its slots, the
     /// row tables and output addresses) lies in its set; the value
     /// scratch does not, the queue running a fire's kernels after the
@@ -136,8 +136,9 @@ pub struct Session {
     stale: Option<Fired>,
 }
 
-/// The sets of tables a session holds ([`Session::sets`]).
-pub const SETS: usize = 2;
+/// The fewest sets of tables a session holds ([`Session::sets`]): one a
+/// pass in flight and one being staged.
+pub const MIN_SETS: usize = 2;
 
 /// A pass in flight: the stages it launched, the set it reads, and where
 /// its verdict is told once its harvest reads it (the next pass's
@@ -185,8 +186,15 @@ impl Session {
     }
 
     /// The tables an instance lays, in order: every launching stage's, a
-    /// set after a set ([`SETS`]), then its score rows.
-    pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32, capture: u64) -> Vec<u64> {
+    /// set after a set (`sets` of them, at least [`MIN_SETS`]), then its
+    /// score rows.
+    pub fn table_sizes(
+        compiled: &Compiled,
+        channels: usize,
+        rows: u32,
+        capture: u64,
+        sets: usize,
+    ) -> Vec<u64> {
         let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         let set: Vec<u64> = compiled
             .plans
@@ -195,7 +203,7 @@ impl Session {
             .filter(|(index, _)| launches(compiled, *index))
             .flat_map(|(_, plan)| Prepared::table_sizes(plan, channels, rows))
             .collect();
-        (0..SETS)
+        (0..sets.max(MIN_SETS))
             .flat_map(|_| set.iter().copied())
             .chain((capture > 0).then_some(capture + CAPTURE_ALIGN))
             .collect()
@@ -252,6 +260,13 @@ impl Session {
         self.run_ahead
     }
 
+    /// Passes of it that may fly while another is staged: a set each, less
+    /// the one being staged.
+    #[must_use]
+    pub fn ahead_depth(&self) -> usize {
+        self.sets.len() - 1
+    }
+
     /// Passes in flight.
     #[must_use]
     pub fn in_flight(&self) -> usize {
@@ -285,6 +300,7 @@ impl Session {
         pooled: Pooled<'_>,
         rows: u32,
         capture: u64,
+        set_count: usize,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -298,13 +314,13 @@ impl Session {
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
         let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
-        let sizes = Session::table_sizes(compiled, shapes.len(), rows, capture);
+        let sizes = Session::table_sizes(compiled, shapes.len(), rows, capture, set_count);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
-        let mut sets = Vec::with_capacity(SETS);
-        for _ in 0..SETS {
+        let mut sets = Vec::with_capacity(set_count.max(MIN_SETS));
+        for _ in 0..set_count.max(MIN_SETS) {
             let mut prepared = Vec::with_capacity(compiled.plans.len());
             for (index, stage_plan) in compiled.plans.iter().enumerate() {
                 prepared.push(if launches(compiled, index) {
@@ -724,7 +740,7 @@ impl Session {
     ) -> Result<Option<Fired>> {
         self.refuse_unread()?;
         let ahead = self.runs_ahead();
-        let deepest = if ahead { SETS } else { 1 };
+        let deepest = if ahead { self.sets.len() } else { 1 };
         if self.airborne.len() >= deepest {
             return Err(Fault::program(
                 "program::session",
@@ -739,7 +755,7 @@ impl Session {
         }
         // The set the pass in flight before it does not read (with none in
         // flight, the first).
-        self.staging = self.airborne.back().map_or(0, |pass| (pass.set + 1) % SETS);
+        self.staging = self.airborne.back().map_or(0, |pass| (pass.set + 1) % self.sets.len());
         let _ = ahead;
         let cursors = self.staging_cursors(plan);
         let mut launched = Vec::with_capacity(compiled.stages.len());
