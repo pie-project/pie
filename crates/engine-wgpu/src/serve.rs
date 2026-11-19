@@ -36,8 +36,8 @@ impl Serve for Api {
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
-    const MAX_BUFFER_SOURCE: &'static str =
-        "the least of wgpu::Limits::max_buffer_size and max_storage_buffer_binding_size";
+    const MAX_BUFFER_SOURCE: &'static str = "the least of wgpu::Limits::max_buffer_size, \
+        max_storage_buffer_binding_size and, on Vulkan, maxMemoryAllocationSize";
 
     const RECORDS: bool = false;
 
@@ -68,9 +68,14 @@ impl Serve for Api {
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile (a
         // browser masks its adapter, so no profile states its rates, and
-        // keeps them for its load alone). No bound on one submission is
-        // stated on wgpu yet.
-        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
+        // keeps them for its load alone), each submission within the
+        // platform's stated bound on one.
+        let tuning = crate::rates::at_load(
+            &device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::STATED_SUBMIT_BOUND,
+        )?;
         Ok((device, tuning))
     }
 
