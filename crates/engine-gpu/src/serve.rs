@@ -1980,24 +1980,8 @@ impl<B: Serve> Shell<B> {
     /// See `Engine::copy_slots`: on the device in queue order; to or from
     /// the host chunks or the slot file once every frame has landed.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
-        self.copy_slots_landing(copy, None).map(drop)
-    }
-
-    /// See `Engine::copy_slots_landing`: whether the copy has read its
-    /// sources by the time this returns. A copy to or from the host chunks
-    /// or the slot file has: it drains, then commits and waits its frame
-    /// (a heap host tier and a slot file read on the host, in the call),
-    /// and `landed` is dropped. A copy within the device is left on the
-    /// queue: `false`, and `landed` runs once its frame's fence (submission)
-    /// lands. Without a `landed` to run, it answers `true`, as
-    /// `Engine::copy_slots` has the queue order alone.
-    pub fn copy_slots_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        landed: Option<Box<dyn FnOnce() + Send + 'static>>,
-    ) -> Result<bool> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
-            return Ok(true);
+            return Ok(());
         }
         let on_device = B::is_device(copy.src) && B::is_device(copy.dst);
         if !on_device {
@@ -2005,17 +1989,12 @@ impl<B: Serve> Shell<B> {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&self.device, &mut frame, copy)?;
-        if !on_device {
+        if on_device {
+            self.grafted = Some(frame.commit_async(None)?);
+        } else {
             frame.commit()?;
-            return Ok(true);
         }
-        let told = landed.is_some();
-        // Told landed whether or not the submission faulted: the fault
-        // reaches the next wait on it (`drain`), and the slots go back.
-        let on_done =
-            landed.map(|landed| -> crate::backend::OnDone { Box::new(move |_refused| landed()) });
-        self.grafted = Some(frame.commit_async(on_done)?);
-        Ok(!told)
+        Ok(())
     }
 
     /// See `Engine::read_tier_slots`: every frame and copy lands first.

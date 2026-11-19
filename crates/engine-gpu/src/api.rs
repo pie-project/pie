@@ -230,8 +230,6 @@ pub struct Gpu<B: Host> {
     next_frame: u64,
 
     pub sink: Option<engine::CompletionSink>,
-    /// Where a slot copy still on the queue is told landed.
-    landed: Option<engine::LandingSink>,
 
     pending: Option<(FrameId, Vec<PendingStep>)>,
 
@@ -267,7 +265,6 @@ impl<B: Host> Gpu<B> {
             next_fire: 1,
             next_frame: 1,
             sink: None,
-            landed: None,
             pending: None,
             programs: B::Programs::default(),
             adapters: BTreeMap::new(),
@@ -948,26 +945,30 @@ where
             .map_err(refusal)
     }
 
-    /// A copy to or from the host tier or the slot file has read its
-    /// sources when the call returns (the shell waits its frame out); a copy
-    /// within the device is still on the queue, told landed from its frame's
-    /// fence (`Shell::copy_slots_landing`).
+    /// Every copy's sources may go back when the call returns
+    /// (`Shell::copy_slots`):
+    /// - device to host, host to device, and device to the slot file: the
+    ///   shell drains every frame, then commits the copy's frame and waits
+    ///   on it (a heap host tier is read and written on the host, in the
+    ///   call), so the copy has read its sources;
+    /// - slot file to device: the file slot is read into a stage on the
+    ///   host, in the call; only the stage's copy onto the device stays on
+    ///   the queue, and the stage is not reused before it lands;
+    /// - within the device: the copy is left on the queue, and every later
+    ///   write that could reach a source slot is ordered behind it: a fire
+    ///   or copy on the same queue, or a host write that first waits out
+    ///   every submitted frame (`Frame::update` settles the queue, a record's
+    ///   clear and a tier write drain).
+    ///
+    /// No copy is ever still landing, so the sink `on_landed` gives is
+    /// never called and the default drops it.
     fn copy_slots_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        let landed = self
-            .landed
-            .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
-        self.loaded_mut()?
-            .copy_slots_landing(copy, landed)
-            .map_err(fault)
-    }
-
-    fn on_landed(&mut self, sink: engine::LandingSink) {
-        self.landed = Some(sink);
+        let _ = token;
+        self.copy_slots(copy).map(|()| true)
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
