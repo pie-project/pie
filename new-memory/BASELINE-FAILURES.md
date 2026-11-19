@@ -27,15 +27,15 @@ coverage is partial. "Not run" is NOT "passes" — confirm those on the base com
   cleared, so rows a staged window does not write are read back as stale bytes — shows only when the
   plane's previous contents differ, i.e. under parallel tests).
 
-## engine-cuda, lib: PARTIAL / NOT RUN
+## engine-cuda, lib (featureless): 104 passed, 1 failed
 
-- Three host-only catalog sweeps run for hours in a debug build (no GPU use, but anyone running them
-  under the GPU lock holds the lock that long):
-  - `tests::no_region_of_a_catalog_deployment_lands_over_its_inputs` — ok (> 1 h)
-  - `tests::every_fused_op_its_rules_form_is_one_dispatch_fires` — ok (> 1 h)
-  - `tests::every_site_a_retired_rule_fused_folds_into_a_region` — did not finish in 2 h 40 min (killed).
-    Run these three OUTSIDE the GPU lock, or skip them (`--skip`).
-- The rest of the lib tests: NOT RUN.
+- The three host-only catalog sweeps now finish in a debug build in 1,059 / 653 / 616 s
+  (sc/l40s-cuda-test-hang: each split traced once, each row folded once for all retired rules,
+  one-pass slot and anchor walks). The whole featureless lib suite runs in ~947 s. They use no GPU,
+  so run them outside the GPU lock.
+- Failing, pre-existing (on aa3fc11e5 too), owner the L40S:
+  `grouped_decode::tests::a_sinked_decode_without_a_window_takes_the_prefill_where_the_profile_says`
+  (assert_eq at grouped_decode.rs:299: (0, 18, 0) vs (0, 18, 18)).
 
 ## engine-cuda, integration (`engine_cuda`): NOT RUN
 Known from the spec, unconfirmed here:

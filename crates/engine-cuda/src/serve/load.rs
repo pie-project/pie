@@ -1628,6 +1628,7 @@ impl Shell {
             guest_faults: Vec::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
+            written: engine::extent::Written::default(),
             _released: Released,
         };
         if !shell.graphs.records() || !shell.bodies {

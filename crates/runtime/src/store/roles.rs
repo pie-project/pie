@@ -758,6 +758,26 @@ impl Roles {
         })
     }
 
+    /// Whether `pair`'s state is on its way to or from the host with the
+    /// instances that hold it, and those instances with their holders: what
+    /// a restore short of it ([`RolesError::PairParked`]) waits to see end.
+    #[must_use]
+    pub fn pair_moving(&self, pair: FireKey) -> Option<Vec<(InstanceId, Option<Holder>)>> {
+        let item = self.items.get(&Owner::Pair(pair))?;
+        (item.tier == Tier::Moving).then(|| {
+            item.attached
+                .iter()
+                .map(|id| {
+                    let holder = self
+                        .items
+                        .get(&Owner::Instance(*id))
+                        .and_then(|instance| instance.holder);
+                    (*id, holder)
+                })
+                .collect()
+        })
+    }
+
     /// A watch on device room given back from now on.
     #[must_use]
     pub fn room_watch(&self) -> RoomWatch {
@@ -1902,6 +1922,9 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
+        // What waits on a pair's move (a bind, a restore) looks again: the
+        // move ended, here as at a commit.
+        self.tell_room();
     }
 
     /// The host tier (`host`), else the device.

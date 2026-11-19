@@ -91,6 +91,23 @@ pub enum Fault {
         lane: u32,
     },
 
+    /// A row the lane's program places lands outside the slots the lane may
+    /// write (`engine::fire::misplaced_write`): refused before any of it runs.
+    KvWrite {
+        lane: u32,
+        why: String,
+    },
+
+    /// A device-geometry program's `embed_indptr` port describes more lanes
+    /// than its attachment spans: its ports would state the next lanes'
+    /// positions and slots. Every lane of the attachment is refused, before
+    /// any of it is written.
+    Overreach {
+        instance: engine::InstanceId,
+        lanes: std::ops::Range<u32>,
+        carried: usize,
+    },
+
     AdapterWord {
         lane: u32,
         word: u64,
@@ -174,6 +191,7 @@ impl Fault {
             | Self::Maskless { lane, .. }
             | Self::MaskUnread { lane, .. }
             | Self::Adapterless { lane, .. }
+            | Self::KvWrite { lane, .. }
             | Self::AdapterWord { lane, .. } => Some(*lane),
             Self::Fire(error) => error.lane(),
             _ => None,
@@ -289,6 +307,18 @@ impl fmt::Display for Fault {
                 "lane {lane} states an attention mask and its word {word:#x} reads it in no \
                  arm this engine applies a mask in, so the mask would be staged and never \
                  read: here `attn.decode`, a selection's and a bias's arms read no per-lane mask"
+            ),
+            Self::KvWrite { lane, why } => write!(f, "lane {lane} refused: {why}"),
+            Self::Overreach {
+                instance,
+                lanes,
+                carried,
+            } => write!(
+                f,
+                "instance {instance} is attached over lanes {}..{} and its `embed_indptr` port \
+                 describes {carried} lane(s): a program's ports state its own lanes' geometry, \
+                 never the next request's",
+                lanes.start, lanes.end
             ),
             Self::Adapterless { lane } => write!(
                 f,

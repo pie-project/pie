@@ -156,7 +156,7 @@ pub fn stage_read_bytes(package: &LaunchPackage) -> std::result::Result<Vec<u64>
 
 /// The values stage `at` of `package` puts that its collect copies from the
 /// device, in the stage's own numbering: the read-back set, which a bind
-/// checks against the stage's heap ([`puts_in_heap`]) and a run reads back.
+/// checks against the stage's heap ([`values_in_heap`]) and a run reads back.
 /// A put whose value the stage's plan lays nowhere on the device (its value
 /// map names none) is held on the host and copied from no span. A stage the
 /// package does not list, or a put of another stage's value, is refused.
@@ -170,19 +170,20 @@ pub fn device_puts(package: &LaunchPackage, at: usize) -> Result<Vec<u32>> {
     })?;
     let mut puts = Vec::with_capacity(stage.puts.len());
     for put in &stage.puts {
-        match engine_gpu::guest::run::local_of(package, at, put.value)? {
-            Some(local) => puts.push(local),
-            // Held on the host: no span to copy, none to check.
-            None => {}
+        // A put with no local is held on the host: no span to copy, none
+        // to check.
+        if let Some(local) = engine_gpu::guest::run::local_of(package, at, put.value)? {
+            puts.push(local);
         }
     }
     Ok(puts)
 }
 
-/// Refuses a stage whose puts (`reads`, the stage's values its collect
-/// copies to the host) do not each lie, in whole words, inside its heap of
-/// `heap_bytes`: a span past it would read another instance's bytes back.
-fn puts_in_heap(
+/// Refuses a stage whose values `reads` do not each lie, in whole words,
+/// inside its heap of `heap_bytes`: a span past it would have the device
+/// reach, or a collect read back, another instance's bytes. A bind checks
+/// every value (the device reads their offsets unchecked) and the puts.
+fn values_in_heap(
     reads: &[u32],
     offsets: &[u64],
     descriptors: &[ValueDesc],
@@ -191,12 +192,12 @@ fn puts_in_heap(
     for &value in reads {
         let at = value as usize;
         let (Some(&offset), Some(desc)) = (offsets.get(at), descriptors.get(at)) else {
-            return Err(format!("the put value {value} has no span in its stage"));
+            return Err(format!("value {value} has no span in its stage"));
         };
         let end = offset.checked_add(desc.device_bytes().next_multiple_of(4));
         if end.is_none_or(|end| end > heap_bytes) {
             return Err(format!(
-                "the put value {value} at byte {offset} of {} runs past its heap of \
+                "value {value} at byte {offset} of {} runs past its heap of \
                  {heap_bytes} bytes",
                 desc.device_bytes()
             ));
@@ -522,12 +523,16 @@ impl Session {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let args = placed.next().expect("a stage's step uniforms");
             let reads = device_puts(package, at)?;
-            puts_in_heap(&reads, &resolved.offsets, &resolved.descriptors, heap.2).map_err(
-                |why| Fault::Program {
+            let values: Vec<u32> =
+                (0..u32::try_from(resolved.descriptors.len()).unwrap_or(u32::MAX)).collect();
+            values_in_heap(&values, &resolved.offsets, &resolved.descriptors, heap.2)
+                .and_then(|()| {
+                    values_in_heap(&reads, &resolved.offsets, &resolved.descriptors, heap.2)
+                })
+                .map_err(|why| Fault::Program {
                     at: "guest::session",
                     why: format!("stage {at}: {why}"),
-                },
-            )?;
+                })?;
             let span = heap_span(places, heap)?;
             stages.push(build_stage(
                 device, &core, &library, &status, resolved, tables, lowered, args, stride, heap,
@@ -589,6 +594,22 @@ impl Session {
     /// lie in, in order), whose bytes the runtime copied there, and the
     /// instance's state and its pair's to `scratch` and `pair`, fresh room
     /// whose contents are dead.
+    /// Zeroes the instance's state and, where `pair` (a new taking of the
+    /// pair's slots), the pair's: room another owner left as it stood.
+    pub fn clear(&self, pair: bool) -> Result<()> {
+        self.instance.clear()?;
+        if pair {
+            self.pair.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Where its pair's state lies.
+    #[must_use]
+    pub fn pair_place(&self) -> &engine::program::ScratchPlace {
+        self.pair.place()
+    }
+
     pub fn retarget(
         &mut self,
         pools: &Pools<crate::device::Api>,
@@ -730,7 +751,7 @@ impl Session {
                 at: "guest::session",
                 why: format!("value {value} is not stage {stage}'s"),
             })?;
-            // Inside its heap, as its bind checked ([`puts_in_heap`]).
+            // Inside its heap, as its bind checked ([`values_in_heap`]).
             let len = len.next_multiple_of(4);
             layout.push((value, at, cursor, len));
             cursor += len;
@@ -1032,7 +1053,7 @@ fn build_stage(
 
 #[cfg(test)]
 mod tests {
-    use super::{STATUS_SPAN, device_puts, puts_in_heap, stage_read_bytes};
+    use super::{STATUS_SPAN, device_puts, stage_read_bytes, values_in_heap};
     use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, LaunchPut, LaunchStage};
     use eta_ir::Dtype;
     use eta_ir::container::ChanDType;
@@ -1123,7 +1144,18 @@ mod tests {
     fn a_put_inside_its_heap_is_read_back() {
         let descriptors = [f32s(3), f32s(1)];
         let offsets = [0, 12];
-        assert_eq!(puts_in_heap(&[0, 1], &offsets, &descriptors, 16), Ok(()));
+        assert_eq!(values_in_heap(&[0, 1], &offsets, &descriptors, 16), Ok(()));
+    }
+
+    #[test]
+    fn a_layout_that_lays_a_value_past_its_heap_is_refused() {
+        // Every value of a stage, as a bind checks them: value 2 runs past.
+        let descriptors = [f32s(2), f32s(2), f32s(4)];
+        let offsets = [0, 8, 16];
+        let all = [0, 1, 2];
+        assert!(values_in_heap(&all, &offsets, &descriptors, 32).is_ok());
+        let why = values_in_heap(&all, &offsets, &descriptors, 24).expect_err("refused");
+        assert!(why.contains("value 2"), "{why}");
     }
 
     #[test]
@@ -1132,10 +1164,10 @@ mod tests {
         // instance's.
         let descriptors = [f32s(3), f32s(2)];
         let offsets = [0, 12];
-        assert!(puts_in_heap(&[1], &offsets, &descriptors, 16).is_err());
-        assert!(puts_in_heap(&[0], &offsets, &descriptors, 16).is_ok());
+        assert!(values_in_heap(&[1], &offsets, &descriptors, 16).is_err());
+        assert!(values_in_heap(&[0], &offsets, &descriptors, 16).is_ok());
         // A put with no span in its stage.
-        assert!(puts_in_heap(&[2], &offsets, &descriptors, 16).is_err());
+        assert!(values_in_heap(&[2], &offsets, &descriptors, 16).is_err());
     }
 
     /// Two stages: stage 0 lays its first value on the device as local 0
@@ -1198,5 +1230,125 @@ mod tests {
         // state lies are an overwritten status, not fault codes.
         assert!(read_status(status(0x3f33_3333, 0)).is_err());
         assert!(read_status(status(151_936, 0)).is_err());
+    }
+    /// A guest's write past its heap, run on the device: an `op_copy` into a
+    /// value whose offset lies at its heap's end. The runtime refuses every
+    /// store (the heap is bound at its exact span, beside words it must not
+    /// reach), and the first fault's status reads Fault, OUT_OF_BOUNDS, the
+    /// index and the limit.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_guest_write_past_its_heap_faults_out_of_bounds_and_lands_nowhere() {
+        use super::{Library, STEP_BINDING};
+        use crate::device::{Buffer, Context, present};
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&crate::api::DeviceBoot::default(), allowance).unwrap();
+        let library = Library::build(&device, 4096, 1).unwrap();
+        let call = eta_compiler::codegen::wgsl::step_calls()
+            .iter()
+            .position(|text| text.contains("op_copy("))
+            .expect("a copy step");
+        let pipeline = library.pipeline(u32::try_from(call).unwrap()).unwrap();
+
+        let words =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let owner = engine_gpu::books::owners::TEST;
+        let buffer = |bytes: &[u8]| {
+            let mut buffer = Buffer::zeroed(&device, bytes.len() as u64, owner).unwrap();
+            buffer.write(0, bytes).unwrap();
+            buffer
+        };
+        // Two f32 values of four: `a` at the heap's start, `o` at its end.
+        const HEAP: u64 = 64;
+        const SENTINEL: u32 = 0xdead_beef;
+        let f32_tag =
+            u32::from(eta_ir::types::to_wire(eta_ir::Dtype::F32).expect("f32 has a wire tag"));
+        let desc = |len: u32| [len, 1, len, 1, f32_tag, len, 1, 1, 1];
+        let descs = buffer(&words(&[desc(4), desc(4)].concat()));
+        let mut op = [0u32; 16];
+        op[1] = 0; // a
+        op[4] = 1; // o
+        let params = buffer(&words(&op));
+        let offs = buffer(&words(&[0, u32::try_from(HEAP).unwrap()]));
+        let heap_words = u32::try_from(HEAP / 4).unwrap();
+        let cfg = buffer(&words(&[2, 0, 1, 0, heap_words, 0, 0, 0]));
+        let mut heap_image: Vec<u32> = vec![0; 32];
+        heap_image[..4].copy_from_slice(&[
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+        ]);
+        heap_image[16..].fill(SENTINEL);
+        let heap = buffer(&words(&heap_image));
+        let status = buffer(&[0u8; 16]);
+        let step = buffer(&[0u8; 256]);
+
+        fn whole(buffer: &Buffer, size: u64) -> wgpu::BindingResource<'_> {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer.slab().buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(size),
+            })
+        }
+        let entry = |binding: u32, resource| wgpu::BindGroupEntry { binding, resource };
+        let group = device
+            .core()
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pie guest bounds test"),
+                layout: &library.binds,
+                entries: &[
+                    entry(0, whole(&status, 16)),
+                    entry(1, whole(&descs, descs.bytes())),
+                    entry(2, whole(&params, params.bytes())),
+                    entry(3, whole(&offs, offs.bytes())),
+                    // The heap at its exact span, the sentinel words past it.
+                    entry(4, whole(&heap, HEAP)),
+                    entry(5, whole(&cfg, cfg.bytes())),
+                    entry(
+                        STEP_BINDING,
+                        whole(&step, u64::from(eta_compiler::codegen::wgsl::STEP_BYTES)),
+                    ),
+                ],
+            });
+        device.core().take_error("create_bind_group").unwrap();
+        let frame = device.frame().unwrap();
+        frame
+            .dispatch_at("bounds test", &pipeline, &group, &[0], [1, 1, 1])
+            .unwrap();
+        frame.commit().unwrap();
+
+        let read = |buffer: &Buffer, n: usize| -> Vec<u32> {
+            let mut bytes = vec![0u8; n * 4];
+            buffer.read(0, &mut bytes).unwrap();
+            bytes
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect()
+        };
+        let status = read(&status, 4);
+        assert_eq!(status[0], 3, "the stage faulted: {status:x?}");
+        assert_eq!(
+            status[1],
+            eta_compiler::codegen::fault::OUT_OF_BOUNDS,
+            "{status:x?}"
+        );
+        assert!(
+            (heap_words..heap_words + 4).contains(&status[2]),
+            "the index of a refused store of `o`: {status:x?}"
+        );
+        assert_eq!(status[3], heap_words, "the limit: {status:x?}");
+        let heap = read(&heap, 32);
+        assert!(
+            heap[16..].iter().all(|&w| w == SENTINEL),
+            "nothing past the heap: {heap:x?}"
+        );
+        assert_eq!(heap[0], 1.0f32.to_bits(), "`a` stands: {heap:x?}");
     }
 }

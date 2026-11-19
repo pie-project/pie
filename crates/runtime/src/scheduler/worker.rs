@@ -3104,8 +3104,21 @@ impl BatchScheduler {
                         in_flight_control.settling[index].state =
                             ControlSlotState::Ready(completion);
                     }
-                    Err(_) => {
-                        in_flight_control.settling.remove(index);
+                    // Refused on the lane (or the lane dropped it): what
+                    // waits on the copy is told now, never left waiting on
+                    // a completion that cannot come (a residency move held
+                    // its items moving for good).
+                    Err(error) => {
+                        let pending = in_flight_control.settling.remove(index);
+                        if let Some(tracked) = pending.tracked_completion.as_ref() {
+                            tracked.resolve(&Err(anyhow!("{error}")));
+                        }
+                        if let Some(logical) = pending.logical_completion.as_ref() {
+                            logical.reject_unsubmitted(format!(
+                                "pre-launch {} failed: {error}",
+                                pending.operation
+                            ));
+                        }
                     }
                 }
             }
@@ -3341,6 +3354,46 @@ mod tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 48);
         want.release();
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// A control the lane refuses or drops (a panic on the copy, the
+    /// reply lost) tells what waits on it: a residency move's copy waited
+    /// on a completion that never came, and the move held its items moving
+    /// for good (Mac Pro's M5: every restore of a pair's other holders
+    /// waited on it).
+    #[test]
+    fn a_refused_control_tells_its_tracked_completion() {
+        let tracked = crate::scheduler::ControlCompletion::new();
+        let mut controls = InFlightControls::default();
+        controls.settling.push(PendingControl {
+            state: ControlSlotState::Posted { id: 41 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(tracked.clone()),
+            operation: "tracked roles copy",
+            holds_launches: false,
+            prelaunch: false,
+        });
+        let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
+        BatchScheduler::apply_control_commit(
+            41,
+            LaneCommit::AsyncControl {
+                result: Err("the engine lane dropped this control unanswered".to_string()),
+            },
+            &mut controls,
+            &mut HashMap::new(),
+            &mut FramePolicy::new(1, 1, 1, None),
+            &rollback,
+            0,
+        );
+        assert!(controls.settling.is_empty());
+        let told = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(5), tracked.wait()).await
+        })
+        .expect("told, never left waiting");
+        let error = told.expect_err("told it failed");
+        assert!(error.to_string().contains("unanswered"), "{error}");
     }
 
     #[test]
@@ -4125,13 +4178,22 @@ mod tests {
             let mut steps = Vec::new();
             let mut refused = None;
             for (index, step) in frame.steps.iter().enumerate() {
+                // A lane whose program places its rows lands them at the
+                // slots its tokens name, as a guest's `slots` port would.
                 let lanes: Vec<::engine::LaneFault> = (step.lanes.iter().enumerate())
-                    .filter(|(_, lane)| lane.word & UNSERVED != 0)
-                    .map(|(lane, _)| ::engine::LaneFault {
-                        lane: u32::try_from(lane).expect("a few lanes"),
-                        instance: None,
-                        reason: "its word reads a mask in no arm this load applies one in"
-                            .into(),
+                    .filter_map(|(at, lane)| {
+                        let reason = if lane.word & UNSERVED != 0 {
+                            Some("its word reads a mask in no arm this load applies one in".into())
+                        } else if lane.list == ::engine::ListKind::Translation {
+                            ::engine::fire::misplaced_write(lane.kv.writable(), &lane.tokens)
+                        } else {
+                            None
+                        };
+                        reason.map(|reason| ::engine::LaneFault {
+                            lane: u32::try_from(at).expect("a few lanes"),
+                            instance: None,
+                            reason,
+                        })
                     })
                     .collect();
                 if !lanes.is_empty() {
@@ -4185,28 +4247,42 @@ mod tests {
         crate::engine::FrameFire,
         Vec<Vec<crate::engine::WorkItemCompletion>>,
     ) {
+        let lanes: Vec<Vec<(u64, ::engine::Lane)>> = steps
+            .iter()
+            .enumerate()
+            .map(|(at, fires)| {
+                fires
+                    .iter()
+                    .map(|&(instance, unserved)| {
+                        let word = if unserved { UNSERVED | 1 } else { 1 };
+                        let token = u32::try_from(1000 * at as u64 + instance).expect("small");
+                        let slot = u32::try_from(instance).expect("small");
+                        (instance, ::engine::Lane::decode(slot, word, token, 0))
+                    })
+                    .collect()
+            })
+            .collect();
+        frame_of_lanes(&lanes)
+    }
+
+    /// A frame of steps of fires, a lane each, each the pass of its own
+    /// instance: step `s` is `steps[s]`, `(instance, lane)` a fire.
+    fn frame_of_lanes(
+        steps: &[Vec<(u64, ::engine::Lane)>],
+    ) -> (
+        crate::engine::FrameFire,
+        Vec<Vec<crate::engine::WorkItemCompletion>>,
+    ) {
         let mut fire = crate::engine::FrameFire::default();
         let mut all = Vec::new();
-        for (at, fires) in steps.iter().enumerate() {
+        for fires in steps {
             let lanes = u32::try_from(fires.len()).expect("a few lanes");
             let completions: Vec<_> = (0..lanes)
                 .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
                 .collect();
-            let token = |instance: u64| u32::try_from(1000 * at as u64 + instance).expect("small");
             fire.steps.push(crate::engine::StepFire {
                 submission: ::engine::Step {
-                    lanes: fires
-                        .iter()
-                        .map(|&(instance, unserved)| {
-                            let word = if unserved { UNSERVED | 1 } else { 1 };
-                            ::engine::Lane::decode(
-                                u32::try_from(instance).expect("small"),
-                                word,
-                                token(instance),
-                                0,
-                            )
-                        })
-                        .collect(),
+                    lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
                     attachments: (0..lanes)
                         .map(|lane| ::engine::Attachment {
                             lane,
@@ -4255,6 +4331,23 @@ mod tests {
         Vec<Vec<std::result::Result<(), String>>>,
         Vec<Vec<(u64, u32)>>,
     ) {
+        fire_refusing_frame(asynchronous, reorder, frame_of(steps))
+    }
+
+    /// Fires `frame` on a [`LaneRefusalEngine`], as [`fire_refusing`] does.
+    #[allow(clippy::type_complexity, reason = "a test's three answers")]
+    fn fire_refusing_frame(
+        asynchronous: bool,
+        reorder: bool,
+        (fire, completions): (
+            crate::engine::FrameFire,
+            Vec<Vec<crate::engine::WorkItemCompletion>>,
+        ),
+    ) -> (
+        std::result::Result<(), String>,
+        Vec<Vec<std::result::Result<(), String>>>,
+        Vec<Vec<(u64, u32)>>,
+    ) {
         let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut lane = Lane::spawn(
             0,
@@ -4268,7 +4361,6 @@ mod tests {
             })),
             Arc::new(SchedulerStats::default()),
         );
-        let (fire, completions) = frame_of(steps);
         let flat: Vec<_> = completions.iter().flatten().cloned().collect();
         let (frame, results) = if reorder {
             // Every fire of a launch landing out of order is failed by the
@@ -4423,6 +4515,59 @@ mod tests {
         assert_eq!(fires[0][0], Ok(()));
         assert_eq!(fires[2][0], Ok(()));
         assert_eq!(fed, vec![vec![(100, 100)], vec![(100, 2100)]]);
+    }
+
+    /// A lane whose program places its rows at a slot below its set's
+    /// frozen prefix, or past what it reserved, is refused by name, the
+    /// write never made; the lanes beside it, writing their own slots,
+    /// fire once each in the same submission.
+    #[test]
+    fn a_row_placed_outside_its_writable_slots_fails_its_own_fire_alone() {
+        // Each lane's set froze slots 0..8 and reserved through 16; its
+        // program places its row at the slot its token names.
+        let placed = |instance: u64, slot: u32| {
+            let mut lane = ::engine::Lane::decode(u32::try_from(instance).unwrap(), 1, slot, 0);
+            lane.list = ::engine::ListKind::Translation;
+            lane.kv.folded = 8;
+            lane.kv.write_end = 16;
+            (instance, lane)
+        };
+        for asynchronous in [true, false] {
+            let steps = vec![vec![
+                placed(100, 8),
+                placed(101, 3),
+                placed(102, 15),
+                placed(103, 16),
+            ]];
+            let (frame, fires, fed) =
+                fire_refusing_frame(asynchronous, false, frame_of_lanes(&steps));
+            assert_eq!(frame, Ok(()), "the frame is not failed by one lane's write");
+            let below = fires[0][1]
+                .as_ref()
+                .expect_err("the lane writing below fails");
+            assert!(
+                below.contains("lane 1") && below.contains("kv slot 3") && below.contains("frozen"),
+                "named, by the slot it placed: {below}"
+            );
+            let past = fires[0][3]
+                .as_ref()
+                .expect_err("the lane writing past fails");
+            assert!(
+                past.contains("lane 3") && past.contains("kv slot 16"),
+                "{past}"
+            );
+            assert_eq!(
+                fires[0][0],
+                Ok(()),
+                "a row at the frozen prefix's end lands"
+            );
+            assert_eq!(fires[0][2], Ok(()), "a row inside what it reserved lands");
+            assert_eq!(
+                fed,
+                vec![vec![(100, 8), (102, 15)]],
+                "the lanes writing their own slots fire once; the refused never fire"
+            );
+        }
     }
 
     /// What [`HoldingEngine`] answers it holds back once it took a resident

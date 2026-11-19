@@ -174,6 +174,19 @@ struct BindCache {
 const BIND_CACHE_CAP: usize = 16 * 1024;
 const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
 
+/// A chunk of the uniform arena bind groups take their uniforms from.
+fn arena_chunk(core: &Arc<Core>) -> super::ctx::Held {
+    core.held(
+        &wgpu::BufferDescriptor {
+            label: Some("pie uniform arena"),
+            size: UNIFORM_ARENA_CHUNK,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+        engine_gpu::books::owners::UNIFORMS,
+    )
+}
+
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
@@ -237,6 +250,17 @@ impl Pipelines {
         engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
     }
 
+    /// Makes the uniform arena's first chunk where it has none, at the
+    /// load: a fire's bind groups take their uniforms from it, so it is
+    /// reserved before the pool is sized past it, not at the first fire.
+    pub(crate) fn stock_arena(&self, core: &Arc<Core>) {
+        let mut binds = self.binds.borrow_mut();
+        if binds.chunks.is_empty() {
+            binds.chunks.push(arena_chunk(core));
+            binds.used = 0;
+        }
+    }
+
     #[must_use]
     pub fn bind_traffic(&self) -> (u64, u64) {
         (self.bind_hits.get(), self.bind_misses.get())
@@ -275,15 +299,7 @@ impl Pipelines {
             let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
             let at = binds.used.next_multiple_of(align);
             if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
-                binds.chunks.push(core.held(
-                    &wgpu::BufferDescriptor {
-                        label: Some("pie uniform arena"),
-                        size: UNIFORM_ARENA_CHUNK,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    },
-                    engine_gpu::books::owners::UNIFORMS,
-                ));
+                binds.chunks.push(arena_chunk(core));
                 binds.used = 0;
             }
             let at = binds.used.next_multiple_of(align);
