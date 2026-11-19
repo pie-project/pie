@@ -153,52 +153,71 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
     const int packs = K / 8;
     const b128* act_g = reinterpret_cast<const b128*>(act);
     if constexpr (NORM) {
-        __shared__ float sums[ROWS][16];
+        // Every row in one pass, each summed as `residual_add_rmsnorm` sums
+        // it, so the fold lands the unfused path's bits: a row is
+        // kNormBlock virtual threads (that kernel's block), thread v adding
+        // packs v, v + kNormBlock, ... in order, a wave reduction over 64
+        // consecutive ones, then their kNormBlock / 64 partials in order.
+        // The block's threads walk the (row, virtual thread) items flat, so
+        // all of the rows' loads are in flight at once (a row of a 1,024-wide
+        // model is 128 packs, a fraction of the block).
+        constexpr int kNormBlock = 256, kNormPpt = 4, kNormGroups = kNormBlock / kWave;
+        __shared__ float sums[ROWS][kNormGroups];
+        __shared__ float invs[ROWS];
         const int t = wave * kWave + l, threads = blockDim.y * kWave;
+        const int pairs = ROWS * packs;
         const b128* xg = reinterpret_cast<const b128*>(norm.x);
         const b128* yg = reinterpret_cast<const b128*>(norm.y);
         b128* og = reinterpret_cast<b128*>(norm.y_out);
+        for (int item = t; item < ROWS * kNormBlock; item += threads) {
+            const int row = item / kNormBlock, v = item - row * kNormBlock;
+            float local = 0.f;
 #pragma unroll
-        for (int r = 0; r < ROWS; ++r) {
-            float ss = 0.f;
-            for (int i = t; i < packs; i += threads) {
-                const b128 xv = xg[r * packs + i], yv = yg[r * packs + i];
-                const bf16* xe = reinterpret_cast<const bf16*>(&xv);
-                const bf16* ye = reinterpret_cast<const bf16*>(&yv);
-                b128 hv;
-                bf16* he = reinterpret_cast<bf16*>(&hv);
+            for (int p = 0; p < kNormPpt; ++p) {
+                const int i = v + p * kNormBlock;
+                if (i < packs) {
+                    const int g = row * packs + i;
+                    const b128 xv = xg[g], yv = yg[g];
+                    const bf16* xe = reinterpret_cast<const bf16*>(&xv);
+                    const bf16* ye = reinterpret_cast<const bf16*>(&yv);
+                    b128 hv;
+                    bf16* he = reinterpret_cast<bf16*>(&hv);
 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    he[e] = from_f32<bf16>(to_f32(ye[e]) + to_f32(xe[e]));
-                    const float h = to_f32(he[e]);
-                    ss += h * h;
+                    for (int e = 0; e < 8; ++e) he[e] = from_f32<bf16>(to_f32(ye[e]) + to_f32(xe[e]));
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const float h = to_f32(he[e]);
+                        local += h * h;
+                    }
+                    act_s[g] = hv;
+                    if (blockIdx.x == 0) og[g] = hv;
                 }
-                act_s[r * packs + i] = hv;
-                if (blockIdx.x == 0) og[r * packs + i] = hv;
             }
-            ss = wave_sum(ss);
-            if (l == 0) sums[r][wave] = ss;
+            const float total = wave_sum(local);
+            if (l == 0) sums[row][v / kWave] = total;
+        }
+        __syncthreads();
+        if (t < ROWS) {
+            float total = 0.f;
+            for (int w = 0; w < kNormGroups; ++w) total += sums[t][w];
+            invs[t] = rsqrtf(total / static_cast<float>(K) + norm.eps);
         }
         __syncthreads();
         const b128* wg = reinterpret_cast<const b128*>(norm.w);
+        for (int g = t; g < pairs; g += threads) {
+            const int row = g / packs, i = g - row * packs;
+            const float inv = invs[row];
+            b128 hv = act_s[g];
+            const b128 wv = wg[i];
+            bf16* he = reinterpret_cast<bf16*>(&hv);
+            const bf16* we = reinterpret_cast<const bf16*>(&wv);
 #pragma unroll
-        for (int r = 0; r < ROWS; ++r) {
-            float ss = 0.f;
-            for (int w = 0; w < static_cast<int>(blockDim.y); ++w) ss += sums[r][w];
-            const float inv = rsqrtf(ss / static_cast<float>(K) + norm.eps);
-            for (int i = t; i < packs; i += threads) {
-                b128 hv = act_s[r * packs + i];
-                const b128 wv = wg[i];
-                bf16* he = reinterpret_cast<bf16*>(&hv);
-                const bf16* we = reinterpret_cast<const bf16*>(&wv);
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const float w = to_f32(we[e]) + (norm.plus_one ? 1.f : 0.f);
-                    he[e] = from_f32<bf16>(to_f32(he[e]) * inv * w);
-                }
-                act_s[r * packs + i] = hv;
-                if (blockIdx.x == 0) reinterpret_cast<b128*>(norm.out)[r * packs + i] = hv;
+            for (int e = 0; e < 8; ++e) {
+                const float w = to_f32(we[e]) + (norm.plus_one ? 1.f : 0.f);
+                he[e] = from_f32<bf16>(to_f32(he[e]) * inv * w);
             }
+            act_s[g] = hv;
+            if (blockIdx.x == 0) reinterpret_cast<b128*>(norm.out)[g] = hv;
         }
         __syncthreads();
     } else if constexpr (!ACT_G) {
@@ -565,6 +584,23 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
         if (t2 >= tiles) break;
         tile = t2;
     }
+}
+
+// The rates step's probe of the on-chip read rate a normed skinny kernel's
+// prologue meets (engine-cuda `rates`, `[rates] cached_gbps`): every block
+// reads a whole set of `set_packs` packs once, block b the set b % `sets`,
+// the sets together past a compute unit's first-level cache and within the
+// last-level ones, as every block of a skinny product reads its rows.
+__global__ __launch_bounds__(256) void cached_read_probe(const b128* __restrict__ sets_base, int set_packs, int sets,
+                                                         float* __restrict__ sink) {
+    const b128* set = sets_base + static_cast<long long>(blockIdx.x % sets) * set_packs;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < set_packs; i += blockDim.x) {
+        const b128 v = set[i];
+        const float* f = reinterpret_cast<const float*>(&v);
+        acc += f[0] + f[1] + f[2] + f[3];
+    }
+    if (acc == 1234.5f) sink[blockIdx.x] = acc;
 }
 
 }  // namespace pie::linear

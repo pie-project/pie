@@ -160,16 +160,23 @@ pub(crate) fn skinny_norm_bf16(
         ctx.multiprocessors(OP)?,
     );
     let staged = m.unsigned_abs() * k.unsigned_abs() * 2;
-    if plan.quad || plan.act_global || staged > SKINNY_LDS {
+    // The prologue sums a row as `residual_add_rmsnorm`'s packed path does,
+    // a row of at most NORM_ROW_PACKS packs (`gemv.hip`'s kNormBlock x
+    // kNormPpt); a wider one stays apart.
+    if plan.quad || plan.act_global || staged > SKINNY_LDS || k / 8 > NORM_ROW_PACKS {
         return Ok(false);
     }
     let t = ctx.tuning();
-    let redundant = f64::from(plan.grid) * f64::from(m) * f64::from(k) * 3.0 * 2.0;
+    // Every block reads the rows' addends and residuals and the norm's
+    // weight again: the same few kilobytes each, which the last-level caches
+    // serve after the first block (priced at device memory's rate where the
+    // profile states no cached one).
+    let redundant = f64::from(plan.grid) * f64::from(2 * m + 1) * f64::from(k) * 2.0;
+    let gbps = if t.cached_gbps > 0 { t.cached_gbps } else { t.hbm_gbps };
     // GB/s is bytes a nanosecond.
-    let folds = t.launch_ns > 0
-        && t.hbm_gbps > 0
-        && redundant / f64::from(t.hbm_gbps) < f64::from(t.launch_ns);
-    told_fold(m, n, k, gated, plan.grid, redundant, t.launch_ns, t.hbm_gbps, folds);
+    let folds =
+        t.launch_ns > 0 && gbps > 0 && redundant / f64::from(gbps) < f64::from(t.launch_ns);
+    told_fold(m, n, k, gated, plan.grid, redundant, t.launch_ns, gbps, folds);
     if !folds {
         return Ok(false);
     }
@@ -273,6 +280,11 @@ const fn skinny_registers(m: u32, wr: u32, unrl: u32) -> u32 {
 
 /// The LDS the skinny kernel stages its activation rows in.
 pub(crate) const SKINNY_LDS: u32 = 64 << 10;
+
+/// The most packs (eight bf16) a row a normed skinny kernel's prologue sums:
+/// `gemv.hip`'s kNormBlock virtual threads of kNormPpt packs, the unfused
+/// `residual_add_rmsnorm`'s packed path, whose sums it reproduces.
+const NORM_ROW_PACKS: i32 = 256 * 4;
 
 /// The whole-product kernel's banks: at least this many weight rows (a
 /// short bank leaves its four-row tiles too few to fill the card, where the
@@ -665,6 +677,32 @@ pub(crate) fn skinnyt(
             ArgValue::I32(n),
             ArgValue::I32(k),
             ArgValue::F32(cap),
+        ],
+    )
+}
+
+/// The rates step's probe of the on-chip read rate (`[rates] cached_gbps`,
+/// engine-cuda `rates`): `blocks` blocks each read one `set_packs`-pack
+/// (16-byte) set of the `sets` at `sets_base` once, block b the set b %
+/// `sets`, as a normed skinny product's blocks read its rows. `sink` holds
+/// `blocks` floats and is written by none.
+pub fn cached_read_probe(
+    ctx: &Ctx,
+    sets_base: u64,
+    set_packs: u32,
+    sets: u32,
+    blocks: u32,
+    sink: u64,
+) -> Result<(), Error> {
+    ctx.fire(
+        "linear.cached_read_probe",
+        Fire::at(kernel("linear/gemv.hip", "::pie::linear::cached_read_probe"))
+            .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(sets_base),
+            ArgValue::I32(set_packs as i32),
+            ArgValue::I32(sets as i32),
+            ArgValue::Ptr(sink),
         ],
     )
 }
