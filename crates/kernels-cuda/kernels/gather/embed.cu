@@ -34,7 +34,7 @@ __global__ void embed(
         if constexpr (VEC) {
             reinterpret_cast<float4*>(out)[h] = make_float4(0.f, 0.f, 0.f, 0.f);
         } else {
-            out[h] = __float2bfloat16(0.f);
+            out[h] = bf16{static_cast<unsigned short>(0)};
         }
         return;
     }
