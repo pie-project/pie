@@ -1194,7 +1194,7 @@ impl<B: Serve> Shell<B> {
         let row_tile: engine::roofline::RowTile = {
             let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), m, n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), n, k).row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;

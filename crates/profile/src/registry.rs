@@ -1121,8 +1121,12 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
-                "gemm_tflops_by_rows" => {
-                    rates.gemm_tflops_by_rows = self.width_curves(v);
+                key @ "gemm_tflops_by_rows" => {
+                    rates.gemm_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ "tile_tflops_by_rows" => {
+                    rates.tile_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
                 key @ "attn_tflops_by_keys" => {
@@ -1156,8 +1160,8 @@ impl<'a> Walk<'a> {
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
-                             `scan_gelems`, `few_row_tflops` and `workgroups_per_core`, not \
-                             `{other}`"
+                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core` and \
+                             `tile_tflops_by_rows`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1178,19 +1182,23 @@ impl<'a> Walk<'a> {
         rates
     }
 
-    /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
-    /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
-    /// width.
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`): `[key,
+    /// curve]` pairs, a whole positive key (a width, a row tile) and a curve
+    /// of `[rows, TFLOP/s]` each, strictly ascending in the key.
     fn width_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
+        key: &str,
     ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
-        const WHAT: &str = "`rates.gemm_tflops_by_rows` is a non-empty list of [width, [[rows, \
-                            TFLOP/s], ...]] pairs, ascending in width";
+        let what = format!(
+            "`rates.{key}` is a non-empty list of [width, [[rows, TFLOP/s], ...]] pairs, \
+             ascending in width"
+        );
+        let what = what.as_str();
         let DeValue::Array(widths) = value.get_ref() else {
             self.err(
                 value.span().start,
-                format!("{WHAT}, not {}", found(value.get_ref())),
+                format!("{what}, not {}", found(value.get_ref())),
             );
             return None;
         };
@@ -1207,14 +1215,14 @@ impl<'a> Walk<'a> {
             else {
                 self.err(
                     entry.span().start,
-                    format!("{WHAT}, not {}", found(entry.get_ref())),
+                    format!("{what}, not {}", found(entry.get_ref())),
                 );
                 return None;
             };
-            out.push((width, self.curve(curve, "gemm_tflops_by_rows")?));
+            out.push((width, self.curve(curve, key)?));
         }
         if out.is_empty() {
-            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            self.err(value.span().start, format!("{what}, not an empty list"));
             return None;
         }
         Some(out)

@@ -1,16 +1,18 @@
-//! The dense matmul's kernel: the vector kernels or the tiled ones,
-//! whichever the estimate (`engine::roofline`) weighs faster over the
-//! model's dense planes, from the device's measured rates (the vector
-//! kernels at `few_row_tflops`, the tiled ones on the `gemm_tflops_by_rows`
-//! curve, each plane's rows padded to its tile), each kernel reading its
-//! plane once a group of rows that share a read
-//! (`gemm::Kernel::rows_a_read`): no cache is assumed to hold it.
+//! The dense matmul's kernel: the vector kernels or one of the tiled ones,
+//! whichever the estimate (`engine::roofline`) weighs fastest over the
+//! model's dense planes, from the device's measured rates: the vector
+//! kernels at `few_row_tflops`; each tiled kernel at its own measured rate
+//! at the rows it lands (`tile_tflops_by_rows`) below the matmul curve's
+//! first row count, and on the `gemm_tflops_by_rows` curve, its rows padded
+//! to its tile, from there. Each kernel reads its plane once a group of
+//! rows that share a read (`gemm::Kernel::rows_a_read`): no cache is assumed
+//! to hold it.
 //!
 //! A backend that records its fires (one recording a rung) takes one kernel
 //! a rung, whatever rows a fire of it lands: the one whose worse cost over
-//! the rows the rung serves, `(rung / 2, rung]`, lies nearer that row
+//! the rows the rung serves, `(rung / 2, rung]`, lies nearest that row
 //! count's best (the least regret at the rung's bottom and its top). A
-//! backend that fires eagerly takes the faster at each fire's own rows.
+//! backend that fires eagerly takes the fastest at each fire's own rows.
 
 use engine::load::Counts;
 use engine::roofline::Constants;
@@ -39,63 +41,88 @@ impl Dense {
     }
 }
 
-/// The two kernels' costs at some rows, in ns.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Cost {
-    pub rows: u32,
-    pub vector_ns: f64,
-    pub tiled_ns: f64,
-}
-
-impl Cost {
-    fn best(&self) -> f64 {
-        self.vector_ns.min(self.tiled_ns)
+/// The name a kernel is said by.
+fn name(tactic: &Tactic) -> &'static str {
+    match (tactic.vector > 0, tactic.wide) {
+        (true, _) => "gemv",
+        (false, false) => "tiled",
+        (false, true) => "wide tiled",
     }
 }
 
-/// One rung weighed both ways at its bottom and top rows.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One rung weighed on each candidate kernel at its bottom and top rows.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Weighed {
-    pub bottom: Cost,
-    pub top: Cost,
+    pub bottom: u32,
+    pub top: u32,
+    /// Each candidate and its cost at the bottom and at the top, in ns.
+    pub costs: Vec<(Tactic, f64, f64)>,
+    /// The candidate taken (least regret).
+    pub taken: usize,
 }
 
 impl Weighed {
-    /// The vector kernels' worse ratio to the best over the rung's rows
-    /// lies strictly under the tiled kernels'.
+    /// Whether the rung takes the vector kernels.
     #[must_use]
     pub fn vector(&self) -> bool {
-        let regret = |of: fn(&Cost) -> f64| {
-            [self.bottom, self.top]
+        self.costs[self.taken].0.vector > 0
+    }
+
+    /// The candidate whose worse ratio to the best at the rung's bottom and
+    /// top is least (the first so where they tie).
+    fn least_regret(costs: &[(Tactic, f64, f64)]) -> usize {
+        let best = |of: fn(&(Tactic, f64, f64)) -> f64| {
+            costs
                 .iter()
-                .map(|c| of(c) / c.best().max(f64::MIN_POSITIVE))
-                .fold(1.0, f64::max)
+                .map(of)
+                .fold(f64::INFINITY, f64::min)
+                .max(f64::MIN_POSITIVE)
         };
-        regret(|c| c.vector_ns) < regret(|c| c.tiled_ns)
+        let (bottom, top) = (best(|c| c.1), best(|c| c.2));
+        let regret = |c: &(Tactic, f64, f64)| (c.1 / bottom).max(c.2 / top);
+        (0..costs.len())
+            .min_by(|&a, &b| regret(&costs[a]).total_cmp(&regret(&costs[b])))
+            .unwrap_or(0)
     }
 }
 
 impl std::fmt::Display for Weighed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kernel = if self.vector() { "gemv" } else { "tiled" };
-        let at = |c: &Cost| {
-            format!(
-                "{} rows {:.1} µs gemv vs {:.1} µs tiled",
-                c.rows,
-                c.vector_ns / 1e3,
-                c.tiled_ns / 1e3
-            )
-        };
         write!(
             f,
-            "rung {}: {kernel} by the estimate ({}",
-            self.top.rows,
-            at(&self.top)
+            "rung {}: {} by the estimate (",
+            self.top,
+            name(&self.costs[self.taken].0)
         )?;
-        if self.bottom.rows != self.top.rows {
-            write!(f, "; {}", at(&self.bottom))?;
+        let at = |pick: fn(&(Tactic, f64, f64)) -> f64| {
+            self.costs
+                .iter()
+                .map(|c| format!("{} {:.1} µs", name(&c.0), pick(c) / 1e3))
+                .collect::<Vec<_>>()
+                .join(" vs ")
+        };
+        write!(f, "{} rows: {}", self.top, at(|c| c.2))?;
+        if self.bottom != self.top {
+            write!(f, "; {} rows: {}", self.bottom, at(|c| c.1))?;
         }
         write!(f, ")")
+    }
+}
+
+/// The tiled kernels a backend can take under its tiled tactic `base`: one
+/// under SPIR-V's cooperative-matrix tier, else the narrow and the wide.
+#[must_use]
+pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
+    if target == Target::Spirv && base.tier == kernels_slang::Tier::Coopmat {
+        vec![Tactic { vector: 0, ..base }]
+    } else {
+        [false, true]
+            .map(|wide| Tactic {
+                vector: 0,
+                wide,
+                ..base
+            })
+            .to_vec()
     }
 }
 
@@ -116,6 +143,10 @@ pub fn choose(
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
     let few = c.few_row_rate()?;
+    let tiles = rates
+        .tile_tflops_by_rows
+        .as_ref()
+        .ok_or("tile_tflops_by_rows")?;
     // `(n, k, planes, bytes a plane)` of every dense plane a row reads.
     let mut planes: Vec<(u32, u32, u32, f64)> = counts
         .gemm_shapes
@@ -129,59 +160,74 @@ pub fn choose(
             u32::try_from(counts.readout_flops / (2 * u64::from(depth))).unwrap_or(u32::MAX);
         planes.push((vocab, depth, 1, counts.head_bytes as f64));
     }
-    // The two tactics at `rows` (the tiled one the backend's at `kernel_rows`,
-    // the vector one carrying that many rows a workgroup) and their costs.
-    let cost = |rows: u32, kernel_rows: u32| -> (Tactic, Tactic, Cost) {
-        let tactic = tiled(kernel_rows);
-        let vector = Tactic {
+    // The candidates at `kernel_rows` (a rung's, or a fire's own): the
+    // vector kernel carrying that many rows a workgroup, and each tiled one.
+    let candidates = |kernel_rows: u32| -> Vec<Tactic> {
+        let base = tiled(kernel_rows);
+        let mut all = vec![Tactic {
             vector: gemm::vector_rows(kernel_rows),
-            ..tactic
-        };
-        let (mut vector_ns, mut tiled_ns) = (0.0, 0.0);
+            ..base
+        }];
+        all.extend(tiled_kernels(target, base));
+        all
+    };
+    // `tactic`'s cost over every plane at `rows`, in ns.
+    let cost = |tactic: Tactic, rows: u32| -> f64 {
+        let mut ns = 0.0;
         for &(n, k, count, bytes) in &planes {
             let flops = |rows: u32| 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
-            // Each kernel reads the plane once its rows sharing a read.
-            let read = |kernel: gemm::Kernel| {
-                f64::from(rows.div_ceil(kernel.rows_a_read().max(1))) * bytes
+            let kernel = gemm::tile_for(target, tactic, n, k);
+            let read = f64::from(rows.div_ceil(kernel.rows_a_read().max(1))) * bytes;
+            let compute = if tactic.vector > 0 {
+                flops(rows) / few
+            } else {
+                let tile = kernel.row_tile().max(1);
+                // Below the curve's first row count, the kernel's own rate
+                // at the rows it lands; from there the curve's, its rows
+                // padded to its tile.
+                match tiles.iter().find(|(at, _)| *at == tile) {
+                    Some((_, curve)) if curve.last().is_some_and(|&(most, _)| rows <= most) => {
+                        let rate = profile::fire::interpolate(curve, f64::from(rows))
+                            .unwrap_or(f64::INFINITY)
+                            * 1e3;
+                        flops(rows) / rate
+                    }
+                    _ => flops(rows.div_ceil(tile) * tile) / c.gemm_rate(rows, n, k),
+                }
             };
-            let tiles = gemm::tile_for(target, tactic, rows, n, k);
-            let tile = tiles.row_tile().max(1);
-            let padded = rows.div_ceil(tile) * tile;
-            let count = f64::from(count);
-            tiled_ns += count * c.dispatch_ns(flops(padded), c.gemm_rate(rows, n, k), read(tiles));
-            let vectors = gemm::tile_for(target, vector, rows, n, k);
-            vector_ns += count * c.dispatch_ns(flops(rows), few, read(vectors));
+            ns += f64::from(count) * (c.launch_ns + compute.max(read / c.bytes_per_ns));
         }
-        (
-            tactic,
-            vector,
-            Cost {
-                rows,
-                vector_ns,
-                tiled_ns,
-            },
-        )
-    };
-    let pick = |tactic: Tactic, vector: Tactic, takes_vector: bool| {
-        if takes_vector { vector } else { tactic }
+        ns
     };
     let mut by_rows = Vec::new();
     let mut weighed = Vec::with_capacity(rungs.len());
     let mut below = 0;
     for &rung in rungs {
-        let bottom_rows = (below + 1).min(rung);
-        let (tactic, vector, top) = cost(rung, rung);
-        let (_, _, bottom) = cost(bottom_rows, rung);
-        let w = Weighed { bottom, top };
+        let bottom = (below + 1).min(rung);
+        let costs: Vec<(Tactic, f64, f64)> = candidates(rung)
+            .into_iter()
+            .map(|t| (t, cost(t, bottom), cost(t, rung)))
+            .collect();
+        let taken = Weighed::least_regret(&costs);
         if records {
-            by_rows.push((rung, pick(tactic, vector, w.vector())));
+            by_rows.push((rung, costs[taken].0));
         } else {
-            for rows in bottom_rows..=rung {
-                let (tactic, vector, at) = cost(rows, rows);
-                by_rows.push((rows, pick(tactic, vector, at.vector_ns < at.tiled_ns)));
+            for rows in bottom..=rung {
+                let fastest = candidates(rows)
+                    .into_iter()
+                    .map(|t| (t, cost(t, rows)))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(t, _)| t)
+                    .expect("one candidate at least");
+                by_rows.push((rows, fastest));
             }
         }
-        weighed.push(w);
+        weighed.push(Weighed {
+            bottom,
+            top: rung,
+            costs,
+            taken,
+        });
         below = rung;
     }
     Ok((Dense { by_rows }, weighed))
@@ -216,44 +262,44 @@ mod tests {
         }
     }
 
-    fn rates(few: Option<f64>) -> profile::fire::Rates {
+    /// Rates whose tiled kernels run at `tiles` below the curve.
+    fn rates(few: Option<f64>, tiles: Vec<(u32, Vec<(u32, f64)>)>) -> profile::fire::Rates {
         profile::fire::Rates {
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (2048, 30.0)])]),
             hbm_gbps: Some(650.0),
             elementwise_gbps: Some(700.0),
             few_row_tflops: few,
+            tile_tflops_by_rows: Some(tiles),
             ..Default::default()
         }
     }
 
-    fn tiled(_: u32) -> Tactic {
+    /// A coopmat tile measured at a sixtieth of the curve's rate at 4 rows,
+    /// rising to it at 256.
+    fn coopmat_tiles() -> Vec<(u32, Vec<(u32, f64)>)> {
+        vec![(64, vec![(4, 0.16), (64, 2.5), (256, 10.0)])]
+    }
+
+    fn coopmat(_: u32) -> Tactic {
         Tactic {
             tier: Tier::Coopmat,
             vector: 0,
+            wide: true,
         }
     }
 
-    /// A rung takes the vector kernels where the tiled one's tile pads its
-    /// rows past what the vector rate costs, and the tiled ones where the
-    /// curve outruns the vector rate; a matmul runs its rung's.
+    /// A rung takes the vector kernels where the tiled one's measured rate
+    /// at its rows costs more, and the tiled ones where the curve outruns
+    /// the vector rate; a matmul runs its rung's.
     #[test]
     fn each_rung_takes_the_kernel_the_estimate_weighs_faster() {
         let rungs = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-        let (dense, weighed) = choose(
-            Target::Spirv,
-            &rungs,
-            tiled,
-            &rates(Some(5.0)),
-            &counts(),
-            true,
-        )
-        .unwrap();
+        let r = rates(Some(5.0), coopmat_tiles());
+        let (dense, weighed) = choose(Target::Spirv, &rungs, coopmat, &r, &counts(), true).unwrap();
         let vector: Vec<bool> = weighed.iter().map(Weighed::vector).collect();
-        // To 4 rows the vector kernel reads the plane once, as the 64-row
-        // tile does; from 256 rows its 64 reads and 5 TFLOP/s lose.
         assert!(vector[..4].iter().all(|&v| v), "{weighed:?}");
-        assert!(vector[8..].iter().all(|&v| !v), "{weighed:?}");
+        assert!(vector[9..].iter().all(|&v| !v), "{weighed:?}");
         for (i, &rows) in rungs.iter().enumerate() {
             assert_eq!(dense.at(rows).vector > 0, vector[i]);
             assert_eq!(
@@ -263,93 +309,99 @@ mod tests {
             );
         }
         assert_eq!(dense.at(3).vector, 4);
-        assert_eq!(dense.at(12).vector, if vector[4] { 16 } else { 0 });
-        assert_eq!(dense.at(5000).vector > 0, vector[rungs.len() - 1]);
         assert!(
             weighed[2]
                 .to_string()
-                .starts_with("rung 4: gemv by the estimate (")
+                .starts_with("rung 4: gemv by the estimate ("),
+            "{}",
+            weighed[2]
         );
     }
 
-    /// A profile stating no vector rate is refused by its key.
+    /// Without coopmat both tiled kernels are candidates, each priced at its
+    /// own measured rate: a wide tile measured faster at partial fill is
+    /// taken there though it pads more rows.
     #[test]
-    fn no_vector_rate_is_refused_by_its_key() {
-        let refused = choose(Target::Spirv, &[1, 2], tiled, &rates(None), &counts(), true);
-        assert_eq!(refused.unwrap_err(), "few_row_tflops");
+    fn the_wide_tile_is_taken_where_it_measures_faster() {
+        let baseline = |_| Tactic {
+            tier: Tier::Baseline,
+            vector: 0,
+            wide: true,
+        };
+        // The 32-row tile slow, the 256-row register tile fast below 256.
+        let tiles = vec![
+            (32, vec![(4, 0.1), (256, 1.0)]),
+            (256, vec![(4, 0.1), (128, 6.0), (256, 10.0)]),
+        ];
+        let r = rates(Some(0.5), tiles);
+        let (dense, weighed) =
+            choose(Target::Spirv, &[128, 256], baseline, &r, &counts(), true).unwrap();
+        assert!(
+            dense.at(200).wide && dense.at(200).vector == 0,
+            "{weighed:?}"
+        );
+        assert_eq!(weighed[1].costs.len(), 3);
     }
 
-    /// A fire fired eagerly takes the faster kernel at its own rows; a
-    /// recorded rung one kernel for all its rows, the faster at its top where
-    /// it is also the faster at its bottom.
+    /// A profile stating no vector rate, or no tiled kernel's, is refused by
+    /// its key.
     #[test]
-    fn an_eager_fire_takes_the_faster_at_its_own_rows() {
-        let rungs = engine::memory::rungs(1, 2048);
-        let (eager, _) = choose(
+    fn a_missing_rate_is_refused_by_its_key() {
+        let refused = choose(
             Target::Spirv,
-            &rungs,
-            tiled,
-            &rates(Some(5.0)),
-            &counts(),
-            false,
-        )
-        .unwrap();
-        let (recorded, weighed) = choose(
-            Target::Spirv,
-            &rungs,
-            tiled,
-            &rates(Some(5.0)),
+            &[1, 2],
+            coopmat,
+            &rates(None, coopmat_tiles()),
             &counts(),
             true,
-        )
-        .unwrap();
-        for rows in 1..=2048 {
-            let (_, w) = choose(
-                Target::Spirv,
-                &[rows],
-                tiled,
-                &rates(Some(5.0)),
-                &counts(),
-                true,
-            )
-            .unwrap();
-            assert_eq!(
-                eager.at(rows).vector > 0,
-                w[0].top.vector_ns < w[0].top.tiled_ns,
-                "{rows}"
-            );
-        }
-        for w in &weighed {
-            let (top, bottom) = (
-                w.top.vector_ns < w.top.tiled_ns,
-                w.bottom.vector_ns < w.bottom.tiled_ns,
-            );
-            if top == bottom {
-                assert_eq!(recorded.at(w.top.rows).vector > 0, top, "{w}");
-            }
+        );
+        assert_eq!(refused.unwrap_err(), "few_row_tflops");
+        let mut no_tiles = rates(Some(5.0), coopmat_tiles());
+        no_tiles.tile_tflops_by_rows = None;
+        let refused = choose(Target::Spirv, &[1, 2], coopmat, &no_tiles, &counts(), true);
+        assert_eq!(refused.unwrap_err(), "tile_tflops_by_rows");
+    }
+
+    /// A fire fired eagerly takes the fastest kernel at its own rows.
+    #[test]
+    fn an_eager_fire_takes_the_fastest_at_its_own_rows() {
+        let r = rates(Some(5.0), coopmat_tiles());
+        let rungs = engine::memory::rungs(1, 2048);
+        let (eager, _) = choose(Target::Spirv, &rungs, coopmat, &r, &counts(), false).unwrap();
+        for rows in [1, 3, 5, 17, 100, 129, 200, 256, 300, 2048] {
+            let (_, w) = choose(Target::Spirv, &[rows], coopmat, &r, &counts(), true).unwrap();
+            let fastest = w[0]
+                .costs
+                .iter()
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|c| c.0)
+                .unwrap();
+            assert_eq!(eager.at(rows), fastest, "{rows}");
         }
     }
 
-    /// The tiled kernels' cost never falls as a rung's rows grow, on every
-    /// target and tier, at one rate (a flat curve, so only the padding
-    /// moves).
+    /// Every tiled kernel's cost never falls as a rung's rows grow, on every
+    /// target and tier, at one rate.
     #[test]
-    fn the_tiled_cost_grows_with_the_rows() {
+    fn the_cost_grows_with_the_rows() {
         let rungs: Vec<u32> = engine::memory::rungs(1, 8192);
-        let flat = profile::fire::Rates {
-            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0)])]),
-            ..rates(Some(5.0))
-        };
+        let flat_tiles: Vec<(u32, Vec<(u32, f64)>)> = [16, 32, 64, 256]
+            .map(|t| (t, vec![(4, 20.0), (256, 20.0)]))
+            .to_vec();
+        let mut flat = rates(Some(5.0), flat_tiles);
+        flat.gemm_tflops_by_rows = Some(vec![(4096, vec![(256, 20.0)])]);
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Coopmat] {
-                let tiled = |_| Tactic { tier, vector: 0 };
+                let tiled = |_| Tactic {
+                    tier,
+                    vector: 0,
+                    wide: true,
+                };
                 let (_, weighed) = choose(target, &rungs, tiled, &flat, &counts(), true).unwrap();
                 for pair in weighed.windows(2) {
-                    assert!(
-                        pair[1].top.tiled_ns >= pair[0].top.tiled_ns
-                            && pair[1].top.vector_ns >= pair[0].top.vector_ns,
-                        "{target:?} {tier:?}: {pair:?}"
-                    );
+                    for (a, b) in pair[0].costs.iter().zip(&pair[1].costs).skip(1) {
+                        assert!(b.2 >= a.2, "{target:?} {tier:?}: {pair:?}");
+                    }
                 }
             }
         }

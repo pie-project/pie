@@ -288,6 +288,7 @@ impl engine_gpu::backend::Tactics for Tuning {
         kernels_slang::linear::gemm::Tactic {
             tier,
             vector: 0,
+            wide: true,
         }
     }
 
@@ -300,6 +301,7 @@ impl engine_gpu::backend::Tactics for Tuning {
         vec![kernels_slang::linear::gemm::Tactic {
             tier,
             vector: 0,
+            wide: true,
         }]
     }
 

@@ -119,6 +119,9 @@ fn gemm_tactic(coopmat: bool) -> kernels_slang::linear::gemm::Tactic {
             kernels_slang::Tier::Baseline
         },
         vector: 0,
+        // The wide tile where no cooperative matrix serves: the matmul curve
+        // is timed on it; a load weighs both tiles a rung.
+        wide: true,
     }
 }
 

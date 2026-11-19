@@ -29,6 +29,9 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
+//! - `tile_tflops_by_rows`: each tiled matmul kernel the backend can take
+//!   at decode-shaped and short prompt rows, below the matmul curve's first,
+//!   its flops at the rows it lands over its time (slang backends).
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
@@ -303,6 +306,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         for (w, curve) in widths {
             if let Some((key, at)) = point("gemm_tflops_by_rows", "rows", curve) {
                 return Some((key, format!("{at} (width {w})")));
+            }
+        }
+    }
+    if let Some(tiles) = &rates.tile_tflops_by_rows {
+        for (tile, curve) in tiles {
+            if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
+                return Some((key, format!("{at} (a {tile}-row tile)")));
             }
         }
     }
@@ -1354,6 +1364,7 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
         }
     }
 
@@ -1852,7 +1863,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("measured no [\"few_row_tflops\", \"workgroups_per_core\"]"),
+            err.contains(
+                "measured no [\"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\"]"
+            ),
             "{err}"
         );
     }
@@ -2182,6 +2195,7 @@ mod tests {
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

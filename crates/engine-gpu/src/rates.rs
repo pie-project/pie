@@ -112,8 +112,9 @@ pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
 /// `few_row_tflops` is the vector kernels' rate, which the dense matmul's
 /// kernel at each rung is chosen by (`crate::dense`). `workgroups_per_core`
 /// is not weighed here yet: no choice on these backends reads it, so a
-/// load measures none.
-pub const KEYS: [&str; 7] = [
+/// load measures none. `tile_tflops_by_rows` is each tiled kernel's rate
+/// below the matmul curve, which that choice weighs them by.
+pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -121,7 +122,12 @@ pub const KEYS: [&str; 7] = [
     "elementwise_gbps",
     "scan_gelems",
     "few_row_tflops",
+    "tile_tflops_by_rows",
 ];
+
+/// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
+/// decode's few to the matmul curve's first.
+const TILE_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
 
 /// The decode-shaped rows `few_row_tflops` is timed at: 4 to 256, the rows
 /// below the matmul curve's first.
@@ -523,6 +529,7 @@ struct Wanted {
     launch: bool,
     gemm: bool,
     few_row: bool,
+    tiles: bool,
     attn: bool,
     elementwise: bool,
     scan: bool,
@@ -536,6 +543,7 @@ impl Wanted {
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
             few_row: lacks("few_row_tflops"),
+            tiles: lacks("tile_tflops_by_rows"),
             attn: lacks("attn_tflops_by_keys"),
             elementwise: lacks("elementwise_gbps"),
             scan: lacks("scan_gelems"),
@@ -622,6 +630,38 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         ));
         few_row = few_row.max(rate);
     }
+    // `tile_tflops_by_rows`: each tiled kernel the backend can take, at
+    // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
+    // its time, keyed by its row tile.
+    let mut tile_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    let tiled_kernels = if want.tiles {
+        crate::dense::tiled_kernels(
+            B::TARGET,
+            tactics.gemm(tier, TILE_ROWS[TILE_ROWS.len() - 1]),
+        )
+    } else {
+        Vec::new()
+    };
+    for tactic in tiled_kernels {
+        let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, w, w).row_tile();
+        let mut curve = Vec::new();
+        for m in TILE_ROWS {
+            let rate = matmul(&mut rig, tactic, timer, (m, w, w), launch);
+            rig.release();
+            let Some(rate) = dropped(&rig, rate, say)? else {
+                continue;
+            };
+            say(&format!(
+                "[rates]: {tile}-row tile matmul {m}x{w}x{w}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        if !curve.is_empty() && tile_curves.iter().all(|(at, _)| *at != tile) {
+            tile_curves.push((tile, curve));
+        }
+    }
+    tile_curves.sort_by_key(|(tile, _)| *tile);
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -709,6 +749,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         elementwise_gbps: elementwise,
         scan_gelems: scan,
         few_row_tflops: (few_row > 0.0).then_some(few_row / 1e3),
+        tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
         workgroups_per_core: None,
     };
     // A rate that settled at nothing is refused by name, never saved or
@@ -1312,11 +1353,13 @@ mod wanted_tests {
             scan_gelems: Some(100.0),
             few_row_tflops: Some(12.0),
             workgroups_per_core: None,
+            tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
         };
         let none = Wanted {
             launch: false,
             gemm: false,
             few_row: false,
+            tiles: false,
             attn: false,
             elementwise: false,
             scan: false,
@@ -1349,6 +1392,7 @@ mod wanted_tests {
             every.launch
                 && every.gemm
                 && every.few_row
+                && every.tiles
                 && every.attn
                 && every.elementwise
                 && every.scan

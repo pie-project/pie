@@ -216,17 +216,17 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
                 }
                 let rec = Recorder::new(target);
                 let shape = Shape::dense(m, n, k);
-                for vector in [0, 4, 8, 16] {
+                for (vector, wide) in [(0, false), (0, true), (4, false), (8, false), (16, false)] {
                     gemm::matmul(
                         &rec,
-                        gemm::Tactic { tier, vector },
+                        gemm::Tactic { tier, vector, wide },
                         t(0, m, k, Dtype::Bf16),
                         t(1, n, k, Dtype::Bf16),
                         t(2, m, n, Dtype::Bf16),
                     )
                     .unwrap();
                     let what = format!(
-                        "gemm {m} x {n} x {k} on {target:?} at {} (vector {vector})",
+                        "gemm {m} x {n} x {k} on {target:?} at {} (vector {vector}, wide {wide})",
                         tier.name()
                     );
                     seen.extend(assert_covers(&rec, &what, shape));

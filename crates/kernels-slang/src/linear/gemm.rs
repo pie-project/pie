@@ -1,14 +1,14 @@
 //! Dense matmuls (`linear.matmul`, `linear.matmul` over a bf16 weight, and
 //! an f32 activation's lane form). SPIR-V fires `kernels/linear/gemm.slang`
 //! (the vector kernels where the rung's tactic takes them, else the tiled
-//! kernel or its cooperative-matrix tier; `gemm_register.slang`'s from 96
-//! rows without one) and `gemm_lane.slang` for f32
+//! kernel or its cooperative-matrix tier; `gemm_register.slang`'s where the
+//! tactic takes the wide tile without one) and `gemm_lane.slang` for f32
 //! activations; WGSL fires `gemm_pairs.slang`, which lands column pairs as
 //! words (its vector kernel at the subgroup tier where the device has one).
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, every, refuse, stated};
+use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -35,13 +35,6 @@ pub fn vector_rows(rows: u32) -> u32 {
 
 const REGISTER: &str = "linear/gemm_register.slang";
 
-/// Fewer rows leave most of a register tile idle; SPIR-V's 32 x 32 tile
-/// serves them.
-const RT_MIN_ROWS: u32 = 96;
-
-/// Rows below this take WGSL's 16-row tile.
-const NARROW_MAX_ROWS: u32 = 48;
-
 /// How an engine runs dense matmuls on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tactic {
@@ -54,6 +47,12 @@ pub struct Tactic {
     /// rows the matmul lands; 0 for the tiled kernels. A load chooses it a
     /// rung, by the estimate (`engine_gpu::dense`).
     pub vector: u32,
+    /// Of the tiled kernels, the wide tile (SPIR-V's register tile, where
+    /// the contraction is whole 16-element steps; WGSL's 64-row tile), else
+    /// the narrow one (SPIR-V's 32 x 32, WGSL's 16-row). No choice under
+    /// SPIR-V's cooperative-matrix tier. A load chooses it a rung, by the
+    /// estimate over each kernel's measured rate (`engine_gpu::dense`).
+    pub wide: bool,
 }
 
 pub fn matmul(
@@ -129,9 +128,10 @@ impl Kernel {
     }
 }
 
-/// The kernel a matmul of `m` x `n` x `k` runs ([`Kernel`]).
+/// The kernel a matmul of `n` columns over `k` runs under `tactic`, at any
+/// rows ([`Kernel`]).
 #[must_use]
-pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kernel {
+pub fn tile_for(target: Target, tactic: Tactic, n: u32, k: u32) -> Kernel {
     match target {
         Target::Spirv if tactic.vector > 0 && k.is_multiple_of(8) => Kernel::GemvV {
             rows: vector_rows(tactic.vector),
@@ -140,7 +140,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
         Target::Spirv if tactic.tier == Tier::Coopmat => Kernel::Coopmat,
         // Sixty-four columns a tile at eight a lane, or thirty-two at four
         // when that leaves none idle.
-        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
+        Target::Spirv if tactic.wide && k.is_multiple_of(16) => {
             if n.is_multiple_of(32) && !n.is_multiple_of(64) {
                 Kernel::Register { cols: 32, per: 4 }
             } else {
@@ -151,7 +151,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
         Target::Wgsl if tactic.vector > 0 => Kernel::PairsGemv {
             rows: vector_rows(tactic.vector),
         },
-        Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
+        Target::Wgsl if !tactic.wide => Kernel::Pairs16,
         Target::Wgsl => Kernel::Pairs64,
     }
 }
@@ -162,7 +162,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
 /// matmuls by, as it pays for the tile it under-fills.
 #[must_use]
 pub fn padded_rows(target: Target, tactic: Tactic, rows: u32, width: u32) -> u32 {
-    let tile = tile_for(target, tactic, rows, width, width).row_tile();
+    let tile = tile_for(target, tactic, width, width).row_tile();
     rows.div_ceil(tile).saturating_mul(tile)
 }
 
@@ -196,15 +196,9 @@ pub fn act_x_wt(
     )
 }
 
-/// The rows at which the kernel a tiled projection takes changes:
-/// [`kernel`]'s own thresholds, so its answers at these are every answer it
-/// has.
-const ROW_BREAKS: [u32; 3] = [1, NARROW_MAX_ROWS, RT_MIN_ROWS];
-
 /// Every kernel a projection of `n` columns over a contraction of `k`
-/// takes at some row count under `tactic`'s tier, vector or tiled: which
-/// of the two a rung takes is the load's choice, made after its kernels
-/// are named.
+/// takes under `tactic`'s tier, vector, narrow or wide: which a rung takes
+/// is the load's choice, made after its kernels are named.
 pub fn kernels(
     target: Target,
     tactic: Tactic,
@@ -212,11 +206,15 @@ pub fn kernels(
     n: u32,
     k: u32,
 ) -> Result<Vec<Fire>, Error> {
-    let tiled = Tactic {
-        vector: 0,
-        ..tactic
-    };
-    let mut all = every(&ROW_BREAKS, |m| kernel(target, tiled, op, m, n, k))?;
+    let mut all = Vec::new();
+    for wide in [false, true] {
+        let tiled = Tactic {
+            vector: 0,
+            wide,
+            ..tactic
+        };
+        crate::encode::distinct(&mut all, kernel(target, tiled, op, 1, n, k)?);
+    }
     for rows in VECTOR_ROWS {
         let vector = Tactic {
             vector: rows,
@@ -259,7 +257,7 @@ fn kernel(
         }
         // Sixty-four columns a tile at eight a lane, or thirty-two at four
         // when that leaves none idle.
-        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
+        Target::Spirv if tactic.wide && k.is_multiple_of(16) => {
             let (entry, cols, per) = if n.is_multiple_of(32) && !n.is_multiple_of(64) {
                 ("linear_gemm_register_bn_32_bf16", 32, 4)
             } else {
@@ -304,7 +302,7 @@ fn kernel(
                     })
                     .groups([1, n.div_ceil(8), m.div_ceil(rows)])
                     .group([32, 8, 1])
-            } else if m < NARROW_MAX_ROWS {
+            } else if !tactic.wide {
                 Fire::at(PAIRS, "linear_gemm_pairs_tiled_bm_16_bf16")
                     .groups([n.div_ceil(64), m.div_ceil(16), 1])
                     .group([16, 16, 1])
@@ -398,8 +396,8 @@ mod tests {
     fn the_kernels_a_projection_names_hold_the_kernel_of_every_row_count() {
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for vector in [0, 4, 8, 16] {
-                    let tactic = Tactic { tier, vector };
+                for (vector, wide) in [(0, false), (0, true), (4, false), (8, false), (16, false)] {
+                    let tactic = Tactic { tier, vector, wide };
                     for (n, k) in [(64, 64), (1024, 1024), (1030, 1001), (48, 16), (8, 24)] {
                         let named: Vec<(&str, Tier)> =
                             kernels(target, tactic, "linear.matmul", n, k)
@@ -433,14 +431,14 @@ mod tile_tests {
         // `tile_for`'s row tile.
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
-                for vector in [0, 4, 8, 16] {
-                    let tactic = Tactic { tier, vector };
+                for (vector, wide) in [(0, false), (0, true), (4, false), (8, false), (16, false)] {
+                    let tactic = Tactic { tier, vector, wide };
                     for m in [1, 4, 8, 16, 47, 48, 64, 255, 256, 1024, 4096] {
                         for (n, k) in [(1024, 1024), (96, 4096), (4096, 1000)] {
                             let Ok(fire) = kernel(target, tactic, "test", m, n, k) else {
                                 continue;
                             };
-                            let tile = tile_for(target, tactic, m, n, k).row_tile();
+                            let tile = tile_for(target, tactic, n, k).row_tile();
                             let groups = fire.groups;
                             let rows = match tile {
                                 1 => continue,
@@ -462,16 +460,22 @@ mod tile_tests {
     fn the_padded_rows_grow_with_the_rows() {
         for target in [Target::Spirv, Target::Wgsl] {
             for tier in [Tier::Baseline, Tier::Coopmat] {
-                let tactic = Tactic { tier, vector: 0 };
-                for width in [1024, 96, 4096] {
-                    let mut computed = 0;
-                    for m in 1..=4096 {
-                        let padded = padded_rows(target, tactic, m, width);
-                        assert!(
-                            padded >= computed,
-                            "{target:?} {tier:?}: {m} rows compute {padded}"
-                        );
-                        computed = padded;
+                for wide in [false, true] {
+                    let tactic = Tactic {
+                        tier,
+                        vector: 0,
+                        wide,
+                    };
+                    for width in [1024, 96, 4096] {
+                        let mut computed = 0;
+                        for m in 1..=4096 {
+                            let padded = padded_rows(target, tactic, m, width);
+                            assert!(
+                                padded >= computed,
+                                "{target:?} {tier:?}: {m} rows compute {padded}"
+                            );
+                            computed = padded;
+                        }
                     }
                 }
             }

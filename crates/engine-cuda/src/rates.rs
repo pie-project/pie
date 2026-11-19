@@ -61,8 +61,18 @@ use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
 use profile::fire::Rates;
 
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
-/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-pub const KEYS: [&str; 8] = profile::fire::KEYS;
+/// `profile::fire::KEYS`, all but the slang backends' `tile_tflops_by_rows`):
+/// what a load whose profile lacks one measures.
+pub const KEYS: [&str; 8] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+    "few_row_tflops",
+    "workgroups_per_core",
+];
 
 /// The `[provenance]` entry a measurement of `device`'s rates writes beside
 /// them (`engine::rates::provenance`): how this backend measured them.
@@ -498,6 +508,7 @@ mod on_device {
                 scan_gelems: Some(tenth(scan)),
                 few_row_tflops: Some(tenth(few_row / 1e3)),
                 workgroups_per_core: Some(f64::from(resident)),
+                tile_tflops_by_rows: None,
             },
             attn_by_dim,
         })
@@ -1063,6 +1074,7 @@ mod ensure_tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
+            tile_tflops_by_rows: None,
         }
     }
 

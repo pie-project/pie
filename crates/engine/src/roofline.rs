@@ -547,6 +547,7 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: None,
         };
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [

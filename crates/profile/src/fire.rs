@@ -23,6 +23,8 @@
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
 //! few_row_tflops = 4.2     # bf16 matmul TFLOP/s at 4-256 rows, as served
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
+//! # each tiled kernel's TFLOP/s by rows below its full fill, keyed by its row tile
+//! tile_tflops_by_rows = [[32, [[8, 1.0], [256, 9.0]]], [256, [[8, 0.2], [256, 12.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -80,10 +82,18 @@ pub struct Rates {
     /// `S = W · t / t_full`, over the cores. A real number of workgroups a
     /// unit.
     pub workgroups_per_core: Option<f64>,
+    /// Each tiled matmul kernel's bf16 TFLOP/s by rows below the matmul
+    /// curve's, its flops counted at the rows it lands (not its tile's):
+    /// `(row tile, [(rows, TFLOP/s)])`, ascending in row tile, keyed by the
+    /// rows one tile of the kernel computes (the slang backends' tiles).
+    /// What a matmul of few rows costs on each tiled kernel, so a choice
+    /// between them and the vector kernels weighs measured costs at partial
+    /// fill. Measured.
+    pub tile_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 9] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -92,6 +102,7 @@ pub const KEYS: [&str; 8] = [
     "scan_gelems",
     "few_row_tflops",
     "workgroups_per_core",
+    "tile_tflops_by_rows",
 ];
 
 impl Rates {
@@ -107,6 +118,7 @@ impl Rates {
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
+            tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
         }
     }
 
@@ -136,6 +148,10 @@ impl Rates {
             workgroups_per_core: self
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
+            tile_tflops_by_rows: self
+                .tile_tflops_by_rows
+                .clone()
+                .filter(|_| has("tile_tflops_by_rows")),
         }
     }
 
@@ -153,6 +169,7 @@ impl Rates {
             "scan_gelems" => self.scan_gelems.is_none(),
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
+            "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -171,17 +188,20 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
-        if let Some(widths) = &self.gemm_tflops_by_rows {
-            let curves: Vec<String> = widths
-                .iter()
-                .map(|(w, c)| {
-                    let points: Vec<String> =
-                        c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
-                    format!("  [{w}, [{}]],\n", points.join(", "))
-                })
-                .collect();
-            let _ = writeln!(out, "gemm_tflops_by_rows = [\n{}]", curves.concat());
-        }
+        let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
+            if let Some(keyed) = v {
+                let curves: Vec<String> = keyed
+                    .iter()
+                    .map(|(w, c)| {
+                        let points: Vec<String> =
+                            c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
+                        format!("  [{w}, [{}]],\n", points.join(", "))
+                    })
+                    .collect();
+                let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
+            }
+        };
+        keyed(&mut out, "gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
         let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
             if let Some(points) = v {
                 let points: Vec<String> = points
@@ -202,6 +222,7 @@ impl Rates {
         float("scan_gelems", self.scan_gelems);
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
+        keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
         out
     }
 }
@@ -352,11 +373,16 @@ mod tests {
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
+            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
             rates.only(&KEYS[..6]).missing(&KEYS),
-            ["few_row_tflops", "workgroups_per_core"]
+            [
+                "few_row_tflops",
+                "workgroups_per_core",
+                "tile_tflops_by_rows"
+            ]
         );
         assert_eq!(
             rates.toml(),
@@ -364,7 +390,7 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\n"
+             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\n"
         );
     }
 
