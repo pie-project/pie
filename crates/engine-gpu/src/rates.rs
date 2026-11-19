@@ -901,8 +901,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // (an Adreno 840 halved its clock ~10 s into load).
     let sustained = if max_submit.is_some() {
         // Rotated as the warm-up rotated it: each fire its own submission,
-        // admitted at the worst ratio the warm-up's walk measured.
-        match warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, walk_worst)? {
+        // admitted at the worst ratio the warm-up's walk measured (not at
+        // the step's own worst since, which its micro-shapes' host latency
+        // inflates and would refuse the cube that fit then: x4.59 refused an
+        // 87 ms fire under a forced 300 ms bound on an RTX).
+        let step_admission = rig.admission.get();
+        rig.admission.set(engine::rates::Admission {
+            settled: true,
+            worst: walk_worst.max(1.0),
+            ..step_admission
+        });
+        let rotated = warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, walk_worst);
+        rig.admission.set(step_admission);
+        match rotated? {
             Some(hot) => {
                 let drop = (warmed.rate / hot.rate.max(f64::MIN_POSITIVE)).max(1.0);
                 say(&format!(
