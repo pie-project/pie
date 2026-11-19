@@ -38,6 +38,7 @@ mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
+mod an_envelope_keeps_two_passes_in_flight;
 mod an_idle_lane_reports_its_last_landing;
 mod an_instance_outlives_its_failed_frame;
 mod an_operand_past_an_ints_reach_reads_its_last_rows;
