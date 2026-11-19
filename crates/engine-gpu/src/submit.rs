@@ -8,7 +8,9 @@
 //! buffer and fence), so a frame's steps never share one: each is admitted
 //! alone. A step is estimated by the load's own estimate
 //! ([`engine::load::FireEstimate`], the device's measured `[rates]` over the
-//! model's counts) at its rows and the keys its longest lane attends, times
+//! model's counts) at its rows and the keys its longest lane attends (its
+//! attention against a longer prefix at the rate measured at those rows
+//! against those keys, `[rates] attn_tflops_by_rows_keys`), times
 //! the worst ratio of a frame's time to its estimate the device's rates step
 //! measured, its clock's swing at least (`[rates] submit_worst_ratio`, saved
 //! with the other rates), and as a split step its widest submission, a
@@ -164,6 +166,40 @@ pub struct SubmitBound {
     pub fire_lanes: u32,
     /// The rungs the load laid, ascending.
     pub rungs: Vec<u32>,
+    /// The attention of a prompt step's rows against a longer prefix, flops
+    /// a ns: `(rows, [(keys, rate)])` (`[rates] attn_tflops_by_rows_keys`).
+    pub prefixed: Vec<(u32, Vec<(u32, f64)>)>,
+}
+
+/// `curve` (ascending in keys) at `keys`: linear in `log keys` between its
+/// points, its first point's below them, and past its last along its last
+/// segment in `log rate` over `log keys` where that segment falls (a rate
+/// falling with keys keeps falling past the keys measured), its last
+/// point's where it rises (never read faster than measured).
+#[must_use]
+pub fn rate_at_keys(curve: &[(u32, f64)], keys: u32) -> Option<f64> {
+    let &(x1, y1) = curve.last()?;
+    if keys <= x1 || curve.len() < 2 {
+        return profile::fire::interpolate(curve, f64::from(keys));
+    }
+    let (x0, y0) = curve[curve.len() - 2];
+    if y1 >= y0 {
+        return Some(y1);
+    }
+    let slope = (y1 / y0).ln() / (f64::from(x1) / f64::from(x0)).ln();
+    Some(y1 * (f64::from(keys) / f64::from(x1)).powf(slope))
+}
+
+/// `by_rows` (ascending in rows, each a curve by keys) at `rows` against
+/// `keys`: each curve read at the keys ([`rate_at_keys`]), linear in `log
+/// rows` between the two rows bracketing it, the nearest rows' outside them.
+#[must_use]
+pub fn rate_at(by_rows: &[(u32, Vec<(u32, f64)>)], rows: u32, keys: u32) -> Option<f64> {
+    let at: Vec<(u32, f64)> = by_rows
+        .iter()
+        .filter_map(|(r, curve)| rate_at_keys(curve, keys).map(|rate| (*r, rate)))
+        .collect();
+    profile::fire::interpolate(&at, f64::from(rows))
 }
 
 impl SubmitBound {
@@ -183,7 +219,26 @@ impl SubmitBound {
             fire_lanes: self.fire_lanes.max(1),
         };
         let terms = self.estimate.terms(&rung);
-        let whole = terms.dispatched;
+        let mut whole = terms.dispatched;
+        // A prompt step's rows against a longer prefix: its attention at the
+        // rate measured at those rows against those keys, where slower than
+        // the square curve reads it (a square prompt skips half its
+        // rectangle causally, a prefixed step almost none).
+        let fire = rung.check_fire();
+        if !rung.decode_shaped() && fire.keys_per_lane > fire.rows {
+            let flops = f64::from(fire.rows)
+                * f64::from(fire.keys_per_lane)
+                * self.estimate.attn_flops_per_row_key;
+            if let Some(rate) = rate_at(&self.prefixed, fire.rows, fire.keys_per_lane)
+                && flops > 0.0
+                && rate > 0.0
+            {
+                let prefixed = flops / rate;
+                if prefixed > terms.attention {
+                    whole += prefixed.max(terms.kv) - terms.attention.max(terms.kv);
+                }
+            }
+        }
         let head = terms.readout.max(terms.head_read) + self.estimate.rates.launch_ns;
         let per_layer = (whole - head).max(0.0) / f64::from(self.layers.max(1)) + head;
         let worst = self.worst.max(1.0);
@@ -331,6 +386,7 @@ mod tests {
             layers: 28,
             fire_lanes: 64,
             rungs: vec![64, 128, 256, 512],
+            prefixed: Vec::new(),
         }
     }
 
@@ -451,5 +507,53 @@ mod tests {
             frame_submissions(&[shaped(&b, step)], b.layers, BOUND).map_err(|(at, _)| at),
             Err(0)
         );
+    }
+
+    /// Past the keys measured, a falling attention rate keeps falling along
+    /// its last segment; a rising one is read at its last point. Between
+    /// rows the rate is read in log rows; outside them, at the nearest.
+    #[test]
+    fn the_prefixed_rate_extrapolates_its_last_segment_falling_only() {
+        let falling = [(2048, 0.367e3), (4096, 0.341e3)];
+        let at = rate_at_keys(&falling, 8192).unwrap();
+        assert!(at < 0.341e3, "{at}");
+        assert!((at - 0.341e3 * (0.341f64 / 0.367).powf(1.0)).abs() < 1e-6, "{at}");
+        let rising = [(1024, 0.3e3), (4096, 0.4e3)];
+        assert_eq!(rate_at_keys(&rising, 8192), Some(0.4e3));
+        assert_eq!(rate_at_keys(&rising, 512), Some(0.3e3));
+        let by_rows = vec![(256, vec![(4096, 0.2e3)]), (1024, vec![(4096, 0.4e3)])];
+        let mid = rate_at(&by_rows, 512, 4096).unwrap();
+        assert!((mid - 0.3e3).abs() < 1e-6, "{mid}");
+        assert_eq!(rate_at(&by_rows, 128, 4096), Some(0.2e3));
+    }
+
+    /// A prompt step against a long prefix is estimated at the prefixed
+    /// rate where it is slower than the square curve: Android's 512 x 3600
+    /// step, read as fast as a square prompt, ran ~2x its estimate.
+    #[test]
+    fn a_prefixed_step_is_estimated_at_the_prefixed_rate() {
+        let square = bound(1.0);
+        let step = prompt(512, 3600);
+        let (at_square, _) = square.step_ns(step);
+        // Half the square curve's 0.25 TFLOP/s against a prefix.
+        let prefixed = SubmitBound {
+            prefixed: vec![(512, vec![(1024, 0.125e3), (8192, 0.125e3)])],
+            ..square.clone()
+        };
+        let (at_prefixed, _) = prefixed.step_ns(step);
+        let attention = 512.0 * 3600.0 * square.estimate.attn_flops_per_row_key / 0.25e3;
+        assert!(
+            (at_prefixed - at_square - attention).abs() < 1e-3 * attention,
+            "{at_square} {at_prefixed} {attention}"
+        );
+        // A square prompt (no prefix) keeps the square curve's term.
+        let own = prompt(512, 512);
+        assert_eq!(prefixed.step_ns(own), square.step_ns(own));
+        // A prefixed rate faster than the square curve's is not read.
+        let faster = SubmitBound {
+            prefixed: vec![(512, vec![(1024, 1e3), (8192, 1e3)])],
+            ..square.clone()
+        };
+        assert_eq!(faster.step_ns(step), square.step_ns(step));
     }
 }

@@ -499,6 +499,7 @@ mod on_device {
                 few_row_tflops: Some(tenth(few_row / 1e3)),
                 workgroups_per_core: Some(f64::from(resident)),
                 submit_worst_ratio: None,
+                attn_tflops_by_rows_keys: None,
             },
             attn_by_dim,
         })
@@ -1065,6 +1066,7 @@ mod ensure_tests {
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
             submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
         }
     }
 

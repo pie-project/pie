@@ -782,6 +782,7 @@ pub fn measure(
         few_row_tflops: few_row,
         workgroups_per_core: per_core,
         submit_worst_ratio: None,
+        attn_tflops_by_rows_keys: None,
     })
 }
 

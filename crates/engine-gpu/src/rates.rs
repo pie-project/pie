@@ -127,9 +127,16 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     let mut keys = KEYS.to_vec();
     if max_submit.is_some() {
         keys.push(profile::fire::SUBMIT_WORST_RATIO);
+        keys.push(profile::fire::ATTN_BY_ROWS_KEYS);
     }
     keys
 }
+
+/// The rows of a prompt step the prefixed attention curve is timed at
+/// (`profile::fire::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
+/// slang load on a bound-stating device lays its top at (wgpu's 512, native
+/// Vulkan's 1024, and the narrower a phone's room leaves).
+pub const PREFIX_ROWS: [u32; 4] = [128, 256, 512, 1024];
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -596,6 +603,41 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             rate / 1e3
         ));
     }
+    // Under a stated submit bound, the attention of a prompt step's rows
+    // against a longer prefix, at each of [`PREFIX_ROWS`] against each of
+    // `engine::rates::ATTN_KEYS` past them: the shapes the steps that near
+    // the bound fire, which the square curve reads up to twice as fast as
+    // they run (`profile::fire::Rates::attn_tflops_by_rows_keys`). A point
+    // past the bound is dropped by name, as every rate's is.
+    let mut prefixed: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    if max_submit.is_some() {
+        let mut last = attn.last().map(|&(_, rate)| rate);
+        for rows in PREFIX_ROWS {
+            let mut curve = Vec::new();
+            for keys in engine::rates::ATTN_KEYS.into_iter().filter(|&k| k > rows) {
+                let shape = engine::rates::AttnShape {
+                    rows,
+                    keys,
+                    ..engine::rates::ATTN_SHAPE
+                };
+                let estimate = at_rate(shape, last);
+                let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
+                rig.release();
+                let Some(rate) = dropped(&rig, rate, say)? else {
+                    continue;
+                };
+                say(&format!(
+                    "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s",
+                    rate / 1e3
+                ));
+                last = Some(rate);
+                curve.push((keys, rate / 1e3));
+            }
+            if !curve.is_empty() {
+                prefixed.push((rows, curve));
+            }
+        }
+    }
     let elementwise = elementwise(&mut rig, timer, launch)?;
     rig.release();
     say(&format!("[rates]: per-row ops: {elementwise:.0} GB/s"));
@@ -625,6 +667,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         // the platform states one.
         submit_worst_ratio: max_submit
             .map(|_| rig.admission.get().worst.max(rig.swing.get()).max(1.0)),
+        attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
     };
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
@@ -912,8 +955,10 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         })
         .collect::<Result<Vec<(Tensor, KvPool)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    // The rows' own positions, all of request 0, no row masked.
-    let positions: Vec<u32> = (0..s.rows).collect();
+    // The rows' own positions, all of request 0, no row masked: the last
+    // `rows` of the `keys`, each attending every key held before it and
+    // its own rows up to itself (a square shape attends itself).
+    let positions: Vec<u32> = (s.keys.saturating_sub(s.rows)..s.keys).collect();
     let tables = kernels_slang::attn::sdpa::Tables {
         positions: rig.words(&positions, s.rows, 1, Dtype::I32)?,
         request_of_token: rig.zeros(s.rows, 1, Dtype::I32)?,

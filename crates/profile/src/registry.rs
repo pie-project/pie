@@ -1122,7 +1122,12 @@ impl<'a> Walk<'a> {
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
                 "gemm_tflops_by_rows" => {
-                    rates.gemm_tflops_by_rows = self.width_curves(v);
+                    rates.gemm_tflops_by_rows = self.width_curves(v, "gemm_tflops_by_rows");
+                    continue;
+                }
+                crate::fire::ATTN_BY_ROWS_KEYS => {
+                    rates.attn_tflops_by_rows_keys =
+                        self.width_curves(v, crate::fire::ATTN_BY_ROWS_KEYS);
                     continue;
                 }
                 key @ "attn_tflops_by_keys" => {
@@ -1157,8 +1162,8 @@ impl<'a> Walk<'a> {
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
-                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core` and \
-                             `submit_worst_ratio`, not \
+                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
+                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not \
                              `{other}`"
                         ),
                     );
@@ -1183,16 +1188,28 @@ impl<'a> Walk<'a> {
     /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
     /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
     /// width.
+    /// `rates.<key>`: `[outer, [[x, rate], ...]]` pairs, ascending in
+    /// `outer`, each curve as [`Self::curve`] reads it (the matmul's by its
+    /// width, the prefixed attention's by its rows).
     fn width_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
+        key: &'static str,
     ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
-        const WHAT: &str = "`rates.gemm_tflops_by_rows` is a non-empty list of [width, [[rows, \
-                            TFLOP/s], ...]] pairs, ascending in width";
+        let (outer, inner) = if key == crate::fire::ATTN_BY_ROWS_KEYS {
+            ("rows", "keys")
+        } else {
+            ("width", "rows")
+        };
+        let what = format!(
+            "`rates.{key}` is a non-empty list of [{outer}, [[{inner}, TFLOP/s], ...]] pairs, \
+             ascending in {outer}"
+        );
+        let what = what.as_str();
         let DeValue::Array(widths) = value.get_ref() else {
             self.err(
                 value.span().start,
-                format!("{WHAT}, not {}", found(value.get_ref())),
+                format!("{what}, not {}", found(value.get_ref())),
             );
             return None;
         };
@@ -1209,14 +1226,14 @@ impl<'a> Walk<'a> {
             else {
                 self.err(
                     entry.span().start,
-                    format!("{WHAT}, not {}", found(entry.get_ref())),
+                    format!("{what}, not {}", found(entry.get_ref())),
                 );
                 return None;
             };
-            out.push((width, self.curve(curve, "gemm_tflops_by_rows")?));
+            out.push((width, self.curve(curve, key)?));
         }
         if out.is_empty() {
-            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            self.err(value.span().start, format!("{what}, not an empty list"));
             return None;
         }
         Some(out)

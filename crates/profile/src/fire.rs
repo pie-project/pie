@@ -87,6 +87,17 @@ pub struct Rates {
     /// read, only where the platform states such a bound (Android); not one
     /// of [`KEYS`], which the estimate weighs a fire by.
     pub submit_worst_ratio: Option<f64>,
+    /// Prefill attention TFLOP/s (the rectangle's flops, four a query
+    /// element a key, as [`Rates::attn_tflops_by_keys`] counts them) of a
+    /// step's rows against a longer prefix: `(rows, [(keys, TFLOP/s)])`, the
+    /// rows a prompt step fires at its rung attending `keys` keys of which
+    /// all but their own are held before them, ascending in rows, each curve
+    /// strictly ascending in keys. A square self-attending prompt skips half
+    /// its rectangle causally, a prefixed step almost none of it, so the
+    /// square curve reads such a step's attention as up to twice as fast as
+    /// it runs. Measured, and read, only where the platform states a bound
+    /// on one submission (`engine_gpu::submit`); not one of [`KEYS`].
+    pub attn_tflops_by_rows_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 
 /// Every key `[rates]` holds, in the order a profile writes them.
@@ -106,6 +117,10 @@ pub const KEYS: [&str; 8] = [
 /// estimate's [`KEYS`].
 pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
 
+/// The `[rates]` key of [`Rates::attn_tflops_by_rows_keys`]: measured beside
+/// [`SUBMIT_WORST_RATIO`] where the platform states a submit bound.
+pub const ATTN_BY_ROWS_KEYS: &str = "attn_tflops_by_rows_keys";
+
 impl Rates {
     /// `self` laid over `below`: each key `self` states replaces `below`'s.
     #[must_use]
@@ -120,6 +135,9 @@ impl Rates {
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
             submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
+            attn_tflops_by_rows_keys: self
+                .attn_tflops_by_rows_keys
+                .or(below.attn_tflops_by_rows_keys),
         }
     }
 
@@ -152,6 +170,10 @@ impl Rates {
             submit_worst_ratio: self
                 .submit_worst_ratio
                 .filter(|_| has(SUBMIT_WORST_RATIO)),
+            attn_tflops_by_rows_keys: self
+                .attn_tflops_by_rows_keys
+                .clone()
+                .filter(|_| has(ATTN_BY_ROWS_KEYS)),
         }
     }
 
@@ -170,6 +192,7 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
+            ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -188,17 +211,20 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
-        if let Some(widths) = &self.gemm_tflops_by_rows {
-            let curves: Vec<String> = widths
-                .iter()
-                .map(|(w, c)| {
-                    let points: Vec<String> =
-                        c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
-                    format!("  [{w}, [{}]],\n", points.join(", "))
-                })
-                .collect();
-            let _ = writeln!(out, "gemm_tflops_by_rows = [\n{}]", curves.concat());
-        }
+        let curves = |key: &str, by: &Option<Vec<(u32, Vec<(u32, f64)>)>>, out: &mut String| {
+            if let Some(widths) = by {
+                let curves: Vec<String> = widths
+                    .iter()
+                    .map(|(w, c)| {
+                        let points: Vec<String> =
+                            c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
+                        format!("  [{w}, [{}]],\n", points.join(", "))
+                    })
+                    .collect();
+                let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
+            }
+        };
+        curves("gemm_tflops_by_rows", &self.gemm_tflops_by_rows, &mut out);
         let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
             if let Some(points) = v {
                 let points: Vec<String> = points
@@ -220,6 +246,7 @@ impl Rates {
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
         float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
+        curves(ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys, &mut out);
         out
     }
 }
@@ -371,6 +398,7 @@ mod tests {
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
@@ -390,10 +418,11 @@ mod tests {
     /// The margin a load measures under a stated submit bound is saved with
     /// the rates and read back: a boot on saved rates holds its steps at it.
     #[test]
-    fn the_submit_margin_is_saved_and_read_back_with_the_rates() {
+    fn the_submit_rates_are_saved_and_read_back_with_the_rates() {
         let measured = Rates {
             launch_ns: Some(904),
             submit_worst_ratio: Some(1.83),
+            attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
             ..Rates::default()
         };
         let text = format!("api = 1\n{}", measured.toml());
@@ -401,6 +430,7 @@ mod tests {
         let registry = crate::Registry::new("test", &[], &[]);
         let read = registry.load_user(&text, "test").unwrap().rates();
         assert_eq!(read.submit_worst_ratio, Some(1.83));
+        assert_eq!(read.attn_tflops_by_rows_keys, measured.attn_tflops_by_rows_keys);
         assert!(read.missing(&[SUBMIT_WORST_RATIO]).is_empty());
         assert_eq!(
             Rates::default().missing(&[SUBMIT_WORST_RATIO]),

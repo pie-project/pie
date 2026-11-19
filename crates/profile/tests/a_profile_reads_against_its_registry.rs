@@ -954,6 +954,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             few_row_tflops: None,
             workgroups_per_core: None,
             submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
         }
     );
 
@@ -1017,12 +1018,12 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`few_row_tflops` and `workgroups_per_core`, not `flops`",
+            "`submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`workgroups_per_core`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`attn_tflops_by_rows_keys`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",
@@ -1040,6 +1041,10 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         (
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",
+        ),
+        (
+            "[rates]\nattn_tflops_by_rows_keys = [[512, [[4096, 0.3]]], [256, [[4096, 0.2]]]]\n",
+            "a non-empty list of [rows, [[keys, TFLOP/s], ...]] pairs, ascending in rows",
         ),
         ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
     ] {

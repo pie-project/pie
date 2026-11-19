@@ -306,6 +306,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
+    if let Some(by_rows) = &rates.attn_tflops_by_rows_keys {
+        for (rows, curve) in by_rows {
+            if let Some((key, at)) = point(profile::fire::ATTN_BY_ROWS_KEYS, "keys", curve) {
+                return Some((key, format!("{at} ({rows} rows)")));
+            }
+        }
+    }
     if let Some(found) = rates
         .attn_tflops_by_keys
         .as_deref()
@@ -1356,6 +1363,7 @@ mod tests {
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
         }
     }
 
@@ -2112,6 +2120,7 @@ mod tests {
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

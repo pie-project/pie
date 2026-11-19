@@ -1568,7 +1568,26 @@ impl<B: Serve> Shell<B> {
                         profile::fire::SUBMIT_WORST_RATIO
                     )));
                 };
+                // A prompt step's attention against a longer prefix,
+                // measured with them: refused by its key where unstated.
+                let Some(prefixed) = device_profile.rates().attn_tflops_by_rows_keys else {
+                    return Err(Fault::Residency(format!(
+                        "the platform states a bound of {} ms on one GPU submission and device \
+                         {}'s profile leaves `[rates] {}` unstated, so nothing estimates a prompt \
+                         step's attention against a longer prefix; `pie tune <backend> --rates` \
+                         measures it",
+                        bound.as_millis(),
+                        device.name(),
+                        profile::fire::ATTN_BY_ROWS_KEYS
+                    )));
+                };
                 let held = crate::submit::SubmitBound {
+                    prefixed: prefixed
+                        .into_iter()
+                        .map(|(rows, curve)| {
+                            (rows, curve.into_iter().map(|(keys, t)| (keys, t * 1e3)).collect())
+                        })
+                        .collect(),
                     bound_ns: bound.as_nanos() as f64,
                     worst: worst.max(1.0),
                     estimate,
