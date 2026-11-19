@@ -813,25 +813,27 @@ pub fn program_at(
                 .collect();
             // positions below a class's rows (a decode step's: below its cache's positions)
             let (lv, bits) = rope_digits(&class_rows, shape.cache);
-            let printed = region::print(
-                &chain.region,
-                &Place {
-                    chunk: at.chunk,
-                    // a head region is whole at each root it runs at
-                    roots: if at.reps > 1 || at.chunk == chain.region.width && at.roots > 1 {
-                        1
-                    } else {
-                        at.roots
-                    },
-                    params: params.clone(),
-                    round16,
-                    rope_lv: lv.max(1),
-                    rope_bits: bits,
-                    straddle: false,
-                    columns: None,
-                    dup: at.per.max(1),
+            let place = Place {
+                chunk: at.chunk,
+                // a head region is whole at each root it runs at
+                roots: if at.reps > 1 || at.chunk == chain.region.width && at.roots > 1 {
+                    1
+                } else {
+                    at.roots
                 },
-            )
+                params: params.clone(),
+                round16,
+                rope_lv: lv.max(1),
+                rope_bits: bits,
+                straddle: false,
+                columns: None,
+                dup: at.per.max(1),
+            };
+            // a root kernel's step: its module, not the region printer's
+            let printed = match crate::kernel::root_of(trace, chain) {
+                Some(k) => k.print(trace, chain, &place, u.rows, shape.cache.is_some()),
+                None => region::print(&chain.region, &place).map_err(|e| e.to_string()),
+            }
             .map_err(|e| format!("{}: step {i}: {e}", u.name))?;
             regions.insert(i, (at, printed, params));
         }
@@ -851,11 +853,11 @@ pub fn program_at(
                 })
                 .filter(|(i, _)| {
                     matches!(
-                        u.steps[**i],
+                        &u.steps[**i],
                         Step::Region {
                             side: Side::Col,
-                            ..
-                        }
+                            chain,
+                        } if crate::kernel::root_of(trace, chain).is_none()
                     )
                 })
                 .max_by(|a, b| {

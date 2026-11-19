@@ -81,7 +81,7 @@ pub struct StreamShape {
 pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShape> {
     let name = &trace.name;
     let analysis = poem_compiler::analysis::analyze(trace).map_err(|e| format!("{name}: {e}"))?;
-    let prog = program::lower(trace, &analysis, classes)?;
+    let prog = program::lower_with(trace, &analysis, classes, &crate::kernel::claims)?;
     let runs = |g: &poem_ir::Guard| classes.iter().any(|c| g.holds(c.word));
     let (mut attn, mut rope, mut glu, mut eps) = (None, None, None, None);
     let (mut qk_norm, mut modulations) = (false, Vec::new());

@@ -20,6 +20,8 @@ use crate::floorplan::stream::KvColumn;
 use crate::stream::build::Program;
 use crate::stream::place::KvSched;
 use crate::stream::unit::{Cols, Joint, Lowering};
+use poem_compiler::fuse::chain::Chain;
+use poem_ir::Operands as _;
 
 type R<T> = Result<T, String>;
 
@@ -36,6 +38,11 @@ pub trait Kernel: Sync {
     fn sources(&self) -> &'static [Source];
     /// How it lowers its ops into a unit's steps (the unit regime), where it runs there.
     fn unit(&self) -> Option<&dyn UnitKernel> {
+        None
+    }
+    /// Its module at a unit's roots, where it runs there (the unit regime): a region step's
+    /// interface, its own code.
+    fn root(&self) -> Option<&dyn RootKernel> {
         None
     }
     /// Its op in the GEMM regime (a function of `gemm_pe.csl`), where it has one.
@@ -101,6 +108,54 @@ pub trait UnitKernel: Sync {
     /// for that node as it is (the unit refuses it by name). A pattern over several nodes lowers
     /// at its first and puts the rest in `cx.skip`.
     fn lower(&self, cx: &mut Lowering, at: u32) -> R<bool>;
+}
+
+/// A kernel at a unit's roots: it lowers its node to a region step (`Step::Region`, its chain
+/// one node: its row inputs and outputs, a kernels-ir region of its width that states only its
+/// interface), so the roots place, chunk, feed and price it as any region, and prints the
+/// module the roots import in place of the region printer's (a printed region's interface:
+/// `in<k>` / `out<k>`, `init()`, `row()` a row), with its own arrays and state.
+pub trait RootKernel: Sync {
+    /// Its module for `place` (its chunk, its roots), over a unit's `rows` rows a step, a decode
+    /// step's (its rows lanes, each a state slot and position) where `decode`.
+    fn print(
+        &self,
+        trace: &poem_ir::Trace,
+        chain: &Chain,
+        place: &crate::emit::region::Place,
+        rows: u32,
+        decode: bool,
+    ) -> R<crate::emit::region::Printed>;
+    /// The arrays its module holds that the host writes at a root running chunk `r` of `c`
+    /// columns: (the module's array, its words, what fills them).
+    fn arrays(&self, trace: &poem_ir::Trace, chain: &Chain, r: u32, c: u32) -> Vec<RootArray>;
+    /// Whether its module reads a decode step's rows' (lane slot, state slot, position): the
+    /// root's `rowp` (passed in as `rowp`; the root a `rows` region of the state root's).
+    fn rows(&self) -> bool;
+}
+
+/// An array of a root kernel's module the host writes.
+pub struct RootArray {
+    /// The module's array (`rg<k>.<name>`).
+    pub name: &'static str,
+    pub len: u32,
+    pub fill: crate::emit::stream::Fill,
+}
+
+/// The root kernel a region step's chain is (one node, a kernel's op), if it is one.
+#[must_use]
+pub fn root_of(trace: &poem_ir::Trace, chain: &Chain) -> Option<&'static dyn RootKernel> {
+    let [n] = chain.nodes[..] else { return None };
+    by_op(trace.nodes.get(n as usize)?.op.name()).and_then(|k| k.root())
+}
+
+/// The ops the unit regime lowers by a kernel of their own where the compiler has no phase for
+/// them (`poem_compiler::spatial::layer::stream::lower_with`): a root kernel's, at the roots.
+#[must_use]
+pub fn claims(op: &poem_ir::Operation) -> Option<poem_compiler::spatial::layer::Claim> {
+    by_op(op.name())
+        .and_then(|k| k.root())
+        .map(|_| poem_compiler::spatial::layer::Claim::Root)
 }
 
 /// What sizes a K / V column's PEs ([`Column::pya`]).

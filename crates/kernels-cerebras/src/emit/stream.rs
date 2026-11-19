@@ -1268,6 +1268,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let mut hrow: Vec<(usize, u32)> = Vec::new();
     let mut hscal: Vec<usize> = Vec::new();
     let mut helped = false;
+    // a root kernel's rows (`rowp`) declared at this root
+    let mut root_rows = false;
     let mut sends_cast = false;
     let mut kv_io = false;
     let mut chain_in = false;
@@ -1419,6 +1421,40 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 } else {
                     "math"
                 };
+                // a root kernel's module: its arrays the host's, a decode step's rows its own
+                let kern = crate::kernel::root_of(r.trace, chain);
+                if let Some(kn) = kern {
+                    if kn.rows() {
+                        let _ = write!(ptrs, ", .rowp = &rowp");
+                        if !root_rows {
+                            root_rows = true;
+                            match rows_of(p) {
+                                Some(n) => {
+                                    let _ = writeln!(
+                                        g.decls,
+                                        "var rowp = @zeros([{}]u32);\nvar rowp_p: [*]u32 = &rowp;",
+                                        3 * n
+                                    );
+                                    g.exports.push(("rowp_p".into(), "rowp".into(), false));
+                                    arrays.push(rowp_array(Coord::new(0, 0), n));
+                                }
+                                None => g.decls.push_str("var rowp = @zeros([3]u32);\n"),
+                            }
+                        }
+                    }
+                    for a in kn.arrays(r.trace, chain, ri, c) {
+                        let sym = format!("k{k}_{}", a.name);
+                        let _ = writeln!(g.decls, "var {sym}_p: [*]f32 = &rg{k}.{};", a.name);
+                        g.exports.push((format!("{sym}_p"), sym.clone(), false));
+                        arrays.push(HostArray {
+                            at: Coord::new(0, 0),
+                            sym,
+                            u16: false,
+                            len: a.len,
+                            fill: a.fill,
+                        });
+                    }
+                }
                 if !later {
                     let _ = writeln!(
                         g.imports,
@@ -2464,6 +2500,30 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
             pos: of("pos"),
             rows: of("rowp"),
             tables: of("ptab"),
+        });
+    }
+    // the roots whose kernels keep a lane slot's state (a root kernel's `rowp`): one region
+    let columns: Vec<Coord> = (s.kv.iter())
+        .flat_map(|kc| std::iter::once(kc.root(s)).chain((0..kc.pya).map(|i| kc.pe(s, i))))
+        .collect();
+    let mut roots: Vec<Pe> = (arrays.iter())
+        .filter(|a| a.sym == "rowp" && !columns.contains(&a.at))
+        .map(|a| Pe {
+            x: a.at.x,
+            y: a.at.y,
+        })
+        .collect();
+    if !roots.is_empty() {
+        roots.sort_unstable();
+        regions.push(Region {
+            kind: "rows".into(),
+            block: 0,
+            head: 0,
+            slots: lanes,
+            paging: None,
+            pos: Vec::new(),
+            rows: roots,
+            tables: Vec::new(),
         });
     }
     Some(StateRoot { lanes, regions })

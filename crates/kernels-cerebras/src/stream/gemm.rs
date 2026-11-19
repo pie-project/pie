@@ -369,6 +369,14 @@ impl Lw<'_> {
                 Ok(())
             }
             Step::Region { chain, .. } => {
+                // a root kernel's step runs its own module, which the GEMM PE has no form of
+                if crate::kernel::root_of(r.trace, chain).is_some() {
+                    let n = chain.nodes[0] as usize;
+                    return Err(format!(
+                        "{} has no GEMM form",
+                        poem_ir::Operands::name(&r.trace.nodes[n].op)
+                    ));
+                }
                 let mut args = Vec::new();
                 let mut params = Vec::new();
                 // a head region (a head's ops, its row a head) runs over every head of the

@@ -30,7 +30,7 @@
 use poem_ir::{Attn, Conv, Def, Dim, Gather, Linear, Operands, Operation, Trace, Ty};
 use serde::Serialize;
 
-use super::{At, Axis, Body, LayerBody, Mixer, Op, Phase, R, Reader};
+use super::{At, Axis, Body, Claim, Claims, LayerBody, Mixer, Op, Phase, R, Reader};
 use crate::analysis::Analysis;
 
 /// A class of a stream step's rows: its name, the word of the request its rows are (the
@@ -306,7 +306,11 @@ impl Body<'_, '_> {
                     outs,
                 )
             }
-            _ => Err(format!("{} has no spatial lowering", op.op)),
+            // an op the target lowers by a kernel of its own, where its claim says
+            _ => match self.r.claims.and_then(|c| c(node)) {
+                Some(Claim::Root) => self.elementwise(op, acts, outs),
+                None => Err(format!("{} has no spatial lowering", op.op)),
+            },
         }
     }
 
@@ -336,6 +340,17 @@ pub fn lower(
     trace: &Trace,
     analysis: &Analysis,
     classes: &[RowClass],
+) -> Result<StreamProgram, String> {
+    lower_with(trace, analysis, classes, &|_| None)
+}
+
+/// [`lower`], each op the target `claims` (one it lowers by a kernel of its own) given the
+/// phase its claim states.
+pub fn lower_with(
+    trace: &Trace,
+    analysis: &Analysis,
+    classes: &[RowClass],
+    claims: Claims<'_>,
 ) -> Result<StreamProgram, String> {
     let name = &trace.name;
     if classes.is_empty() {
@@ -467,6 +482,7 @@ pub fn lower(
         layers: &analysis.layers,
         host: host.clone(),
         stream: true,
+        claims: Some(claims),
     };
     let body = |r, layer| Body {
         r,

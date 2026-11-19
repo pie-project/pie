@@ -228,6 +228,18 @@ const OUTER: &[&str] = &[
 
 type R<T> = Result<T, String>;
 
+/// What a target says of an op the compiler has no phase for but the target lowers by a kernel
+/// of its own (a stateful conv, a mixer): where it runs. The stream regime asks
+/// ([`stream::lower_with`]); with no claims an op with no phase is refused by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// At the roots its inputs are at, as an elementwise op is (its state, if any, its own).
+    Root,
+}
+
+/// A target's claims: the [`Claim`] of each op it lowers by a kernel of its own.
+pub type Claims<'a> = &'a dyn Fn(&Operation) -> Option<Claim>;
+
 /// Where a value is while a layer runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum At {
@@ -251,6 +263,8 @@ struct Reader<'t> {
     /// the units read (a row stream in), `false` a table (positions); empty in decode.
     host: Vec<Option<bool>>,
     stream: bool,
+    /// The target's claims (the stream regime's), where it states any.
+    claims: Option<Claims<'t>>,
 }
 
 impl Reader<'_> {
@@ -791,6 +805,7 @@ pub fn lower(
         layers: &analysis.layers,
         host: Vec::new(),
         stream: false,
+        claims: None,
     };
     let n_layers = analysis.layers.iter().flatten().max().map_or(0, |&l| l + 1);
     let mut bodies: Vec<Body> = (0..n_layers)
