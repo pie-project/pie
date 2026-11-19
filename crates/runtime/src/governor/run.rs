@@ -637,9 +637,10 @@ fn said(
                 reserved_mib = mib(parts.map(|parts| parts.reserved_bytes)),
                 activation_mib = mib(parts.map(|parts| parts.act_bytes)),
                 dense_weights_mib = weights >> 20,
+                least_mapped_mib = mib(parts.map(|parts| parts.least_mapped_bytes)),
                 budget_mib = limits.hard_limit >> 20,
                 target_mib = limits.target(yields, pressure) >> 20,
-                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights"
+                "the device target follows the system's memory pressure: floor + (budget - floor) * (1 - yield * pressure); the floor is one lane at max_context, the reserved chunks, the activation span and the dense weights, and no less than the fewest segments the pool can map (the reserved chunks' and the activation span's)"
             );
         }
         None => tracing::error!(

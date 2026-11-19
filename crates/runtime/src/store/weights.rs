@@ -939,6 +939,10 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
 
     /// The inner pool's floor for kv, state and activation, and the
     /// weights' pinned bytes beside it.
+    fn least_mapped(&self) -> u64 {
+        self.inner.least_mapped()
+    }
+
     fn floor(&self) -> u64 {
         self.inner
             .floor()
