@@ -1115,10 +1115,12 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             // is refused at registration). The buffers, and the widen's
             // table, are the shelf's: reserved before the pool was sized.
             let (outboxes, table) = &place.shelf.guest;
-            let library = crate::guest::session::Library::build(place.device, outboxes.clone())
-                .map_err(|why| {
-                    Refusal::Program(format!("the guest pipelines did not build: {why}"))
-                })?;
+            let library = crate::guest::session::Library::build(
+                place.device,
+                outboxes.clone(),
+                &place.pools.segment_buffers(),
+            )
+            .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));
             let widen = crate::guest::widen::Widen::new(
                 place.device,
