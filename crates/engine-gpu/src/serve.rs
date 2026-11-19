@@ -683,6 +683,12 @@ pub struct Shell<B: Serve> {
     /// The rungs the load laid and the estimate it weighed them by, where
     /// the profile states every `[rates]` key.
     weighed: Option<engine::load::check::Weighed>,
+    /// The platform's bound on one submission and what holds a serving step
+    /// to it (`crate::submit`); none where it states none.
+    submit_bound: Option<crate::submit::SubmitBound>,
+    /// The next step walks a layer at a time: its estimate is past the
+    /// bound whole (`crate::submit::Admitted::Layers`).
+    split_next: bool,
 
     pub handles: Handles<B>,
     trace: Trace,
@@ -1178,6 +1184,9 @@ impl<B: Serve> Shell<B> {
         // or a check's past it.
         let mut laid: Option<u32> = None;
         let mut weighed: Option<engine::load::check::Weighed> = None;
+        // The estimate the pick weighed the rungs by: what a serving step is
+        // held to a stated submit bound by (`crate::submit`).
+        let mut fire_estimate: Option<engine::load::FireEstimate> = None;
         // The rungs this device cannot lay, and why, said once.
         let mut said = false;
         let (compiled, mut span, out, out_width, pixels, readouts) = loop {
@@ -1481,6 +1490,7 @@ impl<B: Serve> Shell<B> {
                         .or(rung_tokens.last().copied())
                         .unwrap_or(rows),
                 };
+                fire_estimate = Some(estimate.clone());
                 chosen = Some(pick);
                 laid = Some(lays);
                 if boot.check.is_some() {
@@ -1529,6 +1539,44 @@ impl<B: Serve> Shell<B> {
         if let Some(weighed) = weighed.as_mut() {
             weighed.laid = budgets.tokens.max_tokens;
         }
+        // Where the platform states a bound on one submission, every serving
+        // step is held to it by the estimate (`crate::submit`), which must
+        // then be stated: refused by its key otherwise.
+        let submit_bound = match crate::rates::STATED_SUBMIT_BOUND {
+            None => None,
+            Some(bound) => {
+                let Some(estimate) = fire_estimate else {
+                    return Err(Fault::Residency(format!(
+                        "the platform states a bound of {} ms on one GPU submission and device \
+                         {}'s profile leaves `[rates]` {:?} unstated, so nothing holds a serving \
+                         step to it; `pie tune <backend> --rates` measures them",
+                        bound.as_millis(),
+                        device.name(),
+                        device_profile.rates().missing(&crate::rates::KEYS)
+                    )));
+                };
+                let held = crate::submit::SubmitBound {
+                    bound_ns: bound.as_nanos() as f64,
+                    worst: crate::rates::measured_worst().unwrap_or(1.0).max(1.0),
+                    estimate,
+                    launches: u32::try_from(compiled.template().len()).unwrap_or(u32::MAX),
+                    layers: crate::submit::layers(&boot.trace),
+                    fire_lanes: budgets.tokens.max_lanes,
+                    rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
+                };
+                tracing::info!(
+                    bound_ms = bound.as_millis() as u64,
+                    worst = held.worst,
+                    worst_measured = crate::rates::measured_worst().is_some(),
+                    layers = held.layers,
+                    rungs = ?held.rungs,
+                    prefill_rows = ?held.prefill_rows(boot.context),
+                    context = boot.context,
+                    "submit bound: each serving step held to the platform's bound on one submission"
+                );
+                Some(held)
+            }
+        };
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
 
@@ -1819,6 +1867,8 @@ impl<B: Serve> Shell<B> {
             walked: (0, 0),
             walk_only: false,
             weighed,
+            submit_bound,
+            split_next: false,
             pipelines,
             asks,
             handles,
@@ -3220,6 +3270,19 @@ impl<B: Serve> Shell<B> {
 
     pub fn reap(&mut self) -> Result<()> {
         B::reap(self)
+    }
+
+    /// What holds a serving step to the platform's bound on one submission,
+    /// where it states one (`crate::submit`).
+    #[must_use]
+    pub fn submit_bound(&self) -> Option<&crate::submit::SubmitBound> {
+        self.submit_bound.as_ref()
+    }
+
+    /// The next step this shell enqueues walks a layer at a time (or, at
+    /// `false`, as its backend plans it).
+    pub fn split_next(&mut self, split: bool) {
+        self.split_next = split;
     }
 
     pub fn harvest_through(&mut self, seq: u64) -> Result<()> {
@@ -4900,7 +4963,14 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
             B::grown(self, prepared.arm, need)?;
         }
-        let plan = if self.walk_only {
+        // A step past the platform's bound whole walks a layer at a time,
+        // never kept nor replayed: a recording replays as one submit.
+        let plan = if std::mem::take(&mut self.split_next) {
+            Plan::Walk {
+                keep: None,
+                split: true,
+            }
+        } else if self.walk_only {
             Plan::Walk {
                 keep: None,
                 split: false,

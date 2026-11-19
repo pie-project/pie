@@ -615,10 +615,41 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             why: format!("measured `[rates] {key}` {why}"),
         });
     }
+    // The worst ratio of a frame's time to its estimate this step measured
+    // (the clock's swing at least): what a serving step's estimate is held
+    // to the bound at (`crate::submit`).
+    MEASURED_WORST.set(rig.admission.get().worst.max(rig.swing.get()));
     Ok(engine::rates::Measured {
         rates,
         unsettled: rig.unsettled.get(),
     })
+}
+
+/// The worst ratio of a timed frame's time to its estimate the last rates
+/// step of this process measured, its clock's swing at least
+/// ([`Admission::worst`](engine::rates::Admission)); none where this process
+/// measured no rates (its profile stated them).
+static MEASURED_WORST: Worst = Worst(std::sync::atomic::AtomicU64::new(0));
+
+struct Worst(std::sync::atomic::AtomicU64);
+
+impl Worst {
+    fn set(&self, worst: f64) {
+        self.0
+            .store(worst.to_bits(), std::sync::atomic::Ordering::Release);
+    }
+
+    fn get(&self) -> Option<f64> {
+        let bits = self.0.load(std::sync::atomic::Ordering::Acquire);
+        (bits != 0).then(|| f64::from_bits(bits))
+    }
+}
+
+/// [`MEASURED_WORST`]: the worst ratio of a frame's time to its estimate
+/// this process's rates step measured, where it measured one.
+#[must_use]
+pub fn measured_worst() -> Option<f64> {
+    MEASURED_WORST.get()
 }
 
 /// The per-row ops' bandwidth: the backend's rmsnorm, then its swiglu, at
