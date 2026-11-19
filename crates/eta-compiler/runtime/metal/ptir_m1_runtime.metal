@@ -784,12 +784,18 @@ inline void ptir_m1_execute_part(
       return;
     }
     if (d0.dtype == 3) {
-
-      if (tid != 0) return;
-      for (uint i = 0; i < logical_bytes; ++i) o0[i] = 0;
-      for (uint i = 0; i < d0.len; ++i)
-        if (a0[i] != 0) o0[i >> 3] |= uchar(1u << (i & 7));
-      for (uint i = logical_bytes; i < p.sink_bytes; ++i) o0[i] = 0;
+      // One packed byte a thread, from its eight bools: no thread writes a
+      // byte another touches, so the pack runs across the whole grid (a
+      // single thread setting bits one read-modify-write at a time cost a
+      // beam step's mask ~0.1 ms).
+      for (uint b = tid; b < p.sink_bytes; b += nthreads) {
+        uchar packed = 0;
+        for (uint j = 0; j < 8u; ++j) {
+          const uint i = b * 8u + j;
+          if (i < d0.len && a0[i] != 0) packed |= uchar(1u << j);
+        }
+        o0[b] = packed;
+      }
       return;
     }
     m1_copy_typed_range(a0, o0, d0.len, d0.dtype, tid, nthreads);
