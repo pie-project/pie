@@ -1241,6 +1241,7 @@ impl Plane {
                         let rings = rings_of.get(&None).map(Vec::as_slice).unwrap_or(&[]);
                         #[cfg(target_vendor = "apple")]
                         if group.len() > 1
+                            && !crate::encode::profiling()
                             && rings_disjoint(rings)
                             && stage.regions.iter().all(|region| region.form == compile::Form::Streamed)
                         {
