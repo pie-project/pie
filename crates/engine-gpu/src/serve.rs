@@ -1977,18 +1977,24 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`.
+    /// See `Engine::copy_slots`: landed when this returns. A move off the
+    /// device, which rides the queue past `copy_slots_landing`, is waited
+    /// out here.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
-        self.copy_slots_landing(copy, None).map(drop)
+        if !self.copy_slots_landing(copy, Some(Box::new(|| ())))? {
+            self.drain()?;
+        }
+        Ok(())
     }
 
     /// See `Engine::copy_slots_landing`: whether the copy's sources may go
     /// back when this returns.
     /// - Within the device, and between the device and mapped host chunks:
     ///   in queue order, behind every frame submitted before, with no
-    ///   drain. A move off the device answers `false` where `landed` is
-    ///   given, and `landed` runs once its frame's fence lands: its device
-    ///   slots, once back, may be written by anything. The rest answer
+    ///   drain. A move off the device answers `false`, and `landed` runs
+    ///   once its frame's fence lands: its device slots, once back, may be
+    ///   written by anything; without a `landed` it is refused before
+    ///   anything is encoded. The rest answer
     ///   `true`: a later write reaching a device source is a fire or copy on
     ///   the same queue, or a host write that first settles the queue
     ///   (`Frame::update`, a record's clear after a drain); one reaching a
@@ -2008,6 +2014,18 @@ impl<B: Serve> Shell<B> {
         let host = |domain| matches!(domain, engine::transfer::MemoryDomain::HostPinned);
         let queued = (src && dst)
             || (self.pools.host_mapped() && ((src && host(copy.dst)) || (host(copy.src) && dst)));
+        let parks = src && !dst;
+        let landed = match landed {
+            Some(landed) => Some(landed),
+            None if queued && parks => {
+                return Err(Fault::Unbound {
+                    what: "a copy on the device with no landing sink installed \
+                           (Engine::on_landed comes before any copy_slots_landing)"
+                        .to_string(),
+                });
+            }
+            None => None,
+        };
         if !queued {
             self.drain()?;
         }
@@ -2017,7 +2035,6 @@ impl<B: Serve> Shell<B> {
             frame.commit()?;
             return Ok(true);
         }
-        let parks = src && !dst;
         match landed.filter(|_| parks) {
             Some(landed) => {
                 // Told landed whether or not the submission faulted: the
@@ -2026,8 +2043,6 @@ impl<B: Serve> Shell<B> {
                 self.grafted = Some(frame.commit_async(Some(on_done))?);
                 Ok(false)
             }
-            // A park no one is told of lands in the call.
-            None if parks => frame.commit().map(|()| true),
             None => {
                 self.grafted = Some(frame.commit_async(None)?);
                 Ok(true)
