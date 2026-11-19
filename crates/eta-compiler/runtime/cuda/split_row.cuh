@@ -55,3 +55,25 @@ __device__ __forceinline__ float ptir_canonical_reduce_met(
   return ptir_canonical_reduce(tag, out, chunks, spare, out);
 }
 
+// `ptir_parallel_copy`'s stretch `part` of `split`: sixteen bytes a thread
+// where both ends allow it, cut at whole quads, the tail bytewise by the
+// last part.
+__device__ __forceinline__ void ptir_split_copy(
+    const m1_u8* input, m1_u8* output, m1_u32 len, m1_u32 dtype, m1_u32 part, m1_u32 split) {
+  if (input == output) return;
+  const m1_u32 bytes = dtype == 3u ? len : len * 4u;
+  m1_u32 head = 0u;
+  if (((reinterpret_cast<m1_u64>(input) | reinterpret_cast<m1_u64>(output)) & 15ull) == 0ull) {
+    const m1_u32 quads = bytes >> 4;
+    const m1_u32 lo = (m1_u32)((m1_u64)quads * part / split);
+    const m1_u32 hi = (m1_u32)((m1_u64)quads * (part + 1u) / split);
+    const uint4* in4 = reinterpret_cast<const uint4*>(input);
+    uint4* out4 = reinterpret_cast<uint4*>(output);
+    for (m1_u32 q = lo + threadIdx.x; q < hi; q += blockDim.x) out4[q] = in4[q];
+    head = quads << 4;
+  }
+  if (part + 1u != split) return;
+  for (m1_u32 index = head + threadIdx.x; index < bytes; index += blockDim.x)
+    output[index] = input[index];
+}
+

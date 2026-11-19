@@ -429,6 +429,22 @@ pub(super) fn scans_model_row(direct: &ArgmaxScan, ops: &[OpView], node: usize) 
         && (direct.gumbel[node].is_some() || direct.intrinsic[node] != u16::MAX)
 }
 
+/// Whether `op` (result `base`) is a reshape a single-row region copies,
+/// whose result only later regions read: its blocks copy it a stretch each
+/// (`ptir_split_copy`), none reading another's.
+fn copies_apart(
+    stage: &CompiledStage,
+    region: &Region,
+    ops: &[OpView],
+    op: &OpView,
+    base: u32,
+) -> bool {
+    op.tag == tags::RESHAPE
+        && !op.args.is_empty()
+        && row_geometry(stage, region).is_none()
+        && !region.nodes.iter().any(|node| ops[node.index()].reads().any(|arg| arg == base))
+}
+
 /// Whether `region`'s rows may each run across several blocks of their lane
 /// (the launcher gives it its rows times a split, `rows_per_lane`): it
 /// streams its rows, every stream split-safe ([`super::stream::Streams::split_safe`]:
@@ -482,6 +498,10 @@ pub fn splits_rows(stage: &CompiledStage, region: &Region) -> bool {
         let base = bases[node];
         at += 1;
         if is_view(stage, region, op, base) {
+            continue;
+        }
+        if copies_apart(stage, region, &ops, op, base) {
+            streamed = true;
             continue;
         }
         let touches_row = op.args.iter().any(|&arg| row(arg))
@@ -703,6 +723,14 @@ pub fn emit_fused_region(
         }
         if is_view(stage, region, op, base) {
             aliases.elide(base, op.args[0]);
+            continue;
+        }
+        if split && copies_apart(stage, region, &ops, op, base) {
+            let from = aliases.resolve(op.args[0]);
+            let _ = writeln!(
+                source,
+                "  {{\n    ptir_split_copy(scratch + offsets[{from}u], scratch + offsets[{base}u], descriptors[{base}u].len, descriptors[{base}u].dtype, ptir_part, ptir_split);\n{TAIL}  }}"
+            );
             continue;
         }
         if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET)
