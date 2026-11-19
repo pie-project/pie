@@ -264,6 +264,7 @@ fn placeholder(ty: eta_ir::types::ValueType) -> Value {
         eta_ir::types::Dtype::I32 => Value::I32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::U32 => Value::U32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::Bool => Value::Bool(alloc::vec::Vec::new()),
+        eta_ir::types::Dtype::Bf16 => Value::Bf16(alloc::vec::Vec::new()),
         _ => crate::eval::interp::no_interpreter_lane(ty.dtype),
     }
 }
@@ -578,6 +579,38 @@ mod tests {
         keyed_rng_is_only_as_tainted_as_its_state();
         seeded_prefill_is_host_derivable();
         the_fold_allocates_only_within_its_budget();
+        a_bf16_value_the_host_cannot_know_folds_as_unknown();
+    }
+
+    /// A bf16 value derived from one the host cannot know (a channel no
+    /// host put holds) is held unknown like any other dtype's, not refused
+    /// as a dtype without a lane: the runtime folds every served program's
+    /// stages on the host (sc/mac-eta-bf16: a bf16 beam's server panicked
+    /// here).
+    fn a_bf16_value_the_host_cannot_know_folds_as_unknown() {
+        let c = TraceContainer {
+            channels: vec![
+                chan(Shape::vector(4), Dtype::F32, 1),
+                chan(Shape::vector(1), Dtype::F32, 1),
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Cast { value: 0, dtype: Dtype::Bf16 },
+                    Op::ReduceSum(1),
+                    Op::Reshape { value: 2, shape: Shape::vector(1) },
+                    Op::ChanPut { chan: 1, value: 3 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let bound = bind(c, vec![vec![]], EngineCaps::default()).unwrap();
+        let fold = fold_stage(&bound, Stage::Prologue, &mut |_| None);
+        assert!(
+            !matches!(&fold, Ok(fold) if matches!(fold.puts.get(&1), Some(Ok(_)))),
+            "a value of an unknown take is not known: {fold:?}"
+        );
     }
 
     /// The host's fold of a stage holds only what the bind held to its
