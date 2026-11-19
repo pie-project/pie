@@ -161,10 +161,12 @@ pub const LAUNCH: u32 = 16;
 pub const ROUNDS: usize = 5;
 
 /// The most single-fire frames a queued rates frame keeps in flight
-/// (`Rig::queue`): enough that the device never waits on the host between
-/// them, few enough that a frame of thousands of tiny fires holds few
-/// command buffers at once.
-const QUEUED: usize = 4;
+/// (`Rig::queue`): as many as the frames of all but the tiniest fires hold
+/// (a frame of 64 or fewer waits once, at its end, as an unqueued frame
+/// does: every wait between is a host round trip, which on wgpu ran 0.3 to
+/// 2.4 ms and read as the device's in a tiny fire's ratio), while a frame of
+/// hundreds of tiny fires holds no more command buffers than that at once.
+const QUEUED: usize = 64;
 
 /// The kv page the attention's pool is laid in.
 const PAGE: u32 = 16;
@@ -228,14 +230,15 @@ struct Rig<'a, B: Serve> {
     /// then holds more than one fire's work, whatever the margin is yet
     /// known to be, and the device stays loaded across them.
     queue: std::cell::Cell<bool>,
-    /// The worst ratio of a settled frame's time to its estimate where the
-    /// estimate is the same step's own last frame (no more fires than it):
-    /// the device's own drift between like frames, what the margin a serving
-    /// step is held to carries (`[rates] submit_worst_ratio`). A step's
-    /// first frame, estimated from another shape or another fire count, is
-    /// left out: its error is the estimate's scaling and a submission's host
-    /// latency against a fire's work (a tiny first fire under a queued
-    /// frame's estimate read x10 on an RTX), not the device.
+    /// The worst ratio of a warm-up rotation's time to the rotation before
+    /// it (its estimate: the slowest fire it had measured), over the
+    /// warm-up's rotations and the sustained ones after every rate: the
+    /// device's own drift between like frames of a large fire, what the
+    /// margin a serving step is held to carries (`[rates]
+    /// submit_worst_ratio`). The micro-shapes' frames are left out: theirs
+    /// is a submission's host latency against a tiny fire's work (a single
+    /// fire's frame ran 0.3 to 2.4 ms on an RTX under wgpu) and the
+    /// estimate's scaling between shapes, not the device.
     drift: std::cell::Cell<f64>,
 }
 
@@ -445,13 +448,6 @@ impl<'a, B: Serve> Rig<'a, B> {
         let took = timed.0.unwrap_or(timed.1) as f64;
         let mut admission = self.admission.get();
         admission.landed(estimate, took, count >= self.basis.get());
-        if let Some(e) = estimate.filter(|&e| e > 0.0)
-            && admission.settled
-            && self.basis.get() > 0
-            && count >= self.basis.get()
-        {
-            self.drift.set(self.drift.get().max(took / e));
-        }
         self.admission.set(admission);
         self.per_fire.set(Some(took / f64::from(count.max(1))));
         self.basis.set(count);
@@ -1170,6 +1166,9 @@ fn warm_at<B: Serve>(
             let mut r = rotations.get();
             r.landed(estimate, took as f64, true);
             rotations.set(r);
+            if let Some(e) = estimate.filter(|&e| e > 0.0) {
+                rig.drift.set(rig.drift.get().max(took as f64 / e));
+            }
             wall += took;
             left -= count;
         }
