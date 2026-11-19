@@ -222,7 +222,7 @@ mod tests {
         fn rated() -> profile::Profile {
             profile(
                 "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\n\
-                 attn_tflops_by_keys = [[2048, 1.0]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
+                 attn_tflops_by_dim_keys = [[128, [[2048, 1.0]]]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
             )
         }
 
