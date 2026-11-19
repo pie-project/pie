@@ -356,6 +356,15 @@ impl engine_gpu::backend::Tactics for Tuning {
         Tuning::sdpa_split_groups(self)
     }
 
+    /// Every prompt row tiled, however few its request brings: the walk
+    /// folds a row's keys in another order than the tile, so a row walked
+    /// in a short pass (the tail a cached prefix leaves) landed other bits
+    /// than the whole prompt's tiled pass did, and a repeated greedy prompt
+    /// answered otherwise.
+    fn sdpa_tile_rows_per_request(&self) -> u32 {
+        1
+    }
+
     fn workgroup_bytes(&self) -> u32 {
         self.workgroup_bytes
     }

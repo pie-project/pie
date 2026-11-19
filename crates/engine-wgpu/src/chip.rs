@@ -113,7 +113,7 @@ mod tests {
                 t.sdpa_split_groups(),
                 t.sdpa_split_min_keys()
             ),
-            (32, 16, 256)
+            (1, 16, 256)
         );
         use crate::tuning::Qmm;
         for (rows, k, want) in [

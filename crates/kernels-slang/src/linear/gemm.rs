@@ -18,8 +18,16 @@ const PAIRS: &str = "linear/gemm_pairs.slang";
 
 const LANE: &str = "linear/gemm_lane.slang";
 
-/// Rows below this take the vector kernels.
+/// Rows below this take SPIR-V's vector kernels.
 const VECTOR_MAX_ROWS: u32 = 4;
+
+/// Rows below this take WGSL's vector kernel: one row alone. Its strips fold
+/// a column's sum in another order than the tiles' running sum, so a row
+/// matmulled beside one or two others would land other bits than in a
+/// longer pass; past one row a row lands the same bits in every pass (a
+/// prompt whose cached prefix leaves a short tail lands what the whole
+/// prompt did).
+const WGSL_VECTOR_MAX_ROWS: u32 = 2;
 
 const REGISTER: &str = "linear/gemm_register.slang";
 
@@ -116,7 +124,7 @@ pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kerne
             }
         }
         Target::Spirv => Kernel::Tiled,
-        Target::Wgsl if m < VECTOR_MAX_ROWS => Kernel::PairsGemv,
+        Target::Wgsl if m < WGSL_VECTOR_MAX_ROWS => Kernel::PairsGemv,
         Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
         Target::Wgsl => Kernel::Pairs64,
     }
@@ -234,7 +242,7 @@ fn kernel(
                     ),
                 ));
             }
-            if m < VECTOR_MAX_ROWS {
+            if m < WGSL_VECTOR_MAX_ROWS {
                 Fire::at(PAIRS, "linear_gemm_pairs_gemv_bf16")
                     .tier(if tactic.tier == Tier::Subgroup {
                         Tier::Subgroup
