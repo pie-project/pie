@@ -991,7 +991,10 @@ pub fn layout_ir(p: &Placed) -> (Routes, Tiles) {
 #[must_use]
 pub fn placed(p: &Placed, own: &[(String, String)], routes: Option<Routes>) -> Report {
     let mut files: BTreeMap<String, String> = BTreeMap::new();
-    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+    for (n, s) in crate::sources::OPS
+        .iter()
+        .chain(crate::sources::stream_ops())
+    {
         files.insert(format!("ops/{n}"), (*s).to_string());
     }
     for (n, s) in own {

@@ -360,7 +360,10 @@ pub fn ops(root: &Path, names: &[String]) -> R<()> {
     for d in std::iter::once(root.to_path_buf()).chain(names.iter().map(|n| root.join(n))) {
         let ops = d.join("ops");
         std::fs::create_dir_all(&ops).map_err(io(&ops))?;
-        for (n, src) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+        for (n, src) in crate::sources::OPS
+            .iter()
+            .chain(crate::sources::stream_ops())
+        {
             std::fs::write(ops.join(n), src).map_err(io(&ops))?;
         }
     }

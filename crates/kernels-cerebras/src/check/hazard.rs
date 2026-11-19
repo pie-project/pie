@@ -894,7 +894,10 @@ mod tests {
 
     fn files(pe: &str) -> BTreeMap<String, String> {
         let mut f: BTreeMap<String, String> = BTreeMap::new();
-        for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+        for (n, s) in crate::sources::OPS
+            .iter()
+            .chain(crate::sources::stream_ops())
+        {
             f.insert(format!("ops/{n}"), (*s).to_string());
         }
         f.insert("pe.csl".into(), pe.into());

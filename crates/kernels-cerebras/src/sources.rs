@@ -66,28 +66,33 @@ pub const OPS: &[(&str, &str)] = &[
     ("wpe.csl", include_str!("../programs/wafer/ops/wpe.csl")),
 ];
 
-/// The stream regime's op modules (GENERIC.md §3.1, M1c), `programs/wafer/ops` too: P1-stream (the
-/// matvec over a row stream) and P7 v0 (attention over a step's rows, its PEs' and its root's
-/// sides). No decode kind imports them, and a decode build neither writes nor keys them, so the
-/// shipping programs stay byte-identical; the stream build (M1d) takes them with [`OPS`].
-pub const STREAM_OPS: &[(&str, &str)] = &[
-    (
-        "cy_satt.csl",
-        include_str!("../programs/wafer/ops/cy_satt.csl"),
-    ),
-    ("satt.csl", include_str!("../programs/wafer/ops/satt.csl")),
+/// The stream regime's shared op modules (GENERIC.md §3.1, M1c), `programs/wafer/ops` too: the
+/// chain reduction, P1-stream (the matvec over a row stream) and the rotation tables. No decode
+/// kind imports them, and a decode build neither writes nor keys them, so the shipping programs
+/// stay byte-identical; the stream build (M1d) takes them with [`OPS`]. The kernels' own (P7's
+/// attention, P8's state) are their modules' ([`crate::kernel`]): [`stream_ops`] lists both.
+pub const STREAM_LIBS: &[(&str, &str)] = &[
     (
         "schain.csl",
         include_str!("../programs/wafer/ops/schain.csl"),
     ),
     ("smv.csl", include_str!("../programs/wafer/ops/smv.csl")),
     ("srope.csl", include_str!("../programs/wafer/ops/srope.csl")),
-    ("sst.csl", include_str!("../programs/wafer/ops/sst.csl")),
-    (
-        "cy_sst.csl",
-        include_str!("../programs/wafer/ops/cy_sst.csl"),
-    ),
 ];
+
+/// Every stream op module: each registered kernel's sources ([`crate::kernel::KERNELS`], in
+/// order), then the shared ones ([`STREAM_LIBS`]).
+#[must_use]
+pub fn stream_ops() -> &'static [(&'static str, &'static str)] {
+    static ALL: std::sync::LazyLock<Vec<(&'static str, &'static str)>> =
+        std::sync::LazyLock::new(|| {
+            (crate::kernel::KERNELS.iter())
+                .flat_map(|k| k.sources().iter().copied())
+                .chain(STREAM_LIBS.iter().copied())
+                .collect()
+        });
+    &ALL
+}
 
 /// The source of the kernel file `name`.
 pub fn get(name: &str) -> Option<&'static str> {
@@ -115,7 +120,7 @@ mod tests {
     fn every_kernel_and_op_is_embedded() {
         let names: Vec<&str> = super::KERNELS.iter().map(|(n, _)| *n).collect();
         assert_eq!(files("programs/wafer"), names);
-        let mut ops: Vec<&str> = (super::OPS.iter().chain(super::STREAM_OPS))
+        let mut ops: Vec<&str> = (super::OPS.iter().chain(super::stream_ops()))
             .map(|(n, _)| *n)
             .collect();
         ops.sort_unstable();

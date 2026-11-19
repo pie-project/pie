@@ -27,6 +27,7 @@ pub mod emit;
 pub mod fabric;
 pub mod floor;
 pub mod floorplan;
+pub mod kernel;
 pub mod kernels;
 pub mod layers;
 pub mod npy;

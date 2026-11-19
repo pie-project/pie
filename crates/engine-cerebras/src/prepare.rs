@@ -447,7 +447,7 @@ pub fn stream_programs(
     });
     for (n, src) in kernels_cerebras::sources::OPS
         .iter()
-        .chain(kernels_cerebras::sources::STREAM_OPS)
+        .chain(kernels_cerebras::sources::stream_ops())
     {
         hasher.update(n.as_bytes());
         hasher.update(src.as_bytes());
@@ -647,7 +647,7 @@ pub fn unit_program(
     }
     for (n, src) in kernels_cerebras::sources::OPS
         .iter()
-        .chain(kernels_cerebras::sources::STREAM_OPS)
+        .chain(kernels_cerebras::sources::stream_ops())
     {
         hasher.update(n.as_bytes());
         hasher.update(src.as_bytes());

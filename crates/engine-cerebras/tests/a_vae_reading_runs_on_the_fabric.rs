@@ -372,7 +372,7 @@ fn flux_2_minis_vae_on_the_fabric() {
         std::fs::create_dir_all(&ops).expect("ops");
         for (n, src) in kernels_cerebras::sources::OPS
             .iter()
-            .chain(kernels_cerebras::sources::STREAM_OPS)
+            .chain(kernels_cerebras::sources::stream_ops())
         {
             std::fs::write(ops.join(n), src).expect("an op");
         }

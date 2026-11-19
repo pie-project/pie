@@ -783,7 +783,10 @@ pub fn pe_files(p: &GemmProgram) -> R<std::collections::BTreeMap<String, String>
     let mut files: std::collections::BTreeMap<String, String> = p.modules.iter().cloned().collect();
     files.insert("gseg.csl".into(), gseg_file());
     files.insert("gpe.csl".into(), pe_file(p, &tb));
-    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+    for (n, s) in crate::sources::OPS
+        .iter()
+        .chain(crate::sources::stream_ops())
+    {
         files.insert(format!("ops/{n}"), (*s).to_string());
     }
     Ok(files)
