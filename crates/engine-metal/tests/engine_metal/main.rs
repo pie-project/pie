@@ -31,6 +31,7 @@ mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_pool_serves_the_same_logits;
 mod a_score_reader_holds_its_rows_through_a_park;
 mod a_settled_fires_fold_is_told_before_it_returns;
+mod a_take_leaves_passes_in_flight_flying;
 mod a_stated_position_bounds_no_key;
 mod a_stale_frozen_length_replays_from_where_the_record_stands;
 mod a_stated_group_mask_reads_only_the_rows_it_admits;

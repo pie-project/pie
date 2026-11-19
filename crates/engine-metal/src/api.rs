@@ -1228,7 +1228,15 @@ impl Engine for Metal {
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
+        self.loaded_mut()?
+            .program_instance_taking(instance, channel)
+            .map_err(fault)?
+            .ok_or(Error::Closed {
+                what: "instance",
+                id: instance.0,
+            })?
+            .take(channel)
+            .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {

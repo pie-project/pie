@@ -102,7 +102,7 @@ fn program(vocab: u32) -> ProgramRegistration {
 
 /// Binds the envelope as a decode envelope at `slot`'s places, `tok`
 /// seeded with [`FIRST_TOKEN`].
-fn bind_envelope(shell: &mut Shell, vocab: u32, slot: u32) -> engine::InstanceId {
+pub(super) fn bind_envelope(shell: &mut Shell, vocab: u32, slot: u32) -> engine::InstanceId {
     let program = shell.register_program(&program(vocab)).expect("the program registers");
     let facts = shell.program_facts(program).expect("the program's facts");
     let layout = shell.pool_layout();
@@ -149,11 +149,11 @@ fn bind_envelope(shell: &mut Shell, vocab: u32, slot: u32) -> engine::InstanceId
         .expect("the decode envelope binds")
 }
 
-type Heard = (engine::StepDone, engine::StepOutcome);
+pub(super) type Heard = (engine::StepDone, engine::StepOutcome);
 
 /// Submits the instance's lane as step `frame` (its buffer failing where
 /// `fail`), harvesting nothing.
-fn submit(
+pub(super) fn submit(
     shell: &mut Shell,
     id: engine::InstanceId,
     tokens: &[u32],
@@ -202,7 +202,7 @@ fn submit(
     FrameShell::settle(shell, enqueued).expect("the fire settles");
 }
 
-fn heard(rx: &mpsc::Receiver<Heard>, frame: u64) -> engine::StepOutcome {
+pub(super) fn heard(rx: &mpsc::Receiver<Heard>, frame: u64) -> engine::StepOutcome {
     let (at, outcome) = rx
         .recv_timeout(Duration::from_secs(20))
         .unwrap_or_else(|_| panic!("step {frame} is told"));
