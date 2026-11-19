@@ -32,7 +32,7 @@ struct Cfg {
 // The fault classes this runtime writes (eta-compiler codegen::fault).
 const OUT_OF_BOUNDS : u32 = 0xB5u;
 
-@group(0) @binding(0) var<storage, read_write> status  : array<u32>;
+@group(0) @binding(0) var<storage, read_write> status  : array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read>       descs   : array<u32>;
 @group(0) @binding(2) var<storage, read>       params  : array<u32>;
 @group(0) @binding(3) var<storage, read>       offs    : array<u32>;
@@ -50,18 +50,25 @@ var<private> sel_groups : u32;
 
 
 // The stage's bounds (its cfg's heap words, values and ops), read once at
-// the step's entry: every access below is checked against them.
+// the step's entry: every access below is checked against them. A heap
+// index is relative to the stage's own heap binding, which spans exactly its
+// heap: [0, lim_heap). Where that binding spans more (a pool segment at a
+// dynamic offset), the check must become [the instance's base, base +
+// limit), never the binding's size.
 var<private> lim_heap : u32;
 var<private> lim_values : u32;
 var<private> lim_ops : u32;
 
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
+// The first fault of a stage wins: of the threads that fault, the one that
+// swaps the state from unset writes the code, index and limit, so the three
+// are one fault's.
 fn pie_fault(code : u32, at : u32, limit : u32) {
-  status[0] = 3u;
-  status[1] = code;
-  status[2] = at;
-  status[3] = limit;
+  if (atomicExchange(&status[0], 3u) != 0u) { return; }
+  atomicStore(&status[1], code);
+  atomicStore(&status[2], at);
+  atomicStore(&status[3], limit);
 }
 
 // The heap's words, each access refused past the stage's heap: a read
