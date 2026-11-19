@@ -261,6 +261,7 @@ fn submit(model: &mut Model, lane: Lane, attach: Option<InstanceId>) -> engine::
                     lanes: 1,
                     instance,
                     adapter_only: false,
+                    scratch: ::engine::ScratchPlace::None,
                 })
                 .into_iter()
                 .collect(),
@@ -385,6 +386,7 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
                 lanes: 1,
                 instance,
                 adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
             }],
             media: Vec::new(),
             voxels: Vec::new(),

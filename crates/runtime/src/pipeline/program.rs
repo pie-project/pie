@@ -178,6 +178,7 @@ impl Registry {
     /// `lanes`. It binds within `budget` (`validate::bind_within`), its
     /// channel cells too: past it, refused by name before anything of it is
     /// evaluated or laid. `tenant` brought it in ([`Registry::make_room`]).
+    #[cfg(test)]
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
@@ -186,52 +187,43 @@ impl Registry {
         budget: Budget,
         tenant: Tenant,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
-        let mut hash = container_hash(&bytes);
-        if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
-            hash ^= 0x9e37_79b9_7f4a_7c15;
+        let hash = program_hash(&bytes);
+        if let Some(hit) = self.hit(hash, &bytes, &lanes)? {
+            return Ok(hit);
         }
-        if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
-            hash ^= 0xbf58_476d_1ce4_e5b9;
+        let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps, budget)?);
+        Ok(self.insert(entry, tenant))
+    }
+
+    fn hit(
+        &mut self,
+        hash: u64,
+        bytes: &[u8],
+        lanes: &[Vec<OutputDecl>],
+    ) -> Result<Option<Arc<RegisteredProgram>>, RegisterError> {
+        let Some(hit) = self.inner.get(&hash) else {
+            return Ok(None);
+        };
+        if hit.bytes != bytes {
+            return Err(RegisterError::HashCollision(hash));
         }
-        if let Some(hit) = self.inner.get(&hash) {
-            if hit.bytes != bytes {
-                return Err(RegisterError::HashCollision(hash));
+        check_outputs(&hit.bound.container, lanes).map_err(RegisterError::Bind)?;
+        Ok(Some(hit.clone()))
+    }
+
+    /// A program another caller registered meanwhile wins, so every caller
+    /// shares one entry; a new one takes its room as `tenant`'s
+    /// ([`Registry::make_room`]).
+    fn insert(&mut self, entry: Arc<RegisteredProgram>, tenant: Tenant) -> Arc<RegisteredProgram> {
+        if let Some(raced) = self.inner.get(&entry.hash) {
+            if raced.bytes == entry.bytes {
+                return raced.clone();
             }
-            check_outputs(&hit.bound.container, &lanes).map_err(RegisterError::Bind)?;
-            return Ok(hit.clone());
         }
-        let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
-        let pricing = price(&decoded)?;
-        // A program's channel cells lie in the `Channel` slots of the same
-        // state room its stages do.
-        if pricing.channel_bytes > budget.room_bytes {
-            return Err(RegisterError::ChannelsPastRoom {
-                bytes: pricing.channel_bytes,
-                room: budget.room_bytes,
-            });
-        }
-        let channel_accesses = Self::channel_accesses(&decoded);
-        let reads = Self::reads(&decoded);
-        let bound = bind_within(decoded, lanes, caps, budget).map_err(RegisterError::Bind)?;
-        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
-        let launch = std::sync::OnceLock::new();
-        let entry = Arc::new(RegisteredProgram {
-            bytes,
-            hash,
-            bound,
-            compiled_stages,
-            channel_accesses,
-            reads,
-            launch,
-            geometry_taint: std::sync::OnceLock::new(),
-            shadow_plan: std::sync::OnceLock::new(),
-            pricing,
-            emitted: Mutex::new(HashMap::new()),
-        });
         self.make_room(tenant);
-        self.inner.put(hash, entry.clone());
-        self.owners.insert(hash, tenant);
-        Ok(entry)
+        self.inner.put(entry.hash, entry.clone());
+        self.owners.insert(entry.hash, tenant);
+        entry
     }
 
     fn reads(container: &TraceContainer) -> Vec<(String, u32)> {
@@ -278,6 +270,57 @@ impl Registry {
 
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
+    }
+}
+
+fn program_hash(bytes: &[u8]) -> u64 {
+    let mut hash = container_hash(bytes);
+    if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
+        hash ^= 0x9e37_79b9_7f4a_7c15;
+    }
+    if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
+        hash ^= 0xbf58_476d_1ce4_e5b9;
+    }
+    hash
+}
+
+impl RegisteredProgram {
+    /// Bind validates every channel index before anything else indexes by
+    /// one; channel cells past `budget`'s room are refused before it binds.
+    fn build(
+        bytes: Vec<u8>,
+        hash: u64,
+        lanes: Vec<Vec<OutputDecl>>,
+        caps: EngineCaps,
+        budget: Budget,
+    ) -> Result<Self, RegisterError> {
+        let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
+        let pricing = price(&decoded)?;
+        // A program's channel cells lie in the `Channel` slots of the same
+        // state room its stages do.
+        if pricing.channel_bytes > budget.room_bytes {
+            return Err(RegisterError::ChannelsPastRoom {
+                bytes: pricing.channel_bytes,
+                room: budget.room_bytes,
+            });
+        }
+        let bound = bind_within(decoded, lanes, caps, budget).map_err(RegisterError::Bind)?;
+        let channel_accesses = Registry::channel_accesses(&bound.container);
+        let reads = Registry::reads(&bound.container);
+        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
+        Ok(Self {
+            bytes,
+            hash,
+            bound,
+            compiled_stages,
+            channel_accesses,
+            reads,
+            launch: std::sync::OnceLock::new(),
+            geometry_taint: std::sync::OnceLock::new(),
+            shadow_plan: std::sync::OnceLock::new(),
+            pricing,
+            emitted: Mutex::new(HashMap::new()),
+        })
     }
 }
 
@@ -362,7 +405,24 @@ pub fn register(
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    global().register(bytes, lanes, caps, eta.budget, tenant)
+    register_with(bytes, lanes, caps, eta.budget, tenant)
+}
+
+/// Decode, bind and compile run outside the global lock, so a slow or refused
+/// program never holds up, or poisons, every other process's registry access.
+fn register_with(
+    bytes: Vec<u8>,
+    lanes: Vec<Vec<OutputDecl>>,
+    caps: EngineCaps,
+    budget: Budget,
+    tenant: Tenant,
+) -> Result<Arc<RegisteredProgram>, RegisterError> {
+    let hash = program_hash(&bytes);
+    if let Some(hit) = global().hit(hash, &bytes, &lanes)? {
+        return Ok(hit);
+    }
+    let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps, budget)?);
+    Ok(global().insert(entry, tenant))
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -643,5 +703,42 @@ mod tenant_tests {
             ),
             "{refused}"
         );
+    }
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::{RegisterError, register_with};
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::validate::{Budget, ValidateError};
+
+    const ROOM: Budget = Budget {
+        room_bytes: 64 << 20,
+        submit: None,
+    };
+
+    #[test]
+    fn an_out_of_range_channel_is_refused_and_the_registry_stays_usable() {
+        let bad = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(5)],
+            }],
+            ..TraceContainer::default()
+        };
+        let err = register_with(bad.encode(), vec![], EngineCaps::default(), ROOM, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Bind(ValidateError::Body { .. })),
+            "{err}"
+        );
+        assert!(err.to_string().contains('5'), "{err}");
+        let good = TraceContainer::default();
+        let hash = register_with(good.encode(), vec![], EngineCaps::default(), ROOM, None)
+            .expect("a valid program registers after a refused one")
+            .hash;
+        assert!(super::lookup(hash).is_some());
     }
 }

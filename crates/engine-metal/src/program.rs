@@ -199,12 +199,17 @@ impl Plane {
     }
 
     /// The value scratch an instance's state holds: its widest launching
-    /// stage's, a frame in flight each, in which it fires every stage,
-    /// alone or as a lane of its pair's batch
-    /// (`engine::GuestState::per_instance`).
+    /// stage's, once, in which it fires every stage, alone or as a lane of
+    /// its pair's batch (`engine::GuestState::resident`). Once, not a
+    /// frame in flight each: an instance's next fire is staged only once
+    /// its last has landed (`fence_instances`), so no two of its fires read
+    /// its scratch at once, and a second set held half its state for
+    /// nothing. Its pair's batch tables stay a frame in flight each
+    /// ([`Self::pair_sets`]): consecutive frames fire different instances of
+    /// one pair (one set there let a beam read another beam's cells).
     fn instance_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<u64>> {
         let scratch = Session::scratch_for(&program.compiled, extents)?;
-        Ok(if scratch == 0 { Vec::new() } else { vec![scratch; self.arms] })
+        Ok(if scratch == 0 { Vec::new() } else { vec![scratch] })
     }
 
     /// What an instance of `program_id` at `extents` and its pair hold in
@@ -460,7 +465,7 @@ impl Plane {
             Some(held) => held.place.clone(),
             None => take(state.per_pair),
         };
-        let scratch = take(state.per_instance);
+        let scratch = take(state.resident);
         self.bind(
             context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )
@@ -1064,6 +1069,56 @@ impl Plane {
         )
     }
 
+    /// The stage `at` of every instance `ids` names, in one command buffer
+    /// and one wait: each instance's regions in order, the instances one
+    /// after another. A step's prologues waited a buffer a region an
+    /// instance; their verdicts are read once this one has landed.
+    pub fn fire_batched(
+        &mut self,
+        context: &Context,
+        ids: &[InstanceId],
+        at: Attach,
+    ) -> Result<Vec<(InstanceId, Fired)>> {
+        let mut frame = context.frame()?;
+        let mut encoded = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let bound = self
+                .instances
+                .get_mut(&id)
+                .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+            let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!(
+                        "instance {id} names program {}, which is gone",
+                        bound.program_id
+                    ),
+                )
+            })?;
+            let scratch = bound.scratch.first().cloned();
+            encoded.push((
+                id,
+                bound
+                    .session
+                    .encode_stages(&mut frame, &program.compiled, &program.plan, at, scratch)?,
+            ));
+        }
+        frame.commit()?;
+        let mut fired = Vec::with_capacity(encoded.len());
+        for (id, launched) in encoded {
+            let verdict = match launched {
+                Err(refused) => refused,
+                Ok(launched) => {
+                    let bound = self.instances.get_mut(&id).expect("encoded above");
+                    let program = self.programs.get(&bound.program_id).expect("encoded above");
+                    bound.session.verdict_of_launched(&program.plan, &launched, at)?
+                }
+            };
+            fired.push((id, verdict));
+        }
+        Ok(fired)
+    }
+
     pub fn stage_batched(
         &mut self,
         frame: &mut Frame,
@@ -1141,7 +1196,7 @@ impl Plane {
                         .flatten()
                         .any(|ring| ring.attachments() > 1);
                     let pair = bound.pair;
-                    let own = bound.scratch.get(arm).cloned();
+                    let own = bound.scratch.first().cloned();
                     let Some(prepared) = bound.session.prepared_mut(stage_index) else {
                         continue;
                     };
@@ -1186,6 +1241,7 @@ impl Plane {
                         let rings = rings_of.get(&None).map(Vec::as_slice).unwrap_or(&[]);
                         #[cfg(target_vendor = "apple")]
                         if group.len() > 1
+                            && !crate::encode::profiling()
                             && rings_disjoint(rings)
                             && stage.regions.iter().all(|region| region.form == compile::Form::Streamed)
                         {
@@ -1352,7 +1408,7 @@ struct Bound {
     /// The pair whose batch sets its grouped stages fire with.
     pair: u64,
     /// Where its value scratch lies, one a frame in flight, for the stages
-    /// it fires alone (`engine::GuestState::per_instance`).
+    /// it fires alone (`engine::GuestState::resident`).
     scratch_place: engine::ScratchPlace,
     scratch: Vec<launch::ScratchAt>,
     program_id: ProgramId,

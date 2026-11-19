@@ -512,6 +512,30 @@ impl Session {
         at: Stage,
         scratch: Option<super::launch::ScratchAt>,
     ) -> Result<Fired> {
+        let _ = pipelines;
+        let mut frame = device.frame()?;
+        let launched = match self.encode_stages(&mut frame, compiled, plan, at, scratch)? {
+            Ok(launched) => launched,
+            Err(refused) => return Ok(refused),
+        };
+        frame.commit()?;
+        self.verdict_of_launched(plan, &launched, at)
+    }
+
+    /// The stages at `at` encoded into `frame`, each region a pass after the
+    /// one before (so they run in order, as one command buffer each did):
+    /// the stages launched, or the gate's refusal (nothing encoded). Their
+    /// verdict is read once `frame` has landed
+    /// ([`Self::verdict_of_launched`]): a step's prologues share one buffer
+    /// and one wait, not one a region an instance.
+    pub fn encode_stages(
+        &mut self,
+        frame: &mut crate::device::ctx::Frame,
+        compiled: &Compiled,
+        plan: &ExecPlan,
+        at: Stage,
+        scratch: Option<super::launch::ScratchAt>,
+    ) -> Result<std::result::Result<Vec<usize>, Fired>> {
         if self.airborne.is_some() {
             return Err(Fault::program(
                 "program::session",
@@ -522,7 +546,7 @@ impl Session {
         }
         self.refuse_unread()?;
         if let Some(refused) = self.gate(compiled, plan, at)? {
-            return Ok(refused);
+            return Ok(Err(refused));
         }
 
         let cursors = self.cursors_now();
@@ -541,12 +565,22 @@ impl Session {
                 Fault::program("program::session", "an instance fires a stage and holds no scratch")
             })?)?;
             for (at, region) in stage.regions.iter().enumerate() {
-                prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
+                prepared.encode_region(frame, region, at == 0)?;
             }
             launched.push(index);
         }
+        Ok(Ok(launched))
+    }
 
-        self.verdict(plan, &launched, at)
+    /// The verdict of stages [`Self::encode_stages`] launched, read once
+    /// their frame has landed.
+    pub fn verdict_of_launched(
+        &mut self,
+        plan: &ExecPlan,
+        launched: &[usize],
+        at: Stage,
+    ) -> Result<Fired> {
+        self.verdict(plan, launched, at)
     }
 
     pub fn prepare_airborne(

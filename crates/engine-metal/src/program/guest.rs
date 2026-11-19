@@ -80,7 +80,11 @@ pub fn guest_state(pair_sets: &[u64], instance_sets: &[u64], room: Room) -> Gues
     let (per_pair, pair_run) = state_of(pair_sets, room);
     let (per_instance, instance_run) = state_of(instance_sets, room);
     GuestState {
-        per_instance,
+        // Today's arms are folded into the instance's bytes: one arm, no
+        // scratch apart.
+        resident: per_instance,
+        scratch: 0,
+        scratch_arms: 1,
         per_pair,
         run: pair_run.max(instance_run),
     }

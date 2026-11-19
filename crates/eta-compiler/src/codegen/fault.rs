@@ -29,10 +29,16 @@ pub const M3_THREADS_EXCEEDED: u32 = 0xB3;
 
 pub const M4_REDUCE_TOO_WIDE: u32 = 0xB4;
 
+/// An access a guest runtime refused past its stage's heap or tables, or
+/// past an index's own bound: the WGSL runtime writes it, with the index and
+/// the limit in the status's reserved words.
+pub const OUT_OF_BOUNDS: u32 = 0xB5;
+
 const TABLE: &[(u32, &str, bool)] = &[
     (FUSED_GEOMETRY_MISMATCH, "FUSED_GEOMETRY_MISMATCH", false),
     (M3_THREADS_EXCEEDED, "M3_THREADS_EXCEEDED", false),
     (M4_REDUCE_TOO_WIDE, "M4_REDUCE_TOO_WIDE", false),
+    (OUT_OF_BOUNDS, "OUT_OF_BOUNDS", false),
     (LANE_HEADER_MISMATCH, "LANE_HEADER_MISMATCH", false),
     (M1_RING_CORRUPT, "M1_RING_CORRUPT", true),
     (M1_HEAD_STALE, "M1_HEAD_STALE", true),
