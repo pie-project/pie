@@ -417,23 +417,38 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
     // rate (no cached rate), one row past a 304-block grid reads less than a
     // launch's worth again, eight rows do not; at a cached rate every row
     // count the kernel stages folds, and lands the unfused path's bits.
-    for (m, n, k, plus_one, cached, folds) in [
-        (1u32, 4096u32, 1024u32, false, 0u32, true),
-        (1, 3000, 1024, true, 0, true),
-        (2, 6144, 1024, false, 0, true),
-        (8, 4096, 1024, false, 0, false),
-        (3, 4096, 1024, false, 1_000_000, true),
-        (4, 4096, 1024, true, 1_000_000, true),
-        (4, 6144, 1024, false, 1_000_000, true),
-        (5, 2048, 1024, false, 1_000_000, true),
-        (6, 2048, 1024, true, 1_000_000, true),
-        (8, 2048, 1024, false, 1_000_000, true),
-        (4, 2048, 3072, false, 1_000_000, true),
+    // Turned (the products from two rows on the turned kernel), the turned
+    // kernel stages them in its turn, the product apart taking it too: 16
+    // rows of 1,024 and their sums outgrow the turn and stay apart; a K past
+    // 2048 takes the skinny kernel still.
+    let (s, turned) = (false, true);
+    for (m, n, k, plus_one, cached, folds, turn) in [
+        (1u32, 4096u32, 1024u32, false, 0u32, true, s),
+        (1, 3000, 1024, true, 0, true, s),
+        (2, 6144, 1024, false, 0, true, s),
+        (8, 4096, 1024, false, 0, false, s),
+        (3, 4096, 1024, false, 1_000_000, true, s),
+        (4, 4096, 1024, true, 1_000_000, true, s),
+        (4, 6144, 1024, false, 1_000_000, true, s),
+        (5, 2048, 1024, false, 1_000_000, true, s),
+        (6, 2048, 1024, true, 1_000_000, true, s),
+        (8, 2048, 1024, false, 1_000_000, true, s),
+        (4, 2048, 3072, false, 1_000_000, true, s),
+        (2, 6144, 1024, false, 1_000_000, true, turned),
+        (3, 4096, 1024, true, 1_000_000, true, turned),
+        (4, 4096, 1024, false, 1_000_000, true, turned),
+        (8, 4096, 1024, true, 1_000_000, true, turned),
+        (12, 4096, 1024, false, 1_000_000, true, turned),
+        (16, 4096, 1024, false, 1_000_000, false, turned),
+        (7, 2048, 2048, false, 1_000_000, true, turned),
+        (4, 3000, 512, false, 1_000_000, true, turned),
+        (4, 2048, 3072, false, 1_000_000, true, turned),
     ] {
         let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
         t.launch_ns = 1536;
         t.hbm_gbps = 4090;
         t.cached_gbps = cached;
+        t.gemm_turn_from = if turn { 2 } else { 0 };
         let ctx = gpu.ctx().with_tuning(t);
         let x: Vec<f32> = values((m * k) as usize, 41, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 42, 1.0).into_iter().map(round_bf16).collect();
@@ -500,13 +515,18 @@ fn the_normed_gated_skinny_product_is_the_norm_then_the_gated_product() {
     let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
     t.launch_ns = 1536;
     t.hbm_gbps = 4090;
-    for (m, i, k, plus_one, cached) in [
-        (1u32, 3072u32, 1024u32, false, 0u32),
-        (2, 1536, 1024, true, 0),
-        (4, 3072, 1024, false, 1_000_000),
+    for (m, i, k, plus_one, cached, turn) in [
+        (1u32, 3072u32, 1024u32, false, 0u32, false),
+        (2, 1536, 1024, true, 0, false),
+        (4, 3072, 1024, false, 1_000_000, false),
+        (2, 3072, 1024, true, 1_000_000, true),
+        (4, 3072, 1024, false, 1_000_000, true),
+        (8, 1536, 1024, false, 1_000_000, true),
+        (12, 3072, 1024, true, 1_000_000, true),
     ] {
         let mut t = t;
         t.cached_gbps = cached;
+        t.gemm_turn_from = if turn { 2 } else { 0 };
         let ctx = gpu.ctx().with_tuning(t);
         let x: Vec<f32> = values((m * k) as usize, 51, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 52, 1.0).into_iter().map(round_bf16).collect();
