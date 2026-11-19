@@ -1422,6 +1422,40 @@ pub(crate) fn checkpoint_rows(
 
 static SEALED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What a keyed pass claimed to compute, and the rows it computes: passes
+/// whose first pages it claimed wait for its fires to land. Landed whole,
+/// the rows it froze seal there and then, and the waiters map them in;
+/// otherwise (failed, refused, dropped) the claims go unsealed, and a waiter
+/// computes the pages itself. Never waits on anything: it runs where the
+/// pass's last fire resolves, or goes as the pass does.
+struct SealOnLanding {
+    claims: crate::pipeline::coalesce::ClaimGuard,
+    stores: crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    start: u64,
+    slots: Vec<crate::store::kv::hash::Hash256>,
+    page_size: u32,
+    failure: PipelineFailure,
+}
+
+impl SealOnLanding {
+    fn landed(self, landed: bool) {
+        if landed && pipeline_failed(&self.failure).is_none() {
+            let sealed =
+                crate::store::registry::with_kv_lock(&self.stores.kv, "host-other", |kv| {
+                    kv.seal_landed(self.ws, self.start, &self.slots, self.page_size)
+                });
+            match sealed {
+                Ok(pages) => {
+                    SEALED_PAGES.fetch_add(u64::from(pages), std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => tracing::debug!(%error, "kv supply: sealing what a pass landed"),
+            }
+        }
+        drop(self.claims);
+    }
+}
+
 struct SupplyCounts {
     passes: std::sync::atomic::AtomicU64,
     tokens: std::sync::atomic::AtomicU64,
@@ -1490,6 +1524,20 @@ fn supply(
                 let mapped = kv.attach_run(ws, &run, limit)?;
                 kv.log_rows(ws, held, tokens_of(held / page + mapped))?;
                 mapped
+            }
+            Attach::Kv if !run.is_empty() => {
+                tracing::debug!(
+                    target: "pie::kv",
+                    found = run.len(),
+                    held,
+                    why = if kv.keeps() {
+                        "the set's rows end inside a page or past what it maps"
+                    } else {
+                        "the store keeps nothing"
+                    },
+                    "attach: found pages not mapped"
+                );
+                0
             }
             _ => 0,
         };
@@ -3808,6 +3856,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Where the pass keeps its state: the checkpoint rows it reaches,
         // floored to whole pages it keys, each the end of a fire of its own.
         let held = u64::from(full.lanes[0].kv.held);
+        // The rows it computes from here, sealed for its claims' waiters
+        // once its fires land.
+        let mut sealing = coalesced.take().map(|claims| SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: ws.id,
+            start: held,
+            slots: pass_slots.clone().unwrap_or_default(),
+            page_size,
+            failure: pipeline_failure.clone(),
+        });
         let reach = held + full.lanes[0].tokens.len() as u64;
         // A model whose only state beside its kv is window lists keeps one at
         // the pass's last page boundary unasked: the refs to its lists' last slots are all a
@@ -4415,9 +4474,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             ask.until_settled(last);
         }
         // The claims on what this pass computes stand until its last piece
-        // settles (its pages sealed); a pass that ends early drops them.
-        if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
-            last.on_settled(move || drop(guard));
+        // settles, its pages sealed if it landed; a pass that ends early
+        // drops them.
+        if let (Some(sealing), Some((last, earlier))) = (sealing.take(), submitted.split_last()) {
+            let earlier = earlier.to_vec();
+            last.on_settled_landed(move |landed| {
+                sealing.landed(landed && earlier.iter().all(|fire| fire.landed()));
+            });
         }
         // A set no piece wrote (its lanes carry no rows) ends where they land.
         for (group, (_, lanes)) in groups.iter().enumerate() {
@@ -7764,9 +7827,26 @@ pub(crate) mod fold_tests {
         Vec<crate::store::kv::hash::Hash256>,
         Vec<crate::store::kv::hash::Hash256>,
     ) {
+        let ws = stores.kv.lock().create_working_set();
+        let slots = written(stores, ws, tokens);
+        let mut kv = stores.kv.lock();
+        kv.seal_rows(ws, 0, &slots, 16).unwrap();
+        let keys = kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
+        let epoch = kv.current_epoch();
+        kv.release_working_set(ws, epoch);
+        kv.retire_idle();
+        (slots, keys)
+    }
+
+    /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass
+    /// whose fires have not landed yet; their rows' hashes.
+    fn written(
+        stores: &Stores,
+        ws: WorkingSetId,
+        tokens: &[u32],
+    ) -> Vec<crate::store::kv::hash::Hash256> {
         let mut kv = stores.kv.lock();
         kv.set_keeps(true);
-        let ws = kv.create_working_set();
         let pages = (tokens.len() as u64).div_ceil(16);
         kv.reserve(ws, pages).unwrap();
         let indexes: Vec<u64> = (0..pages).collect();
@@ -7783,13 +7863,160 @@ pub(crate) mod fold_tests {
             .collect();
         let seq = kv.publish_prepared(prepared, &commits).unwrap();
         kv.settle(seq);
+        kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap()
+    }
+
+    /// A keyed pass over `tokens` on a fresh set of `stores`: the set, and
+    /// its rows' hashes.
+    fn keyed_pass(
+        stores: &Stores,
+        tokens: &[u32],
+    ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
+        let mut kv = stores.kv.lock();
+        let ws = kv.create_working_set();
         let slots = kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap();
-        let keys = kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
-        kv.seal_rows(ws, 0, &slots, 16).unwrap();
-        let epoch = kv.current_epoch();
-        kv.release_working_set(ws, epoch);
-        kv.retire_idle();
-        (slots, keys)
+        (ws, slots)
+    }
+
+    /// Passes over `prompt(2..5)` that arrive while a first pass over
+    /// `prompt(1)` claims the pages they share, each waiting.
+    fn waiting_on(
+        stores: &Stores,
+        prompt: impl Fn(u32) -> Vec<u32>,
+    ) -> Vec<(
+        WorkingSetId,
+        Vec<u32>,
+        tokio::task::JoinHandle<Option<crate::pipeline::coalesce::ClaimGuard>>,
+    )> {
+        (2..5)
+            .map(|tail| {
+                let tokens = prompt(tail);
+                let (ws, slots) = keyed_pass(stores, &tokens);
+                let stores = stores.clone();
+                let waiting = tokio::spawn(async move {
+                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots).await
+                });
+                (ws, tokens, waiting)
+            })
+            .collect()
+    }
+
+    async fn settle_tasks() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Passes over one prompt that arrive while the first computes it wait
+    /// on its fires' landing, which seals what it froze: they map in all of
+    /// it, short only of their last row's page. One over another prompt
+    /// waits on nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn passes_of_one_prefix_map_what_the_first_lands() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let prompt = |tail: u32| -> Vec<u32> { (0..64).map(|t| 1300 + t).chain([tail]).collect() };
+        let (first, slots) = keyed_pass(&stores, &prompt(1));
+        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            .await
+            .expect("the first claims the pages it computes");
+        let waiters = waiting_on(&stores, prompt);
+        let other: Vec<u32> = (0..65).map(|t| 1500 + t).collect();
+        let (ws, other_slots) = keyed_pass(&stores, &other);
+        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots).await;
+        assert!(
+            own.is_some(),
+            "another prompt claims its own, waiting on nothing"
+        );
+        settle_tasks().await;
+        assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+        // The first's fires are written and frozen; then they land.
+        written(&stores, first, &prompt(1));
+        stores.kv.lock().freeze(first, 65).unwrap();
+        settle_tasks().await;
+        assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+        let sealing = SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: first,
+            start: 0,
+            slots,
+            page_size: 16,
+            failure: PipelineFailure::default(),
+        };
+        sealing.landed(true);
+        for (ws, tokens, waiting) in waiters {
+            assert!(waiting.await.unwrap().is_none(), "all sealed: none claimed");
+            let slots = stores
+                .kv
+                .lock()
+                .slot_hashes(ws, 0, &tokens, 16)
+                .unwrap()
+                .unwrap();
+            let supplied = supply(&stores, ws, &rows(0, &tokens), &slots, Attach::Kv, 65, 16);
+            assert_eq!(supplied.rows, 64, "all four sealed pages mapped in");
+        }
+    }
+
+    /// A pass that does not land what it claimed (it failed, was refused or
+    /// dropped), or landed it unfrozen, seals none of it and lets its
+    /// waiters go: one claims the pages and computes them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_on_a_pass_that_seals_nothing_compute_its_pages() {
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        for (case, landed, frozen) in [(0, false, 65), (1, true, 0), (2, true, 10)] {
+            let prompt = move |tail: u32| -> Vec<u32> {
+                (0..64)
+                    .map(|t| 1700 + case * 100 + t)
+                    .chain([tail])
+                    .collect()
+            };
+            let (first, slots) = keyed_pass(&stores, &prompt(1));
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+                .await
+                .unwrap();
+            let waiters = waiting_on(&stores, prompt);
+            written(&stores, first, &prompt(1));
+            stores.kv.lock().freeze(first, frozen).unwrap();
+            settle_tasks().await;
+            assert!(waiters.iter().all(|(_, _, waiting)| !waiting.is_finished()));
+            let sealing = SealOnLanding {
+                claims,
+                stores: stores.clone(),
+                ws: first,
+                start: 0,
+                slots,
+                page_size: 16,
+                failure: PipelineFailure::default(),
+            };
+            sealing.landed(landed);
+            // One claims the pages and the rest wait on it; here it seals
+            // nothing either, and the next goes on.
+            let (mut pending, mut computing) = (waiters, 0);
+            while !pending.is_empty() {
+                settle_tasks().await;
+                let (done, rest): (Vec<_>, Vec<_>) = pending
+                    .into_iter()
+                    .partition(|(_, _, waiting)| waiting.is_finished());
+                assert!(!done.is_empty(), "case {case}: a waiter goes on");
+                for (_, _, waiting) in done {
+                    computing += usize::from(waiting.await.unwrap().is_some());
+                }
+                pending = rest;
+            }
+            assert!(computing >= 1, "case {case}: a waiter computes the pages");
+            let (probe, probe_slots) = keyed_pass(&stores, &prompt(9));
+            let keys = crate::store::kv::KvStore::fresh_page_keys(&probe_slots, 16);
+            assert_eq!(
+                stores.kv.lock().cached_run(&keys).len(),
+                0,
+                "case {case}: nothing sealed"
+            );
+            stores.kv.lock().release_working_set(probe, 0);
+        }
     }
 
     /// A keyed pass of 64 rows whose first 48 the cache holds maps them in
