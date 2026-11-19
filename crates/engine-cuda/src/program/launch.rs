@@ -703,6 +703,9 @@ pub struct Prepared {
     samplers: Vec<bool>,
     /// The selects split across a lane's blocks ([`splits`]), a region each.
     splits: Vec<bool>,
+    /// The rows of each region whose rows split across blocks
+    /// ([`splits_rows`]).
+    row_splits: Vec<Option<u32>>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -746,6 +749,11 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
         .iter()
         .zip(region_rows(plan, descriptors))
         .map(|(region, rows)| match region.kind {
+            // A row of a region that splits its rows runs on up to a
+            // sampler's blocks: its temporary area is laid for them all.
+            RegionKind::Generated if splits_rows(region, rows) => {
+                rows.saturating_mul(LANE_SAMPLER_BLOCKS)
+            }
             RegionKind::Generated => rows,
             kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
             RegionKind::Library(LibraryOp::TopK) if splits(plan, region, rows) => {
@@ -756,6 +764,13 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
             RegionKind::Library(_) => 1,
         })
         .collect()
+}
+
+/// Whether `region`'s kernel runs each of its `rows` across several blocks
+/// (its rows meet at a word each of the lane arenas' barrier line, which
+/// holds a word for each of [`LANE_SAMPLER_BLOCKS`] rows).
+fn splits_rows(region: &LaunchRegion, rows: u32) -> bool {
+    region.splits_rows && (1..=LANE_SAMPLER_BLOCKS).contains(&rows)
 }
 
 /// Whether `region` is a select over a lane's one row (`rows` 1) wide enough
@@ -930,6 +945,12 @@ impl Prepared {
             .zip(&rows_of)
             .map(|(region, &rows)| splits(plan, region, rows))
             .collect();
+        let row_splits = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| splits_rows(region, rows).then_some(rows))
+            .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -1029,6 +1050,7 @@ impl Prepared {
             region_rows,
             samplers,
             splits,
+            row_splits,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1450,6 +1472,24 @@ impl Prepared {
             }
             self.zero_barriers(arenas, lane_span(rows), stream)?;
             rows
+        } else if let Some(Some(region_rows)) = self.row_splits.get(at).copied() {
+            // Each row on as many blocks as the device holds at once with
+            // the fire's lanes' rows (they wait on one another), meeting at
+            // its word of its lane's barrier line.
+            let split =
+                (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, LANE_SAMPLER_BLOCKS);
+            if split > 1 {
+                let need = u64::from(self.filled) * lane_span(1);
+                if need > arenas.bytes {
+                    return Err(Fault::Ceiling {
+                        what: "bytes of the engine's lane arenas a fire's split rows meet in",
+                        need,
+                        have: arenas.bytes,
+                    });
+                }
+                self.zero_barriers(arenas, lane_span(1), stream)?;
+            }
+            region_rows * split
         } else {
             rows
         };
@@ -1477,6 +1517,7 @@ impl Prepared {
     #[must_use]
     pub fn meets_across_blocks(&self) -> bool {
         self.samplers.iter().any(|&sampler| sampler)
+            || self.row_splits.iter().any(Option::is_some)
     }
 
     #[must_use]
