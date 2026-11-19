@@ -1,6 +1,6 @@
 # Beam page lists: `Port::Parents` (spec)
 
-Status: agreed (GPU, Leader, ROCm), 2026-11-19. The single written spec the
+Status: agreed (GPU, Mac, Leader, ROCm), 2026-11-19; reviewed edits folded in. The single written spec the
 device kernels (engine-cuda CUDA/HIP, engine-gpu Vulkan/wgpu, engine-metal)
 and the host replay all follow. Where an implementation and this text
 disagree, this text is right and the implementation is the bug.
@@ -33,7 +33,10 @@ memory, and nothing waits on the host.
   first decode fire: `end = (f0 + Q) * S` (§3).
 - The parents channel is written by the guest's epilogue and read by the
   next fire (loop-carried, device only: `HostRole::None`). Its initial value
-  is ignored (the first fire primes, §5).
+  is ignored (the first fire primes, §5). Engines never read the parents
+  cell on the host: the head kernel reads it at the staging cursor's head,
+  so an engine that resolves envelope ports on the host excludes `Parents`
+  from them.
 - SDK: `inferlet::beam::BeamGroup::new(&ws, beams, folded, steps)` reserves
   the pool; `group.geometry()` binds `positions`, `slots`, `parents`;
   `group.reorder(&parent)` in the epilogue puts the parents and advances
@@ -56,37 +59,48 @@ memory, and nothing waits on the host.
   slots `[(f0 + j) S, (f0 + j + 1) S)`.
 - `P` (list width): columns a list may hold, `P = ceil(reserved / S) - f0`
   bounds it; an engine may size by its context pages (`pages_per_slot`).
+- `F`: the fires a freed page waits before it is handed out again (§6.3).
+  The engine states its `F` at bind (its frames in flight); the guest sizes
+  with `run_ahead_window()` (the fires its pipeline holds in flight), which
+  is never less, and never with a constant.
 - Sizing the guest asks for (`BeamGroup`): `P_used = (folded + steps - 1) /
-  S - f0 + 1`, `Q = B * P_used + 2B + 1`. (Each column's pages, a beam's
-  each at most; the pages a fire hands out; those freed one fire late; the
-  frozen prompt page.) A fire that finds fewer free pages than it needs
-  faults the lanes that needed one (`RESERVE_EXHAUSTED`).
+  S - f0 + 1`, `Q = B * P_used + B + B * F + (tail > 0 ? 1 : 0)`: each
+  column's pages (a beam's each at most), the most one fire hands out, the
+  pages pending across `F` fires, and the frozen prompt page. A fire that
+  finds fewer free pages than it needs faults the lanes that needed one
+  (`RESERVE_EXHAUSTED`).
 
 ## 4. Resident state (per instance)
 
-    map[B][P]   u32   pool page of each beam's column (columns > c_t: unspecified)
-    free[Q]     bit   page may be handed out
-    pending[Q]  bit   page freed by the previous fire; joins `free` one fire late
-    primed      bit   the first fire has run
+    map[B][P]      u32   pool page of each beam's column (columns > c_t: unspecified)
+    free[Q]        bit   page may be handed out
+    pending[F][Q]  bit   a ring: slot `t mod F` holds the pages fire `t` freed
+    fired          u32   fires run; 0 until the first fire primes
 
-Stated in `engine::GuestState::resident` (bind to unbind; `scratch` and
-`scratch_arms` unchanged): `B*P*4 + 2*ceil(Q/32)*4 + 16` bytes, by the
-engine's bound on `P` and `Q`. The state is pool-relative: it never names a
-physical page, so the runtime may move, suspend and restore the set's pages
-and the instance's resident bytes freely (§8).
+Stated in `engine::GuestState::resident`, part of the instance's bytes at
+its bind extents (bind to unbind; `scratch` and `scratch_arms` unchanged):
+`B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on `P`
+and `Q` (an engine may hold a word where a bit is stated, and may keep two
+copies of `map` to reorder in place). It is one copy, device-owned, changed
+only by head kernels in queue order: never part of what an engine
+double-buffers for fires in flight, and never touched by staging a later
+fire on the host. It is pool-relative: it never names a physical page, so
+the runtime may move, suspend and restore the set's pages and the
+instance's resident bytes freely (§8).
 
 ## 5. Priming (the instance's first fire, `primed == 0`)
 
     for b in 0..B: map[b][0] = b                (columns 1.. unspecified)
-    free[q]    = (q >= B) && !(q == 0 && tail > 0)
-    pending[q] = 0
+    free[q]       = (q >= B) && !(q == 0 && tail > 0)
+    pending[k][q] = 0
     copies: for b in 1..B, if tail > 0 and o_0 > 0: copy(src = 0, dst = b, tokens = tail)
     primed = 1
 
 The parents are not read. `c_0` must be 0 (the first write lies on page
 `f0`); otherwise every lane faults `SHORT`. Beam 0 keeps page 0 (the
 prompt's own when `tail > 0`), every other beam gets the prompt's tail
-slots copied into its first page.
+slots copied into its first page. With `tail == 0`, page 0 is an ordinary
+pool page, and beams take pages `0 .. B-1`.
 
 ## 6. Each later fire `t >= 1` (in this order, before the fire appends or reads)
 
@@ -94,7 +108,8 @@ Inputs: the state after fire `t-1`, `parent[B]` (the cell the epilogue of
 fire `t-1` wrote), `s_t` (host-derived; `c = c_t`, `o = o_t`, `cp = c_{t-1}`).
 
 **6.1 Check.** For each `b`: `parent[b] < B`, else lane `b` faults
-`PARENT` (and §6.2–6.5 do nothing for it; its list keeps `map[b]`).
+`PARENT`: it continues itself (`parent[b] := b`, keeping `map[b]`), so its
+pages stay named and none is freed under it.
 
 **6.2 Reorder.**
 
@@ -114,14 +129,15 @@ fire `t-1` wrote), `s_t` (host-derived; `c = c_t`, `o = o_t`, `cp = c_{t-1}`).
 
 **6.3 Free.** A page lies in one column of every list that names it.
 
+    k        = t mod F
     freed[q] = exists (p, j), j <= cp, map[p][j] == q, and no b with map'[b][j] == q
     taken[q] = exists b, need[b] && fresh[b] == q
-    free'    = (free & !taken) | pending
-    pending' = freed
-    (when tail > 0: free'[0] = pending'[0] = 0, always)
+    free'    = (free & !taken) | pending[k]      (the pages fire t - F freed)
+    pending'[k] = freed                          (other slots unchanged)
+    (when tail > 0: free'[0] = 0 and page 0 is never freed)
 
-  A page freed by fire `t` is handed out no earlier than fire `t+2`'s
-  reorder: one fire late, on every engine.
+  A page freed by fire `t` is handed out no earlier than fire `t + F + 1`'s
+  reorder, whatever the engine's queue model.
 
 **6.4 Copy.** For each `b` with a copy: copy the first `tokens` slots of the
 set's page `f0 + src` to page `f0 + dst`, in every kv plane a page holds
@@ -131,7 +147,11 @@ copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`.
 
 **6.5 Resolve.** Over the page tables the fire stages for each lane as for
 any envelope lane (its slots `[0, s_t + 1)`): entry `f0 + j` of lane `b`'s
-list becomes the set's page `f0 + map'[b][j]` for `j <= c`, and its row's
+list becomes the set's page `f0 + map'[b][j]` for `j <= c`, resolved
+through the set's **whole reserved translation** (its pages `f0 .. f0 +
+Q - 1`, which the host stages each fire as one per-group input: host-known,
+no wait), not through the lane's own staged list (`map'` may name any pool
+page), and its row's
 write page becomes the set's page `f0 + map'[b][c]` (write offset `o`
 unchanged). Checks (else lane `b` faults and keeps the staged words, which
 name its own set's pages): `map'[b][j] < Q` (`PAST_RESERVE`), `c < P`
@@ -151,8 +171,11 @@ every lane, faulted or not. A faulted lane fails its fire by name
 | 3    | BELOW_FLOOR       | a row would land below the set's frozen slots or past its reserve |
 | 4    | COPY_BOUNDS       | a copy past the pool, longer than a page, or into frozen slots |
 | 5    | PARENT            | `parent[b] >= B` |
-| 6    | RESERVE_EXHAUSTED | fewer free pages than the fire hands out |
+| 6    | RESERVE_EXHAUSTED | fewer free pages than the fire hands out: unreachable with the exact sizing of §3, so a bug, logged loudly; it still faults only that lane |
 
+The fault words are a `[B]` array per group the head kernel writes and the
+settle reads, **one set per fire in flight**: the next fire's head kernel
+may run after this fire completes but before its settle reads them.
 Nothing outside the group's own working set is read or written in any
 case; the staged words a faulted lane keeps are its own set's pages.
 
