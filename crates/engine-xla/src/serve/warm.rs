@@ -311,6 +311,43 @@ impl Shell {
         // its rung by one-row lanes reading nothing (`canonical_pads`): `n`
         // at the rung, just past half of it and one short of it reach every
         // form that rung pads to.
+        // Each prompt and mixed fire once more with a prompt reading every
+        // row of itself (prompt logprobs): its fire's readouts are the
+        // store's (`fire_padded`), a program of its own. The runtime's cut
+        // holds a fire's real readouts to the store, the other lanes a row
+        // each, so the lane reads that much at most; rows past it go to
+        // another prompt, keeping the fire's lanes and rows.
+        if let Some(store) = self.readout_store_rows() {
+            let from = parts
+                .iter()
+                .find(|(name, _)| *name == "prefill")
+                .map_or(0, |&(_, at)| at);
+            parts.push(("logprobs", shapes.len()));
+            let laid = shapes.len();
+            for at in from..laid {
+                let mut lanes = shapes[at].clone();
+                let n = lanes.len() as u32;
+                let cap = store.saturating_sub(n.saturating_sub(1));
+                let prompts: Vec<usize> = (0..lanes.len())
+                    .filter(|&i| lanes[i].word == prefill)
+                    .collect();
+                let Some(&first) = prompts.first() else {
+                    continue;
+                };
+                if cap < 2 {
+                    continue;
+                }
+                if lanes[first].rows > cap {
+                    let excess = lanes[first].rows - cap;
+                    lanes[first].rows = cap;
+                    if let Some(&other) = prompts.get(1) {
+                        lanes[other].rows += excess;
+                    }
+                }
+                lanes[first].all_rows = true;
+                shapes.push(lanes);
+            }
+        }
         if let Some(depth) = self.trace().facts.draft_depth {
             let drafts = facts.word(&Request::new(2, false).drafting(true));
             let window = facts.word(&Request::new(1 + depth, false).drafting(true));

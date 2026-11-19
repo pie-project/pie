@@ -2419,7 +2419,30 @@ impl Shell {
         // rung and not by how many rows its lanes read (prompt logprobs, a
         // draft block): the rows past the count repeat the last, read by no
         // lane.
-        let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
+        // A plain lane reading every row of itself (prompt logprobs) puts the
+        // fire's readouts at the store's rows, its padding lanes' past them:
+        // the runtime's cut holds the real lanes' to the store
+        // (`ReadoutFacts::store_rows`), so the count is the load's and the
+        // fire's form's, and the warm ladder lays it. (A drafting lane's
+        // window keeps its rung: its fires are laid by rung.)
+        let classes = &self.compiled.classes;
+        let store = self.readout_store_rows();
+        let every_row = store.is_some()
+            && lanes[..real].iter().any(|s| {
+                s.readout.is_some_and(|r| r.len() > 1)
+                    && classes
+                        .class_of(s.lane.word & classes.mask)
+                        .is_some_and(|class| !self.drafting.contains(&class))
+            });
+        let pad_lanes = composition
+            .lanes()
+            .iter()
+            .filter(|row| row.source as usize >= real)
+            .count() as u32;
+        let want = match store {
+            Some(store) if every_row => store + pad_lanes,
+            _ => poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32),
+        };
         if let Some(&last) = readout_rows.last() {
             readout_rows.resize((want as usize).max(readout_rows.len()), last);
         }
@@ -2428,13 +2451,11 @@ impl Shell {
         // rows (a row each) are read out and dropped, so the planes hold no
         // more than the runtime's cut lets the real lanes read
         // (`ReadoutFacts::store_rows`).
-        let compacts = lanes[..real]
-            .iter()
-            .any(|s| s.readout.is_some_and(|r| r.len() > 1))
-            && composition
-                .lanes()
+        let compacts = every_row
+            || (lanes[..real]
                 .iter()
-                .any(|row| row.source as usize >= real);
+                .any(|s| s.readout.is_some_and(|r| r.len() > 1))
+                && pad_lanes > 0);
         let mut plane_layout = readout_layout.clone();
         let readout_pick = compacts.then(|| {
             let mut pick: Vec<i32> = Vec::new();
@@ -2442,7 +2463,10 @@ impl Shell {
                 plane_layout[source] = (pick.len() as u32, count);
                 pick.extend((first..first + count).map(|at| at as i32));
             }
-            let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, pick.len() as u32);
+            let want = match store {
+                Some(store) if every_row => store,
+                _ => poem_exec::fire::rung_of(&self.budgets.tokens.buckets, pick.len() as u32),
+            };
             if let Some(&last) = pick.last() {
                 pick.resize((want as usize).max(pick.len()), last);
             }
