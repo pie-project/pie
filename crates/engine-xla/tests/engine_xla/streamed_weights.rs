@@ -83,15 +83,44 @@ fn encode(readouts: &[Vec<u32>]) -> Vec<u8> {
     out
 }
 
-/// Fires the scenario under `held`; the readouts' bits, the uses read and
-/// the chunks the load seated its weights in.
+/// The layers a load rolls (`engine_xla::roll::Plan`).
+fn rolled(model: &Model) -> u32 {
+    model.engine.shell().map_or(0, |s| s.rolling().rolled())
+}
+
+/// Whether `got` answers `want` within contract A: each `vocab`-wide row's
+/// argmax the same, or parted only on a near-tie of `want`'s two best.
+fn agrees(want: &[Vec<u32>], got: &[Vec<u32>], vocab: usize) -> bool {
+    let argmax = |row: &[f32]| {
+        (row.iter().enumerate())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(at, _)| at)
+    };
+    want.len() == got.len()
+        && want.iter().zip(got).all(|(w, g)| {
+            let (w, g): (Vec<f32>, Vec<f32>) = (
+                w.iter().map(|&b| f32::from_bits(b)).collect(),
+                g.iter().map(|&b| f32::from_bits(b)).collect(),
+            );
+            w.len() == g.len()
+                && w.chunks(vocab).zip(g.chunks(vocab)).all(|(w, g)| {
+                    let (a, b) = (argmax(w), argmax(g));
+                    let scale = w.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1.0);
+                    a == b || (w[a] - w[b]).abs() <= 2e-2 * scale
+                })
+        })
+}
+
+/// Fires the scenario under `held`; the readouts' bits, the readouts, the
+/// uses read, the chunks the load seated its weights in and the layers it
+/// rolls.
 fn served(
     name: &str,
     context: u32,
     long: Option<u32>,
     kind: WeightKind,
     held: Held,
-) -> (Vec<u8>, engine::chunk::WeightUses, u32) {
+) -> (Vec<u8>, Vec<Vec<u32>>, engine::chunk::WeightUses, u32, u32) {
     let mut model = Model::load(name, None, context, 7);
     let facts = model.loaded.caps.chunks.clone();
     let chunks: u32 = facts
@@ -130,7 +159,8 @@ fn served(
             "{name}: a held set keeps no host copy to move an atom with"
         );
     }
-    (encode(&readouts), uses, chunks)
+    let rolls = rolled(&model);
+    (encode(&readouts), readouts, uses, chunks, rolls)
 }
 
 fn every_residency(name: &str, context: u32, long: Option<u32>, kind: WeightKind) {
@@ -147,13 +177,14 @@ fn every_residency(name: &str, context: u32, long: Option<u32>, kind: WeightKind
         Held::Half,
         Held::Whole,
     ] {
-        let (bits, uses, chunks) = served(name, context, long, kind, held);
+        let (bits, readouts, uses, chunks, rolls) = served(name, context, long, kind, held);
         // The base build's programs at this pool size: a load that streams
         // nothing (its programs are the base build's, `PIE_XLA_DUMP`
         // shows), its pool grown by the chunks the weights were seated in.
-        let control = grown.get_or_insert_with(|| {
+        let (control, control_rows, control_rolls, vocab) = grown.get_or_insert_with(|| {
             let mut model = Model::load_held_grown(name, None, context, 7, chunks);
-            let bits = encode(&scenario(&mut model, long));
+            let rows = scenario(&mut model, long);
+            let bits = encode(&rows);
             if let Some(want) = &golden {
                 if *want == bits {
                     eprintln!("{name}: the base build grown by {chunks} chunks = the base build");
@@ -164,13 +195,28 @@ fn every_residency(name: &str, context: u32, long: Option<u32>, kind: WeightKind
                     );
                 }
             }
-            bits
+            let rolls = rolled(&model);
+            (bits, rows, rolls, model.vocab as usize)
         });
-        assert!(
-            *control == bits,
-            "{name}: {held:?} answers otherwise than the base build's programs at its pool size"
-        );
-        eprintln!("{name}: {held:?} = the base build's programs at its pool size, bit for bit");
+        if *control_rolls == rolls {
+            assert!(
+                *control == bits,
+                "{name}: {held:?} answers otherwise than the base build's programs at its pool size"
+            );
+            eprintln!("{name}: {held:?} = the base build's programs at its pool size, bit for bit");
+        } else {
+            // A held load rolls the runs a streamed one spells out layer by
+            // layer: the two forms agree within contract A, not bit for bit.
+            assert!(
+                agrees(control_rows, &readouts, *vocab),
+                "{name}: {held:?} (rolling {rolls} layers) answers otherwise than the held load \
+                 (rolling {control_rolls}), past contract A"
+            );
+            eprintln!(
+                "{name}: {held:?} = the held load within contract A ({rolls} vs {control_rolls} \
+                 layers rolled)"
+            );
+        }
         assert!(
             !uses.uses.is_empty(),
             "{name}: {held:?}: the fires read weights"

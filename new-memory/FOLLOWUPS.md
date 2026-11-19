@@ -360,3 +360,33 @@ writes) in series with ~23 ms parked at the guest gate (GPU plus the guest
 pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
 wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
 boundary), not host time.
+
+## F29. XLA does not roll a layer stack whose weights stream
+
+XLA traces a fire's repeating blocks of regions as one loop (`engine-xla roll.rs`,
+`serve.rs` `roll_block`). A run whose experts stream through the pool
+(`store/streamed.rs`) stays spelled out layer by layer, and its load line says why.
+
+Why the loop cannot hold it:
+- A fire with a non-resident layer is cut before that layer's first select
+  (`Tracer::cut`). The segment before the cut lands, the routes come back to the
+  host, and the misses are staged.
+- Each param's miss copy is its own pinned host bank (`Source::HostBank`), copied
+  into staging slots between segments.
+- A loop cannot span those cuts. Rolling only the fully resident case would lay
+  two program forms by residency, which doubles the ladder.
+
+Consequence: rolling cuts a fire program's compiled code about 12× on qwen3-0.6b
+(49.1 to 4.0 MB a program). The host RAM libtpu holds for loaded programs scales
+with that code, about 2.2× code. So the large models that stream experts keep
+the full unrolled cost, at the scale where it hurts most (126 GB at ready for the
+qwen3-0.6b base ladder already).
+
+What could roll: streamed PLE rows (`Rows` weights, gemma4-e2b/e4b). A fire reads
+them through per-fire row indices with no cut, so a body can pick the counter's
+pass's indices the way it picks an adapter bank's staged starts
+(`Run::rolled_starts`). Do that one when convenient.
+
+Experts would need the miss staging moved inside the loop. One possibility:
+stage every layer's misses before the fire, from routes known ahead, which the
+routes being decided inside the fire rules out today.
