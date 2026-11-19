@@ -751,3 +751,26 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F42. Cerebras refuses device-geometry binds until it carries attn_mask / fold
+
+Since engine-gpu carries device geometry, an engine whose port mask lacks a
+port a program's device class needs refuses the bind by name
+(`runtime pipeline/fire/host_geometry.rs` `EngineLacks`) instead of serving
+it host-resolved. Cerebras advertises device geometry without `attn_mask` and
+`fold`, so beam search (a channel-fed mask) and any decode envelope with a
+device fold no longer bind there. It gets them back when its spatial engine
+reads those two ports from the device.
+
+## F43. engine-cuda's device geometry disables run-ahead structurally
+
+`serve/prepare.rs` (`can_runahead`, ~339-387) turns run-ahead off for every
+DeviceGeometry attachment: the envelope is read off its rings on the host
+(`program/ports.rs`), and the page CSR, write descriptors and mask are carved
+from it before the fire stages, so `reap_guests_at` (`serve/enqueue.rs`)
+waits for the previous pass every step and beam runs at depth 1. The pieces
+are those of Vulkan's run-ahead: stage from bounds (the translation table to
+the reserved extent), positions copied behind the pass, write descriptors and
+the mask built on the device from the slots and mask cells, and a device
+extent clamping attention. The L40S has started it on `sc/l40s-devgeo-runahead`,
+to the same design as Vulkan's.
