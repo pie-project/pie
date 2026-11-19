@@ -3789,3 +3789,64 @@ async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
         "no one moved for the held restore"
     );
 }
+
+/// A short head with nothing resident and parked state on the device that a
+/// move down a tier would clear for its runs is no refusal: it waits while
+/// the move funds it. A need no move could stand is refused by name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past_it() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 4)
+    });
+    pool.free.lock().extend([0, 1, 3, 4, 6, 7]);
+    pool.host_used.store(4, Ordering::Relaxed);
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, a, b) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.parked.lock().extend([(2, a), (5, b)]);
+    let need = |pieces| super::proc::PendingBind {
+        run: 3,
+        pieces,
+        pages: 3 * pieces,
+    };
+    let key = planner.with_inner(|inner| {
+        for pid in [head, a, b] {
+            inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+        }
+        inner.procs.get_mut(&head).unwrap().roles_short = Some(need(1));
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    assert!(
+        !planner.with_inner(|inner| inner.others_hold_room(Some(head))),
+        "no one else holds room it could move"
+    );
+    planner.note_short(key, 3 << 20, 0);
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    assert!(
+        planner.short_expired(key).is_none(),
+        "parked state moving down stands its run: it waits"
+    );
+    planner.with_inner(|inner| inner.procs.get_mut(&head).unwrap().roles_short = Some(need(3)));
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    let refused = planner
+        .short_expired(key)
+        .expect("three runs of three fit no eight chunks: refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("does not fit with every other process moved"),
+        "{refused}"
+    );
+}

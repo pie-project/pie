@@ -278,12 +278,24 @@ impl ResidencyPlanner {
         // need that does not fit with every other process moved fails, by
         // name. Failed at the first wedge, a restore or an allocation was
         // refused on the M1 stress room that the next eviction gave it.
-        if !host
-            && self.with_inner(|inner| {
-                let waiter = inner.queue.get(&key).map(|waiter| waiter.pid);
-                inner.others_hold_room(waiter)
-            })
-        {
+        // Parked state lying on the device moves down a tier for it too
+        // ([`Self::movable_parked_room`]): a head short of runs of whole
+        // chunks those moves would stand is no refusal either.
+        let (others, runs) = self.with_inner(|inner| {
+            let waiter = inner.queue.get(&key).map(|waiter| waiter.pid);
+            let runs = inner.queue.get(&key).and_then(|waiter| match waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some((waiter.pid, run, pieces)),
+                _ => inner.procs.get(&waiter.pid).and_then(|proc| {
+                    proc.roles_short
+                        .or(proc.bind_room)
+                        .map(|need| (waiter.pid, need.run, need.pieces))
+                }),
+            });
+            (inner.others_hold_room(waiter), runs)
+        });
+        let parked_moves = runs
+            .is_some_and(|(head, run, pieces)| self.movable_parked_room(head, run, pieces));
+        if !host && (others || parked_moves) {
             self.short.lock().restart(key.1);
             self.poke();
             return None;
