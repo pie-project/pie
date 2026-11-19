@@ -247,7 +247,7 @@ impl ResidencyPlanner {
 
     /// The error waiter `key` fails with when it has stood short of what
     /// only the policy can free past the seat deadline, rather than wait on.
-    pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
+    pub(super) fn short_expired(self: &Arc<Self>, key: EntryKey) -> Option<super::PlannerError> {
         let (waited, host, answered) = {
             let short = self.short.lock();
             (
@@ -269,6 +269,23 @@ impl ResidencyPlanner {
         // would have given it.
         if !host && !self.is_wedged() {
             self.short.lock().restart(key.1);
+            return None;
+        }
+        // The fleet stands still and the policy freed nothing: over-demand
+        // is served, slower, never failed. While another process holds room
+        // that can move, the planner moves it by its victim choice (the
+        // policy's, where one is attached) and the wait goes on; only a
+        // need that does not fit with every other process moved fails, by
+        // name. Failed at the first wedge, a restore or an allocation was
+        // refused on the M1 stress room that the next eviction gave it.
+        if !host
+            && self.with_inner(|inner| {
+                let waiter = inner.queue.get(&key).map(|waiter| waiter.pid);
+                inner.others_hold_room(waiter)
+            })
+        {
+            self.short.lock().restart(key.1);
+            self.poke();
             return None;
         }
         let short = self.short.lock();

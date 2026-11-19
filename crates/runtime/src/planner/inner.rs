@@ -190,6 +190,14 @@ impl Inner {
     pub(super) fn enqueue(&mut self, pid: ProcessId, kind: WaitKind) -> EntryKey {
         let key = (self.procs[&pid].rank(), self.next_id);
         self.next_id += 1;
+        // The one restored for its bind asks for pages: its bind went
+        // through, and the next suspended bind may come back. Held to its
+        // first fire, the hold outlived a grant it waited on behind the
+        // held restore (the M1 stress: 86 at the planner's grant, the
+        // restore head held, nothing moved).
+        if matches!(kind, WaitKind::Allocation { .. }) && self.bind_restoring == Some(pid) {
+            self.bind_restoring = None;
+        }
         self.queue.insert(key, Waiter { pid, kind });
         key
     }
@@ -410,9 +418,9 @@ impl Inner {
             self.completion_credit -= 1;
             return RestoreGate::Serve;
         }
-        let stalled = self.fleet_stalled();
+        let stalled = self.nothing_in_flight();
         if let Some(need) = roles_short {
-            return if stalled || self.fleet_waits_at_binds() {
+            return if stalled {
                 RestoreGate::Evict((need.run, need.pieces))
             } else {
                 RestoreGate::Wait
@@ -436,25 +444,32 @@ impl Inner {
         }
     }
 
-    /// No resident process makes progress save through room: each is
-    /// stalled as [`Self::fleet_stalled`] counts it, or waits at a bind for
-    /// room (AMD's 7-minute stall: 143 processes at a bind, the restore
-    /// head short of role slots never funded). Read only where a restore
-    /// short of role slots asks whether to wait for a completion: a bind
-    /// waiter is no wedge for the starvation verdict, which may still
-    /// move it.
-    pub(super) fn fleet_waits_at_binds(&self) -> bool {
-        self.evicting.is_empty()
-            && self.procs.values().any(|proc| proc.bind_waiting)
-            && self.procs.iter().all(|(pid, proc)| match proc.state {
-                Residency::Resident => {
-                    !proc.admitted
-                        || proc.idle
-                        || proc.bind_waiting
-                        || (self.queue.values().any(|waiter| waiter.pid == *pid) && !proc.firing())
+    /// Whether a process other than `waiter` holds device room the planner
+    /// can still move: resident (a victim), or on its way in or out.
+    pub(super) fn others_hold_room(&self, waiter: Option<ProcessId>) -> bool {
+        self.procs.iter().any(|(pid, proc)| {
+            Some(*pid) != waiter
+                && match proc.state {
+                    Residency::Resident => proc.admitted,
+                    Residency::Evicting | Residency::Restoring => true,
+                    Residency::Evicted => false,
                 }
-                Residency::Evicting | Residency::Restoring => false,
-                Residency::Evicted => true,
+        })
+    }
+
+    /// Nothing in flight can free room: no fire submitted and not landed,
+    /// no eviction, restore or kill under way. What the others wait on
+    /// (grants, binds, gates, anything not yet named) does not matter:
+    /// with nothing moving, only the planner moving a resident makes room.
+    /// Counting waiter kinds instead missed one each time (stalled, then
+    /// waiting at binds, then one resident between steps), and the fleet
+    /// stood still with nothing coming.
+    pub(super) fn nothing_in_flight(&self) -> bool {
+        self.evicting.is_empty()
+            && !self.kill_in_flight()
+            && self.procs.values().all(|proc| {
+                !proc.firing()
+                    && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
             })
     }
 

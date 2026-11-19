@@ -2117,6 +2117,16 @@ fn a_restore_that_fails_a_step_is_failed_once_not_queued_again() {
         planner.register(pid);
         planner.note_admitted(pid);
     }
+    // A fire in flight elsewhere: a queued restore waits for it rather
+    // than being served at once with nothing moving.
+    let decoding = ProcessId::new_v4();
+    planner.register(decoding);
+    planner.note_admitted(decoding);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&decoding).unwrap();
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
+    });
     let restoring = |planner: &Arc<ResidencyPlanner>, pid: ProcessId| {
         planner.with_inner(|inner| {
             inner.procs.get_mut(&pid).expect("registered").state = Residency::Restoring;
@@ -3228,8 +3238,8 @@ async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_
     });
     *pool.occupant.lock() = Some(decoding);
     assert!(
-        planner.with_inner(|inner| inner.fleet_waits_at_binds()),
-        "the fleet waits at binds"
+        planner.with_inner(|inner| inner.nothing_in_flight()),
+        "nothing in flight frees room"
     );
     planner.poke();
     for _ in 0..200 {
@@ -3576,6 +3586,13 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
     let fire = planner.fire_in_flight(first);
     assert_eq!(planner.with_inner(|inner| inner.bind_restoring), None);
     drop(fire);
+    // Asking for pages also says its bind went through: the hold must not
+    // wait on a grant queued behind the held restore.
+    planner.with_inner(|inner| {
+        inner.bind_restoring = Some(other);
+        inner.enqueue(other, allocation(Demand::default()));
+        assert_eq!(inner.bind_restoring, None, "released as it asks for pages");
+    });
 }
 
 /// A short restore that gives up parks its process out of the queue and
@@ -3651,4 +3668,124 @@ async fn a_restore_that_gives_up_forgets_what_it_learned_of_the_room() {
         assert_eq!(proc.roles_free_retry, None);
         assert_eq!(proc.roles_free_short, None, "no longer marked understated");
     });
+}
+
+/// A wedged fleet, a restore short of room and the policy freeing nothing:
+/// over-demand is served, slower, never failed. While another process holds
+/// room that can move, the restore keeps waiting and the planner moves a
+/// resident for it (the M1 stress: refused at the first wedge, a beam
+/// failed with room the next eviction gave it). With nothing else on the
+/// device to move, it is refused by name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_alone() {
+    // Alone: it raises the policy's global answer, which wakes other tests'
+    // gates.
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restoring, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [restoring, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let key = planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    *pool.occupant.lock() = Some(resident);
+    assert!(planner.is_wedged(), "the fleet stands still");
+    planner.note_short(key, 3 << 20, 0);
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    assert!(
+        planner.short_expired(key).is_none(),
+        "a resident can move: the restore waits on"
+    );
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the resident is moved for it"
+    );
+
+    // Alone on the device: nothing else to move, refused by name.
+    planner.unregister(resident);
+    planner.with_inner(|inner| {
+        inner.evicting.clear();
+    });
+    crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+    let refused = planner
+        .short_expired(key)
+        .expect("alone, it does not fit: refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("does not fit with every other process moved"),
+        "{refused}"
+    );
+}
+
+/// The M1 stress on the funding commit: a restore head held while another
+/// process restored for its bind had not fired, and that process's bind
+/// waited behind the head for good (and the planner, funding the head,
+/// moved every resident for a restore it would not serve). The restored
+/// one's bind goes first.
+#[tokio::test(flavor = "current_thread")]
+async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (held, restored) = (ProcessId::new_v4(), ProcessId::new_v4());
+    // The held restore first: older, ranked ahead.
+    for pid in [held, restored] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.bind_restoring = Some(restored);
+        let proc = inner.procs.get_mut(&held).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+        proc.bind_room_after = Some(0);
+        inner.enqueue(
+            held,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(restored, 1, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if bind.is_finished() {
+            break;
+        }
+    }
+    assert!(bind.is_finished(), "the restored one's bind is served");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "no one moved for the held restore"
+    );
 }

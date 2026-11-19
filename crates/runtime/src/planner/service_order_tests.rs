@@ -135,7 +135,13 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         pieces: 1,
         pages: 3,
     });
-    assert!(!inner.fleet_stalled());
+    // The resident decodes: a fire of its in flight.
+    {
+        let proc = inner.procs.get_mut(&pids[1]).unwrap();
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
+    }
+    assert!(!inner.nothing_in_flight());
     assert_eq!(
         inner.restore_gate(pids[0], 64),
         RestoreGate::Wait,
@@ -148,10 +154,14 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         "a completion's credit"
     );
     assert_eq!(inner.completion_credit, 0);
-    // The resident waits at a bind for room: it makes no progress, so the
-    // fleet is stalled and the restore's runs are funded.
-    inner.procs.get_mut(&pids[1]).unwrap().bind_waiting = true;
-    assert!(inner.fleet_waits_at_binds(), "the fleet waits at binds");
+    // Its fire landed and it waits at a bind for room: nothing in flight
+    // frees room, and the restore's runs are funded.
+    {
+        let proc = inner.procs.get_mut(&pids[1]).unwrap();
+        proc.fires = 0;
+        proc.bind_waiting = true;
+    }
+    assert!(inner.nothing_in_flight(), "nothing in flight frees room");
     assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict((3, 1)));
 }
 

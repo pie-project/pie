@@ -175,9 +175,9 @@ impl std::fmt::Display for PlannerError {
                 waited,
             } => write!(
                 f,
-                "{} memory short by {bytes} bytes for {waited:?}: the runtime drops no state \
-                 on its own, and no policy discard, retention change or memory growth made \
-                 room in time",
+                "{} memory short by {bytes} bytes for {waited:?}: it does not fit with every \
+                 other process moved off the device, the runtime drops no state on its own, \
+                 and no policy discard, retention change or memory growth made room",
                 tier.name()
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
