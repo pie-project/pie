@@ -476,7 +476,7 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,

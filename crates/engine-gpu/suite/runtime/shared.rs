@@ -162,7 +162,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                 max_clips: None,
             },
             residency: Residency {
-                device: backend::ALLOWANCE,
+                device: crate::gpu::share(),
                 ..Residency::default()
             },
             ordinal: 0,

@@ -292,9 +292,12 @@ pub fn load_paged(fixture: &Fixture, page: u32, context: u32, chunk: Option<u64>
 
 /// Held over a load: a driver reports what it holds a process, so a load
 /// prices what its pipelines take while no other test's load allocates.
+/// Taken after the test's share of the device (`gpu::share`), which a test
+/// holding this never waits on.
 static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn loading() -> std::sync::MutexGuard<'static, ()> {
+    crate::gpu::share();
     LOADING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -402,37 +405,27 @@ fn boot<'a>(
     }
 }
 
-/// `residency` with the device's budget a quarter of what it has where it
-/// states none; `None` where no device comes up.
+/// `residency` with the device's budget the test's share of the device
+/// (`gpu::share`) where it states none; `None` where no device comes up.
 fn allowed(
     device: &DeviceBoot,
     residency: engine::load::Residency,
 ) -> Option<engine::load::Residency> {
     // The device is shared: a driver that fails to come up is asked again
-    // before the test is skipped. A load takes what the harness states a
-    // test's load takes; where that is the whole device, at most a quarter of
-    // what the device is measured to have, as tests load at once.
+    // before the test is skipped.
     let mut tries = 0;
-    let quarter = loop {
-        match Context::bind(device, backend::ALLOWANCE) {
-            Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
-            Err(why) => {
-                tries += 1;
-                if tries == 5 {
-                    eprintln!("skipping: no {} device ({why})", backend::NAME);
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+    while let Err(why) = Context::bind(device, backend::ALLOWANCE) {
+        tries += 1;
+        if tries == 5 {
+            eprintln!("skipping: no {} device ({why})", backend::NAME);
+            return None;
         }
-    };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let share = crate::gpu::share();
     Some(engine::load::Residency {
         device: engine::Allowance {
-            budget: residency
-                .device
-                .budget
-                .or(backend::ALLOWANCE.budget)
-                .or(Some(quarter)),
+            budget: residency.device.budget.or(share.budget),
         },
         ..residency
     })
