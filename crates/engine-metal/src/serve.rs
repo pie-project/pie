@@ -173,6 +173,10 @@ pub struct Seated<'a> {
     /// The set's committed boundary (`KvDelta::folded`): the lane's mask
     /// speaks of the keys from it on.
     pub folded: u32,
+    /// The set's written end the runtime states, and the set
+    /// (`KvDelta::readable`, `KvDelta::set`): what its rows may read.
+    pub readable: u32,
+    pub set: u64,
     pub mask: Option<&'a Masking>,
     /// A lane with no KV of its own: its mask is over its attention group.
     pub kv_less: bool,
@@ -217,6 +221,8 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             folded: 0,
+            readable: 0,
+            set: 0,
             mask: None,
             kv_less: false,
             adapter: None,
@@ -361,6 +367,10 @@ pub struct Shell {
     blobs: crate::blob::Store,
     held: Vec<u32>,
     programs: crate::program::Plane,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
 }
 
 /// The longest a load waits for the Neural Engine's programs.
@@ -1657,6 +1667,7 @@ impl PreparedLoad<'_> {
                 plane.set_capture(capture_bytes);
                 plane
             },
+            written: engine::extent::Written::default(),
         };
         shell.settle_ane()?;
         if let Some(&(tokens, bytes)) = shell.arena.rs_rooms().last() {
@@ -4144,6 +4155,8 @@ impl Shell {
         }
         let mut beginning: Vec<Vec<u32>> = Vec::new();
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
+        // What each lane writes and reads of its set (`engine::extent`).
+        let mut extents = engine::extent::FireExtents::default();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -4562,7 +4575,35 @@ impl Shell {
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
+            if !seated.kv_less {
+                let reach = have.saturating_add(row.rows);
+                let set = (seated.set, seated.readable);
+                match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+                    Some(Some(slots)) => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                        reach,
+                    ),
+                    _ => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        std::iter::once(have..reach),
+                        reach,
+                    ),
+                }
+            }
         }
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written.
+        extents
+            .check()
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        self.written.commit(extents);
 
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let paging = self.pools.paging();
@@ -5848,7 +5889,13 @@ impl engine::frame::Shell for Shell {
         self.pools.weights_ready()?;
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
-        self.stage(step)
+        // A step refused here carries no set's written end.
+        let written = self.written.clone();
+        let staged = self.stage(step);
+        if staged.is_err() {
+            self.written = written;
+        }
+        staged
     }
 
     fn enqueue<'a>(&mut self, mut prepared: Prepared<'a>) -> Result<Enqueued<'a>>

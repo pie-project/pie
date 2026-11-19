@@ -63,6 +63,9 @@ pub(crate) struct Half {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     session: crate::guest::session::Session,
+    /// The taking of its pair's slots its session lies in
+    /// (`engine::InstanceBinding::pair_generation`).
+    pair_generation: u64,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -328,6 +331,10 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     library: Option<Arc<crate::guest::session::Library>>,
 
+    /// The pairs whose state lies laid now, cleared at each new taking.
+    #[cfg(feature = "wgpu")]
+    takings: engine_gpu::guest::state::Takings,
+
     tally: Arc<Tally>,
 }
 
@@ -495,6 +502,19 @@ impl Plane {
         let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
+        // The instance's room is fresh, its pair's where none holds that
+        // taking: both are another owner's bytes until cleared.
+        #[cfg(feature = "wgpu")]
+        {
+            let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            if let Err(fault) = session.clear(fresh_pair) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::Program(format!(
+                    "program {} does not bind: its state did not clear: {fault}",
+                    binding.program
+                )));
+            }
+        }
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -510,6 +530,7 @@ impl Plane {
                     plan: Arc::clone(&plan),
                     inst: inst.clone(),
                     session,
+                    pair_generation: binding.pair_generation,
                     poisoned: Arc::clone(&poisoned),
                 })),
                 #[cfg(feature = "wgpu")]
@@ -540,13 +561,19 @@ impl Plane {
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
-        self.instances
-            .remove(&id)
-            .map(|_| ())
-            .ok_or(Refusal::Closed {
-                what: "instance",
-                id: id.0,
-            })
+        let seat = self.instances.remove(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        #[cfg(feature = "wgpu")]
+        {
+            let half = seat.half.lock().expect("half lock poisoned");
+            self.takings
+                .give(half.session.pair_place(), half.pair_generation);
+        }
+        #[cfg(not(feature = "wgpu"))]
+        drop(seat);
+        Ok(())
     }
 
     /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
@@ -1055,6 +1082,7 @@ impl Plane {
                 rings,
                 scratch,
                 pair,
+                pair_generation,
                 ..
             } => {
                 if !rings.is_empty() {
@@ -1071,13 +1099,22 @@ impl Plane {
                 {
                     seat.gate.settle(*id)?;
                     let mut half = seat.half.lock().expect("half lock poisoned");
+                    let was = (half.session.pair_place().clone(), half.pair_generation);
                     half.session
                         .retarget(pools, instance, scratch, pair)
+                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    // The unpark's room is fresh; the pair's is cleared where
+                    // this is the first instance on its new taking.
+                    self.takings.give(&was.0, was.1);
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    half.pair_generation = *pair_generation;
+                    half.session
+                        .clear(fresh_pair)
                         .map_err(|fault| Refusal::Program(fault.to_string()))?;
                     seat.scores = half.session.scores();
                 }
                 #[cfg(not(feature = "wgpu"))]
-                let _ = (seat, pools, instance, scratch, pair);
+                let _ = (seat, pools, instance, scratch, pair, pair_generation);
                 Ok(())
             }
             Rebind::Channel { id, .. } => Err(Refusal::Program(format!(

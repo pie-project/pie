@@ -762,6 +762,18 @@ impl WorkItemCompletion {
         hook();
     }
 
+    /// [`Self::on_settled`], `hook` told whether the work item succeeded:
+    /// one never resolved, or resolved failed, did not.
+    pub fn on_settled_ok(&self, hook: impl FnOnce(bool) + Send + 'static) {
+        let state = Arc::downgrade(&self.state);
+        self.on_settled(move || {
+            let ok = state
+                .upgrade()
+                .is_some_and(|state| matches!(state.result(), Some(Ok(()))));
+            hook(ok);
+        });
+    }
+
     pub fn same_request(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }

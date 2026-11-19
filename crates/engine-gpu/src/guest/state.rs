@@ -29,6 +29,9 @@
 //!
 //! The contents are dead between fires, so a park copies nothing and an
 //! unpark takes fresh room, the engine told where (`Rebind::Instance`).
+//! Room that changes owner is zeroed before the guest's first fire there
+//! ([`Placed::clear`]): an instance's at its bind and its unpark, a pair's
+//! at each new taking of its slots ([`Takings`]); never per fire.
 //! Each side lies whole in one place: a run of adjacent `Instance` slots in
 //! one chunk where two of its size share a chunk (the runtime's rule,
 //! `store::roles`), else one run of adjacent chunks inside one segment. A
@@ -39,7 +42,7 @@
 use engine::program::{GuestState, ScratchPlace};
 
 use crate::arena::ALIGN;
-use crate::backend::Backend;
+use crate::backend::{Backend, Buffer as _};
 use crate::error::{Fault, Result};
 use crate::store::Pools;
 use crate::store::layout::INSTANCE;
@@ -279,6 +282,21 @@ impl<B: Backend> Placed<B> {
         Ok(())
     }
 
+    /// Zeroes the state's bytes where it lies now. The room is another
+    /// owner's until then: the pool hands back slots and chunks as their
+    /// last owner left them, and a guest's stages may read heap bytes no
+    /// launch of its own wrote. Called when the room changes owner (a bind,
+    /// an unpark's fresh room, a pair's new taking), never per fire; ordered
+    /// as the tables the bind writes are, after the work of the room's last
+    /// owner, which the runtime retired before it handed the room on.
+    pub fn clear(&self) -> Result<()> {
+        let Some((buffer, at)) = &self.span else {
+            return Ok(());
+        };
+        let mut buffer = buffer.clone();
+        buffer.zero_span(*at, self.bytes)
+    }
+
     /// The segment buffer the state lies in and its first byte there;
     /// `None` where it takes no bytes.
     #[must_use]
@@ -297,9 +315,79 @@ impl<B: Backend> Placed<B> {
     }
 }
 
+/// The pairs whose state lies laid now: each place, the taking of its
+/// slots it was laid in (`engine::InstanceBinding::pair_generation`), and
+/// the instances bound on it. A pair's state is zeroed once, where an
+/// instance binds on a place and taking no other instance holds: room the
+/// pool handed back and took again is another owner's bytes until then.
+/// The same live slots bound again are not cleared: a sibling's fire may
+/// be reading its score rows.
+#[derive(Debug, Default)]
+pub struct Takings {
+    live: Vec<(ScratchPlace, u64, u32)>,
+}
+
+impl Takings {
+    /// An instance binds on `place` at `generation`: `true` where none
+    /// holds that taking, so its bytes are to be cleared.
+    pub fn take(&mut self, place: &ScratchPlace, generation: u64) -> bool {
+        if *place == ScratchPlace::None {
+            return false;
+        }
+        match self
+            .live
+            .iter_mut()
+            .find(|(held, taken, _)| held == place && *taken == generation)
+        {
+            Some((_, _, bound)) => {
+                *bound += 1;
+                false
+            }
+            None => {
+                self.live.push((place.clone(), generation, 1));
+                true
+            }
+        }
+    }
+
+    /// An instance bound on `place` at `generation` lets it go: closed, or
+    /// moved to other room.
+    pub fn give(&mut self, place: &ScratchPlace, generation: u64) {
+        if let Some(at) = self
+            .live
+            .iter()
+            .position(|(held, taken, _)| held == place && *taken == generation)
+        {
+            self.live[at].2 -= 1;
+            if self.live[at].2 == 0 {
+                self.live.swap_remove(at);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Facts, GuestLayout, Side};
+    use super::{Facts, GuestLayout, Side, Takings};
+    use engine::program::ScratchPlace;
+
+    /// A pair's state is cleared at the first bind on a place and taking,
+    /// not while another instance holds it, and again once the place is
+    /// let go and taken anew or taken in another generation.
+    #[test]
+    fn a_pair_is_cleared_at_each_new_taking_and_only_then() {
+        let place = ScratchPlace::Run { first: 4, slots: 2 };
+        let mut takings = Takings::default();
+        assert!(takings.take(&place, 0), "the first bind clears");
+        assert!(!takings.take(&place, 0), "a sibling on the live taking does not");
+        assert!(takings.take(&place, 1), "another taking of the same refs clears");
+        takings.give(&place, 0);
+        assert!(!takings.take(&place, 0), "one instance still holds taking 0");
+        takings.give(&place, 0);
+        takings.give(&place, 0);
+        assert!(takings.take(&place, 0), "taken again once every holder let go");
+        assert!(!takings.take(&ScratchPlace::None, 0), "no room, nothing to clear");
+    }
     use engine::program::GuestState;
 
     /// Qwen3-0.6B's pool on the GPU: 4 MiB chunks of 4 KiB `Instance` slots.

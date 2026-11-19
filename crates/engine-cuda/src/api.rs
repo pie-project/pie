@@ -1756,6 +1756,8 @@ impl Cuda {
                         .filter(|_| !placed[at])
                         .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     kv_less: lane.kv_less,
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
