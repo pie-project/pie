@@ -649,19 +649,25 @@ fn the_replay_kernels_cost_at_serving_shapes() {
         // kernels' device time a pass.
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
         let mut device: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        let mut parts: Vec<Vec<[f64; 3]>> = vec![Vec::new(); modes.len()];
         for _ in 0..ROUNDS {
             for (m, &mode) in modes.iter().enumerate() {
                 crate::backend::time_kernels(true);
                 let start = std::time::Instant::now();
                 pass(&gpu, mode);
                 times[m].push(start.elapsed().as_secs_f64() * 1e6 / PASSES as f64);
-                let ns: u64 = crate::backend::kernel_times()
-                    .iter()
-                    .filter(|(name, _, _)| name.contains("ssm"))
-                    .map(|row| row.1)
-                    .sum();
+                let rows = crate::backend::kernel_times();
+                let of = |part: &str| -> f64 {
+                    rows.iter()
+                        .filter(|(name, _, _)| name.contains(part))
+                        .map(|row| row.1 as f64)
+                        .sum::<f64>()
+                        / 1e3
+                        / PASSES as f64
+                };
                 crate::backend::time_kernels(false);
-                device[m].push(ns as f64 / 1e3 / PASSES as f64);
+                device[m].push(of("ssm"));
+                parts[m].push([of("conv1d"), of("gdn_prep"), of("gdn_recurrent")]);
             }
         }
         let median = |v: &[f64]| {
@@ -672,15 +678,19 @@ fn the_replay_kernels_cost_at_serving_shapes() {
         let (base, base_dev) = (median(&times[0]), median(&device[0]));
         for (m, mode) in modes.iter().enumerate() {
             let (us, dev) = (median(&times[m]), median(&device[m]));
+            let part = |k: usize| median(&parts[m].iter().map(|p| p[k]).collect::<Vec<_>>());
             let name = match mode {
                 None => "plain decode".to_string(),
                 Some(l) => format!("replay L={l}"),
             };
             eprintln!(
-                "LAGBENCH {} c{lanes}: {name}: device {dev:.1} us ({:+.1}% of plain), wall {us:.1} us \
-                 ({:+.1}%), a step's 18 delta layers",
+                "LAGBENCH {} c{lanes}: {name}: device {dev:.1} us ({:+.1}% of plain; conv {:.1}, \
+                 gates {:.1}, scan {:.1}), wall {us:.1} us ({:+.1}%), a step's 18 delta layers",
                 crate::backend::NAME,
                 (dev / base_dev - 1.0) * 100.0,
+                part(0),
+                part(1),
+                part(2),
                 (us / base - 1.0) * 100.0
             );
         }

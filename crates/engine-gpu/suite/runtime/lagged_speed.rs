@@ -17,7 +17,7 @@ const CONTEXT: u32 = 1024;
 const PROMPT: usize = 16;
 const STEPS: usize = 32;
 const SETTLE: usize = 3;
-const ROUNDS: usize = 9;
+const ROUNDS: usize = 7;
 
 #[test]
 #[ignore = "a measurement of the lagged decode step"]
@@ -98,6 +98,8 @@ fn the_lagged_decode_step_costs() {
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); lags.len()];
         for _ in 0..ROUNDS {
             for (at, &lag) in lags.iter().enumerate() {
+                // A plain fold first: the lane's buffer starts afresh.
+                step(&mut shell, 0);
                 for _ in 0..SETTLE {
                     step(&mut shell, lag);
                 }
