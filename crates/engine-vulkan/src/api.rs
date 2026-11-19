@@ -12,9 +12,11 @@ use engine::fire::{FireTicket, Step};
 use engine::transfer::MemoryDomain;
 use eta_ir::registry::{PortMask, Stage};
 
-use engine_gpu::api::{Envelope, Host, PendingStep, each_pass, fault, program_attachments};
+use engine_gpu::api::{
+    Envelope, Host, PendingStep, attachment_lanes, each_pass, fault, program_attachments,
+};
 #[cfg(feature = "vulkan")]
-use engine_gpu::api::{attachment_lanes, refusal};
+use engine_gpu::api::refusal;
 
 use crate::device::Api;
 use engine_gpu::serve::Landed;
@@ -87,17 +89,22 @@ impl Host for Api {
         let (ticket, mut step_pending) = gpu.fire_step(step, at, defers, meet.clone())?;
         let landed = step_pending.landed;
         if defers && reads_on_device(gpu, step, &landed) {
-            // The sampler lands on its own and reports the step;
-            // the next frame's forward reads its token on the
-            // device, so nothing here waits.
+            // The step's guest passes land on their own, in one frame
+            // behind the forward, and report the step; the next frame's
+            // forward reads their tokens on the device, so nothing here
+            // waits, unless the host reads some lane's rows itself.
             let wrote = std::mem::take(&mut step_pending.wrote);
             let faulted = std::mem::take(&mut step_pending.faulted);
             let fed = step_pending.fed.take();
-            defer_attachment(gpu, step, at, &landed, wrote, faulted, fed)?;
+            defer_attachments(gpu, step, at, &landed, wrote, faulted, fed)?;
             let shell = gpu.loaded_mut()?;
-            shell.leave_unread(&landed);
+            if host_reads_rows(step) {
+                step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
+            } else {
+                shell.leave_unread(&landed);
+                step_pending.rows = Some(Vec::new());
+            }
             shell.forget_seat(&landed);
-            step_pending.rows = Some(Vec::new());
             return Ok((ticket, step_pending));
         }
         let mut faulted = Vec::new();
@@ -286,16 +293,15 @@ fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> Vec<engine
     faulted.faulted
 }
 
-/// Whether `step`'s one attachment can run behind its forward without
-/// the host waiting for either.
+/// Whether `step`'s guest passes can all run behind its forward, in one
+/// frame, without the host waiting for either.
 fn defers(gpu: &Vulkan, step: &Step) -> bool {
     #[cfg(feature = "vulkan")]
     {
         gpu.sink.is_some()
             && gpu.settles_asynchronously()
-            && step.attachments.len() == 1
-            && !step.attachments[0].adapter_only
-            && gpu.programs.defers(step.attachments[0].instance)
+            && program_attachments(step).next().is_some()
+            && program_attachments(step).all(|attachment| gpu.programs.defers(attachment.instance))
     }
     #[cfg(not(feature = "vulkan"))]
     {
@@ -304,7 +310,17 @@ fn defers(gpu: &Vulkan, step: &Step) -> bool {
     }
 }
 
-fn defer_attachment(
+/// Whether the host reads rows of some lane of `step` no guest pass covers.
+fn host_reads_rows(step: &Step) -> bool {
+    step.lanes.iter().enumerate().any(|(lane, submitted)| {
+        submitted.readout != engine::fire::Readout::None
+            && !program_attachments(step).any(|attachment| {
+                attachment_lanes(attachment).contains(&u32::try_from(lane).unwrap_or(u32::MAX))
+            })
+    })
+}
+
+fn defer_attachments(
     gpu: &mut Vulkan,
     step: &Step,
     at: engine::StepDone,
@@ -324,8 +340,13 @@ fn defer_attachment(
         let shell = shell
             .as_ref()
             .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
-        let attachment = &step.attachments[0];
-        let seats = lane_seats(shell, landed, attachment);
+        let passes = program_attachments(step)
+            .map(|attachment| crate::program::DeferredPass {
+                instance: attachment.instance,
+                lanes: attachment_lanes(attachment),
+                seats: lane_seats(shell, landed, attachment),
+            })
+            .collect();
         let done = sink.clone().map(|sink| Done {
             at,
             sink,
@@ -336,13 +357,7 @@ fn defer_attachment(
             fed,
         });
         programs
-            .fire_deferred(
-                attachment.instance,
-                attachment_lanes(attachment),
-                shell.device(),
-                seats,
-                done,
-            )
+            .fire_deferred(passes, shell.device(), done)
             .map_err(refusal)
     }
     #[cfg(not(feature = "vulkan"))]

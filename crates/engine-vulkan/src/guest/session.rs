@@ -929,6 +929,14 @@ impl Session {
         }
     }
 
+    /// Read-back buffers lent to a pass that never went to the queue.
+    pub fn give_back(&self, lent: Vec<(usize, Buffer)>) {
+        self.landings
+            .lock()
+            .expect("landings lock poisoned")
+            .extend(lent.into_iter().map(|(_, buffer)| buffer));
+    }
+
     /// Where a landed pass hands its read-back buffer back.
     #[must_use]
     pub fn landings(&self) -> Arc<std::sync::Mutex<Vec<Buffer>>> {

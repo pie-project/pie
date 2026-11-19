@@ -25,22 +25,26 @@ pub struct OnDevice<'a> {
     deferral: Option<Deferral>,
 }
 
-/// A pass recorded rather than run: its frame, unsubmitted, and the values
-/// the host reads back once it lands. Every put the host does not read
-/// stays on the device, so the next pass and the next forward take it from
-/// there.
+/// A pass recorded rather than run: the frame it records into (the step's
+/// guest frame, which the passes of every attachment of the step share),
+/// unsubmitted, and the values the host reads back once it lands. Every put
+/// the host does not read stays on the device, so the next stage, the next
+/// pass and the next forward take it from there.
 #[derive(Default)]
 pub struct Deferral {
     pub frame: Option<Frame>,
-    /// The read-back buffer the frame lands into, lent by the session.
-    pub landing: Option<Buffer>,
+    /// The read-back buffers the frame lands into, lent by the session, one
+    /// for each stage that lands a value, with that stage.
+    pub lent: Vec<(usize, Buffer)>,
     pub landings: Vec<Landing>,
 }
 
-/// A put the host reads, landing in the stage's read-back buffer.
+/// A put the host reads, landing in its stage's read-back buffer, the
+/// deferral's `lent[lent]`.
 #[derive(Clone, Copy, Debug)]
 pub struct Landing {
     pub channel: u32,
+    pub lent: usize,
     pub at: u64,
     pub dtype: Dtype,
     pub held: u64,
@@ -73,11 +77,16 @@ impl<'a> OnDevice<'a> {
             .copied()
     }
 
-    /// Records the pass into a frame of its own for the caller to submit,
-    /// instead of running each stage to completion.
+    /// Records the pass into `frame` for the caller to submit, instead of
+    /// running each stage to completion. The frame comes back with the
+    /// deferral ([`OnDevice::take_deferral`]) however the pass ends, with
+    /// whatever other passes recorded into it before.
     #[must_use]
-    pub fn deferred(mut self) -> OnDevice<'a> {
-        self.deferral = Some(Deferral::default());
+    pub fn deferred(mut self, frame: Frame) -> OnDevice<'a> {
+        self.deferral = Some(Deferral {
+            frame: Some(frame),
+            ..Deferral::default()
+        });
         self
     }
 
@@ -98,12 +107,42 @@ impl<'a> OnDevice<'a> {
         wanted: &[u32],
         vals: &mut [Value],
     ) -> Result<()> {
+        let Some(deferral) = self.deferral.as_mut() else {
+            let mut frame = self.device.frame()?;
+            let landed = self.record(package, at, roots, wanted, vals, &mut frame)?;
+            return self.land(package, at, wanted, vals, &landed, frame);
+        };
+        let mut frame = deferral.frame.take().ok_or_else(|| Fault::Program {
+            at: "guest::run",
+            why: "a deferred pass was given no frame to record into".into(),
+        })?;
+        // The frame carries other passes of the step: it goes back to the
+        // deferral whether or not this stage records.
+        let recorded = self.record(package, at, roots, wanted, vals, &mut frame);
+        self.deferral
+            .as_mut()
+            .expect("the deferral was just read")
+            .frame = Some(frame);
+        recorded?;
+        self.ran.push(at);
+        Ok(())
+    }
+
+    /// Records stage `at` into `frame`: its roots in, its dispatch, its puts
+    /// kept on the device or copied out to be read back. Deferred, the
+    /// values the host reads land after the frame does; else returns the
+    /// (value, channel) pairs it copied out, for [`OnDevice::land`].
+    fn record(
+        &mut self,
+        package: &LaunchPackage,
+        at: usize,
+        roots: &[u32],
+        wanted: &[u32],
+        vals: &mut [Value],
+        frame: &mut Frame,
+    ) -> Result<Vec<(u32, u32)>> {
         let plan = &package.plans[at];
         let deferring = self.deferral.is_some();
-        let mut frame = match self.deferral.as_mut().and_then(|d| d.frame.take()) {
-            Some(frame) => frame,
-            None => self.device.frame()?,
-        };
 
         for &global in roots {
             let Some(local) = local_of(package, at, global)? else {
@@ -133,7 +172,7 @@ impl<'a> OnDevice<'a> {
                         frame.copy(seat.seat, seat.at, heap, into, u64::from(values) * 4)?;
                     } else {
                         self.widen
-                            .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                            .encode(frame, seat.seat, seat.at, heap, into, values)?;
                     }
                     into += u64::from(values) * 4;
                 }
@@ -141,7 +180,7 @@ impl<'a> OnDevice<'a> {
             }
             if root.source == ValueOrigin::ChannelTake
                 && vals[global as usize].is_empty()
-                && self.session.restore(&mut frame, at, local, root.channel)?
+                && self.session.restore(frame, at, local, root.channel)?
             {
                 continue;
             }
@@ -153,8 +192,8 @@ impl<'a> OnDevice<'a> {
             self.session.stage_in(at, local, &bytes)?;
         }
 
-        self.session.flush(&mut frame, at)?;
-        self.session.dispatch(&frame, at)?;
+        self.session.flush(frame, at)?;
+        self.session.dispatch(frame, at)?;
         // A value is read back when any channel it goes to is one the
         // device does not keep.
         let mut landed: Vec<(u32, u32)> = Vec::new();
@@ -170,96 +209,91 @@ impl<'a> OnDevice<'a> {
                 keeps(package, channel, bytes)
             };
             if on_device {
-                self.session
-                    .keep(self.device, &mut frame, at, local, channel)?;
+                self.session.keep(self.device, frame, at, local, channel)?;
             } else {
                 self.session.forget(channel);
                 landed.push((put.value, channel));
             }
         }
         let kept = |global: u32| !landed.iter().any(|&(value, _)| value == global);
-        let landing = match self.deferral.as_mut() {
-            Some(deferral) if deferral.landing.is_none() => {
-                if package.plans.len() != 1 {
-                    return Err(Fault::Program {
-                        at: "guest::run",
-                        why: "a pass recorded to land later runs one stage".into(),
-                    });
+        let Some(deferral) = self.deferral.as_mut() else {
+            for &global in wanted {
+                if kept(global) {
+                    continue;
                 }
-                let lent = self.session.lend_landing(self.device, at)?;
-                Some(deferral.landing.insert(lent).clone())
+                if let Some(local) = local_of(package, at, global)? {
+                    self.session.read_back(frame, at, local)?;
+                }
             }
-            Some(deferral) => deferral.landing.clone(),
-            None => None,
+            return Ok(landed);
         };
-        for &global in wanted {
-            if kept(global) {
+        // The stage's read-back buffer, lent once a value of it lands.
+        let mut lent = None;
+        for (index, &global) in wanted.iter().enumerate() {
+            if kept(global) || wanted[..index].contains(&global) {
                 continue;
             }
+            let Some(local) = local_of(package, at, global)? else {
+                continue;
+            };
+            let lent = match lent {
+                Some(lent) => lent,
+                None => {
+                    let buffer = self.session.lend_landing(self.device, at)?;
+                    deferral.lent.push((at, buffer));
+                    *lent.insert(deferral.lent.len() - 1)
+                }
+            };
+            self.session
+                .read_back_into(frame, at, local, &deferral.lent[lent].1)?;
+            let dtype = plan.value_types[local as usize].dtype;
+            let (from, held) = self
+                .session
+                .span(at, local)
+                .expect("a wanted value has a span");
+            for &(_, channel) in landed.iter().filter(|&&(value, _)| value == global) {
+                deferral.landings.push(Landing {
+                    channel,
+                    lent,
+                    at: from,
+                    dtype,
+                    held,
+                });
+            }
+        }
+        // The ring takes an empty cell now; the host's own lands after the
+        // frame does, and a later stage of the pass takes a kept one from
+        // the device.
+        for &global in wanted {
             if let Some(local) = local_of(package, at, global)? {
-                match landing.as_ref() {
-                    Some(into) => self.session.read_back_into(&mut frame, at, local, into)?,
-                    None => self.session.read_back(&mut frame, at, local)?,
-                }
+                vals[global as usize] = from_heap(&[], plan.value_types[local as usize].dtype, 0);
             }
         }
-        if let Some(deferral) = self.deferral.as_mut() {
-            for (index, &global) in wanted.iter().enumerate() {
-                if wanted[..index].contains(&global) {
-                    continue;
-                }
-                let Some(local) = local_of(package, at, global)? else {
-                    continue;
-                };
-                let dtype = plan.value_types[local as usize].dtype;
-                // The ring takes an empty cell now; the host's own lands
-                // after the frame does.
-                vals[global as usize] = from_heap(&[], dtype, 0);
-                let (from, held) = self
-                    .session
-                    .span(at, local)
-                    .expect("a wanted value has a span");
-                for &(_, channel) in landed.iter().filter(|&&(value, _)| value == global) {
-                    deferral.landings.push(Landing {
-                        channel,
-                        at: from,
-                        dtype,
-                        held,
-                    });
-                }
-            }
-            deferral.frame = Some(frame);
-            self.ran.push(at);
-            return Ok(());
-        }
+        Ok(landed)
+    }
+
+    /// Runs the frame stage `at` recorded to completion and reads back what
+    /// it copied out (`landed`).
+    fn land(
+        &mut self,
+        package: &LaunchPackage,
+        at: usize,
+        wanted: &[u32],
+        vals: &mut [Value],
+        landed: &[(u32, u32)],
+        frame: Frame,
+    ) -> Result<()> {
+        let plan = &package.plans[at];
         frame.commit()?;
 
         if let Some(code) = self.session.status()? {
             self.session.clear_status()?;
             return Err(Fault::Program {
                 at: "guest::run",
-                why: {
-                    let named = eta_exec::describe_fault(
-                        package,
-                        code,
-                        u32::try_from(package.channels.len()).unwrap_or(0),
-                    );
-                    match (named.class, named.channel) {
-                        (Some(class), Some(channel)) => format!(
-                            "stage {at} faulted on the device: {class} on channel {channel} \
-                             (code {code})"
-                        ),
-                        (Some(class), None) => {
-                            format!("stage {at} faulted on the device: {class} (code {code})")
-                        }
-                        (None, _) => format!(
-                            "stage {at} faulted on the device with code {code}, which this \
-                             program's fault table does not name"
-                        ),
-                    }
-                },
+                why: describe_device_fault(package, at, code),
             });
         }
+        let kept = |global: u32| !landed.iter().any(|&(value, _)| value == global);
         for &global in wanted {
             let Some(local) = local_of(package, at, global)? else {
                 continue;
@@ -280,6 +314,26 @@ impl<'a> OnDevice<'a> {
         }
         self.ran.push(at);
         Ok(())
+    }
+}
+
+/// What a stage's device fault `code` says, in the words of `package`'s fault
+/// table.
+pub fn describe_device_fault(package: &LaunchPackage, at: usize, code: u32) -> String {
+    let named = eta_exec::describe_fault(
+        package,
+        code,
+        u32::try_from(package.channels.len()).unwrap_or(0),
+    );
+    match (named.class, named.channel) {
+        (Some(class), Some(channel)) => format!(
+            "stage {at} faulted on the device: {class} on channel {channel} (code {code})"
+        ),
+        (Some(class), None) => format!("stage {at} faulted on the device: {class} (code {code})"),
+        (None, _) => format!(
+            "stage {at} faulted on the device with code {code}, which this program's fault \
+             table does not name"
+        ),
     }
 }
 
@@ -338,9 +392,49 @@ fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
             .is_some_and(|decl| decl.host_role != eta_ir::container::HostRole::Reader)
 }
 
-/// The value a landed read-back holds.
-pub fn landed_value(landed: &Buffer, landing: &Landing) -> Result<Value> {
+/// The value a landed read-back holds, of the buffers a deferral lent.
+pub fn landed_value(lent: &[Buffer], landing: &Landing) -> Result<Value> {
+    let landed = lent.get(landing.lent).ok_or_else(|| Fault::Program {
+        at: "guest::run",
+        why: format!(
+            "a landing names read-back buffer {} of the {} its pass lent",
+            landing.lent,
+            lent.len()
+        ),
+    })?;
     let mut raw = vec![0u8; landing.held as usize];
     landed.read(landing.at, &mut raw)?;
     Ok(from_heap(&raw, landing.dtype, landing.held))
+}
+
+/// Whether `package`'s epilogue can be recorded whole to land later: no
+/// stage takes or reads a channel an earlier stage of the pass puts for
+/// the host to read, since that cell reaches the host only once the frame
+/// lands. A cell kept on the device a later stage takes from the device.
+#[must_use]
+pub fn records_whole(package: &LaunchPackage) -> bool {
+    let mut landing: Vec<u32> = Vec::new();
+    for (at, stage) in package.stages.iter().enumerate() {
+        if stage.stage != eta_ir::registry::Stage::Epilogue {
+            continue;
+        }
+        let reads_landing = package.values.iter().enumerate().any(|(global, value)| {
+            matches!(
+                value.source,
+                ValueOrigin::ChannelTake | ValueOrigin::ChannelRead
+            ) && landing.contains(&value.channel)
+                && package
+                    .plan_local(global as u32)
+                    .is_some_and(|(stage, local)| stage == at && local.is_some())
+        });
+        if reads_landing {
+            return false;
+        }
+        landing.extend(
+            (stage.puts.iter())
+                .map(|put| put.channel)
+                .filter(|&channel| !host_reads_not(package, channel)),
+        );
+    }
+    true
 }

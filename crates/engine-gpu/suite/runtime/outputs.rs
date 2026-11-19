@@ -250,6 +250,16 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 
 /// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
 pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
+    loaded_in_flight(tag, model, lanes, 1)
+}
+
+/// [`loaded_lanes`], `frames` in flight.
+fn loaded_in_flight(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    frames: u8,
+) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
@@ -294,7 +304,7 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
                 ..Residency::default()
             },
             ordinal: 0,
-            frames_in_flight: 1,
+            frames_in_flight: frames,
         })
         .expect("the miniature loads");
     Some(Loaded {
@@ -339,6 +349,27 @@ fn bound_with(
     let chunks = &loaded.caps.chunks;
     let mut slots =
         super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
+    let (instance, channels) = bind_epilogue(&mut engine, &mut slots, program, 0);
+    Some(Bound {
+        engine,
+        instance,
+        channels,
+        t_input,
+        word: facts.word(&Request::new(ROWS, false)),
+        planes,
+        dir,
+        decls,
+    })
+}
+
+/// An instance of the epilogue `program` bound over channels of its own
+/// (ids from `3 * at + 1`), and `t` published.
+fn bind_epilogue(
+    engine: &mut backend::Engine,
+    slots: &mut super::slots::Slots,
+    program: engine::program::ProgramId,
+    at: u64,
+) -> (engine::InstanceId, Vec<ChannelId>) {
     let channels: Vec<ChannelId> = [
         (vec![1, 1], EtaDtype::I32, HostRole::Reader),
         (vec![LAYERS, WIDTH], EtaDtype::F32, HostRole::Reader),
@@ -346,10 +377,10 @@ fn bound_with(
     ]
     .into_iter()
     .enumerate()
-    .map(|(at, (shape, dtype, host_role))| {
-        let id = ChannelId(at as u64 + 1);
+    .map(|(dense, (shape, dtype, host_role))| {
+        let id = ChannelId(3 * at + dense as u64 + 1);
         slots.register(
-            &mut engine,
+            engine,
             ChannelRegistration {
                 id,
                 shape,
@@ -367,7 +398,7 @@ fn bound_with(
     .collect();
     let rows = ROWS;
     let binding = slots.binding(
-        &engine,
+        engine,
         InstanceBinding {
             program,
             channels: channels.clone(),
@@ -400,16 +431,163 @@ fn bound_with(
             .expect("the timestep publishes"),
         "the ring had room"
     );
-    Some(Bound {
-        engine,
-        instance,
-        channels,
-        t_input,
-        word: facts.word(&Request::new(rows, false)),
+    (instance, channels)
+}
+
+/// A step of four lanes, each its own instance's, two frames in flight:
+/// every guest pass lands with the step (on an engine that settles off the
+/// submit, in one frame behind the forward, told through the sink), each
+/// instance reads its own lane's id; an instance that cannot run (its
+/// output ring full) faults its own lane and no other.
+#[test]
+fn a_step_of_many_guests_lands_each_on_its_own_lanes() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    const GUESTS: u32 = 4;
+    let Some(Loaded {
+        mut engine,
+        caps: loaded,
+        trace,
         planes,
         dir,
-        decls,
-    })
+    }) = loaded_in_flight("many-guests", &Outputs, GUESTS, 2)
+    else {
+        return;
+    };
+    let asynchronous = engine.settles_asynchronously();
+    let (tx, heard) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    engine.on_complete(Arc::new(move |at, outcome| {
+        let _ = tx.lock().expect("the sink's sender").send((at, outcome));
+    }));
+    let t_input = trace
+        .inputs
+        .iter()
+        .position(|input| input.name == "t")
+        .expect("the plan reads `t`") as u32;
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let program = engine
+        .register_program(&registration_of(&output_decls(&loaded), epilogue(), 0x0e7))
+        .expect("the program registers");
+    let chunks = &loaded.caps.chunks;
+    let mut slots =
+        super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
+    let bound: Vec<(engine::InstanceId, Vec<ChannelId>)> = (0..u64::from(GUESTS))
+        .map(|at| bind_epilogue(&mut engine, &mut slots, program, at))
+        .collect();
+    let tokens = |lane: u32| vec![3u32, 11, (lane * 5 + 2) % VOCAB];
+    let want_id = |lane: u32| {
+        let row = &planes["embed"].1[(tokens(lane)[2] * WIDTH) as usize..][..WIDTH as usize];
+        (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+            .expect("a row") as i32
+    };
+    // Fires the step, every lane its own instance's, and returns what the
+    // step reported: through the sink where the engine settles off the
+    // submit, else committed by the time `submit` returned.
+    let fire = |engine: &mut backend::Engine| {
+        let lanes = (0..GUESTS)
+            .map(|lane| Lane {
+                slot: lane,
+                word,
+                tokens: tokens(lane),
+                readout: Readout::Last,
+                kv_less: true,
+                inputs: vec![InputFeed {
+                    id: t_input,
+                    channel: bound[lane as usize].1[2],
+                }],
+                ..Lane::default()
+            })
+            .collect();
+        let attachments = (0..GUESTS)
+            .map(|lane| Attachment {
+                lane,
+                lanes: 1,
+                instance: bound[lane as usize].0,
+                adapter_only: false,
+            })
+            .collect();
+        let mut ticket = engine
+            .submit(&FrameSubmission::of(Step {
+                lanes,
+                attachments,
+                media: Vec::new(),
+                voxels: Vec::new(),
+            }))
+            .expect("the frame fires");
+        engine.settle_frame(&mut ticket).expect("the frame settles");
+        let outcome = if asynchronous {
+            loop {
+                let (at, outcome) = heard
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the step's completion reaches the sink");
+                if at.frame == ticket.id {
+                    break outcome;
+                }
+            }
+        } else {
+            engine::StepOutcome::committed()
+        };
+        for (instance, _) in &bound {
+            let _ = engine.publish_channel(*instance, 2, &T.to_le_bytes());
+        }
+        outcome
+    };
+    let take = |engine: &mut backend::Engine, lane: u32| {
+        let instance = bound[lane as usize].0;
+        let ids = engine
+            .take_channel(instance, 0)
+            .expect("the channel reads")
+            .expect("the channel holds a cell");
+        engine
+            .take_channel(instance, 1)
+            .expect("the channel reads")
+            .expect("the channel holds a cell");
+        ids
+    };
+
+    let outcome = fire(&mut engine);
+    assert!(outcome.faulted.is_empty(), "no lane faults: {:?}", outcome.faulted);
+    for lane in 0..GUESTS {
+        assert_eq!(
+            take(&mut engine, lane),
+            want_id(lane).to_le_bytes(),
+            "lane {lane}'s instance reads its own lane's id"
+        );
+    }
+
+    // Lane 0's instance leaves its outputs untaken: two fires fill its
+    // rings, and the third cannot put.
+    for _ in 0..2 {
+        let outcome = fire(&mut engine);
+        assert!(outcome.faulted.is_empty(), "no lane faults: {:?}", outcome.faulted);
+        for lane in 1..GUESTS {
+            assert_eq!(take(&mut engine, lane), want_id(lane).to_le_bytes());
+        }
+    }
+    let outcome = fire(&mut engine);
+    let faulted: Vec<u32> = outcome.faulted.iter().map(|fault| fault.lane).collect();
+    assert_eq!(
+        faulted,
+        vec![0],
+        "the blocked instance faults its own lane alone: {:?}",
+        outcome.faulted
+    );
+    for lane in 1..GUESTS {
+        assert_eq!(
+            take(&mut engine, lane),
+            want_id(lane).to_le_bytes(),
+            "lane {lane} commits beside the faulted one"
+        );
+    }
+    assert_eq!(
+        engine.live().tallied(engine::live::Tally::BuiltInFire),
+        0,
+        "a fire the guests read built a pipeline the load did not"
+    );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

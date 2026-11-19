@@ -39,9 +39,92 @@ struct Instance {
     landing: Arc<Owed>,
     /// Set by a pass that faulted after its fire returned.
     faulted: Arc<AtomicBool>,
+
+    /// Whether its epilogue records whole into a step's guest frame to land
+    /// later ([`crate::guest::run::records_whole`]).
+    #[cfg(feature = "vulkan")]
+    records_whole: bool,
 }
 
 use engine_gpu::serve::InputCell;
+
+/// One attachment's pass for a step's guest frame: its instance, the step's
+/// lanes it covers, and what the step read out for each of them.
+#[cfg(feature = "vulkan")]
+pub struct DeferredPass<'a> {
+    pub instance: InstanceId,
+    pub lanes: std::ops::Range<u32>,
+    pub seats: Vec<Vec<crate::guest::run::Readout<'a>>>,
+}
+
+/// A pass on the queue in a step's guest frame: what its landing reads and
+/// where it lands the cells the host reads.
+#[cfg(feature = "vulkan")]
+struct Lander {
+    instance: InstanceId,
+    program: ProgramId,
+    lanes: std::ops::Range<u32>,
+    /// The device's fault word for the instance.
+    status: crate::device::alloc::Buffer,
+    fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)>,
+    owed: Vec<(u32, u64)>,
+    owing: Arc<Owed>,
+    faulted: Arc<AtomicBool>,
+    /// The read-back buffers the frame lands into, each handed back to
+    /// `spare` once read.
+    lent: Vec<crate::device::alloc::Buffer>,
+    spare: Arc<Mutex<Vec<crate::device::alloc::Buffer>>>,
+}
+
+#[cfg(feature = "vulkan")]
+impl Lander {
+    /// The frame landed (or was lost, for `lost`): reads the pass's status
+    /// word, lands its cells into the rings and hands its buffers back.
+    /// Returns its lanes' fault, if any; a fault poisons the instance.
+    fn land(self, lost: Option<&str>) -> Option<String> {
+        let Lander {
+            instance,
+            program,
+            status,
+            fixups,
+            owed,
+            owing,
+            faulted,
+            lent,
+            spare,
+            ..
+        } = self;
+        let mut fault = lost.map(str::to_owned);
+        if fault.is_none() {
+            let mut word = [0u8; 4];
+            fault = match status.read(0, &mut word) {
+                Ok(()) if word == [0; 4] => None,
+                Ok(()) => Some(format!(
+                    "instance {instance} (program {program}) faulted on the device with code {}",
+                    u32::from_le_bytes(word)
+                )),
+                Err(why) => Some(why.to_string()),
+            };
+        }
+        if fault.is_none() {
+            for (ring, sequence, landing) in &fixups {
+                match crate::guest::run::landed_value(&lent, landing) {
+                    Ok(value) => ring.encode_sequence(*sequence, &value),
+                    Err(why) => {
+                        fault = Some(why.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if fault.is_some() {
+            faulted.store(true, Ordering::Release);
+        }
+        owing.land(&owed);
+        spare.lock().expect("spare lock poisoned").extend(lent);
+        fault
+    }
+}
 
 /// Ring cells a pass on the queue has yet to land, as (channel, sequence):
 /// the ring holds a cell for each from the pass's submit, and its value only
@@ -355,6 +438,8 @@ impl Plane {
         }
         #[cfg(not(feature = "vulkan"))]
         let _ = place;
+        #[cfg(feature = "vulkan")]
+        let records_whole = crate::guest::run::records_whole(&plan.package);
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         self.instances.insert(
@@ -370,6 +455,8 @@ impl Plane {
                 own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
+                #[cfg(feature = "vulkan")]
+                records_whole,
             },
         );
         Ok(BoundInstance {
@@ -897,7 +984,6 @@ impl Plane {
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, seats);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
-            widen.disarm();
             (outcome, ran)
         };
 
@@ -965,30 +1051,31 @@ impl Plane {
         Some(cell)
     }
 
-    /// Whether `instance`'s pass can be recorded to land later: one stage,
-    /// reading its logits on the device.
+    /// Whether `instance`'s pass can be recorded into a step's guest frame
+    /// to land later: its epilogue records whole, reading its logits on the
+    /// device, and the instance is sound.
     #[cfg(feature = "vulkan")]
     #[must_use]
     pub fn defers(&self, instance: InstanceId) -> bool {
         self.widen.is_some()
             && self.instances.get(&instance).is_some_and(|seat| {
-                seat.plan.package.plans.len() == 1
-                    && !seat.inst.poisoned
-                    && !seat.faulted.load(Ordering::Acquire)
+                seat.records_whole && !seat.inst.poisoned && !seat.faulted.load(Ordering::Acquire)
             })
     }
 
-    /// Runs `instance`'s pass behind the forward on the queue and returns
-    /// before either lands. The cells the host reads land into the rings on
-    /// another thread, which then reports the step done; every other cell
-    /// stays on the device for the next pass and the next forward.
+    /// Records the passes of a step's attachments (`passes`) into one guest
+    /// frame behind the step's forward on the queue, submits it, and
+    /// returns before either lands. The frame's one landing reads each
+    /// pass's status word and lands the cells the host reads into its
+    /// instance's rings, then reports the step done (`done`): a pass that
+    /// faulted, on the host while it recorded or on the device, faults its
+    /// own lanes, and the step's other lanes commit. Every other cell stays
+    /// on the device for the next pass and the next forward.
     #[cfg(feature = "vulkan")]
     pub fn fire_deferred(
         &mut self,
-        instance: InstanceId,
-        lanes: std::ops::Range<u32>,
+        passes: Vec<DeferredPass<'_>>,
         device: &crate::device::Context,
-        seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
         done: Option<engine_gpu::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
@@ -997,145 +1084,164 @@ impl Plane {
             widen,
             ..
         } = self;
-        let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
         let widen = widen.as_ref().ok_or_else(|| {
-            Refusal::Program(format!(
-                "instance {instance} has a device half, but the plane built no readout widen"
-            ))
+            Refusal::Program(
+                "a guest pass has a device half, but the plane built no readout widen".into(),
+            )
         })?;
-        let inputs = PassInputs::none();
-        let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
-        let outcome = eta_exec::step_with(
-            &mut seat.inst,
-            &seat.plan,
-            &inputs,
-            &mut runner,
-            Stage::Epilogue,
-        );
-        let deferral = runner.take_deferral().unwrap_or_default();
-        widen.disarm();
-        let program = seat.program;
-        let refused = match outcome {
-            StepOutcome::Committed => None,
-            StepOutcome::Blocked(channel) => Some(format!(
-                "instance {instance} (program {program}) blocked on channel {channel}"
-            )),
-            StepOutcome::Faulted(why) => Some(format!(
-                "instance {instance} (program {program}) faulted: {why}"
-            )),
+        let mut frame = device
+            .frame()
+            .map_err(|fault| Refusal::Program(format!("the step's guest frame: {fault}")))?;
+        // The passes that faulted on the host, and those on the queue.
+        let mut refused: Vec<(std::ops::Range<u32>, InstanceId, String)> = Vec::new();
+        let mut landers: Vec<Lander> = Vec::new();
+        for pass in passes {
+            let DeferredPass {
+                instance,
+                lanes,
+                seats,
+            } = pass;
+            let Some(seat) = instances.get_mut(&instance) else {
+                refused.push((lanes, instance, format!("instance {instance} is closed")));
+                continue;
+            };
+            if seat.faulted.load(Ordering::Acquire) {
+                refused.push((lanes, instance, format!("instance {instance} is poisoned")));
+                continue;
+            }
+            let inputs = PassInputs::none();
+            let mut runner = crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats)
+                .deferred(frame);
+            let outcome = eta_exec::step_with(
+                &mut seat.inst,
+                &seat.plan,
+                &inputs,
+                &mut runner,
+                Stage::Epilogue,
+            );
+            let ran = !runner.ran().is_empty();
+            let crate::guest::run::Deferral {
+                frame: back,
+                lent,
+                landings,
+            } = runner.take_deferral().unwrap_or_default();
+            frame = back.ok_or_else(|| {
+                Refusal::Program(format!(
+                    "instance {instance}'s pass kept the step's guest frame"
+                ))
+            })?;
+            let program = seat.program;
+            let why = match outcome {
+                StepOutcome::Committed => None,
+                StepOutcome::Blocked(channel) => Some(format!(
+                    "instance {instance} (program {program}) blocked on channel {channel}"
+                )),
+                StepOutcome::Faulted(why) => Some(format!(
+                    "instance {instance} (program {program}) faulted: {why}"
+                )),
+            };
+            if let Some(why) = why {
+                // What it recorded before it faulted touches its own state
+                // alone, which its fault leaves dead.
+                tracing::warn!(instance = instance.0, %why, "a deferred guest epilogue faulted its lanes");
+                seat.session.give_back(lent);
+                refused.push((lanes, instance, why));
+                continue;
+            }
+            *tally += 1;
+            if !ran {
+                seat.session.give_back(lent);
+                continue;
+            }
+            let fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)> = landings
+                .into_iter()
+                .map(|landing| {
+                    let ring = Arc::clone(&seat.inst.channels[landing.channel as usize]);
+                    let sequence = ring.tail().saturating_sub(1);
+                    (ring, sequence, landing)
+                })
+                .collect();
+            let owed: Vec<(u32, u64)> = fixups
+                .iter()
+                .map(|(_, sequence, landing)| (landing.channel, *sequence))
+                .collect();
+            seat.landing.owe(&owed);
+            landers.push(Lander {
+                instance,
+                program,
+                lanes,
+                status: seat.session.status_cell(),
+                fixups,
+                owed,
+                owing: Arc::clone(&seat.landing),
+                faulted: Arc::clone(&seat.faulted),
+                lent: lent.into_iter().map(|(_, buffer)| buffer).collect(),
+                spare: seat.session.landings(),
+            });
+        }
+        let host_faults = move |outcome: &mut engine::StepOutcome| {
+            for (lanes, instance, why) in &refused {
+                outcome.fault_lanes(lanes.clone(), Some(*instance), why);
+            }
         };
-        if let Some(why) = refused {
-            // The pass faulted on the host: its own lanes fault, and the
-            // step's other lanes commit.
-            tracing::warn!(instance = instance.0, %why, "a deferred guest epilogue faulted its lanes");
+        if landers.is_empty() {
+            // Nothing went to the queue: the step lands with its forward.
+            drop(frame);
             if let Some(done) = done {
                 let mut outcome = done.settled();
-                outcome.fault_lanes(lanes, Some(instance), &why);
+                host_faults(&mut outcome);
                 (done.sink)(done.at, outcome);
             }
             return Ok(());
         }
-        *tally += 1;
-
-        let crate::guest::run::Deferral {
-            frame,
-            landing,
-            landings,
-        } = deferral;
-        let Some(frame) = frame else {
-            if let Some(done) = done {
-                (done.sink)(done.at, done.settled());
-            }
-            return Ok(());
-        };
-        let fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)> = landings
-            .into_iter()
-            .map(|landing| {
-                let ring = Arc::clone(&seat.inst.channels[landing.channel as usize]);
-                let sequence = ring.tail().saturating_sub(1);
-                (ring, sequence, landing)
+        let airborne: Vec<InstanceId> = landers.iter().map(|lander| lander.instance).collect();
+        // A frame that never went to the queue lands nothing: what waits on
+        // its cells finds the instances poisoned rather than waiting on.
+        let never: Vec<(Arc<Owed>, Arc<AtomicBool>, Vec<(u32, u64)>)> = landers
+            .iter()
+            .map(|lander| {
+                (
+                    Arc::clone(&lander.owing),
+                    Arc::clone(&lander.faulted),
+                    lander.owed.clone(),
+                )
             })
             .collect();
-        let owed: Vec<(u32, u64)> = fixups
-            .iter()
-            .map(|(_, sequence, landing)| (landing.channel, *sequence))
-            .collect();
-        seat.landing.owe(&owed);
-
-        // A frame that never went to the queue lands nothing: what waits on
-        // its cells finds the instance poisoned rather than waiting on.
-        let (unowed, poisoned, never) = (
-            Arc::clone(&seat.landing),
-            Arc::clone(&seat.faulted),
-            owed.clone(),
-        );
-        let status = seat.session.status_cell();
-        let spare = seat.session.landings();
-        let landing = Mutex::new(landing);
-        let owing = Arc::clone(&seat.landing);
-        let faulted = Arc::clone(&seat.faulted);
-        let on_done = move |refused: Option<String>| {
-            // The queue refusing the buffer the step's forward and this
-            // pass rode is the step lost whole; what the pass's own status
-            // and landing say is its lanes'.
-            let lost = refused.clone();
-            let mut fault = refused;
-            if fault.is_none() {
-                let mut word = [0u8; 4];
-                fault = match status.read(0, &mut word) {
-                    Ok(()) if word == [0; 4] => None,
-                    Ok(()) => Some(format!(
-                        "instance {instance} (program {program}) faulted on the device with                          code {}",
-                        u32::from_le_bytes(word)
-                    )),
-                    Err(why) => Some(why.to_string()),
-                };
-            }
-            let lent = landing.lock().expect("landing lock poisoned").take();
-            if fault.is_none()
-                && let Some(lent) = lent.as_ref()
-            {
-                for (ring, sequence, landing) in &fixups {
-                    match crate::guest::run::landed_value(lent, landing) {
-                        Ok(value) => ring.encode_sequence(*sequence, &value),
-                        Err(why) => {
-                            fault = Some(why.to_string());
-                            break;
-                        }
-                    }
+        let on_done = move |lost: Option<String>| {
+            // The queue refusing the buffer the step's forward and these
+            // passes rode is the step lost whole; what each pass's own
+            // status and landing say is its lanes'.
+            let mut outcome = done.as_ref().map(engine_gpu::settle::Done::settled);
+            for lander in landers {
+                let (lanes, instance) = (lander.lanes.clone(), lander.instance);
+                let fault = lander.land(lost.as_deref());
+                if let (Some(why), Some(outcome)) = (fault, outcome.as_mut()) {
+                    outcome.fault_lanes(lanes, Some(instance), &why);
                 }
             }
-            if fault.is_some() {
-                faulted.store(true, Ordering::Release);
+            let Some(done) = done.as_ref() else {
+                return;
+            };
+            if lost.is_some() {
+                done.tell(lost, "vulkan guest pass");
+                return;
             }
-            owing.land(&owed);
-            if let Some(lent) = lent {
-                spare.lock().expect("spare lock poisoned").push(lent);
-            }
-            if let Some(done) = done.as_ref() {
-                if lost.is_some() {
-                    done.tell(lost, "vulkan guest pass");
-                    return;
-                }
-                let mut outcome = done.settled();
-                if let Some(why) = fault {
-                    outcome.fault_lanes(lanes.clone(), Some(instance), &why);
-                }
-                (done.sink)(done.at, outcome);
-            }
+            let mut outcome = outcome.expect("a done gives an outcome");
+            host_faults(&mut outcome);
+            (done.sink)(done.at, outcome);
         };
-        let pending = frame
-            .commit_async(Some(Box::new(on_done)))
-            .map_err(|fault| {
+        let pending = frame.commit_async(Some(Box::new(on_done))).map_err(|fault| {
+            for (owing, poisoned, owed) in &never {
                 poisoned.store(true, Ordering::Release);
-                unowed.land(&never);
-                Refusal::Program(format!("instance {instance}: {fault}"))
-            })?;
-        seat.session.depart(pending);
+                owing.land(owed);
+            }
+            Refusal::Program(format!("the step's guest frame: {fault}"))
+        })?;
+        for instance in airborne {
+            if let Some(seat) = instances.get_mut(&instance) {
+                seat.session.depart(pending.clone());
+            }
+        }
         Ok(())
     }
 

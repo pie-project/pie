@@ -2033,6 +2033,9 @@ impl Landing {
     }
 }
 
+/// Clones wait on the one submission: the passes of a step's guest frame
+/// each keep one.
+#[derive(Clone)]
 pub struct Pending {
     inner: Arc<Inner>,
     /// Set where a watcher thread is the fence's one waiter.
