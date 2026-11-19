@@ -1500,7 +1500,10 @@ impl Drop for Inner {
         // device). The command buffer is freed only on the thread whose pool
         // it came from, and otherwise left to that thread as an orphan.
         unsafe {
-            if self.submitted.load(Ordering::Acquire) {
+            // A fence already signaled is not waited on: the frame landed.
+            if self.submitted.load(Ordering::Acquire)
+                && d.get_fence_status(self.fence) != Ok(true)
+            {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
             for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
