@@ -1011,8 +1011,10 @@ fn streamed_dispatches(
                         count = count.div_ceil(32);
                         at += 1;
                     }
+                    // A row's groups, for every row (the kernel folds the
+                    // rows side by side).
                     let chunks = count.div_ceil(32).max(1);
-                    let groups = chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1);
+                    let groups = chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1) * desc.rows.max(1);
                     for _ in 0..repeats(StepKind::Reduce) {
                         out.push((StepWord { level, ..word }, groups));
                     }
