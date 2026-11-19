@@ -595,6 +595,12 @@ impl Lane {
             let landed = broker.clone();
             engine.on_landed(std::sync::Arc::new(move |token: u64| {
                 landed.notify(token, waker::FIRST_COMPLETION_EPOCH);
+                // The scheduler retires the copy's completion on its next
+                // turn: woken now, not at its idle backstop, so the move
+                // waiting on it commits (and its pages come back) at once.
+                if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
+                    let _ = handle.nudge();
+                }
             }));
             if engine.settles_asynchronously() {
                 engine.on_complete(std::sync::Arc::new(
