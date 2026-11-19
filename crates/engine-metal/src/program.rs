@@ -3253,6 +3253,7 @@ mod tests {
                     adapter: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .expect("the slots rebind");
@@ -3332,6 +3333,7 @@ mod tests {
                     adapter: Vec::new(),
                     scratch: engine::ScratchPlace::None,
                     pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
             )
             .expect("the slots rebind");
