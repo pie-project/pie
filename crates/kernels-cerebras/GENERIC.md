@@ -4372,7 +4372,7 @@ pub fn by_op(op: &str) -> Option<&'static dyn Kernel>;
 | `ssm::state` | `ssm.causal_conv1d`, `ssm.gated_delta`, `ssm.gdn_gates`, `ssm.mamba2`, `ssm.kda` | sst, cy_sst | Store / Attend + `Joint::state` | `PYA x lanes`, no replicas, no pages, kind `gdn` / `mamba2` / `kda`, `stw` + `rowp`, b / a parts | none (no GEMM / tiled form) |
 | `linear::moe` | `linear.moe_route`, `moe_select`, `moe_combine` | none (matvecs + regions) | `stream::moe`'s pattern | | none |
 | `linear::gemm` | `linear.matmul` (GEMM regime) | gemm_pe.csl `gemm` | | | `line "gemm"`, `orders Row` |
-| `conv::tiled` | `conv.*`, `attn.voxel` (tiled regime) | tiled_pe.csl | | | hub `allreduce` (a norm's groups) |
+| `conv::conv3d`, `conv::norm`, `conv::up`, `attn::voxel` | `conv.conv3d`, `conv.group_norm`, `conv.upsample`, `attn.voxel` (tiled regime) | tiled_pe.csl | | | their tiled price; hub `allreduce` (a norm's groups), `attend` (a key's words) |
 | template mixers `att`, `gdn`, `kv`, `swa`, `moe` | via `Mixer::{Attn, Gdn}` | ops/*.csl, cy_*.csl | | | declared only (below) |
 
 ### Regimes as placement strategies
@@ -4414,5 +4414,56 @@ H1-H4 and the hub loops stay the same checks, over declared properties instead o
 4. `UnitKernel::lower`: `unit::lower_through`'s attention, recurrence and MoE arms move into
    their modules; the loop asks the registry.
 5. Hazards: `lines` / `hub_loops` over `Hazards`.
-6. The new op: `ssm::short_conv` (inkling's keys and values), `Step::Kernel` and poem-compiler's
+6. The new op: `ssm::short_conv` (inkling's keys and values), a root kernel and poem-compiler's
    `claims`.
+
+### Built
+
+Every step below kept the decode configs, flux's 16,812 files and the unit decodes (qwen3-0.6b
+-l2, qwen3-sim, qwen3-sim4, minimax-sim, gemma4-sim, qwen35-d0.8b -l1, nemotron3-nano-mini -l2,
+qwen3-next-80b-a3b-mini -l4, qwen3-30b-a3b-mini -l1; the 0.6B and 0.8B at two lanes too)
+byte-identical.
+
+- **Registry** (`kernel::{Kernel, KERNELS, by_op}`): a kernel's sources are its own;
+  `sources::stream_ops()` lists the kernels' then the shared `STREAM_LIBS`.
+- **Columns** (`kernel::Column`): `attn.column` (satt / cy_satt) and `ssm.state` (sst / cy_sst)
+  print their K / V column's root and PE files and state its arrays, PEs, replicas, paging,
+  state-root kind and a store's per-head parts; `emit::stream`, `stream::build`, `stream::place`
+  ask the registry.
+- **Unit lowering** (`kernel::UnitKernel`, `stream::unit::Lowering`): `lower_through`'s attention,
+  recurrence and MoE arms are their modules' (`attn.column`, `ssm.state`, `linear.moe`); it
+  matches no mixer op.
+- **Hazards and price** (`kernel::{GemmForm, TiledForm}`): `check::hazard::lines` (H1-H4) reads
+  each GEMM op's form (`linear.gemm`'s row line, `attn.column`'s column line and row order from
+  its code), `hub_loops` each tiled op's `HubSend`; `cost::tiled` sums the tiled forms' prices.
+  The GEMM price moves once D1's stamps refit lands.
+- **Root kernels** (`kernel::RootKernel`, the first of their kind, built with the demonstration):
+  a kernel's op at a unit's roots lowers to a region step of one node (its interface: rows in and
+  out), so the roots place, chunk, feed, price and check it as any region; its module (in place
+  of the region printer's) holds its own arrays (the host's, by `Fill`) and, in a decode step,
+  reads the root's `rowp` (the state root's `rows` region). poem-compiler's stream lowering takes
+  a target's claims (`layer::stream::lower_with`, `Claim::Root`); the GEMM regime refuses a root
+  kernel by name.
+
+**The demonstration: `ssm.short_conv`.** Inkling's first refusal on the units (its keys' and
+values' and both residual branches' short convs). Adding it touched:
+
+| file | what |
+|---|---|
+| `kernel/ssm/short_conv.rs` (new) | the module: its op, its source, its unit lowering, its root module and arrays |
+| `programs/wafer/ops/sconv.csl` (new) | the conv: a root's channels' taps and a lane slot's history, cleared at position 0 |
+| `kernel/mod.rs` | one line in `KERNELS` (and a test) |
+| `kernel/ssm/mod.rs` | `pub mod short_conv;` |
+| `engine-cpu/src/forward.rs` | the reference (`Forward::ssm`; engine-cpu had no `ssm.*` op) |
+
+Inkling's decode now stops at its attention's relative bias (`linear.rel_bias`).
+
+**On the simulator.** No catalog model runs short convs alone (Inkling needs the bias and sink
+experts next), so the gate is a scratch poem, `sconv-sim` (`qwen3-sim` with a short conv on each
+layer's attention output, at the row roots, and on its MLP's gate, at the column roots; 4 taps,
+N(0, 0.5) in bf16, not in `models/`), its golden engine-cpu's (`examples/cpu_golden`, which
+teacher-forced through qwen3-sim's HF golden matches 16 of 16). 20 steps (the prompt's 4 and the
+golden's 16): **16 of 16 token-exact**, logits within bf16 of engine-cpu's (step 4: 408 at 5.4375
+against 5.40625; step 19: 302 at 5.156 against 5.094), 136k cycles a step (qwen3-sim's 75k: the
+column roots' conv is a scalar loop over 256 channels at one root; a DSD form is next).
+
