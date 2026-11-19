@@ -4009,6 +4009,15 @@ refusal of the program where any is open):
     block) holds the difference, unattributed until the attention's own stamps split it.
   - Priced so: Pie's 384 x 520 denoise 163.67M (chip 163.4M); flux2-mini's kbm-16 m2 1.82M
     (chip 1.858M, 1.71M before); the 576-row one 168.7M.
+- **A PE's low data** (`check::lo_dsds`, `LO_DSDS`). cslc keeps every constant DSD value a PE
+  loads in `.data.lo` (`__dsr_lowmeminit_*`, 8 B each), 1,024 B: past 128 the link fails
+  ("data.lo doesn't fit in 1024 bytes") however much of the PE is free. The estimate counts
+  each module instance's top-level `@get_dsd` constants and the distinct DSD-builtin
+  expressions over them with literal arguments, less 17 (fitted: flux2-mini's GEMM PEs at 32
+  columns 103 + 40 = 1,008 B linked, klein's at 384 columns 92 + 40 = 920 B; both exact).
+  flux2-mini's default denoise at 16 x 128 (the price fit's pick) prints its regions at a
+  16-column chunk, 68 expressions: ~154, and its link failed. Every placed program's report
+  refuses an image past it, and the GEMM search a candidate (compile on load keeps 32 x 128).
 
 As emitted today, every GEMM after an attention is an H2 window: flux2-mini's denoise has 8,
 and klein's at c5 and c2 have 50. With v14's barrier or v16's queues, none

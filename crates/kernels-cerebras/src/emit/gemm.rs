@@ -775,6 +775,19 @@ pub fn placed(p: &GemmProgram) -> Placed {
     l
 }
 
+/// The array PE's files (`gpe.csl` and what it imports: the printed regions, `gseg.csl`, the
+/// ops), as [`emit`] writes them: what a check of its image reads before anything is placed.
+pub fn pe_files(p: &GemmProgram) -> R<std::collections::BTreeMap<String, String>> {
+    let tb = table(p)?;
+    let mut files: std::collections::BTreeMap<String, String> = p.modules.iter().cloned().collect();
+    files.insert("gseg.csl".into(), gseg_file());
+    files.insert("gpe.csl".into(), pe_file(p, &tb));
+    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+        files.insert(format!("ops/{n}"), (*s).to_string());
+    }
+    Ok(files)
+}
+
 /// The emitted program.
 #[allow(clippy::too_many_lines)]
 pub fn emit(p: &GemmProgram) -> R<Emitted> {

@@ -21,7 +21,7 @@ pub mod code;
 pub mod hazard;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::emit::placed::Placed;
@@ -194,6 +194,100 @@ pub fn pe_bytes(
         data: held(files, file, params, 0).data,
         code: code_bytes(&code::reached(files, file, params)) + kind_code(files, file),
     }
+}
+
+/// The DSD descriptors a PE image's low data holds at most: cslc keeps every constant DSD value
+/// its code loads (`__dsr_lowmeminit_*`, 8 bytes each) in `.data.lo`, 1,024 bytes; past it the
+/// link fails ("data.lo doesn't fit in 1024 bytes"), whatever the rest of the PE's memory.
+pub const LO_DSDS: i64 = 128;
+/// [`lo_dsds`]' offset, fitted to linked images: what memcpy's runtime adds less what the
+/// compiler folds onto a constant's own descriptor (flux2-mini's GEMM PEs at 32 columns: 103
+/// constants, 40 expressions, 1,008 B; klein's at 384: 92 and 40, 920 B; both exact).
+const LO_FOLDED: i64 = 17;
+
+/// A PE image's constant DSD values ([`LO_DSDS`] the most it links with): every top-level
+/// `@get_dsd` constant of each module instance (its imports' included, at their params), and
+/// each distinct DSD-builtin expression over such a constant whose other arguments are
+/// literals (a region printed at a wider chunk spells more of them: flux2-mini's denoise at 16
+/// columns, 68 against 40 at 32, did not link).
+#[must_use]
+pub fn lo_dsds(
+    files: &BTreeMap<String, String>,
+    file: &str,
+    params: &BTreeMap<String, i64>,
+) -> i64 {
+    const BUILTINS: [&str; 4] = [
+        "@increment_dsd_offset(",
+        "@set_dsd_length(",
+        "@set_dsd_stride(",
+        "@set_dsd_base_addr(",
+    ];
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let c = code::code(files, file, params);
+    let mut tops = 0i64;
+    let mut exprs: BTreeSet<(usize, String)> = BTreeSet::new();
+    for (mi, m) in c.modules.iter().enumerate() {
+        let consts: BTreeSet<String> = m
+            .outside
+            .match_indices("const ")
+            .filter_map(|(at, _)| {
+                let rest = &m.outside[at + 6..];
+                let name: String = rest.chars().take_while(|&ch| ident(ch)).collect();
+                rest[name.len()..]
+                    .trim_start()
+                    .starts_with("= @get_dsd(")
+                    .then_some(name)
+            })
+            .collect();
+        tops += consts.len() as i64;
+        let constant = |e: &str| {
+            let cs: Vec<char> = e.chars().collect();
+            let mut any = false;
+            let mut i = 0;
+            while i < cs.len() {
+                if (cs[i].is_ascii_alphabetic() || cs[i] == '_')
+                    && (i == 0 || !(ident(cs[i - 1]) || cs[i - 1] == '@'))
+                {
+                    let w: String = cs[i..].iter().take_while(|&&ch| ident(ch)).collect();
+                    i += w.len();
+                    if consts.contains(&w) {
+                        any = true;
+                    } else if !matches!(
+                        w.as_str(),
+                        "f32" | "f16" | "i16" | "u16" | "i32" | "u32" | "as"
+                    ) {
+                        return false;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            any
+        };
+        let mut found: Vec<String> = Vec::new();
+        for text in std::iter::once(&m.outside).chain(m.funcs.values().map(|f| &f.body)) {
+            for b in BUILTINS {
+                for (at, _) in text.match_indices(b) {
+                    if let Some(args) = call_args(&text[at..]) {
+                        let e: String = format!("{b}{})", args.join(","))
+                            .chars()
+                            .filter(|ch| !ch.is_whitespace())
+                            .collect();
+                        if constant(&e) {
+                            found.push(e);
+                        }
+                    }
+                }
+            }
+        }
+        // (an operand is the outermost expression: one nested in another is not its own)
+        for e in &found {
+            if !found.iter().any(|o| o != e && o.contains(e.as_str())) {
+                exprs.insert((mi, e.clone()));
+            }
+        }
+    }
+    tops + exprs.len() as i64 - LO_FOLDED
 }
 
 /// The words a tape PE's array may take: the room its image leaves past its own bytes (`own`,
@@ -999,6 +1093,13 @@ fn placed_with(
         let params: BTreeMap<String, i64> = p.iter().cloned().collect();
         for h in hazard::hazards(files, f, &params) {
             rep.errors.push(h);
+        }
+        let lo = lo_dsds(files, f, &params);
+        if lo > LO_DSDS {
+            rep.errors.push(format!(
+                "`{f}`: ~{lo} constant DSD values, past the {LO_DSDS} a PE's low data holds \
+                 (data.lo): it cannot link"
+            ));
         }
         let reached = code::reached(files, f, &params);
         let code = code_bytes(&reached) + kind_code(files, f);

@@ -1718,6 +1718,22 @@ pub fn candidates(
                     }
                     continue;
                 }
+                // (its array PE's constant DSDs: past a PE's low data it cannot link)
+                let lo = crate::emit::gemm::pe_files(&p).map_or(0, |f| {
+                    crate::check::lo_dsds(&f, "gpe.csl", &BTreeMap::new())
+                });
+                if lo > crate::check::LO_DSDS {
+                    if why.as_ref().is_none_or(|w| w.1) {
+                        why = Some((
+                            format!(
+                                "{c} x {r}: ~{lo} constant DSD values a PE (of {})",
+                                crate::check::LO_DSDS
+                            ),
+                            false,
+                        ));
+                    }
+                    continue;
+                }
                 all.push((crate::cost::gemm::time(&p).cycles, p));
             }
             Err(e) => {
@@ -2271,6 +2287,35 @@ mod tests {
         assert_eq!(m.src(3 * 128 + 16), 128 + 64);
         assert!(p.l.regs.iter().any(|g| g.head));
         assert!(crate::cost::gemm::memory(&p).total <= crate::cost::gemm::PE_WORDS);
+    }
+
+    /// A PE's low data (`data.lo`, 128 DSD descriptors): flux2-mini's default denoise (rows 16,
+    /// four requests a launch, key blocks of 32) at 32 x 128 PEs holds 126 constant DSD values,
+    /// as its link measured (1,008 B); at 16 x 128 its regions print at a 16-column chunk and
+    /// spell more of them (~154): it did not link ("data.lo doesn't fit in 1024 bytes"), so the
+    /// search refuses it, pinned or not.
+    #[test]
+    fn a_placement_past_a_pes_low_data_is_refused() {
+        let o = Options {
+            reading: "denoise".into(),
+            rows: 16,
+            round16: true,
+            upto: None,
+            taps: Vec::new(),
+            anneal: Default::default(),
+        };
+        let t = trace("flux2-mini-bf16-kv-bf16");
+        let at = |c: u32| candidates(&t, &o, &[], Some((c, 128, 32)), (762, 1172), 4);
+        let (wide, _) = at(32).unwrap_or_else(|e| panic!("{e}"));
+        let p = &wide.first().expect("32 x 128 places").1;
+        let files = crate::emit::gemm::pe_files(p).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            crate::check::lo_dsds(&files, "gpe.csl", &BTreeMap::new()),
+            126
+        );
+        let (narrow, why) = at(16).unwrap_or_else(|e| panic!("{e}"));
+        assert!(narrow.is_empty(), "16 x 128 refused");
+        assert!(why.contains("constant DSD values"), "{why}");
     }
 
     /// Two requests a launch: their rows in turn over the array, each PE row one request's, the
