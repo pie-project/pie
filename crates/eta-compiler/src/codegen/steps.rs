@@ -290,12 +290,22 @@ pub fn reduce_levels(plan: &LaunchStagePlan, at: usize) -> u32 {
     let Some(mut len) = last_extent(plan, at) else {
         return REDUCE_LEVELS;
     };
+    let first = plan.ops.get(at).map_or(32, |op| first_fan(op.tag));
     let mut levels = 0;
     while len > 1 && levels < REDUCE_LEVELS {
-        len = len.div_ceil(32);
+        len = len.div_ceil(if levels == 0 { first } else { 32 });
         levels += 1;
     }
     levels
+}
+
+/// The lanes a job of a reduction's first level folds (the runtime's
+/// `red_fan0`): 32, but 8 for a `gumbel_argmax`, whose lanes each hash the
+/// rng and take two logs, so a row spreads over four times the
+/// invocations. Every level above folds 32.
+#[must_use]
+pub const fn first_fan(tag: u8) -> u64 {
+    if tag == tags::GUMBEL_ARGMAX { 8 } else { 32 }
 }
 
 /// Whether `at`'s argument is one row, which the one-row select handles.

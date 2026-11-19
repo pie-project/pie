@@ -22,8 +22,9 @@ pub const SELECT_WORDS: u32 = 10320;
 /// node of `tag` whose first argument holds `len` elements in `rows` rows,
 /// as its cells lay them: a sort, a top-k or a pivot two buffers of two
 /// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
-/// lie within them), a reduction two buffers of two words a 32-element
-/// group of each row (`tmp_v`), any other node none. Saturates past a
+/// lie within them), a reduction two buffers of two words a group of each
+/// row its first level folds (`tmp_v`; 32 elements, a `gumbel_argmax`'s 8:
+/// `steps::first_fan`), any other node none. Saturates past a
 /// `u64`, which no scratch holds.
 #[must_use]
 pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
@@ -31,7 +32,7 @@ pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
         len.saturating_mul(16)
     } else if is_reduce(tag) {
         let rows = if rows == 0 { 1 } else { rows };
-        rows.saturating_mul((len / rows).div_ceil(32))
+        rows.saturating_mul((len / rows).div_ceil(steps::first_fan(tag)))
             .saturating_mul(16)
     } else {
         0
@@ -402,7 +403,9 @@ pub struct Stepwise {
 /// 7: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
 /// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
 /// the divisor and the keyed rng, with no noise row.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 7;
+/// 8: a `gumbel_argmax`'s first level folds 8 lanes a job, not 32
+/// (`red_fan0`), so its hashes spread over four times the invocations.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 8;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
@@ -1096,6 +1099,9 @@ mod stepwise_tests {
             assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
             assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
         }
+        // A draw's first level folds 8 lanes a job.
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1), 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
         assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
         assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
         assert!(selects(tags::PIVOT_THRESHOLD));
