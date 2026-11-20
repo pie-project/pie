@@ -63,8 +63,10 @@ impl Image {
 pub struct ArmBlock {
     pub(crate) block: Buffer,
     pub(crate) staging: Buffer,
-    /// The hash and length of the image the staging slice holds.
-    staged: Mutex<Option<(u64, u64)>>,
+    /// The bytes of the sealed image the staging slice holds (and, every
+    /// write being followed by a head that copies the slice, the block),
+    /// with their hash: a fire's image that matches both needs no head.
+    staged: Mutex<Option<(u64, Vec<u8>)>>,
 }
 
 impl ArmBlock {
@@ -91,19 +93,38 @@ impl ArmBlock {
         self.block.bytes()
     }
 
-    /// Writes `image` into the staging slice, unless it holds it already.
-    /// The caller holds the arm: its last fire has landed.
-    pub(crate) fn stage(&self, image: &Image) -> Result<()> {
+    /// Writes `image` into the staging slice, unless it holds it already,
+    /// and answers whether it wrote it. Every write is followed by a head
+    /// that copies the slice into the block, so an image the slice already
+    /// held is the block's too, and its fire needs no head. The caller holds
+    /// the arm: its last fire has landed.
+    pub(crate) fn stage(&self, image: &Image) -> Result<bool> {
         let mut staged = self.staged.lock().expect("staged lock poisoned");
-        let held = (image.hash, image.bytes());
-        if image.hash != 0 && *staged == Some(held) {
-            return Ok(());
+        let bytes = image.chunks.first().map_or(&[][..], Vec::as_slice);
+        // The hash over the whole image, then the bytes themselves: a few
+        // kilobytes, against a head's copy and two barriers.
+        if image.hash != 0
+            && staged
+                .as_ref()
+                .is_some_and(|(hash, held)| *hash == image.hash && held.as_slice() == bytes)
+        {
+            return Ok(false);
         }
-        if let Some(bytes) = image.chunks.first() {
+        // Forgotten first: a write that fails leaves no image held.
+        *staged = None;
+        if !bytes.is_empty() {
             self.staging.write_shared(0, bytes)?;
         }
-        *staged = (image.hash != 0).then_some(held);
-        Ok(())
+        if image.hash != 0 {
+            *staged = Some((image.hash, bytes.to_vec()));
+        }
+        Ok(true)
+    }
+
+    /// The slice's image may not have reached the block (its head was not
+    /// submitted): the next fire writes and copies it again.
+    pub(crate) fn forget_staged(&self) {
+        *self.staged.lock().expect("staged lock poisoned") = None;
     }
 }
 

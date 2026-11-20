@@ -1769,6 +1769,8 @@ impl Frame {
     /// walks runs first. The arm's last fire has landed: the arm was taken.
     fn staged_head(&self) -> Result<Option<vk::CommandBuffer>> {
         if let Some(arm) = self.block.borrow().arm() {
+            // A walk's image is unsealed: it is always written, and its head
+            // always copies it.
             arm.stage(self.block.borrow().image())?;
         }
         self.head(true)
@@ -2447,6 +2449,7 @@ impl Frame {
         let head = self.head(false)?;
         Ok(Kept {
             head,
+            copy: std::sync::atomic::AtomicBool::new(true),
             inner: Arc::clone(&self.inner),
             block: std::mem::take(&mut *self.block.borrow_mut()),
             baked: self.baked.borrow().finish(),
@@ -2481,8 +2484,13 @@ impl Drop for Frame {
 pub struct Kept {
     inner: Arc<Inner>,
 
-    /// What every submission of it runs first ([`Frame::head`]).
+    /// What a submission of it runs first ([`Frame::head`]), where the
+    /// block does not hold its image already.
     head: Option<vk::CommandBuffer>,
+
+    /// The next replay runs the head: its image reached the staging slice
+    /// since the last head copied it.
+    copy: std::sync::atomic::AtomicBool,
 
     block: super::block::FireBlock,
 
@@ -2533,7 +2541,13 @@ impl Kept {
     /// in flight reads the slice and no wait is owed.
     pub fn stage(&self, image: &super::block::Image) -> Result<()> {
         match self.block.arm() {
-            Some(arm) => arm.stage(image),
+            Some(arm) => {
+                let wrote = arm.stage(image)?;
+                // The block holds the image already where the slice did:
+                // the next replay runs no head.
+                self.copy.store(wrote, Ordering::Release);
+                Ok(())
+            }
             None => Err(Fault::Unbound {
                 what: "an arm's fire block for a kept frame walked without one".to_string(),
             }),
@@ -2605,8 +2619,8 @@ impl Kept {
         let fence = core.lend_fence()?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
-            let bufs: Vec<vk::CommandBuffer> =
-                self.head.into_iter().chain([self.inner.cmd()]).collect();
+            let head = self.head.filter(|_| self.copy.swap(true, Ordering::AcqRel));
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([self.inner.cmd()]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
             // SAFETY: the head and `cmd` are executable and recorded without
@@ -2615,6 +2629,9 @@ impl Kept {
             if let Err(e) = unsafe { d.queue_submit(*queue, &submits, fence) } {
                 drop(queue);
                 core.return_fence(fence);
+                if let Some(arm) = self.block.arm() {
+                    arm.forget_staged();
+                }
                 return Err(core.fault("vkQueueSubmit", e));
             }
         }
