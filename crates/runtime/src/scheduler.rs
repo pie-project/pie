@@ -362,13 +362,16 @@ impl std::fmt::Display for ReconfigureRefused {
 
 impl std::error::Error for ReconfigureRefused {}
 
-pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), ReconfigureRefused> {
+/// Sets the frame size while the runtime is idle. The dispatch depth is
+/// the engines' stated frames in flight
+/// ([`::engine::Capabilities::frames_in_flight`]) and changes only with a
+/// load: a sweep over it reloads the engine at each depth.
+pub fn reconfigure(frame_size: usize) -> Result<(), ReconfigureRefused> {
     let live = crate::inferlet::process::live_count();
     if live > 0 {
         return Err(ReconfigureRefused::Busy(live));
     }
     set_frame_size(frame_size);
-    set_dispatch_depth(dispatch_depth);
     Ok(())
 }
 
