@@ -8369,3 +8369,88 @@ async fn a_restore_head_one_queued_resident_away_is_funded_with_nothing_in_fligh
         "the queued occupant is moved for the head"
     );
 }
+
+/// The L40S at 3 GiB disk-only on 5120cbc3c: the last six beams waited
+/// silently, every one evicted and queued for its restore, none resident,
+/// nothing in flight, and no head chosen (head_kind=-): each restore was
+/// held for the head it had been evicted for, itself an evicted restore
+/// held the same way. With nothing else to serve, the oldest such restore
+/// heads the queue.
+#[test]
+fn with_every_waiter_an_evicted_restore_held_for_another_one_heads_the_queue() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let pids: Vec<ProcessId> = (0..3).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &pids {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let keys = planner.with_inner(|inner| {
+        pids.iter()
+            .enumerate()
+            .map(|(at, &pid)| {
+                let proc = inner.procs.get_mut(&pid).unwrap();
+                proc.state = Residency::Evicted;
+                proc.evicted_for = Some(pids[(at + 1) % pids.len()]);
+                inner.enqueue(
+                    pid,
+                    WaitKind::Restore {
+                        demand: Demand::default(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        planner.with_inner(|inner| inner.unmet_head().map(|(key, _)| key)),
+        Some(keys[0]),
+        "the oldest held restore heads the queue"
+    );
+}
+
+/// The L40S at 3 GiB disk-only on 5120cbc3c, its last six beams: every
+/// waiter an evicted restore held for another's, no one resident, nothing
+/// in flight, and the device still held by their state (17 chunks, 150
+/// pages). The oldest heads the queue, and the state the others left on
+/// the device moves down for its runs, nobody resident.
+#[tokio::test(flavor = "current_thread")]
+async fn with_no_one_resident_evicted_state_moves_down_for_a_held_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(4, 0..0, 0));
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (first, second) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [first, second] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // The second's state holds every chunk; each was evicted for the other.
+    pool.kv.lock().extend((0..4).map(|chunk| (chunk, second)));
+    planner.with_inner(|inner| {
+        for (pid, other) in [(first, second), (second, first)] {
+            let proc = inner.procs.get_mut(&pid).unwrap();
+            proc.state = Residency::Evicted;
+            proc.evicted_for = Some(other);
+        }
+        inner.procs.get_mut(&first).unwrap().roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        for pid in [first, second] {
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if !pool.moved.lock().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(*pool.moved.lock(), vec!["state"], "the second's state moves down for the first");
+}

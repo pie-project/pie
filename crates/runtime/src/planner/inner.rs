@@ -349,6 +349,13 @@ impl Inner {
                     && self.procs.get(&other.pid).is_some_and(|proc| proc.seq < seq)
             })
         };
+        // The oldest restore passed over for the head it was evicted for:
+        // where nothing else heads the queue, it does. With every waiter
+        // an evicted restore, each held for another's (the L40S at 3 GiB
+        // on 5120cbc3c: six beams evicted for one another, none resident,
+        // nothing in flight), no head was chosen, no restore was ever
+        // planned, and even the beat named none.
+        let mut held_restore: Option<EntryKey> = None;
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {
                 continue;
@@ -356,6 +363,7 @@ impl Inner {
             if matches!(waiter.kind, WaitKind::Restore { .. })
                 && (held_for_head(waiter.pid) || behind_queue(waiter.pid))
             {
+                held_restore.get_or_insert(key);
                 continue;
             }
             match &waiter.kind {
@@ -391,7 +399,25 @@ impl Inner {
                 }
             }
             (Some(allocation), None) => allocation,
-            (None, restore) => restore?,
+            (None, Some(restore)) => restore,
+            // Nothing else waits that could be served: an older entry still
+            // to take its grant holds the queue (`behind_queue`'s case), as
+            // does anything in flight; else, nothing moving, the restore
+            // held for its head goes.
+            (None, None) => {
+                let held = held_restore?;
+                let served_untaken = self.queue.values().any(|waiter| match &waiter.kind {
+                    WaitKind::Allocation { outcome, .. } => outcome.is_some(),
+                    WaitKind::BindRoom { served, .. } => *served,
+                    WaitKind::Restore { .. } => false,
+                });
+                // A head restoring (or anything else in flight) may serve
+                // it yet: held, as the anti-thrash rule asks.
+                if served_untaken || !self.nothing_in_flight() {
+                    return None;
+                }
+                held
+            }
         };
         self.queue
             .get_key_value(&head)
