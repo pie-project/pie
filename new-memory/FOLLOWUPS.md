@@ -823,21 +823,25 @@ whichever submit is in flight; the test catches it when that submit overlaps the
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
 
-## F42. XLA: a laid program's first execution costs 2.5-6 ms more than its later ones
+## F42. The first request after boot runs slow; the first served fire of each XLA shape too
 
-The warm ladder compiles and loads every program at boot but only traces its fires
-(6123377f2); nothing executes a program until a served fire does. Each executable's first
-execution then runs 2.5-6 ms longer on the device than its median (v6e qwen3-0.6b, census
-config, PIE_XLA_TIMING after ready: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
-decode 5.6 against 2.2 ms, a 128-row mixed fire 9.7 against 5.3 ms; host stage unchanged;
-nothing compiled or loaded after ready, 0 misses). A burst that touches many shapes pays it
-many times: the first staggered load after boot runs 1508 tok/s against 2189 on the next
-(tip e465dd459; the same with the mixed decode capacity, 1392 against 2150 under timing).
+Two one-time costs after ready, measured on v6e qwen3-0.6b (census config), tip and the
+mixed decode capacity alike:
 
-Pre-existing; the libtpu per-executable work on first execute (likely its program image
-reaching the device) is not named by the PJRT API. Lever: execute each laid program once at
-load, on scratch (the warm fires did so before 6123377f2, at boot time's cost: ~436 programs
-x a few ms, plus staging), so a served fire is never an executable's first.
+- The server's first request of an inferlet: 117 ms against 22 ms for the next ones (a
+  12 ms install, guest registrations cache hits of ~1 ms). A burst that arrives first
+  piles up behind it: the first staggered load after boot runs 1508 tok/s against 2189 on
+  the next, and one tiny request beforehand brings the first staggered load to 2335
+  against 2345. It sits in the runtime's first launch of an inferlet program (not the
+  engine's programs); naming it is the runtime's.
+- XLA: the first served fire of each fire shape runs 2.5-6 ms longer on the device than
+  its median (PIE_XLA_TIMING: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
+  decode 5.6 against 2.2 ms; about 45-50 ms over the 20 shapes a first load touches; host
+  stage unchanged, nothing compiled or loaded after ready). Executing every laid program
+  once at load, on scratch, does not remove it (2.36 against 2.47 ms mean excess, at 17 s
+  of boot), so it is not an executable's first execution: something a served fire of a
+  shape first touches (its staged inputs' device buffers, its readout seats) that a
+  scratch fire does not. Unnamed; small next to the first item.
 
 ## F43. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
 
