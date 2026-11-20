@@ -2639,4 +2639,143 @@ fn with_no_host_tier_a_second_restore_waits_for_the_pair_the_first_brings_back()
         .expect("it comes back");
     roles.lock().unwrap().commit(back);
     assert_eq!(rebound_pair(&roles, 2, second), pair, "rebound to where it landed");
+    // Back but not yet rebound, it is no resident's: its restore waits.
+    assert_eq!(roles.lock().unwrap().unbound(holder(2)), vec![second]);
+    let stale = roles.lock().unwrap().stale(holder(2));
+    for rebind in stale {
+        roles.lock().unwrap().rebound(Owner::of(&rebind));
+    }
+    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "rebound: resident");
+}
+
+/// A process's instances parked where they lie (no host tier) are unbound
+/// until its restore brings them back and the engine is told where: a
+/// restore reports it resident only once none is, so no fire runs on the
+/// places it gave back at its park. A process never parked has none.
+#[test]
+fn an_instance_is_unbound_from_its_park_until_its_rebind() {
+    let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let other = bind(&roles, &mut engine, 2).unwrap();
+    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "bound where it lies");
+    park(&roles, 1);
+    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "parked where it lies");
+    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "the other stays bound");
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it comes back");
+    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "moving");
+    roles.lock().unwrap().commit(back);
+    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "back, not rebound");
+    let stale = roles.lock().unwrap().stale(holder(1));
+    for rebind in stale {
+        roles.lock().unwrap().rebound(Owner::of(&rebind));
+    }
+    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "rebound");
+    roles.lock().unwrap().close_instance(id);
+    roles.lock().unwrap().close_instance(other);
+}
+
+/// Where the engine fires instance `id` now: the scratch and pair its bind
+/// named, then each rebind it was told since (the mock's own record).
+fn fires_on(engine: &GuestEngine, id: InstanceId) -> (ScratchPlace, ScratchPlace) {
+    let bound = &engine.bindings[usize::try_from(id.0 - 1).expect("an index")];
+    let (mut scratch, mut pair) = (bound.scratch.clone(), bound.pair.clone());
+    for rebind in &engine.rebinds {
+        if let Rebind::Instance {
+            id: at,
+            scratch: to,
+            pair: to_pair,
+            ..
+        } = rebind
+            && *at == id
+        {
+            if *to != ScratchPlace::None {
+                scratch = to.clone();
+            }
+            if *to_pair != ScratchPlace::None {
+                pair = to_pair.clone();
+            }
+        }
+    }
+    (scratch, pair)
+}
+
+/// A mock engine's view of the disk-only soak's failure: two processes
+/// share a pair on a pool with no host tier, both park where they lie
+/// (scratch and the pair's state given back), and a third binds into the
+/// room they gave back. Their restores run at once. Whenever a process is
+/// fit to fire (no instance of its unbound, `Roles::unbound`, what its
+/// restore waits on), the engine fires each of its instances on the place
+/// it was rebound to: the roles' current place, apart from every other
+/// live instance's. The second restore waits for the pair the first brings
+/// back, and until its rebind lands it is not fit to fire: the place its
+/// engine binding still names was given back at its park.
+#[test]
+fn with_no_host_tier_a_restored_instance_fires_on_its_rebound_place() {
+    let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let a = bind(&roles, &mut engine, 1).unwrap();
+    let b = bind(&roles, &mut engine, 2).unwrap();
+    let parked_at = fires_on(&engine, b).0;
+    park(&roles, 1);
+    park(&roles, 2);
+    // Another program's process binds in the room given back (one of the
+    // same program would bring the pair back with its bind).
+    let (other, mut other_engine) = runs_of(14, 1, 1, 9000);
+    bind_as(&roles, &mut other_engine, other, 3).expect("the third binds in the room given back");
+    let c_place = other_engine.bindings[0].scratch.clone();
+    let lane = |roles: &RolesHandle, engine: &mut GuestEngine, by: u128| {
+        let stale = roles.lock().unwrap().stale(holder(by));
+        for rebind in stale {
+            super::rebind(Some(roles), engine, rebind, |_, _, _| Ok(())).expect("rebound");
+        }
+    };
+    let apart = |engine: &GuestEngine, live: &[InstanceId]| {
+        let places: Vec<ScratchPlace> = live.iter().map(|&id| fires_on(engine, id).0).collect();
+        let pair = fires_on(engine, live[0]).1;
+        let mut all: Vec<&ScratchPlace> = places.iter().collect();
+        all.push(&pair);
+        all.push(&c_place);
+        disjoint(&all)
+    };
+
+    let first = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("the first brings the pair back");
+    assert!(
+        matches!(roles.lock().unwrap().prepare_unpark(holder(2)), Err(RolesError::PairParked(_))),
+        "the second waits for the pair's move"
+    );
+    roles.lock().unwrap().commit(first);
+    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![a], "back, not yet rebound");
+    lane(&roles, &mut engine, 1);
+    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "the first may fire");
+    apart(&engine, &[a]).expect("the first fires on its own place");
+
+    let second = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .expect("the second comes back once the pair has landed");
+    roles.lock().unwrap().commit(second);
+    assert_eq!(
+        roles.lock().unwrap().unbound(holder(2)),
+        vec![b],
+        "back, its engine binding still where it parked: not fit to fire"
+    );
+    assert_eq!(fires_on(&engine, b).0, parked_at, "the engine still names its old place");
+    lane(&roles, &mut engine, 2);
+    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "the second may fire");
+    assert_ne!(fires_on(&engine, b).0, parked_at, "it fires on fresh room");
+    apart(&engine, &[a, b]).expect("each fires on its own place");
+    assert_eq!(fires_on(&engine, a).1, fires_on(&engine, b).1, "one pair, where it landed");
 }

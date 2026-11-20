@@ -2474,6 +2474,28 @@ impl Roles {
             .map_or_else(Vec::new, Item::refs)
     }
 
+    /// `holder`'s open instances not yet bound where they lie: off the
+    /// device, moving, parked where they lie, or back but not rebound. A
+    /// restore reports its process resident only once this is empty: a
+    /// fire of an instance the engine still binds at the places it gave
+    /// back at its park runs on room others hold since.
+    #[must_use]
+    pub fn unbound(&self, holder: Holder) -> Vec<InstanceId> {
+        self.items
+            .iter()
+            .filter_map(|(owner, item)| match *owner {
+                Owner::Instance(id)
+                    if item.holder == Some(holder)
+                        && item.open
+                        && (item.tier != Tier::Device || item.shed || item.stale) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether a host write into `instance`'s rings must wait: its own
     /// slots, or a registered channel's it is bound to, are parked, moving,
     /// or back but not yet rebound.

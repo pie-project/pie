@@ -1044,6 +1044,24 @@ async fn restore(
             planner.restore_failed(pid, &error);
             return;
         }
+        // An instance its rebinds could not name yet (its pair still on its
+        // way back with another process's restore) is bound once that move
+        // lands: the process is not resident until then, so no fire of it
+        // runs on the places it gave back at its park. Each change of the
+        // roles (a move committed or aborted) looks again.
+        loop {
+            let watch = store.lock().unwrap().room_watch();
+            let unbound = store.lock().unwrap().unbound(pid);
+            if unbound.is_empty() {
+                break;
+            }
+            tracing::debug!(%pid, ?unbound, "planner: a restore waits for its instances' rebinds");
+            watch.freed().await;
+            if let Err(error) = rebind(engine, store, pid).await {
+                planner.restore_failed(pid, &error);
+                return;
+            }
+        }
     }
     ptrace!(
         "restore-done pid={} ms={}",
