@@ -823,7 +823,7 @@ whichever submit is in flight; the test catches it when that submit overlaps the
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
 
-## F43. XLA: a laid program's first execution costs 2.5-6 ms more than its later ones
+## F42. XLA: a laid program's first execution costs 2.5-6 ms more than its later ones
 
 The warm ladder compiles and loads every program at boot but only traces its fires
 (6123377f2); nothing executes a program until a served fire does. Each executable's first
@@ -839,7 +839,7 @@ reaching the device) is not named by the PJRT API. Lever: execute each laid prog
 load, on scratch (the warm fires did so before 6123377f2, at boot time's cost: ~436 programs
 x a few ms, plus staging), so a served fire is never an executable's first.
 
-## F44. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
+## F43. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
 
 `canonical_pads` (engine-xla serve) pads a fire that prefills to rungs so a laid program
 holds it, and returns None where no laid shape exists; the fire then goes out at its exact
