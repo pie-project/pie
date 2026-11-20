@@ -1037,12 +1037,15 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     //
     // A point's first fire is estimated from the nearest shape measured: the
     // point before it at these rows, else these keys at the rows before
-    // (fewer rows run slower, so it is estimated long), else not at all
-    // (estimated from its own frames as they land). Never from the square
-    // curve: a few rows against a prefix run several times slower than a
-    // square of the keys (128 rows ran at an eighth of it on an RTX), and a
-    // first fire estimated that far short would count that error into the
-    // margin as the device's.
+    // (fewer rows run slower, so it is estimated long). Only the sweep's
+    // first point, its fewest rows against its fewest keys, has none (it is
+    // estimated from its own frames as they land); any other point with none
+    // is not fired, nor is any past a point the bound refused: its rows'
+    // curve stops there, as a kernel's does (`curve_of`), since more keys or
+    // more rows take no less. Never from the square curve: a few rows
+    // against a prefix run several times slower than a square of the keys
+    // (128 rows ran at an eighth of it on an RTX), and a first fire estimated
+    // that far short would count that error into the margin as the device's.
     let mut prefixed: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
     if max_submit.is_some() && stated.attn_tflops_by_rows_keys.is_none() {
         for rows in PREFIX_ROWS {
@@ -1061,11 +1064,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                             .map(|&(_, tflops)| tflops * 1e3)
                     })
                 });
+                let first = rows == PREFIX_ROWS[0] && curve.is_empty();
+                if nearest.is_none() && !first {
+                    say(&format!(
+                        "[rates]: attention {rows} rows x {keys} keys d 128: not fired (no \
+                         shape measured to estimate it from)"
+                    ));
+                    break;
+                }
                 let estimate = at_rate(shape, nearest);
                 let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
                 rig.release();
                 let Some(rate) = dropped(&rig, rate, say)? else {
-                    continue;
+                    break;
                 };
                 say(&format!(
                     "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s",

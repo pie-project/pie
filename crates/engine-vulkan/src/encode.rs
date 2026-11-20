@@ -23,6 +23,21 @@ pub fn frame_span_ns() -> u64 {
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit_frame_span(ns: u64) {
     FRAME_SPAN_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    LONGEST_SPAN_NS.with(|longest| longest.set(longest.get().max(ns)));
+}
+
+thread_local! {
+    /// The longest device span of a frame this thread waited on since it
+    /// last took it ([`take_longest_frame_span_ns`]).
+    static LONGEST_SPAN_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The longest device span (first dispatch's start to last's end, by the
+/// device's timestamps) of a frame this thread waited on since it last
+/// asked, while kernels were profiled ([`profile_kernels`]); 0 where none.
+/// What one submission took on the device, apart from any queued ahead of it.
+pub fn take_longest_frame_span_ns() -> u64 {
+    LONGEST_SPAN_NS.with(|longest| longest.replace(0))
 }
 
 static SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
