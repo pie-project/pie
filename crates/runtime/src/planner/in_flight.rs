@@ -50,6 +50,8 @@ impl ResidencyPlanner {
                     inner.bind_restoring = None;
                 }
                 proc.fire_lapsed = false;
+                // It runs: an eviction candidate again.
+                proc.unfired = false;
                 true
             })
         });
@@ -68,9 +70,19 @@ impl ResidencyPlanner {
                 proc.fire_lapsed = false;
             }
         });
+        self.stats
+            .fires_landed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // After the count drops: a poke read before it would see the fire
-        // still in flight and wait on a settling that has passed.
-        self.pages_freed();
+        // still in flight and wait on a settling that has passed. A head
+        // refused on room that has not moved since is not planned again
+        // for it: fire landings re-planned such a head at hundreds a second
+        // (Mac Pro on 22b0a3e83: 838 no-step lines a second at peak).
+        if self.head_refused_on_room_unmoved() {
+            self.pages_freed_quietly();
+        } else {
+            self.pages_freed();
+        }
     }
 
     /// A parked process whose fires have stood unsettled past

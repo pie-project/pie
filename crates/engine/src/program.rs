@@ -93,10 +93,16 @@ pub struct InstanceBinding {
     /// program binds none.
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
-    /// Where this instance's lanes' scratch lies
-    /// ([`GuestState::resident`]).
+    /// Where this instance's lanes' scratch lies ([`GuestState::scratch`]):
+    /// dead between fires.
     #[serde(default)]
     pub scratch: ScratchPlace,
+    /// Where its resident state lies ([`GuestState::resident`]): one run of
+    /// adjacent `Instance` slots, live from the bind to the close, copied
+    /// wherever a park moves the instance and laid again at the same bytes
+    /// in the slots it comes back to ([`Rebind::Instance`]).
+    #[serde(default)]
+    pub resident: ScratchPlace,
     /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
     /// instance of the pair, taken at the pair's first bind and given back
     /// at its last close.
@@ -117,14 +123,18 @@ pub struct InstanceBinding {
 /// what the (program, extents) pair keeps once while any instance of it is
 /// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
 /// taken at the bind and held while bound ([`InstanceBinding::scratch`],
-/// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
-/// between fires: a park gives them back and an unpark takes fresh room,
-/// nothing copied, the engine told where ([`Rebind::Instance`]).
+/// [`InstanceBinding::resident`], [`InstanceBinding::pair`],
+/// [`ScratchPlace`]). The scratch's and the pair's contents are dead between
+/// fires: a park gives them back and an unpark takes fresh room, nothing
+/// copied. The resident state is live: a park copies it wherever the
+/// instance goes and an unpark copies it back into fresh slots. The engine
+/// is told where each lies ([`Rebind::Instance`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes an instance holds from bind to unbind, at rest included: launch tables,
-    /// status words, rings, anything a later fire reads. Placed at bind (today's
-    /// per_instance minus the value scratch).
+    /// Bytes an instance holds from bind to unbind that a later fire reads
+    /// (a beam group's page lists): one run of adjacent `Instance` slots, at
+    /// most a chunk, taken at the bind, priced and moved as the instance's
+    /// tables are ([`InstanceBinding::resident`]).
     #[serde(default)]
     pub resident: u64,
     /// Bytes ONE fire of the instance needs for its value scratch: dead outside that
@@ -430,6 +440,10 @@ pub enum Rebind {
         /// Its scratch, as [`InstanceBinding::scratch`].
         #[serde(default)]
         scratch: ScratchPlace,
+        /// Its resident state's slots, as [`InstanceBinding::resident`],
+        /// holding the bytes they held before the move.
+        #[serde(default)]
+        resident: ScratchPlace,
         /// Its pair's, as [`InstanceBinding::pair`].
         #[serde(default)]
         pair: ScratchPlace,

@@ -355,3 +355,218 @@ fn a_suspend_leaves_a_device_folding_set_where_the_engine_holds_it() {
     assert!(s.suspend_short(&only).is_zero());
     assert!(!s.on_host(slot(&s, failed)));
 }
+
+/// The kv store's swap slots tell the planner's room signal as they come
+/// back, as the device's do: disk chunks given back (a parked role's, or a
+/// victim's pages leaving the disk tier) wake a waiter blocked on swap
+/// room within a turn, not on a timer.
+#[test]
+fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
+    use crate::store::chunks::ShapePool;
+    let mut facts = fixed_facts();
+    facts.host_chunks = HOST_CHUNKS;
+    facts.disk_chunks = 2;
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let tiers = Tiers::of(&facts).unwrap();
+    let list = shared.lock().unwrap().list().unwrap();
+    let host = tiers.host.as_ref().map(|host| ShapePool::shared(host, list));
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [3; 32]);
+    kv.set_tiers(list.id, host, tiers.disk_slots);
+    let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let count = Arc::clone(&told);
+    kv.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move |_| {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })));
+    let chunks = kv
+        .take_disk_chunks(1, tiers.disk_chunk_slots)
+        .expect("a disk chunk");
+    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 0, "taking tells nothing");
+    kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
+    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 1, "given back: told");
+}
+
+/// What evicting a process empties counts its state's slots too (records,
+/// the state lists), not its kv pages and guest parts alone: the M1's
+/// bind room found 356 opened chunks of a state shape and a map of six,
+/// every candidate's state unattributed. A working set's own device slots
+/// are named, by the engine's shape and ref, each in a chunk the pool
+/// holds used.
+#[test]
+fn a_working_set_s_state_slots_are_named_in_the_chunks_they_hold() {
+    use crate::store::rs::{RsGeometry, RsStore};
+    let facts = fixed_facts();
+    let tiers = Tiers::of(&facts).unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut s = RsStore::shared(&shared, tiers.host.as_ref());
+    let ws = s.create_working_set(RsGeometry {
+        state_size: 4096,
+        buffer_page_tokens: RS_TOKENS,
+    });
+    let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    s.settle(published);
+    s.fold(ws, 4);
+    let refs = s.private_slot_refs(&HashSet::from([ws]));
+    assert!(!refs.is_empty(), "its state's slots are named");
+    let pool = shared.lock().unwrap();
+    for (engine, refs) in &refs {
+        let shape = pool.pool_shape(*engine).expect("a state shape the pool knows");
+        for &slot_ref in refs {
+            let slot = pool.slot(shape, slot_ref);
+            assert!(pool.pool().chunk_used(slot.chunk) > 0, "in a chunk it holds used");
+        }
+    }
+}
+
+/// A slot file of `chunks` whole disk chunks, for a store's disk tier.
+struct DiskFile(Mutex<Vec<u32>>);
+
+impl crate::store::roles::DiskSlots for DiskFile {
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>> {
+        let mut free = self.0.lock().unwrap();
+        let at = free.len().checked_sub(n)?;
+        Some(free.split_off(at))
+    }
+    fn give_chunks(&self, chunks: &[u32]) {
+        self.0.lock().unwrap().extend_from_slice(chunks);
+    }
+    fn free_chunks(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+/// The M1 (no host tier, unified memory): an evicted process's records and
+/// rs list slots stayed on the device, their chunks held, since a suspend
+/// found no host row. Where no host row is free its state parks in the
+/// disk tier's slot file, a disk chunk of each shape laid out as the
+/// device's (CONTRACT-BC 22): the move copies to the disk, the device slots
+/// come free, and a restore brings it back and gives the disk chunks back.
+#[test]
+fn with_no_host_tier_an_evicted_set_s_state_parks_on_disk_and_frees_the_device() {
+    use crate::store::rs::{RsGeometry, RsStore};
+    let facts = fixed_facts();
+    let tiers = Tiers::of(&facts).unwrap();
+    assert!(tiers.host.is_none(), "unified memory: no host tier");
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut s = RsStore::shared(&shared, None);
+    assert!(s.host_available().is_zero(), "no host rows");
+    let ws = s.create_working_set(RsGeometry {
+        state_size: 4096,
+        buffer_page_tokens: RS_TOKENS,
+    });
+    let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    s.settle(published);
+    s.fold(ws, 4);
+    let sets = HashSet::from([ws]);
+    let held = s.suspendable(&sets);
+    assert!(!held.is_zero(), "its state holds device slots");
+    assert!(s.prepare_suspend(&sets).is_none(), "no disk tier: it stays on the device");
+
+    let file = Arc::new(DiskFile(Mutex::new((0..8).collect())));
+    s.set_disk(&shared, file.clone());
+    assert!(!s.disk_units(8).is_zero(), "the disk is room below");
+    let device_refs = s.private_slot_refs(&sets);
+    let txn = s.prepare_suspend(&sets).expect("it parks on disk");
+    let plan = txn.copy_plan();
+    assert!(plan.shared.is_empty(), "nothing to a host tier");
+    let to_disk: usize = plan.disk.iter().map(|(_, pairs)| pairs.len()).sum();
+    let named: usize = device_refs.iter().map(|(_, refs)| refs.len()).sum();
+    assert_eq!(to_disk, named, "every device slot of its state copied to disk");
+    for (shape, pairs) in &plan.disk {
+        let device = &device_refs.iter().find(|(at, _)| at == shape).unwrap().1;
+        assert!(pairs.iter().all(|(from, _)| device.contains(from)), "by shape");
+    }
+    let taken = 8 - crate::store::roles::DiskSlots::free_chunks(&*file);
+    assert!(taken > 0, "disk chunks of its shapes opened");
+    let freed = s.commit_suspend(txn);
+    assert_eq!(freed, held, "its device slots come free");
+    assert!(s.private_slot_refs(&sets).is_empty(), "nothing of it on the device");
+    assert!(s.disk_rows() > 0);
+    assert_eq!(s.swapped_units(&sets), held, "parked, counted as swapped");
+
+    let swapped = s.swapped_units(&sets);
+    let mut grant = s.reserve(swapped).expect("device room to come back");
+    let txn = s.prepare_restore(&sets, &mut grant).expect("it comes back");
+    let back: usize = txn.copy_plan().disk.iter().map(|(_, pairs)| pairs.len()).sum();
+    assert_eq!(back, named, "read back from the disk");
+    s.commit_restore(txn);
+    assert_eq!(s.disk_rows(), 0, "no disk row held");
+    assert_eq!(crate::store::roles::DiskSlots::free_chunks(&*file), 8, "its disk chunks given back");
+    assert_eq!(s.suspendable(&sets), held, "on the device again");
+}
+
+/// Lock order for the disk tier's slot file (the kv store's disk chunks):
+/// the rs store and the roles take chunks under their own lock (rs or
+/// roles, then kv); nothing takes the rs store's or the roles' lock under
+/// the kv store's. An rs suspend and restore through the file, a holder of
+/// another lock (as the roles park) taking and giving chunks, and the kv
+/// store's own disk takes run together, round after round, and end.
+#[test]
+fn rs_and_role_disk_takes_and_kv_run_together_without_deadlock() {
+    use crate::store::rs::RsGeometry;
+    let mut facts = fixed_facts();
+    facts.disk_chunks = 64;
+    let tiers = Tiers::of(&facts).unwrap();
+    assert!(tiers.host.is_none() && tiers.disk_slots > 0);
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, &tiers, 16, 4096);
+    let disk = stores.rs.lock().unwrap().disk_slots().expect("the rs store parks on disk");
+    let ws = {
+        let mut s = stores.rs.lock().unwrap();
+        let ws = s.create_working_set(RsGeometry {
+            state_size: 4096,
+            buffer_page_tokens: RS_TOKENS,
+        });
+        let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+        let published = s.publish_prepared(prepared).unwrap();
+        s.settle(published);
+        s.fold(ws, 4);
+        ws
+    };
+    let sets = HashSet::from([ws]);
+    let roles_lock = Mutex::new(());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let (rs, kv, sets, disk, roles_lock) = (&stores.rs, &stores.kv, &sets, &disk, &roles_lock);
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                let mut s = rs.lock().unwrap();
+                let txn = s.prepare_suspend(sets).expect("it parks on disk");
+                s.commit_suspend(txn);
+                let swapped = s.swapped_units(sets);
+                let mut grant = s.reserve(swapped).expect("room to come back");
+                let txn = s.prepare_restore(sets, &mut grant).expect("it comes back");
+                s.commit_restore(txn);
+            }
+            d.send(()).unwrap();
+        });
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                let _roles = roles_lock.lock().unwrap();
+                if let Some(chunks) = disk.take_chunks(2) {
+                    disk.give_chunks(&chunks);
+                }
+            }
+            d.send(()).unwrap();
+        });
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                crate::store::registry::with_kv_lock(kv, "test", |kv| {
+                    if let Some(chunks) = kv.take_disk_chunks(1, tiers.disk_chunk_slots) {
+                        kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
+                    }
+                });
+            }
+            d.send(()).unwrap();
+        });
+        for _ in 0..3 {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("every thread ends: no lock taken in opposite orders");
+        }
+    });
+}
