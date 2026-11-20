@@ -266,16 +266,31 @@ pub fn choose(
     // measured row counts in log rows; below the first row count timed, that
     // count's time (a kernel takes no less for fewer rows than it was timed
     // at, so its rate there is not held).
+    //
+    // Past a vector kernel's stop as beaten at a plane
+    // (`KernelCurve::BEATEN`: slower there than twice a tiled kernel), its
+    // time at its last rows grown with the rows: what that stop rests on (a
+    // vector kernel's time grows at least as its rows do, a weight pass for
+    // every workgroup's rows), so a floor on its time, never below it. The
+    // kernel stays a candidate: beaten at one plane (an output head's), it
+    // may still win the model's planes together.
     let time_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> Option<f64> {
         let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
-        let curve = &curves.iter().find(|c| c.id() == (kind, key, n, k))?.curve;
+        let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
+        let curve = &found.curve;
         let (&(first, _), &(most, _)) = (curve.first()?, curve.last()?);
+        let time = |at: u32| {
+            let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
+            profile::fire::interpolate(curve, f64::from(at)).map(|t| flops / (t * 1e3))
+        };
         if rows > most {
-            return None;
+            let beaten =
+                matches!(found.stop, Some((_, why)) if why == profile::fire::KernelCurve::BEATEN);
+            return (beaten && tactic.vector > 0)
+                .then(|| time(most).map(|t| t * f64::from(rows) / f64::from(most)))
+                .flatten();
         }
-        let at = rows.max(first);
-        let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
-        profile::fire::interpolate(curve, f64::from(at)).map(|t| flops / (t * 1e3))
+        time(rows.max(first))
     };
     // `tactic`'s cost at `rows` over every plane some candidate of `among`
     // was timed at to the rows, in ns: each at the kernel's rate measured
@@ -698,6 +713,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eager.at(3).vector, 1);
+    }
+
+    /// A vector kernel beaten at one plane (an output head's) stays a
+    /// candidate past its stop, priced there at its last time grown with the
+    /// rows: it still takes the rungs where it wins the model's planes
+    /// together.
+    #[test]
+    fn a_vector_kernel_beaten_at_one_plane_stays_a_candidate() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let shape = |n, k, planes| engine::load::GemmShape {
+            planes,
+            ..engine::load::GemmShape::dense(n, k, 2 * u64::from(n * k), 2 * u64::from(n * k))
+        };
+        // Many layer planes and one wide head.
+        let model = Counts {
+            gemm_shapes: vec![shape(1024, 1024, 28), shape(8192, 1024, 1)],
+            ..counts()
+        };
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            kind,
+            key,
+            n,
+            k,
+            curve: points,
+            stop,
+        };
+        let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
+        let (v, t) = (
+            profile::fire::KernelCurve::VECTOR,
+            profile::fire::KernelCurve::TILE,
+        );
+        let mut curves = vec![
+            // The layer planes: the vector kernel 4x the tile to 256 rows.
+            curve(
+                t,
+                tile(1024, 1024),
+                1024,
+                1024,
+                vec![(1, 0.01), (256, 1.0)],
+                None,
+            ),
+            curve(v, 16, 1024, 1024, vec![(1, 0.04), (256, 4.0)], None),
+            // The head: the vector kernel beaten at 16 rows.
+            curve(
+                t,
+                tile(8192, 1024),
+                8192,
+                1024,
+                vec![(1, 0.05), (256, 8.0)],
+                None,
+            ),
+            curve(
+                v,
+                16,
+                8192,
+                1024,
+                vec![(1, 0.02), (16, 2.0)],
+                Some((64, profile::fire::KernelCurve::BEATEN)),
+            ),
+        ];
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves.clone()),
+            ..rates(None, Vec::new())
+        };
+        let (dense, weighed) =
+            choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
+        assert_eq!(dense.at(128).vector, 16, "{}", weighed[0]);
+        // Stopped for another reason it is no candidate past its stop.
+        curves[3].stop = Some((64, profile::fire::KernelCurve::BOUND));
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let (dense, weighed) =
+            choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
+        assert_eq!(dense.at(128).vector, 0, "{}", weighed[0]);
     }
 
     /// Below the first row count a kernel was timed at it takes that count's
