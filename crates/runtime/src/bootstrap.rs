@@ -225,10 +225,13 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
 /// ([`::engine::Capabilities::frames_in_flight`]): one number, so engines
 /// stating different ones are refused by name.
 fn frames_in_flight(engines: &[EngineConfig]) -> Result<u32> {
-    let mut stated = engines.iter().map(|e| e.frames_in_flight.max(1));
+    let mut stated = engines.iter().map(|e| e.frames_in_flight);
     let Some(first) = stated.next() else {
         anyhow::bail!("a model served by no engine states no frames in flight");
     };
+    if first == 0 {
+        anyhow::bail!("an engine states no frame in flight; a fire needs one");
+    }
     if let Some(other) = stated.find(|&f| f != first) {
         anyhow::bail!(
             "the model's engines keep {first} and {other} frames in flight; the scheduler \

@@ -611,7 +611,9 @@ impl Engine for Xla {
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: shell.mixed_lanes(),
             // the staging ring's slots less the one being written
-            frames_in_flight: shell.staging_facts().ring_slots.saturating_sub(1).max(1),
+            frames_in_flight: engine::stated_frames(
+                (shell.staging_facts().ring_slots as usize).saturating_sub(1),
+            )?,
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());

@@ -38,7 +38,7 @@ pub mod transfer;
 pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{
     Capabilities, DeviceFacts, FireLimits, GuestCost, LibraryForms, MixedLanes, MixedRung,
-    PoolFacts,
+    PoolFacts, stated_frames,
 };
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
