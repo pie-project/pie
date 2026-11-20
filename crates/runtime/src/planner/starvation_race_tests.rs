@@ -8579,3 +8579,52 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
     assert!(restore_queued(&planner), "lifted: its restore is queued");
     waiting.abort();
 }
+
+/// Mac Pro at 2 GiB disk-only on 1e87ab171, stalled at 86 serves: a
+/// process suspended for its bind (two runs of nine Instance chunks
+/// short), evicted to disk, restored ~95 ms later, then waiting on
+/// "its instances' rebinds" (InstanceId(5)) until teardown, Restoring the
+/// whole while; the queue's head, a restore, held behind it as a move in
+/// flight, no stall dump, nothing evicted or compacted. Its state back
+/// and committed, a restore waiting on its rebinds moves nothing: it is
+/// no move in flight, the bind-suspended restore it was no longer holds
+/// the next, the stall dump names what it waits on, and its restore
+/// landing (or failing) clears it.
+#[test]
+fn a_restore_waiting_on_its_rebinds_is_nothing_in_flight() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let (rebinding, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [rebinding, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&rebinding).unwrap();
+        proc.state = Residency::Restoring;
+        inner.bind_restoring = Some(rebinding);
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(PendingBind {
+            run: 9,
+            pieces: 2,
+            pages: 18,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    let quiet = |planner: &ResidencyPlanner| planner.with_inner(|inner| inner.nothing_in_flight());
+    let released =
+        |planner: &ResidencyPlanner| planner.with_inner(|inner| inner.bind_restoring_released());
+    assert!(!quiet(&planner), "its copy back on its way: in flight");
+    assert!(!released(&planner), "and it holds the next bind-suspended restore");
+    planner.rebind_waiting(rebinding, Some("[InstanceId(5)]".to_owned()));
+    assert!(quiet(&planner), "waiting on its rebinds: nothing in flight");
+    assert!(released(&planner), "the next bind-suspended restore goes");
+    // Its rebinds land: restored, cleared.
+    planner.report_restored(rebinding);
+    assert!(planner.with_inner(|inner| inner.procs[&rebinding].rebind_waiting.is_none()));
+}

@@ -35,6 +35,16 @@ pub(super) struct Proc {
     /// until room comes, its refused bind holds nothing, and parked it binds
     /// once restored, so it yields as an idle process does.
     pub(super) bind_waiting: bool,
+    /// Restoring, its state back and committed, it waits for instances its
+    /// rebinds cannot name yet (their pair parked with another process, or
+    /// their room not given back): the instances it waits on, said by the
+    /// stall dump. It moves no state and runs no fire meanwhile: nothing in
+    /// flight on its account ([`super::inner::Inner::nothing_in_flight`]),
+    /// or the restore that brings what it waits on, or the room, is never
+    /// planned (Mac Pro at 2 GiB on 1e87ab171: a restore waiting on
+    /// InstanceId(5) for good, the queue's head held behind it as a move
+    /// in flight).
+    pub(super) rebind_waiting: Option<String>,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
     /// Parked below the floor, it gave its execution seat back: it takes
@@ -193,6 +203,7 @@ impl Proc {
             holder: false,
             idle: false,
             bind_waiting: false,
+            rebind_waiting: None,
             roles_short_why: None,
             parked: None,
             seatless: false,

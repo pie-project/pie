@@ -1070,6 +1070,7 @@ async fn restore(
                 break;
             }
             tracing::debug!(%pid, ?unbound, "planner: a restore waits for its instances' rebinds");
+            planner.rebind_waiting(pid, Some(format!("{unbound:?}")));
             watch.freed().await;
             if let Err(error) = rebind(engine, store, pid).await {
                 planner.restore_failed(pid, &error);
@@ -1077,6 +1078,7 @@ async fn restore(
             }
         }
     }
+    planner.rebind_waiting(pid, None);
     ptrace!(
         "restore-done pid={} ms={}",
         pid,

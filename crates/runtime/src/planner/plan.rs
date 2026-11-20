@@ -360,8 +360,17 @@ impl ResidencyPlanner {
                 ),
                 _ => "no eviction plan for this head".to_owned(),
             };
+            // Restores waiting on their instances' rebinds, nothing in
+            // flight on their account: each with the instances it waits on.
+            let rebinding: Vec<String> = inner
+                .procs
+                .iter()
+                .filter_map(|(pid, proc)| {
+                    proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
+                })
+                .collect();
             let blocked = format!(
-                "host_swap_blocked={} prepare_blocked={}",
+                "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?}",
                 some_pids(inner.host_swap_blocked.iter()),
                 some_pids(inner.prepare_blocked.iter())
             );

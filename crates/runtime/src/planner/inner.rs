@@ -658,7 +658,13 @@ impl Inner {
             && !self.kill_in_flight()
             && self.procs.values().all(|proc| {
                 !proc.firing()
-                    && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
+                    && match proc.state {
+                        Residency::Evicting => false,
+                        // Waiting on its rebinds, it moves nothing: it is
+                        // waiting, not in flight ([`Proc::rebind_waiting`]).
+                        Residency::Restoring => proc.rebind_waiting.is_some(),
+                        _ => true,
+                    }
             })
     }
 

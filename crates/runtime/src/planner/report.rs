@@ -147,12 +147,29 @@ impl ResidencyPlanner {
         }
     }
 
+    /// `pid`'s restore waits for its instances' rebinds (`Some`, the
+    /// instances), or no longer (`None`): waiting, it is nothing in flight
+    /// ([`super::proc::Proc::rebind_waiting`]), and the planner plans on
+    /// that at once.
+    pub(super) fn rebind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: Option<String>) {
+        let changed = self.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid)?;
+            let changed = proc.rebind_waiting.is_some() != waiting.is_some();
+            proc.rebind_waiting = waiting;
+            Some(changed)
+        });
+        if changed == Some(true) {
+            self.poke();
+        }
+    }
+
     pub(super) fn report_restored(self: &Arc<Self>, pid: ProcessId) {
         self.clear_host_swap_blocks();
         let signal = self.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
+            proc.rebind_waiting = None;
             proc.progressed = false;
             // Back for a waiting head (its own restore): no victim until it
             // has fired once; and what it was evicted for is past.
@@ -206,6 +223,7 @@ impl ResidencyPlanner {
                 return false;
             }
             proc.state = Residency::Evicted;
+            proc.rebind_waiting = None;
             true
         });
         self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
