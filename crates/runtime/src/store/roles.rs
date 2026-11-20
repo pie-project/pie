@@ -1319,6 +1319,12 @@ impl Roles {
                 });
             }
         }
+        // The unpark lays its whole-chunk runs first, the longest first,
+        // then its runs of slots ([`Self::prepare_unpark`]).
+        own.sort_by_key(|piece| match *piece {
+            OwnPiece::Chunks { run, .. } => (0, std::cmp::Reverse(run)),
+            OwnPiece::Slots { .. } => (1, std::cmp::Reverse(0)),
+        });
         self.device
             .lock()
             .unwrap()
@@ -1326,22 +1332,24 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
-    /// The runs of `run` adjacent chunks `holder`'s unpark lays fresh for
-    /// its own parked state before any bind's room, as the unpark takes it:
-    /// each dead part given back at its park in whole chunks (its pieces of
-    /// whole runs), and the slots of its dead runs of slots and of the live
-    /// parts of items parked below the device, by shape, past the free
-    /// slots that shape's partly filled chunks hold, in whole chunks once.
-    /// Parts still on the device (parked in place, or never parked) lay
-    /// nothing. What a map of free chunks must stand beside a bind's runs
-    /// for the restore that bind suspended, as [`Self::fits_beside_unpark`]
-    /// reads it, and what a restore short of its roles asks. Counting every
-    /// part a chunk of its own, a restore of twenty small items asked
-    /// twenty-one chunks it would lay in one or none.
+    /// The runs of adjacent chunks `holder`'s unpark lays fresh for its own
+    /// parked state before any bind's room, one entry per run length, the
+    /// longest first, as the unpark takes it: each dead part given back at
+    /// its park in whole chunks (its pieces of runs of its length), and the
+    /// slots of its dead runs of slots and of the live parts of items
+    /// parked below the device, by shape, past the free slots that shape's
+    /// partly filled chunks hold, in single chunks. Parts still on the
+    /// device (parked in place, or never parked) lay nothing. What a map of
+    /// free chunks must stand beside a bind's runs for the restore that
+    /// bind suspended, as [`Self::fits_beside_unpark`] reads it, and what a
+    /// restore short of its roles asks. Counted in runs of one length, a
+    /// run of two read as two single chunks (the L40S: a need of sixteen
+    /// single chunks while the unpark was refused a run of two), and every
+    /// part a chunk of its own asked twenty-one chunks for twenty small
+    /// items it would lay in one or none.
     #[must_use]
-    pub fn unpark_runs(&self, holder: Holder, run: u32) -> u32 {
-        let run = u64::from(run.max(1));
-        let mut runs = 0u64;
+    pub fn unpark_need(&self, holder: Holder) -> Vec<(u32, u32)> {
+        let mut runs: BTreeMap<u32, u64> = BTreeMap::new();
         let mut slots: HashMap<SlotRole, u64> = HashMap::new();
         for (owner, item) in &self.items {
             let below = matches!(item.tier, Tier::Host | Tier::Disk);
@@ -1355,7 +1363,7 @@ impl Roles {
                         continue;
                     }
                     if part.pieces > 0 {
-                        runs += u64::from(part.pieces) * u64::from(part.chunks).div_ceil(run);
+                        *runs.entry(part.chunks.max(1)).or_default() += u64::from(part.pieces);
                     } else {
                         *slots.entry(part.role).or_default() += u64::from(part.run);
                     }
@@ -1376,9 +1384,14 @@ impl Roles {
             let chunks = wanted
                 .saturating_sub(device.pool().partial_free(shape.pool))
                 .div_ceil(per_chunk);
-            runs += chunks.div_ceil(run);
+            if chunks > 0 {
+                *runs.entry(1).or_default() += chunks;
+            }
         }
-        u32::try_from(runs).unwrap_or(u32::MAX)
+        runs.into_iter()
+            .rev()
+            .map(|(run, pieces)| (run, u32::try_from(pieces).unwrap_or(u32::MAX)))
+            .collect()
     }
 
     /// What `holder`'s restore would take back, in one line for a stall
@@ -2195,64 +2208,72 @@ impl Roles {
             return Err(RolesError::PairParked(pair));
         }
         let device = Arc::clone(&self.device);
-        let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
-        let mut shed: Vec<(Owner, Vec<Part>)> = Vec::new();
-        let taken_dead = |parts: &[Part]| -> Vec<Part> {
-            parts
-                .iter()
-                .filter(|part| part.dead() && !part.refs.is_empty())
-                .cloned()
-                .collect()
-        };
-        for owner in &shed_owners {
-            let parts = self.items[owner].parts.clone();
-            let mut back = Vec::with_capacity(parts.len());
-            let mut short = None;
-            for part in &parts {
-                if !part.dead() {
-                    back.push(part.clone());
-                    continue;
-                }
-                match self.take_parts(&device, std::slice::from_ref(part), true) {
-                    Ok(mut taken) => back.push(taken.remove(0)),
-                    Err(error) => {
-                        short = Some(error);
-                        break;
-                    }
-                }
+        // Every part it takes, of every item: a shed item's dead parts (its
+        // live ones stay where they lie), a parked item's all. Its runs of
+        // whole chunks are laid first, the longest first, then its runs of
+        // slots and its live parts: taken in the items' order, a single
+        // chunk opened for a table at the lowest free chunk split the only
+        // stretch a run of two stood in, and the unpark was refused the
+        // run its need counted on (the L40S).
+        let groups: Vec<(Owner, bool, Vec<Part>)> = shed_owners
+            .iter()
+            .map(|owner| (*owner, true, self.items[owner].parts.clone()))
+            .chain(
+                owners
+                    .iter()
+                    .map(|owner| (*owner, false, self.items[owner].parts.clone())),
+            )
+            .collect();
+        let mut order: Vec<(usize, usize)> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(at, (_, shed, parts))| {
+                parts
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, part)| !*shed || part.dead())
+                    .map(move |(index, _)| (at, index))
+            })
+            .collect();
+        order.sort_by_key(|&(at, index)| {
+            let part = &groups[at].2[index];
+            if part.dead() && part.pieces > 0 {
+                (0, std::cmp::Reverse(part.chunks))
+            } else {
+                (1, std::cmp::Reverse(0))
             }
-            if let Some(error) = short {
-                self.give(&device, &taken_dead(&back));
-                for (_, parts) in &shed {
-                    self.give(&device, &taken_dead(parts));
-                }
-                // It held these parts on the device before its park: the
-                // budget holds them, and the restore waits for room.
-                if error.is_short() {
-                    return Err(RolesError::UnparkShort(Box::new(error)));
-                }
-                return Err(error);
-            }
-            shed.push((*owner, back));
-        }
-        for owner in &owners {
-            match self.take_parts(&device, &self.items[owner].parts, true) {
-                Ok(to) => items.push((*owner, to)),
+        });
+        let mut back: Vec<Vec<Option<Part>>> =
+            groups.iter().map(|(_, _, parts)| vec![None; parts.len()]).collect();
+        for (at, index) in order {
+            let part = &groups[at].2[index];
+            match self.take_parts(&device, std::slice::from_ref(part), true) {
+                Ok(mut taken) => back[at][index] = Some(taken.remove(0)),
                 Err(error) => {
-                    for (_, parts) in &items {
-                        self.give(&device, parts);
-                    }
-                    for (_, parts) in &shed {
-                        self.give(&device, &taken_dead(parts));
-                    }
-                    // It held these items on the device before its park: the
-                    // budget holds them, and the restore waits for room,
-                    // never failed for it.
+                    let taken: Vec<Part> = back.into_iter().flatten().flatten().collect();
+                    self.give(&device, &taken);
+                    // It held these parts on the device before its park:
+                    // the budget holds them, and the restore waits for
+                    // room, never failed for it.
                     if error.is_short() {
                         return Err(RolesError::UnparkShort(Box::new(error)));
                     }
                     return Err(error);
                 }
+            }
+        }
+        let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
+        let mut shed: Vec<(Owner, Vec<Part>)> = Vec::new();
+        for ((owner, is_shed, parts), taken) in groups.into_iter().zip(back) {
+            let parts: Vec<Part> = parts
+                .into_iter()
+                .zip(taken)
+                .map(|(part, taken)| taken.unwrap_or(part))
+                .collect();
+            if is_shed {
+                shed.push((owner, parts));
+            } else {
+                items.push((owner, parts));
             }
         }
         let below: Vec<Tier> = items.iter().map(|(owner, _)| self.items[owner].tier).collect();

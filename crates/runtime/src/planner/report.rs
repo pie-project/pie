@@ -260,13 +260,20 @@ impl ResidencyPlanner {
                 .map(|proc| proc.bind_room.into_iter().chain(proc.roles_short).collect::<Vec<_>>())
                 .unwrap_or_default()
         });
-        let (run, pieces) = recorded
+        // Of what was recorded, only a need of the refusal's own length:
+        // folded over a bind's run of seven, a refusal of a run of four
+        // read as runs of seven (Mac Pro's mx-3: need (7, 4) while its unpark
+        // was refused a run of four).
+        let run = need.0;
+        let pieces = recorded
             .iter()
-            .fold(need, |(run, pieces), had| (run.max(had.run), pieces.max(had.pieces)));
+            .filter(|had| had.run == run)
+            .fold(need.1, |pieces, had| pieces.max(had.pieces));
         // The whole unpark, not the part its refusal named: recorded so, the
         // need is fixed as the restore takes it, and a refusal while those
-        // runs stand is one the need truly understates.
-        let (run, pieces) = self.whole_unpark(pid, (run, pieces));
+        // runs stand is one the need truly understates. Its other lengths
+        // are read where its need is ([`Self::head_room`]).
+        let pieces = self.whole_unpark(pid, (run, pieces)).pieces_at(run).max(pieces);
         // The runs of the length its refusal named, standing now: what it
         // goes again on. Read at its need's length (a run of seven, the
         // bind's, folded over the unpark's run of four), runs of seven
@@ -278,7 +285,7 @@ impl ResidencyPlanner {
         let gives = self.port.room_gives();
         let map_runs = self.port.guest_free_runs(run);
         // The refusal's own count is of runs of its own length.
-        let refused_runs = refused_free_runs.filter(|_| run == need.0);
+        let refused_runs = refused_free_runs;
         let refused_saw = refused_runs.is_some_and(|free| free >= pieces);
         let map_shows = map_runs >= pieces;
         let stood = map_runs.max(refused_runs.unwrap_or(0));
@@ -302,7 +309,7 @@ impl ResidencyPlanner {
         self.with_inner(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.roles_short = Some(updated);
-                if proc.bind_room.is_some() {
+                if proc.bind_room.is_some_and(|bind| bind.run == run) {
                     proc.bind_room = Some(updated);
                 }
                 proc.roles_free_retry = None;

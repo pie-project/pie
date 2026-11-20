@@ -7,6 +7,7 @@ use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReserva
 use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::inner::RestoreGate;
 use super::proc::{PendingBind, Residency};
+use super::pool::RunNeed;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
@@ -184,7 +185,7 @@ impl ResidencyPlanner {
         // A head short of kv reads the map at runs of one chunk: what holds
         // the chunks it could take, parked state lying on the device among
         // it (a no-host pool's parked-in-place sets).
-        let run = need.map_or(1, |(run, _)| run);
+        let run = need.as_ref().and_then(RunNeed::longest).map_or(1, |(run, _)| run);
         // The candidates the eviction pass reads (nothing is in flight
         // here: every member), so the dump's map is the plan's.
         let pids: Vec<ProcessId> = self
@@ -204,7 +205,12 @@ impl ResidencyPlanner {
             need = ?need,
             again,
             refusal = %refusal.unwrap_or_default(),
-            free_runs = need.map(|(run, _)| self.port.guest_free_runs(run)),
+            free_runs = ?need.as_ref().map(|need| {
+                need.entries()
+                    .iter()
+                    .map(|&(run, _)| (run, self.port.guest_free_runs(run)))
+                    .collect::<Vec<_>>()
+            }),
             device = ?(free, total),
             queue = %self.debug_queue(),
             %map,
@@ -441,7 +447,7 @@ impl ResidencyPlanner {
                     }
                     // Parked state lying on the device moves down a tier
                     // before any resident does.
-                    if self.park_down_for(run, pieces) {
+                    if self.park_down_for(&RunNeed::one(run, pieces)) {
                         return false;
                     }
                     true
@@ -483,11 +489,11 @@ impl ResidencyPlanner {
                     // Instance chunk held by parked processes' role slots,
                     // the bind-suspended head's runs never funded): the
                     // bind's runs beside its own retake ([`Self::beside_own`]).
-                    let (run, pieces) = match pid {
+                    let room = match pid {
                         Some(pid) => self.beside_own(pid, (need.run, need.pieces)),
-                        None => (need.run, need.pieces),
+                        None => RunNeed::one(need.run, need.pieces),
                     };
-                    if self.park_down_for(run, pieces) {
+                    if self.park_down_for(&room) {
                         return false;
                     }
                     // Funded once nothing in flight can free room
@@ -503,10 +509,12 @@ impl ResidencyPlanner {
                 } => {
                     // What the restore's step takes, as the map and the
                     // census read it ([`Self::head_room`]).
-                    let (run, pieces) = self
+                    // Every run length its unpark lays, each counted apart;
+                    // its refusal's own length is `run` (the gate's need).
+                    let room = self
                         .with_inner(|inner| inner.unmet_head().map(|(key, _)| key))
                         .and_then(|key| self.head_room(key))
-                        .unwrap_or((run, pieces));
+                        .unwrap_or_else(|| RunNeed::one(run, pieces));
                     // Its runs stand free (a completion or a commit gave
                     // them back): it goes again, once a need. Short again
                     // with the same need, the need understates its unpark
@@ -544,7 +552,7 @@ impl ResidencyPlanner {
                         Some(None) => true,
                         None => false,
                     };
-                    if !understated && map_moved && self.port.guest_room_free(run, pieces) {
+                    if !understated && map_moved && self.port.guest_need_free(&room) {
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
                             if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {
@@ -569,7 +577,9 @@ impl ResidencyPlanner {
                     // A grow the walk will make holds its runs: it waits on
                     // that, moving no one.
                     let grow = Demand {
-                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        kv_pages: self
+                            .port
+                            .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, grow) {
@@ -580,7 +590,7 @@ impl ResidencyPlanner {
                     // any resident does: no one runs on it (Mac Pro's M5
                     // stall: host full, every process evicted, the head's
                     // runs held by parked role slots, nothing to evict).
-                    if self.park_down_for(run, pieces) {
+                    if self.park_down_for(&room) {
                         return false;
                     }
                     // Else the occupants of the chunks it could take move

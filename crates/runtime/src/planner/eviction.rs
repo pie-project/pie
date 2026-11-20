@@ -10,6 +10,7 @@ use super::holdings::suspendable_rs_units;
 use super::plan::ServeOutcome;
 use super::proc::Residency;
 use super::rank::Rank;
+use super::pool::RunNeed;
 use super::reclaim::Reclaim;
 use super::victim::{Victim, VictimSet};
 use super::wait::{EntryKey, WaitKind};
@@ -266,7 +267,7 @@ impl ResidencyPlanner {
         // Parked state lying on the device is an occupant too: a chunk it
         // shares with residents empties once both move, it down a tier and
         // they off the device.
-        let map = shape.map(|_| {
+        let map = shape.as_ref().map(|_| {
             let mut map = self.port.chunk_occupants(&residents);
             map.merge(self.port.parked_occupants(self.parked_except(victims.head_pid)));
             map
@@ -281,8 +282,9 @@ impl ResidencyPlanner {
         // Only with nothing in flight: an eviction on its way (its victim
         // no candidate now, the map empty of it) forms the runs as it lands,
         // and a compaction asked meanwhile waited on what it would make.
-        if let (Some((run, pieces)), Some(map)) = (shape, map.as_ref())
-            && map.cheapest_runs(run, pieces).is_none()
+        if let (Some((run, pieces)), Some(need), Some(map)) =
+            (shape.as_ref().and_then(RunNeed::longest), shape.as_ref(), map.as_ref())
+            && map.cheapest_need(need).is_none()
             && self.with_inner(|inner| inner.nothing_in_flight())
             && self.port.compaction_comes(run, pieces)
         {
@@ -297,7 +299,7 @@ impl ResidencyPlanner {
             return;
         }
         let (candidates, wanted, occupants) =
-            chunk_picks(candidates, victims.deficit, shape, map.as_ref());
+            chunk_picks(candidates, victims.deficit, shape.as_ref(), map.as_ref());
         let (occupants, parked): (Vec<ProcessId>, Vec<ProcessId>) = occupants
             .into_iter()
             .partition(|pid| residents.contains(pid));
@@ -312,10 +314,10 @@ impl ResidencyPlanner {
                 picks.push((pid, Reclaim::default()));
             }
         }
-        if let Some((run, pieces)) = shape {
+        if let Some(need) = shape.as_ref() {
+            let (run, pieces) = need.longest().unwrap_or((1, 0));
             tracing::debug!(
-                run,
-                pieces,
+                ?need,
                 picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
                 chunks = ?map.as_ref().map(|map| (map.held.len(), map.free.len())),
                 "planner: a bind short of whole chunks: the occupants of the cheapest it could \
@@ -839,12 +841,12 @@ impl ResidencyPlanner {
 fn chunk_picks(
     candidates: Vec<(ProcessId, super::rank::Rank)>,
     deficit: Reclaim,
-    shape: Option<(u32, u32)>,
+    shape: Option<&RunNeed>,
     map: Option<&super::pool::ChunkMap>,
 ) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim, Vec<ProcessId>) {
     let occupants = shape
         .zip(map)
-        .and_then(|((run, pieces), map)| map.cheapest_runs(run, pieces))
+        .and_then(|(need, map)| map.cheapest_need(need))
         .filter(|occupants| !occupants.is_empty());
     // Short of whole chunks with the map read and no runs its candidates
     // could empty: no one is moved by pages counted anywhere, which frees
@@ -903,6 +905,39 @@ mod chunk_picks_tests {
         two.sort_unstable();
         assert_eq!(two, vec![pid(1), pid(3)]);
         assert_eq!(map.cheapest_runs(1, 3), None, "B's chunk does not empty");
+    }
+
+    /// The L40S's line (a restore of kv 0 whose need read (1, 16) while
+    /// its unpark was refused a run of two, 15 chunks open, headroom one):
+    /// a need of one entry per run length lays its run of two first and
+    /// its single chunks beside it, the budget's headroom read against all
+    /// of them. Read as single chunks, four scattered free ones stood the
+    /// need, no one moved, and the run of two was never made.
+    #[test]
+    fn a_need_lays_its_longer_runs_first_and_its_singles_beside_them() {
+        let map = ChunkMap {
+            held: vec![held(1, 4, &[(1, 4)]), held(9, 1, &[(2, 1)])],
+            free: vec![0, 2, 4, 6],
+            headroom: None,
+            segment_chunks: 0,
+        };
+        assert_eq!(map.cheapest_runs(1, 4), Some(vec![]), "four singles stand: no one moves");
+        let need = RunNeed::of([(1, 2), (2, 1)]);
+        assert_eq!(need.entries(), &[(2, 1), (1, 2)], "the longest first");
+        assert_eq!(
+            map.cheapest_need(&need),
+            Some(vec![pid(1)]),
+            "the run of two takes 0-1 or 1-2: chunk 1's occupant moves"
+        );
+        // Headroom for two chunks: the third free chunk the need opens
+        // empties a chunk elsewhere, the cheapest.
+        let tight = ChunkMap {
+            headroom: Some(2),
+            ..map.clone()
+        };
+        let mut pids = tight.cheapest_need(&RunNeed::of([(2, 1), (1, 2)])).unwrap();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![pid(1), pid(2)], "every chunk it opens read against the headroom");
     }
 
     /// A run of two adjacent chunks: a free chunk beside an emptiable one
@@ -967,7 +1002,7 @@ mod chunk_picks_tests {
             segment_chunks: 0,
         };
         let (picked, wanted, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&map));
+            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(1, 1)), Some(&map));
         assert_eq!(occupants, vec![pid(3)]);
         assert_eq!(picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(), vec![pid(3)]);
         assert_eq!(wanted.pages, u32::MAX, "every occupant is picked");
@@ -978,10 +1013,10 @@ mod chunk_picks_tests {
         // which frees no run (Mac Pro's cascade).
         let none = ChunkMap::default();
         let (kept, _, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some((1, 1)), Some(&none));
+            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(1, 1)), Some(&none));
         assert!(kept.is_empty() && occupants.is_empty(), "no run its eviction makes: none moved");
         // Without a map (no shared pool) the candidates stand as before.
-        let (kept, same, _) = chunk_picks(candidates, deficit, Some((1, 1)), None);
+        let (kept, same, _) = chunk_picks(candidates, deficit, Some(&RunNeed::one(1, 1)), None);
         assert_eq!((kept.len(), same), (3, deficit));
     }
 
@@ -1006,7 +1041,7 @@ mod chunk_picks_tests {
         };
         assert_eq!(standing.cheapest_runs(4, 1), Some(vec![]), "a run stands");
         let (kept, _, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some((4, 1)), Some(&standing));
+            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(4, 1)), Some(&standing));
         assert!(kept.is_empty() && occupants.is_empty(), "a free run: no one moved");
         // No candidate's chunk lies where a run could form: none moved.
         let scattered = ChunkMap {
@@ -1016,7 +1051,7 @@ mod chunk_picks_tests {
             segment_chunks: 0,
         };
         assert_eq!(scattered.cheapest_runs(3, 1), None, "their chunks do not empty");
-        let (kept, _, _) = chunk_picks(candidates, deficit, Some((3, 1)), Some(&scattered));
+        let (kept, _, _) = chunk_picks(candidates, deficit, Some(&RunNeed::one(3, 1)), Some(&scattered));
         assert!(kept.is_empty(), "evicting them makes no run: none moved");
         assert!(scattered.explain(3).contains("stuck=2"), "{}", scattered.explain(3));
     }

@@ -2716,9 +2716,9 @@ impl PoolPort for BindRoomPool {
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
     }
-    /// The chunks its own restore retakes first, in runs of `run`.
-    fn unpark_runs(&self, _pid: ProcessId, run: u32) -> u32 {
-        (self.own.lock().len() as u32).div_ceil(run.max(1))
+    /// The chunks its own restore retakes first, single chunks.
+    fn unpark_need(&self, _pid: ProcessId) -> super::pool::RunNeed {
+        super::pool::RunNeed::one(1, self.own.lock().len() as u32)
     }
     fn state_chunks(&self) -> u32 {
         self.total
@@ -5841,10 +5841,10 @@ async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_
 /// mx-7's state (a restore waiting for room for its roles, recorded
 /// bind_room (3,1) beside a refused roles_short (4,1), free 4-runs standing
 /// in the map, every other chunk emptiable by residents, and nothing ever
-/// moved, evictions frozen): the refusal's need becomes the head's need, the
-/// larger of the two, and, refused while runs of it stood, one run more than
-/// stood; the planner plans against that and moves the occupants of the
-/// cheapest such runs. No wait for a map change that never comes.
+/// moved, evictions frozen): the refusal's need becomes the head's need
+/// beside the bind's, each length apart, and, refused while runs of it
+/// stood, one run more than stood; the planner plans against that and
+/// moves the occupants of the cheapest such runs. No wait for a map change that never comes.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5882,7 +5882,15 @@ async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it(
         )
     });
     assert_eq!(roles_short, Some((4, 3)), "its refusal's run, one more piece than stood");
-    assert_eq!(bind_room, Some((4, 3)), "the recorded need follows: never less than refused");
+    assert_eq!(bind_room, Some((3, 1)), "the bind's runs keep their own length");
+    let key = planner
+        .with_inner(|inner| inner.queue.iter().find(|(_, w)| w.pid == head).map(|(k, _)| *k))
+        .expect("queued again");
+    assert_eq!(
+        planner.head_room(key),
+        Some(super::pool::RunNeed::of([(4, 3), (3, 1)])),
+        "the head's need: each length apart, never runs of three read as runs of four"
+    );
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -6906,7 +6914,7 @@ async fn a_restore_is_funded_for_its_runs_and_its_kv_pages_together() {
             },
         )
     });
-    assert_eq!(planner.head_room(key), Some((2, 2)), "its run and its pages' chunks");
+    assert_eq!(planner.head_room(key), Some(super::pool::RunNeed::one(2, 2)), "its run and its pages' chunks");
     assert!(pool.guest_room_free(2, 1), "the run alone stands");
     planner.poke();
     for _ in 0..200 {

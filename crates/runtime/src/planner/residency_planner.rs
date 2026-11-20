@@ -10,7 +10,7 @@ use super::departure::Departure;
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RoomReturns, RsSlotReservation};
 use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
-use super::pool::PoolPort;
+use super::pool::{PoolPort, RunNeed};
 use super::proc::{PendingBind, Proc, Residency};
 use super::rank::Rank;
 use super::reclaim::Reclaim;
@@ -470,8 +470,8 @@ impl ResidencyPlanner {
         // short of a run of four, 231 chunks free), every chunk given back
         // anywhere, the pass's own among them, woke a pass that found no
         // step (Mac Pro's mx-3: ~470 a second, nothing in flight).
-        let mut want_chunks = self.head_room(key).map_or(u64::MAX, |(run, pieces)| {
-            (u64::from(run) * u64::from(pieces))
+        let mut want_chunks = self.head_room(key).map_or(u64::MAX, |need| {
+            need.chunks()
                 .max(u64::from(self.port.free_chunks()).saturating_add(1))
         });
         let want_list = if kv_missing > 0 {
@@ -621,7 +621,7 @@ impl ResidencyPlanner {
     /// record, the census, the chunk map's ask and the step: read apart,
     /// the map asked less than the step took and moved no one. `None` for
     /// a head short of kv alone.
-    pub(super) fn head_room(&self, key: EntryKey) -> Option<(u32, u32)> {
+    pub(super) fn head_room(&self, key: EntryKey) -> Option<RunNeed> {
         let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
@@ -630,61 +630,73 @@ impl ResidencyPlanner {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
                     let suspended = proc.bind_room.is_some() && proc.roles_short.is_none();
+                    // A bind it was suspended for, of another length than
+                    // its refusal's: its runs stand beside the unpark's.
+                    let bind = proc
+                        .bind_room
+                        .filter(|bind| !suspended && bind.run != need.0)
+                        .map(|bind| (bind.run, bind.pieces));
                     // Its kv pages not yet gathered take chunks of the same
                     // free pool as its runs.
                     let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    Some((need, Some((waiter.pid, suspended)), kv_missing))
+                    Some((need, Some((waiter.pid, suspended, bind)), kv_missing))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
-        let (run, pieces) = match suspended {
+        let mut room = match suspended {
             // A bind's runs beside what its own unpark takes back first.
-            Some((pid, true)) => self.beside_own(pid, need),
+            Some((pid, true, _)) => self.beside_own(pid, need),
             // Short of its roles: the whole unpark, not the part it came up
-            // short on (its own runs count that part among them).
-            Some((pid, false)) => self.whole_unpark(pid, need),
-            None => need,
+            // short on (its own runs count that part among them), and the
+            // runs of the bind that suspended it, of their own length.
+            Some((pid, false, bind)) => {
+                let mut room = self.whole_unpark(pid, need);
+                if let Some((run, pieces)) = bind {
+                    room.add(run, pieces);
+                }
+                room
+            }
+            None => RunNeed::one(need.0, need.1),
         };
         // A restore's step gathers its kv pages, then lays its runs: the
-        // chunks the pages still need stand beside the runs, in runs of the
-        // same length (they need not be adjacent; asked so, they never fall
-        // short). Read as the runs alone, fitting runs stood (Mac Pro: a
-        // restore of (3, 3) and 41 kv pages, 8 runs open), the pages broke
-        // them as they were gathered, and the unpark came up short.
+        // chunks the pages still need are asked in runs of its longest
+        // length, laid after the runs (they need not be adjacent; asked so,
+        // no page gathered first breaks a run the need counts on). Read as
+        // the runs alone, fitting runs stood (Mac Pro: a restore of (3, 3)
+        // and 41 kv pages, 8 runs open), the pages broke them as they were
+        // gathered, and the unpark came up short.
         let per_chunk = self.port.chunks_as_pages(1);
-        let kv_runs = if per_chunk > 0 {
-            kv_missing.div_ceil(per_chunk).div_ceil(run.max(1))
-        } else {
-            0
-        };
-        let most = self.port.state_chunks() / run.max(1);
-        Some((run, pieces.saturating_add(kv_runs).min(most).max(pieces)))
+        if per_chunk > 0 && kv_missing > 0 {
+            let (run, _) = room.longest().unwrap_or(need);
+            room.add(run, kv_missing.div_ceil(per_chunk).div_ceil(run.max(1)));
+        }
+        Some(room.within(self.port.state_chunks(), Some(need)))
     }
 
     /// The runs a restore short of its roles takes when its unpark runs:
-    /// the whole unpark (`PoolPort::unpark_runs`, its parts' runs, the one
-    /// it came up short on among them) where that is more than the part
-    /// its refusal named, never more than the pool stands. Asked the part
-    /// alone, the map saw it free and moved no one, the refusal came again
-    /// with those runs standing, and the need grew a run a refusal (9x3,
-    /// then 9x4) while nothing was issued.
-    pub(super) fn whole_unpark(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> (u32, u32) {
-        let own = self.port.unpark_runs(pid, run);
-        let most = self.port.state_chunks() / run.max(1);
-        (run, own.min(most).max(pieces))
+    /// the whole unpark (`PoolPort::unpark_need`, its parts' runs, one
+    /// entry per run length, the one it came up short on among them) where
+    /// that is more than the part its refusal named, never more than the
+    /// pool stands. Asked the part alone, the map saw it free and moved no
+    /// one, the refusal came again with those runs standing, and the need
+    /// grew a run a refusal (9x3, then 9x4) while nothing was issued.
+    pub(super) fn whole_unpark(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> RunNeed {
+        let mut need = self.port.unpark_need(pid);
+        need.at_least(run, pieces);
+        need.within(self.port.state_chunks(), Some((run, pieces)))
     }
 
     /// The runs a restore a bind suspended asks of the chunk map: its bind's
-    /// `pieces` runs of `run` chunks beside those its own unpark takes back
-    /// first (`PoolPort::unpark_runs`), never more than the pool stands.
-    /// The census reads the bind's runs beside its own retake
-    /// (`room_beside_own`); a map asked for the bind's runs alone saw them
-    /// free, found no one to move, and the restore waited with no step.
-    pub(super) fn beside_own(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> (u32, u32) {
-        let own = self.port.unpark_runs(pid, run);
-        let most = self.port.state_chunks() / run.max(1);
-        (run, pieces.saturating_add(own).min(most).max(pieces))
+    /// `pieces` runs of `run` chunks beside those its own unpark lays first
+    /// (`PoolPort::unpark_need`, one entry per run length), never more than
+    /// the pool stands. The census reads the bind's runs beside its own
+    /// retake (`room_beside_own`); a map asked for the bind's runs alone saw
+    /// them free, found no one to move, and the restore waited with no step.
+    pub(super) fn beside_own(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> RunNeed {
+        let mut need = self.port.unpark_need(pid);
+        need.add(run, pieces);
+        need.within(self.port.state_chunks(), Some((run, pieces)))
     }
 
     /// Whose parked state a map for `head` leaves out: its own while it is
@@ -705,15 +717,15 @@ impl ResidencyPlanner {
 
     /// Parked state lying on the device (role slots its park found no host
     /// room for) is room a move makes, as idle cache is: for the head's
-    /// `pieces` runs of `run` adjacent chunks, the parked processes whose
+    /// runs (`need`, each length laid as the map lays it), the parked processes whose
     /// state alone empties the cheapest such runs, free chunks beside it,
     /// move it down a tier ([`Self::park_down`]). Whether a move is on its
     /// way (its landing pokes the planner).
-    pub(super) fn park_down_for(self: &Arc<Self>, run: u32, pieces: u32) -> bool {
+    pub(super) fn park_down_for(self: &Arc<Self>, need: &RunNeed) -> bool {
         let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(_, w)| w.pid)) else {
             return false;
         };
-        match self.port.parked_occupants(self.parked_except(head)).cheapest_runs(run, pieces) {
+        match self.port.parked_occupants(self.parked_except(head)).cheapest_need(need) {
             Some(pids) if !pids.is_empty() => self.park_down(head, pids),
             _ => false,
         }

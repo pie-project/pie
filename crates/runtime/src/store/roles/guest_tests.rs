@@ -2792,10 +2792,13 @@ fn a_parked_process_s_own_retake_is_counted_in_runs() {
     let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
     let (program, mut engine) = runs_of(13, 2, 1, 0);
     let id = bind_as(&roles, &mut engine, program, 1).unwrap();
-    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 0, "bound: nothing to take back");
+    assert!(roles.lock().unwrap().unpark_need(holder(1)).is_empty(), "bound: nothing to take back");
     park(&roles, 1);
-    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 1, "its run of two comes back first");
-    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 1), 2, "two runs of one");
+    assert_eq!(
+        roles.lock().unwrap().unpark_need(holder(1)),
+        vec![(2, 1)],
+        "its run of two comes back first, a run of two, never two single chunks"
+    );
     let back = roles
         .lock()
         .unwrap()
@@ -2803,7 +2806,7 @@ fn a_parked_process_s_own_retake_is_counted_in_runs() {
         .unwrap()
         .expect("it comes back");
     roles.lock().unwrap().commit(back);
-    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 0, "back: nothing parked");
+    assert!(roles.lock().unwrap().unpark_need(holder(1)).is_empty(), "back: nothing parked");
     roles.lock().unwrap().close_instance(id);
 }
 
@@ -2850,7 +2853,13 @@ fn an_unpark_asks_the_chunks_it_lays_not_a_chunk_a_part() {
     park(&roles, 1);
     let free = || device.lock().unwrap().pool().free_chunks();
     let before = free();
-    let asked = roles.lock().unwrap().unpark_runs(holder(1), 1);
+    let asked: u32 = roles
+        .lock()
+        .unwrap()
+        .unpark_need(holder(1))
+        .iter()
+        .map(|&(run, pieces)| run * pieces)
+        .sum();
     let back = roles
         .lock()
         .unwrap()
@@ -2906,4 +2915,65 @@ fn a_restore_needing_three_runs_of_nine_is_seated_in_stretches_of_ten_ten_and_ni
         .expect("seated where its runs stand")
         .expect("it comes back");
     roles.lock().unwrap().commit(back);
+}
+
+/// The L40S's refusal of a run of two its need counted on: an unpark took
+/// its parts in its items' order, and a run of slots opened the lowest free
+/// chunk, splitting the only stretch the run of two stood in. It lays its
+/// runs of whole chunks first, the longest first, then its runs of slots:
+/// free chunks `c`, `c + 1` and `d` hold a run of two and a run of slots,
+/// and the unpark lands. (Its items lie in a hash map: five runs of slots
+/// beside the run of two, four rounds, so the old order fails nearly
+/// always.)
+#[test]
+fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
+    for round in 0..4u64 {
+        let Pools { device, roles } = pools(64);
+        // Its five runs of slots and its run of two chunks, then parked.
+        let mut slots = GuestEngine::new(TOP_P, 0);
+        slots.next = round * 10_000;
+        for _ in 0..5 {
+            bind(&roles, &mut slots, 1).unwrap();
+        }
+        let (program, mut two) = runs_of(13, 2, 1, round * 10_000 + 500);
+        bind_as(&roles, &mut two, program, 1).unwrap();
+        park(&roles, 1);
+        // The device filled with single chunks, then three of them closed:
+        // two adjacent at the lowest, one apart above.
+        let (singles, mut single) = runs_of(9, 1, 1, round * 10_000 + 1000);
+        let mut at: Vec<(u32, InstanceId)> = Vec::new();
+        for by in 0.. {
+            match bind_as(&roles, &mut single, singles, 500 + by) {
+                Ok(id) => at.push((chunks(&single.bindings.last().unwrap().scratch)[0], id)),
+                Err(_) => {
+                    roles.lock().unwrap().leave_guest_wait(holder(500 + by));
+                    break;
+                }
+            }
+        }
+        at.sort_unstable();
+        let c = at
+            .windows(2)
+            .find(|pair| pair[1].0 == pair[0].0 + 1)
+            .map(|pair| pair[0])
+            .expect("two adjacent singles");
+        let d = at
+            .iter()
+            .rev()
+            .find(|(chunk, _)| *chunk > c.0 + 2)
+            .copied()
+            .expect("a single apart above");
+        let next = at.iter().find(|(chunk, _)| *chunk == c.0 + 1).unwrap().1;
+        for id in [c.1, next, d.1] {
+            roles.lock().unwrap().close_instance(id);
+        }
+        assert_eq!(device.lock().unwrap().pool().free_chunks(), 3, "c, c + 1 and d free");
+        let back = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .expect("its run of two at c, its runs of slots at d: it lands")
+            .expect("it comes back");
+        roles.lock().unwrap().commit(back);
+    }
 }

@@ -21,6 +21,110 @@ pub struct ChunkStats {
 
 /// Physical chunks of a shared pool by what holds them
 /// ([`PoolPort::chunk_occupants`]).
+/// The runs of adjacent chunks a head's step lays, one entry per run
+/// length, the longest first: `(run, pieces)`. Read as one length, a
+/// restore whose unpark lays a run of two and fourteen single chunks was
+/// asked sixteen single chunks, the map stood them, and the unpark was
+/// refused the run of two (the L40S).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunNeed(Vec<(u32, u32)>);
+
+impl RunNeed {
+    /// `pieces` runs of `run` chunks.
+    #[must_use]
+    pub fn one(run: u32, pieces: u32) -> Self {
+        let mut need = Self::default();
+        need.add(run, pieces);
+        need
+    }
+
+    /// Each `(run, pieces)` of `entries`, summed by length.
+    #[must_use]
+    pub fn of(entries: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        let mut need = Self::default();
+        for (run, pieces) in entries {
+            need.add(run, pieces);
+        }
+        need
+    }
+
+    /// `pieces` more runs of `run` chunks.
+    pub fn add(&mut self, run: u32, pieces: u32) {
+        self.entry(run, |had| had.saturating_add(pieces), pieces);
+    }
+
+    /// At least `pieces` runs of `run` chunks.
+    pub fn at_least(&mut self, run: u32, pieces: u32) {
+        self.entry(run, |had| had.max(pieces), pieces);
+    }
+
+    fn entry(&mut self, run: u32, with: impl Fn(u32) -> u32, fresh: u32) {
+        if fresh == 0 {
+            return;
+        }
+        let run = run.max(1);
+        match self.0.iter_mut().find(|(at, _)| *at == run) {
+            Some((_, pieces)) => *pieces = with(*pieces),
+            None => {
+                self.0.push((run, fresh));
+                self.0.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            }
+        }
+    }
+
+    /// Its entries, the longest run first.
+    #[must_use]
+    pub fn entries(&self) -> &[(u32, u32)] {
+        &self.0
+    }
+
+    /// Its longest runs' entry.
+    #[must_use]
+    pub fn longest(&self) -> Option<(u32, u32)> {
+        self.0.first().copied()
+    }
+
+    /// The runs of `run` chunks it asks.
+    #[must_use]
+    pub fn pieces_at(&self, run: u32) -> u32 {
+        self.0
+            .iter()
+            .find(|(at, _)| *at == run.max(1))
+            .map_or(0, |&(_, pieces)| pieces)
+    }
+
+    /// The chunks it asks in all.
+    #[must_use]
+    pub fn chunks(&self) -> u64 {
+        self.0
+            .iter()
+            .map(|&(run, pieces)| u64::from(run) * u64::from(pieces))
+            .sum()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Never more chunks than `most` (the pool's state chunks), the longest
+    /// runs kept first; `floor`'s entry (what a refusal named) kept whole.
+    #[must_use]
+    pub fn within(self, most: u32, floor: Option<(u32, u32)>) -> Self {
+        let mut left = most;
+        let mut need = Self::default();
+        for (run, pieces) in self.0 {
+            let pieces = pieces.min(left / run);
+            left -= pieces * run;
+            need.add(run, pieces);
+        }
+        if let Some((run, pieces)) = floor {
+            need.at_least(run, pieces);
+        }
+        need
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChunkMap {
     /// Each chunk some candidate's pages lie in: the slots it holds in
@@ -224,11 +328,17 @@ impl ChunkMap {
     /// such runs stand.
     #[must_use]
     pub fn cheapest_runs(&self, run: u32, pieces: u32) -> Option<Vec<ProcessId>> {
-        let run = run.max(1);
-        let one_segment = |first: u32| {
-            self.segment_chunks == 0
-                || first / self.segment_chunks == (first + run - 1) / self.segment_chunks
-        };
+        self.cheapest_need(&RunNeed::one(run, pieces))
+    }
+
+    /// As [`Self::cheapest_runs`], for every entry of `need` at once: its
+    /// longest runs laid first, each shorter length in the chunks left
+    /// beside them, and the budget's headroom read against every chunk
+    /// they open together. Asked one length at a time, each fit the
+    /// headroom alone and runs of two were laid where single chunks had
+    /// been counted.
+    #[must_use]
+    pub fn cheapest_need(&self, need: &RunNeed) -> Option<Vec<ProcessId>> {
         let free: std::collections::BTreeSet<u32> = self.free.iter().copied().collect();
         let held: std::collections::BTreeMap<u32, &ChunkHeld> = self
             .held
@@ -243,31 +353,37 @@ impl ChunkMap {
                 held.get(&chunk).map(|held| held.pages())
             }
         };
-        // Every window of `run` adjacent chunks each free or emptiable, by
-        // its cost; then the cheapest disjoint ones.
         let starts: std::collections::BTreeSet<u32> =
             free.iter().chain(held.keys()).copied().collect();
-        let windows: Vec<(u32, u32)> = starts
-            .iter()
-            .filter(|&&first| one_segment(first))
-            .filter_map(|&first| {
-                (first..first + run)
-                    .map(cost)
-                    .try_fold(0u32, |sum, cost| cost.map(|cost| sum + cost))
-                    .map(|sum| (sum, first))
-            })
-            .collect();
-        // The cheapest `pieces` disjoint windows, chosen exactly: taking the
-        // cheapest window first could leave no room for the rest where a
-        // costlier set of them fits (free runs at 1-3 and 6-8 of eleven
-        // chunks, a third run asked: the two free ones taken, nothing fit
-        // beside them, and no one was moved, though moving one occupant
-        // stood three runs at 0, 3 and 6).
-        let taken = cheapest_disjoint(&windows, run, pieces)?;
-        let in_runs: std::collections::BTreeSet<u32> = taken
-            .iter()
-            .flat_map(|&(_, first)| first..first + run)
-            .collect();
+        let mut in_runs: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for &(run, pieces) in need.entries() {
+            let run = run.max(1);
+            let one_segment = |first: u32| {
+                self.segment_chunks == 0
+                    || first / self.segment_chunks == (first + run - 1) / self.segment_chunks
+            };
+            // Every window of `run` adjacent chunks each free or emptiable
+            // and not laid for a longer run, by its cost; then the cheapest
+            // disjoint ones.
+            let windows: Vec<(u32, u32)> = starts
+                .iter()
+                .filter(|&&first| one_segment(first))
+                .filter_map(|&first| {
+                    (first..first + run)
+                        .map(|chunk| if in_runs.contains(&chunk) { None } else { cost(chunk) })
+                        .try_fold(0u32, |sum, cost| cost.map(|cost| sum + cost))
+                        .map(|sum| (sum, first))
+                })
+                .collect();
+            // The cheapest `pieces` disjoint windows, chosen exactly: taking the
+            // cheapest window first could leave no room for the rest where a
+            // costlier set of them fits (free runs at 1-3 and 6-8 of eleven
+            // chunks, a third run asked: the two free ones taken, nothing fit
+            // beside them, and no one was moved, though moving one occupant
+            // stood three runs at 0, 3 and 6).
+            let taken = cheapest_disjoint(&windows, run, pieces)?;
+            in_runs.extend(taken.iter().flat_map(|&(_, first)| first..first + run));
+        }
         // The free chunks the runs open take the budget's headroom; past
         // it, each needs a chunk emptied elsewhere (its slots leave, and
         // the budget it held comes back). Counted as costless, a free run
@@ -396,6 +512,15 @@ pub trait PoolPort: Send + Sync + 'static {
     fn guest_free_runs(&self, run: u32) -> u32 {
         u32::from(self.guest_room_free(run, 1))
     }
+    /// Whether every entry of `need` stands free together, as a guest's
+    /// takes lay them: the longest runs first, each shorter length beside
+    /// them, the budget's headroom spent by all of them. Where the pool
+    /// lays nothing apart, each entry read on its own.
+    fn guest_need_free(&self, need: &RunNeed) -> bool {
+        need.entries()
+            .iter()
+            .all(|&(run, pieces)| self.guest_room_free(run, pieces))
+    }
     /// Where a raise of the activation to `rung` (tokens) stands now: what
     /// a rung raise short of room waits on
     /// ([`super::ResidencyPlanner::fund_rise`]). `Fits` where the pool has
@@ -492,14 +617,14 @@ pub trait PoolPort: Send + Sync + 'static {
     fn free_chunks(&self) -> u32 {
         self.chunk_stats().pages.0
     }
-    /// The runs of `run` adjacent chunks `pid`'s restore takes for its own
-    /// parked guest state before a bind's room
-    /// ([`crate::store::roles::Roles::unpark_runs`]): what the chunk map
-    /// must stand beside the runs of the bind that suspended it. 0 where
-    /// the pool keeps no guest state.
-    fn unpark_runs(&self, pid: ProcessId, run: u32) -> u32 {
-        let _ = (pid, run);
-        0
+    /// The runs of adjacent chunks `pid`'s restore lays for its own parked
+    /// guest state before a bind's room, one entry per run length
+    /// ([`crate::store::roles::Roles::unpark_need`]): what the chunk map
+    /// must stand beside the runs of the bind that suspended it. Empty
+    /// where the pool keeps no guest state.
+    fn unpark_need(&self, pid: ProcessId) -> RunNeed {
+        let _ = pid;
+        RunNeed::default()
     }
     /// The chunks the device pool holds for kv and state at most (its
     /// chunks past the reserved and the activation's): the most runs of
@@ -679,6 +804,26 @@ impl PoolPort for RegistryPool {
         self.guest_free_runs(run) >= pieces
     }
 
+    fn guest_need_free(&self, need: &RunNeed) -> bool {
+        use crate::store::slots::OwnPiece;
+        let Some((last, laid)) = need.entries().split_last() else {
+            return true;
+        };
+        let own: Vec<OwnPiece> = laid
+            .iter()
+            .map(|&(run, pieces)| OwnPiece::Chunks { run, pieces })
+            .collect();
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| {
+                shared
+                    .lock()
+                    .unwrap()
+                    .pool()
+                    .chunk_runs_beside(&own, last.0, last.1)
+            })
+    }
+
     fn rise_room(&self, rung: u32) -> RiseRoom {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
@@ -766,10 +911,12 @@ impl PoolPort for RegistryPool {
         });
     }
 
-    fn unpark_runs(&self, pid: ProcessId, run: u32) -> u32 {
+    fn unpark_need(&self, pid: ProcessId) -> RunNeed {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
-            .map_or(0, |roles| roles.lock().unwrap().unpark_runs(pid, run))
+            .map_or_else(RunNeed::default, |roles| {
+                RunNeed::of(roles.lock().unwrap().unpark_need(pid))
+            })
     }
 
     fn state_chunks(&self) -> u32 {
