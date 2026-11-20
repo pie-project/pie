@@ -895,6 +895,7 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a

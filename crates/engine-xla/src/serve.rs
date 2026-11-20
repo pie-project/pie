@@ -283,6 +283,13 @@ pub struct Shell {
     /// A fire on scratch slots every lane shares (the warm ladder's): what it
     /// writes is never read back, so its rows may lay a page in two runs.
     pub(crate) scratch_fire: bool,
+    /// The fire being traced is a mixed one the load states laid
+    /// (`Shell::mixed_lanes`): a program missing for it after the ladder
+    /// fails the fire by name, never compiles on its path.
+    laid_mixed: bool,
+    /// The fire limits the load stated beside its mixed lanes
+    /// (`Capabilities::limits`), as the runtime's cutter reads them.
+    stated_limits: Option<engine::FireLimits>,
     /// The stage-only pass (`size`): a fire stops once its inputs are
     /// staged, before anything is traced, leaving their rows here.
     sizing: Option<u32>,
@@ -1118,6 +1125,8 @@ impl Shell {
             fire_streamed: None,
             stage_all: false,
             scratch_fire: false,
+            laid_mixed: false,
+            stated_limits: None,
             sizing: None,
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
@@ -1739,6 +1748,22 @@ impl Shell {
             return Ok(Fired::default());
         }
         let real_rows: u32 = lanes.iter().map(|s| s.lane.tokens.len() as u32).sum();
+        // A mixed fire the load states laid, counted as the runtime's cutter
+        // counts it (a prompt a lane of more than one row, a decode one).
+        let (prompts, prompt_rows) = lanes
+            .iter()
+            .filter(|s| s.lane.tokens.len() > 1)
+            .fold((0u32, 0u32), |(n, r), s| {
+                (n + 1, r + s.lane.tokens.len() as u32)
+            });
+        let decodes = lanes.iter().filter(|s| s.lane.tokens.len() == 1).count() as u32;
+        self.laid_mixed = prompts > 0
+            && decodes > 0
+            && clips.is_empty()
+            && self.stated_limits.is_some_and(|limits| {
+                self.mixed_lanes()
+                    .fits(&limits, prompts, prompt_rows, decodes)
+            });
         let decode = lanes.iter().all(|s| s.lane.tokens.len() == 1);
         if !decode
             && clips.is_empty()
@@ -1839,6 +1864,36 @@ impl Shell {
             .filter(|&d| d <= top && pad.rung(d) == d)
             .max()
             .unwrap_or(1)
+    }
+
+    /// The mixed fires the load lays, as the runtime's cutter reads them
+    /// (`engine::MixedLanes`): each prompt lane rung from the mixed host rung
+    /// up, with the decode lanes beside it (`mixed_decode_lanes`), the
+    /// pairs the warm ladder lays.
+    pub fn mixed_lanes(&self) -> engine::MixedLanes {
+        let pad = self.pad;
+        let max = self.budgets.tokens.max_lanes;
+        let mut rungs = Vec::new();
+        let mut p = pad.mixed_host_rung;
+        while p < max {
+            let d = self.mixed_decode_lanes(p);
+            if d == 0 {
+                break;
+            }
+            rungs.push(engine::MixedRung {
+                prompt_lanes: p,
+                decode_lanes: d,
+            });
+            p = pad.next(p);
+        }
+        engine::MixedLanes::Laid(rungs)
+    }
+
+    /// Holds the fire limits the load stated (`Capabilities::limits`): a
+    /// mixed fire within them and [`Self::mixed_lanes`] is one the load
+    /// states laid.
+    pub fn state_limits(&mut self, limits: engine::FireLimits) {
+        self.stated_limits = Some(limits);
     }
 
     /// The decode lanes beside `prompt_lanes` prompt lanes (their rung, the
@@ -3809,6 +3864,15 @@ impl Shell {
                 descriptor.lanes.len()
             )
         };
+        if self.laddered && self.laid_mixed && !self.device.holds(&text) {
+            return Err(Fault::Program {
+                at: "serve::mixed_lanes",
+                why: format!(
+                    "a mixed fire the load states laid ({}) has no program from the warm ladder",
+                    fire()
+                ),
+            });
+        }
         Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
