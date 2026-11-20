@@ -1703,7 +1703,9 @@ impl<B: Serve> Shell<B> {
         }
         // Said once, by the load that serves: its naming walk weighs the same.
         if !B::NAMES {
-            tracing::info!("dense matmul by rows: {}", dense.runs());
+            for plane in dense.runs() {
+                tracing::info!("dense matmul plane {plane}");
+            }
             for w in &weighed_dense {
                 if B::RECORDS {
                     tracing::info!("dense matmul {w}");

@@ -61,15 +61,14 @@ fn runs_of(by_rows: &[(u32, Tactic)]) -> String {
 }
 
 impl Dense {
-    /// The tactic each run of row counts takes at each plane, said
-    /// compactly: `n x k: rows-rows name, ...; ...`.
+    /// The tactic each run of row counts takes at each plane, a line a
+    /// plane: `n x k: rows-rows name, ...`.
     #[must_use]
-    pub fn runs(&self) -> String {
+    pub fn runs(&self) -> Vec<String> {
         self.planes
             .iter()
             .map(|((n, k), by_rows)| format!("{n}x{k}: {}", runs_of(by_rows)))
-            .collect::<Vec<_>>()
-            .join("; ")
+            .collect()
     }
 
     /// The tactic a matmul of `rows` over an `n x k` plane runs: the
@@ -885,8 +884,8 @@ mod tests {
         .unwrap();
         // At one rung the layers' planes take the vector kernel and the head,
         // where it was beaten, the tile.
-        assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", dense.runs());
-        assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{}", dense.runs());
+        assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{:?}", dense.runs());
+        assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{:?}", dense.runs());
         let _ = weighed;
         // Stopped by the bound at the head instead: the same.
         curves[3].stop = Some((64, profile::fire::KernelCurve::BOUND));
@@ -959,7 +958,7 @@ mod tests {
         )
         .unwrap()
         .0;
-        assert_eq!(spread.at(1024, n, k).vector, 16, "{}", spread.runs());
+        assert_eq!(spread.at(1024, n, k).vector, 16, "{:?}", spread.runs());
         let full = choose(
             Target::Spirv,
             &rungs,
@@ -971,7 +970,7 @@ mod tests {
         )
         .unwrap()
         .0;
-        assert_eq!(full.at(1024, n, k).vector, 0, "{}", full.runs());
+        assert_eq!(full.at(1024, n, k).vector, 0, "{:?}", full.runs());
         // Only that rung: the one below still weighs the rows it serves.
         assert_eq!(full.at(512, n, k), spread.at(512, n, k));
     }
