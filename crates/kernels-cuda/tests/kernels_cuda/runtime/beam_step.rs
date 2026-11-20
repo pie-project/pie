@@ -37,14 +37,13 @@ impl Lcg {
     }
 }
 
-/// The slot address the synthetic rs translation gives rs pool page `q`
-/// (a hybrid's, `BEAM-PAGE-LISTS.md` §11).
-fn rs_base(q: u32) -> u64 {
-    0x7000_0000 + u64::from(q) * 0x100
+/// The slot address the synthetic rs translation gives the set's rs entry
+/// `e` (a hybrid's, `BEAM-PAGE-LISTS.md` §11).
+fn rs_base(e: u32) -> u64 {
+    0x7000_0000 + u64::from(e) * 0x100
 }
 
-/// Where column 0 lies in a beam's rs page table: the buffer starts pages
-/// before the beams' first (`f0 - base / S`).
+/// Where a beam's rs page table starts in the fire's.
 const RS_FROM: u32 = 3;
 
 /// The device id the synthetic translation gives pool page `q`.
@@ -53,6 +52,16 @@ fn device_id(q: u32) -> i32 {
 }
 
 fn search(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
+    // The rs buffer pages `rs_tokens` rows from the frozen slot rounded to
+    // them: off a kv page where the prompt ends mid-page (the live frozen
+    // slot 38 at 2 rows a page).
+    for rs_tokens in [1, 2, 4] {
+        search_rs(gpu, lanes, folded, steps, seed, rs_tokens);
+    }
+}
+
+fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_tokens: u32) {
+    let rs_from_slot = folded - folded % rs_tokens;
     let ctx = gpu.ctx();
     let f0 = folded / PAGE;
     let columns = (folded + steps - 1) / PAGE - f0 + 1;
@@ -65,11 +74,12 @@ fn search(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
     // A table each beam: its entries from `f0`, one row.
     let indices_at = gpu.up(&vec![-1i32; (lanes * cap) as usize]);
     let write_page_at = gpu.up(&vec![-1i32; lanes as usize]);
-    // An rs page table each beam (its run `RS_FROM + cap` long), and the rs
-    // pool pages' slot addresses.
-    let rs_span = RS_FROM + cap;
+    // An rs page table each beam (its run `RS_FROM` past the last's), and
+    // the set's rs entries' slot addresses, every slot of its reserve.
+    let rs_entries_set = ((f0 + reserve) * PAGE - rs_from_slot).div_ceil(rs_tokens);
+    let rs_span = RS_FROM + rs_entries_set;
     let rs_pages_at = gpu.up(&vec![0u64; (lanes * rs_span) as usize]);
-    let rs_bases: Vec<u64> = (0..reserve).map(rs_base).collect();
+    let rs_bases: Vec<u64> = (0..rs_entries_set).map(rs_base).collect();
     let rs_bases_at = gpu.up(&rs_bases);
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
@@ -100,14 +110,17 @@ fn search(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             })
             .collect();
         let lists_at = gpu.up(&lists);
+        let rs_entries = (slot - rs_from_slot) / rs_tokens + 1;
         let rs_runs: Vec<BeamRsRun> = (0..lanes)
             .map(|b| BeamRsRun {
                 pages: rs_pages_at,
                 bases: rs_bases_at,
                 lane: b,
                 from: b * rs_span + RS_FROM,
-                entries: c + 1,
-                _pad: 0,
+                entries: rs_entries,
+                base: rs_from_slot,
+                tokens: rs_tokens,
+                bases_len: rs_entries_set,
             })
             .collect();
         let rs_at = gpu.up(&rs_runs);
@@ -145,7 +158,7 @@ fn search(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             },
         );
         let held: Vec<u32> = gpu.down(state_at, words);
-        let at = format!("lanes {lanes} folded {folded} seed {seed} fire {t}");
+        let at = format!("lanes {lanes} folded {folded} seed {seed} rs {rs_tokens} fire {t}");
         assert_eq!(held[0], 1, "{at}: primed");
         assert_eq!(held[1], replay.fired, "{at}: fires run");
         assert_eq!(held[2], replay.pool, "{at}: the pool's pages");
@@ -179,21 +192,23 @@ fn search(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
             assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
         }
-        // A hybrid's rs page tables (§11): each beam's columns over the same
-        // list, its write page among them.
+        // A hybrid's rs page tables (§11), slot by slot: entry e (slot
+        // `base + e T`) holds the set's rows of slot (f0 + list[j]) S +
+        // slot mod S, its write page among them; entries on the frozen
+        // pages are left as staged.
         let rs_resolved: Vec<u64> = gpu.down(rs_pages_at, (lanes * rs_span) as usize);
         for b in 0..lanes as usize {
-            let want_rs: Vec<u64> = want.lists[b].iter().map(|&q| rs_base(q)).collect();
             let at_b = b * rs_span as usize + RS_FROM as usize;
-            assert_eq!(
-                &rs_resolved[at_b..at_b + c as usize + 1],
-                &want_rs[..],
-                "{at}: beam {b}'s rs page table"
-            );
-            assert!(
-                rs_resolved[b * rs_span as usize..at_b].iter().all(|&w| w == 0),
-                "{at}: beam {b}'s rs entries before column 0 untouched"
-            );
+            for e in 0..rs_entries {
+                let s = rs_from_slot + e * rs_tokens;
+                let want_rs = if s < f0 * PAGE {
+                    0
+                } else {
+                    let q = want.lists[b][(s / PAGE - f0) as usize];
+                    rs_base(((f0 + q) * PAGE + s % PAGE - rs_from_slot) / rs_tokens)
+                };
+                assert_eq!(rs_resolved[at_b + e as usize], want_rs, "{at}: beam {b}'s rs entry {e}");
+            }
         }
     }
 }
