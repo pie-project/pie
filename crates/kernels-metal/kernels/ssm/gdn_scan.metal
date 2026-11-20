@@ -466,6 +466,17 @@ inline device uchar* gdn_buffered_row(
          size_t(at % page_tokens) * row_bytes;
 }
 
+// Where row `t` of a lane's extended rows lands a corrected plane: through
+// the page table in its buffer page, or (no page table) at its own row
+// `own_row` of the plane's scratch, which the fire then scatters into the
+// buffer as it does the planes it gathers.
+inline device uchar* gdn_corrected_row(
+    device uchar* slab, const device int* pages, int t, int own_row, uint page_tokens,
+    uint page_bytes, uint row_bytes) {
+  return pages != nullptr ? gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, row_bytes)
+                          : slab + size_t(own_row) * row_bytes;
+}
+
 // `gdn_row_sum<32>` of each of `V` values, with fewer shuffles: each xor step
 // of the first `log2(V)` halves the values a lane carries, keeping the half
 // its lane bit names and taking its partner's of that half, so a lane ends
@@ -593,6 +604,14 @@ template <typename T, int LANES, int SG, int VROWS>
     const constant uint& row_bytes [[buffer(20)]],
     const constant int& paged   [[buffer(21)]],
     const device ulong* map     [[buffer(22)]],
+    // The corrected planes (`rs_corrected`): each own row's raw keys (bf16)
+    // and its corrected value `u` (f32) land in the lane's buffer, where a
+    // later decode step reads the row as a linear attention.
+    device uchar* key_slab      [[buffer(23)]],
+    const constant uint& key_row_bytes [[buffer(24)]],
+    device uchar* u_slab        [[buffer(25)]],
+    const constant uint& u_row_bytes [[buffer(26)]],
+    const constant int& corrected [[buffer(27)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -633,6 +652,11 @@ template <typename T, int LANES, int SG, int VROWS>
   const device int* pages =
       paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
   const int hk = hv / (v_heads / k_heads);
+  // Own rows land their corrected planes where the lane has a buffer page.
+  const bool lands_corrected = corrected != 0 && (pages == nullptr || pages[0] >= 0);
+  // A key head's raw keys land once: by its first value head's first group.
+  const bool lands_keys =
+      lands_corrected && group.y == 0 && hv % (v_heads / k_heads) == 0;
   const size_t keys = size_t(k_heads) * D;
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
   const float scale = 1.0f / metal::sqrt(float(D));
@@ -669,6 +693,14 @@ template <typename T, int LANES, int SG, int VROWS>
       for (int i = 0; i < NORM_PER; ++i) {
         q_s[j][NORM_PER * int(lane_u) + i] = q[i] * qinv;
         k_s[j][NORM_PER * int(lane_u) + i] = k[i] * kinv;
+      }
+      if (lands_keys && c0 + j >= rep) {
+        device T* row = reinterpret_cast<device T*>(gdn_corrected_row(
+            key_slab, pages, c0 + j, own + c0 + j, page_tokens, page_bytes, key_row_bytes));
+        for (int i = 0; i < NORM_PER; ++i) {
+          const int d = NORM_PER * int(lane_u) + i;
+          row[size_t(hk) * D + size_t(d)] = qkv[kbase + size_t(d)];
+        }
       }
     }
     for (int at = tid; at < rows * GROUP_ROWS; at += SG * 32) {
@@ -725,6 +757,14 @@ template <typename T, int LANES, int SG, int VROWS>
           }
         }
       } else {
+        if (lands_corrected && lane == 0) {
+          // `u = beta (v - g S^T k)`: what the update below adds along `k`.
+          device float* row = reinterpret_cast<device float*>(gdn_corrected_row(
+              u_slab, pages, t, own + t, page_tokens, page_bytes, u_row_bytes));
+          for (int v = 0; v < VROWS; ++v) {
+            row[size_t(hv) * D + size_t(dv_base + v)] = (vals[v] - mem[v]) * beta;
+          }
+        }
         float out[VROWS];
         gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
         const size_t row_out = (size_t(own + t) * size_t(v_heads) + size_t(hv)) * D;
@@ -769,7 +809,9 @@ template <typename T, int LANES, int SG, int VROWS>
       const constant int&, const constant int&, const device int*,             \
       const constant int&, device uchar*, const device int*,                   \
       const constant uint&, const constant uint&, const constant uint&,        \
-      const constant int&, const device ulong*, uint3, uint, uint);
+      const constant int&, const device ulong*, device uchar*,                 \
+      const constant uint&, device uchar*, const constant uint&,               \
+      const constant int&, uint3, uint, uint);
 
 PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)

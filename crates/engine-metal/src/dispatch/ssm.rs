@@ -171,7 +171,35 @@ impl Run<'_> {
                         Some(_) => self.tensor(ba),
                         None => self.rs_extend(OP, &seat, ba)?,
                     };
-                    return ssm::gated_delta_verify(
+                    // The corrected planes (keys, u) each own row lands:
+                    // through the page table, or into the planes' scratch at
+                    // its own row and scattered into the buffer after.
+                    let planes = seat
+                        .layout
+                        .in_of
+                        .get(&qkv.0)
+                        .copied()
+                        .zip(seat.layout.in_of.get(&y.0).copied());
+                    let corrected = match (planes, paged) {
+                        (None, _) => None,
+                        (Some(_), Some(_)) => seat
+                            .paged(self.handles(), *qkv)
+                            .zip(seat.paged(self.handles(), *y))
+                            .map(|(keys, u)| ssm::Corrected {
+                                keys: keys.slab,
+                                key_row_bytes: keys.row_bytes,
+                                u: u.slab,
+                                u_row_bytes: u.row_bytes,
+                            }),
+                        (Some((kp, up)), None) => Some(ssm::Corrected {
+                            keys: seat.ext_in[kp],
+                            key_row_bytes: plane_row_bytes(&seat, kp, OP)?,
+                            u: seat.ext_in[up],
+                            u_row_bytes: plane_row_bytes(&seat, up, OP)?,
+                        }),
+                    };
+                    let scattered = planes.filter(|_| paged.is_none());
+                    let landed = ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
                         self.qo_indptr(),
@@ -183,6 +211,7 @@ impl Run<'_> {
                             gates: self.tensor(*gates),
                         },
                         paged,
+                        corrected,
                         &self.recurrent(*state),
                         *k_heads,
                         *v_heads,
@@ -191,6 +220,11 @@ impl Run<'_> {
                         self.tensor(*y),
                         self.rs_snapshots(*state),
                     );
+                    if let (Ok(()), Some((kp, up))) = (&landed, scattered) {
+                        self.rs_scatter(OP, &seat, kp, seat.ext_in[kp])?;
+                        self.rs_scatter(OP, &seat, up, seat.ext_in[up])?;
+                    }
+                    return landed;
                 }
                 // Heads the verify scan does not stage take the gate prep
                 // the verify scan would have folded in.
@@ -463,4 +497,16 @@ impl Run<'_> {
             ),
         }
     }
+}
+
+/// A buffered plane's bytes a token, as the kernels take it.
+fn plane_row_bytes(
+    seat: &crate::rs::Seat,
+    plane: usize,
+    op: &'static str,
+) -> Result<u32, kernels_metal::Error> {
+    u32::try_from(seat.layout.planes[plane].row_bytes).map_err(|_| kernels_metal::Error::Backend {
+        op,
+        detail: "a buffered plane's row is past a u32 of bytes".to_string(),
+    })
 }

@@ -1205,6 +1205,34 @@ pub struct Paged {
     pub row_bytes: u32,
 }
 
+/// A buffer's corrected planes (`rs_corrected`), as a verify or carried
+/// scan lands and reads them through the fire's page table: each row's raw
+/// keys (bf16, `k_heads * k_dim`) and corrected value `u` (f32, `v_heads *
+/// v_dim`), each from the plane's first row in the buffer's first slot.
+#[derive(Clone, Copy, Debug)]
+pub struct Corrected {
+    pub keys: Tensor,
+    pub key_row_bytes: u32,
+    pub u: Tensor,
+    pub u_row_bytes: u32,
+}
+
+fn corrected_args(
+    ctx: &Ctx<'_>,
+    corrected: Option<Corrected>,
+) -> Result<[crate::encode::ArgValue; 5], Error> {
+    Ok(match corrected {
+        Some(c) => [
+            c.keys.arg_mut(),
+            c.key_row_bytes.arg(),
+            c.u.arg_mut(),
+            c.u_row_bytes.arg(),
+            1i32.arg(),
+        ],
+        None => [ctx.absent()?, 0u32.arg(), ctx.absent()?, 0u32.arg(), 0i32.arg()],
+    })
+}
+
 fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 6], Error> {
     Ok(match paged {
         Some(paged) => [
@@ -1290,6 +1318,7 @@ pub fn gated_delta_verify(
     committed: &Committed,
     gates: &VerifyGates,
     paged: Option<Paged>,
+    corrected: Option<Corrected>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1306,6 +1335,7 @@ pub fn gated_delta_verify(
         committed,
         gates,
         paged,
+        corrected,
         state,
         k_heads,
         v_heads,
@@ -1326,6 +1356,7 @@ fn gated_delta_verify_at(
     committed: &Committed,
     gates: &VerifyGates,
     paged: Option<Paged>,
+    corrected: Option<Corrected>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1381,6 +1412,8 @@ fn gated_delta_verify_at(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
+    let [key_slab, key_row_bytes, u_slab, u_row_bytes, is_corrected] =
+        corrected_args(ctx, corrected)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1410,6 +1443,11 @@ fn gated_delta_verify_at(
             row_bytes,
             is_paged,
             state.segments.arg(),
+            key_slab,
+            key_row_bytes,
+            u_slab,
+            u_row_bytes,
+            is_corrected,
         ],
     )
 }

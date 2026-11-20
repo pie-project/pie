@@ -169,6 +169,31 @@ impl Run<'_> {
         Ok(ext)
     }
 
+    /// Copies each lane's own rows of `own` (laid by the fire's rows) into
+    /// its buffer pages of plane `plane`: what [`Self::rs_extend`] scatters,
+    /// for a plane an op lands rather than reads (a gated-delta row's
+    /// corrected keys and `u`, where the fire stages no page table).
+    pub(crate) fn rs_scatter(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        plane: usize,
+        own: Tensor,
+    ) -> Result<(), Error> {
+        let indptr = self.qo_indptr_host();
+        let lane0 = self.window().span.lane_offset;
+        let mut copies = Vec::new();
+        for r in 0..indptr.len().saturating_sub(1) {
+            let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
+                continue;
+            };
+            if let Some(run) = &plan.scatter {
+                self.rs_move(op, &mut copies, seat, plane, run, own, indptr[r].max(0) as u32, true)?;
+            }
+        }
+        self.rs_flush(&copies)
+    }
+
     pub(crate) fn rs_out(
         &self,
         op: &'static str,
