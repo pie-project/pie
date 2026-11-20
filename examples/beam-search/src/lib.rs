@@ -53,6 +53,13 @@ struct Input {
     /// its siblings'.
     #[serde(default)]
     verify: bool,
+    /// A negative control of `verify`, a beam broken on purpose: `parent`
+    /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
+    /// % beams`) while its hypothesis keeps its own, so its rows read
+    /// another beam's cells; `score` moves lane 0's last step by 1.0 on the
+    /// host. Either must fail `verify`.
+    #[serde(default)]
+    corrupt: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -71,23 +78,29 @@ fn default_beams() -> u32 {
     2
 }
 
+/// Each lane's row: its parent's, `picked` (its own) appended.
+fn advance<T: Copy>(rows: &[Vec<T>], picked: &[T], parents: &[u32]) -> Result<Vec<Vec<T>>> {
+    parents
+        .iter()
+        .zip(picked)
+        .map(|(&parent, &value)| {
+            let mut row = rows
+                .get(parent as usize)
+                .ok_or_else(|| format!("invalid parent beam {parent}"))?
+                .clone();
+            row.push(value);
+            Ok(row)
+        })
+        .collect()
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
     parents: &[u32],
 ) -> Result<Vec<Vec<u32>>> {
-    parents
-        .iter()
-        .zip(picked)
-        .map(|(&parent, &token)| {
-            let mut hypothesis = hypotheses
-                .get(parent as usize)
-                .ok_or_else(|| format!("invalid parent beam {parent}"))?
-                .clone();
-            hypothesis.push(token as u32);
-            Ok(hypothesis)
-        })
-        .collect()
+    let picked: Vec<u32> = picked.iter().map(|&token| token as u32).collect();
+    advance(hypotheses, &picked, parents)
 }
 
 #[inferlet::main]
@@ -165,6 +178,8 @@ async fn main(input: Input) -> Result<String> {
         .context("prefill drain")?;
     let mut greedy_mismatches = usize::from(first.first() != greedy.first());
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
+    // Each lane's score after each of its steps, its ancestry's first.
+    let mut scored: Vec<Vec<f32>> = final_scores.iter().map(|&s| vec![s]).collect();
 
     if decodes > 0 {
         let scores = Channel::from(&final_scores[..]);
@@ -175,6 +190,7 @@ async fn main(input: Input) -> Result<String> {
         let out_greedy = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
         let lanes_b = Channel::from_iter(0u32..=b);
 
+        let corrupt_parent = input.corrupt.as_deref() == Some("parent");
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &lanes_b)?;
         let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
@@ -223,7 +239,11 @@ async fn main(input: Input) -> Result<String> {
             let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]
             let wpos = &base_b + iota(b); // [B]
 
-            let inherited = gather(mask.take(), &parent); // bool [B,cells]
+            let inherited = if corrupt_parent {
+                gather(mask.take(), (&parent + 1u32) % b)
+            } else {
+                gather(mask.take(), &parent)
+            }; // bool [B,cells]
             // Column `c` is slot `n + c`.
             let col = broadcast(reshape(iota(cells) + n, [1, cells]), [b, cells]);
             let wpos_b = broadcast(reshape(&wpos, [b, 1]), [b, cells]);
@@ -298,6 +318,7 @@ async fn main(input: Input) -> Result<String> {
                 }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
             }
         } else {
@@ -320,6 +341,7 @@ async fn main(input: Input) -> Result<String> {
                     .with_context(|| format!("@{step}"))?;
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
                 Ok(ControlFlow::Continue(()))
             })
@@ -343,24 +365,43 @@ async fn main(input: Input) -> Result<String> {
         ));
     }
     let text = model::decode(&hypotheses[best_lane])?;
+    if input.corrupt.as_deref() == Some("score")
+        && let Some(last) = scored.first_mut().and_then(|lane| lane.last_mut())
+    {
+        *last += 1.0;
+    }
     let verified = if input.verify {
         let mut worst = 0f32;
+        // The most of its room any step came to (apart / room).
+        let mut closest = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis).await?;
-            let apart = (alone - final_scores[lane]).abs();
-            // bf16 logits: a step's log-probability rounds to about 1e-2.
-            let room = 0.02 * hypothesis.len() as f32 + 0.05;
-            if apart > room {
-                return Err(format!(
-                    "beam {lane} scored {:.4}, and its hypothesis alone scores {alone:.4}: \
-                     {apart:.4} apart, past {room:.3}; its recurrence or attention read \
-                     another beam's cells",
-                    final_scores[lane]
-                ));
+            // Each step's log-probability as the beam took it (its score's
+            // step), against the hypothesis's own, within that step's room:
+            // the quanta its log-probability and logits round to, and the
+            // quanta of the beam's scores either side of it.
+            let mut before = 0f32;
+            for (at, (&after, &(step, room))) in scored[lane].iter().zip(&alone).enumerate() {
+                let took = after - before;
+                let room = room + quantum(after) + if at > 0 { quantum(before) } else { 0.0 };
+                let apart = (took - step).abs();
+                closest = closest.max(apart / room);
+                if apart > room {
+                    return Err(format!(
+                        "beam {lane} took {took:.4} at step {at}, and its hypothesis alone \
+                         {step:.4} there: {apart:.4} apart, past {room:.3}; its recurrence or \
+                         attention read another beam's cells",
+                    ));
+                }
+                before = after;
             }
-            worst = worst.max(apart);
+            let total: f32 = alone.iter().map(|&(step, _)| step).sum();
+            worst = worst.max((total - final_scores[lane]).abs());
         }
-        format!(" verified={} worst_apart={worst:.4}", hypotheses.len())
+        format!(
+            " verified={} worst_apart={worst:.4} worst_step={closest:.3}",
+            hypotheses.len()
+        )
     } else {
         String::new()
     };
@@ -370,14 +411,33 @@ async fn main(input: Input) -> Result<String> {
     ))
 }
 
-/// The summed log-probability of `hypothesis` after `prompt`, teacher-forced
+/// The quantum of `x` in the dtype it was stored in: the gap between it and
+/// the next value away from zero, of bf16 (8 significant bits) where `x` is
+/// a bf16 widened (its low 16 bits zero), else of f32 (24). The logits are
+/// bf16; the scores and log-probabilities come off f32 channels, f32 or bf16
+/// as the program computed them. An f32 that is a bf16 by chance (one in
+/// 65536) is given bf16's room.
+fn quantum(x: f32) -> f32 {
+    let bits = x.abs().to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let significant = if bits & 0xffff == 0 { 7 } else { 23 };
+    2f32.powi(exponent.max(-126) - significant)
+}
+
+/// Each step's log-probability of `hypothesis` after `prompt`, teacher-forced
 /// one token a fire on a working set of its own: what a beam that read only
-/// its own ancestry scores.
-async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<f32> {
+/// its own ancestry takes; and the room a beam's step has from it. The
+/// logits are bf16, and the beam's fires run other kernels than these
+/// (more rows), which round their sums elsewhere: a
+/// logit may land a bf16 quantum apart (0.125 at a logit of 16 to 32), so
+/// a step's log-probability may move by the target's logit's quantum and
+/// the largest logit's (the log-sum-exp moves with it), and by its own
+/// quantum; past those a beam read what its ancestry did not hold.
+async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<Vec<(f32, f32)>> {
     let v = model::output_vocab_size();
     let ws = WorkingSet::new();
     let pipeline = Pipeline::new();
-    let mut total = 0f32;
+    let mut steps = Vec::with_capacity(hypothesis.len());
     for (at, &target) in hypothesis.iter().enumerate() {
         let fed: Vec<i32> = if at == 0 {
             prompt.iter().map(|&t| t as i32).collect()
@@ -389,18 +449,34 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<f32> {
         let indptr = Channel::from([0u32, rows]);
         let wanted = Channel::from([target]);
         let out = Channel::new([1], dtype::f32);
+        let picked = Channel::new([1], dtype::f32);
+        let largest = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
         fwd.state(&[&ws], StateGeometry::folding())
             .context("bind the rescoring set")?;
         fwd.epilogue(move || {
             let logits = reshape(intrinsics::output(0, "logits"), [v]);
-            out.put(gather(log_softmax(&logits), wanted.take()));
+            let wanted = wanted.take();
+            picked.put(cast(&gather(&logits, &wanted), dtype::f32));
+            largest.put(cast(&reshape(reduce_max(&logits), [1]), dtype::f32));
+            out.put(gather(log_softmax(&logits), &wanted));
         });
         fwd.submit(&pipeline).context("rescore submit")?;
         let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        total += got.first().copied().ok_or("the rescoring fire returned nothing")?;
+        let step = got.first().copied().ok_or("the rescoring fire returned nothing")?;
+        let picked = picked.take_host::<Vec<f32>>().await.context("rescore drain")?;
+        let largest = largest.take_host::<Vec<f32>>().await.context("rescore drain")?;
+        // The beam's fire and the rescore round each logit independently, so
+        // each may sit one quantum from the true value on either side: the
+        // step's log-probability (target logit less the log-sum-exp, which
+        // the largest logit leads) may move by the target's quantum and the
+        // largest logit's, two quanta where they share a binade (the CUDA
+        // beam-4 run's 0.227 step against 0.25), and by its own quantum.
+        let room =
+            quantum(step) + picked.iter().chain(&largest).map(|&l| quantum(l)).sum::<f32>();
+        steps.push((step, room));
     }
     pipeline.close();
-    Ok(total)
+    Ok(steps)
 }
