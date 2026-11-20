@@ -2185,7 +2185,7 @@ mod tests {
     const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
         ("standard greedy", 3_689_472, 1_536),
         ("standard gumbel-max", 3_689_984, 1_536),
-        ("standard top-p", 5_058_560, 837_888),
+        ("standard top-p", 5_058_560, 457_472),
         ("standard top-k + top-p", 5_363_200, 990_464),
         ("standard top logprobs", 4_910_592, 724_992),
         ("standard penalized top-p", 10_834_688, 2_358_528),

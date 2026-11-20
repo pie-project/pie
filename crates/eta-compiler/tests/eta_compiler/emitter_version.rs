@@ -6,8 +6,8 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_module};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 78, 0x4b59_beca_4595_436f),
-    ("hip", 38, 0xd659_6471_d699_a685),
+    ("cuda", 78, 0x4879_590d_a635_8208),
+    ("hip", 38, 0xddab_1cb5_2d25_8e42),
     ("metal", 69, 0x7641_169d_826d_d06b),
 ];
 

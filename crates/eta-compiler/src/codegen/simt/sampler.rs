@@ -4,6 +4,7 @@
 //! region as many blocks a lane as the device holds at once with the fire's
 //! lanes (`rows_per_lane`), and the kernel's blocks split each row.
 
+use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
@@ -39,6 +40,19 @@ pub struct SamplerValues {
     pub rank: bool,
     /// A lone cut (`LaneCut`): `probs` in, `keep` out, the rest unused.
     pub cut_only: bool,
+    /// The bf16 draw (a gumbel_argmax over the f32 logits at a constant
+    /// temperature, its cut's probabilities a bf16 softmax), where the
+    /// region is one.
+    pub draw: Option<Draw>,
+}
+
+/// What the bf16 draw reads beside the values: its temperature's f32 bits,
+/// and the model output whose row the logits are a view of (its node and
+/// its slot in the lane's table), which the draw reads where it lies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Draw {
+    pub temperature: u32,
+    pub output: Option<(u32, u16)>,
 }
 
 /// Whether `region` is a sampler region this emitter takes.
@@ -63,6 +77,7 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
     let ops: alloc::vec::Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = result_bases(&ops);
     let (mut logits, mut pivot, mut state, mut token) = (None, None, None, None);
+    let mut divisor = None;
     for node in &region.nodes {
         let index = node.index();
         let op = ops.get(index)?;
@@ -78,6 +93,11 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
             }
             tags::RNG_KEYED => state = op.args.first().copied(),
             tags::REDUCE_ARGMAX => token = Some(bases[index]),
+            tags::GUMBEL_ARGMAX if op.args.len() == 4 => {
+                token = Some(bases[index]);
+                state = Some(op.args[3]);
+                divisor = Some(op.args[2]);
+            }
             _ => {}
         }
     }
@@ -100,13 +120,43 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
             token: keep,
             rank,
             cut_only: true,
+            draw: None,
         });
     }
     if rank != (library == LibraryOp::RankSample) {
         return None;
     }
+    let logits = logits?;
+    let draw = match divisor {
+        None => None,
+        Some(divisor) => {
+            let producer = ops
+                .iter()
+                .enumerate()
+                .find(|(n, op)| op.results > 0 && bases[*n] == divisor && op.tag == tags::CONST)?;
+            let mut producers = alloc::vec![u32::MAX; stage.normalized.value_types.len()];
+            for (node, op) in ops.iter().enumerate() {
+                for result in 0..op.results {
+                    if let Some(slot) = producers.get_mut((bases[node] + result) as usize) {
+                        *slot = node as u32;
+                    }
+                }
+            }
+            let output = super::stream::output_source(stage, &ops, &producers, logits).map(|out| {
+                let node = producers[out as usize];
+                (
+                    node,
+                    crate::codegen::op_view::output_slot(stage, &ops[node as usize]),
+                )
+            });
+            Some(Draw {
+                temperature: producer.1.lit_bits,
+                output,
+            })
+        }
+    };
     Some(SamplerValues {
-        logits: logits?,
+        logits,
         threshold,
         state: state?,
         probs,
@@ -114,6 +164,7 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
         token: token?,
         rank,
         cut_only: false,
+        draw,
     })
 }
 
@@ -192,6 +243,7 @@ pub fn emit_sampler_region(
         token,
         rank,
         cut_only,
+        draw,
     } = values;
     source.push_str(
         "
@@ -216,6 +268,56 @@ pub fn emit_sampler_region(
       scratch + offsets[{threshold}],
       descriptors[{threshold}u],
       scratch + offsets[{keep}]);
+}}
+"
+        );
+        return Ok(source);
+    }
+    if let Some(Draw {
+        temperature,
+        output,
+    }) = draw
+    {
+        // The logits where the model left them (its output's row), or in
+        // scratch.
+        let row = match output {
+            Some((node, slot)) => {
+                let pitch = super::fused::output_pitch(stage);
+                format!(
+                    "
+  const m1_u32 draw_index = dispatch_lane * {pitch}u + {slot}u;
+  const m1_u32 draw_width = intrinsic_widths[draw_index];
+  const M1DrawRow draw_row{{
+      reinterpret_cast<const m1_u8*>(intrinsic_bases[draw_index]),
+      intrinsic_modes[draw_index],
+      intrinsic_strides[draw_index] == 0u ? draw_width : intrinsic_strides[draw_index],
+      (m1_u64)intrinsic_offsets[draw_index] + (m1_u64)params[{node}u].imm2,
+      intrinsic_rows[draw_index]}};"
+                )
+            }
+            None => format!(
+                "
+  const M1DrawRow draw_row{{scratch + offsets[{logits}], 0u, descriptors[{logits}u].last, 0u, descriptors[{logits}u].rows}};"
+            ),
+        };
+        source.push_str(&row);
+        let _ = write!(
+            source,
+            "
+  const M1ValueDesc logits_desc = descriptors[{logits}u];
+  ptir_lane_draw<{rank}>(
+      g,
+      draw_row,
+      m1_bits_f32({temperature:#x}u),
+      scratch + offsets[{threshold}],
+      descriptors[{threshold}u],
+      scratch + offsets[{state}],
+      descriptors[{state}u],
+      scratch + offsets[{probs}],
+      scratch + offsets[{keep}],
+      scratch + offsets[{token}],
+      logits_desc.rows,
+      logits_desc.last);
 }}
 "
         );

@@ -702,6 +702,13 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
         else {
             return false;
         };
+        // The lane sampler's bf16 draw reads the model's row where it lies.
+        if let Some(values) = super::sampler::sampler_values(stage, home) {
+            return values
+                .draw
+                .and_then(|draw| draw.output)
+                .is_some_and(|(node, _)| bases[node as usize] == source);
+        }
         if home.kind != crate::plan::RegionKind::Generated
             || super::validate::validate_generated_region(stage, home).is_err()
         {
@@ -732,7 +739,7 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
 /// produces it, or the output a reshape covering it (the same elements in
 /// the same order) reads, in any region of the stage. The row is the
 /// model's for the whole stage, so any region may read it where it lies.
-fn output_source(
+pub(super) fn output_source(
     stage: &CompiledStage,
     ops: &[OpView],
     producers: &[u32],
