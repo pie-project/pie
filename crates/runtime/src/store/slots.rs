@@ -1329,10 +1329,12 @@ impl SlotPool {
             .filter(|&segment| segment < self.top_segment)
             .collect();
         let backed = uncommitted.iter().filter(|&&segment| self.backs(segment)).count();
+        let lent = self.span_lent();
         format!(
             "budget: total={} reserved={} held={} act={} committed={} headroom={} \
              ceiling={} state_limit={} open={} free_chunks={} segments={} top_segment={} \
-             uncommitted_below_top={} of_them_backed={} growable={} committable_one_chunk={}",
+             uncommitted_below_top={} of_them_backed={} growable={} committable_one_chunk={} \
+             span_lent={} span_lent_backed={} span_reclaim_at_top_rung={}",
             self.total,
             self.reserved,
             self.held,
@@ -1349,6 +1351,9 @@ impl SlotPool {
             backed,
             self.growable_chunks(),
             self.committable_runs(1),
+            lent.0,
+            lent.1,
+            lent.2,
         )
     }
 
@@ -2005,7 +2010,7 @@ impl SlotPool {
             return 0;
         }
         let limit = self.state_limit().min(self.ceiling);
-        let runs: u32 = self
+        let prefix: u32 = self
             .segments
             .uncommitted()
             .filter(|&segment| segment < self.top_segment && self.backs(segment))
@@ -2014,7 +2019,8 @@ impl SlotPool {
                 range.end.min(limit).saturating_sub(range.start) / run
             })
             .sum();
-        runs.min(self.growable_chunks() / run)
+        let lent: u32 = self.lent_unbacked().iter().map(|&(_, chunks)| chunks / run).sum();
+        (prefix + lent).min(self.growable_chunks() / run)
     }
 
     /// `pieces` runs of `run` adjacent free chunks for `holder`, each run
@@ -2490,6 +2496,56 @@ impl SlotPool {
         self.span_on_demand
     }
 
+    /// The span segments the rung lends and no segment backs yet, each with
+    /// the chunks of it the rung lends (below [`Self::state_limit`]),
+    /// highest first, the order [`Self::span_to_commit`] backs them. Empty
+    /// where the span is backed from the load or the engine holds part of
+    /// the range back.
+    ///
+    /// Span lending. The pool is one range: the top `act_max` chunks are
+    /// the largest rung's activation, and a fire at a smaller rung takes
+    /// only its own `act_chunks(rung)` of them. The chunks between, below
+    /// the state limit, are lent to state (kv pages, records, rs lists,
+    /// guest parts alike): they open as any chunk does once their segment
+    /// is backed, and a grow for a waiter short of room backs them after
+    /// the prefix ([`super::shared::SharedPool::grow_step`]). Lending
+    /// allocates nothing past load: the span's segments are in the range
+    /// reserved at load, backed on demand within it. A fire whose rung
+    /// needs lent chunks takes them back first: a raise moves the state
+    /// lying there down into free chunks below ([`Self::plan_rung`]); where
+    /// too few stand free, [`Self::rung_short`] says how many, and the
+    /// planner frees them as it does any head's room (its occupants
+    /// evicted or moved down, under the key rule), the raise waiting for
+    /// that with no timer. The budget line states the span lent, how much
+    /// of it is backed, and the state chunks a raise to the largest rung
+    /// takes back.
+    fn lent_unbacked(&self) -> Vec<(u32, u32)> {
+        if !self.span_on_demand || self.ceiling < self.total {
+            return Vec::new();
+        }
+        let limit = self.state_limit();
+        (self.top_segment..self.segments.count())
+            .rev()
+            .filter(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
+            .filter_map(|segment| {
+                let range = self.segments.range(segment);
+                let lent = range.end.min(limit).saturating_sub(range.start);
+                (lent > 0).then_some((segment, lent))
+            })
+            .collect()
+    }
+
+    /// The span the rung lends to state now (`act_max` less the rung's
+    /// activation), how much of it is backed, and the state chunks a raise
+    /// to the largest rung must take back ([`Self::held_in_span`]).
+    #[must_use]
+    pub fn span_lent(&self) -> (u32, u32, u32) {
+        let lent = self.act_max.saturating_sub(self.act);
+        let unbacked: u32 = self.lent_unbacked().iter().map(|&(_, chunks)| chunks).sum();
+        let top = self.act_chunks.last().map_or(0, |&(tokens, _)| tokens);
+        (lent, lent.saturating_sub(unbacked), self.held_in_span(top))
+    }
+
     /// Span segments committed here, counted from the top of the pool: the
     /// `n` of `commit_span(n)` (0 where the span is backed from the load).
     pub fn span_committed(&self) -> u32 {
@@ -2513,22 +2569,9 @@ impl SlotPool {
     /// where every lent span chunk is backed, nothing is lent, or the
     /// engine holds back part of the range (no state opens past it then).
     pub fn span_to_commit(&self) -> Option<u32> {
-        if !self.span_on_demand || self.ceiling < self.total {
-            return None;
-        }
-        let limit = self.state_limit();
-        let start = self
-            .segments
-            .range(self.top_segment.min(self.segments.count()))
-            .start;
-        if self.top_segment >= self.segments.count() || limit <= start {
-            return None;
-        }
-        let highest_lent = self.segments.of(limit - 1);
-        (self.top_segment..=highest_lent)
-            .rev()
-            .find(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
-            .map(|segment| self.segments.count() - segment)
+        self.lent_unbacked()
+            .first()
+            .map(|&(segment, _)| self.segments.count() - segment)
     }
 
     /// The engine backed the top `n` span segments (`commit_span(n)`):
@@ -2856,6 +2899,14 @@ impl SlotPool {
                 break;
             }
             room += u64::from(self.segments.len(segment));
+            segments.push(segment);
+        }
+        // The prefix whole, the span the rung lends ([`Self::lent_unbacked`]).
+        for (segment, lent) in self.lent_unbacked() {
+            if room >= want {
+                break;
+            }
+            room += u64::from(lent);
             segments.push(segment);
         }
         segments

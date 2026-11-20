@@ -789,18 +789,6 @@ pub enum SegmentMove {
     Wait,
 }
 
-/// Whom the walk grows for: what decides whether the span a lowered rung
-/// lends is a step at all ([`SharedPool::grow_step`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrowFor {
-    /// A waiter short of room for live state. Live state never opens in
-    /// the top rung's span, so backing the span it lends funds no such
-    /// waiter: only the prefix grows for it.
-    Live,
-    /// No waiter: the governor's target alone (or its test pin).
-    Target,
-}
-
 /// A step of the walk that maps a segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrowStep {
@@ -2217,7 +2205,7 @@ impl SharedPool {
             self.pool.release_span(n);
             return Some(SegmentMove::ReleaseSpan { n });
         }
-        if let Some(step) = self.grow_step(target, self.grow_for()) {
+        if let Some(step) = self.grow_step(target) {
             return Some(step.into());
         }
         if let Some(step) = self.compact_step(epoch) {
@@ -2312,31 +2300,19 @@ impl SharedPool {
         self.compact_for = None;
     }
 
-    /// Whom a grow is for now: a live waiter while any is parked short of
-    /// a slot, else the target alone.
-    #[must_use]
-    pub fn grow_for(&self) -> GrowFor {
-        if self.pool.waiting() {
-            GrowFor::Live
-        } else {
-            GrowFor::Target
-        }
-    }
-
-    /// The walk's next grow step toward `goal` mapped segments for `who`,
-    /// `None` where none maps a segment: the one place a grow is decided.
+    /// The walk's next grow step toward `goal` mapped segments, `None`
+    /// where none maps a segment: the one place a grow is decided.
     /// [`Self::next_move`] takes it, and `SharedGrow::can_grow` tells a
-    /// waiter the pool grows exactly where it is `Some` for
-    /// [`GrowFor::Live`], so the planner never waits on a grow the walk
-    /// does not make.
+    /// waiter the pool grows exactly where it is `Some`, so the planner
+    /// never waits on a grow the walk does not make.
     ///
     /// The lowest uncommitted prefix segment the engine binds first. The
-    /// prefix whole, the span a lowered rung lends is backed next, before
-    /// state opens a chunk there, but never for a live waiter (live state
-    /// never opens in the top rung's span), and not while a refused commit
-    /// waits for room to be freed.
+    /// prefix whole, the span the rung lends is backed next (span lending,
+    /// [`SlotPool::span_lent`]), for a waiter short of live state as
+    /// for the target alone: a fire whose rung needs it takes it back
+    /// first. Not while a refused commit waits for room to be freed.
     #[must_use]
-    pub fn grow_step(&self, goal: u32, who: GrowFor) -> Option<GrowStep> {
+    pub fn grow_step(&self, goal: u32) -> Option<GrowStep> {
         if self.mapped_segments() >= goal {
             return None;
         }
@@ -2344,7 +2320,7 @@ impl SharedPool {
         if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
             return Some(GrowStep::Commit { prefix: prefix + 1 });
         }
-        if who == GrowFor::Live || self.span_commit_blocked() {
+        if self.span_commit_blocked() {
             return None;
         }
         let n = self.pool.span_to_commit()?;

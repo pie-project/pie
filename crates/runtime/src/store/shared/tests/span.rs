@@ -621,8 +621,9 @@ fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
 /// the stall could stand in: the prefix whole or not, a span lent or not,
 /// a span commit refused or not, the target above what is mapped or at it,
 /// and a waiter short of kv, of state, or none. Spelled out apart from the
-/// code: a live waiter grows only into the prefix, under a target above it,
-/// and the lent span is never its step.
+/// code: a live waiter grows into the prefix, then into the span the rung
+/// lends (span lending), under a target above what is mapped, never while
+/// a refused span commit waits for room.
 #[test]
 fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     const ENGINE: usize = 46;
@@ -656,21 +657,19 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                             Some(SegmentMove::Commit { .. } | SegmentMove::CommitSpan { .. })
                         );
                         assert_eq!(can, grow.live_step_for_test().is_some(), "{case}");
+                        assert_eq!(can, maps, "{case}: can_grow is the walk's own step");
                         if waiter.is_some() {
-                            assert_eq!(can, maps, "{case}: can_grow is the walk's own step");
-                            assert_eq!(can, below && !prefix_whole, "{case}");
-                        } else {
-                            let pool = shared.lock().unwrap();
                             assert_eq!(
-                                maps,
-                                pool.grow_step(goal, GrowFor::Target).is_some(),
-                                "{case}: the walk takes the step for no waiter"
+                                can,
+                                below && (!prefix_whole || (lent && !blocked)),
+                                "{case}"
+                            );
+                            assert_eq!(
+                                matches!(step, Some(SegmentMove::CommitSpan { .. })),
+                                below && prefix_whole && lent && !blocked,
+                                "{case}: the lent span backed once the prefix is whole"
                             );
                         }
-                        assert!(
-                            !matches!(step, Some(SegmentMove::CommitSpan { .. })),
-                            "{case}: nothing the walk goes toward backs the lent span"
-                        );
                         cases += 1;
                     }
                 }
@@ -680,33 +679,92 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     assert_eq!(cases, 48);
 }
 
-/// Mac's over-demand stall (Metal, the span backed on demand): the prefix
-/// whole and a lowered rung lending span no segment backs, a live waiter
-/// short of room is told the pool does not grow, and the walk backs no span
-/// for it, so the planner goes on to demote, sweep and evict. Before,
-/// `can_grow` said yes for the lent span while the walk's goal stopped at
-/// the prefix: the planner waited on a grow that never came, and nothing
-/// was ever evicted.
+/// Mac Pro at 2 GiB on 5120cbc3c (Metal, the span backed on demand): the
+/// prefix whole, a rung of 32 chunks under a top span of 165, and the 126
+/// chunks it lends unbacked (committable_one_chunk=0), a live waiter short
+/// of room waited on evictions. Span lending: the walk backs the lent span
+/// for it, the goal past the prefix, and the waiter's room opens there.
+/// The commit is within the range reserved at load: the span's own
+/// segments, the pool's total unchanged. Once every lent segment is
+/// backed, no step is left and nothing more is promised.
 #[test]
-fn a_live_waiter_beside_an_unbacked_lent_span_is_told_the_pool_does_not_grow() {
+fn a_live_waiter_beside_an_unbacked_lent_span_is_funded_by_lending_it() {
     const ENGINE: usize = 48;
     for short in [Short::Kv, Short::State] {
         let mut pool = grow_pool(true, true);
+        let total = pool.pool().total_chunks();
+        let segments = pool.pool().segments().count();
+        let top = pool.pool().top_segment();
         assert_eq!(pool.pool().span_to_commit(), Some(1));
+        let (lent, backed, _) = pool.pool().span_lent();
+        assert!(lent > 0 && backed < lent, "{short:?}: the span lent, unbacked");
+        assert_eq!(pool.pool().free_chunks(), 0, "{short:?}: nothing open");
+        assert!(pool.pool().committable_runs(1) > 0, "{short:?}: the lent span commits");
         wait_short(&mut pool, short);
         let mapped = pool.mapped_segments();
         let shared: Shared = Arc::new(Mutex::new(pool));
         let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
         let _ = grow.retarget(u64::from(u32::MAX));
-        assert!(!grow.can_grow(), "{short:?}: no step maps a segment");
-        assert!(!grow.promise_grow(), "{short:?}: so nothing is promised");
-        assert_eq!(grow.goal_for_test(), mapped, "{short:?}: the prefix");
-        assert_eq!(
-            shared.lock().unwrap().next_move(mapped, 1),
-            None,
-            "{short:?}: and the walk backs no span"
-        );
+        assert!(grow.can_grow(), "{short:?}: the lent span is a step");
+        assert!(grow.goal_for_test() > mapped, "{short:?}: past the prefix");
+        let mut pool = shared.lock().unwrap();
+        let mut steps = 0;
+        while let Some(step) = pool.next_move(u32::MAX, 1) {
+            let SegmentMove::CommitSpan { n } = step else {
+                panic!("{short:?}: only the lent span is backed, got {step:?}");
+            };
+            assert!(top + n <= segments + n && n <= segments - top, "{short:?}: a span segment");
+            pool.span_committed(n);
+            steps += 1;
+        }
+        assert!(steps > 0, "{short:?}: the span is backed for the waiter");
+        let (lent, backed, _) = pool.pool().span_lent();
+        assert_eq!(backed, lent, "{short:?}: every lent chunk backed");
+        assert!(pool.pool().free_chunks() > 0, "{short:?}: room opens in the span");
+        assert_eq!(pool.pool().total_chunks(), total, "{short:?}: no allocation past load");
+        assert_eq!(pool.pool().segments().count(), segments, "{short:?}: the range as loaded");
+        drop(pool);
+        assert!(!grow.can_grow(), "{short:?}: nothing left to back");
     }
+}
+
+/// A raise to a rung whose activation takes lent span chunks takes them
+/// back: state lying there moves down into free chunks below where they
+/// stand; where none do, the raise is short by the chunks to free (the
+/// planner frees them as any head's room, its occupants evicted), and once
+/// they are free the raise moves the state down and fits.
+#[test]
+fn a_rising_rung_reclaims_the_lent_span() {
+    let mut pool = grow_pool(true, true);
+    while let Some(n) = pool.pool().span_to_commit() {
+        pool.span_committed(n);
+    }
+    // State takes the lent span: every chunk below is held already.
+    let records = pool.records_available() as usize;
+    let lent = pool.take_records(records).unwrap();
+    let (_, _, reclaim) = pool.pool().span_lent();
+    assert!(reclaim > 0, "state lies in the lent span");
+    let top = 2048;
+    let short = pool.pool().rung_short(top);
+    assert!(short > 0, "no free chunk below: the raise is short");
+    assert!(matches!(
+        pool.rise_room(top),
+        crate::planner::RiseRoom::Short { .. }
+    ));
+    // The planner frees room below (here: records that lay below go, as
+    // their evictions would take them): the raise fits, and moves the
+    // state lying in the span down into what they freed.
+    let below: Vec<u32> = (0..u32::try_from(lent.len()).unwrap())
+        .filter(|record| !lent.contains(record))
+        .collect();
+    assert_eq!(below.len(), lent.len(), "the records below are the older ids");
+    pool.give_records(&below);
+    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(pool.pool().rung_short(top), 0, "freed: the raise fits");
+    let evacuation = pool.plan_raise(top).unwrap();
+    assert!(!evacuation.moves.is_empty(), "the span's state moves down");
+    assert!(pool.raise_applied(&evacuation).is_ok());
+    assert_eq!(pool.pool().span_lent().0, 0, "the largest rung lends nothing");
 }
 
 /// A grow promised a waiter that the walk does not make (here the governor

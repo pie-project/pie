@@ -2371,14 +2371,15 @@ fn reached_eviction(planner: &ResidencyPlanner, key: EntryKey) -> bool {
 }
 
 /// Mac's over-demand stall reworked (Metal, M1, Qwen3-0.6B, 64 single-lane
-/// requests, 0 of 539 pages free, 0 evictions for good): the prefix whole
-/// and a lowered rung lending span no segment backs, a head short of room
-/// gets an eviction plan, and nothing waits on a span commit. Before, the
-/// planner was told the pool grows (the lent span) while the walk's goal
-/// stopped at the prefix, so the plan returned on the grow and never
-/// reached `plan_eviction`.
+/// requests, 0 of 539 pages free): the prefix whole and a lowered rung
+/// lending span no segment backs. Span lending: the head waits on the
+/// walk backing the lent span (a grow the walk makes, its next move), not
+/// on evictions; the grow promised is the walk's own step. Before, a live
+/// waiter's grow never backed the span, and the head was funded by
+/// evicting residents while the span's chunks stood idle (Mac Pro at
+/// 2 GiB on 5120cbc3c: 126 chunks lent, committable_one_chunk=0).
 #[tokio::test(flavor = "current_thread")]
-async fn a_head_short_beside_an_unbacked_lent_span_gets_an_eviction_plan() {
+async fn a_head_short_beside_an_unbacked_lent_span_waits_on_lending_it() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = crate::store::shared::tests::grow_pool(true, true);
     assert_eq!(
@@ -2390,22 +2391,19 @@ async fn a_head_short_beside_an_unbacked_lent_span_gets_an_eviction_plan() {
     planner.plan();
     assert_eq!(
         planner.stats.grow_waits.load(Ordering::Relaxed),
-        0,
-        "no plan waits on a grow"
+        1,
+        "the plan waits on the span's commit"
     );
-    assert!(!grow.grow_promised(), "nothing promised");
-    assert!(
-        reached_eviction(&planner, key),
-        "the head is funded by eviction"
-    );
+    assert!(grow.grow_promised(), "a grow promised");
+    assert!(!reached_eviction(&planner, key), "no one is moved for it");
     let shared = grow.shared().clone();
     let goal = grow.goal_for_test();
     assert!(
-        !matches!(
+        matches!(
             shared.lock().unwrap().next_move(goal, 1),
             Some(crate::store::shared::SegmentMove::CommitSpan { .. })
         ),
-        "and the walk backs no span"
+        "and the walk backs the lent span"
     );
 }
 
