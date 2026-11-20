@@ -2585,3 +2585,58 @@ fn an_empty_pool_serves_a_run_of_four_at_once() {
     let piece = &pieces_of(&device, &engine.bindings[0].scratch)[0];
     assert_eq!(piece, &[(1, 0), (2, 0), (3, 0), (4, 0)], "segment 0's first run past the null chunk");
 }
+
+/// With no host tier (unified memory) two processes share a pair, both
+/// parked where they lie (scratch and the pair's state given back). Their
+/// restores run at once: while the first brings the pair back, the
+/// second's must wait for that move (`PairParked`), as it does where a
+/// host tier took the items. Let through, its instance came back stale
+/// with its pair not yet on the device, so its restore named it no rebind
+/// (`stale` skips an instance whose pair is away) and reported it
+/// resident: its next fire ran on the scratch and pair places it held
+/// before its park, given back and taken by others since.
+#[test]
+fn with_no_host_tier_a_second_restore_waits_for_the_pair_the_first_brings_back() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 1);
+    park(&roles, 2);
+    let first_back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("the first brings the pair back");
+    let concurrent = roles.lock().unwrap().prepare_unpark(holder(2));
+    match concurrent {
+        Err(RolesError::PairParked(_)) => {}
+        Ok(Some(back)) => {
+            roles.lock().unwrap().commit(back);
+            let stale = roles.lock().unwrap().stale(holder(2));
+            panic!(
+                "the second restore went while its pair was moving; its rebinds: {stale:?} \
+                 (instance {second:?} named: {})",
+                stale
+                    .iter()
+                    .any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == second))
+            );
+        }
+        other => panic!("the pair is moving: {other:?}"),
+    }
+    roles.lock().unwrap().commit(first_back);
+    let pair = rebound_pair(&roles, 1, first);
+    assert!(matches!(pair, ScratchPlace::Chunks { .. } | ScratchPlace::Run { .. }), "{pair:?}");
+    // Once the pair has landed the second comes back, rebound to it.
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .expect("it comes back");
+    roles.lock().unwrap().commit(back);
+    assert_eq!(rebound_pair(&roles, 2, second), pair, "rebound to where it landed");
+}

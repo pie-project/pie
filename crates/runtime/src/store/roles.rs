@@ -1985,8 +1985,11 @@ impl Roles {
             .collect();
         // An instance whose pair is on its way back with another process's
         // unpark is rebound once that lands: until then its restore is
-        // queued again, never told no room for its pair.
-        if let Some(pair) = owners.iter().find_map(|owner| {
+        // queued again, never told no room for its pair. One parked where
+        // it lies (no tier below, [`Item::shed`]) waits the same: let
+        // through, it came back with its pair away, so its restore named it
+        // no rebind and its next fire ran on the places it gave back.
+        if let Some(pair) = owners.iter().chain(&shed_owners).find_map(|owner| {
             let key = self.items[owner].pair?;
             (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
         }) {
