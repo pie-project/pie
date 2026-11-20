@@ -1085,7 +1085,8 @@ pub(super) fn emit_stream(
                 let _ = writeln!(pass.body.s, "      const float red{node} = {first};");
                 let _ = writeln!(
                     pass.body.fold_s,
-                    "      if (stream_lane == 0u) stream_work[{slot}u + (stream_base >> 5u)] = red{node};"
+                    "      if (stream_lane == 0u) {};",
+                    work_put(streams.split, &format!("{slot}u + (stream_base >> 5u)"), &format!("red{node}"))
                 );
                 let _ = writeln!(pass.body.pre, "        float red{node}[4];");
                 let _ = writeln!(pass.body.v, "      red{node}[j] = {x};");
@@ -1130,7 +1131,8 @@ pub(super) fn emit_stream(
                 let _ = writeln!(f, "          r0 = {};", combine("r0", "r1"));
                 let _ = writeln!(
                     f,
-                    "          if ((stream_lane & 7u) == 0u && stream_live) stream_work[{slot}u + (i4 >> 5u)] = r0;"
+                    "          if ((stream_lane & 7u) == 0u && stream_live) {};",
+                    work_put(streams.split, &format!("{slot}u + (i4 >> 5u)"), "r0")
                 );
                 let _ = writeln!(f, "        }}");
                 let ptr = (pass.pointer)(out);
@@ -1441,4 +1443,19 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
         at += members.len() - 1;
     }
     spent
+}
+
+/// A reduction's chunk partial stored at `at` of the row's work. Where the
+/// row is split across blocks the others read it after the meeting
+/// (`ptir_canonical_reduce_met`): stored at the device's coherence point
+/// (`M1_LANE_PUT32`, agent scope), where every block's reads look, not in
+/// the writing block's cache. On a device whose last-level caches are not
+/// coherent with each other (MI300X's eight XCDs) a plain store waits there
+/// unseen.
+fn work_put(split: bool, at: &str, value: &str) -> String {
+    if split {
+        format!("M1_LANE_PUT32(reinterpret_cast<m1_u32*>(stream_work + ({at})), __float_as_uint({value}))")
+    } else {
+        format!("stream_work[{at}] = {value}")
+    }
 }
