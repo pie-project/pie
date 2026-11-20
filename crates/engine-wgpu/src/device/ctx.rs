@@ -854,6 +854,10 @@ pub(crate) struct UniformRegion {
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
     used: u64,
+    /// The end of the most the frame's encoder has staged through its
+    /// chunk: a copy gives its slot back once encoded, and a staging the
+    /// queue writes lies past this, where no command of the frame writes.
+    high: u64,
 }
 
 pub(crate) struct Inner {
@@ -1061,16 +1065,32 @@ impl Frame {
         }
     }
 
+    /// `bytes` of this frame's scratch the frame's encoder writes: the
+    /// chunk and the slot's first byte in it.
     pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, false)
+    }
+
+    /// `bytes` of this frame's scratch the queue writes, which lands before
+    /// any command of the frame runs: past every slot the encoder has
+    /// written, so no command of the frame writes over it.
+    pub(crate) fn scratch_slot_queued(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, true)
+    }
+
+    fn scratch_take(&self, bytes: u64, queued: bool) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
-        let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
+        let from = if queued {
+            ring.used.max(ring.high)
+        } else {
+            ring.used
+        };
+        let at = from.next_multiple_of(align);
         let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
         if at + bytes > room {
             return Err(Fault::Ceiling {
@@ -1080,6 +1100,7 @@ impl Frame {
             });
         }
         ring.used = at + bytes;
+        ring.high = ring.high.max(ring.used);
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
@@ -1123,7 +1144,16 @@ impl Frame {
         // in what room the frame's chunk has. Where the destination lies past
         // an overlapping source the pieces go from the end, so each reads its
         // source as it was.
+        // The slot is given back once the copy is encoded: a later slot the
+        // encoder writes runs after the copy's pieces, and one the queue
+        // writes lies past it (`scratch_slot_queued`).
         let piece = len.min(self.scratch_room() & !3).max(4);
+        let given = self
+            .inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used;
         let (scratch, at) = self.scratch_slot(piece)?;
         let mut starts: Vec<u64> = (0..len).step_by(piece as usize).collect();
         if into_at > source_at && into_at < source_at + len {
@@ -1135,7 +1165,13 @@ impl Frame {
                 encoder.copy_buffer_to_buffer(from, source_at + start, &scratch, at, Some(bytes));
                 encoder.copy_buffer_to_buffer(&scratch, at, to, into_at + start, Some(bytes));
             }
-        })
+        })?;
+        self.inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used = given;
+        Ok(())
     }
 
     pub fn fill_zero(&mut self, into: &super::Buffer, at: u64, len: u64) -> Result<()> {
@@ -1420,6 +1456,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let owner = engine_gpu::books::owners::TEST;
         let mut buffer = Buffer::zeroed(&device, 64, owner).unwrap();
         // A frame opened before the loss and submitted after it.
@@ -1491,6 +1528,9 @@ mod tests {
                 .copy(&buffer, size - 64, &buffer, size - 32, 16)
                 .unwrap();
             frame.copy(&buffer, from, &buffer, into, len).unwrap();
+            // The copy gave its slot back: a view staged after it in the frame
+            // still finds the chunk's room.
+            frame.scratch_slot(pooled - 4096).unwrap();
             frame.commit().unwrap();
             let mut want = words.clone();
             want.copy_within(
