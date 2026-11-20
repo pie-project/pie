@@ -73,11 +73,23 @@ struct Params {
     int channels;
     int conv_width;
     int dilation;
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    // The window's CSR lies at int `indptr_at` of the fire's packed windows
+    // table, which is bound whole: one view whatever window a fire cuts.
+    int indptr_at;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+// The window's CSR boundary `i`.
+int csr(uint i) {
+    return indptr[uint(params.indptr_at) + i];
+}
+#endif
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(state, float, params.state_origin)
@@ -202,11 +214,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 #if defined(PIE_COMMITTED)
     uint lane = uint(params.lane0) + r;
-    int begin = indptr[r];
+    int begin = csr(r);
     for (uint j = 0; j < r; j++) {
         begin += replay[uint(params.lane0) + j];
     }
-    int span = (indptr[r + 1] - indptr[r]) + replay[lane];
+    int span = (csr(r + 1) - csr(r)) + replay[lane];
     if (span <= 0 || pie_state_none(lane)) {
         return;
     }
@@ -217,8 +229,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
     walk(column(lane, chans, c), begin, span, min(commit[lane], span), chans, c, snap);
 #elif defined(PIE_CHUNKED)
-    int begin = indptr[r];
-    int span = indptr[r + 1] - begin;
+    int begin = csr(r);
+    int span = csr(r + 1) - begin;
     if (span <= 0) {
         return;
     }

@@ -822,3 +822,41 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F42. The first request after boot runs slow; the first served fire of each XLA shape too
+
+Two one-time costs after ready, measured on v6e qwen3-0.6b (census config), tip and the
+mixed decode capacity alike:
+
+- The server's first request of an inferlet: 117 ms against 22 ms for the next ones (a
+  12 ms install, guest registrations cache hits of ~1 ms). A burst that arrives first
+  piles up behind it: the first staggered load after boot runs 1508 tok/s against 2189 on
+  the next, and one tiny request beforehand brings the first staggered load to 2335
+  against 2345. It sits in the runtime's first launch of an inferlet program (not the
+  engine's programs); naming it is the runtime's.
+- XLA: the first served fire of each fire shape runs 2.5-6 ms longer on the device than
+  its median (PIE_XLA_TIMING: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
+  decode 5.6 against 2.2 ms; about 45-50 ms over the 20 shapes a first load touches; host
+  stage unchanged, nothing compiled or loaded after ready). Executing every laid program
+  once at load, on scratch, does not remove it (2.36 against 2.47 ms mean excess, at 17 s
+  of boot), so it is not an executable's first execution: something a served fire of a
+  shape first touches (its staged inputs' device buffers, its readout seats) that a
+  scratch fire does not. Unnamed; small next to the first item.
+
+## F43. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
+
+`canonical_pads` (engine-xla serve) pads a fire that prefills to rungs so a laid program
+holds it, and returns None where no laid shape exists; the fire then goes out at its exact
+lane counts and compiles mid-run. One composition the runtime forms: 35 three-row prompts
+beside 17 decodes (128 rows, 53 lanes, v6e qwen3-0.6b c64). Its prompts pad to the 64-lane
+rung, which leaves 16 decode lanes within max_lanes (80); 17 decodes fit neither 16 nor
+their rung 32 (96 lanes). Base's rule has the same gap (the decodes' rung 32 > the 16 left
+and 17 > 16); with the mixed decode capacity (decodes beside prompts pad to the largest
+decode rung their prompts' rung leaves) it hit 2 of 4 serving runs (a c64 pass at 642
+tok/s), base 0 of ~10.
+
+A contract bug: a served fire with no laid shape is a compile after ready. Fix on the
+cutter (runtime, every backend): never compose a mixed fire the engine has no canonical
+shape for; seat the decodes and the prompts that fit beside them, and defer the rest to the
+next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
+composition above.

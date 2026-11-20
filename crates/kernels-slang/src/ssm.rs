@@ -7,7 +7,7 @@ use dtype::Dtype;
 use crate::encode::{Arg, ArgValue};
 use crate::encode::{nonzero, refuse};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Segments, Tensor, words_of};
+use crate::tensor::{Segments, Tensor, words_of};
 
 pub mod conv1d;
 pub mod gdn_prep;
@@ -182,12 +182,41 @@ fn csr_lanes(op: &'static str, what: &str, indptr: Tensor) -> Result<u32, Error>
     }
 }
 
-fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
-    csr_lanes(op, "query", x.indptr)
+/// A window's query CSR in the fire's packed windows table: the table is
+/// bound whole (one view whatever window a fire cuts) and the window's
+/// `lanes + 1` boundaries lie from int `at` of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Csr {
+    pub table: Tensor,
+    pub at: u32,
+    pub lanes: u32,
 }
 
-fn window_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
-    csr_lanes(op, "window", indptr)
+impl Csr {
+    /// The lanes the CSR spans, at least one, refused where its boundaries
+    /// pass the table or are not i32.
+    fn lanes(&self, op: &'static str) -> Result<u32, Error> {
+        let lanes = csr_lanes(
+            op,
+            "window",
+            Tensor {
+                rows: self.lanes + 1,
+                ..self.table
+            },
+        )?;
+        let held = u64::from(self.table.rows) * u64::from(self.table.width);
+        if u64::from(self.at) + u64::from(lanes) + 1 > held {
+            return Err(refuse(
+                op,
+                format!(
+                    "the window's {} boundaries from int {} pass the {held} ints of its table",
+                    lanes + 1,
+                    self.at
+                ),
+            ));
+        }
+        Ok(lanes)
+    }
 }
 
 /// The rows of a fire, at least one.

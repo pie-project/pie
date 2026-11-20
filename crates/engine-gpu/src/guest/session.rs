@@ -35,6 +35,33 @@ pub fn step_stride(align: u64) -> u64 {
     u64::from(wgsl::STEP_BYTES).max(align).next_power_of_two()
 }
 
+/// The bytes a stage's status word takes where it lies in the instance's
+/// slots.
+pub const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
+
+/// What an instance's tables take in its `Instance` slots, in the order a
+/// bind places them: each stage's four bind-time tables and its steps'
+/// records (`stride` apart), then the status word its stages share. The
+/// one list a registration's facts and a bind's placement both read.
+#[must_use]
+pub fn instance_table_sizes(
+    plans: &[eta_compiler::codegen::launch::LaunchStagePlan],
+    code: &[crate::guest::Lowered],
+    stride: u64,
+) -> Vec<u64> {
+    let mut sizes: Vec<u64> = plans
+        .iter()
+        .zip(code)
+        .flat_map(|(plan, lowered)| {
+            let mut stage = table_sizes(plan).to_vec();
+            stage.push(lowered.steps.len().max(1) as u64 * stride);
+            stage
+        })
+        .collect();
+    sizes.push(STATUS_SPAN);
+    sizes
+}
+
 /// A stage's step records, `stride` apart, in dispatch order, each with its
 /// node's area of `areas` (`StageTables::areas`) and the instance's
 /// `bases`.

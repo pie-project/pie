@@ -594,8 +594,17 @@ impl Session {
     /// The program `inferlet` names for this session's tenant, compiled.
     async fn launchable(&self, inferlet: &str) -> anyhow::Result<program::Program> {
         let reference = ProgramRef::parse(inferlet)?;
+        let t0 = crate::rt::Instant::now();
         let program = program::resolve(Some(&self.tenant), &reference).await?;
+        let resolved = t0.elapsed();
         program::load(&program).await?;
+        tracing::debug!(
+            target: "pie::launch",
+            %program,
+            resolve_us = resolved.as_micros() as u64,
+            load_us = (t0.elapsed() - resolved).as_micros() as u64,
+            "launchable"
+        );
         Ok(program)
     }
 
