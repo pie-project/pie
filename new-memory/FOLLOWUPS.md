@@ -751,3 +751,25 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F42. Lanes carry page deltas; each engine keeps a per-slot page table resident
+
+Every fire the runtime hands each lane its full page list (`Lane.tables`), so every
+backend walks every lane's pages every fire to lay its page tables. XLA's dense table
+(4ac0361f0, `KvPool::page_table`) rides the CSR walk serve already does (about 2 ns an
+entry), but the walk itself is O(pages) a fire: at a fixed lane capacity of 128 lanes x
+256 pages, 32k entries a fire (paired with the fixed-capacity lowering).
+
+Shape (GPU's):
+- each Lane carries its slot index and its page deltas: the pages granted and freed
+  since the slot's last fire, in order;
+- each engine keeps a per-slot device table, laid at load and sized by the pool's max
+  pages per slot (no allocation after load), and applies the deltas in the fire's own
+  command stream;
+- a slot reused by another set gets a reset delta;
+- the host walk becomes O(deltas) a fire.
+
+A coordinated change (the CUDA, engine-gpu, Metal and XLA halves), with a correctness
+test: a table built from deltas equals one built from the full list after arbitrary
+grant / free / reuse sequences. AMD's beam page lists already keep page state resident
+for beams; the two should converge.
