@@ -100,6 +100,12 @@ pub(super) struct Proc {
     /// its last unpark refusal left them: it goes again only once more
     /// stand, as well as more runs of the refused length.
     pub(super) roles_short_free: Option<u32>,
+    /// The run its last unpark was refused, `(run, pieces)`, kept across a
+    /// re-send until a restore serves it: its need always holds what the
+    /// unpark asked. Cleared with the refusal at a re-send, the need fell
+    /// back to its bind's runs and its own, and the run of nine its unpark
+    /// was refused was never asked of the map (Mac Pro on 22b0a3e83).
+    pub(super) roles_refused: Option<(u32, u32)>,
     /// Refused while the map showed runs of its need standing that its
     /// unpark did not see: `(map's free runs, the refusal's)`, for the
     /// census, so the need is fixed rather than the retry.
@@ -201,6 +207,7 @@ impl Proc {
             roles_short_gives: None,
             roles_short_runs: None,
             roles_short_free: None,
+            roles_refused: None,
             roles_short_mismatch: None,
             bind_room: None,
             unfired: false,

@@ -164,6 +164,7 @@ impl ResidencyPlanner {
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
+            proc.roles_refused = None;
             proc.roles_short_mismatch = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
@@ -326,6 +327,7 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
                 proc.roles_short_free = Some(free_chunks);
+                proc.roles_refused = Some(need);
                 // Refused against runs the map shows: the census names the
                 // mismatch (a room the map does not read).
                 proc.roles_short_mismatch =

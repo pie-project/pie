@@ -718,6 +718,9 @@ impl ResidencyPlanner {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
                     let suspended = proc.bind_room.is_some() && proc.roles_short.is_none();
+                    // The run its last unpark was refused, kept across a
+                    // re-send: its need holds it until a restore serves it.
+                    let refused = proc.roles_refused;
                     // A bind it was suspended for, of another length than
                     // its refusal's: its runs stand beside the unpark's.
                     let bind = proc
@@ -728,18 +731,23 @@ impl ResidencyPlanner {
                     // free pool as its runs, and so does its state (records,
                     // rs list slots) its serve takes before its unpark.
                     let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    Some((need, Some((waiter.pid, suspended, bind)), (kv_missing, waiter.rs_need())))
+                    Some((
+                        need,
+                        Some((waiter.pid, suspended, bind, refused)),
+                        (kv_missing, waiter.rs_need()),
+                    ))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
+        let refused = suspended.and_then(|(_, _, _, refused)| refused);
         let mut room = match suspended {
             // A bind's runs beside what its own unpark takes back first.
-            Some((pid, true, _)) => self.beside_own(pid, need),
+            Some((pid, true, _, _)) => self.beside_own(pid, need),
             // Short of its roles: the whole unpark, not the part it came up
             // short on (its own runs count that part among them), and the
             // runs of the bind that suspended it, of their own length.
-            Some((pid, false, bind)) => {
+            Some((pid, false, bind, _)) => {
                 let mut room = self.whole_unpark(pid, need);
                 if let Some((run, pieces)) = bind {
                     room.add(run, pieces);
@@ -748,6 +756,9 @@ impl ResidencyPlanner {
             }
             None => RunNeed::one(need.0, need.1),
         };
+        if let Some((run, pieces)) = refused {
+            room.at_least(run, pieces);
+        }
         // A restore's step gathers its kv pages, then lays its runs: the
         // chunks the pages still need are asked in runs of its longest
         // length, laid after the runs (they need not be adjacent; asked so,

@@ -7995,3 +7995,38 @@ fn a_victim_that_found_nothing_is_a_candidate_again_once_a_fire_lands() {
     assert!(!blocked(&planner), "a fire landed: a candidate again");
     drop(grant);
 }
+
+/// Mac Pro on 22b0a3e83: a restore refused a run of nine whose need read
+/// [(7, 8), (4, 1)]. A re-send cleared its refusal, and its need fell back
+/// to its bind's runs and its own. The refused run stays in its need
+/// across a re-send, until a restore serves it.
+#[test]
+fn a_refused_run_stays_in_the_need_across_a_re_send() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(BindRoomPool::new(64, 0..0, 64));
+    pool.free.lock().extend(0..64);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Restoring;
+        proc.bind_room = Some(PendingBind {
+            run: 7,
+            pieces: 1,
+            pages: 7,
+        });
+    });
+    planner.requeue_restore_roles(head, (9, 1), Some(0));
+    let key = planner
+        .with_inner(|inner| inner.queue.iter().find(|(_, w)| w.pid == head).map(|(k, _)| *k))
+        .expect("queued again");
+    let has_nine = |planner: &ResidencyPlanner| {
+        planner.head_room(key).is_some_and(|need| need.pieces_at(9) >= 1)
+    };
+    assert!(has_nine(&planner), "refused a run of nine: its need asks it");
+    // Re-sent: its refusal cleared for the try.
+    planner.with_inner(|inner| inner.roles_retry_head());
+    assert!(has_nine(&planner), "re-sent: its need still asks the run of nine");
+}
