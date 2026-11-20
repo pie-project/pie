@@ -8131,3 +8131,61 @@ fn a_restore_past_every_state_chunk_is_refused_as_never_fitting_alone() {
         "past every state chunk: refused by name"
     );
 }
+
+/// Mac Pro on 22b0a3e83: a refused restore head re-planned by every fire
+/// landing (838 no-step lines a second at peak, nothing in its room
+/// moved). A fire landing plans no pass for a head refused on room that
+/// has not moved since; room that moves does.
+#[tokio::test(flavor = "current_thread")]
+async fn fire_landings_plan_no_pass_for_a_head_refused_on_room_unmoved() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(16, 0..0, 64)
+    });
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let (head, decoding) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    planner.requeue_restore_roles(head, (2, 1), Some(0));
+    planner.with_inner(|inner| {
+        if !inner.queue.values().any(|waiter| waiter.pid == head) {
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    for _ in 0..100 {
+        drop(planner.fire_in_flight(decoding));
+        for _ in 0..5 {
+            crate::rt::yield_now().await;
+        }
+    }
+    let more = planner.stats.plan_passes.load(Ordering::Relaxed) - passes;
+    assert!(more <= 2, "a hundred fire landings planned {more} passes");
+    // Room moves: a fire landing plans again.
+    pool.free.lock().extend([1, 3]);
+    drop(planner.fire_in_flight(decoding));
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(
+        planner.stats.plan_passes.load(Ordering::Relaxed) > passes + more,
+        "room moved: planned"
+    );
+}

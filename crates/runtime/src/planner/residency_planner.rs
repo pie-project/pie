@@ -1899,6 +1899,31 @@ impl ResidencyPlanner {
         })
     }
 
+    /// What [`Self::pages_freed`] does short of planning: the seats are
+    /// read again, idle reclaim re-armed.
+    pub(super) fn pages_freed_quietly(&self) {
+        self.port.freed();
+        self.seat_room.notify_waiters();
+        self.re_arm_idle_reclaim();
+    }
+
+    /// The queue's head is a restore refused on room that has not moved
+    /// since: no more chunks free within the state budget than its refusal
+    /// left ([`super::proc::Proc::roles_short_free`]), the key it goes again
+    /// on. A pass for it finds no step.
+    pub(super) fn head_refused_on_room_unmoved(&self) -> bool {
+        let free = self.port.free_chunks();
+        self.with_inner(|inner| {
+            inner.unmet_head().is_some_and(|(_, waiter)| {
+                matches!(waiter.kind, WaitKind::Restore { .. })
+                    && inner.procs.get(&waiter.pid).is_some_and(|proc| {
+                        proc.roles_short.is_some()
+                            && proc.roles_short_free.is_some_and(|left| free <= left)
+                    })
+            })
+        })
+    }
+
     pub fn pages_freed(self: &Arc<Self>) {
         self.port.freed();
         // A set let go or a segment backed: admission reads its seats again.
