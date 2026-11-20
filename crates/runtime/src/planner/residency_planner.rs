@@ -102,11 +102,20 @@ async fn waits_said(wait: impl std::future::Future<Output = ()>) -> bool {
 impl ResidencyPlanner {
     pub fn new(port: Arc<dyn PoolPort>) -> Self {
         let sink = super::short::sink(port.locus().1);
+        // Device room coming free on any path (a release, a fire's epoch
+        // retiring, a sequence ending, an eviction's pages let go) wakes the
+        // planner as a dropped grant does: lock-free, never planning in the
+        // release itself.
+        let returns: Arc<RoomReturns> = Arc::default();
+        let signal = Arc::clone(&returns);
+        port.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move || {
+            signal.slots_freed();
+        })));
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
-            returns: Arc::default(),
+            returns,
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
@@ -363,6 +372,13 @@ impl ResidencyPlanner {
     /// is woken to be refused, and a stall that goes on is said again. It
     /// plans nothing on the clock: events plan.
     pub(super) fn tick(self: &Arc<Self>) {
+        // The backstop, never the main path: room that came free since the
+        // last pass began (a free that raced that pass, or a path that
+        // woke no one) is planned on now, within a beat; with nothing
+        // freed, nothing is planned.
+        if self.returns.freed_since_plan() {
+            self.plan();
+        }
         self.report_short();
         self.note_lapsed_fires();
         // One read of the queue, as `never_fits` reads each need.

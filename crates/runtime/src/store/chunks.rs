@@ -70,6 +70,17 @@ fn waiter(backing: &Backing) -> u64 {
 }
 
 impl<I: PoolId> ShapePool<I> {
+    /// Calls `signal` each time this pool's ids come free, where they come
+    /// from: its own slot pool, or the shared one it takes a shape of.
+    pub fn set_room_signal(&self, signal: super::slots::RoomSignal) {
+        match &self.slots {
+            Backing::Own(pool) => pool.set_room_signal(signal),
+            Backing::Shape(shared, _) | Backing::Records(shared) => {
+                shared.lock().unwrap().pool().set_room_signal(signal);
+            }
+        }
+    }
+
     /// `capacity` ids from `base`, every one committed.
     pub fn new(kind: ShapeKind, slot_bytes: u64, base: u32, capacity: u32) -> Self {
         base.checked_add(capacity)

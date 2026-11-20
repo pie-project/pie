@@ -459,6 +459,14 @@ impl KvStore {
         self.disk_pool = Pool::new(disk_slots);
     }
 
+    /// Calls `signal` each time host or disk slots come free: room a
+    /// waiter blocked on swap room (a victim's move with no slot below)
+    /// waits on.
+    pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
+        self.host_pool.set_room_signal(signal.clone());
+        self.disk_pool.set_room_signal(signal);
+    }
+
     pub fn set_domain(&mut self, domain: Hash256) {
         self.domain = domain;
     }

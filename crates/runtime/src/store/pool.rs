@@ -26,6 +26,9 @@ pub struct Pool<I> {
     base: u32,
     capacity: u32,
     id: PhantomData<I>,
+    /// Told each time ids come free ([`Self::set_room_signal`]): the disk
+    /// tier's slots, whose return a waiter blocked on swap room waits on.
+    signal: Option<super::slots::RoomSignal>,
 }
 
 impl<I: PoolId> Pool<I> {
@@ -49,7 +52,14 @@ impl<I: PoolId> Pool<I> {
             base,
             capacity,
             id: PhantomData,
+            signal: None,
         }
+    }
+
+    /// Calls `signal` each time ids come free (lock-free: a give-back runs
+    /// under its store's lock).
+    pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
+        self.signal = Some(signal);
     }
 
     /// The `n` lowest free ids, in ascending order, or none when fewer than
@@ -148,6 +158,7 @@ impl<I: PoolId> Pool<I> {
     }
 
     fn give_back(&mut self, ids: Vec<I>) {
+        let freed = !ids.is_empty();
         for id in ids {
             debug_assert!(self.contains(id));
             let offset = id.index() - self.base;
@@ -156,6 +167,9 @@ impl<I: PoolId> Pool<I> {
             self.free[word] |= bit;
             self.lowest = self.lowest.min(word);
             self.available += 1;
+        }
+        if freed && let Some(signal) = &self.signal {
+            (signal.0)();
         }
     }
 
@@ -221,6 +235,28 @@ mod tests {
         pool.release_runs(&[3], 3);
         assert_eq!(pool.available(), 7);
         assert_eq!(pool.try_alloc_aligned_runs(1, 3), Some(vec![3]));
+    }
+
+    /// Ids coming free tell the room signal once a give-back, taking tells
+    /// nothing: the disk tier's slots wake a waiter blocked on swap room as
+    /// the device's do.
+    #[test]
+    fn ids_coming_free_tell_the_room_signal() {
+        let told = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = std::sync::Arc::clone(&told);
+        let mut pool = Pool::<u32>::new(12);
+        pool.set_room_signal(super::super::slots::RoomSignal(std::sync::Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })));
+        let told_now = || told.load(std::sync::atomic::Ordering::Relaxed);
+        let ids = pool.try_alloc_n(4).unwrap();
+        let run = pool.try_alloc_aligned_runs(1, 4).unwrap();
+        assert_eq!(told_now(), 0, "taking tells nothing");
+        pool.release_runs(&run, 4);
+        assert_eq!(told_now(), 1, "a run back: told once");
+        for id in ids {
+            assert!(pool.contains(id));
+        }
     }
 
     #[test]

@@ -90,6 +90,8 @@ impl ResidencyPlanner {
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
+        self.returns.planning.store(true, Ordering::Release);
+        self.returns.plan_begins();
         let on_grow = loop {
             let seen = self.returns.epoch();
             let on_grow = self.plan_once();
@@ -97,6 +99,7 @@ impl ResidencyPlanner {
                 break on_grow;
             }
         };
+        self.returns.planning.store(false, Ordering::Release);
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
             self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())

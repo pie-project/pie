@@ -471,6 +471,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (planner, pids, order);
         false
     }
+    /// Has `signal` called each time device slots come free, whatever path
+    /// gives them back (`SlotPool::set_room_signal`): how the planner hears
+    /// of room it did not free itself. None where the pool keeps no slots.
+    fn set_room_signal(&self, signal: crate::store::slots::RoomSignal) {
+        let _ = signal;
+    }
     /// The runs of `run` adjacent chunks `pid`'s restore takes for its own
     /// parked guest state before a bind's room
     /// ([`crate::store::roles::Roles::unpark_runs`]): what the chunk map
@@ -712,6 +718,23 @@ impl PoolPort for RegistryPool {
             crate::store::shared::ask_walk(self.engine);
         }
         comes
+    }
+
+    fn set_room_signal(&self, signal: crate::store::slots::RoomSignal) {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return;
+        };
+        // The device's slots, the host tier's, and the kv store's host and
+        // disk slots: every tier room comes back on.
+        if let Some(shared) = &stores.shared {
+            shared.lock().unwrap().pool().set_room_signal(signal.clone());
+        }
+        if let Some(host) = &stores.host {
+            host.lock().unwrap().pool().set_room_signal(signal.clone());
+        }
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-room-signal", |kv| {
+            kv.set_room_signal(signal);
+        });
     }
 
     fn unpark_runs(&self, pid: ProcessId, run: u32) -> u32 {

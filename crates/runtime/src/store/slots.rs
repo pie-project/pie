@@ -586,12 +586,34 @@ pub struct SlotPool {
 pub struct RoomGiven {
     gives: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
+    /// Told each time slots come free, of any shape, in an open chunk or
+    /// not (a release, a fire's epoch retiring): the one place every
+    /// return of device room passes, so a waiter the room serves is woken
+    /// whichever path gave it back ([`SlotPool::set_room_signal`]).
+    signal: std::sync::OnceLock<RoomSignal>,
+}
+
+/// What [`RoomGiven::signal`] calls: lock-free, for a release may run under
+/// the pool's lock and its caller's.
+#[derive(Clone)]
+pub struct RoomSignal(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for RoomSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoomSignal")
+    }
 }
 
 impl RoomGiven {
     fn give(&self) {
         self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.notify.notify_waiters();
+    }
+
+    fn slots_freed(&self) {
+        if let Some(signal) = self.signal.get() {
+            (signal.0)();
+        }
     }
 }
 
@@ -2188,9 +2210,19 @@ impl SlotPool {
                 }
             }
         }
+        let freed = !immediate.is_empty();
         for slot in immediate {
             self.give_back(slot);
         }
+        if freed {
+            self.given.slots_freed();
+        }
+    }
+
+    /// Calls `signal` each time slots come free ([`RoomGiven::signal`]):
+    /// set once, by the planner of the engine this pool backs.
+    pub fn set_room_signal(&self, signal: RoomSignal) {
+        let _ = self.given.signal.set(signal);
     }
 
     /// Every fire through `epoch` has retired: what waited on them is free.
@@ -2214,15 +2246,21 @@ impl SlotPool {
         }
         let later = self.pending.split_off(&(epoch.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
+        let mut freed = false;
         if epoch == u64::MAX {
             // split_off(MAX) leaves MAX itself behind.
             let rest = std::mem::take(&mut self.pending);
             for slot in rest.into_values().flatten() {
                 self.give_back(slot);
+                freed = true;
             }
         }
         for slot in due.into_values().flatten() {
             self.give_back(slot);
+            freed = true;
+        }
+        if freed {
+            self.given.slots_freed();
         }
     }
 
@@ -3323,6 +3361,32 @@ mod tests {
             }
         }
         assert_eq!(pool.plan_compaction(3), None, "too few free chunks: it waits");
+    }
+
+    /// Every return of slots tells the room signal once: a release whose
+    /// slots no fire still reads, at once; one a fire still reads, when that
+    /// fire's epoch retires, not before. What wakes a planner's waiter
+    /// whichever path gave the room back.
+    #[test]
+    fn slots_coming_free_tell_the_room_signal() {
+        let mut pool = run_pool();
+        let told = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = std::sync::Arc::clone(&told);
+        pool.set_room_signal(RoomSignal(std::sync::Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })));
+        let holder = Holder::WorkingSet(1);
+        let slots = pool.acquire(holder, 0, 10).unwrap();
+        let told_now = || told.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(told_now(), 0, "taking tells nothing");
+        pool.release(holder, &slots[..5], 0);
+        assert_eq!(told_now(), 1, "freed at once: told once");
+        pool.release(holder, &slots[5..], 7);
+        assert_eq!(told_now(), 1, "waiting on a fire: not yet free");
+        pool.retire_through(7);
+        assert_eq!(told_now(), 2, "the fire retired: told");
+        pool.retire_through(8);
+        assert_eq!(told_now(), 2, "nothing more came free");
     }
 
     /// The run-class pool these tests take from: 1024-slot chunks of one

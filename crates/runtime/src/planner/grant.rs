@@ -35,6 +35,16 @@ pub(super) struct RoomReturns {
     pub(super) drain: OnceLock<Arc<Notify>>,
     /// Where no drain task is armed: the parked waiters, each to plan.
     room: Notify,
+    /// Device slots come free on any path (the pool's release or a fire's
+    /// epoch retiring, `SlotPool::set_room_signal`), counted.
+    freed: AtomicU64,
+    /// The count of [`Self::freed`] the last plan pass began on: moved
+    /// since, the drain task's tick plans again (the backstop).
+    freed_at_plan: AtomicU64,
+    /// A plan pass runs: slots it frees itself (a stale reservation, pages
+    /// gathered for a head that left) wake nothing, or a pass would wake
+    /// its own next pass.
+    pub(super) planning: std::sync::atomic::AtomicBool,
 }
 
 impl RoomReturns {
@@ -51,7 +61,32 @@ impl RoomReturns {
 
     /// Room came back: the epoch moves, then the planner is woken, both
     /// lock-free (`Notify` takes only its own lock).
-    fn given(&self) {
+    /// Device slots came free: counted, and, outside a plan pass, the
+    /// planner woken while anyone waits. Lock-free: the pool's release
+    /// calls it under its own lock and its caller's.
+    pub(super) fn slots_freed(&self) {
+        self.freed.fetch_add(1, Ordering::AcqRel);
+        if self.planning.load(Ordering::Acquire) || self.waiters.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        match self.drain.get() {
+            Some(drain) => drain.notify_one(),
+            None => self.room.notify_waiters(),
+        }
+    }
+
+    /// A plan pass begins: the frees it reads as given.
+    pub(super) fn plan_begins(&self) {
+        self.freed_at_plan
+            .store(self.freed.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Slots came free since the last plan pass began.
+    pub(super) fn freed_since_plan(&self) -> bool {
+        self.freed.load(Ordering::Acquire) != self.freed_at_plan.load(Ordering::Acquire)
+    }
+
+    pub(super) fn given(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         if self.waiters.load(Ordering::Acquire) == 0 {
             return;

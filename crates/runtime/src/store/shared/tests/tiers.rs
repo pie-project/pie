@@ -355,3 +355,32 @@ fn a_suspend_leaves_a_device_folding_set_where_the_engine_holds_it() {
     assert!(s.suspend_short(&only).is_zero());
     assert!(!s.on_host(slot(&s, failed)));
 }
+
+/// The kv store's swap slots tell the planner's room signal as they come
+/// back, as the device's do: disk chunks given back (a parked role's, or a
+/// victim's pages leaving the disk tier) wake a waiter blocked on swap
+/// room within a turn, not on a timer.
+#[test]
+fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
+    use crate::store::chunks::ShapePool;
+    let mut facts = fixed_facts();
+    facts.host_chunks = HOST_CHUNKS;
+    facts.disk_chunks = 2;
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let tiers = Tiers::of(&facts).unwrap();
+    let list = shared.lock().unwrap().list().unwrap();
+    let host = tiers.host.as_ref().map(|host| ShapePool::shared(host, list));
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [3; 32]);
+    kv.set_tiers(list.id, host, tiers.disk_slots);
+    let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let count = Arc::clone(&told);
+    kv.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })));
+    let chunks = kv
+        .take_disk_chunks(1, tiers.disk_chunk_slots)
+        .expect("a disk chunk");
+    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 0, "taking tells nothing");
+    kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
+    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 1, "given back: told");
+}

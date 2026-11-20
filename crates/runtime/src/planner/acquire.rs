@@ -285,7 +285,9 @@ impl ResidencyPlanner {
                                 () = &mut notified => {}
                                 () = &mut returned => {}
                             }
-                            if self.returns.epoch() != seen {
+                            // Room returned since: a dropped grant's, or
+                            // slots the pool freed on any path.
+                            if self.returns.epoch() != seen || self.returns.freed_since_plan() {
                                 self.poke();
                             }
                             let Some(error) = self.never_fits(key) else {

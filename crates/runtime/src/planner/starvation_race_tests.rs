@@ -41,6 +41,8 @@ struct RacePool {
     /// `RegistryPool`'s does: the waiter registered short, then promised a
     /// grow only where the walk's next step maps a segment.
     grow: Option<crate::store::shared::SharedGrow>,
+    /// The room signal the planner set (`PoolPort::set_room_signal`).
+    signal: parking_lot::Mutex<Option<crate::store::slots::RoomSignal>>,
 }
 
 impl RacePool {
@@ -54,6 +56,19 @@ impl RacePool {
             host_total: 0,
             rs_model: None,
             grow: None,
+            signal: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// `n` pages come free by a path that tells the planner nothing but
+    /// the pool's room signal (a sequence ending, a fire's epoch retiring).
+    fn free_quietly(&self, n: u32) {
+        let mut free = self.free.lock();
+        let base = 1000 + free.len() as u32;
+        free.extend((0..n).map(|i| PhysicalKvPageId(base + i)));
+        drop(free);
+        if let Some(signal) = self.signal.lock().clone() {
+            (signal.0)();
         }
     }
 
@@ -81,6 +96,9 @@ impl RacePool {
 }
 
 impl PoolPort for RacePool {
+    fn set_room_signal(&self, signal: crate::store::slots::RoomSignal) {
+        *self.signal.lock() = Some(signal);
+    }
     fn grow(&self, need: Demand) -> bool {
         let Some(grow) = &self.grow else {
             return false;
@@ -6597,4 +6615,70 @@ async fn with_nothing_in_flight_a_head_is_funded_by_residents_that_made_no_progr
         "a resident holding a run beside the free chunks is moved"
     );
     bind.abort();
+}
+
+/// Room that comes back by any path wakes a parked waiter it serves within
+/// a turn: the pool's room signal, told wherever device slots come free (a
+/// sequence ending, a fire's epoch retiring, an eviction's pages let go),
+/// with no pages_freed and no timer. Without it the head slept until an
+/// unrelated event (the L40S at 4 GiB: silent waits to 793 ms once the
+/// 100 ms re-plan was gone). With the drain task armed and without.
+#[tokio::test(flavor = "current_thread")]
+async fn room_that_comes_free_on_any_path_wakes_the_waiter_it_serves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for drain in [true, false] {
+        let pool = Arc::new(RacePool::new(4));
+        pool.refill_after_stall(4, 0);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        if drain {
+            planner.arm_drain_task();
+        }
+        let (holder, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [holder, head] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        // A holder takes the pool; its pages never come back by the grant
+        // (the grant is leaked), only by the pool's own return below.
+        let held = planner
+            .grant_now(
+                holder,
+                Demand {
+                    kv_pages: 4,
+                    rs: RsUnits::default(),
+                },
+            )
+            .expect("the pool is free");
+        std::mem::forget(held);
+        let p = planner.clone();
+        let task = crate::rt::spawn(async move {
+            p.acquire(
+                head,
+                head,
+                Demand {
+                    kv_pages: 2,
+                    rs: RsUnits::default(),
+                },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+            if planner.diagnostics().queue.len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(planner.diagnostics().queue.len(), 1, "the head parks");
+        let since = std::time::Instant::now();
+        pool.free_quietly(2);
+        for _ in 0..50 {
+            if task.is_finished() {
+                break;
+            }
+            crate::rt::yield_now().await;
+        }
+        assert!(task.is_finished(), "woken by the room coming free (drain {drain})");
+        assert!(since.elapsed() < crate::policy::pressure::AGAIN, "within a turn, no tick");
+        assert!(matches!(task.await.unwrap(), Ok(super::acquire::Acquired::Granted(_))));
+    }
 }
