@@ -81,6 +81,12 @@ pub trait Backend:
         Self::with_frame(Frame::flush).unwrap_or(Ok(()))
     }
 
+    /// Submits what this thread's recording frame holds as a split step's
+    /// segment, unawaited ([`Frame::submit_segment`]), if one is recording.
+    fn submit_recording() -> Result<()> {
+        Self::with_frame(Frame::submit_segment).unwrap_or(Ok(()))
+    }
+
     /// Lays `len` bytes at `at` of `staging` by `fill`, handed the address
     /// of the first, before work the frame records next reads them.
     fn stage_rows(
@@ -185,6 +191,16 @@ pub trait Frame<B: Backend>: 'static {
 
     /// Submits what the frame holds so far; it records on.
     fn flush(&self) -> Result<()>;
+
+    /// Submits what the frame holds so far without waiting for it to land;
+    /// it records on, queued behind it: a split step's segment (a layer),
+    /// which the platform's bound wants short, not waited on. The work
+    /// recorded next is ordered after it by the queue; the host writes
+    /// nothing it reads in between (no staging between a split step's
+    /// layers rides on it). Where the backend cannot, [`Frame::flush`].
+    fn submit_segment(&self) -> Result<()> {
+        self.flush()
+    }
 
     /// [`Frame::flush`], then every frame submitted before has landed too:
     /// the host may rewrite memory any of them reads.

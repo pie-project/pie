@@ -274,6 +274,59 @@ pub struct Gpu<B: Host> {
 }
 
 impl<B: Host> Gpu<B> {
+    /// `step` held to the platform's bound on one submission, where the
+    /// load states one (`crate::submit`): the shell told to walk it a layer
+    /// at a time where it is past the bound whole, and its lanes' refusal,
+    /// by name, where it is past it even so (its prompt lanes', or every
+    /// lane's where it carries no prompt). `None` where it is admitted.
+    fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
+        let shell = self.shell.as_mut()?;
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        let admitted = held.admit(rows);
+        let (whole, per_layer) = held.step_ns(rows);
+        tracing::debug!(
+            frame = at.frame.0,
+            step = at.step,
+            rows = rows.rows,
+            lanes = rows.lanes,
+            keys = rows.keys,
+            prompt = rows.prompt,
+            rung = held.rung_of(rows.rows),
+            estimate_ms = whole / 1e6,
+            per_layer_ms = per_layer / 1e6,
+            worst = held.worst,
+            bound_ms = held.bound_ns / 1e6,
+            split = admitted.split(),
+            refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
+            "submit bound: a step admitted"
+        );
+        if let crate::submit::Admitted::Refused { .. } = admitted {
+            let why = held.refusal(rows, &admitted);
+            tracing::warn!(frame = at.frame.0, step = at.step, %why, "submit bound: a step refused");
+            let prompts: Vec<u32> = (0..step.lanes.len() as u32)
+                .filter(|&lane| step.lanes[lane as usize].rows() > 1)
+                .collect();
+            let lanes = if prompts.is_empty() {
+                (0..step.lanes.len() as u32).collect()
+            } else {
+                prompts
+            };
+            return Some(Error::Lanes(
+                lanes
+                    .into_iter()
+                    .map(|lane| engine::LaneFault {
+                        lane,
+                        instance: None,
+                        reason: why.clone(),
+                    })
+                    .collect(),
+            ));
+        }
+        shell.split_next(admitted.split());
+        None
+    }
+
     #[must_use]
     pub fn new(boot: B::DeviceBoot, contract_for: ContractFor) -> Gpu<B> {
         Gpu {
@@ -581,6 +634,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
+        | Fault::DeviceLost { .. }
         | Fault::NoDevice { .. }
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
@@ -867,7 +921,13 @@ where
                 max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(max_lanes),
                 max_context: paging.context(),
-                prefill_rows: 0,
+                // Where the platform states a bound on one submission, a
+                // prompt is cut to the widest laid rung whose step at the
+                // context is admitted under it (`crate::submit`).
+                prefill_rows: shell
+                    .submit_bound()
+                    .and_then(|held| held.prefill_rows(paging.context()))
+                    .unwrap_or(0),
                 prefill_lanes: 0,
                 max_readouts,
             },
@@ -1108,7 +1168,23 @@ where
                 frame: id,
                 step: index as u32,
             };
+            // Held to the platform's bound on one submission, where it
+            // states one (`crate::submit`): a step past it whole walks a
+            // layer at a time; past it even so, its lanes are refused by
+            // name. Nothing is estimated where no bound is stated.
+            if let Some(refused_lanes) = self.admit_step(step, at) {
+                if refused_lanes.stops_frame_at(index) {
+                    refused = Some(refused_lanes);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(refused_lanes);
+            }
             let fired = B::step(self, step, at);
+            if let Some(shell) = self.shell.as_mut() {
+                shell.split_next(false);
+            }
             match fired {
                 Ok((ticket, step_pending)) => {
                     steps.push(ticket);
