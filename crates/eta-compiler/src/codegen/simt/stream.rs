@@ -117,7 +117,10 @@ impl<'a> Streams<'a> {
             return false;
         }
         let node = node as usize;
-        if !self.region.nodes.iter().any(|n| n.index() == node) {
+        // An output is read in place from any region of the stage.
+        if !self.region.nodes.iter().any(|n| n.index() == node)
+            && self.ops[node].tag != tags::OUTPUT
+        {
             return false;
         }
         let op = &self.ops[node];
@@ -159,29 +162,10 @@ impl<'a> Streams<'a> {
             && self.ops[node].args.first() == Some(&value)
     }
 
-    /// The model output a value is a view of: `value` itself where an
-    /// output produces it, or the output a reshape of this region reads
-    /// as its source ([`super::fused::is_view`]). A stream reads such a
-    /// value's row in place, in the output's own storage.
+    /// The model output a value is a view of ([`output_source`]): a stream
+    /// reads such a value's row in place, in the output's own storage.
     fn output_source(&self, value: u32) -> Option<u32> {
-        let node = *self.producers.get(value as usize)?;
-        if node == u32::MAX || !self.region.nodes.iter().any(|n| n.index() == node as usize) {
-            return None;
-        }
-        let op = &self.ops[node as usize];
-        match op.tag {
-            tags::OUTPUT => Some(value),
-            tags::RESHAPE
-                if !op.args.is_empty()
-                    && super::fused::is_view(self.stage, self.region, op, value) =>
-            {
-                let source = op.args[0];
-                let producer = *self.producers.get(source as usize)?;
-                (producer != u32::MAX && self.ops[producer as usize].tag == tags::OUTPUT)
-                    .then_some(source)
-            }
-            _ => None,
-        }
+        output_source(self.stage, self.ops, &self.producers, value)
     }
 
     /// The row width an output is read at in place: its own, where it is a
@@ -541,13 +525,26 @@ impl<'a> Streams<'a> {
                 }
                 at += 1;
             }
-            if views[1..].iter().any(|&view| {
-                self.region.outputs.contains(&view)
-                    || self.region.sinks.iter().any(|s| s.value == view)
-            }) {
+            if views
+                .iter()
+                .any(|&view| self.region.sinks.iter().any(|s| s.value == view))
+            {
+                return true;
+            }
+            // Read past this region, the row is read in place there too, or
+            // the bytes are kept for whoever reads them.
+            let beyond = views.iter().any(|view| self.region.outputs.contains(view))
+                || self
+                    .readers_through_views(value)
+                    .iter()
+                    .any(|&node| !self.region.nodes.iter().any(|n| n.index() == node));
+            if beyond && !read_in_place_beyond(self.stage, self.region, value) {
                 return true;
             }
             self.readers_through_views(value)
+                .into_iter()
+                .filter(|&node| self.region.nodes.iter().any(|n| n.index() == node))
+                .collect()
         } else {
             self.readers
                 .get(value as usize)
@@ -654,6 +651,109 @@ impl<'a> Streams<'a> {
             out.push(nodes[i]);
         }
         out
+    }
+}
+
+/// Whether every reader of model output `value` (through its views) past
+/// `region` reads the row in place: a node of a generated region whose
+/// stream reads it through the output, or an argmax that scans the model's
+/// row itself. Only then does `region` leave the row unwritten.
+pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value: u32) -> bool {
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = crate::codegen::op_view::result_bases(&ops);
+    let mut producers = vec![u32::MAX; stage.normalized.value_types.len()];
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); stage.normalized.value_types.len()];
+    for (node, op) in ops.iter().enumerate() {
+        for result in 0..op.results {
+            if let Some(slot) = producers.get_mut((bases[node] + result) as usize) {
+                *slot = node as u32;
+            }
+        }
+        for arg in op.reads() {
+            if let Some(list) = readers.get_mut(arg as usize) {
+                list.push(node);
+            }
+        }
+    }
+    let Some(source) = output_source(stage, &ops, &producers, value) else {
+        return false;
+    };
+    // The readers past the views, wherever they are.
+    let mut pending = vec![source];
+    let mut outside = Vec::new();
+    while let Some(at) = pending.pop() {
+        for &reader in &readers[at as usize] {
+            let view = bases[reader];
+            if ops[reader].tag == tags::RESHAPE
+                && output_source(stage, &ops, &producers, view) == Some(at)
+            {
+                pending.push(view);
+            } else if !region.nodes.iter().any(|n| n.index() == reader) {
+                outside.push(reader);
+            }
+        }
+    }
+    outside.iter().all(|&reader| {
+        let Some(home) = stage
+            .fused
+            .regions
+            .iter()
+            .find(|r| r.nodes.iter().any(|n| n.index() == reader))
+        else {
+            return false;
+        };
+        if home.kind != crate::plan::RegionKind::Generated
+            || super::validate::validate_generated_region(stage, home).is_err()
+        {
+            return false;
+        }
+        let Some(kinds) = super::fused::stream_rows(stage, home) else {
+            return false;
+        };
+        let direct = super::fused::analyze_direct_argmax(stage, home, &bases);
+        let direct_topk = super::fused::analyze_direct_topk(stage);
+        let claimed = direct.claimed();
+        let streams = Streams::new(
+            stage,
+            home,
+            &ops,
+            &bases,
+            &kinds,
+            &claimed,
+            &direct.skipped,
+            &direct_topk,
+        );
+        streams.scans_model_row(reader)
+            || (streams.stream_reader(reader) && streams.rematerializable(source))
+    })
+}
+
+/// The model output `value` is a view of: `value` itself where an output
+/// produces it, or the output a reshape covering it (the same elements in
+/// the same order) reads, in any region of the stage. The row is the
+/// model's for the whole stage, so any region may read it where it lies.
+fn output_source(
+    stage: &CompiledStage,
+    ops: &[OpView],
+    producers: &[u32],
+    value: u32,
+) -> Option<u32> {
+    let node = *producers.get(value as usize)?;
+    if node == u32::MAX {
+        return None;
+    }
+    let op = &ops[node as usize];
+    match op.tag {
+        tags::OUTPUT => Some(value),
+        tags::RESHAPE if !op.args.is_empty() => {
+            let source = op.args[0];
+            let producer = *producers.get(source as usize)?;
+            (producer != u32::MAX
+                && ops[producer as usize].tag == tags::OUTPUT
+                && crate::codegen::alias::covers(&stage.normalized.value_types, source, value))
+            .then_some(source)
+        }
+        _ => None,
     }
 }
 
@@ -1508,7 +1608,9 @@ fn unnamed_values(
     for node in region.nodes.iter().map(|n| n.index()) {
         let base = bases[node];
         if view(node) {
-            if !read_past.contains(&base) {
+            if !read_past.contains(&base)
+                || super::fused::output_view_read_in_place(stage, region, base)
+            {
                 unnamed.push(base);
             }
         } else if left_out(node) {

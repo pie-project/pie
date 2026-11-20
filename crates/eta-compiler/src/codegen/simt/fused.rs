@@ -210,6 +210,8 @@ pub(crate) fn analyze_direct_argmax(
         // descriptor gives its noise lanes' row, its rng state, the nodes it
         // takes in, the node that reads the logits, and the rounding so far.
         let mut operands: Option<(u32, u32, u32, Vec<u32>, u32, u32)> = None;
+        // A draw's own divisor where it is not one: the fused draw's.
+        let mut draw_divisor: Option<u32> = None;
         if draw {
             // A gumbel_argmax that keeps every lane at a divisor of one: the
             // fused draw's own form (its lanes are f32, never rounded).
@@ -232,11 +234,17 @@ pub(crate) fn analyze_direct_argmax(
                 op.lit_dtype == eta_ir::types::wire_dtype(Dtype::F32)
                     && op.lit_bits == 1.0f32.to_bits()
             });
-            if every_lane && unit {
+            if every_lane && !unit && one_element(divisor) {
+                draw_divisor = Some(divisor);
+            }
+            if every_lane && (unit || draw_divisor.is_some()) {
                 // A constant the draw alone reads is taken in with it.
                 let head = [keep, divisor]
                     .into_iter()
-                    .filter(|&v| single_consumer(v, node as u32))
+                    .filter(|&v| {
+                        single_consumer(v, node as u32)
+                            && ops[producers[v as usize] as usize].tag == tags::CONST
+                    })
                     .map(|v| producers[v as usize])
                     .collect();
                 operands = Some((logits, logits, state, head, node as u32, 0));
@@ -273,9 +281,9 @@ pub(crate) fn analyze_direct_argmax(
             }
         }
         if let Some((logits, noise, state, mut head, mut consumer, mut rounding)) = operands {
-            let mut divisor = None;
+            let mut divisor = draw_divisor;
             let mut source = logits;
-            if single_consumer(logits, consumer) {
+            if divisor.is_none() && single_consumer(logits, consumer) {
                 let scale = producers[logits as usize];
                 let scale_op = &ops[scale as usize];
                 if scale_op.tag == tags::DIV
@@ -498,8 +506,16 @@ pub(super) fn left_out(skipped: &[u8], ops: &[OpView], node: usize) -> bool {
 pub(super) fn is_view(stage: &CompiledStage, region: &Region, op: &OpView, base: u32) -> bool {
     op.tag == tags::RESHAPE
         && !op.args.is_empty()
-        && !region.outputs.contains(&base)
         && crate::codegen::alias::covers(&stage.normalized.value_types, op.args[0], base)
+        && (!region.outputs.contains(&base) || output_view_read_in_place(stage, region, base))
+}
+
+/// Whether `base`, a view of a model output another region reads, is read
+/// there in place (`stream::read_in_place_beyond`), so no bytes of it are
+/// kept for that region.
+pub(super) fn output_view_read_in_place(stage: &CompiledStage, region: &Region, base: u32) -> bool {
+    !region.sinks.iter().any(|sink| sink.value == base)
+        && super::stream::read_in_place_beyond(stage, region, base)
 }
 
 /// Whether `node` is an argmax `region`'s kernel scans from the model's

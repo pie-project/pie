@@ -2179,14 +2179,16 @@ mod tests {
     }
 
     /// Each standard decode fire's scratch, its own and as laid, as
-    /// `eta_dsl::sampler` builds it, the model's output row read in place.
+    /// `eta_dsl::sampler` builds it (its vocabulary-sized values bf16, the
+    /// draw a gumbel_argmax), the model's output row read in place by every
+    /// region that reads it.
     const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
         ("standard greedy", 3_689_472, 1_536),
-        ("standard gumbel-max", 5_512_960, 1_792),
-        ("standard top-p", 9_312_768, 1_368_832),
-        ("standard top-k + top-p", 9_617_408, 2_205_696),
-        ("standard top logprobs", 6_732_544, 1_293_568),
-        ("standard penalized top-p", 20_254_720, 2_584_576),
+        ("standard gumbel-max", 3_689_984, 1_536),
+        ("standard top-p", 5_058_560, 837_888),
+        ("standard top-k + top-p", 5_363_200, 990_464),
+        ("standard top logprobs", 4_910_592, 724_992),
+        ("standard penalized top-p", 10_834_688, 2_358_528),
     ];
 
     /// What each laid out with f32 intermediates and the output row copied
