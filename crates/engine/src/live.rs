@@ -77,10 +77,15 @@ pub enum Tally {
     /// to depth one for it. Counted while such a move is not yet on the
     /// queue, so a backend's remaining drains are seen.
     Drained,
+    /// A submit-bound probe fired after the device idled (the smallest
+    /// matmul re-timing the clock where the platform states a bound on one
+    /// submission): not a model fire, and recorded at load where the
+    /// backend keeps recordings, so never [`Tally::Unrecorded`].
+    Probed,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 9] = [
+    pub const ALL: [Tally; 10] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -90,6 +95,7 @@ impl Tally {
         Tally::BuiltInFire,
         Tally::BoundInFire,
         Tally::Drained,
+        Tally::Probed,
     ];
 
     /// Its name in the model status.
@@ -105,6 +111,7 @@ impl Tally {
             Tally::BuiltInFire => "built_in_fire",
             Tally::BoundInFire => "bound_in_fire",
             Tally::Drained => "drained",
+            Tally::Probed => "probed",
         }
     }
 }

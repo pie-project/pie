@@ -221,12 +221,12 @@ impl KnobChannels {
             top_p: f(sampled && s.top_p < 1.0, s.top_p),
             top_k: (sampled && s.top_k > 0).then(|| Channel::from([s.top_k])),
             min_p: f(sampled && s.min_p > 0.0, s.min_p),
-            repetition: f(
-                penalized && s.repetition_penalty != 1.0,
-                s.repetition_penalty,
-            ),
-            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty),
-            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty),
+            // Penalized, all three ride, the unasked at their neutral
+            // values: which penalties a request asks for is data, so every
+            // penalized request is one program (`sampler::standard`'s).
+            repetition: f(penalized, s.repetition_penalty),
+            frequency: f(penalized, s.frequency_penalty),
+            presence: f(penalized, s.presence_penalty),
             logprobs: s.logprobs,
         }
     }

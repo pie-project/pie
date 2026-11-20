@@ -276,10 +276,10 @@ impl Keys {
 }
 
 /// Every knob the sampler has, and the standard shapes.
-fn shapes() -> Vec<(&'static str, Shape)> {
-    let mut shapes: Vec<(&'static str, Shape)> = sampler::STANDARD.to_vec();
+fn shapes() -> Vec<(String, Shape)> {
+    let mut shapes = sampler::standard();
     shapes.push((
-        "every knob",
+        "every knob".into(),
         Shape {
             temperature: true,
             top_p: true,
@@ -289,15 +289,6 @@ fn shapes() -> Vec<(&'static str, Shape)> {
             frequency: true,
             presence: true,
             logprobs: Some(5),
-        },
-    ));
-    shapes.push((
-        "penalized greedy",
-        Shape {
-            repetition: true,
-            frequency: true,
-            presence: true,
-            ..Shape::GREEDY
         },
     ));
     shapes

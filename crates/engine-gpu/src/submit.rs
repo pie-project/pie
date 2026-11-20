@@ -35,8 +35,30 @@
 //! No margin is chosen here: the bound is the platform's, the estimate and
 //! the worst ratio are measurements. Where no bound is stated nothing is
 //! estimated (the load keeps no [`SubmitBound`]).
+//!
+//! An estimate is read off curves timed on a loaded device; a device left
+//! idle drops its clock (an L40S idles at 210 MHz), and a step admitted
+//! against the loaded clock then runs past its estimate (two such frames
+//! ran 26 and 44 ms against a simulated 25 ms bound). So a frame that
+//! follows an idle device re-times it first ([`Probe`], [`Clock`]): the
+//! smallest shape on the matmul curve ([`PROBE`]) fired alone and timed on
+//! the device, its time over its curve time the scale every estimate is
+//! read at ([`SubmitBound::scale`]) until a later probe. The device is
+//! idle where its queue is empty when the frame's first step goes out
+//! (every submission made on it landed, read without waiting:
+//! `backend::Context::idle`, `Shell::retime`); a frame queued behind work
+//! still running follows no idle and keeps the scale. The probe is
+//! recorded at load where the backend keeps recordings, and counted apart
+//! from the model's fires (`engine::live::Tally::Probed`).
 
 use engine::load::{FireEstimate, RungFacts};
+use kernels_slang::Tensor;
+use poem_ir::Dtype;
+
+use crate::backend::Buffer as _;
+use crate::error::Fault;
+use crate::handles::Handles;
+use crate::serve::Serve;
 
 /// What a step asks of the device, as the estimate weighs it: `rows` new
 /// tokens over `lanes` lanes, the longest lane attending `keys` keys (the
@@ -148,6 +170,174 @@ pub fn frame_submissions(
     Ok(out)
 }
 
+/// The probe a device is re-timed by ([`Probe`]): the smallest shape on the
+/// matmul curve, `rows x width x width` (the curve's narrowest rows at its
+/// narrowest width, `engine::rates::GEMM_ROWS` and `GEMM_WIDTHS`).
+pub const PROBE: (u32, u32, u32) = (
+    engine::rates::GEMM_ROWS[0],
+    engine::rates::GEMM_WIDTHS[0],
+    engine::rates::GEMM_WIDTHS[0],
+);
+
+/// The device's clock as the last probe read it: the probe's time against
+/// its time on the curve the estimates are read from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Clock {
+    /// The probe's time on the curve, ns: what a probe at the clock the
+    /// curve was timed at takes.
+    pub curve_ns: f64,
+    /// The last probe's time over `curve_ns` (1 before any probe).
+    pub ratio: f64,
+}
+
+impl Clock {
+    #[must_use]
+    pub fn new(curve_ns: f64) -> Clock {
+        Clock {
+            curve_ns,
+            ratio: 1.0,
+        }
+    }
+
+    /// A probe took `took_ns`: the ratio from here.
+    pub fn probed(&mut self, took_ns: f64) {
+        if self.curve_ns > 0.0 && took_ns > 0.0 {
+            self.ratio = took_ns / self.curve_ns;
+        }
+    }
+
+    /// The scale a serving estimate is read at: the ratio, never below 1
+    /// (a step is never read faster than its curve measured).
+    #[must_use]
+    pub fn scale(&self) -> f64 {
+        self.ratio.max(1.0)
+    }
+
+    /// The next probe's estimate, ns: its curve time at the last ratio.
+    #[must_use]
+    pub fn probe_ns(&self) -> f64 {
+        self.curve_ns * self.ratio
+    }
+}
+
+/// The probe's matmul ([`PROBE`]) laid on the device with its own operands
+/// (`engine::rates::operand_pattern`, as the curve's were), bindings and
+/// pipelines: fired alone in a spanned frame, timed by the device's
+/// timestamps where it writes them, else by the host's clock around its
+/// submit and wait (longer than the device's: the scale only rises by it).
+pub struct Probe<B: Serve> {
+    handles: Handles<B>,
+    pipelines: B::Pipelines,
+    _held: Vec<B::Buffer>,
+    act: Tensor,
+    weight: Tensor,
+    out: Tensor,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    /// A device slowed by this factor, for a test: each fire runs the
+    /// matmul this many times (1 serving).
+    slowed: u32,
+    /// Its work as the backend holds it: recorded at load where the backend
+    /// keeps recordings ([`Serve::record_probe`]).
+    probed: B::Probed,
+}
+
+impl<B: Serve> Probe<B> {
+    /// The probe laid on `device` under `tactic` (the curve's at its rows):
+    /// its operands, its work recorded where the backend keeps recordings,
+    /// and fired once.
+    pub fn new(
+        device: &B::Context,
+        tactic: kernels_slang::linear::gemm::Tactic,
+    ) -> crate::error::Result<Self> {
+        let (m, n, k) = PROBE;
+        let handles = Handles::<B>::new();
+        let mut held = Vec::new();
+        let pattern = engine::rates::operand_pattern();
+        let mut lay = |rows: u32, width: u32, fill: bool| -> crate::error::Result<Tensor> {
+            let bytes = u64::from(rows) * u64::from(width) * 2;
+            let mut buf = B::Buffer::zeroed(device, bytes, crate::books::owners::TUNING)?;
+            let mut at = 0u64;
+            while fill && at < bytes {
+                let len = (pattern.len() as u64).min(bytes - at);
+                buf.write(at, &pattern[..len as usize])?;
+                at += len;
+            }
+            let handle = handles.bind(&buf, 0, buf.bytes())?;
+            held.push(buf);
+            Ok(Tensor::new(handle, rows, width, Dtype::Bf16))
+        };
+        let act = lay(m, k, true)?;
+        let weight = lay(n, k, true)?;
+        let out = lay(m, n, false)?;
+        let pipelines = B::Pipelines::default();
+        let probed = B::record_probe(device, &|frame| {
+            Self::encode(device, frame, &pipelines, &handles, (tactic, act, weight, out), 1)
+        })?;
+        let probe = Probe {
+            handles,
+            pipelines,
+            _held: held,
+            act,
+            weight,
+            out,
+            tactic,
+            slowed: 1,
+            probed,
+        };
+        // Fired once untimed: its operands touched, so no probe's time
+        // holds that.
+        probe.fire(device)?;
+        Ok(probe)
+    }
+
+    /// The probe's matmul, `times` over, into `frame`.
+    fn encode(
+        device: &B::Context,
+        frame: &B::Frame,
+        pipelines: &B::Pipelines,
+        handles: &Handles<B>,
+        (tactic, act, weight, out): (kernels_slang::linear::gemm::Tactic, Tensor, Tensor, Tensor),
+        times: u32,
+    ) -> crate::error::Result<()> {
+        let sink = B::sink(device, frame, pipelines, handles);
+        for _ in 0..times.max(1) {
+            kernels_slang::linear::gemm::matmul(&sink, tactic, act, weight, out).map_err(|e| {
+                Fault::Device {
+                    call: "submit bound: probe",
+                    why: e.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The probe fired alone, ns: the device's span where it writes
+    /// timestamps, else the host's clock around the submit and the wait. A
+    /// backend that keeps recordings replays the one laid at load.
+    pub fn fire(&self, device: &B::Context) -> crate::error::Result<f64> {
+        let started = std::time::Instant::now();
+        let work = (self.tactic, self.act, self.weight, self.out);
+        let span = B::replay_probe(device, &self.probed, &|frame| {
+            Self::encode(device, frame, &self.pipelines, &self.handles, work, self.slowed)
+        })?;
+        let host = started.elapsed().as_nanos() as f64;
+        Ok(span.map_or(host, |ns| ns as f64).max(1.0))
+    }
+
+    /// For a test: the device slowed by `factor` from here (each probe runs
+    /// its matmul `factor` times), its work recorded again.
+    #[doc(hidden)]
+    pub fn slow(&mut self, device: &B::Context, factor: u32) -> crate::error::Result<()> {
+        self.slowed = factor.max(1);
+        let work = (self.tactic, self.act, self.weight, self.out);
+        let (pipelines, handles, slowed) = (&self.pipelines, &self.handles, self.slowed);
+        self.probed = B::record_probe(device, &|frame| {
+            Self::encode(device, frame, pipelines, handles, work, slowed)
+        })?;
+        Ok(())
+    }
+}
+
 /// A load's hold on its serving steps under a stated submit bound.
 #[derive(Debug, Clone)]
 pub struct SubmitBound {
@@ -169,6 +359,9 @@ pub struct SubmitBound {
     /// The attention of a prompt step's rows against a longer prefix, flops
     /// a ns: `(rows, [(keys, rate)])` (`[rates] attn_tflops_by_rows_keys`).
     pub prefixed: Vec<(u32, Vec<(u32, f64)>)>,
+    /// The scale every estimate is read at: the last probe's
+    /// ([`Clock::scale`]), 1 before any.
+    pub scale: f64,
 }
 
 /// `curve` (ascending in keys) at `keys`: linear in `log keys` between its
@@ -212,7 +405,8 @@ pub fn rate_at(by_rows: &[(u32, Vec<(u32, f64)>)], rows: u32, keys: u32) -> Opti
 }
 
 impl SubmitBound {
-    /// The estimate of `step` at the worst ratio, ns: `(whole, per layer)`,
+    /// The estimate of `step` at the worst ratio and the clock's scale, ns:
+    /// `(whole, per layer)`,
     /// a layer's submission its share of the dispatches but the readout's,
     /// the last carrying the readout too.
     #[must_use]
@@ -250,7 +444,7 @@ impl SubmitBound {
         }
         let head = terms.readout.max(terms.head_read) + self.estimate.rates.launch_ns;
         let per_layer = (whole - head).max(0.0) / f64::from(self.layers.max(1)) + head;
-        let worst = self.worst.max(1.0);
+        let worst = self.worst.max(1.0) * self.scale.max(1.0);
         (whole * worst, per_layer * worst)
     }
 
@@ -317,8 +511,8 @@ impl SubmitBound {
         format!(
             "a step of {} rows over {} lanes at {} keys is estimated at {:.0} ms whole and {:.0} \
              ms a layer at a time ({} layers, at the worst ratio {:.3} of a frame's time to its \
-             estimate the rates step measured, `[rates] submit_worst_ratio`), past the platform's \
-             stated bound of {:.0} ms on \
+             estimate the rates step measured, `[rates] submit_worst_ratio`, and the clock's \
+             scale {:.3} its last probe read), past the platform's stated bound of {:.0} ms on \
              one GPU submission (engine_gpu::rates::stated_submit_bound); the widest prefill \
              rung this load lays is {} rows",
             step.rows,
@@ -328,6 +522,7 @@ impl SubmitBound {
             per / 1e6,
             self.layers,
             self.worst,
+            self.scale,
             self.bound_ns / 1e6,
             self.rungs.last().copied().unwrap_or(0),
         )
@@ -396,6 +591,7 @@ mod tests {
             fire_lanes: 64,
             rungs: vec![64, 128, 256, 512],
             prefixed: Vec::new(),
+            scale: 1.0,
         }
     }
 
@@ -516,6 +712,46 @@ mod tests {
             frame_submissions(&[shaped(&b, step)], b.layers, BOUND).map_err(|(at, _)| at),
             Err(0)
         );
+    }
+
+    /// A probe after the device idled scales every step's estimate by its
+    /// time over its curve time, never below 1: a step admitted whole at the
+    /// loaded clock is split (or refused) once the clock dropped, and is
+    /// whole again once a probe reads the clock back.
+    #[test]
+    fn a_probe_after_idle_scales_every_estimate() {
+        let b = bound(1.0);
+        let step = prompt(256, 1024);
+        let (whole, per_layer) = b.step_ns(step);
+        let held = SubmitBound {
+            bound_ns: whole + per_layer,
+            ..b.clone()
+        };
+        assert!(matches!(held.admit(step), Admitted::Whole { .. }));
+        let mut clock = Clock::new(2.0 * MS);
+        assert_eq!(clock.scale(), 1.0);
+        assert_eq!(clock.probe_ns(), 2.0 * MS);
+        // Idle: the probe ran 3x its curve time.
+        clock.probed(6.0 * MS);
+        assert_eq!(clock.scale(), 3.0);
+        assert_eq!(clock.probe_ns(), 6.0 * MS);
+        let dropped = SubmitBound {
+            scale: clock.scale(),
+            ..held.clone()
+        };
+        let (scaled, _) = dropped.step_ns(step);
+        assert!((scaled - 3.0 * whole).abs() < 1e-6 * whole);
+        assert!(!matches!(dropped.admit(step), Admitted::Whole { .. }));
+        assert!(dropped.refusal(step, &dropped.admit(step)).contains("scale 3.000"));
+        // Faster than its curve: read at the curve, never faster.
+        clock.probed(1.0 * MS);
+        assert_eq!(clock.scale(), 1.0);
+        assert_eq!(clock.ratio, 0.5);
+        let back = SubmitBound {
+            scale: clock.scale(),
+            ..held
+        };
+        assert!(matches!(back.admit(step), Admitted::Whole { .. }));
     }
 
     /// Past the keys measured, a falling attention rate keeps falling along

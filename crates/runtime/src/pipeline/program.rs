@@ -11,17 +11,13 @@ use eta_compiler::plan::{CompiledStage, LibraryForms};
 /// The library forms this process plans programs with: every form, less
 /// what an engine it serves states its emitters lack
 /// ([`Backend::library_forms`]), narrowed at boot before any program is
-/// registered ([`serve_backend`]).
+/// registered ([`serve_forms`]).
 static PLAN_FORMS: Mutex<LibraryForms> = Mutex::new(LibraryForms::ALL);
 
-/// Narrows the forms programs are planned with to what `backend` (an
-/// engine's codegen backend) serves; logs once what it plans as generated
-/// regions instead.
-pub fn serve_backend(backend: &str) {
-    let Some(parsed) = Backend::parse(backend) else {
-        return;
-    };
-    let states = parsed.library_forms();
+/// Narrows the forms programs are planned with to what an engine states
+/// its emitters serve (`engine::DeviceFacts::library_forms`, `engine` its
+/// backend's name); logs once what it plans as generated regions instead.
+pub fn serve_forms(engine: &str, states: LibraryForms) {
     let mut forms = PLAN_FORMS.lock().unwrap();
     let narrowed = forms.and(states);
     if narrowed != *forms {
@@ -33,10 +29,10 @@ pub fn serve_backend(backend: &str) {
             generated.push("a bf16 row's lane cut");
         }
         tracing::info!(
-            backend,
+            engine,
             generated = %generated.join("; "),
-            "the {backend} emitters state no library form for these: programs are planned with \
-             them as generated regions"
+            "the {engine} engine's emitters state no library form for these: programs are \
+             planned with them as generated regions"
         );
     }
     *forms = narrowed;
