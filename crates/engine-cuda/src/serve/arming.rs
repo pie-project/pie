@@ -95,6 +95,9 @@ pub(super) struct Arming {
     never_from: u32,
     belted: bool,
     starved: Option<u64>,
+    /// A capture took the bodies past their allowance: it was given back
+    /// and arming stops at its composition, stated eager with the rest.
+    overdrawn: bool,
     peer_stopped: bool,
     unit_margin: u64,
     /// The bodies' allowance is a record's measurement
@@ -1502,6 +1505,7 @@ impl Shell {
             never_from: 0,
             belted: false,
             starved: None,
+            overdrawn: false,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
@@ -1551,7 +1555,8 @@ impl Shell {
         let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
+                || (st.capped
+                    && (st.overdrawn || allowance_spent(spent.census.bytes, self.bodies_mem)))
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -1662,9 +1667,29 @@ impl Shell {
             golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
         }
         if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
+            let now = self.cache.body_stats().census;
+            // The stop above weighs what the bodies took before this
+            // capture, not what it took: the capture that crossed the
+            // allowance is given back, and its composition is the first
+            // stated eager (pushed back for the stop to state), so the
+            // bodies end within what the fit measured for them.
+            if st.capped
+                && !st.group
+                && !st.verify
+                && allowance_spent(now.bytes, self.bodies_mem)
+                && let Some(key) = key.as_ref()
+            {
+                let weight = now.bytes.saturating_sub(weighed_before.bytes) as u64;
+                self.cache.forget_body(key);
+                st.took = st.took.map(|took| took.saturating_sub(weight));
+                st.wanted -= 1;
+                st.tally[at].1 -= 1;
+                st.overdrawn = true;
+                st.targets.push_front((bucket, target, treatment));
+                return Ok(());
+            }
             st.armed += 1;
             st.tally[at].0 += 1;
-            let now = self.cache.body_stats().census;
             if now.bodies > weighed_before.bodies {
                 st.weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
                 st.weighed[at].1 += now.bodies - weighed_before.bodies;
