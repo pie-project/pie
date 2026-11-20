@@ -163,30 +163,6 @@ pub(crate) async fn read_host_kv(engine_id: usize, slots: Vec<u32>) -> Result<Ve
         .await
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) async fn read_host_state(
-    engine_id: usize,
-    slots: Vec<u32>,
-    pages: Vec<u32>,
-) -> Result<Vec<u8>> {
-    scheduler_handle(engine_id)?
-        .host_kv(worker::HostKvOp::ReadState(slots, pages))
-        .await
-}
-
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) async fn write_host_state(
-    engine_id: usize,
-    slots: Vec<u32>,
-    pages: Vec<u32>,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    scheduler_handle(engine_id)?
-        .host_kv(worker::HostKvOp::WriteState(slots, pages, bytes))
-        .await
-        .map(drop)
-}
-
 /// The bytes of host tier slots, shape by shape, in order (CONTRACT-BC 22).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) async fn read_tier_slots(

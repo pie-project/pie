@@ -128,12 +128,12 @@ impl Shell {
         self.accounting
     }
 
-    /// See `Engine::commit_segments`: off a fire's path.
+    /// See `Pool::commit`: off a fire's path.
     pub fn commit_segments(&mut self, segments: u32) -> crate::Result<()> {
         self.pools.commit_segments(segments)
     }
 
-    /// See `Engine::release_segments`. The runtime has waited out every
+    /// See `Pool::release`. The runtime has waited out every
     /// frame that named the segments' chunks; what the stream still holds
     /// (an evacuation's copy out of them) lands first.
     pub fn release_segments(&mut self, segments: u32) -> crate::Result<()> {
@@ -141,7 +141,7 @@ impl Shell {
         self.pools.release_segments(segments)
     }
 
-    /// See `Engine::evacuate`: the copy and the table change are ordered on
+    /// See `Pool::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
         self.pools.evacuate(self.device.stream(), evacuation)
@@ -195,7 +195,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: stream-ordered before the next fire.
+    /// See `WeightCache::set_residency`: stream-ordered before the next fire.
     pub fn weight_residency(
         &mut self,
         residency: &engine::chunk::WeightResidency,
@@ -301,7 +301,7 @@ impl Shell {
         self.pools.row_blocks()
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> crate::Result<engine::chunk::WeightUses> {
         self.pools.weight_uses(self.device.stream())
     }

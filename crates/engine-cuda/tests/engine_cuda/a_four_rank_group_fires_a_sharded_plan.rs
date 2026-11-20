@@ -5,11 +5,11 @@ use std::path::Path;
 
 use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_close, bf};
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
+use engine::{Channels, Engine, Programs};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -265,7 +265,7 @@ fn four_ranks_land_what_one_rank_lands() {
         let backend =
             Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
         let program = group
-            .register_program(&ProgramRegistration {
+            .register(&ProgramRegistration {
                 program_hash: 0x4a4a ^ u64::from(n),
                 emitted_kernels: emit_program(backend, &stages, &bound),
                 emitter_version: backend.emitter_version(),
@@ -280,7 +280,7 @@ fn four_ranks_land_what_one_rank_lands() {
             let id = ChannelId(next_channel);
             next_channel += 1;
             group
-                .register_channel(&ChannelRegistration {
+                .open(&ChannelRegistration {
                     id,
                     shape: vec![n, WIDTH],
                     dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -296,7 +296,7 @@ fn four_ranks_land_what_one_rank_lands() {
         let latent = channel(HostRole::Writer);
         let out = channel(HostRole::Reader);
         let instance = group
-            .bind_instance(&InstanceBinding {
+            .bind(&InstanceBinding {
                 program,
                 channels: vec![latent, out],
                 seeds: Vec::new(),
@@ -315,7 +315,7 @@ fn four_ranks_land_what_one_rank_lands() {
         let bytes: Vec<u8> = inputs[at].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert!(
             group
-                .publish_channel(instance, 0, &bytes)
+                .publish(instance, 0, &bytes)
                 .expect("the cell publishes")
         );
         lanes.push(Lane {
@@ -371,7 +371,7 @@ fn four_ranks_land_what_one_rank_lands() {
     }
     for (at, &instance) in instances.iter().enumerate() {
         let bytes = group
-            .take_channel(instance, 1)
+            .take(instance, 1)
             .expect("the channel reads")
             .expect("the channel holds a cell");
         let got: Vec<f32> = bytes

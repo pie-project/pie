@@ -9,8 +9,8 @@
 //! is never stated here.
 //!
 //! The runtime decides which atoms are resident, a governor tick at a time,
-//! from the use record the engine reports ([`crate::Engine::weight_uses`]),
-//! and tells the engine the whole set ([`crate::Engine::weight_residency`]).
+//! from the use record the engine reports ([`crate::WeightCache::uses`]),
+//! and tells the engine the whole set ([`crate::WeightCache::set_residency`]).
 //! A use of an atom that is not resident is the engine's to serve: it streams
 //! the atom through one of the shape's staging slots and drops it. The
 //! runtime never inserts on a miss.

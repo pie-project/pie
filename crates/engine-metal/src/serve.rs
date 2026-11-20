@@ -1168,12 +1168,12 @@ impl Shell {
         *self.pools.layout()
     }
 
-    /// See `Engine::commit_segments`.
+    /// See `Pool::commit`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
         self.pools.commit_segments(segments)
     }
 
-    /// See `Engine::weight_residency`: every frame drains, blocks newly
+    /// See `WeightCache::set_residency`: every frame drains, blocks newly
     /// named a slot land in it, and every address table is rewritten
     /// before the next fire. A held set naming every atom gives back the
     /// tables' own copies (`store::streamed`).
@@ -1256,7 +1256,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`: each atom's reads since the last call.
+    /// See `WeightCache::uses`: each atom's reads since the last call.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         // No drain: the counters only grow, and a read takes what landed so
         // far (a fire still in flight counts toward the next read). The
@@ -1283,7 +1283,7 @@ impl Shell {
             .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
     }
 
-    /// See `Engine::release_segments`: every frame drains first.
+    /// See `Pool::release`: every frame drains first.
     #[allow(unsafe_code)]
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
         self.drain()?;
@@ -1292,7 +1292,7 @@ impl Shell {
         unsafe { self.pools.release_segments(segments) }
     }
 
-    /// See `Engine::evacuate`: the moved chunks' bytes land, and the chunk
+    /// See `Pool::evacuate`: the moved chunks' bytes land, and the chunk
     /// table changes, before any later fire is encoded.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
         if evacuation.moves.is_empty() {
@@ -1324,7 +1324,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`.
+    /// See `Tiers::copy`.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
             return Ok(());
@@ -1336,7 +1336,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::read`: every frame and copy lands first.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -1345,7 +1345,7 @@ impl Shell {
         self.pools.read_tier_slots(slots)
     }
 
-    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::write`: every frame and copy lands first.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],

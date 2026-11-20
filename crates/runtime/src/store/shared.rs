@@ -32,7 +32,7 @@
 //! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
 //! raising the rung first moves state out of the new activation span
 //! ([`RungWalk`], [`SharedPool::plan_raise`]), the engine copying it by
-//! [`::engine::Engine::evacuate`] before the next fire
+//! [`::engine::Pool::evacuate`] before the next fire
 //! ([`SharedPool::apply_rung`] once it has). The top
 //! `act_chunks_max` span is committed from the load and counts as held from
 //! then on. Segments commit as a prefix (`commit_segments(n)`) ahead of need,
@@ -1189,7 +1189,7 @@ impl SharedPool {
         self.pool.plan_rung(rung).map_err(RungError::Pool)
     }
 
-    /// `evacuation`'s moves as the engine takes them (`Engine::evacuate`).
+    /// `evacuation`'s moves as the engine takes them (`Pool::evacuate`).
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)

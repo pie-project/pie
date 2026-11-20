@@ -42,7 +42,7 @@ pub(crate) fn load_model_engines(
     home: &Path,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
-    let (engine_groups, metadata) = {
+    let (mut engine_groups, metadata) = {
         let m = &user_cfg.model;
         let e = &user_cfg.engine;
         let flavor = crate::backend::flavor::resolve(e.kind, &m.name)?;
@@ -179,8 +179,9 @@ pub(crate) fn load_model_engines(
         .context("no engine capabilities available for control-plane registration")?;
     let kv_handle = engine_groups
         .groups
-        .first()
-        .and_then(|group| group.backend.export_kv_handle());
+        .first_mut()
+        .and_then(|group| group.backend.peers())
+        .and_then(|peers| peers.export());
     Ok(LoadedModelEngines {
         metadata,
         model: user_cfg.model.name.clone(),

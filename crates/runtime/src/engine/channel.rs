@@ -284,7 +284,11 @@ impl ChannelJoin {
                         cell_bytes,
                     )
                 };
-                if !engine.publish_channel(instance, dense as u32, cell)? {
+                let kind = engine.kind();
+                let Some(channels) = engine.channels() else {
+                    return Err(engine::Error::unsupported(kind, "publish_channel"));
+                };
+                if !channels.publish(instance, dense as u32, cell)? {
                     break;
                 }
                 head += 1;
@@ -338,7 +342,11 @@ impl ChannelJoin {
             let mut tail = load_word(binding.word_base, binding.tail_word_index);
             let mut moved = false;
             while tail.saturating_sub(head) < u64::from(binding.capacity) {
-                let Some(bytes) = engine.take_channel(instance, dense as u32)? else {
+                let kind = engine.kind();
+                let Some(channels) = engine.channels() else {
+                    return Err(engine::Error::unsupported(kind, "take_channel"));
+                };
+                let Some(bytes) = channels.take(instance, dense as u32)? else {
                     break;
                 };
                 if bytes.len() != cell_bytes {
