@@ -35,11 +35,26 @@ fn rows_of(words: i64) -> i64 {
 }
 
 /// Where a group's results lie past its state: each beam's resolved entries
-/// (`[lanes, cap]` grains), its write page (`[lanes]` grain) and its fault
-/// (`[lanes]`), from the first row past the state's.
+/// (`[lanes, cap]` grains) and write page (`[lanes]` grain) for the fire
+/// next in stream order, then its faults (`[frames + 1, lanes]`): one set a
+/// fire in flight, fire `t`'s at `t mod (frames + 1)`, since the next fire's
+/// head may run before this fire's settle reads them (§7).
 #[must_use]
 pub fn results_words(layout: Layout) -> i64 {
-    layout.lanes * layout.cap + 2 * layout.lanes
+    layout.lanes * layout.cap + layout.lanes + fault_sets(layout) * layout.lanes
+}
+
+/// The fault sets a group keeps: one a fire in flight and the one landing.
+#[must_use]
+pub fn fault_sets(layout: Layout) -> i64 {
+    layout.frames.max(1) + 1
+}
+
+/// Where fire `t`'s faults lie among a group's results (words).
+#[must_use]
+pub fn faults_at(layout: Layout, fire: u64) -> i64 {
+    let set = (fire % fault_sets(layout) as u64) as i64;
+    layout.lanes * layout.cap + layout.lanes + set * layout.lanes
 }
 
 /// The rows a group's `Instance` run holds: its state's, then its results'.
@@ -50,7 +65,12 @@ pub fn run_rows(layout: Layout) -> i64 {
 
 impl Pools {
     /// Lays (compiles) the head program of width rung `layout`.
-    pub fn lay_beam_head(&mut self, device: &Device, handles: &Handles, layout: Layout) -> Result<()> {
+    pub fn lay_beam_head(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        layout: Layout,
+    ) -> Result<()> {
         let blank = Head {
             state_row: 0,
             parents_row: 0,
@@ -232,10 +252,25 @@ impl Pools {
                     cx.put_rows(whole, at, v, Combine::Set)
                 };
                 let whole = land(cx, whole, step.state, state_row, state_rows)?;
-                let entries = cx.reshape(entries, &[b_n * cap])?;
-                let results = cx.concat(&[entries, write, step.faults], 0)?;
                 let rows = cx.const_i(Elem::I32, state_rows, &[]);
                 let out_row = cx.add(state_row, rows)?;
+                // the fault sets of fires still in flight stay as they are
+                let r_rows = rows_at(cx, out_row, result_rows)?;
+                let kept = cx.take_rows(whole, r_rows)?;
+                let kept = cx.bitcast(kept, Elem::I32)?;
+                let kept = cx.reshape(kept, &[result_rows * ROW_WORDS])?;
+                let sets = fault_sets(layout) * b_n;
+                let first = b_n * cap + b_n;
+                let fault_words = cx.slice_axis(kept, 0, first, first + sets)?;
+                let fired = cx.slice_axis(state, 0, 0, 1)?;
+                let fired = cx.reshape(fired, &[])?;
+                let n_sets = cx.const_i(Elem::I32, fault_sets(layout), &[]);
+                let set = cx.rem(fired, n_sets)?;
+                let width = cx.const_i(Elem::I32, b_n, &[]);
+                let set_at = cx.mul(set, width)?;
+                let fault_words = cx.dynamic_update_slice(fault_words, step.faults, &[set_at])?;
+                let entries = cx.reshape(entries, &[b_n * cap])?;
+                let results = cx.concat(&[entries, write, fault_words], 0)?;
                 let whole = land(cx, whole, results, out_row, result_rows)?;
                 cx.write(root, whole)
             })?;

@@ -30,13 +30,27 @@ pub fn group_of(package: &LaunchPackage) -> Option<Group> {
     })
 }
 
-/// The group's state layout on this load: its pool holds its beams' pages
-/// (each at most a sequence's, `pages_per_slot`), the pages one fire hands
-/// out, those pending over the frames in flight and the prompt's own page
-/// (§3, as engine-cuda lays it).
+/// The width rung a group of `lanes` beams runs on: the smallest power of
+/// two that holds it (the head program is laid once a rung at load, the
+/// rung's beams past the group's own dead).
+#[must_use]
+pub fn rung(lanes: u32) -> u32 {
+    lanes.max(1).next_power_of_two()
+}
+
+/// The group's state layout on this load, at its width rung: its pool holds
+/// its beams' pages (each at most a sequence's, `pages_per_slot`), the pages
+/// one fire hands out, those pending over the frames in flight and the
+/// prompt's own page (§3, as engine-cuda lays it).
 #[must_use]
 pub fn layout(group: Group, page_size: u32, pages_per_slot: u32, frames: u32) -> Layout {
-    let lanes = i64::from(group.lanes);
+    rung_layout(rung(group.lanes), page_size, pages_per_slot, frames)
+}
+
+/// The state layout of width rung `rung` on this load.
+#[must_use]
+pub fn rung_layout(rung: u32, page_size: u32, pages_per_slot: u32, frames: u32) -> Layout {
+    let lanes = i64::from(rung);
     let frames = i64::from(frames.max(1));
     Layout {
         lanes,
@@ -46,11 +60,13 @@ pub fn layout(group: Group, page_size: u32, pages_per_slot: u32, frames: u32) ->
     }
 }
 
-/// The state's bytes in the pool's `Instance` slots: its i32 words, whole
-/// slots of `slot_bytes`.
+/// The group's `Instance` run: its state's rows and its results' (each
+/// beam's resolved entries, write page and fault sets,
+/// [`crate::store::beam::results_words`]), whole slots of `slot_bytes`.
 #[must_use]
 pub fn state_slots(layout: Layout, slot_bytes: u64) -> (u64, u32) {
-    let bytes = u64::try_from(layout.words()).unwrap_or(u64::MAX) * 4;
+    let rows = u64::try_from(crate::store::beam::run_rows(layout)).unwrap_or(u64::MAX);
+    let bytes = rows * crate::store::layout::ROW_BYTES;
     let slots = bytes.div_ceil(slot_bytes.max(1));
     (slots * slot_bytes, u32::try_from(slots).unwrap_or(u32::MAX))
 }
