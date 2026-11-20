@@ -3,7 +3,7 @@
 //! (`engine::Engine::prewarm_programs`). The stage bodies are the SDK's own
 //! ([`eta_dsl::sampler`], which the built-in inferlets' generation loop
 //! runs as `inferlet::sampler`), traced for each of
-//! [`eta_dsl::sampler::STANDARD`]'s shapes over the channels and ports that
+//! [`eta_dsl::sampler::standard`]'s shapes over the channels and ports that
 //! loop binds: the prompt's last fire and the decode fire. An engine keys a
 //! program's regions by their text, which a request's knob values do not
 //! change, so a request of one of these shapes builds nothing.
@@ -197,7 +197,7 @@ pub fn traces(
     capacity: u32,
 ) -> Result<Vec<(String, Traced)>, String> {
     let mut all = Vec::new();
-    for (name, shape) in &sampler::STANDARD {
+    for (name, shape) in &sampler::standard() {
         let [prefill, decode] = passes(vocab, page_size, outputs, capacity, shape, &PREWARM)
             .map_err(|error| format!("the standard sampler `{name}`: {error}"))?;
         all.push((format!("{name} (prompt)"), prefill));
@@ -328,7 +328,8 @@ mod tests {
     #[test]
     fn a_standard_request_registers_the_regions_the_prewarm_built() {
         let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
-        assert_eq!(prewarmed.len(), 2 * sampler::STANDARD.len());
+        let standard = sampler::standard();
+        assert_eq!(prewarmed.len(), 2 * standard.len());
         let requests = [
             Request {
                 temperature: 0.7,
@@ -345,7 +346,7 @@ mod tests {
                 prompt: 280,
             },
         ];
-        for ((name, shape), built) in sampler::STANDARD.iter().zip(prewarmed.chunks(2)) {
+        for ((name, shape), built) in standard.iter().zip(prewarmed.chunks(2)) {
             for request in &requests {
                 let asked = passes(VOCAB, 16, &outputs(), 8, shape, request).expect("traces");
                 for (pass, (built, asked)) in
