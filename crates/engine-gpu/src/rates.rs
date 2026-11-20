@@ -327,10 +327,11 @@ fn curve_of(
 }
 
 /// The device time a point of a kernel's curve at a shape fills with its
-/// fires' frame (`Rig::budgeted`): enough fires that a submission's own
-/// time is a small part of it, few enough that a curve's points take
-/// milliseconds each.
-const POINT_NS: f64 = 2e6;
+/// fires' frame (`Rig::budgeted`), timed by the device's timestamps where it
+/// has them (the host's wait, to 2.4 ms a frame on wgpu, then out of it):
+/// enough fires that the dispatches' own spread averages out, few enough
+/// that a curve's points take milliseconds each.
+const POINT_NS: f64 = 4e6;
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -691,11 +692,12 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// each frame's one submit.
     /// The current step's fire's ns at a point of a kernel's curve at a
     /// shape (`measure_shapes`): its sets touched once (`touched`, shared by
-    /// every point over them), one warm fire untimed, one fire timed, then
-    /// one frame of as many fires as the step's estimate says fill
-    /// [`POINT_NS`] of the device (as many as fit the bound), the fire's time
-    /// the two frames' difference over the fires between (the device's
-    /// span where the backend times one, else the host's clock).
+    /// every point over them), one warm fire, one fire timed, then one frame
+    /// of as many fires as the step's estimate says fill [`POINT_NS`] of the
+    /// device (as many as fit the bound), each frame timed twice and the
+    /// faster kept (by the device's span where the backend times one), the fire's time the two frames'
+    /// difference over the fires between (the device's span where the
+    /// backend times one, else the host's clock).
     fn budgeted(
         &self,
         timer: Timer<'_, B>,
@@ -717,18 +719,25 @@ impl<'a, B: Serve> Rig<'a, B> {
         )?;
         self.fitting(1)?;
         self.frame(timer, 1, fire, &nothing)?;
-        let (span, host) = self.frame(timer, 1, fire, &nothing)?;
+        // Each frame twice, the faster kept, by the device's span where the
+        // backend times one, else the host's clock (whose wait only ever adds
+        // to a frame's: it ran 0.3 to 2.4 ms on wgpu).
+        let timed = |count: u32| -> Result<u64> {
+            let mut best = u64::MAX;
+            for _ in 0..2 {
+                let (span, host) = self.frame(timer, count, fire, &nothing)?;
+                best = best.min(span.unwrap_or(host));
+            }
+            Ok(best)
+        };
+        let one = timed(1)?;
         let estimate = self.per_fire.get().unwrap_or(POINT_NS).max(1.0);
         let wanted = (POINT_NS / estimate).ceil().clamp(2.0, f64::from(u32::MAX)) as u32;
         let count = self.fitting(wanted)?;
         if count < 2 {
-            return Ok(span.unwrap_or(host).max(1));
+            return Ok(one.max(1));
         }
-        let (many_span, many_host) = self.frame(timer, count, fire, &nothing)?;
-        let (one, many) = match (span, many_span) {
-            (Some(one), Some(many)) => (one, many),
-            _ => (host, many_host),
-        };
+        let many = timed(count)?;
         Ok((many.saturating_sub(one) / u64::from(count - 1)).max(1))
     }
 

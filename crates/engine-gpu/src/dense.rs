@@ -33,6 +33,25 @@ pub struct Dense {
 }
 
 impl Dense {
+    /// The tactic each run of row counts takes, said compactly: `rows-rows
+    /// name` for every run of one tactic, ascending.
+    #[must_use]
+    pub fn runs(&self) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut from = 1;
+        for (i, &(rows, tactic)) in self.by_rows.iter().enumerate() {
+            let last = self
+                .by_rows
+                .get(i + 1)
+                .is_none_or(|&(_, next)| next != tactic);
+            if last {
+                out.push(format!("{from}-{rows} {}", name(&tactic)));
+                from = rows + 1;
+            }
+        }
+        out.join(", ")
+    }
+
     /// The tactic a matmul of `rows` runs: that of the fewest rows stated
     /// that hold them (its rung's, or its own), the most past them all.
     #[must_use]

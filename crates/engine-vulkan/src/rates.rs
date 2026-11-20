@@ -91,7 +91,17 @@ pub fn shapes_at_load(
     top_rows: u32,
 ) -> Result<crate::tuning::Tuning> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
-    let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
+    // Each point timed by the device's timestamps where it has them (the
+    // frame's span): the host's wait swings a frame more than the kernels it
+    // weighs apart.
+    let was = crate::encode::profiling();
+    crate::encode::profile_kernels(true);
+    let timer = |frame: Frame| {
+        let _ = crate::encode::take_longest_frame_span_ns();
+        let host = (frame.commit_timed()? * 1e9) as u64;
+        let span = crate::encode::take_longest_frame_span_ns();
+        Ok(((span > 0).then_some(span), host))
+    };
     let measured = device.chip();
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
@@ -108,8 +118,12 @@ pub fn shapes_at_load(
         save,
         shapes,
         top_rows,
-    )?;
-    Ok(crate::tuning::Tuning::new(chip, device.limits()))
+    );
+    crate::encode::profile_kernels(was);
+    if !was {
+        crate::encode::reset_kernel_profile();
+    }
+    Ok(crate::tuning::Tuning::new(chip?, device.limits()))
 }
 
 /// [`measure`], saying how the warm-up ended.
