@@ -100,6 +100,15 @@ impl ResidencyPlanner {
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
         self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
+        let began = crate::rt::Instant::now();
+        struct Timed<'a>(&'a super::stats::PlannerStats, crate::rt::Instant);
+        impl Drop for Timed<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .pass_took(u64::try_from(self.1.elapsed().as_micros()).unwrap_or(u64::MAX));
+            }
+        }
+        let _timed = Timed(&self.stats, began);
         let cause = self
             .returns
             .wake_cause
@@ -207,6 +216,14 @@ impl ResidencyPlanner {
             .map(|((label, slots), chunks)| format!("{label}:{slots}={chunks}"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Plan passes so far, their total time (us), mean (us) and the power of
+    /// two of microseconds 99 of each 100 fell under: the census the field
+    /// reads a pass's cost by.
+    #[must_use]
+    pub fn pass_census(&self) -> (u64, u64, u64, u64) {
+        self.stats.pass_census()
     }
 
     /// Frames the scheduler holds out under the fire cap (capped: complete,
@@ -428,6 +445,7 @@ impl ResidencyPlanner {
             %plan,
             %blocked,
             capped = %self.capped_line(),
+            passes = ?self.pass_census(),
             swap = ?self.swap_stats(),
             %held_by,
             %store,
@@ -802,6 +820,7 @@ impl ResidencyPlanner {
                         !stood || free_left.is_none_or(|left| self.port.free_chunks() > left)
                     });
                     if !understated && moved && self.port.guest_need_free(&room, state) {
+                        self.plan_stopped("restore sent again: its placement stands");
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
                             if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {

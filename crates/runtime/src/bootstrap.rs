@@ -754,6 +754,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             loop {
                 interval.tick().await;
                 let d = planner.diagnostics();
+                let pass = planner.pass_census();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
                 // Who holds the device pool's slots, whatever the queue.
                 if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
@@ -778,6 +779,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
+                     passes={} pass_ms={} pass_mean_us={} pass_p99_under_us={} \
                      runners=[{}]",
                     d.queue.len(),
                     d.unmet_queued,
@@ -840,6 +842,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.proc_states[2],
                     d.proc_states[3],
                     d.admitted_procs,
+                    pass.0,
+                    pass.1 / 1000,
+                    pass.2,
+                    pass.3,
                     d.runners
                         .iter()
                         .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))

@@ -4,6 +4,11 @@ use std::sync::atomic::AtomicU64;
 pub struct PlannerStats {
     /// Plan passes run (`ResidencyPlanner::plan`).
     pub plan_passes: AtomicU64,
+    /// Their time, in total and by power of two of microseconds (bucket
+    /// `i` holds passes under `2^i` us): a pass's cost, mean and tail, said
+    /// by the planner's census ([`Self::pass_census`]).
+    pub plan_pass_us: AtomicU64,
+    pub plan_pass_buckets: [AtomicU64; 24],
     /// Fires landed: state settled, so a victim whose move found nothing
     /// (its state still settling) may find something now.
     pub fires_landed: AtomicU64,
@@ -65,4 +70,38 @@ pub struct PlannerStats {
     pub h2d_rs_slots: AtomicU64,
     pub d2h_copy_us: AtomicU64,
     pub h2d_copy_us: AtomicU64,
+}
+
+impl PlannerStats {
+    /// Counts a plan pass of `us` microseconds.
+    pub(super) fn pass_took(&self, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.plan_pass_us.fetch_add(us, Relaxed);
+        let bucket = (u64::BITS - us.leading_zeros()) as usize;
+        if let Some(count) = self.plan_pass_buckets.get(bucket.min(self.plan_pass_buckets.len() - 1)) {
+            count.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Passes so far, their total time in microseconds, their mean, and
+    /// the bound under which 99 of each 100 fell (a power of two of
+    /// microseconds).
+    #[must_use]
+    pub fn pass_census(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counts: Vec<u64> = self.plan_pass_buckets.iter().map(|c| c.load(Relaxed)).collect();
+        let passes: u64 = counts.iter().sum();
+        let total = self.plan_pass_us.load(Relaxed);
+        let mean = total.checked_div(passes).unwrap_or(0);
+        let mut seen = 0u64;
+        let mut p99 = 0u64;
+        for (bucket, &count) in counts.iter().enumerate() {
+            seen += count;
+            if passes > 0 && seen * 100 >= passes * 99 {
+                p99 = 1u64 << bucket;
+                break;
+            }
+        }
+        (passes, total, mean, p99)
+    }
 }

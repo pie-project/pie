@@ -8779,3 +8779,58 @@ async fn a_capped_frame_s_raise_waits_through_its_owner_s_eviction_and_is_served
     let taken = raised.await.expect("the wait ends");
     assert_eq!(taken.expect("not refused"), Some("raised"), "served: the frame goes");
 }
+
+/// The planner's census says each pass's cost: passes, their total time,
+/// mean, and the bound 99 of each 100 fell under.
+#[test]
+fn the_census_counts_each_plan_pass_and_its_time() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    for _ in 0..10 {
+        planner.plan();
+    }
+    let (passes, total, mean, p99) = planner.pass_census();
+    assert_eq!(passes, 10);
+    assert_eq!(mean, total / 10);
+    assert!(p99 >= mean, "the tail bound covers the mean: {p99} {mean}");
+    planner.stats.pass_took(5);
+    assert_eq!(planner.pass_census().0, 11);
+}
+
+/// Mac Pro at 2 GiB on 5aa45805b: 151k no-step lines, each with
+/// ended=none and need_moves Some(Some(1)): the pass sent the refused
+/// restore again (its placement stood) and recorded nowhere that it had.
+/// A pass that sends a refused restore again says so.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_that_sends_a_refused_restore_again_says_so() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        proc.roles_short_stood = Some(false);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    // Something in flight, so the restore it sends lands nowhere here.
+    let fire = planner.fire_in_flight(other);
+    planner.plan();
+    let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
+    assert!(plan.contains("restore sent again: its placement stands"), "{plan}");
+    drop(fire);
+}

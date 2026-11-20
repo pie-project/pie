@@ -409,6 +409,18 @@ impl ResidencyPlanner {
     /// More of `pid`'s pages were swapped out since its restore was quoted:
     /// it is queued again, to be quoted anew when served. No failure.
     pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId) {
+        // Queued at what it has off the device, read now: its kv pages and
+        // its state. Queued at nothing, the planner's need and placement
+        // read no state for it until its next serve re-quoted it, stood a
+        // need its serve's state then broke, and sent it again, refused,
+        // round after round (Mac Pro at 2 GiB on 5aa45805b: 151k no-step
+        // lines, the refusal's room 0 free chunks beside 28 runs the
+        // planner read).
+        let (model, engine) = self.port.locus();
+        let demand = Demand {
+            kv_pages: super::holdings::swapped_page_count(pid, model, engine),
+            rs: super::holdings::swapped_rs_units(pid, model, engine),
+        };
         self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
@@ -420,12 +432,7 @@ impl ResidencyPlanner {
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
             }
-            inner.enqueue(
-                pid,
-                WaitKind::Restore {
-                    demand: Demand::default(),
-                },
-            );
+            inner.enqueue(pid, WaitKind::Restore { demand });
         });
         self.poke();
     }
