@@ -49,6 +49,11 @@ pub struct ChunkProfile {
     /// layer's: the rs list then holds them too. Else a Mamba-2 layer
     /// buffers nothing.
     pub rs_mamba2: bool,
+    /// Whether the backend's gated-delta decode reads a layer's buffered
+    /// rows as a linear attention over them (CUDA): the rs list then keeps
+    /// each row's keys and corrected values beside its conv input and
+    /// gates, written once, when the row is a fire's own.
+    pub rs_corrected: bool,
     /// The tokens a slot of the kv list holds, where the backend's kernels
     /// page their rows by a count of their own (and a slot of each window
     /// list too where `one_window` holds; else a window list still picks
@@ -100,6 +105,7 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: false,
         rs_mamba2: true,
+        rs_corrected: true,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -120,6 +126,7 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: true,
         rs_mamba2: false,
+        rs_corrected: false,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -139,6 +146,7 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: false,
         rs_mamba2: false,
+        rs_corrected: false,
         token_slot: None,
         one_window: false,
         full_from: None,

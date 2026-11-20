@@ -1640,9 +1640,21 @@ impl Shell {
             .map(|reads| crate::run::replayed(reads))
             .collect();
         let rs_lands = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        // A decoding lane replays its carried rows in its decode step's own
+        // kernels (`dispatch::ssm`, `kernels_cuda::ssm::Carry`), in the body
+        // that buffers; only a wider lane's replay runs extended (and every
+        // lane's on ROCm, whose decode steps carry none).
+        let rs_extends = composition
+            .lanes()
+            .iter()
+            .zip(&rs_replays)
+            .any(|(row, replay)| {
+                *replay > 0
+                    && (cfg!(feature = "rocm") || !self.decoding.contains(row.class as usize))
+            });
         let rs_body = match self.arm_rs {
             armed if arming && armed.buffers() => armed,
-            _ if rs_replays.iter().any(|replay| *replay > 0) => record::RsBody::Replays,
+            _ if rs_extends => record::RsBody::Replays,
             _ if rs_lands => record::RsBody::Buffers,
             _ => record::RsBody::Folds,
         };
@@ -1669,6 +1681,10 @@ impl Shell {
                     continue;
                 };
                 let replay_off = rs_tokens.len() as u32;
+                let page_off = rs_slots.len();
+                for &page in pages.iter() {
+                    rs_slots.push(buffers.slot(&self.pools, page)?);
+                }
                 for span in &rs_reads[fire_lane] {
                     rs_tokens.extend(span.clone());
                 }
@@ -1676,12 +1692,9 @@ impl Shell {
                     at: *at,
                     replay: rs_replays[fire_lane],
                     replay_off,
-                    page_off: rs_slots.len() as u32,
+                    page_off: page_off as u32,
                     ext: begin,
                 });
-                for &page in pages.iter() {
-                    rs_slots.push(buffers.slot(&self.pools, page)?);
-                }
             }
         }
         // The records as the kernels read them: each row's pieces by the
@@ -2091,8 +2104,9 @@ impl Shell {
         // A buffering fire's recurrences take its commit lengths and its
         // fold predicate whatever its lanes fold, so one body serves every
         // fold; its extended run is the widest bucket's, whatever its rows
-        // and whatever its lanes replay.
-        let rs_rows_ext = if rs_body == record::RsBody::Replays {
+        // and whatever its lanes replay, and its decode steps' carried
+        // scratch lies in it.
+        let rs_rows_ext = if rs_body.buffers() {
             crate::store::rs::Buffers::rows_ext(self.budget.max_tokens)
         } else {
             0

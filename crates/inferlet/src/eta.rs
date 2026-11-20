@@ -1069,6 +1069,10 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
     wit_forward::submit(&on.wit, &borrows)
 }
 
+/// Fires `pass` up to `budget` times, running ahead of `on_token`, whose
+/// `i`-th call reads fire `i`'s output. A break keeps the fires through the
+/// one it read and takes back the rows of those submitted past it
+/// ([`Pipeline::retract`]); the count kept is returned.
 pub async fn run_ahead(
     on: &Pipeline,
     pass: &ForwardPass,
@@ -1122,7 +1126,13 @@ pub async fn run_ahead(
             if !ended {
                 on.close();
             }
-            return Ok(consumed + 1);
+            // The fire whose output broke the loop read a token the program
+            // took, so its rows stay; those submitted past it are taken back.
+            let kept = consumed + 1;
+            if submitted > kept {
+                on.retract(u32::try_from(submitted - kept).unwrap_or(u32::MAX))?;
+            }
+            return Ok(kept);
         }
         consumed += 1;
         if submitted < budget && submitted - consumed <= (window_frames - 1) * r {
@@ -1152,6 +1162,13 @@ impl Pipeline {
 
     pub fn close(&self) {
         self.wit.close();
+    }
+
+    /// Take back what the last `fires` fires submitted on this closed
+    /// pipeline wrote, once every fire on it has landed: the rows a program
+    /// ran ahead past its stop.
+    pub fn retract(&self, fires: u32) -> Result<(), String> {
+        self.wit.retract(fires)
     }
 
     pub fn park(&self) {

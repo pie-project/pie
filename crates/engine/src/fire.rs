@@ -779,6 +779,17 @@ pub fn rung_rows(own: u32, carried: u32) -> u32 {
     own.max(carried)
 }
 
+/// The carried rows a lane of `own` rows counts toward [`rung_rows`]: a
+/// decode lane's (one own row, a one-token class's) none, since its decode
+/// step replays them in the step's own kernels, a lane's buffered rows a
+/// kernel input and no rows of the fire (at most the run-ahead window of
+/// them, which the set's reservation holds); a wider lane's all of them,
+/// which it replays through the rung's replay scratch.
+#[must_use]
+pub fn lane_carried(own: u32, carried: u32) -> u32 {
+    if own == 1 { 0 } else { carried }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {
     Host(u32),

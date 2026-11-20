@@ -17,15 +17,68 @@ mod kda;
 mod kda_chunk;
 mod mamba2;
 
-pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};
+pub use conv1d::{
+    causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv, short_conv_carried,
+    short_conv_chunked,
+};
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::gated_delta;
-pub use kda::{kda, kda_chunked};
-pub use mamba2::{Mamba2, mamba2, mamba2_chunked};
+pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_tail};
+pub use kda::{kda, kda_carried, kda_chunked};
+pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked};
 
 const BLOCK: u32 = 256;
+
+/// A decode step's carried rows (`ssm/carry.cuh`'s `Carry`), passed by
+/// value: the staged rs tables a lane's buffered rows are read through
+/// (`runtime::channel::RsTables`), each lane's commit length over its run
+/// (carried rows, then its own), where the op's buffered planes lie in a
+/// page's slot, and the carried scratch the conv lands its carried rows'
+/// outputs in for the recurrence to read (row `RsLane::ext + j`, the lane's
+/// `j`-th carried row). [`Carry::NONE`]: no lane carries a row, lands one,
+/// or commits short of its own.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Carry {
+    pub lanes: u64,
+    pub pages: u64,
+    pub replay_tok: u64,
+    pub commit_len: u64,
+    pub scratch: u64,
+    pub plane_off: [u64; 3],
+    pub plane_stride: [u64; 3],
+    pub page_tokens: u32,
+    pub pad: u32,
+}
+
+const _: () = assert!(size_of::<Carry>() == 96);
+
+impl Carry {
+    pub const NONE: Carry = Carry {
+        lanes: 0,
+        pages: 0,
+        replay_tok: 0,
+        commit_len: 0,
+        scratch: 0,
+        plane_off: [0; 3],
+        plane_stride: [0; 3],
+        page_tokens: 1,
+        pad: 0,
+    };
+
+    /// The kernels' argument.
+    #[must_use]
+    pub fn arg(&self) -> ArgValue<'_> {
+        ArgValue::of(self)
+    }
+
+    /// Whether lanes may carry rows: the fire buffers.
+    #[must_use]
+    pub const fn buffers(&self) -> bool {
+        self.lanes != 0
+    }
+}
 
 const WARP: u32 = 32;
 

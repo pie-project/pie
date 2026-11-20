@@ -68,6 +68,11 @@ pub fn gated_delta(
     )
 }
 
+/// The shared memory a block of the carried step stages a chunk of buffered
+/// rows in, double-buffered with its state: 16 rows of a head's keys (at
+/// most 128 bf16), corrected values (at most 128 f32) and `a` gate word.
+const CARRIED_ROWS_SMEM: u32 = 2 * 16 * (128 * 2 + 128 * 4 + 4);
+
 /// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
 
@@ -197,6 +202,181 @@ impl Delta {
             ],
         )
     }
+}
+
+/// The gate prep a gated-delta step's `gates` come from: its `[b | a]` rows
+/// and its banks, which a carried row's gates are derived from as
+/// `gdn_gates` derives them.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnGated {
+    pub ba: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+}
+
+/// The gated-delta decode step over each lane's buffered rows then its own
+/// ([`Carry`]: planes `[b | a]`, keys, corrected values): the fused step's
+/// tile, loaded once, folds the carried rows the lane commits, reads the
+/// rest as a linear attention for the own row's corrected value and output,
+/// folds the own row where it commits too, and is stored once; the own
+/// row's `[b | a]` and corrected value land in the lane's buffer. The fused
+/// step's shapes only: another is refused by name.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    ctx: &Ctx,
+    qkv: Tensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: &mut Tensor,
+    gated: GdnGated,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta";
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, gated.ba.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, gated.dt_bias.dtype, { Bf16 => () });
+    debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    debug_assert_eq!(gated.a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    seated(OP, state, "gdn_step_carried", true, false, false)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    if !fused_fits(&shape, state, &rows, qkv, y) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a lane's carried rows step in the fused tile only: {k_heads} key heads of \
+                 {k_dim} and {v_heads} value heads of {v_dim} do not lie in it"
+            ),
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let tiles = shape
+        .n
+        .checked_mul(v_heads * (v_dim / FUSED_BV))
+        .ok_or_else(|| refuse(OP, format!("{} rows of value tiles overflow a grid", shape.n)))?;
+    let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
+    // A block's warps share one (lane, head)'s buffered rows: they are a
+    // whole number of the head's value tiles.
+    let head_tiles = v_dim / FUSED_BV;
+    if !head_tiles.is_multiple_of(warps) || v_dim > 128 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a block of {warps} warps stages one head's buffered rows, and a {v_dim}-wide \
+                 head's {head_tiles} value tiles do not split into it"
+            ),
+        ));
+    }
+    let blocks = tiles.div_ceil(warps).min(sms * per_sm);
+    let entrypoint = if warps == FUSED_WARPS_WIDE {
+        "::pie::ssm::gdn_step_carried<8>"
+    } else {
+        "::pie::ssm::gdn_step_carried<4>"
+    };
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, entrypoint)).apply(
+            Launch::grid([blocks, 1, 1], [32 * warps, 1, 1])
+                .smem(fused_smem(warps) + CARRIED_ROWS_SMEM),
+        ),
+        &[
+            qkv.arg(),
+            gates.arg(),
+            gated.ba.arg(),
+            gated.dt_bias.arg(),
+            gated.a_log.arg(),
+            rows.arg(),
+            y.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            stated(OP, shape.conv_dim)?.arg(),
+            q_scale.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, tiles)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The rows a chunked gated-delta fire's lanes land in their buffer past
+/// their commit, made ready for a later decode ([`gated_delta_carried`]):
+/// each row's corrected value and keys into the lane's buffer (planes 2 and
+/// 1; its `[b | a]`, plane 0, the gate prep lands), stepped in order from
+/// the state the fire left. `qkv` and `gates` are the fire's own rows by
+/// `qo_indptr`, or with `ext` its extended rows (row `RsLane::ext + j`).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_tail(
+    ctx: &Ctx,
+    qkv: Tensor,
+    gates: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_chunked";
+    const WARPS: u32 = 4;
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    if !(k_dim.is_multiple_of(16) && k_dim <= FUSED_BK && v_dim.is_multiple_of(FUSED_BV)) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a buffered row's corrected value steps in the fused tile only: key heads of \
+                 {k_dim} and value heads of {v_dim} do not lie in it"
+            ),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    let tiles = v_heads * (v_dim / FUSED_BV);
+    let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_tail_corrected<4>"))
+            .apply(Launch::grid([tiles.div_ceil(WARPS), lanes, 1], [32 * WARPS, 1, 1])),
+        &[
+            qkv.arg(),
+            gates.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            rows.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            stated(OP, conv_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
 #[cfg(test)]

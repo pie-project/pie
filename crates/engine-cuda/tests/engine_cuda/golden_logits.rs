@@ -1758,6 +1758,171 @@ fn golden_buffered_carrying() {
     );
 }
 
+/// Decode steps a lagged lane takes: a fold behind its rows by the lag.
+const LAGGED_STEPS: u32 = 30;
+
+/// A prefill folded as it lands, then [`LAGGED_STEPS`] decodes of a fixed
+/// script, each buffering its row and folding so that `lag` rows stay
+/// unfolded behind it (a run-ahead decode whose rows are folded once they
+/// are accepted): from the lag on, each decode carries `lag` rows into its
+/// step and commits the oldest of them, every seventh step committing them
+/// all and every fifth one none. `lag` 0 folds each row as it lands. Each
+/// step's logits, and the fires of the decodes walked with no body.
+fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u64) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        steps.push(rows.swap_remove(0));
+    };
+    let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+    let mut fed = prompt.len() as u32;
+    let mut folded = fed;
+    step(&mut shell, &prompt, RsVerb::Fold);
+    let before = shell.body_stats().tally;
+    for at in 0..LAGGED_STEPS {
+        let token = (fed * 7 + 11) % 1000;
+        if lag == 0 {
+            step(&mut shell, &[token], RsVerb::Fold);
+            fed += 1;
+            folded += 1;
+            continue;
+        }
+        let end = fed + 1;
+        let base = folded / page * page;
+        let fold = match at {
+            _ if at % 7 == 6 => end - folded,
+            _ if at % 5 == 4 => 0,
+            _ => (end - folded).saturating_sub(lag),
+        };
+        step(
+            &mut shell,
+            &[token],
+            RsVerb::Buffer {
+                pages: (base / page..end.div_ceil(page)).collect(),
+                base,
+                folded,
+                fold: FoldLen::Host(fold),
+                lineage: engine::fire::Lineage::Set,
+            },
+        );
+        fed = end;
+        folded += fold;
+    }
+    let after = shell.body_stats().tally;
+    (steps, after.eager_unbodied - before.eager_unbodied)
+}
+
+/// A lane folding `lag` rows behind its decodes answers, step for step,
+/// what the lane folding each row as it lands answers, to the tolerance of
+/// the two forms of the recurrence: its decode step reads the buffered rows
+/// as a linear attention over their stored keys and corrected values from
+/// the committed state (rounded to bf16 only as a fold stores it), where
+/// the folding lane re-steps and stores the state a row. Its greedy tokens
+/// are the folding lane's but where the two lie within that tolerance.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged(&fixture, &cache, 0);
+    let lags: Vec<u32> = std::env::var("PIE_GOLDEN_LAGS").map_or_else(
+        |_| vec![1, 2, 3, 9],
+        |lags| lags.split(',').map(|lag| lag.parse().expect("a lag")).collect(),
+    );
+    for lag in lags {
+        let (lagged, unbodied) = served_lagged(&fixture, &cache, lag);
+        assert_eq!(lagged.len(), folded.len());
+        let mut worst = 0f32;
+        let mut moved = 0usize;
+        let mut flips = 0usize;
+        for (lagged, folded) in lagged.iter().zip(&folded) {
+            let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+            let apart = lagged
+                .iter()
+                .zip(folded)
+                .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+            worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+            moved += usize::from(lagged != folded);
+            let (a, b) = (argmax(lagged), argmax(folded));
+            if a != b {
+                let mut sorted = folded.clone();
+                sorted.sort_by(|x, y| y.total_cmp(x));
+                let gap = (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE);
+                if gap > 0.02 {
+                    flips += 1;
+                }
+            }
+            if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
+                println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
+            }
+        }
+        println!(
+            "golden {model}-lagged lag {lag}: {} steps, {moved} differ, logits apart by \
+             {worst:e} of their scale, {flips} greedy token(s) flipped off a near tie, \
+             {unbodied} decode(s) walked with no body",
+            lagged.len()
+        );
+        // The two forms round apart: the folding lane's step rounds the
+        // decayed state to bf16 before its update and stores it a row, the
+        // lagged lane's sums in f32 and rounds as a fold stores. On this
+        // miniature they lie 0.012 to 0.023 of their scale apart, the own
+        // row's step alone as much as a lag of eleven (the chunked replay's
+        // band beside the scan's is 0.013 to 0.035, `golden_buffered_carrying`).
+        assert!(
+            worst < 0.05 && flips == 0,
+            "at a lag of {lag} the lagged lane's logits lie {worst:e} of their scale from the \
+             folded lane's, {flips} greedy token(s) flipped"
+        );
+        assert_eq!(unbodied, 0, "a lagged decode walked with no body");
+    }
+}
+
 /// Two lanes of two seats that buffer their rows past the state in one fire
 /// a step: a 12-row prefill each folded as it lands, then decodes folded
 /// late (none, two, or all a step), the lanes out of step with each other.

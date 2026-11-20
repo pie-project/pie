@@ -1777,6 +1777,11 @@ impl KvStore {
             self.stamp_path(terminal, epoch);
         }
         if self.keeps {
+            // What its decodes folded seals as it goes, unless a prompt
+            // sealed it already.
+            if let Err(error) = self.seal_folded(ws, false) {
+                tracing::debug!(%error, "kv: sealing what a released set's decodes folded");
+            }
             self.keep_sealed_prefix(ws);
         }
         // A hint is for what its owner leaves in the cache: one that left
@@ -1923,9 +1928,22 @@ impl KvStore {
     }
 
     /// `decoded` when a decode wrote them, which the cache lets go before a
-    /// prompt.
+    /// prompt. What a decode folds is frozen and not sealed: a decode runs
+    /// ahead of the program that reads its tokens, which may take back the
+    /// rows past where it stops ([`Self::truncate`]). Its rows seal with the
+    /// next prompt the set folds, or as the set is released.
     pub fn fold(&mut self, ws: WorkingSetId, to: u64, decoded: bool) -> Result<u64, KvStoreError> {
-        let folded = self.table.freeze(ws, to)?;
+        self.table.freeze(ws, to)?;
+        if decoded {
+            return Ok(0);
+        }
+        self.seal_folded(ws, true)
+    }
+
+    /// Seals the whole pages `ws` has folded and logged; `prompt` when they
+    /// reach its prompt.
+    fn seal_folded(&mut self, ws: WorkingSetId, prompt: bool) -> Result<u64, KvStoreError> {
+        let folded = self.table.folded(ws)?;
         let page = u64::from(self.page_size);
         if page == 0 {
             return Ok(0);
@@ -1946,11 +1964,23 @@ impl KvStore {
         let tokens = logged[start as usize..(full * page) as usize].to_vec();
         let slots = hash::chain_slots(&self.domain, prev, start, &tokens);
         self.seal_rows(ws, start, &slots, self.page_size)?;
-        if !decoded {
+        if prompt {
             self.table.reach_prompt(ws, full)?;
         }
-        tracing::debug!(target: "pie::kv", pages = full - sealed, decoded, "sealed at a fold");
+        tracing::debug!(target: "pie::kv", pages = full - sealed, prompt, "sealed");
         Ok(full - sealed)
+    }
+
+    /// `ws` ends at row `rows` ([`KvPageTable::truncate`]): what a program
+    /// that ran ahead of its stop takes back once its fires have landed.
+    /// Every fire of the set has settled, so what this frees waits on no
+    /// fire in flight.
+    pub fn truncate(&mut self, ws: WorkingSetId, rows: u64) -> Result<(), KvStoreError> {
+        let freed = self.table.truncate(ws, rows, self.page_size)?;
+        let epoch = self.retired_through();
+        self.recycle_backings(freed, epoch);
+        self.refresh_flat(ws);
+        Ok(())
     }
 
     pub fn folded(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {

@@ -61,6 +61,18 @@ struct Input {
     /// turnaround.
     #[serde(default)]
     run_ahead_frames: Option<usize>,
+    /// Decode fires each lane keeps submitted past the last token it took,
+    /// one a frame: a cap on run-ahead counted in fires, not frames (a
+    /// sweep of a hybrid model's cost of a short window). Overrides
+    /// `run_ahead_frames`.
+    #[serde(default)]
+    run_ahead_fires: Option<usize>,
+    /// Rows the working set leaves unfolded behind each lane's last row:
+    /// the prompt folds all but this many and each decode folds one, so
+    /// every decode carries this many buffered rows (a hybrid model's
+    /// replay at a steady lag). 0 folds all it writes.
+    #[serde(default)]
+    fold_lag: u32,
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
@@ -345,6 +357,10 @@ async fn run_one(
     // deeper window (`16` frames) so 256-lane high-concurrency waves do not
     // serialize on host-side frame-seal wakes between fast 2-step GPU batches.
     let (window_fires, out_capacity) = match input.run_ahead_frames {
+        _ if let Some(f) = input.run_ahead_fires => {
+            let w = f.max(1);
+            (w, w + 1 + 7 * live_slots)
+        }
         Some(r) => {
             let w = r.max(1) * live_slots;
             (w, w + 1 + 7 * live_slots)
@@ -362,8 +378,20 @@ async fn run_one(
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    let lag = input.fold_lag.min(u32::try_from(num_prompt_tokens).unwrap_or(0));
+    let prefill_fold = Channel::from([u32::try_from(num_prompt_tokens).unwrap_or(0) - lag]);
+    let decode_fold = Channel::from([1u32]);
+    fn geometry(lag: u32, fold: &Channel) -> StateGeometry<'_> {
+        match lag {
+            0 => StateGeometry::folding(),
+            _ => StateGeometry {
+                fold: Fold::Count(fold),
+                ..StateGeometry::default()
+            },
+        }
+    }
     fwd_p
-        .state(&[&ws], StateGeometry::folding())
+        .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
     let prefill_knobs = SampleKnobs::new(temperature, top_p);
     fwd_p.epilogue(move || {
@@ -384,7 +412,7 @@ async fn run_one(
             let fwd = ForwardPass::new();
             let embed_indptr = Channel::from([0u32, 1u32]);
             fwd.embed(&tok_in, &embed_indptr)?;
-            fwd.state(&[ws_ref], StateGeometry::folding())
+            fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
             let knobs = SampleKnobs::new(temperature, top_p);
             fwd.epilogue(move || {
@@ -427,7 +455,7 @@ async fn run_one(
         && !input.host_first_token
         && fwd_d.is_some()
     {
-        live_slots.saturating_sub(1).min(budget)
+        live_slots.saturating_sub(1).min(budget).min(window_fires)
     } else {
         0
     };
@@ -466,7 +494,7 @@ async fn run_one(
         };
         let mut burst = 0usize;
         while submitted < budget && burst < burst_limit {
-            let s = (budget - submitted).min(live_slots);
+            let s = (budget - submitted).min(live_slots).min(window_fires);
             if submitted - drained + s > window_fires {
                 break;
             }
@@ -572,7 +600,7 @@ async fn run_one(
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.
-        if submitted < budget && submitted - taken + live_slots <= window_fires {
+        if submitted < budget && submitted - taken + live_slots.min(window_fires) <= window_fires {
             submitted = submit_ahead(
                 fwd_d.as_ref().expect("decode pass exists while budget > 0"),
                 submitted,

@@ -1,5 +1,6 @@
 #include "ssm/tile_sm80.cuh"
 #include "prim/state_rows.cuh"
+#include "ssm/carry.cuh"
 
 namespace pie::ssm {
 
@@ -72,6 +73,109 @@ __global__ void __launch_bounds__(256) mamba2_step(
         #pragma unroll
         for (int q = 0; q < ROWS; ++q) __stcs(st + q * 256, s[q]);
     }
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) {
+        acc[q] = ::pie::warp_sum(acc[q]);
+    }
+    if (l < ROWS) {
+        float mine = acc[0];
+        #pragma unroll
+        for (int q = 1; q < ROWS; ++q) mine = l == q ? acc[q] : mine;
+        const long long o = row * inner + h * M2_P + l * 8 + warp;
+        y[o] = __float2bfloat16((mine + D[h] * xl) * silu_f(__bfloat162float(z[o])));
+    }
+}
+
+// `mamba2_step` over a lane's carried rows then its own (`Carry`): the
+// block loads its head's state once, steps each row the lane buffered past
+// its committed state (its convolved `xbc` from the carried scratch, its
+// step size from its rs buffer pages), then its own row, and stores the
+// state as it stands after `commit` rows of the run. The state is f32, so
+// each step is the bits a fold a row gives. Carried rows land no output;
+// the own row's step size lands in its buffer. Lanes index the fire's
+// tables (`win[3]` on).
+__global__ void __launch_bounds__(256) mamba2_step_carried(
+    const bf16* __restrict__ xbc,
+    const bf16* __restrict__ dt,
+    const bf16* __restrict__ z,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ D,
+    StateRows rows,
+    bf16* __restrict__ y,
+    int H, int G,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    constexpr int ROWS = M2_P / 8;
+    const int r = blockIdx.x;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int h = blockIdx.y;
+    const CarryLane cl = carry.lane(rl);
+    if (threadIdx.x == 0) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) dst[h] = dt[row * H + h];
+    }
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int inner = H * M2_P;
+    const int width = inner + 2 * G * M2_N;
+    const int g = h / (H / G);
+    const int warp = threadIdx.x >> 5;
+    const int l = threadIdx.x & 31;
+    float4* st = reinterpret_cast<float4*>(
+        rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N)) + threadIdx.x;
+    float4 s[ROWS];
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) s[q] = __ldcs(st + q * 256);
+    const int n = carry.carried(cl);
+    const int commit = carry.commit(rl, n + 1);
+    const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
+    auto store = [&]() {
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) __stcs(st + q * 256, s[q]);
+    };
+    const u64 row_bytes = static_cast<u64>(width) * sizeof(bf16);
+    for (int j = 0; j < n; ++j) {
+        const bf16* at = carry.scratch_row<bf16>(cl, j, row_bytes);
+        const uint2 braw = *reinterpret_cast<const uint2*>(at + inner + g * M2_N + 4 * l);
+        const float xl = l < ROWS ? __bfloat162float(at[h * M2_P + l * 8 + warp]) : 0.f;
+        const float step =
+            m2_dt(__bfloat162float(carry.carried_row<bf16>(cl, j, 0)[h]), dt_bias[h]);
+        const float decay = __expf(-__expf(A_log[h]) * step);
+        const float2 b01 = gdn_unpack(braw.x), b23 = gdn_unpack(braw.y);
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) {
+            const float dx = step * __shfl_sync(0xffffffffu, xl, q);
+            s[q].x = s[q].x * decay + dx * b01.x;
+            s[q].y = s[q].y * decay + dx * b01.y;
+            s[q].z = s[q].z * decay + dx * b23.x;
+            s[q].w = s[q].w * decay + dx * b23.y;
+        }
+        if (fold && j + 1 == commit) store();
+    }
+    const bf16* at = xbc + row * width;
+    const uint2 braw = *reinterpret_cast<const uint2*>(at + inner + g * M2_N + 4 * l);
+    const uint2 craw = *reinterpret_cast<const uint2*>(at + inner + (G + g) * M2_N + 4 * l);
+    const float xl = l < ROWS ? __bfloat162float(at[h * M2_P + l * 8 + warp]) : 0.f;
+    const float step = m2_dt(__bfloat162float(dt[row * H + h]), dt_bias[h]);
+    const float decay = __expf(-__expf(A_log[h]) * step);
+    const float2 b01 = gdn_unpack(braw.x), b23 = gdn_unpack(braw.y);
+    const float2 c01 = gdn_unpack(craw.x), c23 = gdn_unpack(craw.y);
+    float acc[ROWS];
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) {
+        const float dx = step * __shfl_sync(0xffffffffu, xl, q);
+        s[q].x = s[q].x * decay + dx * b01.x;
+        s[q].y = s[q].y * decay + dx * b01.y;
+        s[q].z = s[q].z * decay + dx * b23.x;
+        s[q].w = s[q].w * decay + dx * b23.y;
+        acc[q] = s[q].x * c01.x + s[q].y * c01.y + s[q].z * c23.x + s[q].w * c23.y;
+    }
+    if (fold && commit == n + 1) store();
     #pragma unroll
     for (int q = 0; q < ROWS; ++q) {
         acc[q] = ::pie::warp_sum(acc[q]);
