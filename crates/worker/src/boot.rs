@@ -42,6 +42,8 @@ pub(crate) fn load_model_engines(
     home: &Path,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
+    #[cfg(feature = "net")]
+    engine::memory::on_return_freed_heap(crate::return_freed_heap);
     let (engine_groups, metadata) = {
         let m = &user_cfg.model;
         let e = &user_cfg.engine;
