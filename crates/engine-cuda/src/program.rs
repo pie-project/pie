@@ -673,8 +673,11 @@ impl Plane {
         // owner and taken again at the same refs, are another taking: kept
         // as they stood, every fire of the pair ran on that owner's words.
         // The same live slots bound again are not.
-        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
-            .next_multiple_of(launch::SPAN_ALIGN);
+        let scratch_piece = piece_at(&slots.scratch, room.instance_bytes(), span)?;
+        let scratch = scratch_piece.next_multiple_of(launch::SPAN_ALIGN);
+        // A new taking of the pair's slots is another owner's bytes until
+        // cleared, as the instance's own scratch always is at a bind.
+        let mut clears = vec![(&slots.scratch, scratch_piece, room.instance_bytes())];
         if batch.bound == 0
             || batch.pair != slots.pair
             || batch.generation != slots.pair_generation
@@ -684,7 +687,9 @@ impl Plane {
             batch.generation = slots.pair_generation;
             batch.base = base;
             batch.stale = true;
+            clears.push((&slots.pair, base, batch.room.bytes()));
         }
+        clear_state(&clears, stream)?;
         let program = &*program;
         let held = program.held(self.score_bytes);
         let place = slots.place(&held, span)?;
@@ -768,7 +773,13 @@ impl Plane {
 
     /// Instance `id`'s items lie in `slots` now, where the runtime copied
     /// them (`Engine::rebind_slots`).
-    pub fn rebind(&mut self, id: InstanceId, slots: Slots, span: Span<'_>) -> Result<()> {
+    pub fn rebind(
+        &mut self,
+        id: InstanceId,
+        slots: Slots,
+        span: Span<'_>,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -785,12 +796,21 @@ impl Plane {
         let extents = bound.session.extents();
         let program_id = bound.program_id;
         let room = program.bound_room(extents)?;
-        let scratch = piece_at(&slots.scratch, room.instance_bytes(), span)?
-            .next_multiple_of(launch::SPAN_ALIGN);
+        let scratch_piece = piece_at(&slots.scratch, room.instance_bytes(), span)?;
+        let scratch = scratch_piece.next_multiple_of(launch::SPAN_ALIGN);
         // The pair's state where the rebind names it: fresh room, whether
         // or not where it lay before, since what another item wrote there
         // meanwhile is staged over.
         let pair_base = piece_at(&slots.pair, room.bytes(), span)?;
+        // Both are fresh room, another owner's bytes until cleared: on the
+        // stream, behind the fires before and ahead of every one after.
+        clear_state(
+            &[
+                (&slots.scratch, scratch_piece, room.instance_bytes()),
+                (&slots.pair, pair_base, room.bytes()),
+            ],
+            stream,
+        )?;
         // The rings move ring by ring: one refused partway leaves the
         // instance between its old slots and its new, and it is failed by
         // name, never fired so.
@@ -1111,6 +1131,11 @@ impl Plane {
             });
         }
         wave.fly(context, wave_base)?;
+        for (_, _, id) in staged.iter() {
+            if let Some(bound) = instances.get_mut(id) {
+                bound.session.fly_in(wave);
+            }
+        }
         let streams = fan.fork(&meet, main)?;
         let flown = groups.into_iter().zip(streams).zip(places).try_for_each(
             |(((program_id, extents, members), stream), (base, lanes, fresh))| {
@@ -1411,6 +1436,22 @@ pub struct Slots {
 /// piece: a lane's scratch, a pair's tables). Where none is named, the
 /// span is asked for an item of no slots (a plane with no pool lends one;
 /// a pool refuses it by name).
+/// Zeroes each `(place, address, bytes)` of a guest's state on `stream`:
+/// room that changed owner (a bind's scratch, an unpark's fresh room, a
+/// pair's new taking), never per fire. A place of none holds nothing.
+fn clear_state(
+    clears: &[(&engine::ScratchPlace, u64, u64)],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    for &(place, at, bytes) in clears {
+        if *place == engine::ScratchPlace::None {
+            continue;
+        }
+        crate::device::zero_span_on(stream, at, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+    }
+    Ok(())
+}
+
 fn piece_at(place: &engine::ScratchPlace, bytes: u64, span: Span<'_>) -> Result<u64> {
     use engine::ScratchPlace;
     match place {

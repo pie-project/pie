@@ -94,9 +94,7 @@ impl Host for Api {
             let faulted = std::mem::take(&mut step_pending.faulted);
             let fed = step_pending.fed.take();
             defer_attachment(gpu, step, at, &landed, wrote, faulted, fed)?;
-            let shell = gpu.loaded_mut()?;
-            shell.leave_unread(&landed);
-            shell.forget_seat(&landed);
+            gpu.loaded_mut()?.forget_seat(&landed);
             step_pending.rows = Some(Vec::new());
             return Ok((ticket, step_pending));
         }
@@ -195,6 +193,9 @@ impl Host for Api {
                     Ok(count) => count,
                     Err(refused) => break 'pass Some(refused.to_string()),
                 };
+                if let Some(why) = engine_gpu::api::overreach(attachment, lane_count) {
+                    break 'pass Some(why);
+                }
                 for lane_at in 0..lane_count {
                     let lane_index = attachment.lane as usize + lane_at;
                     let Some(lane) = step.lanes.get(lane_index) else {

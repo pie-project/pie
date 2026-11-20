@@ -29,14 +29,11 @@ struct LandedSeat {
     generation: u64,
 }
 
-/// A step in flight: its submission, the token feed it waits behind, and
-/// whether the host reads its rows back.
+/// A step in flight: its submission and the token feed it waits behind.
 pub struct Flight {
     pending: Pending,
 
     _fed: Option<Pending>,
-
-    read: bool,
 }
 
 impl Serve for Api {
@@ -67,6 +64,12 @@ impl Serve for Api {
     /// A pass keeps the cells only the device reads in `Channel` slots
     /// (`guest::session::Kept`).
     const CHANNEL_CELLS: bool = true;
+
+    /// A step's guest passes are submitted behind its forward on the one
+    /// queue before the step returns, so before any later fire, and every
+    /// frame waits for all work submitted before it: they read the rows
+    /// where the forward left them in its span.
+    const READS_SPAN: bool = true;
 
     const TARGET: kernels_slang::Target = kernels_slang::Target::Spirv;
 
@@ -138,6 +141,18 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
+    const BINDS_AT_LOAD: bool = false;
+
+    fn bind_frame(_device: &Context) -> Result<Frame> {
+        Err(engine_gpu::error::Fault::Unbound {
+            what: "a bind walk on Vulkan, which keeps no descriptor set per set of views".into(),
+        })
+    }
+
+    fn bound(_pipelines: &Pipelines) -> u64 {
+        0
+    }
+
     fn walk_frame(device: &Context, keep: bool) -> Result<Frame> {
         if keep {
             device.frame_kept()
@@ -146,7 +161,13 @@ impl Serve for Api {
         }
     }
 
-    fn shelf(_device: &Context, _readout: &[Buffer], weights_stream: bool) -> Result<Shelf> {
+    fn shelf(
+        _device: &Context,
+        _pipelines: &Pipelines,
+        _readout: &[Buffer],
+        weights_stream: bool,
+        _guest: engine_gpu::serve::GuestRoom,
+    ) -> Result<Shelf> {
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
@@ -254,15 +275,11 @@ impl Serve for Api {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        let split_rows = shell
-            .tuning
-            .profile()
-            .get::<crate::chip::SubmitSplitRows>()
-            .0;
-        // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = (split_rows > 0
-            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
-            || prepared.bindings.voxels.is_some();
+        // A step past the platform's bound on one submission walks a layer
+        // at a time by the shell's own admission (`engine_gpu::submit`);
+        // whole, a 512x512 VAE decode outlasts one Adreno submission and
+        // loses the device, and nothing estimates it.
+        let split = prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
         Ok(Plan::Walk { keep, split })
     }
@@ -315,11 +332,7 @@ impl Serve for Api {
     }
 
     fn fly(pending: Pending, fed: Option<Pending>) -> Flight {
-        Flight {
-            pending,
-            _fed: fed,
-            read: true,
-        }
+        Flight { pending, _fed: fed }
     }
 
     fn reap(shell: &mut Shell<Api>) -> Result<()> {
@@ -353,14 +366,10 @@ impl Serve for Api {
                 other => other,
             });
         }
-        if !flight.api.read {
-            shell.arms.give(flight.arm);
-            return Ok(());
-        }
         let end = flight
             .rows
             .iter()
-            .filter(|span| span.host)
+            .filter(|span| span.hosted)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
@@ -419,6 +428,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 
     for lane in p.lanes {
         key.shown(&lane.readout);
+        key.shown(&lane.hosts);
         key.shown(&lane.reads);
         // A score room is its pair's place in the pool, which an unpark
         // or an evacuation moves: a recording binds the one it was taken at.
@@ -439,9 +449,6 @@ pub trait Seats {
     fn readout_seats(&self, landed: &Landed, lane: u32) -> Option<Vec<ReadSeat<'_>>>;
 
     fn forget_seat(&mut self, landed: &Landed);
-
-    /// Lets the host leave a step's rows unread: the device read them.
-    fn leave_unread(&mut self, landed: &Landed);
 }
 
 impl Seats for Shell<Api> {
@@ -457,16 +464,27 @@ impl Seats for Shell<Api> {
             }
         };
         let seat = self.readout.get(arm)?;
+        // A spanned read's rows lie in the fire's span: read only while no
+        // later fire was submitted to carve over them.
+        let span = self.span_buffer().ok()?;
+        let last = landed.seq + 1 == self.airborne.entered();
+        let reads: Vec<&ReadSpan> = (rows.iter())
+            .filter(|read| read.lane == lane && read.rows > 0)
+            .filter(|read| read.seated || read.spanned)
+            .collect();
+        if !last && reads.iter().any(|read| read.spanned) {
+            return None;
+        }
         Some(
-            rows.iter()
-                .filter(|span| span.lane == lane && span.rows > 0)
-                .map(|span| {
+            reads
+                .into_iter()
+                .map(|read| {
                     (
-                        seat,
-                        span.at,
-                        span.values(),
-                        span.dtype,
-                        self.output_name(span.plane),
+                        if read.spanned { span } else { seat },
+                        read.at,
+                        read.values(),
+                        read.dtype,
+                        self.output_name(read.plane),
                     )
                 })
                 .collect(),
@@ -475,11 +493,5 @@ impl Seats for Shell<Api> {
 
     fn forget_seat(&mut self, landed: &Landed) {
         self.shelf.landed_seats.remove(&landed.seq);
-    }
-
-    fn leave_unread(&mut self, landed: &Landed) {
-        if let Some(flight) = self.inflight.iter_mut().find(|f| f.seq == landed.seq) {
-            flight.api.read = false;
-        }
     }
 }

@@ -1121,19 +1121,37 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
-                "gemm_tflops_by_rows" => {
-                    rates.gemm_tflops_by_rows = self.width_curves(v);
+                key @ "gemm_tflops_by_rows" => {
+                    rates.gemm_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ "tile_tflops_by_rows" => {
+                    rates.tile_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ "vector_tflops_by_rows" => {
+                    rates.vector_tflops_by_rows = self.width_curves(v, key);
+                    continue;
+                }
+                key @ crate::fire::ATTN_BY_ROWS_KEYS => {
+                    rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
                     continue;
                 }
                 key @ "attn_tflops_by_keys" => {
                     rates.attn_tflops_by_keys = self.curve(v, key);
                     continue;
                 }
+                "product_ns" => {
+                    rates.product_ns = self.product_times(v);
+                    continue;
+                }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
+                "cached_gbps" => &mut rates.cached_gbps,
                 "scan_gelems" => &mut rates.scan_gelems,
                 "few_row_tflops" => &mut rates.few_row_tflops,
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
+                crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1155,9 +1173,10 @@ impl<'a> Walk<'a> {
                         k.span().start,
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
-                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps`, \
-                             `scan_gelems`, `few_row_tflops` and `workgroups_per_core`, not \
-                             `{other}`"
+                             `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
+                             `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
+                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
+                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1178,19 +1197,71 @@ impl<'a> Walk<'a> {
         rates
     }
 
-    /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
-    /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
-    /// width.
+    /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
+    /// whole numbers then a positive time and a spread at least zero, no
+    /// shape twice.
+    fn product_times(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<crate::fire::ProductTime>> {
+        let what = "`rates.product_ns` is a list of [kind, rows, k, m, kernel, ns, spread], each \
+                    shape once";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(value.span().start, format!("{what}, not {}", found(value.get_ref())));
+            return None;
+        };
+        let number = |v: &DeValue<'_>| match v {
+            DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+            DeValue::Integer(_) => int(v).map(|i| i as f64),
+            _ => None,
+        };
+        let mut out: Vec<crate::fire::ProductTime> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let parsed = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 7 => {
+                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    match (whole(0), whole(1), whole(2), whole(3), whole(4), number(f[5].get_ref()), number(f[6].get_ref())) {
+                        (Some(kind), Some(rows), Some(k), Some(m), Some(kernel), Some(ns), Some(spread))
+                            if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 =>
+                        {
+                            Some(crate::fire::ProductTime { kind, rows, k, m, kernel, ns, spread })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match parsed {
+                Some(t) if out.iter().all(|o| o.key() != t.key()) => out.push(t),
+                _ => {
+                    self.err(entry.span().start, format!("{what}, not {}", found(entry.get_ref())));
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,
+    /// `vector_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
+    /// pairs, a whole positive outer key (a width, a row tile, rows) and a
+    /// curve of `[x, TFLOP/s]` each, strictly ascending in the outer key.
     fn width_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
+        key: &str,
     ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
-        const WHAT: &str = "`rates.gemm_tflops_by_rows` is a non-empty list of [width, [[rows, \
-                            TFLOP/s], ...]] pairs, ascending in width";
+        let (outer, inner) = if key == crate::fire::ATTN_BY_ROWS_KEYS {
+            ("rows", "keys")
+        } else {
+            ("width", "rows")
+        };
+        let what = format!(
+            "`rates.{key}` is a non-empty list of [{outer}, [[{inner}, TFLOP/s], ...]] pairs, \
+             ascending in {outer}"
+        );
+        let what = what.as_str();
         let DeValue::Array(widths) = value.get_ref() else {
             self.err(
                 value.span().start,
-                format!("{WHAT}, not {}", found(value.get_ref())),
+                format!("{what}, not {}", found(value.get_ref())),
             );
             return None;
         };
@@ -1207,14 +1278,14 @@ impl<'a> Walk<'a> {
             else {
                 self.err(
                     entry.span().start,
-                    format!("{WHAT}, not {}", found(entry.get_ref())),
+                    format!("{what}, not {}", found(entry.get_ref())),
                 );
                 return None;
             };
-            out.push((width, self.curve(curve, "gemm_tflops_by_rows")?));
+            out.push((width, self.curve(curve, key)?));
         }
         if out.is_empty() {
-            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            self.err(value.span().start, format!("{what}, not an empty list"));
             return None;
         }
         Some(out)

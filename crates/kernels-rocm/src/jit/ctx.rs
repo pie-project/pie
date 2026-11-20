@@ -239,6 +239,9 @@ pub struct Ctx {
     lane: core::cell::Cell<u32>,
 
     tuning: crate::tuning::Tuning,
+    /// The device's measured product times (`crate::linear::routes`);
+    /// `None` until a load states them, every choice then the skinny kernel.
+    routes: Option<std::sync::Arc<crate::linear::routes::Routes>>,
 }
 
 impl Ctx {
@@ -260,6 +263,7 @@ impl Ctx {
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
             tuning: crate::tuning::Tuning::DEFAULT,
+            routes: None,
         }
     }
 
@@ -285,6 +289,22 @@ impl Ctx {
     #[must_use]
     pub const fn tuning(&self) -> crate::tuning::Tuning {
         self.tuning
+    }
+
+    #[must_use]
+    pub fn with_routes(mut self, routes: std::sync::Arc<crate::linear::routes::Routes>) -> Self {
+        self.routes = Some(routes);
+        self
+    }
+
+    pub fn set_routes(&mut self, routes: std::sync::Arc<crate::linear::routes::Routes>) {
+        self.routes = Some(routes);
+    }
+
+    /// The measured product times a load stated (`with_routes`).
+    #[must_use]
+    pub fn routes(&self) -> Option<&std::sync::Arc<crate::linear::routes::Routes>> {
+        self.routes.as_ref()
     }
 
     #[must_use]

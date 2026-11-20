@@ -151,6 +151,18 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// What a device beam's lane may write, as the runtime states it: past the
+/// shared prompt page (its frozen prefix, `folded`) to the end of the one
+/// page the fire makes the set's own, `folded` and the fire's one row
+/// rounded up to the page (`KvDelta::writable`).
+fn device_writes() -> engine::fire::KvDelta {
+    engine::fire::KvDelta {
+        folded: PAGE,
+        write_end: (PAGE + 1).div_ceil(PAGE) * PAGE,
+        ..engine::fire::KvDelta::default()
+    }
+}
+
 /// A lane of `tokens` on `pages` of the kv list `kv` past `held` keys.
 pub(crate) fn host_lane(
     kv: engine::chunk::ShapeId,
@@ -282,6 +294,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 };
                 lane.tables.push((kv, vec![shared, device_own[b as usize]]));
                 lane.list = engine::fire::ListKind::Translation;
+                lane.kv = device_writes();
                 lane
             })
             .collect();
@@ -332,6 +345,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             };
             lane.tables.push((kv, vec![shared, device_own[b as usize]]));
             lane.list = engine::fire::ListKind::Translation;
+            lane.kv = device_writes();
             lane
         })
         .collect();
