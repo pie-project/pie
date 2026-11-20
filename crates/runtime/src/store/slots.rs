@@ -533,6 +533,11 @@ pub struct SlotPool {
     /// the engine's carve, refused, and the process failed). Elsewhere it
     /// is the activation itself.
     carved: u32,
+    /// Physical chunks a residency move's copy (an eviction, parked state
+    /// moving down) reads from while it is in flight, each with how many
+    /// such moves read it: a raise does not take them back for its
+    /// activation until the copy has landed ([`Self::plan_rung`]).
+    moving_out: BTreeMap<u32, u32>,
     /// What a fire takes for the guest programs it carries, on top of
     /// every rung's activation ([`Self::act_chunks`]): the term of the
     /// pairs that can be in a fire ([`::engine::GuestTerm`]).
@@ -709,6 +714,7 @@ impl SlotPool {
             act_chunks,
             act: 0,
             carved: 0,
+            moving_out: BTreeMap::new(),
             fire: ::engine::GuestTerm::default(),
             standing: 0,
             readout_row_bytes: 0,
@@ -1102,6 +1108,34 @@ impl SlotPool {
         }
     }
 
+    /// The activation is `act` again, the engine's carve with it, after a
+    /// raise whose copy landed and whose carve the engine refused: the
+    /// state the copy moved stays where it went.
+    pub fn restore_act(&mut self, act: u32) {
+        self.set_act(act);
+        self.engine_narrowed();
+    }
+
+    /// A residency move's copy reads `chunks` (physical) from here until
+    /// [`Self::moved_out`]: no raise takes them back meanwhile.
+    pub fn moving_out(&mut self, chunks: &[u32]) {
+        for &chunk in chunks {
+            *self.moving_out.entry(chunk).or_default() += 1;
+        }
+    }
+
+    /// The copy [`Self::moving_out`] named has landed, or will not.
+    pub fn moved_out(&mut self, chunks: &[u32]) {
+        for chunk in chunks {
+            if let Some(count) = self.moving_out.get_mut(chunk) {
+                *count -= 1;
+                if *count == 0 {
+                    self.moving_out.remove(chunk);
+                }
+            }
+        }
+    }
+
     /// The engine narrowed its carve to the activation set aside now (a
     /// lower's notice landed, `Engine::set_rung`): the span above it opens
     /// for state ([`Self::carved`]).
@@ -1121,6 +1155,16 @@ impl SlotPool {
         let act = self.act_chunks(rung);
         self.rung_budget(act)?;
         let limit = self.total - act;
+        // A move's copy still reads chunks the raise would take back: it
+        // waits for the copy to land (its end asks the walk again), never
+        // laying its activation over state a copy is reading.
+        let read = self.moving_out.range(limit..).count();
+        if read > 0 {
+            return Err(SlotError::Occupied {
+                rung,
+                chunks: u32::try_from(read).unwrap_or(u32::MAX),
+            });
+        }
         let sources = self.held_in(limit, self.state_limit());
         let moves: Vec<ChunkMove> = sources
             .iter()

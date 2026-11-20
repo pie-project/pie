@@ -562,6 +562,35 @@ impl MoveGuard {
     }
 }
 
+/// The physical chunks a process's state holds, fenced against a raise's
+/// taking them back while a copy of the process reads them; let go when
+/// dropped ([`super::pool::PoolPort::moving_out`]).
+struct MovingOut<'a> {
+    planner: &'a ResidencyPlanner,
+    chunks: Vec<u32>,
+}
+
+impl<'a> MovingOut<'a> {
+    fn of(planner: &'a ResidencyPlanner, pid: ProcessId) -> Self {
+        let mut map = planner.port.chunk_occupants(&[pid]);
+        map.merge(planner.port.parked_occupants(super::residency_planner::SWEEP));
+        let chunks: Vec<u32> = map
+            .held
+            .iter()
+            .filter(|held| held.by.iter().any(|&(holder, _)| holder == pid))
+            .map(|held| held.chunk)
+            .collect();
+        planner.port.moving_out(&chunks);
+        Self { planner, chunks }
+    }
+}
+
+impl Drop for MovingOut<'_> {
+    fn drop(&mut self) {
+        self.planner.port.moved_out(&self.chunks);
+    }
+}
+
 /// A residency move's copy that did not land: what it says, and whether
 /// the engine refused it before reading or writing any of it (its state
 /// lies where it lay, untouched: a placement the engine will not copy,
@@ -785,7 +814,14 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
-    if let Err(error) = guard.copy(&planner, pid).await {
+    // The chunks its copy reads: no raise takes them back for its
+    // activation until the copy has landed or will not (Mac Pro at 5 GiB
+    // on 5aa45805b: an eviction's copy of a lent chunk refused inside the
+    // carve).
+    let reading = MovingOut::of(&planner, pid);
+    let copied_out = guard.copy(&planner, pid).await;
+    drop(reading);
+    if let Err(error) = copied_out {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         if error.untouched {
             // Refused untouched: its state lies where it lay, and the move

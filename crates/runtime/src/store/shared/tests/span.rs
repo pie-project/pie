@@ -903,3 +903,73 @@ async fn no_fire_wider_than_the_rung_the_engine_was_told_reaches_it() {
     assert_eq!(reached, [297, 298]);
     assert_eq!(queued, [1024], "held until the engine holds its rung");
 }
+
+/// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy of state in a lent
+/// span chunk. State lent the span (the engine told the lower) is evicted:
+/// while the eviction's copy reads its chunks, a raise wanting them waits
+/// (never lays its activation over state a copy reads); once the copy has
+/// landed, the raise moves what is left there down and takes the span back.
+#[test]
+fn a_raise_waits_for_a_copy_reading_a_lent_chunk_then_takes_it_back() {
+    let mut pool = grow_pool(true, true);
+    while let Some(n) = pool.pool().span_to_commit() {
+        pool.span_committed(n);
+    }
+    let lent = pool.take_records(pool.records_available() as usize).unwrap();
+    let chunks = state_chunks(&pool, &lent);
+    let (span_lent, _, _) = pool.pool().span_lent();
+    assert!(span_lent > 0 && !chunks.is_empty(), "state in the lent span");
+    // Room below for them: older records go.
+    let below: Vec<u32> = (0..u32::try_from(lent.len()).unwrap()).collect();
+    pool.give_records(&below);
+    pool.pool_mut().retire_through(u64::MAX);
+    // The eviction's copy reads the lent chunks.
+    pool.pool_mut().moving_out(&chunks);
+    assert!(
+        matches!(pool.plan_raise(2048), Err(RungError::Pool(SlotError::Occupied { .. }))),
+        "a copy reads them: the raise waits"
+    );
+    // The copy landed (the eviction moved them off, or was taken back).
+    pool.pool_mut().moved_out(&chunks);
+    let evacuation = pool.plan_raise(2048).expect("the copy landed: it raises");
+    assert!(!evacuation.moves.is_empty(), "what lies in the span moves down");
+    pool.raise_applied(&evacuation).unwrap();
+    pool.pool().check();
+}
+
+/// Mac Pro at 2 GiB on 6c21ebca3: a forward refused "state chunk 231
+/// (physical 433) lies inside the activation span's backed carve" and
+/// three beams were lost: a raise told the engine its wider carve before
+/// it moved the state lying there, and a fire in between read it inside
+/// the carve. State in a lent chunk, then a raise covering it: the state
+/// moves down first, and only then does the engine back the carve.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raise_moves_the_state_down_before_the_engine_backs_its_carve() {
+    let mut pool = grow_pool(true, true);
+    while let Some(n) = pool.pool().span_to_commit() {
+        pool.span_committed(n);
+    }
+    let lent = pool.take_records(pool.records_available() as usize).unwrap();
+    let below: Vec<u32> = (0..u32::try_from(lent.len()).unwrap()).collect();
+    pool.give_records(&below);
+    pool.pool_mut().retire_through(u64::MAX);
+    let evacuation = pool.plan_raise(2048).expect("room below");
+    assert!(!evacuation.moves.is_empty(), "state lies in the span it raises over");
+    let notice = pool.raise_applied(&evacuation).unwrap();
+    assert!(notice.is_some(), "the engine is told the wider rung");
+    let mut engine = FakeEngine::on_demand();
+    engine.prefix = pool.pool().prefix_segments();
+    engine.calls.clear();
+    let engine = Arc::new(Mutex::new(engine));
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    carry_raise(&shared, &evacuation, notice, &Lane(engine.clone()))
+        .await
+        .expect("carried");
+    let calls = engine.lock().unwrap().calls.clone();
+    let evacuated = calls.iter().position(|call| matches!(call, Call::Evacuate(_)));
+    let told = calls.iter().position(|call| matches!(call, Call::Rung(..)));
+    assert!(
+        evacuated.is_some() && told.is_some() && evacuated < told,
+        "moved down, then the carve: {calls:?}"
+    );
+}

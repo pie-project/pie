@@ -542,6 +542,17 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (pid, bind);
         self.guest_need_free(need, state)
     }
+    /// A residency move's copy reads `chunks` (physical) until
+    /// [`Self::moved_out`]: no raise takes them back for its activation
+    /// meanwhile ([`crate::store::slots::SlotPool::moving_out`]).
+    fn moving_out(&self, chunks: &[u32]) {
+        let _ = chunks;
+    }
+    /// The copy [`Self::moving_out`] named has landed, or will not; the
+    /// walk looks again (a raise that waited on it).
+    fn moved_out(&self, chunks: &[u32]) {
+        let _ = chunks;
+    }
     /// The free physical chunks a restore's `state` would open as its serve
     /// takes it, lowest first after the shapes' partly filled chunks
     /// ([`crate::store::slots::SlotPool::opens_for`]): chunks the map must
@@ -879,6 +890,23 @@ impl PoolPort for RegistryPool {
         // roles take the pool's lock themselves.
         let takes = shared.lock().unwrap().state_takes(state);
         roles.lock().unwrap().unpark_stands(pid, &takes, bind)
+    }
+
+    fn moving_out(&self, chunks: &[u32]) {
+        if let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        {
+            shared.lock().unwrap().pool_mut().moving_out(chunks);
+        }
+    }
+
+    fn moved_out(&self, chunks: &[u32]) {
+        if let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        {
+            shared.lock().unwrap().pool_mut().moved_out(chunks);
+        }
+        crate::store::shared::ask_walk(self.engine);
     }
 
     fn serve_opens(&self, state: RsUnits) -> Vec<u32> {

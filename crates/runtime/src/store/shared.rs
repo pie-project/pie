@@ -1912,6 +1912,23 @@ impl SharedPool {
         self.publish_held();
     }
 
+    /// The engine took a raise's copy (the state moved down, its table
+    /// changed) and then refused the carve for the wider rung: the moved
+    /// chunks stay where they went (their fence lifts once the fire at
+    /// `epoch` retires), and the activation and the rung the engine holds
+    /// are the rung in hand's again. Fires stay cut to it.
+    pub fn raise_carve_refused(&mut self, epoch: u64) {
+        self.pool.refence(UNTIL_COPIED, epoch);
+        if let Some(act) = self.raise_from.take() {
+            self.pool.restore_act(act);
+        }
+        if let Some(told) = self.told_from.take() {
+            self.told = told;
+        }
+        self.copying = None;
+        self.publish_held();
+    }
+
     /// The engine has taken a raise's copy, carried by the fire at `epoch`
     /// (the next it is handed): its chunks moved off reopen once that fire
     /// retires, and fires may take the raised rung.
