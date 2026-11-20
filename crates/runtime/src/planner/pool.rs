@@ -797,7 +797,17 @@ impl PoolPort for RegistryPool {
     }
 
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
-        self.with_rs(|rs| (rs.host_available(), rs.host_capacity()))
+        let (free, total, disk) =
+            self.with_rs(|rs| (rs.host_available(), rs.host_capacity(), rs.disk_slots()));
+        // Where state parks on disk too (no host row free, no host tier on
+        // unified memory), the disk's room is room below: read outside the
+        // rs store's lock (the slot file is the kv store's).
+        let Some(disk) = disk else {
+            return (free, total);
+        };
+        let chunks = u32::try_from(disk.free_chunks()).unwrap_or(u32::MAX);
+        let below = self.with_rs(|rs| rs.disk_units(chunks));
+        (free.add(below), total.add(below))
     }
 
     fn guest_room_free(&self, run: u32, pieces: u32) -> bool {

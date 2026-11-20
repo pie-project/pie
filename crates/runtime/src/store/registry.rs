@@ -229,7 +229,15 @@ pub fn shared_stores(
         kv.set_domain(identity.domain());
     }
     let kv = Arc::new(parking_lot::Mutex::new(kv));
-    let rs = RsStore::shared(shared, tiers.host.as_ref());
+    let mut rs = RsStore::shared(shared, tiers.host.as_ref());
+    // Where no host row is free (no host tier on unified memory), an
+    // evicted process's records and rs list slots park on disk.
+    if tiers.disk_slots > 0 {
+        rs.set_disk(
+            shared,
+            Arc::new(KvDiskSlots(Arc::downgrade(&kv), tiers.disk_chunk_slots)),
+        );
+    }
     {
         let mut kv = kv.lock();
         kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
@@ -271,6 +279,12 @@ impl super::roles::DiskSlots for KvDiskSlots {
         if let Some(kv) = self.0.upgrade() {
             with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_chunks(chunks, self.1));
         }
+    }
+
+    fn free_chunks(&self) -> usize {
+        self.0.upgrade().map_or(0, |kv| {
+            with_kv_lock(&kv, "roles-disk", |kv| kv.disk_free_slots()) / self.1.max(1) as usize
+        })
     }
 }
 

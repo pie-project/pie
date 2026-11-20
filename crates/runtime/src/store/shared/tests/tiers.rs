@@ -417,3 +417,80 @@ fn a_working_set_s_state_slots_are_named_in_the_chunks_they_hold() {
         }
     }
 }
+
+/// A slot file of `chunks` whole disk chunks, for a store's disk tier.
+struct DiskFile(Mutex<Vec<u32>>);
+
+impl crate::store::roles::DiskSlots for DiskFile {
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>> {
+        let mut free = self.0.lock().unwrap();
+        let at = free.len().checked_sub(n)?;
+        Some(free.split_off(at))
+    }
+    fn give_chunks(&self, chunks: &[u32]) {
+        self.0.lock().unwrap().extend_from_slice(chunks);
+    }
+    fn free_chunks(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+/// The M1 (no host tier, unified memory): an evicted process's records and
+/// rs list slots stayed on the device, their chunks held, since a suspend
+/// found no host row. Where no host row is free its state parks in the
+/// disk tier's slot file, a disk chunk of each shape laid out as the
+/// device's (CONTRACT-BC 22): the move copies to the disk, the device slots
+/// come free, and a restore brings it back and gives the disk chunks back.
+#[test]
+fn with_no_host_tier_an_evicted_set_s_state_parks_on_disk_and_frees_the_device() {
+    use crate::store::rs::{RsGeometry, RsStore};
+    let facts = fixed_facts();
+    let tiers = Tiers::of(&facts).unwrap();
+    assert!(tiers.host.is_none(), "unified memory: no host tier");
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut s = RsStore::shared(&shared, None);
+    assert!(s.host_available().is_zero(), "no host rows");
+    let ws = s.create_working_set(RsGeometry {
+        state_size: 4096,
+        buffer_page_tokens: RS_TOKENS,
+    });
+    let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    s.settle(published);
+    s.fold(ws, 4);
+    let sets = HashSet::from([ws]);
+    let held = s.suspendable(&sets);
+    assert!(!held.is_zero(), "its state holds device slots");
+    assert!(s.prepare_suspend(&sets).is_none(), "no disk tier: it stays on the device");
+
+    let file = Arc::new(DiskFile(Mutex::new((0..8).collect())));
+    s.set_disk(&shared, file.clone());
+    assert!(!s.disk_units(8).is_zero(), "the disk is room below");
+    let device_refs = s.private_slot_refs(&sets);
+    let txn = s.prepare_suspend(&sets).expect("it parks on disk");
+    let plan = txn.copy_plan();
+    assert!(plan.shared.is_empty(), "nothing to a host tier");
+    let to_disk: usize = plan.disk.iter().map(|(_, pairs)| pairs.len()).sum();
+    let named: usize = device_refs.iter().map(|(_, refs)| refs.len()).sum();
+    assert_eq!(to_disk, named, "every device slot of its state copied to disk");
+    for (shape, pairs) in &plan.disk {
+        let device = &device_refs.iter().find(|(at, _)| at == shape).unwrap().1;
+        assert!(pairs.iter().all(|(from, _)| device.contains(from)), "by shape");
+    }
+    let taken = 8 - crate::store::roles::DiskSlots::free_chunks(&*file);
+    assert!(taken > 0, "disk chunks of its shapes opened");
+    let freed = s.commit_suspend(txn);
+    assert_eq!(freed, held, "its device slots come free");
+    assert!(s.private_slot_refs(&sets).is_empty(), "nothing of it on the device");
+    assert!(s.disk_rows() > 0);
+    assert_eq!(s.swapped_units(&sets), held, "parked, counted as swapped");
+
+    let mut grant = s.reserve(s.swapped_units(&sets)).expect("device room to come back");
+    let txn = s.prepare_restore(&sets, &mut grant).expect("it comes back");
+    let back: usize = txn.copy_plan().disk.iter().map(|(_, pairs)| pairs.len()).sum();
+    assert_eq!(back, named, "read back from the disk");
+    s.commit_restore(txn);
+    assert_eq!(s.disk_rows(), 0, "no disk row held");
+    assert_eq!(crate::store::roles::DiskSlots::free_chunks(&*file), 8, "its disk chunks given back");
+    assert_eq!(s.suspendable(&sets), held, "on the device again");
+}

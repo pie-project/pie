@@ -1239,6 +1239,12 @@ impl KvStore {
         Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
     }
 
+    /// The disk tier's free slots, idle cache's not counted.
+    #[must_use]
+    pub fn disk_free_slots(&self) -> usize {
+        self.disk_pool.available()
+    }
+
     /// Chunks [`Self::take_disk_chunks`] took, free again.
     pub fn give_disk_chunks(&mut self, chunks: &[u32], per_chunk: u32) {
         let per_chunk = per_chunk.max(1);

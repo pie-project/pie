@@ -708,6 +708,11 @@ pub trait DiskSlots: Send + Sync {
     fn take_chunks(&self, n: usize) -> Option<Vec<u32>>;
     /// Chunks taken before, free again.
     fn give_chunks(&self, chunks: &[u32]);
+    /// The whole chunks free, at most (the file's free slots a chunk's
+    /// worth each): what a planner reads the disk's room by.
+    fn free_chunks(&self) -> usize {
+        0
+    }
 }
 
 /// The disk tier a [`Roles`] parks on: its chunks, and each role shape's

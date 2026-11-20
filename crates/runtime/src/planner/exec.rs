@@ -364,16 +364,24 @@ impl Move {
         if let Some(rs) = rs.as_ref() {
             let plan = rs.copy_plan();
             // A shared pool's state moves shape by shape (CONTRACT-BC 22).
-            for (shape, pairs) in &plan.shared {
-                let (device, slots) = pairs.iter().copied().unzip();
-                copies.push(TierMove {
-                    kind: TierKind::RsSlots(*shape),
-                    tier: MemoryDomain::HostPinned,
-                    out,
-                    device,
-                    slots,
-                    source: None,
-                });
+            // With no host row free (no host tier on unified memory) it
+            // moves to the disk tier's slot file, laid out by shape too.
+            let tiers = [
+                (&plan.shared, MemoryDomain::HostPinned),
+                (&plan.disk, MemoryDomain::LocalDisk),
+            ];
+            for (moves, tier) in tiers {
+                for (shape, pairs) in moves {
+                    let (device, slots) = pairs.iter().copied().unzip();
+                    copies.push(TierMove {
+                        kind: TierKind::RsSlots(*shape),
+                        tier,
+                        out,
+                        device,
+                        slots,
+                        source: None,
+                    });
+                }
             }
         }
         // Instance tables and rings park with their process (never
