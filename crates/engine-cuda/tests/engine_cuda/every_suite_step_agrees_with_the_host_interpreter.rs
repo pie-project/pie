@@ -787,6 +787,12 @@ fn standard(name: &str, shape: &eta_dsl::sampler::Shape) -> Suite {
             named(label, channel)
         })
     };
+    // The temperature rides as its reciprocal, a knob like the rest.
+    let inverse = knob(
+        "inverse_temperature",
+        shape.temperature,
+        Value::F32(vec![sampler::inverse_temperature(0.7)]),
+    );
     let top_p = knob("top_p", shape.top_p, Value::F32(vec![0.9]));
     let top_k = knob("top_k", shape.top_k, Value::U32(vec![40]));
     let min_p = knob("min_p", shape.min_p, Value::F32(vec![0.05]));
@@ -831,13 +837,12 @@ fn standard(name: &str, shape: &eta_dsl::sampler::Shape) -> Suite {
     let out = named("out", Channel::new([1], dtype::i32).capacity(4));
     out.note_host_take();
     tok_in.note_host_take();
-    let temperature = shape.temperature;
     let logprob_top = shape.logprobs;
     let mut b = builder(vocab, 1);
     b.stage(Stage::Epilogue, move || {
         let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
         let knobs = Knobs {
-            temperature,
+            temperature: t(inverse),
             top_p: t(top_p),
             top_k: t(top_k),
             min_p: t(min_p),
@@ -971,7 +976,7 @@ fn bf16_draw(rows: u32, truncated: bool) -> Suite {
 /// Every suite whose vocabulary-sized values are bf16.
 fn bf16_suites() -> Vec<Suite> {
     let penalized = eta_dsl::sampler::Shape {
-        temperature: Some(1.0),
+        temperature: true,
         top_p: true,
         min_p: true,
         repetition: true,

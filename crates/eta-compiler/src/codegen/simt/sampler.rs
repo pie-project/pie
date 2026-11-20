@@ -48,12 +48,13 @@ pub struct SamplerValues {
     pub draw: Option<Draw>,
 }
 
-/// What the bf16 draw reads beside the values: its temperature's f32 bits,
-/// and the model output whose row the logits are a view of (its node and
-/// its slot in the lane's table), which the draw reads where it lies.
+/// What the bf16 draw reads beside the values: its scale (the value of the
+/// temperature's reciprocal, read from scratch as the stage holds it), and
+/// the model output whose row the logits are a view of (its node and its
+/// slot in the lane's table), which the draw reads where it lies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Draw {
-    pub temperature: u32,
+    pub scale: u32,
     pub output: Option<(u32, u16)>,
 }
 
@@ -132,10 +133,6 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
     let draw = match divisor {
         None => None,
         Some(divisor) => {
-            let producer = ops
-                .iter()
-                .enumerate()
-                .find(|(n, op)| op.results > 0 && bases[*n] == divisor && op.tag == tags::CONST)?;
             let mut producers = alloc::vec![u32::MAX; stage.normalized.value_types.len()];
             for (node, op) in ops.iter().enumerate() {
                 for result in 0..op.results {
@@ -152,7 +149,7 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
                 )
             });
             Some(Draw {
-                temperature: producer.1.lit_bits,
+                scale: divisor,
                 output,
             })
         }
@@ -276,11 +273,7 @@ pub fn emit_sampler_region(
         );
         return Ok(source);
     }
-    if let Some(Draw {
-        temperature,
-        output,
-    }) = draw
-    {
+    if let Some(Draw { scale, output }) = draw {
         // The logits where the model left them (its output's row), or in
         // scratch.
         let row = match output {
@@ -311,7 +304,7 @@ pub fn emit_sampler_region(
   ptir_lane_draw<{rank}>(
       g,
       draw_row,
-      m1_bits_f32({temperature:#x}u),
+      m1_load_f(scratch + offsets[{scale}], 0u, descriptors[{scale}u].dtype),
       scratch + offsets[{threshold}],
       descriptors[{threshold}u],
       scratch + offsets[{state}],

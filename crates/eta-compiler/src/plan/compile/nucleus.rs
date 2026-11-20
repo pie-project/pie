@@ -153,12 +153,21 @@ fn match_draw_dataflow(
     if summed != exps || row != logits || maxed != logits {
         return None;
     }
-    // One constant reciprocal temperature, above zero, scales both.
-    let constant = |value: ValueId| match made(value)? {
-        (_, Op::Const(Literal::F32(t))) if *t > 0.0 && t.is_finite() => Some(t.to_bits()),
+    // One reciprocal temperature scales both: the same value (data the
+    // stage reads, as the sampler's knob is), or one constant.
+    let constant = |value: ValueId| match made(value) {
+        Some((_, Op::Const(Literal::F32(t)))) => Some(t.to_bits()),
         _ => None,
     };
-    if constant(temperature)? != constant(divisor)? {
+    let same = temperature == divisor
+        || constant(temperature).is_some_and(|t| constant(divisor) == Some(t));
+    let scalar_f32 = |value: ValueId| {
+        stage
+            .value_types
+            .get(value as usize)
+            .is_some_and(|t| t.dtype == Dtype::F32 && t.is_scalar())
+    };
+    if !same || !scalar_f32(temperature) {
         return None;
     }
     let ty = |value: ValueId| stage.value_types.get(value as usize);

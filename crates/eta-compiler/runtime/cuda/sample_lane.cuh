@@ -1615,8 +1615,12 @@ __device__ M1_CALLEE void ptir_lane_draw(
     int stretch = 0;
     M1Fast& fs = m1_fast_state();
     if (counted) {
-      least = m1_desc_key(prob(maximum, shift, sum));
-      most = m1_desc_key(prob(range.least, shift, sum));
+      // q is monotone in x (rising for a positive scale): its bounds are the
+      // probabilities of the row's largest and least logits, either way.
+      const m1_u32 at_max = m1_desc_key(prob(maximum, shift, sum));
+      const m1_u32 at_least = m1_desc_key(prob(range.least, shift, sum));
+      least = at_max < at_least ? at_max : at_least;
+      most = at_max < at_least ? at_least : at_max;
       if (most < least) most = least;
       stretch = m1_fast_stretch(least, most);
       m1_fast_clear(fs);
