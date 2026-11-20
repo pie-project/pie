@@ -83,9 +83,12 @@ struct SettleLane {
     const u32* commit;
     u32 ticket_offset;
     u32 ticket_count;
+    // Where the host reads the pass's verdict: `commit` lives in the wave's
+    // device tables, read by every region; the settle hands it over.
+    u32* commit_host;
 };
 
-static_assert(sizeof(SettleLane) == 16, "SettleLane: the Rust `channel::SettleLane` mirrors this layout");
+static_assert(sizeof(SettleLane) == 24, "SettleLane: the Rust `channel::SettleLane` mirrors this layout");
 
 __device__ __forceinline__ u64 load_system_acquire(const u64* word) {
     u64 value;
@@ -301,6 +304,9 @@ __global__ void settle(
     if (lane_index >= lane_count) return;
     const SettleLane lane = lanes[lane_index];
 
+    if (threadIdx.x == 0 && lane.commit_host != nullptr && lane.commit != nullptr) {
+        *reinterpret_cast<volatile u32*>(lane.commit_host) = *lane.commit;
+    }
     if (lane.commit == nullptr || *lane.commit == 0u) return;
 
     for (u32 index = threadIdx.x; index < lane.ticket_count; index += blockDim.x) {

@@ -10,12 +10,17 @@ const DT_F32 : u32 = 0u;
 const DT_I32 : u32 = 1u;
 const DT_U32 : u32 = 2u;
 const DT_BOOL : u32 = 3u;
+// bf16 (eta_ir::types::WIRE_BF16): two elements a word, element 2w in the
+// low half of word w. Every op computes in f32; a bf16 result is rounded to
+// nearest even on its store (bf16_round), and an invocation stores whole
+// words of it, two adjacent elements, so no two invocations ever write one
+// word. A value starts on a word, so the high half of an odd-length value's
+// last word is its own padding.
+const DT_BF16 : u32 = 5u;
 
-// A stage's config table, by word: its values, its temporary words' first
-// heap word, its ops, its lane, and its heap's words (no access reaches past
-// them).
-const CFG_TEMPORARY : u32 = 1u;
-const CFG_HEAP_WORDS : u32 = 4u;
+// A stage's config table, by word: its values, its heap's words (no access
+// reaches past them), its ops and its lane.
+const CFG_HEAP_WORDS : u32 = 1u;
 
 // The fault classes this runtime writes (eta-compiler codegen::fault).
 const OUT_OF_BOUNDS : u32 = 0xB5u;
@@ -63,14 +68,14 @@ var<private> sel_groups : u32;
 var<private> lim_heap : u32;
 
 // Where the step's tables, status and heap start, in words of their
-// segments, and its temporary words' first heap word: read once at the
-// step's entry from its record and its config table.
+// segments, and the first heap word of its node's temporary area: read once
+// at the step's entry from its record.
 var<private> b_status : u32;
 var<private> b_descs : u32;
 var<private> b_params : u32;
 var<private> b_offs : u32;
 var<private> b_heap : u32;
-var<private> cfg_temporary : u32;
+var<private> tmp_base : u32;
 
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
@@ -167,9 +172,20 @@ fn ld_byte(v : u32, i : u32) -> u32 {
   return (w >> ((i & 3u) * 8u)) & 0xFFu;
 }
 
+// Element i of a bf16 value: its word, the half i names, widened exactly.
+fn ld_h_bits(v : u32, i : u32) -> u32 {
+  let w = hld(base(v) + (i >> 1u));
+  return (w >> ((i & 1u) * 16u)) & 0xFFFFu;
+}
+
+fn ld_h(v : u32, i : u32) -> f32 { return bitcast<f32>(ld_h_bits(v, i) << 16u); }
+
+fn is_float_dt(dt : u32) -> bool { return dt == DT_F32 || dt == DT_BF16; }
+
 fn ld_f(v : u32, i : u32) -> f32 {
   let dt = d_dtype(v);
   if (dt == DT_F32) { return bitcast<f32>(ld_raw(v, i)); }
+  if (dt == DT_BF16) { return ld_h(v, i); }
   if (dt == DT_I32) { return f32(bitcast<i32>(ld_raw(v, i))); }
   if (dt == DT_U32) { return f32(ld_raw(v, i)); }
   return select(0.0, 1.0, ld_byte(v, i) != 0u);
@@ -178,6 +194,7 @@ fn ld_f(v : u32, i : u32) -> f32 {
 fn ld_i(v : u32, i : u32) -> i32 {
   let dt = d_dtype(v);
   if (dt == DT_F32) { return i32(bitcast<f32>(ld_raw(v, i))); }
+  if (dt == DT_BF16) { return i32(ld_h(v, i)); }
   if (dt == DT_I32) { return bitcast<i32>(ld_raw(v, i)); }
   if (dt == DT_U32) { return i32(ld_raw(v, i)); }
   return select(0, 1, ld_byte(v, i) != 0u);
@@ -186,6 +203,7 @@ fn ld_i(v : u32, i : u32) -> i32 {
 fn ld_u(v : u32, i : u32) -> u32 {
   let dt = d_dtype(v);
   if (dt == DT_F32) { return u32(bitcast<f32>(ld_raw(v, i))); }
+  if (dt == DT_BF16) { return u32(ld_h(v, i)); }
   if (dt == DT_I32) { return bitcast<u32>(bitcast<i32>(ld_raw(v, i))); }
   if (dt == DT_U32) { return ld_raw(v, i); }
   return select(0u, 1u, ld_byte(v, i) != 0u);
@@ -194,6 +212,7 @@ fn ld_u(v : u32, i : u32) -> u32 {
 fn ld_b(v : u32, i : u32) -> bool {
   let dt = d_dtype(v);
   if (dt == DT_BOOL) { return ld_byte(v, i) != 0u; }
+  if (dt == DT_BF16) { return ld_h_bits(v, i) != 0u; }
   return ld_raw(v, i) != 0u;
 }
 
@@ -211,6 +230,27 @@ fn st_b_word(v : u32, w : u32, n : u32, b0 : bool, b1 : bool, b2 : bool, b3 : bo
   hst(base(v) + w, packed);
 }
 
+// x rounded to bf16, round-to-nearest-even, as its 16 bits; a NaN stays a
+// quiet NaN (eta_ir::types::bf16_bits).
+fn bf16_round(x : f32) -> u32 {
+  let b = bitcast<u32>(x);
+  if ((b & 0x7FFFFFFFu) > 0x7F800000u) { return ((b >> 16u) | 0x40u) & 0xFFFFu; }
+  return (b + 0x7FFFu + ((b >> 16u) & 1u)) >> 16u;
+}
+
+// Word w of a bf16 value of n elements: elements 2w and 2w + 1, x0 and x1,
+// the high half the value's padding (zero) where 2w + 1 is past its end.
+// The one bf16 store: an invocation owns the word it writes.
+fn st_h_word(v : u32, w : u32, n : u32, x0 : f32, x1 : f32) {
+  var packed = bf16_round(x0);
+  if (w * 2u + 1u < n) { packed = packed | (bf16_round(x1) << 16u); }
+  hst(base(v) + w, packed);
+}
+
+fn h_words(n : u32) -> u32 { return (n + 1u) / 2u; }
+
+// A store of one element at its dtype. Never a bf16 one: a bf16 result is
+// stored a word at a time (st_h_word).
 fn st_as_f(v : u32, i : u32, x : f32) {
   let dt = d_dtype(v);
   if (dt == DT_F32) { st_f(v, i, x); }
@@ -247,6 +287,16 @@ fn map_unary(p : u32, which : u32) {
         b[k] = v;
       }
       st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  if (odt == DT_BF16) {
+    let na = d_len(a);
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      let i = w * 2u;
+      var x1 = 0.0;
+      if (i + 1u < n) { x1 = unary_f(which, a, pick(na, i + 1u)); }
+      st_h_word(o, w, n, unary_f(which, a, pick(na, i)), x1);
     }
     return;
   }
@@ -330,7 +380,16 @@ fn bin_arith(p : u32, which : u32) {
   let adt = d_dtype(a);
   let na = d_len(a);
   let nb = d_len(b);
-  if (adt == DT_F32) {
+  if (d_dtype(o) == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      let i = w * 2u;
+      var x1 = 0.0;
+      if (i + 1u < n) { x1 = arith_f(which, ld_f(a, pick(na, i + 1u)), ld_f(b, pick(nb, i + 1u))); }
+      st_h_word(o, w, n, arith_f(which, ld_f(a, pick(na, i)), ld_f(b, pick(nb, i))), x1);
+    }
+    return;
+  }
+  if (is_float_dt(adt) || is_float_dt(d_dtype(b))) {
     for (var i : u32 = tid; i < n; i = i + lanes) {
       st_as_f(o, i, arith_f(which, ld_f(a, pick(na, i)), ld_f(b, pick(nb, i))));
     }
@@ -407,7 +466,7 @@ fn cmp_lane(which : u32, a : u32, b : u32, i : u32) -> bool {
   let ia = pick(d_len(a), i);
   let ib = pick(d_len(b), i);
   let adt = d_dtype(a);
-  if (adt == DT_F32) {
+  if (is_float_dt(adt) || is_float_dt(d_dtype(b))) {
     let x = ld_f(a, ia);
     let y = ld_f(b, ib);
     switch (which) {
@@ -493,6 +552,20 @@ fn op_select(p : u32) {
     }
     return;
   }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let i = w * 2u + k;
+        if (i < n) {
+          if (ld_b(c, pick(d_len(c), i))) { xs[k] = ld_f(x, pick(d_len(x), i)); }
+          else { xs[k] = ld_f(y, pick(d_len(y), i)); }
+        }
+      }
+      st_h_word(o, w, n, xs[0], xs[1]);
+    }
+    return;
+  }
   for (var i : u32 = tid; i < n; i = i + lanes) {
     let take = ld_b(c, pick(d_len(c), i));
     if (odt == DT_F32) {
@@ -518,6 +591,28 @@ const RED_SUM : u32 = 0u;
 const RED_MAX : u32 = 1u;
 const RED_MIN : u32 = 2u;
 const RED_ARGMAX : u32 = 3u;
+// gumbel_argmax (tag 0x34): an argmax over lanes logits[i] * scale +
+// gumbel(state, i), -inf where keep is false, each made in f32 in the first
+// level and never stored (eta_ir::types: a draw is never a bf16 row). Its
+// operands: a0 the logits, a1 keep, a2 the scale, imm the rng state.
+const RED_GUMBEL : u32 = 4u;
+
+fn gumbel_seed(p : u32) -> U64 {
+  let st = p_imm(p);
+  var ctr : u32 = 0u;
+  if (d_len(st) > 1u) { ctr = ld_u(st, 1u); }
+  return rng_keyed_seed(ld_u(st, 0u), ctr);
+}
+
+// Lane i of a gumbel_argmax: what `select(keep, logits * scale, -inf) +
+// rng_keyed(state)` holds at i, in the same f32 operations.
+fn gumbel_lane(p : u32, seed : U64, i : u32) -> f32 {
+  let kp = p_a1(p);
+  if (!ld_b(kp, pick(d_len(kp), i))) { return NEG_INF(); }
+  let u = rng_hash_uniform(seed, i);
+  let noise = -log(-log(u));
+  return ld_f(p_a0(p), i) * ld_f(p_a2(p), 0u) + noise;
+}
 
 fn POS_INF() -> f32 { return bitcast<f32>(0x7F800000u); }
 fn NEG_INF() -> f32 { return bitcast<f32>(0xFF800000u); }
@@ -571,10 +666,31 @@ fn red_combine(kind : u32, l : f32, r : f32) -> f32 {
 
 const PTIR_REDUCE_LEVELS : u32 = 7u;
 
-fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
+// The lanes a job of a reduction's first level folds: 32, but 8 for a
+// gumbel_argmax, whose lanes each hash the rng and take two logs, so a row
+// spreads over four times the invocations (eta_compiler::codegen::steps::
+// first_fan). Every level above folds 32.
+fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }
+
+// The groups of a row the first level writes, which the levels above read:
+// the reduction's temporary cells a row (wgsl::temporary_bytes).
+fn red_stride_k(len : u32, kind : u32) -> u32 {
+  let fan = red_fan0(kind);
+  return (len + fan - 1u) / fan;
+}
+
+// The values a row has left before level `level`.
+fn red_n_in(len : u32, kind : u32, level : u32) -> u32 {
+  var n = len;
+  for (var l : u32 = 0u; l < level; l = l + 1u) {
+    let fan = select(32u, red_fan0(kind), l == 0u);
+    n = (n + fan - 1u) / fan;
+  }
+  return n;
+}
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
-  return cfg_temporary + (buf * span + row * stride + c) * 2u;
+  return tmp_base + (buf * span + row * stride + c) * 2u;
 }
 
 fn red_read_buf(level : u32) -> u32 { return level % 2u; }
@@ -585,24 +701,29 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
   let a = p_a0(p);
   let rows = rows_of(a);
   let len = d_len(a) / max(rows, 1u);
-  let stride = red_stride(len);
-  var n_in = len;
-  for (var l : u32 = 0u; l < level; l = l + 1u) { n_in = (n_in + 31u) / 32u; }
+  let stride = red_stride_k(len, kind);
+  let n_in = red_n_in(len, kind, level);
   if (n_in <= 1u) { return; }
-  let n_out = (n_in + 31u) / 32u;
+  var seed : U64;
+  if (kind == RED_GUMBEL && level == 0u) { seed = gumbel_seed(p); }
+  let fan = select(32u, red_fan0(kind), level == 0u);
+  let n_out = (n_in + fan - 1u) / fan;
   let total = rows * n_out;
   for (var job : u32 = tid; job < total; job = job + lanes) {
     let row = job / n_out;
     let c = job % n_out;
     var vs : array<f32, 32>;
     var ix : array<u32, 32>;
-    let count = min(32u, n_in - c * 32u);
+    let count = min(fan, n_in - c * fan);
     for (var k : u32 = 0u; k < 32u; k = k + 1u) {
       vs[k] = red_identity(kind);
       ix[k] = 0u;
       if (k < count) {
-        let at = c * 32u + k;
-        if (level == 0u) {
+        let at = c * fan + k;
+        if (level == 0u && kind == RED_GUMBEL) {
+          vs[k] = gumbel_lane(p, seed, row * len + at);
+          ix[k] = at;
+        } else if (level == 0u) {
           vs[k] = ld_f(a, row * len + at);
           ix[k] = at;
         } else {
@@ -615,7 +736,7 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
 
     for (var off : u32 = 16u; off >= 1u; off = off / 2u) {
       for (var lane : u32 = 0u; lane < off; lane = lane + 1u) {
-        if (kind == RED_ARGMAX) {
+        if (kind == RED_ARGMAX || kind == RED_GUMBEL) {
           let takes = arg_takes(vs[lane], ix[lane], vs[lane + off], ix[lane + off], level, count, lane, off);
           if (takes) { vs[lane] = vs[lane + off]; ix[lane] = ix[lane + off]; }
         } else {
@@ -644,7 +765,7 @@ fn op_reduce_finish(p : u32, kind : u32) {
   let o = p_o0(p);
   let rows = rows_of(a);
   let len = d_len(a) / max(rows, 1u);
-  let stride = red_stride(len);
+  let stride = red_stride_k(len, kind);
   for (var row : u32 = tid; row < rows; row = row + lanes) {
     var v : f32;
     var idx : u32;
@@ -657,18 +778,16 @@ fn op_reduce_finish(p : u32, kind : u32) {
       idx = 0u;
     } else {
 
-      var folded : u32 = len;
       var last : u32 = 0u;
       for (var l : u32 = 0u; l < PTIR_REDUCE_LEVELS; l = l + 1u) {
-        if (folded <= 1u) { break; }
+        if (red_n_in(len, kind, l) <= 1u) { break; }
         last = l;
-        folded = (folded + 31u) / 32u;
       }
       let cell = tmp_v(row, stride, 0u, red_write_buf(last), rows * stride);
       v = bitcast<f32>(hld(cell));
       idx = hld(cell + 1u);
     }
-    if (kind == RED_ARGMAX) { st_i(o, row, bitcast<i32>(idx)); }
+    if (kind == RED_ARGMAX || kind == RED_GUMBEL) { st_i(o, row, bitcast<i32>(idx)); }
     else { st_as_f(o, row, v); }
   }
 }
@@ -678,6 +797,34 @@ fn op_cumulative(p : u32, is_prod : bool) {
   let o = p_o0(p);
   let rows = rows_of(a);
   let len = d_len(a) / max(rows, 1u);
+  if (d_dtype(o) == DT_BF16) {
+    // An invocation scans a whole number of words: a row where a row is
+    // whole words, two rows where it is not (an even span, from an even
+    // element), so a word two rows share is one invocation's. Each prefix
+    // is the f32 running value, rounded once on its store.
+    if (len == 0u) { return; }
+    let group = select(2u, 1u, (len & 1u) == 0u);
+    let total = rows * len;
+    let groups = (rows + group - 1u) / group;
+    for (var g : u32 = tid; g < groups; g = g + lanes) {
+      let first = g * group * len;
+      let last = min(first + group * len, total);
+      var acc : f32 = 0.0;
+      var lo : f32 = 0.0;
+      for (var at : u32 = first; at < last; at = at + 1u) {
+        if ((at - first) % len == 0u) { acc = select(0.0, 1.0, is_prod); }
+        let x = ld_f(a, at);
+        if (is_prod) { acc = acc * x; } else { acc = acc + x; }
+        if ((at & 1u) == 0u) {
+          lo = acc;
+          if (at + 1u == last) { st_h_word(o, at >> 1u, total, lo, 0.0); }
+        } else {
+          st_h_word(o, at >> 1u, total, lo, acc);
+        }
+      }
+    }
+    return;
+  }
   for (var row : u32 = tid; row < rows; row = row + lanes) {
     let rowb = row * len;
     var acc : f32 = select(0.0, 1.0, is_prod);
@@ -707,6 +854,15 @@ fn op_copy(p : u32) {
         b[k] = v;
       }
       st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      let i = w * 2u;
+      var x1 = 0.0;
+      if (i + 1u < n) { x1 = ld_f(a, pick(na, i + 1u)); }
+      st_h_word(o, w, n, ld_f(a, pick(na, i)), x1);
     }
     return;
   }
@@ -762,6 +918,15 @@ fn op_broadcast(p : u32) {
     }
     return;
   }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      let i = w * 2u;
+      var x1 = 0.0;
+      if (i + 1u < n) { x1 = ld_f(a, bcast_src(a, o, i + 1u)); }
+      st_h_word(o, w, n, ld_f(a, bcast_src(a, o, i)), x1);
+    }
+    return;
+  }
   for (var i : u32 = tid; i < n; i = i + lanes) {
     let j = bcast_src(a, o, i);
     if (odt == DT_F32) { st_f(o, i, ld_f(a, j)); }
@@ -788,6 +953,15 @@ fn op_transpose(p : u32) {
         b[k] = v;
       }
       st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      let at = w * 2u;
+      var x1 = 0.0;
+      if (at + 1u < n) { x1 = ld_f(a, ((at + 1u) % m) * n2 + (at + 1u) / m); }
+      st_h_word(o, w, n, ld_f(a, (at % m) * n2 + at / m), x1);
     }
     return;
   }
@@ -822,6 +996,20 @@ fn op_gather(p : u32) {
         b[k] = v;
       }
       st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let at = w * 2u + k;
+        if (at < n) {
+          let want = ld_i(ix, pick(d_len(ix), at / rest));
+          if (want >= 0 && u32(want) < n0) { xs[k] = ld_f(a, u32(want) * rest + at % rest); }
+        }
+      }
+      st_h_word(o, w, n, xs[0], xs[1]);
     }
     return;
   }
@@ -874,6 +1062,20 @@ fn op_gather_row(p : u32) {
     }
     return;
   }
+  if (odt == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(m); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let i = w * 2u + k;
+        if (i < m) {
+          let c = ld_i(ix, pick(d_len(ix), i));
+          if (c >= 0 && u32(c) < n2) { xs[k] = ld_f(a, i * n2 + u32(c)); }
+        }
+      }
+      st_h_word(o, w, m, xs[0], xs[1]);
+    }
+    return;
+  }
   for (var i : u32 = tid; i < m; i = i + lanes) {
     let c = ld_i(ix, pick(d_len(ix), i));
     let ok = c >= 0 && u32(c) < n2;
@@ -919,6 +1121,30 @@ fn op_scatter(p : u32, is_add : bool) {
         b[q] = v;
       }
       st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  if (odt == DT_BF16) {
+    // Two cells a word, each summed in f32 and rounded once.
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var q : u32 = 0u; q < 2u; q = q + 1u) {
+        let at = w * 2u + q;
+        if (at >= n) { continue; }
+        var acc = ld_f(a, at);
+        let dest = at / rest;
+        let within = at % rest;
+        for (var k : u32 = 0u; k < slots; k = k + 1u) {
+          let want = ld_i(ix, k);
+          if (want < 0 || u32(want) >= n0 || u32(want) != dest) { continue; }
+          var lane = k * rest + within;
+          if (scalar) { lane = 0u; }
+          let x = ld_f(src, lane);
+          if (is_add) { acc = acc + x; } else { acc = x; }
+        }
+        xs[q] = acc;
+      }
+      st_h_word(o, w, n, xs[0], xs[1]);
     }
     return;
   }
@@ -985,6 +1211,22 @@ fn op_mask_apply(p : u32) {
   var width : u32 = 1u;
   if (rank > 0u) { width = d_dim(a, rank - 1u); }
   let mw = d_len(m);
+  if (d_dtype(o) == DT_BF16) {
+    for (var w2 : u32 = tid; w2 < h_words(n); w2 = w2 + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let j = w2 * 2u + k;
+        if (j >= n) { continue; }
+        let c = j % max(width, 1u);
+        let w = c >> 5u;
+        var word : u32 = 0u;
+        if (w < mw) { word = ld_u(m, w); }
+        xs[k] = select(NEG_INF(), ld_f(a, j), ((word >> (c & 31u)) & 1u) != 0u);
+      }
+      st_h_word(o, w2, n, xs[0], xs[1]);
+    }
+    return;
+  }
   for (var j : u32 = tid; j < n; j = j + lanes) {
     let c = j % max(width, 1u);
     let w = c >> 5u;
@@ -1148,7 +1390,7 @@ fn key_less(ah : u32, al : u32, bh : u32, bl : u32) -> bool {
 }
 
 fn sort_cell(buf : u32, n : u32, c : u32) -> u32 {
-  return cfg_temporary + ((buf * n) + c) * 2u;
+  return tmp_base + ((buf * n) + c) * 2u;
 }
 
 fn sort_rows_of(p : u32, a : u32) -> u32 {
@@ -1222,10 +1464,10 @@ fn op_sort_round(p : u32, r : u32) {
   }
 }
 
-fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }
-fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }
-fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }
-fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }
+fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }
+fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }
+fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }
+fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }
 
 const PIVOT_UNROLL : u32 = 32u;
 
@@ -1288,6 +1530,21 @@ fn op_sort_desc_finish(p : u32) {
   let o = p_o0(p);
   let o1 = p_o1(p);
   let n = d_len(a);
+  if (d_dtype(o) == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(n); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let t = w * 2u + k;
+        if (t >= n) { continue; }
+        let idx = hld(sort_cell(0u, n, t) + 1u);
+        if (idx >= n) { pie_fault(OUT_OF_BOUNDS, idx, n); continue; }
+        xs[k] = ld_f(a, idx);
+        st_u(o1, t, idx);
+      }
+      st_h_word(o, w, n, xs[0], xs[1]);
+    }
+    return;
+  }
   for (var t : u32 = tid; t < n; t = t + lanes) {
     let idx = hld(sort_cell(0u, n, t) + 1u);
     if (idx >= n) { pie_fault(OUT_OF_BOUNDS, idx, n); continue; }
@@ -1306,6 +1563,23 @@ fn op_top_k_finish(p : u32) {
 
   let want = min(p_imm(p), len);
   let total = rows * want;
+  if (d_dtype(o) == DT_BF16) {
+    for (var w : u32 = tid; w < h_words(total); w = w + lanes) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let j = w * 2u + k;
+        if (j >= total) { continue; }
+        let row = j / max(want, 1u);
+        let t = j - row * want;
+        let idx = hld(sort_cell(0u, n, row * len + t) + 1u);
+        if (idx >= len) { pie_fault(OUT_OF_BOUNDS, idx, len); continue; }
+        xs[k] = ld_f(a, row * len + idx);
+        st_u(o1, j, idx);
+      }
+      st_h_word(o, w, total, xs[0], xs[1]);
+    }
+    return;
+  }
   for (var j : u32 = tid; j < total; j = j + lanes) {
     let row = j / max(want, 1u);
     let t = j - row * want;
@@ -1516,7 +1790,7 @@ var<workgroup> sel_wg_key : array<u32, 1024>;
 var<workgroup> sel_wg_idx : array<u32, 1024>;
 var<workgroup> sel_wg_skip : u32;
 
-fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }
+fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }
 fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
 fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
 fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }
@@ -1882,6 +2156,7 @@ fn ptir_reduce_level(p : u32, level : u32) {
     case 0x31u: { op_reduce_level(p, RED_MAX, level); }
     case 0x32u: { op_reduce_level(p, RED_MIN, level); }
     case 0x33u: { op_reduce_level(p, RED_ARGMAX, level); }
+    case 0x34u: { op_reduce_level(p, RED_GUMBEL, level); }
     default: {}
   }
 }
@@ -1893,6 +2168,7 @@ fn ptir_reduce_finish(p : u32) {
     case 0x31u: { op_reduce_finish(p, RED_MAX); }
     case 0x32u: { op_reduce_finish(p, RED_MIN); }
     case 0x33u: { op_reduce_finish(p, RED_ARGMAX); }
+    case 0x34u: { op_reduce_finish(p, RED_GUMBEL); }
     default: {}
   }
 }
@@ -1920,5 +2196,5 @@ fn ptir_is_sort(p : u32) -> bool {
 
 fn ptir_is_reduce(p : u32) -> bool {
   let tag = p_tag(p);
-  return tag >= 0x30u && tag <= 0x33u;
+  return tag >= 0x30u && tag <= 0x34u;
 }

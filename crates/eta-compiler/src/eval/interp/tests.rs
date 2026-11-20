@@ -238,3 +238,161 @@ fn numeric_contract_argmax_and_topk() {
     assert_eq!(argmax_ordered(&[16_777_216u32, 16_777_217]), 1);
     assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
 }
+
+/// The interpreter's rounding rule ([`eval_op::narrows`]) names `bf16`
+/// exactly where eta-ir's types do, for every op over a bf16 value 0, an
+/// f32 value 1, a u32 value 2, a bool value 3 (each `[4]`) and an f32
+/// scalar 4.
+#[test]
+fn the_interpreter_narrows_where_the_ir_types_bf16() {
+    use eta_ir::infer::{BodyCtx, body_types};
+    use eta_ir::types::Predicate;
+    let chans = [
+        ValueType::vector(4, Dtype::Bf16),
+        ValueType::vector(4, Dtype::F32),
+        ValueType::vector(4, Dtype::U32),
+        ValueType::vector(4, Dtype::Bool),
+        ValueType::scalar(Dtype::F32),
+    ];
+    let ctx = BodyCtx {
+        channel_types: &chans,
+        n_names: 1,
+    };
+    let cases = [
+        Op::Exp(0),
+        Op::Neg(0),
+        Op::Cast { value: 1, dtype: Dtype::Bf16 },
+        Op::Cast { value: 0, dtype: Dtype::I32 },
+        Op::Add(0, 1),
+        Op::Add(1, 1),
+        Op::Rem(1, 0),
+        Op::Gt(0, 1),
+        Op::Select { cond: 3, a: 1, b: 0 },
+        Op::Select { cond: 3, a: 1, b: 1 },
+        Op::ReduceSum(0),
+        Op::ReduceMax(0),
+        Op::ReduceArgmax(0),
+        Op::CumSum(0),
+        Op::CumProd(0),
+        Op::SortDesc(0),
+        Op::TopK { input: 0, k: 2 },
+        Op::PivotThreshold { input: 0, predicate: Predicate::CummassLe(4) },
+        Op::Gather { src: 0, idx: 2 },
+        Op::ScatterAdd { base: 0, idx: 2, vals: 1 },
+        Op::ScatterSet { base: 1, idx: 2, vals: 0 },
+        Op::Broadcast { value: 0, shape: eta_ir::types::Shape::vector(4) },
+        Op::Reshape { value: 0, shape: eta_ir::types::Shape::matrix(2, 2) },
+    ];
+    for op in cases {
+        let mut ops: Vec<Op> = (0..5).map(Op::ChanTake).collect();
+        ops.push(op.clone());
+        let types = body_types(&ops, &ctx).unwrap_or_else(|e| panic!("{op:?}: {e}"));
+        let typed = types[5].dtype == Dtype::Bf16;
+        let bf16 = |id: u32| chans[id as usize].dtype == Dtype::Bf16;
+        assert_eq!(eval_op::narrows(&op, bf16), typed, "{op:?}");
+    }
+}
+
+/// `gumbel_argmax` over f32 logits is the draw it fuses, bit for bit:
+/// `reduce_argmax(select(keep, logits * scale, -inf) + rng_keyed(state))`.
+#[test]
+fn gumbel_argmax_is_the_draw_it_fuses() {
+    use eta_ir::types::Shape;
+    let n = 997usize;
+    let x: Vec<f32> = (0..n).map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 9.0).collect();
+    let keep: Vec<bool> = (0..n).map(|i| i % 5 != 3).collect();
+    for seed in 0..40u32 {
+        let vals = vec![
+            Value::F32(x.clone()),
+            Value::Bool(keep.clone()),
+            Value::F32(vec![1.0 / 0.7]),
+            Value::U32(vec![seed, seed * 3 + 1]),
+        ];
+        let ty = |id: u32| match id {
+            0 => ValueType::vector(n as u32, Dtype::F32),
+            1 => ValueType::vector(n as u32, Dtype::Bool),
+            2 => ValueType::scalar(Dtype::F32),
+            _ => ValueType::vector(2, Dtype::U32),
+        };
+        let fused = eval_op(
+            &Op::GumbelArgmax {
+                logits: 0,
+                keep: 1,
+                scale: 2,
+                state: 3,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap();
+        let Evaled::One(Value::I32(fused)) = fused else {
+            panic!("an index")
+        };
+        let noise = eval_op(
+            &Op::RngKeyed {
+                state: 3,
+                shape: Shape::vector(n as u32),
+                kind: RngKind::Gumbel,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap();
+        let Evaled::One(Value::F32(noise)) = noise else {
+            panic!("noise")
+        };
+        let perturbed: Vec<f32> = (0..n)
+            .map(|i| {
+                let scaled = if keep[i] { x[i] * (1.0 / 0.7) } else { f32::NEG_INFINITY };
+                scaled + noise[i]
+            })
+            .collect();
+        assert_eq!(fused, vec![argmax_row(&perturbed)], "seed {seed}");
+    }
+}
+
+/// Over a bf16 row the draw is unbiased between two tokens whose logits
+/// round to one bf16 value: each perturbed lane is f32, so neither the
+/// rounding nor the lowest index decides it.
+#[test]
+fn a_bf16_draw_splits_a_tie_evenly() {
+    let row = [24.0f32, 24.0];
+    let bits: Vec<u16> = row.iter().map(|&a| eta_ir::types::bf16_bits(a)).collect();
+    let (mut second, trials) = (0u32, 4000u32);
+    for seed in 0..trials {
+        let vals = vec![
+            Value::Bf16(bits.clone()),
+            Value::Bool(vec![true]),
+            Value::F32(vec![1.0]),
+            Value::U32(vec![seed, 7]),
+        ];
+        let ty = |id: u32| match id {
+            0 => ValueType::vector(2, Dtype::Bf16),
+            1 => ValueType::scalar(Dtype::Bool),
+            2 => ValueType::scalar(Dtype::F32),
+            _ => ValueType::vector(2, Dtype::U32),
+        };
+        let Evaled::One(Value::I32(i)) = eval_op(
+            &Op::GumbelArgmax {
+                logits: 0,
+                keep: 1,
+                scale: 2,
+                state: 3,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap() else {
+            panic!("an index")
+        };
+        second += i[0] as u32;
+    }
+    let share = f64::from(second) / f64::from(trials);
+    assert!((share - 0.5).abs() < 0.03, "token 1 drawn {share:.3} of the time");
+}

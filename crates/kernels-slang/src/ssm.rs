@@ -7,7 +7,7 @@ use dtype::Dtype;
 use crate::encode::{Arg, ArgValue};
 use crate::encode::{nonzero, refuse};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Segments, Tensor, words_of};
+use crate::tensor::{Segments, Tensor, words_of};
 
 pub mod conv1d;
 pub mod gdn_prep;
@@ -182,12 +182,95 @@ fn csr_lanes(op: &'static str, what: &str, indptr: Tensor) -> Result<u32, Error>
     }
 }
 
-fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
-    csr_lanes(op, "query", x.indptr)
+/// Refuses a committed dispatch of more lanes than its work plane holds:
+/// a fire's lanes take as many dispatches as the plane holds lanes.
+fn work_holds(op: &'static str, work: Tensor, csr: Csr) -> Result<(), Error> {
+    if csr.lanes > work.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "a dispatch of {} lanes, and the work plane holds {}",
+                csr.lanes, work.rows
+            ),
+        ));
+    }
+    Ok(())
 }
 
-fn window_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
-    csr_lanes(op, "window", indptr)
+/// The rows a window's dispatch walks of the fire's whole row tensors: from
+/// fire row `row0`, `rows` of them. The tensors are bound whole, one view
+/// whatever window a fire cuts; the kernels add `row0` to each row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSpan {
+    pub row0: u32,
+    pub rows: u32,
+}
+
+impl RowSpan {
+    /// Every row of `t`, from row 0.
+    #[must_use]
+    pub fn whole(t: Tensor) -> RowSpan {
+        RowSpan {
+            row0: 0,
+            rows: t.rows,
+        }
+    }
+
+    /// The span's rows, refused where they pass any of `held` (tensors
+    /// whose rows it indexes) or are none.
+    pub(crate) fn rows(&self, op: &'static str, held: &[Tensor]) -> Result<u32, Error> {
+        let rows = nonzero(op, "rows", self.rows)?;
+        let end = u64::from(self.row0) + u64::from(rows);
+        for t in held {
+            if end > u64::from(t.rows) {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the window's rows {}..{end} pass the {} rows bound",
+                        self.row0, t.rows
+                    ),
+                ));
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// A window's query CSR in the fire's packed windows table: the table is
+/// bound whole (one view whatever window a fire cuts) and the window's
+/// `lanes + 1` boundaries lie from int `at` of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Csr {
+    pub table: Tensor,
+    pub at: u32,
+    pub lanes: u32,
+}
+
+impl Csr {
+    /// The lanes the CSR spans, at least one, refused where its boundaries
+    /// pass the table or are not i32.
+    fn lanes(&self, op: &'static str) -> Result<u32, Error> {
+        let lanes = csr_lanes(
+            op,
+            "window",
+            Tensor {
+                rows: self.lanes + 1,
+                ..self.table
+            },
+        )?;
+        let held = u64::from(self.table.rows) * u64::from(self.table.width);
+        if u64::from(self.at) + u64::from(lanes) + 1 > held {
+            return Err(refuse(
+                op,
+                format!(
+                    "the window's {} boundaries from int {} pass the {held} ints of its table",
+                    lanes + 1,
+                    self.at
+                ),
+            ));
+        }
+        Ok(lanes)
+    }
 }
 
 /// The rows of a fire, at least one.

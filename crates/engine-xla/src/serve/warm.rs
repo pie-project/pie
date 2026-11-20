@@ -220,30 +220,52 @@ impl Shell {
         let least = pad.prefill_floor;
         // (A fire that prefills pads its decodes to `pad.rung`: a half rung of
         // the ladder is a decode-only fire's.)
+        // (A fire of decodes beside prompts pads them to the decode lanes its
+        // prompts' rung leaves, `canonical_pads`: one decode count a row
+        // bucket and prompt rung.)
         for &d in buckets
             .iter()
             .filter(|&&d| d <= pad.rung(lanes_cap) && pad.rung(d) == d)
         {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
+                // The bucket filled: decodes, prompt pad lanes, the rest. At
+                // the top also a full fire, the runtime's widest rows,
+                // decodes and all (where the profile keeps padding room past
+                // the widest rows, that one lands a bucket lower, and a fire
+                // its pads carry into the top found no program: every
+                // composition the load states laid, `Shell::mixed_lanes`,
+                // has one).
+                let filled = b.saturating_sub(d + host);
+                let mut totals = vec![filled];
+                if b == top && widest.saturating_sub(d) != filled {
+                    totals.push(widest.saturating_sub(d));
+                }
+                for rows in totals {
+                    if rows < 2 || d == 0 || d != self.mixed_decode_lanes(host) {
+                        continue;
+                    }
+                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    lanes.push(fresh(prefill, rows));
+                    shapes.push(lanes);
+                }
+                // (the wide fires below: the widest rows at the top, else
+                // the bucket filled)
                 let rows = if b == top {
-                    // A full fire: the runtime's widest rows, decodes and all.
                     widest.saturating_sub(d)
                 } else {
-                    b.saturating_sub(d + host)
+                    filled
                 };
-                if rows < 2 || (b != top && d + rows + host > b) {
-                    continue;
-                }
-                let mut lanes = vec![fresh(decode, 1); d as usize];
-                lanes.push(fresh(prefill, rows));
-                shapes.push(lanes);
                 let mut p = pad.next(host);
                 while p + d <= max_lanes {
+                    if d != self.mixed_decode_lanes(p) {
+                        p = pad.next(p);
+                        continue;
+                    }
                     let n = p / 2;
                     // the prompts' rows: the bucket, less the decodes, the
                     // one-row lanes their count pads with and the rest lane
                     let r = b.saturating_sub(d + p - n);
-                    if b != top && r >= 2 * n {
+                    if r >= 2 * n {
                         let mut lanes = vec![fresh(decode, 1); d as usize];
                         lanes.extend(std::iter::repeat_n(fresh(prefill, r / n), n as usize));
                         lanes[d as usize].rows += r % n;
@@ -261,7 +283,10 @@ impl Shell {
                 if b >= widest && widest >= 4096 {
                     for n in [17u32, 33] {
                         let each = rows / n;
-                        if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
+                        if each >= 2
+                            && d + 2 * n <= self.budgets.tokens.max_lanes
+                            && d == self.mixed_decode_lanes(pad.rung(n + 1).max(host))
+                        {
                             let mut lanes = vec![fresh(decode, 1); d as usize];
                             lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
                             // A full fire's prompts fill the widest rows, and the

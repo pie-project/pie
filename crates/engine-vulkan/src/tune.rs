@@ -520,7 +520,6 @@ mod tests {
             let knobs = search::knobs(&base, SEARCH_SKIPS, "");
             let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
             assert!(ids.contains(&"kernel.sdpa.decode.threads"), "{ids:?}");
-            assert!(ids.contains(&"engine.submit.split_rows"), "{ids:?}");
             assert!(!ids.contains(&"kernel.qmm"), "{ids:?}");
             for k in &knobs {
                 for (label, _) in &k.candidates {

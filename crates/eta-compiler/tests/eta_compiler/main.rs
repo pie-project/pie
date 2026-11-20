@@ -9,6 +9,7 @@ mod traces;
 
 mod a_streamed_step_publishes_the_nodes_it_stores;
 mod a_whole_read_is_one_view_of_its_region;
+mod bf16_emits_two_byte_storage;
 mod cuda_region_rejection;
 mod emitted_source_shape;
 mod emitter_version;

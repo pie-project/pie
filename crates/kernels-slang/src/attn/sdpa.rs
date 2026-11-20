@@ -74,6 +74,12 @@ pub struct Tables {
     /// byte; a row stating none reads no plane. The masks are data: a fire
     /// of masked and unmasked rows runs the kernels a fire of either runs.
     pub mask_words: Tensor,
+    /// The row of the tables, the queries and the output the window's first
+    /// row is: they are bound whole, the same views whatever window a fire
+    /// cuts, and the kernels add it to each row they index.
+    pub row0: u32,
+    /// The window's rows, which the kernels launch over.
+    pub rows: u32,
 }
 
 /// A row's boundary stating no mask: past every key (`sdpa.slang`'s
@@ -111,6 +117,16 @@ impl Tables {
                 ),
             ));
         }
+        let end = u64::from(tables.row0) + u64::from(tables.rows);
+        if end > u64::from(tables.positions.rows) || end > u64::from(tables.mask_words.rows) {
+            return Err(refuse(
+                op,
+                format!(
+                    "the window's rows {}..{end} pass the fire tables' {} positions and {}                      mask entries",
+                    tables.row0, tables.positions.rows, tables.mask_words.rows
+                ),
+            ));
+        }
         if tables.positions.rows != tables.request_of_token.rows {
             return Err(refuse(
                 op,
@@ -129,12 +145,14 @@ struct Shape {
     q_heads: u32,
     kv_heads: u32,
     rows: u32,
+    row0: u32,
     window: i32,
 }
 
 fn shape(
     op: &'static str,
     q: Tensor,
+    tables: &Tables,
     pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
@@ -178,10 +196,23 @@ fn shape(
         None => 0,
         Some(w) => stated(op, nonzero(op, "the sliding extent", w)?)?,
     };
+    let rows = nonzero(op, "rows", tables.rows)?;
+    if u64::from(tables.row0) + u64::from(rows) > u64::from(q.rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the window's rows {}..{} pass the {} query rows bound",
+                tables.row0,
+                u64::from(tables.row0) + u64::from(rows),
+                q.rows
+            ),
+        ));
+    }
     Ok(Shape {
         q_heads,
         kv_heads,
-        rows: nonzero(op, "rows", q.rows)?,
+        rows,
+        row0: tables.row0,
         window,
     })
 }
@@ -208,6 +239,17 @@ fn args(
             ),
         ));
     }
+    if u64::from(shape.row0) + u64::from(shape.rows) > u64::from(o.rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the window's rows {}..{} pass the {} output rows bound",
+                shape.row0,
+                u64::from(shape.row0) + u64::from(shape.rows),
+                o.rows
+            ),
+        ));
+    }
     let mut args = vec![
         q.arg(),
         o.arg_mut(),
@@ -231,18 +273,20 @@ fn args(
         sm_scale.arg(),
         shape.window.arg(),
         stated(op, shape.q_heads)?.arg(),
+        shape.row0.arg(),
     ]);
     Ok(args)
 }
 
 fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, Error> {
     let held = u64::from(lse.rows) * u64::from(lse.width);
-    if lse.dtype != Dtype::F32 || held < u64::from(shape.rows) * u64::from(shape.q_heads) {
+    let rows = u64::from(shape.row0) + u64::from(shape.rows);
+    if lse.dtype != Dtype::F32 || held < rows * u64::from(shape.q_heads) {
         return Err(refuse(
             op,
             format!(
                 "the log-sum-exp plane is {} x {} {:?}, and it holds an f32 a head a row ({} x {})",
-                lse.rows, lse.width, lse.dtype, shape.rows, shape.q_heads
+                lse.rows, lse.width, lse.dtype, rows, shape.q_heads
             ),
         ));
     }
@@ -339,7 +383,7 @@ pub fn decode(
     split: Option<Split>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
-    let shape = shape(OP, q, pool, window, head_dim)?;
+    let shape = shape(OP, q, tables, pool, window, head_dim)?;
     if let Some(names) = ctx.naming() {
         // The rows and the keys a fire holds say whether it splits: where
         // the planes are there to split into, either walk, then the fold.
@@ -452,6 +496,7 @@ fn decode_split(
         stated(OP, shape.rows)?.arg(),
         stated(OP, shape.q_heads)?.arg(),
         stated(OP, head_dim)?.arg(),
+        shape.row0.arg(),
     ]);
     ctx.fire(
         fold_kernel(lse.is_some())
@@ -489,7 +534,7 @@ pub fn selected(
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.selected";
-    let shape = shape(OP, q, pool, None, head_dim)?;
+    let shape = shape(OP, q, tables, pool, None, head_dim)?;
     if selection.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -501,12 +546,14 @@ pub fn selected(
     }
     let ratio = nonzero(OP, "the block width this reader expands", ratio)?;
     let top_k = nonzero(OP, "the selection budget", selection.width)?;
-    if selection.rows < shape.rows {
+    if u64::from(selection.rows) < u64::from(shape.row0) + u64::from(shape.rows) {
         return Err(refuse(
             OP,
             format!(
-                "the selection seats {} rows and this reader launches {}",
-                selection.rows, shape.rows
+                "the selection seats {} rows and this reader reads rows {}..{}",
+                selection.rows,
+                shape.row0,
+                u64::from(shape.row0) + u64::from(shape.rows)
             ),
         ));
     }
@@ -531,7 +578,7 @@ pub fn prefill(
     lse: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
-    let shape = shape(OP, q, pool, window, head_dim)?;
+    let shape = shape(OP, q, tables, pool, window, head_dim)?;
     let (lanes, tile) = match (tactic.tile_lanes, tactic.tile_rows) {
         (..=16, _) => (16, 16),
         (_, 32..) => (32, 32),
@@ -738,6 +785,8 @@ mod tests {
             request_of_token: tensor(4, staged, 1, Dtype::I32),
             mask: tensor(5, 1, 1, Dtype::U8),
             mask_words: tensor(6, staged, 2, Dtype::U32),
+            row0: 0,
+            rows: staged,
         };
         let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);
         let pool = KvPool::planes(

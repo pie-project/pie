@@ -77,6 +77,39 @@ impl SlotFile {
         self.file.read_exact_at(stage, self.offset(slot, stage)?)
     }
 
+    /// Writes `stage`, an `ALIGN`-aligned buffer of a multiple of `ALIGN`
+    /// bytes, at byte `at` (a multiple of `ALIGN`) within the slots: a span
+    /// of a slot, for an engine that lays several of its own in one.
+    pub fn write_span(&self, at: u64, stage: &[u8]) -> io::Result<()> {
+        self.file.write_all_at(stage, self.span(at, stage)?)
+    }
+
+    /// Reads the span at byte `at` into `stage`, as [`Self::write_span`].
+    pub fn read_span(&self, at: u64, stage: &mut [u8]) -> io::Result<()> {
+        self.file.read_exact_at(stage, self.span(at, stage)?)
+    }
+
+    fn span(&self, at: u64, stage: &[u8]) -> io::Result<u64> {
+        let len = u64::from(self.slots) * self.stride as u64;
+        let align = ALIGN as u64;
+        if at % align != 0
+            || stage.len() % ALIGN != 0
+            || stage.as_ptr().align_offset(ALIGN) != 0
+            || at.checked_add(stage.len() as u64).is_none_or(|end| end > len)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} bytes at byte {at} is not an aligned span of the file's {} x {}",
+                    stage.len(),
+                    self.slots,
+                    self.stride
+                ),
+            ));
+        }
+        Ok(at)
+    }
+
     fn offset(&self, slot: u32, stage: &[u8]) -> io::Result<u64> {
         if slot >= self.slots
             || stage.len() != self.stride

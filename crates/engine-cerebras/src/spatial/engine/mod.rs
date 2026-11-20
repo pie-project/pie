@@ -267,6 +267,7 @@ impl Engine for Spatial {
             classes: facts.classes(),
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
         };
         self.facts = Some(facts);
         self.caps = Some(caps.clone());

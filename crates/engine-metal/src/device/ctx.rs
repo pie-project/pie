@@ -311,6 +311,7 @@ impl Context {
                 need: bytes,
                 have: self.max_buffer,
             })?;
+            crate::diag::made("buffer", bytes);
             self.device
                 .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
                 .ok_or(Fault::Device {
@@ -340,6 +341,7 @@ impl Context {
                 have: self.max_buffer,
             });
         }
+        crate::diag::made("no-copy buffer", bytes);
         // SAFETY: the caller's contract is exactly this call's — an aligned
         // live mapping of `span` readable bytes that outlives the buffer —
         // and a nil deallocator is what leaves the pages theirs.
@@ -370,6 +372,7 @@ impl Context {
             self.empty
                 .get_or_init(|| {
                     RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::diag::made("empty buffer", 1);
                     self.device
                         .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
                         .expect("one byte of shared storage")

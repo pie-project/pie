@@ -18,14 +18,34 @@ pub const WORKGROUP: u32 = 256;
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
 pub const SELECT_WORDS: u32 = 10320;
 
-/// What WGSL's kernels take of a lane's temporary area past the
-/// whole-value rule (`eta_exec::stage_temporaries`): nothing, by statement.
-/// Its sorts, reduction levels and pivots run over the whole value in
-/// place, in at most four words an element of it (`sort_cell`, `tmp_v`,
-/// `pivot_*` in the runtime: two buffers of two words), the rule's figure,
-/// and its one-row select keeps its state in the [`SELECT_WORDS`] reserved
-/// below the area, not in it.
-pub const TEMPORARY_NEEDS: &[crate::codegen::temporary::TemporaryNeed] = &[];
+/// The bytes the runtime keeps in a lane's temporary area while it runs a
+/// node of `tag` whose first argument holds `len` elements in `rows` rows,
+/// as its cells lay them: a sort, a top-k or a pivot two buffers of two
+/// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
+/// lie within them), a reduction two buffers of two words a group of each
+/// row its first level folds (`tmp_v`; 32 elements, a `gumbel_argmax`'s 8:
+/// `steps::first_fan`), any other node none. Saturates past a
+/// `u64`, which no scratch holds.
+#[must_use]
+pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
+    if is_sort(tag) {
+        len.saturating_mul(16)
+    } else if is_reduce(tag) {
+        let rows = if rows == 0 { 1 } else { rows };
+        rows.saturating_mul((len / rows).div_ceil(steps::first_fan(tag)))
+            .saturating_mul(16)
+    } else {
+        0
+    }
+}
+
+/// Whether a node of `tag` runs the one-row select, which keeps its state
+/// in the [`SELECT_WORDS`] just below the temporary area (`sel_at`): a
+/// pivot's select ladder.
+#[must_use]
+pub const fn selects(tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD
+}
 
 const BARRIER: &str = "  storageBarrier();\n";
 
@@ -93,6 +113,7 @@ pub fn emits(tag: u8) -> bool {
             | tags::REDUCE_MAX
             | tags::REDUCE_MIN
             | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
             | tags::CUMSUM
             | tags::CUMPROD
             | tags::BROADCAST
@@ -189,6 +210,7 @@ fn reduce_kind(tag: u8) -> Option<&'static str> {
         tags::REDUCE_MAX => Some("RED_MAX"),
         tags::REDUCE_MIN => Some("RED_MIN"),
         tags::REDUCE_ARGMAX => Some("RED_ARGMAX"),
+        tags::GUMBEL_ARGMAX => Some("RED_GUMBEL"),
         _ => None,
     }
 }
@@ -345,11 +367,14 @@ pub struct Step {
 impl Step {
     /// What the step's uniform holds.
     #[must_use]
-    pub fn uniform(&self) -> StepUniform {
+    /// The step's uniform, its node's temporary area at word `area` of the
+    /// stage's heap as the bind lays it.
+    pub fn uniform(&self, area: u32) -> StepUniform {
         StepUniform {
             node: self.node,
             rung: self.rung,
             selector: self.selector,
+            area,
         }
     }
 }
@@ -373,7 +398,22 @@ pub struct Stepwise {
 /// states, in the two pool segments a backend binds whole (the instance's
 /// slots, its heap), and its config from its config table: one bind group
 /// serves every instance whose slots and heap share two segments.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 4;
+/// 5: a node keeps its temporaries in an area of its own, at the heap word
+/// its step's record carries (`pie_step.area`), in place of the stage's one
+/// area its config table named.
+/// 6: a reshape that covers its source is read as its source whatever the
+/// stage's channel slots number, and launches nothing.
+/// 7: `bf16` values (`DT_BF16`, wire tag 5): loaded a half of a word,
+/// computed in f32, and stored rounded to nearest even a word at a time,
+/// an invocation owning both elements of every word it writes.
+/// 8: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
+/// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
+/// the scale and the keyed rng, with no noise row.
+/// 9: a `gumbel_argmax`'s first level folds 8 lanes a job, not 32
+/// (`red_fan0`), so its hashes spread over four times the invocations.
+/// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
+/// (the temperature's reciprocal) where it divided by a divisor.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 10;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
@@ -400,6 +440,7 @@ fn reduce_name(reduce: Reduce) -> &'static str {
         Reduce::Max => "RED_MAX",
         Reduce::Min => "RED_MIN",
         Reduce::Argmax => "RED_ARGMAX",
+        Reduce::GumbelArgmax => "RED_GUMBEL",
     }
 }
 
@@ -491,7 +532,7 @@ pub fn step_module(entry: &str, call: &str) -> String {
     source.push('\n');
     // The words [`StepUniform::bytes`] lays.
     source.push_str(
-        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n  \
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n  \
          status_base : u32,\n  descs_base : u32,\n  params_base : u32,\n  offs_base : u32,\n  \
          cfg_base : u32,\n  heap_base : u32,\n  pad1 : u32,\n  pad2 : u32,\n}\n",
     );
@@ -530,13 +571,14 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
     // The step's bases, its heap bound ([`RUNTIME`]'s `hld` / `hst`) and
-    // its temporaries' first word, read once.
+    // its node's temporary area's first word, read once: the area from the
+    // record, as uniform as the node, with no table load ahead of it.
     source.push_str(
         "  b_status = pie_step.status_base;\n  b_descs = pie_step.descs_base;\n  \
          b_params = pie_step.params_base;\n  b_offs = pie_step.offs_base;\n  \
          b_heap = pie_step.heap_base;\n  \
          lim_heap = tables[pie_step.cfg_base + CFG_HEAP_WORDS];\n  \
-         cfg_temporary = tables[pie_step.cfg_base + CFG_TEMPORARY];\n",
+         tmp_base = pie_step.area;\n",
     );
     source.push_str(call);
     source.push_str("  heap_flush();\n}\n");
@@ -1029,25 +1071,42 @@ mod stepwise_tests {
         );
     }
 
-    /// The runtime's temporaries are what [`TEMPORARY_NEEDS`] states of
-    /// them: two buffers of two words an element of the value a step runs
-    /// over (four words, the whole-value rule's figure), and the select's
-    /// state below the area.
+    /// The runtime's temporaries are what [`super::temporary_bytes`] states
+    /// of them: a sort's, top-k's or pivot's two buffers of two words an
+    /// element of the value it runs over, a reduction's two buffers of two
+    /// words a 32-element group of a row, and a pivot's select state below
+    /// the area ([`super::selects`]).
     #[test]
-    fn the_runtimes_temporaries_lie_within_the_whole_value_rule() {
-        assert!(super::TEMPORARY_NEEDS.is_empty());
+    fn the_runtimes_temporaries_lie_within_what_each_node_states() {
+        use super::{selects, temporary_bytes};
+        for tag in [tags::SORT_DESC, tags::TOP_K, tags::PIVOT_THRESHOLD] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
+        }
+        for tag in [tags::REDUCE_SUM, tags::REDUCE_MAX, tags::REDUCE_MIN, tags::REDUCE_ARGMAX] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
+        }
+        // A draw's first level folds 8 lanes a job.
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1), 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
+        assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
+        assert!(selects(tags::PIVOT_THRESHOLD));
+        assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
-            "return cfg_temporary + ((buf * n) + c) * 2u;",
-            "return cfg_temporary + (buf * span + row * stride + c) * 2u;",
-            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }",
-            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }",
-            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }",
-            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }",
-            "fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }",
+            "return tmp_base + ((buf * n) + c) * 2u;",
+            "return tmp_base + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
         ] {
             assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
         }
-        let named = RUNTIME.matches("return cfg_temporary").count();
+        let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
         assert_eq!(named, 7, "a temporary cell this statement has not read");
         assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
     }
@@ -1301,5 +1360,172 @@ mod select_tests {
         // State, a histogram per workgroup, a tally pair per workgroup, and
         // the candidates' keys and indices.
         assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
+    }
+}
+
+/// The runtime's `bf16` stores, read from its text: no two invocations
+/// write one word, and every op whose result may be `bf16` stores it so.
+#[cfg(test)]
+mod bf16_store_tests {
+    use super::RUNTIME;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Each runtime function's name and body.
+    fn functions() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in RUNTIME.lines() {
+            if let Some(rest) = line.strip_prefix("fn ") {
+                if let Some(done) = current.take() {
+                    out.push(done);
+                }
+                let name = rest.split('(').next().unwrap_or("").trim().into();
+                current = Some((name, String::new()));
+            } else if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        out.extend(current);
+        out
+    }
+
+    /// The ops whose result may be `bf16` (`eta_ir::infer`): every one
+    /// that stores a float result an element at a time, but a reduction's,
+    /// a product's, an rng's, a constant's and an iota's, which are never
+    /// `bf16`.
+    const NEVER_BF16: &[&str] = &[
+        "op_reduce_finish",
+        "op_matmul",
+        "op_rng",
+        "op_const",
+        "op_iota",
+    ];
+
+    #[test]
+    fn a_bf16_word_is_one_invocation_s() {
+        let functions = functions();
+        let mut storers = 0;
+        for (name, body) in &functions {
+            let stores_h = body.contains("st_h_word(");
+            if name == "st_h_word" {
+                // The one store: a whole word, both halves.
+                assert!(body.contains("hst(base(v) + w, packed)"), "{body}");
+                assert!(body.contains("w * 2u + 1u < n"), "the padding half is the value's");
+                continue;
+            }
+            if stores_h {
+                storers += 1;
+                // An invocation strides over words (or rows of whole words,
+                // the scan), never over elements.
+                let by_words = body.contains("< h_words(") && body.contains("= w + lanes")
+                    || body.contains("< h_words(") && body.contains("= w2 + lanes");
+                let by_groups = name == "op_cumulative" && body.contains("g < groups");
+                assert!(
+                    by_words || by_groups,
+                    "`{name}` stores bf16 words but does not hand an invocation whole words"
+                );
+                // A bf16 branch stores nothing an element at a time.
+                let branch = body
+                    .split("DT_BF16")
+                    .nth(1)
+                    .and_then(|rest| rest.split("return;").next())
+                    .unwrap_or("");
+                for single in ["st_f(o", "st_as_f(o", "st_raw(o", "st_i(o", "hst(base(o)"] {
+                    assert!(
+                        !branch.contains(single),
+                        "`{name}`'s bf16 branch stores an element alone (`{single}`)"
+                    );
+                }
+            } else if (body.contains("st_f(o,") || body.contains("st_as_f(o,"))
+                && !NEVER_BF16.contains(&name.as_str())
+            {
+                panic!("`{name}` stores a float result with no bf16 word store");
+            }
+        }
+        assert!(storers >= 12, "{storers} ops store bf16 words");
+    }
+
+    #[test]
+    fn the_runtime_rounds_as_the_ir_does() {
+        // The runtime's rounding, transcribed: it must be eta_ir's.
+        fn wgsl_round(x: f32) -> u32 {
+            let b = x.to_bits();
+            if (b & 0x7FFF_FFFF) > 0x7F80_0000 {
+                return ((b >> 16) | 0x40) & 0xFFFF;
+            }
+            b.wrapping_add(0x7FFF + ((b >> 16) & 1)) >> 16
+        }
+        assert!(RUNTIME.contains("return (b + 0x7FFFu + ((b >> 16u) & 1u)) >> 16u;"));
+        assert!(RUNTIME.contains("return ((b >> 16u) | 0x40u) & 0xFFFFu;"));
+        assert!(RUNTIME.contains("const DT_BF16 : u32 = 5u;"));
+        assert_eq!(u32::from(eta_ir::types::WIRE_BF16), 5);
+        let mut x = 0x0001_2345u32;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let f = f32::from_bits(x);
+            assert_eq!(
+                wgsl_round(f),
+                u32::from(eta_ir::types::bf16_bits(f)),
+                "{x:#010x}"
+            );
+        }
+    }
+
+    /// A word-pair store over a value of `n` elements, as the runtime's
+    /// loops run it with `lanes` invocations: every element stored once, by
+    /// the invocation that owns its word, and nothing past the value's words.
+    #[test]
+    fn word_pairs_cover_a_value_of_any_length_once() {
+        for n in [1u32, 2, 3, 7, 8, 151_935, 151_936] {
+            for lanes in [1u32, 3, 256] {
+                let words = n.div_ceil(2);
+                let mut owner = alloc::vec![u32::MAX; words as usize];
+                let mut stored = alloc::vec![0u8; n as usize];
+                for tid in 0..lanes.min(words) {
+                    let mut w = tid;
+                    while w < words {
+                        assert_eq!(owner[w as usize], u32::MAX, "word {w} written twice");
+                        owner[w as usize] = tid;
+                        stored[(w * 2) as usize] += 1;
+                        if w * 2 + 1 < n {
+                            stored[(w * 2 + 1) as usize] += 1;
+                        }
+                        w += lanes;
+                    }
+                }
+                assert!(stored.iter().all(|&c| c == 1), "n {n}, lanes {lanes}");
+                assert!(owner.iter().all(|&o| o != u32::MAX));
+            }
+        }
+    }
+
+    /// The scan's invocations: a row of whole words each, or two rows
+    /// where a row is an odd number of elements, so a word two rows share
+    /// is one invocation's.
+    #[test]
+    fn a_scan_s_groups_begin_and_end_on_a_word() {
+        for len in [1u32, 2, 3, 5, 8] {
+            for rows in [1u32, 2, 3, 7] {
+                let group = if len % 2 == 0 { 1 } else { 2 };
+                let total = rows * len;
+                let groups = rows.div_ceil(group);
+                let mut owner = alloc::vec![u32::MAX; total.div_ceil(2) as usize];
+                for g in 0..groups {
+                    let first = g * group * len;
+                    let last = (first + group * len).min(total);
+                    assert_eq!(first % 2, 0, "a group begins on a word");
+                    assert!(last % 2 == 0 || last == total, "a group ends on a word");
+                    for at in first..last {
+                        let w = (at / 2) as usize;
+                        assert!(owner[w] == u32::MAX || owner[w] == g, "word {w} shared");
+                        owner[w] = g;
+                    }
+                }
+            }
+        }
     }
 }

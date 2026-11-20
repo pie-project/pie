@@ -954,8 +954,11 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             launch_ns: None,
             few_row_tflops: None,
             workgroups_per_core: None,
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         }
     );
 
@@ -1019,12 +1022,12 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`tile_tflops_by_rows` and `vector_tflops_by_rows`, not `flops`",
+            "`submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`vector_tflops_by_rows`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`attn_tflops_by_rows_keys`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",
@@ -1042,6 +1045,10 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         (
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",
+        ),
+        (
+            "[rates]\nattn_tflops_by_rows_keys = [[512, [[4096, 0.3]]], [256, [[4096, 0.2]]]]\n",
+            "a non-empty list of [rows, [[keys, TFLOP/s], ...]] pairs, ascending in rows",
         ),
         ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
     ] {
@@ -1163,4 +1170,21 @@ fn a_stale_inline_table_takes_only_itself() {
     assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
     assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
     assert!(!kept.contains("group_at") && !kept.contains("grouped"), "{kept}");
+}
+
+/// `[rates] product_ns` reads back as it was written, and a load's newly
+/// measured shapes join the saved ones, its own replacing a shape both state.
+#[test]
+fn product_times_read_back_and_accumulate() {
+    use profile::fire::{ProductTime, Rates};
+    let t = |kind, m, kernel, ns| ProductTime { kind, rows: 6144, k: 1024, m, kernel, ns, spread: 40.0 };
+    let saved = Rates { product_ns: Some(vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6100.0)]), ..Rates::default() };
+    let text = format!("api = 1\n{}", saved.toml());
+    let read = profile::Registry::new("t", &[], &[]).parse(&text, "p.toml", profile::Strict::User).unwrap();
+    assert_eq!(read.tuned.rates, saved, "{text}");
+    let measured = Rates { product_ns: Some(vec![t(3, 8, 0, 7000.0), t(3, 4, 1, 6000.0)]), ..Rates::default() };
+    let merged = measured.over(saved).product_ns.unwrap();
+    assert_eq!(merged, vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6000.0), t(3, 8, 0, 7000.0)]);
+    let twice = "api = 1\n[rates]\nproduct_ns = [[3, 6144, 1024, 4, 0, 1.0, 0.0], [3, 6144, 1024, 4, 0, 2.0, 0.0]]\n";
+    assert!(refusal(twice).contains("each shape once"));
 }

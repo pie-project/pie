@@ -211,6 +211,9 @@ fn setup(tag: &str, lanes: u32) -> Option<(Loaded, engine::program::ProgramId, S
 /// span's rungs read as before any bound, and one fire of 64 lanes, each
 /// its own instance's, serves every lane its own row: on Vulkan through
 /// the one heap the pair's passes share, on wgpu through each instance's.
+/// The binds and the passes reserve nothing on the device or the host: a
+/// session's status and step records lie in its slots, and a pass stages
+/// and reads back through room the load laid.
 #[test]
 fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
     const LANES: u32 = 64;
@@ -248,6 +251,12 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
             .act_chunks
     };
     let before = span(&engine);
+    // Every buffer a guest session uses was laid at the load: binding 64
+    // and firing them reserves nothing.
+    let takes = |engine: &backend::Engine| {
+        engine_gpu::backend::Context::books(engine.loaded().expect("loaded").device()).takes()
+    };
+    let loaded_takes = takes(&engine);
 
     let bound: Vec<(InstanceId, Vec<ChannelId>)> = (0..u64::from(LANES))
         .map(|k| {
@@ -256,15 +265,27 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
         })
         .collect();
     assert_eq!(span(&engine), before, "64 bound guests leave the span's rungs as they were");
+    assert_eq!(takes(&engine), loaded_takes, "64 guest sessions bind with nothing reserved");
 
     let word = trace.facts.word(&Request::new(ROWS, false));
+    // The first fire of 64 lanes may grow the load's readout seat, which
+    // is not a guest's; the fire after it reserves nothing.
+    let mut fired_takes = loaded_takes;
     for round in 0..2u32 {
+        if round == 1 {
+            fired_takes = takes(&engine);
+        }
         let tokens: Vec<u32> = (0..LANES).map(|k| (k + round) % super::outputs::VOCAB).collect();
         let ids = fire(&mut engine, word, t_input, &bound, &tokens);
         let want: Vec<i32> = tokens.iter().map(|&token| argmax(&planes, token)).collect();
         assert_eq!(ids, want, "round {round}: each of 64 lanes reads its own row");
     }
     assert_eq!(span(&engine), before, "the fires leave the span's rungs as they were");
+    assert_eq!(
+        takes(&engine),
+        fired_takes,
+        "a fire of 64 guest sessions' passes reserves nothing"
+    );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3,10 +3,10 @@
 
 use dtype::Dtype;
 
-use super::{Committed, StatePool, head_width, requests, rows, window_lanes};
+use super::{Committed, Csr, StatePool, head_width, rows};
 use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, Tier, dtype_dispatch, nonzero, stated};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Tensor};
+use crate::tensor::Tensor;
 
 const KDA: &str = "ssm/kda.slang";
 
@@ -126,7 +126,7 @@ pub fn kda(
                 y.arg_mut(),
             ][..],
             &state.piece_args(true),
-            &[heads, head_dim, eps, floor],
+            &[heads, head_dim, eps, floor, 0u32.arg()],
         ]
         .concat(),
     )
@@ -136,24 +136,25 @@ pub fn kda(
 pub fn kda_chunked(
     ctx: &Ctx<'_>,
     tier: Tier,
-    mixed: RaggedTensor,
+    mixed: Tensor,
+    csr: Csr,
     gates: &Gates,
     state: &StatePool,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.kda_chunked";
-    let entry = dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => "ssm_kda_chunked_bf16" });
-    gates.check(OP, mixed.data, y)?;
+    let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "ssm_kda_chunked_bf16" });
+    gates.check(OP, mixed, y)?;
     let [f, b, dt_bias, a_log] = gates.planes();
     let [heads, head_dim, eps, floor] = gates.scalars(OP)?;
     ctx.fire(
         Fire::at(KDA, state.entry(OP, entry)?)
             .tier(tier)
-            .apply(gates.grid(requests(OP, mixed)?)),
+            .apply(gates.grid(csr.lanes(OP)?)),
         &[
             &[
-                mixed.data.arg(),
-                mixed.indptr.arg(),
+                mixed.arg(),
+                csr.table.arg(),
                 f,
                 b,
                 dt_bias,
@@ -163,7 +164,8 @@ pub fn kda_chunked(
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
-            &[heads, head_dim, eps, floor],
+            &[heads, head_dim, eps, floor, 0u32.arg()],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),
@@ -177,26 +179,28 @@ pub fn kda_committed(
     ctx: &Ctx<'_>,
     tier: Tier,
     mixed: Tensor,
-    indptr: Tensor,
+    csr: Csr,
     committed: &Committed,
     gates: &Gates,
     state: &StatePool,
     work: Tensor,
     y: Tensor,
+    row0: u32,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.kda_committed";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "ssm_kda_committed_bf16" });
     gates.check(OP, mixed, y)?;
+    super::work_holds(OP, work, csr)?;
     let [f, b, dt_bias, a_log] = gates.planes();
     let [heads, head_dim, eps, floor] = gates.scalars(OP)?;
     ctx.fire(
         Fire::at(KDA, state.entry(OP, entry)?)
             .tier(tier)
-            .apply(gates.grid(window_lanes(OP, indptr)?)),
+            .apply(gates.grid(csr.lanes(OP)?)),
         &[
             &[
                 mixed.arg(),
-                indptr.arg(),
+                csr.table.arg(),
                 committed.replay.arg(),
                 committed.commit.arg(),
                 committed.slots.arg(),
@@ -215,7 +219,9 @@ pub fn kda_committed(
                 head_dim,
                 eps,
                 floor,
+                row0.arg(),
             ],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),

@@ -88,11 +88,26 @@ struct Params {
     int head_dim;
     float norm_eps;
     float gate_floor;
+    // The fire row the dispatch's row 0 is (the extended rows of the lanes
+    // a committed fire walked in earlier dispatches; else 0).
+    uint row0;
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    // The window's CSR lies at int `indptr_at` of the fire's packed windows
+    // table, which is bound whole: one view whatever window a fire cuts.
+    int indptr_at;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+// The window's CSR boundary `i`.
+int csr(uint i) {
+    return indptr[uint(params.indptr_at) + i];
+}
+#endif
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
@@ -109,7 +124,8 @@ groupshared int kda_hi;
 groupshared int kda_keep;
 
 // Token `t` of head `h`, its state at `state_base`.
-void token(uint tid, uint t, uint h, uint state_base) {
+void token(uint tid, uint window_t, uint h, uint state_base) {
+    uint t = params.row0 + window_t;
     uint d = uint(params.head_dim);
     uint wide = uint(params.heads) * d;
     uint row = t * 3u * wide;
@@ -198,11 +214,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_COMMITTED)
     uint lane = uint(params.lane0) + r;
     if (tid == 0u) {
-        int begin = indptr[r];
+        int begin = csr(r);
         for (uint j = 0; j < r; j++) {
             begin += replay[uint(params.lane0) + j];
         }
-        int span = (indptr[r + 1] - indptr[r]) + replay[lane];
+        int span = (csr(r + 1) - csr(r)) + replay[lane];
         kda_lo = begin;
         kda_hi = pie_state_none(lane) ? begin : begin + span;
         kda_keep = min(commit[lane], span);
@@ -217,7 +233,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         return;
     }
     uint bank = pie_state_atom(lane, h, cells);
-    uint state_base = (lane * uint(params.heads) + h) * cells;
+    // The work plane holds the dispatch's lanes, the lane's at its own `r`.
+    uint state_base = (r * uint(params.heads) + h) * cells;
     for (uint i = tid; i < cells; i += uint(PIE_GROUP_X)) {
         work[state_base + i] = rstate[bank + i];
     }
@@ -245,8 +262,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 #elif defined(PIE_CHUNKED)
     if (tid == 0u) {
-        kda_lo = indptr[r];
-        kda_hi = indptr[r + 1];
+        kda_lo = csr(r);
+        kda_hi = csr(r + 1);
     }
     GroupMemoryBarrierWithGroupSync();
     // Read uniformly: they bound the token loop.

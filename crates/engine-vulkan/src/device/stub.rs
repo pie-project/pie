@@ -128,6 +128,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn lay_staging(&self) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -147,6 +151,10 @@ impl Frame {
     }
 
     pub fn flush(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
+    pub fn submit_segment(&self) -> Result<()> {
         Err(Fault::Deviceless)
     }
 

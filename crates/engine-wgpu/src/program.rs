@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{
-    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
-    RingFacts,
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind, RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -240,7 +239,7 @@ impl Guests {
                     let spans: Vec<Vec<engine_gpu::serve::ReadSpan>> = (lane..lane + lanes as u32)
                         .map(|lane| {
                             (layout.iter())
-                                .filter(|span| span.lane == lane && span.rows > 0)
+                                .filter(|span| span.lane == lane && span.rows > 0 && span.seated)
                                 .copied()
                                 .collect()
                         })
@@ -499,9 +498,11 @@ impl Plane {
         #[cfg(not(feature = "wgpu"))]
         let _ = (place, layout);
         #[cfg(feature = "wgpu")]
-        let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
-            Refusal::Program(format!("program {} does not bind: {why}", binding.program))
-        })?;
+        let session = self
+            .build_session(place, binding, &plan, layout)
+            .map_err(|why| {
+                Refusal::Program(format!("program {} does not bind: {why}", binding.program))
+            })?;
         // The instance's room is fresh, its pair's where none holds that
         // taking: both are another owner's bytes until cleared.
         #[cfg(feature = "wgpu")]
@@ -1028,7 +1029,11 @@ impl Plane {
                     }
                 }
             }
-            crate::guest::session::instance_table_sizes(&plan.package.plans, compiled.all(), stride)
+            engine_gpu::guest::session::instance_table_sizes(
+                &plan.package.plans,
+                compiled.all(),
+                stride,
+            )
         };
         #[cfg(not(feature = "wgpu"))]
         let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);

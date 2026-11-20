@@ -255,6 +255,7 @@ impl Pipelines {
         }
         descriptor.setSupportIndirectCommandBuffers(true);
         descriptor.setLabel(Some(&super::ctx::nsstring(fire.entrypoint)));
+        crate::diag::made(&format!("pipeline {}", fire.entrypoint), 0);
         let pipeline = device
             .newComputePipelineStateWithDescriptor_options_reflection_error(
                 &descriptor,
@@ -332,6 +333,7 @@ impl Pipelines {
         let options = super::ctx::compile_options();
         let library = device
             .newLibraryWithSource_options_error(&source, Some(&options))
+            .inspect(|_| crate::diag::made("kernel library", 0))
             .map_err(|error| Fault::Shader {
                 file: fire.file,
                 entrypoint: fire.entrypoint,

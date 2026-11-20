@@ -177,10 +177,15 @@ impl Rung {
         self.bytes
     }
 
-    /// Whether a fire of `rows` fits this rung's carve.
-    fn holds(&self, rows: FireRows) -> bool {
+    /// Whether a fire of `rows` carrying `carried` recurrent rows ahead of
+    /// its own fits this rung: its own rows and its carried rows each at
+    /// most the rung's tokens (`engine::fire::ActivationRows`).
+    fn holds(&self, rows: FireRows, carried: u32) -> bool {
         let tokens = u64::from(self.tokens);
-        rows.tokens <= tokens && rows.lanes <= tokens && rows.readouts <= tokens
+        rows.tokens <= tokens
+            && rows.lanes <= tokens
+            && rows.readouts <= tokens
+            && carried <= self.tokens
     }
 }
 
@@ -291,15 +296,15 @@ impl<B: Backend> Span<B> {
         Ok(self.placed()?.0)
     }
 
-    /// The carve a fire of `rows` takes: the widest whose bytes lie in the
-    /// chunks stated for the narrowest rung that holds it
-    /// ([`Span::widen`]).
+    /// The carve a fire of `rows` carrying `carried` recurrent rows takes:
+    /// the widest whose bytes lie in the chunks stated for the narrowest
+    /// rung that holds it ([`Span::widen`]).
     #[must_use]
-    pub fn rung_of(&self, rows: FireRows) -> usize {
+    pub fn rung_of(&self, rows: FireRows, carried: u32) -> usize {
         let narrowest = self
             .rungs
             .iter()
-            .position(|rung| rung.holds(rows))
+            .position(|rung| rung.holds(rows, carried))
             .unwrap_or(self.rungs.len().saturating_sub(1));
         self.widest.get(narrowest).copied().unwrap_or(narrowest)
     }

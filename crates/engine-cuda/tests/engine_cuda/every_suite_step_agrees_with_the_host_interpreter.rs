@@ -33,6 +33,10 @@ enum Check {
     Exact,
     /// Within this many ulps of the larger of one and the expected value.
     Scaled(u32),
+    /// bf16 values within this many bf16 ulps of the expected value: what a
+    /// value built on `exp` or `log` keeps where the device's and the host's
+    /// f32 differ by an ulp at a rounding boundary.
+    Bf16Ulps(u32),
 }
 
 struct Suite {
@@ -381,10 +385,40 @@ fn wire_value(bytes: &[u8], like: &Value) -> Value {
                 .map(|i| bytes[i / 8] >> (i % 8) & 1 == 1)
                 .collect(),
         ),
+        Value::Bf16(_) => Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect(),
+        ),
     }
 }
 
+/// The size of one bf16 ulp at `x`.
+fn bf16_ulp(x: f32) -> f32 {
+    let exponent = ((x.to_bits() >> 23) & 0xff) as i32;
+    f32::from_bits(((exponent - 7).max(1) as u32) << 23)
+}
+
 fn agree(got: &Value, want: &Value, check: Check) -> Result<(), String> {
+    if let (Value::Bf16(g), Value::Bf16(w), Check::Bf16Ulps(n)) = (got, want, check) {
+        let wide = |b: u16| eta_ir::types::bf16_to_f32(b);
+        let bad = g.iter().zip(w).position(|(&x, &y)| {
+            let (x, y) = (wide(x), wide(y));
+            !(x.is_nan() && y.is_nan()) && x != y && (x - y).abs() > n as f32 * bf16_ulp(y)
+        });
+        return match bad {
+            None if g.len() == w.len() => Ok(()),
+            None => Err(format!("{} elements against {}", g.len(), w.len())),
+            Some(i) => Err(format!(
+                "[{i}]: device {:e} vs interpreter {:e}",
+                wide(g[i]),
+                wide(w[i])
+            )),
+        };
+    }
     if let (Value::F32(g), Value::F32(w), Check::Scaled(n)) = (got, want, check) {
         let bad = g.iter().zip(w).position(|(&x, &y)| {
             !(x.is_nan() && y.is_nan())
@@ -419,6 +453,11 @@ fn agree(got: &Value, want: &Value, check: Check) -> Result<(), String> {
             .zip(w)
             .position(|(x, y)| x != y)
             .map(|i| format!("[{i}]: device {} vs interpreter {}", g[i], w[i])),
+        (Value::Bf16(g), Value::Bf16(w)) => g
+            .iter()
+            .zip(w)
+            .position(|(x, y)| x != y)
+            .map(|i| format!("[{i}]: device {:#06x} vs interpreter {:#06x}", g[i], w[i])),
         (Value::Bool(g), Value::Bool(w)) => {
             let wrong = g.iter().zip(w).filter(|(x, y)| x != y).count();
             g.iter().zip(w).position(|(x, y)| x != y).map(|i| {
@@ -614,6 +653,386 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
     }
     plane.close_program(program).expect("the program closes");
     failures
+}
+
+/// `channel` under `name` in the suite being built, kept owned.
+fn noted(name: &'static str, channel: Channel) -> Channel {
+    NAMES.with(|names| names.borrow_mut().push((name, channel.gid())));
+    channel
+}
+
+/// bf16 guest values over `rows` rows of an odd vocabulary: a cast in,
+/// elementwise ops mixing an f32 constant, the bf16 softmax and
+/// log-softmax, reductions, a scan over rows of odd length, a gather of
+/// rows, a scatter-add hitting one cell twice, a transpose, a top-k and an
+/// argmax, each landed at its own dtype. The values are an odd number of
+/// elements, so a value's last word holds padding and, past one row, a
+/// row's elements start mid-word.
+fn bf16_battery(rows: u32) -> Suite {
+    let vocab = 1_001u32;
+    let n = rows * vocab;
+    let bf =
+        |name: &'static str, len: u32| named(name, Channel::new([len], dtype::bf16).capacity(4));
+    let narrow_out = bf("narrow", n);
+    let scaled_out = bf("scaled", n);
+    let exp_out = bf("exp", n);
+    let softmax_out = bf("softmax", n);
+    let log_softmax_out = bf("log_softmax", n);
+    let cumsum_out = bf("cumsum", n);
+    let gathered_out = bf("gathered", n);
+    let scattered_out = bf("scattered", n);
+    let transposed_out = bf("transposed", n);
+    let selected_out = bf("selected", n);
+    let top_out = bf("top", rows * 5);
+    let top_ids_out = named("top_ids", Channel::new([rows * 5], dtype::u32).capacity(4));
+    let stats_out = named("stats", Channel::new([3 * rows], dtype::f32).capacity(4));
+    let argmax_out = named("argmax", Channel::new([rows], dtype::i32).capacity(4));
+    let mut b = builder(vocab, rows);
+    b.stage(Stage::Epilogue, move || {
+        let logits = reshape(intrinsics::output(0, "logits"), [rows, vocab]);
+        let x = cast(&logits, dtype::bf16);
+        let flat = |t: &Tensor| reshape(t, [n]);
+        narrow_out.put(flat(&x));
+        let scaled = &x * 0.5f32 + 1.0f32;
+        scaled_out.put(flat(&scaled));
+        exp_out.put(flat(&exp(&scaled)));
+        softmax_out.put(flat(&softmax(&x)));
+        log_softmax_out.put(flat(&log_softmax(&x)));
+        let odd = reshape(&x, [7 * rows, 143]);
+        cumsum_out.put(flat(&cumsum(&odd)));
+        let reversed = (iota(7 * rows) * 0u32 + (7 * rows - 1)) - iota(7 * rows);
+        gathered_out.put(flat(&gather(&odd, &reversed)));
+        let cells = reshape(&x, [n]);
+        let hit = min_elem(iota(3), 1u32);
+        scattered_out.put(scatter_add(&cells, &hit, 1.0f32));
+        transposed_out.put(flat(&transpose(&odd)));
+        selected_out.put(flat(&select(gt(&x, 0.0f32), &x, f32::NEG_INFINITY)));
+        let (top, ids) = top_k(&x, 5);
+        top_out.put(reshape(&top, [rows * 5]));
+        top_ids_out.put(reshape(&ids, [rows * 5]));
+        let stats =
+            [reduce_sum(&x), reduce_max(&x), reduce_sum(&exp(&x))].map(|s| reshape(s, [rows, 1]));
+        let k = broadcast(reshape(iota(3), [1, 3]), [rows, 3]);
+        let pick = |i: u32| broadcast(&stats[i as usize], [rows, 3]);
+        stats_out.put(reshape(
+            select(
+                eq(&k, 0u32),
+                pick(0),
+                select(eq(&k, 1u32), pick(1), pick(2)),
+            ),
+            [3 * rows],
+        ));
+        argmax_out.put(reshape(cast(reduce_argmax(&scaled), dtype::i32), [rows]));
+    });
+    for channel in [
+        narrow_out,
+        scaled_out,
+        exp_out,
+        softmax_out,
+        log_softmax_out,
+        cumsum_out,
+        gathered_out,
+        scattered_out,
+        transposed_out,
+        selected_out,
+        top_out,
+        top_ids_out,
+        stats_out,
+        argmax_out,
+    ] {
+        channel.note_host_take();
+    }
+    Suite {
+        names: take_names(),
+        name: format!("bf16 battery ({rows} row(s) of {vocab})"),
+        traced: b.build().expect("the bf16 battery traces"),
+        rows,
+        vocab,
+        seeds: port_seeds(rows),
+        outputs: vec![
+            ("narrow", Dtype::Bf16, Check::Exact),
+            ("scaled", Dtype::Bf16, Check::Exact),
+            ("exp", Dtype::Bf16, Check::Bf16Ulps(1)),
+            ("softmax", Dtype::Bf16, Check::Bf16Ulps(1)),
+            ("log_softmax", Dtype::Bf16, Check::Bf16Ulps(1)),
+            ("cumsum", Dtype::Bf16, Check::Exact),
+            ("gathered", Dtype::Bf16, Check::Exact),
+            ("scattered", Dtype::Bf16, Check::Exact),
+            ("transposed", Dtype::Bf16, Check::Exact),
+            ("selected", Dtype::Bf16, Check::Exact),
+            ("top", Dtype::Bf16, Check::Exact),
+            ("top_ids", Dtype::U32, Check::Exact),
+            ("stats", Dtype::F32, Check::Scaled(64)),
+            ("argmax", Dtype::I32, Check::Exact),
+        ],
+    }
+}
+
+/// The SDK's standard sampler's decode fire of `shape`
+/// (`eta_dsl::sampler::decode`) over Qwen3's vocabulary, its knobs in
+/// channels, as the built-in inferlets build it: its vocabulary-sized
+/// values bf16.
+fn standard(name: &str, shape: &eta_dsl::sampler::Shape) -> Suite {
+    use eta_dsl::sampler::{self, Knobs, Slots};
+    let vocab = QWEN_VOCAB;
+    let mut seeds = port_seeds(1);
+    let mut knob = |label: &'static str, on: bool, value: Value| {
+        on.then(|| {
+            let channel = match &value {
+                Value::U32(v) => Channel::from(v.clone()),
+                Value::F32(v) => Channel::from(v.clone()),
+                _ => unreachable!("a knob is f32 or u32"),
+            };
+            seeds.push((label, value));
+            named(label, channel)
+        })
+    };
+    // The temperature rides as its reciprocal, a knob like the rest.
+    let inverse = knob(
+        "inverse_temperature",
+        shape.temperature,
+        Value::F32(vec![sampler::inverse_temperature(0.7)]),
+    );
+    let top_p = knob("top_p", shape.top_p, Value::F32(vec![0.9]));
+    let top_k = knob("top_k", shape.top_k, Value::U32(vec![40]));
+    let min_p = knob("min_p", shape.min_p, Value::F32(vec![0.05]));
+    let repetition = knob("repetition", shape.repetition, Value::F32(vec![1.3]));
+    let frequency = knob("frequency", shape.frequency, Value::F32(vec![0.4]));
+    let presence = knob("presence", shape.presence, Value::F32(vec![0.6]));
+    let penalized = shape.repetition || shape.frequency || shape.presence;
+    let hist = penalized.then(|| {
+        // A few tokens seen, some of them several times.
+        let counts: Vec<f32> = (0..vocab)
+            .map(|t| [0.0, 0.0, 0.0, 1.0, 0.0, 3.0][t as usize % 6])
+            .collect();
+        let present: Vec<f32> = (0..vocab)
+            .map(|t| if t % 11 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        seeds.push(("counts", Value::F32(counts.clone())));
+        seeds.push(("present", Value::F32(present.clone())));
+        (
+            noted("counts", Channel::from(counts)),
+            noted("present", Channel::from(present)),
+        )
+    });
+    let logprobs = shape.logprobs.map(|top| {
+        let values = noted("logprobs", Channel::new([1 + top], dtype::f32).capacity(4));
+        values.note_host_take();
+        let ids = (top > 0).then(|| {
+            let ids = noted("logprob_ids", Channel::new([top], dtype::i32).capacity(4));
+            ids.note_host_take();
+            ids
+        });
+        (values, ids)
+    });
+    let rng_seed = [0x9e37u32, 1];
+    seeds.push(("rng", Value::U32(rng_seed.to_vec())));
+    let slots: &'static Slots = Box::leak(Box::new(Slots {
+        rng: noted("rng", Channel::from(rng_seed)),
+        hist,
+        mask: None,
+        logprobs,
+    }));
+    let tok_in = named("tok_in", Channel::new([1], dtype::i32).capacity(4));
+    let out = named("out", Channel::new([1], dtype::i32).capacity(4));
+    out.note_host_take();
+    tok_in.note_host_take();
+    let logprob_top = shape.logprobs;
+    let mut b = builder(vocab, 1);
+    b.stage(Stage::Epilogue, move || {
+        let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
+        let knobs = Knobs {
+            temperature: t(inverse),
+            top_p: t(top_p),
+            top_k: t(top_k),
+            min_p: t(min_p),
+            repetition: t(repetition),
+            frequency: t(frequency),
+            presence: t(presence),
+            logprobs: logprob_top,
+        };
+        sampler::decode(vocab, &knobs, slots, tok_in, out);
+    });
+    let mut outputs = vec![("out", Dtype::I32, Check::Exact)];
+    if let Some(top) = shape.logprobs {
+        outputs.push(("logprobs", Dtype::F32, Check::Scaled(1 << 16)));
+        if top > 0 {
+            outputs.push(("logprob_ids", Dtype::I32, Check::Exact));
+        }
+    }
+    Suite {
+        names: take_names(),
+        name: format!("standard {name}"),
+        traced: b.build().expect("the standard sampler traces"),
+        rows: 1,
+        vocab,
+        seeds,
+        outputs,
+    }
+}
+
+/// `beam-search`'s bf16 step at `beams` wide, as the example runs it: the
+/// candidates bf16, each beam's score relative to the best, the absolute
+/// scores carried in f32.
+fn beam_bf16(beams: u32) -> Suite {
+    let vocab = QWEN_VOCAB;
+    let mut initial = vec![f32::NEG_INFINITY; beams as usize];
+    initial[0] = 0.0;
+    let scores = named("scores", Channel::from(initial.clone()));
+    let out = named("out", Channel::new([beams], dtype::i32).capacity(4));
+    let out_par = named("out_par", Channel::new([beams], dtype::u32).capacity(4));
+    let out_scr = named("out_scr", Channel::new([beams], dtype::f32).capacity(4));
+    let greedy = named("greedy", Channel::new([beams], dtype::i32).capacity(4));
+    let (b, v) = (beams, vocab);
+    let mut builder = builder(vocab, beams);
+    builder.stage(Stage::Epilogue, move || {
+        let logits = cast(
+            reshape(intrinsics::output(0, "logits"), [b, v]),
+            dtype::bf16,
+        );
+        let carried = scores.take();
+        let best = reduce_max(&carried);
+        let relative = cast(&carried - &best, dtype::bf16);
+        let cand = broadcast(reshape(relative, [b, 1]), [b, v]) + log_softmax(&logits);
+        let (s, i) = top_k(reshape(cand, [b * v]), b);
+        let s = cast(&s, dtype::f32) + &best;
+        scores.put(&s);
+        out.put(cast(&i % v, dtype::i32));
+        out_par.put(&i / v);
+        out_scr.put(&s);
+        greedy.put(reshape(cast(reduce_argmax(&logits), dtype::i32), [b]));
+    });
+    for channel in [out, out_par, out_scr, greedy] {
+        channel.note_host_take();
+    }
+    let mut seeds = port_seeds(beams);
+    seeds.push(("scores", Value::F32(initial)));
+    Suite {
+        names: take_names(),
+        name: format!("beam-search bf16 ({beams} beam(s))"),
+        traced: builder.build().expect("the bf16 beam step traces"),
+        rows: beams,
+        vocab,
+        seeds,
+        outputs: vec![
+            ("out", Dtype::I32, Check::Exact),
+            ("out_par", Dtype::U32, Check::Exact),
+            ("out_scr", Dtype::F32, Check::Scaled(1 << 16)),
+            ("greedy", Dtype::I32, Check::Exact),
+        ],
+    }
+}
+
+/// `gumbel_argmax` over a bf16 row at a temperature, over `rows` rows of
+/// Qwen3's vocabulary: every lane kept, or a top-k (40) and top-p (0.9) keep
+/// mask of the row's softmax; the key advances fire to fire. Each perturbed
+/// lane is made in f32 in the reduction, as the interpreter makes it.
+fn bf16_draw(rows: u32, truncated: bool) -> Suite {
+    let vocab = QWEN_VOCAB;
+    let temperature = 0.7f32;
+    let rng = named("rng", Channel::from([0x51edu32, 3]));
+    let tok_out = named("tok_out", Channel::new([rows], dtype::i32).capacity(4));
+    let mut b = builder(vocab, rows);
+    b.stage(Stage::Epilogue, move || {
+        let r = rng.take();
+        let logits = cast(
+            reshape(intrinsics::output(0, "logits"), [rows, vocab]),
+            dtype::bf16,
+        );
+        let token = if truncated {
+            let probs = softmax(&logits / temperature);
+            let keep = and(
+                pivot_threshold(&probs, rank_le(40u32)),
+                pivot_threshold(&probs, cummass_le(0.9f32)),
+            );
+            gumbel_argmax(&logits, keep, temperature, &r)
+        } else {
+            gumbel_argmax(&logits, true, temperature, &r)
+        };
+        tok_out.put(reshape(cast(token, dtype::i32), [rows]));
+        rng.put(&r + iota(2));
+    });
+    tok_out.note_host_take();
+    let mut seeds = port_seeds(rows);
+    seeds.push(("rng", Value::U32(vec![0x51ed, 3])));
+    Suite {
+        names: take_names(),
+        name: format!(
+            "bf16 gumbel_argmax ({rows} row(s), {})",
+            if truncated {
+                "top-k + top-p"
+            } else {
+                "every lane"
+            }
+        ),
+        traced: b.build().expect("the bf16 draw traces"),
+        rows,
+        vocab,
+        seeds,
+        outputs: vec![("tok_out", Dtype::I32, Check::Exact)],
+    }
+}
+
+/// Every suite whose vocabulary-sized values are bf16.
+fn bf16_suites() -> Vec<Suite> {
+    let penalized = eta_dsl::sampler::Shape {
+        temperature: true,
+        top_p: true,
+        min_p: true,
+        repetition: true,
+        frequency: true,
+        presence: true,
+        ..eta_dsl::sampler::Shape::GREEDY
+    };
+    let mut suites = vec![
+        bf16_battery(1),
+        bf16_battery(3),
+        bf16_draw(1, false),
+        bf16_draw(1, true),
+        bf16_draw(3, false),
+        bf16_draw(3, true),
+    ];
+    suites.extend(
+        eta_dsl::sampler::STANDARD
+            .iter()
+            .map(|(name, shape)| standard(name, shape)),
+    );
+    suites.push(standard("penalized min-p + top-p", &penalized));
+    suites.push(standard(
+        "penalized top-p",
+        &eta_dsl::sampler::Shape {
+            min_p: false,
+            ..penalized
+        },
+    ));
+    suites.extend([beam_bf16(1), beam_bf16(4)]);
+    suites
+}
+
+/// The bf16 suites on the device against the host interpreter, which
+/// computes in f32 and rounds each bf16 store once: every value either
+/// computes without `exp` or `log` is the interpreter's bit for bit.
+#[test]
+fn every_bf16_suite_step_agrees_with_the_host_interpreter() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let context = Context::bind(0, None).expect("a CUDA context");
+    let failures: Vec<String> = bf16_suites()
+        .iter()
+        .flat_map(|suite| {
+            let failed = run(&context, suite);
+            eprintln!("{}: {} disagreement(s)", suite.name, failed.len());
+            failed
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} disagreement(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
