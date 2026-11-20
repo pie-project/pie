@@ -492,16 +492,21 @@ pub struct Seat {
 }
 
 /// What a fire's recording is keyed by: everything its kernels bind and every
-/// host move it makes. A carried lane's plan is the staged tables' data, read
-/// on the device, and keys nothing: its decodes replay one recording whatever
-/// rows they carry.
+/// host move it makes. A lane's replay and commit lengths are the staged
+/// tables' data, read on the device, and key nothing: only the plans of lanes
+/// whose rows the host moves (an extended lane's gathers and scatter) do. A
+/// carried lane moves none, so its decodes replay one recording whatever rows
+/// they carry, and a folding lane beside them keys none either.
 impl std::fmt::Debug for Seat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let moved: Vec<(usize, &LanePlan)> = self
             .lanes
             .iter()
             .enumerate()
-            .filter(|(lane, _)| !self.carried.get(*lane).copied().unwrap_or(false))
+            .filter(|(lane, plan)| {
+                !self.carried.get(*lane).copied().unwrap_or(false)
+                    && (!plan.gathers.is_empty() || plan.scatter.is_some())
+            })
             .collect();
         f.debug_struct("Seat")
             .field("moved", &moved)
