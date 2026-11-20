@@ -869,6 +869,12 @@ and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the l
 misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
 built-ins' guest programs before ready is GPU's queued item.
 
+XLA beam heads (Port::Parents), laid at load before ready: 7 width rungs (1..64), 4.4 s on a cold
+v6e census boot compiled in turn (10.8 s side by side: libtpu's compiles contend), ~0 warm (disk
+cache). Each rung costs 0.36-1.23 s. Not the donated pool: maintenance programs over the same
+50M-row pool compile in 17-45 ms cold. The floor is the head's own HLO (the step, the resolve and
+the copy loop); shrinking it means a smaller step, not a smaller signature.
+
 ## F44. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
 
 A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
