@@ -6,7 +6,7 @@
 # model's checkpoint at its full width.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/adapters.poem", "peft", "peft_banks")
 load("//lib/blocks.poem", "attention", "swiglu")
 
 LLAMA = template("llama")
@@ -95,7 +95,6 @@ def layout(id, deploy):
     kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -107,8 +106,7 @@ def layout(id, deploy):
             up = weight([d.inter, hidden], proj),
             down = weight([hidden, d.inter], proj),
             kv = kv(),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            lora = peft_banks(hidden, q_width, kv_width, d.inter),
         )
 
     mtp = None
@@ -233,7 +231,6 @@ TRANSFORMERS = [
 # The forward of Llama 3.1 / 3.3: pre-norm layers of full grouped-query
 # attention, q and k rotated in full (neox halves) at llama3-scaled
 # frequencies, and a SwiGLU MLP. A row with an adapter adds its LoRA
-# correction to the attention's output.
 
 def tap(mtp, layer, y, fused):
     if mtp == None or layer not in mtp.taps:
@@ -257,11 +254,12 @@ def forward(m, inputs):
 
     def block(l, w, carried):
         y, fused = carried
+        adapt = peft(w, routes)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling)
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        y = swiglu(x, w, adapt = adapt, residual = y)
         return (y, tap(m.mtp, l, y, fused))
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)

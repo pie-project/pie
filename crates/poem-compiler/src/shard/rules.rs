@@ -25,12 +25,18 @@ pub(super) enum Rule {
         input: u32,
     },
     /// Linear in `follow` jointly, so partial sums stay one.
-    Linear { follow: &'static [&'static str] },
+    Linear {
+        follow: &'static [&'static str],
+    },
     /// A row lookup in a table the ranks split by row: each rank holds the
     /// rows it has, zeros elsewhere.
-    Lookup { table: &'static str },
+    Lookup {
+        table: &'static str,
+    },
     /// An attention plan: its head counts are each rank's share.
-    Plan { scale: &'static [&'static str] },
+    Plan {
+        scale: &'static [&'static str],
+    },
     /// A row norm, which needs the whole row unless its weight is split
     /// with it (or it has none): then each rank norms its own share by the
     /// row's sum of squares, its share's summed across the ranks.
@@ -38,6 +44,7 @@ pub(super) enum Rule {
     /// Group indices for a grouped matmul, which reads no value: they are
     /// a rank's share of the groups when the row it groups is split.
     Groups,
+    Correct,
 }
 
 /// An op whose `follow` inputs are split by head or channel, every output
@@ -287,6 +294,9 @@ pub(super) fn rule(op: &Operation) -> Rule {
     if let Operation::Attn(Attn::ScoreCapture { .. }) = op {
         return Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
+    if let Operation::Linear(Linear::LoraCorrect { .. }) = op {
+        return Rule::Correct;
+    }
     let name = op.name();
     match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
@@ -445,6 +455,48 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 Some((axis, _)) => {
                     return Err(format!(
                         "`{}` reads a weight split along axis {axis}",
+                        at.name
+                    ));
+                }
+            }
+        }
+        Rule::Correct => {
+            at.whole_except(pass, &["x", "y"])?;
+            let x = at.one("x").expect("a correction reads a row");
+            let y = at.one("y").expect("a correction corrects a row");
+            let a = at.one("bank_a").expect("a correction reads its down bank");
+            let b = at.one("bank_b").expect("a correction reads its up bank");
+            match (pass.weight_cut(a)?, pass.weight_cut(b)?) {
+                (None, None) => {
+                    at.make_whole(pass, x)?;
+                    at.make_whole(pass, y)?;
+                    vec![Dist::Whole; outs.len()]
+                }
+                (None, Some((1, blocks))) => {
+                    at.make_whole(pass, x)?;
+                    match pass.dist(y)? {
+                        Dist::Split(held) if held == blocks => vec![Dist::Split(held); outs.len()],
+                        held => {
+                            return Err(format!(
+                                "`{}` corrects a row held {held:?} by a bank cut in {blocks:?}",
+                                at.name
+                            ));
+                        }
+                    }
+                }
+                (Some((2, _)), None) => match (pass.dist(x)?, pass.dist(y)?) {
+                    (Dist::Split(_), Dist::Partial) => vec![Dist::Partial; outs.len()],
+                    (over, held) => {
+                        return Err(format!(
+                            "`{}` corrects a row held {held:?} over one held {over:?} by a \
+                             bank cut along its input",
+                            at.name
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(format!(
+                        "`{}` reads its banks cut along other axes",
                         at.name
                     ));
                 }

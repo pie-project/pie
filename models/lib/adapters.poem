@@ -15,3 +15,35 @@ def corrected(x, o, w, routes):
     banks, the adapter each row reads named by `routes`."""
     adapted = fact.has(fact.Adapter)
     return ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+
+PEFT = struct(slots = 4, rank = 16)
+
+def peft_banks(hidden, q_width, kv_width, inter):
+    widths = {
+        "q": (hidden, q_width),
+        "k": (hidden, kv_width),
+        "v": (hidden, kv_width),
+        "o": (q_width, hidden),
+        "gate": (hidden, inter),
+        "up": (hidden, inter),
+        "down": (inter, hidden),
+    }
+    return struct(**{
+        site: struct(
+            lora_a = weight([PEFT.slots, PEFT.rank, fan_in]).registered(),
+            lora_b = weight([PEFT.slots, fan_out, PEFT.rank]).registered(),
+        )
+        for site, (fan_in, fan_out) in widths.items()
+    })
+
+def peft(w, routes):
+    adapted = fact.has(fact.Adapter)
+
+    def correct(site, x, y):
+        return corrected(x, y, getattr(w.lora, site), routes)
+
+    def split(x, arm):
+        within = lambda site, x, y: correct(site, x, y).on(adapted)
+        return branch(x, [(adapted, lambda x: arm(x, within))], otherwise = lambda x: arm(x, None))
+
+    return struct(correct = correct, split = split)

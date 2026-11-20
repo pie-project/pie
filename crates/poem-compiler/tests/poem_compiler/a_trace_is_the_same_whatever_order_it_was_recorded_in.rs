@@ -37,14 +37,12 @@ def forward(m, inputs):
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
+        adapt = peft(w, routes)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w, adapt)
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(ops.linear.glu(ops.linear.matmul(x, w.gate), gating.swiglu(), up = ops.linear.matmul(x, w.up)), w.down)
-        return ops.elemwise.residual_add(f, y)
+        return swiglu(x, w, adapt = adapt, residual = y)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
@@ -53,19 +51,27 @@ def forward(m, inputs):
     draft_self(logits)
     output("logits", logits)
 
-def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
+def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w, adapt):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+
+    def project(x, correct):
+        q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
+        if correct != None:
+            q, k, v = correct("q", x, q), correct("k", x, k), correct("v", x, v)
+        q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+        return q
+
+    q = adapt.split(x, project)
 
     o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(q, plans.m, pages, None, d, m.kv_heads, m.sm_scale, mask = mask)),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
     output("attn.scores", ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048))
-    return ops.linear.matmul(o, w.o)
+    out = ops.linear.matmul(o, w.o)
+    return adapt.correct("o", o, out)
 "#;
 
 #[test]

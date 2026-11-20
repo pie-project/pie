@@ -482,7 +482,7 @@ function laneOutputs(switches: [string, string][]): OutputDecl[] {
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16, down: 32 };
+const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16, down: 32, gate: 64, up: 128 };
 
 /**
  * The forward-pass builder over `pie:inferlet/forward`.
@@ -608,7 +608,7 @@ export class ForwardPass {
     this.ports.push([Port.ATTN_MASK, rows]);
   }
 
-  /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */
+  /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate"|"up"|"gate_up"|"down"). */
   adapter(site: string, f: (x: AdapterExpr, y: AdapterExpr) => AdapterExpr): void {
     const bit = SITE_BITS[site];
     if (bit === undefined) throw new InferletError(`adapter: unknown site ${site}`);
@@ -632,7 +632,7 @@ export class ForwardPass {
         if ((this.adapterLowrankSites | this.adapterScaleSites) & bit) throw new InferletError(`adapter: site ${site} already carries an adapter on this pass`);
         this.adapterLowrankSites |= bit;
         this.adapterScaleSites |= bit;
-        this.prologue(() => {
+        this.chainPrologue(() => {
           kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32));
           kernel.adapterScale(l.read(), Tensor.constant(bit, Dtype.U32));
         });
@@ -641,7 +641,7 @@ export class ForwardPass {
       if (inner.kind === 'y') {
         if (this.adapterScaleSites & bit) throw new InferletError(`adapter: site ${site} already carries a scale on this pass`);
         this.adapterScaleSites |= bit;
-        this.prologue(() => kernel.adapterScale(l.read(), Tensor.constant(bit, Dtype.U32)));
+        this.chainPrologue(() => kernel.adapterScale(l.read(), Tensor.constant(bit, Dtype.U32)));
         return;
       }
     }
@@ -650,7 +650,12 @@ export class ForwardPass {
     const [a, b] = lr;
     if (this.adapterLowrankSites & bit) throw new InferletError(`adapter: site ${site} already carries an adapter on this pass`);
     this.adapterLowrankSites |= bit;
-    this.prologue(() => kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)));
+    this.chainPrologue(() => kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)));
+  }
+
+  private chainPrologue(body: () => void): void {
+    const first = this.stages.find(([s]) => s === Stage.PROLOGUE)?.[1];
+    this.prologue(first ? () => { first(); body(); } : body);
   }
 
   private setStage(stage: Stage, body: () => void): void {

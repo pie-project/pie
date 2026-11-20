@@ -8,7 +8,7 @@
 # codes moved as they are.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/adapters.poem", "peft", "peft_banks")
 load("//lib/blocks.poem", "attention", "swiglu")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP")
@@ -63,7 +63,6 @@ DEPLOYMENTS = [
 # projections with per-head q and k norms, an RMS norm and a SwiGLU MLP; the
 # token embedding, which the 0.6B and 1.7B also read out through (tied), a
 # final norm.
-# Each layer also has the LoRA banks the host registers. A deployment's dtype
 # is its projections'; the embedding and head stay at its compute dtype, as
 # an AWQ or GPTQ export keeps them.
 
@@ -106,7 +105,6 @@ def layout(id, deploy):
     kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([d.q_heads * hd, hidden], proj),
@@ -120,8 +118,7 @@ def layout(id, deploy):
             up = weight([d.inter, hidden], proj),
             down = weight([hidden, d.inter], proj),
             kv = kv(),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            lora = peft_banks(hidden, d.q_heads * hd, d.kv_heads * hd, d.inter),
         )
 
     mtp = None
@@ -241,7 +238,6 @@ TRANSFORMERS = [
 
 # The forward of Qwen 3 (dense): pre-norm layers of full attention, its q and
 # k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
-# A row with an adapter adds its LoRA correction to the attention's output.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
 
 def tap(mtp, layer, y, fused):
@@ -260,11 +256,12 @@ def forward(m, inputs):
 
     def block(l, w, carried):
         y, fused = carried
+        adapt = peft(w, routes)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head", adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        y = swiglu(x, w, adapt = adapt, residual = y)
         return (y, tap(m.mtp, l, y, fused))
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)

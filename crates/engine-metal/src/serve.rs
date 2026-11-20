@@ -1699,17 +1699,17 @@ impl Shell {
         self.weights.seats()
     }
 
-    pub fn program_adapter_sink(
+    pub fn program_adapter_sinks(
         &self,
         program_id: engine::ProgramId,
-    ) -> Result<Option<crate::adapter::Sink>> {
+    ) -> Result<Vec<crate::adapter::Sink>> {
         let program = self.programs.program(program_id).ok_or_else(|| {
             Fault::program(
                 "serve::shell",
                 format!("no program {program_id} to read an adapter sink off"),
             )
         })?;
-        crate::adapter::sink_of(&program.plan.package)
+        crate::adapter::sinks_of(&program.plan.package)
     }
 
     pub fn bind_adapter(

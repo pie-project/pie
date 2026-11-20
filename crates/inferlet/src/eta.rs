@@ -14,6 +14,8 @@ use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::pie::inferlet::working_set as wit_ws;
 
+mod peft;
+
 pub use eta_dsl::intrinsics;
 
 pub use eta_dsl::Dtype;
@@ -497,6 +499,7 @@ type StageClosure = Box<dyn Fn()>;
 
 pub mod adapter {
     use super::Channel;
+    pub use super::peft::Peft;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Site {
@@ -506,6 +509,8 @@ pub mod adapter {
         O,
         GateUp,
         Down,
+        Gate,
+        Up,
     }
 
     impl Site {
@@ -517,6 +522,8 @@ pub mod adapter {
                 Site::O => 1 << 3,
                 Site::GateUp => 1 << 4,
                 Site::Down => 1 << 5,
+                Site::Gate => 1 << 6,
+                Site::Up => 1 << 7,
             }
         }
     }
@@ -819,7 +826,7 @@ impl ForwardPass {
                     st.adapter_lowrank_sites |= site.bit();
                     st.adapter_scale_sites |= site.bit();
                 }
-                self.prologue(move || {
+                self.chain_prologue(move || {
                     intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
                     intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
                 });
@@ -840,7 +847,7 @@ impl ForwardPass {
                 }
                 inner_state.adapter_scale_sites |= site.bit();
             }
-            self.prologue(move || {
+            self.chain_prologue(move || {
                 intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
             });
             return Ok(());
@@ -874,10 +881,35 @@ impl ForwardPass {
             }
             inner.adapter_lowrank_sites |= site.bit();
         }
-        self.prologue(move || {
+        self.chain_prologue(move || {
             intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
         });
         Ok(())
+    }
+
+    pub fn peft(&self, peft: &adapter::Peft) -> Result<(), String> {
+        for &(site, a, b) in &peft.sites {
+            self.adapter(site, move |x, y| y + adapter::mm(&b, adapter::mm(&a, x)))?;
+        }
+        Ok(())
+    }
+
+    fn chain_prologue(&self, body: impl Fn() + 'static) {
+        let mut inner = self.inner.borrow_mut();
+        assert!(
+            !inner.program_attached,
+            "stage attachment is construction-only"
+        );
+        match inner.stages.iter_mut().find(|(s, _)| *s == Stage::Prologue) {
+            Some(slot) => {
+                let first = std::mem::replace(&mut slot.1, Box::new(|| {}));
+                slot.1 = Box::new(move || {
+                    first();
+                    body();
+                });
+            }
+            None => inner.stages.push((Stage::Prologue, Box::new(body))),
+        }
     }
 
     pub fn prologue(&self, body: impl Fn() + 'static) {
