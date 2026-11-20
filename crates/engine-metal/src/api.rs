@@ -692,7 +692,8 @@ impl Engine for Metal {
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
@@ -1483,11 +1484,19 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: match lane.list {
-                        engine::fire::ListKind::Translation => {
-                            pages_of[at].as_deref().unwrap_or(&[])
+                    // A beam group's lane resolves through its working set's
+                    // whole reserve (the pool its list's entries name,
+                    // BEAM-PAGE-LISTS §6.5); any other lane through its own
+                    // table.
+                    translation: if lane.reserve.is_empty() {
+                        match lane.list {
+                            engine::fire::ListKind::Translation => {
+                                pages_of[at].as_deref().unwrap_or(&[])
+                            }
+                            engine::fire::ListKind::Pages => &[],
                         }
-                        engine::fire::ListKind::Pages => &[],
+                    } else {
+                        &lane.reserve
                     },
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,

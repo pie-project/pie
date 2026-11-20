@@ -197,6 +197,13 @@ const _: () = {
     assert!(core::mem::size_of::<PagePlane>() == 16);
 };
 
+/// The pipelines the head step dispatches: a load builds them before
+/// ready, where any fire may meet a beam group.
+#[must_use]
+pub fn pipelines() -> [Fire; 2] {
+    [Fire::at(FILE, "beam_step"), Fire::at(FILE, "beam_copy_pages")]
+}
+
 /// Runs `run_count` [`BeamStepRun`]s from `runs` (bytes), a threadgroup a
 /// group.
 pub fn beam_step(ctx: &Ctx<'_>, runs: Tensor, run_count: u32) -> Result<(), Error> {

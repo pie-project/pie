@@ -119,6 +119,9 @@ pub struct Session {
     /// The score rows its capturing lanes write (a key row and its page
     /// row), where its program reads them out.
     capture: Option<held::Held>,
+    /// A beam group's resident state (BEAM-PAGE-LISTS §4), where its
+    /// program states parents.
+    beam: Option<super::held::Held>,
     /// The outputs bound, by name and lane.
     bound: Vec<(String, u32)>,
     /// Seats past lane 0 that no stage reads (no output there, and past the
@@ -187,12 +190,14 @@ impl Session {
 
     /// The tables an instance lays, in order: every launching stage's, a
     /// set after a set (`sets` of them, at least [`MIN_SETS`]), then its
-    /// score rows.
+    /// score rows, then a beam group's resident state (`beam` bytes,
+    /// BEAM-PAGE-LISTS §4).
     pub fn table_sizes(
         compiled: &Compiled,
         channels: usize,
         rows: u32,
         capture: u64,
+        beam: u64,
         sets: usize,
     ) -> Vec<u64> {
         let channels = u32::try_from(channels).unwrap_or(u32::MAX);
@@ -206,6 +211,7 @@ impl Session {
         (0..sets.max(MIN_SETS))
             .flat_map(|_| set.iter().copied())
             .chain((capture > 0).then_some(capture + CAPTURE_ALIGN))
+            .chain((beam > 0).then_some(beam + CAPTURE_ALIGN))
             .collect()
     }
 
@@ -227,6 +233,8 @@ impl Session {
         let other_ports = plan.package.ports.iter().any(|binding| {
             !binding.is_const
                 && binding.port != eta_ir::registry::Port::EmbedTokens
+                // Read on the device by the beam step, never on the host.
+                && binding.port != eta_ir::registry::Port::Parents
                 && engine::ports::engine_resolves(class, device, binding.port)
         });
         self.run_ahead = !fires_alone && !other_ports;
@@ -282,6 +290,35 @@ impl Session {
         Some((held.buffer(), held.offset() + capture_pad(held)))
     }
 
+    /// The GPU address of this instance's beam group state now, at
+    /// [`CAPTURE_ALIGN`]; `None` where its program states no parents.
+    #[must_use]
+    pub fn beam_row(&self) -> Option<u64> {
+        let held = self.beam.as_ref()?;
+        held.buffer().address_at(held.offset() + capture_pad(held))
+    }
+
+    /// Where the next pass's parents cell lies (`Port::Parents`): the cell
+    /// at the head its staging cursors name, `[lanes]` u32, read by the
+    /// beam step on the device and never on the host. `None` where the
+    /// program binds no parents channel.
+    pub fn parents_cell(&self, plan: &ExecPlan) -> Result<Option<(Buffer, u64)>> {
+        let Some(binding) = plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)
+        else {
+            return Ok(None);
+        };
+        let channel = binding.channel as usize;
+        let cursors = self.staging_cursors(plan);
+        let Some(cursor) = cursors.get(channel) else {
+            return Ok(None);
+        };
+        self.rings.cell_at(channel, cursor.head).map(Some)
+    }
+
     /// Reads `into.len()` bytes of this instance's score rows from byte `at`.
     pub fn read_capture(&self, at: u64, into: &mut [u8]) -> Result<()> {
         let held = self.capture.as_ref().ok_or_else(|| {
@@ -300,6 +337,7 @@ impl Session {
         pooled: Pooled<'_>,
         rows: u32,
         capture: u64,
+        beam: u64,
         set_count: usize,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
@@ -314,7 +352,7 @@ impl Session {
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
         let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
-        let sizes = Session::table_sizes(compiled, shapes.len(), rows, capture, set_count);
+        let sizes = Session::table_sizes(compiled, shapes.len(), rows, capture, beam, set_count);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
@@ -343,6 +381,12 @@ impl Session {
         let capture = (capture > 0)
             .then(|| tables.take(capture + CAPTURE_ALIGN))
             .transpose()?;
+        // A beam group's lists, zeroed with the tables: its first fire
+        // primes them (BEAM-PAGE-LISTS §5). State of the instance, parked
+        // and unparked with it.
+        let beam = (beam > 0)
+            .then(|| tables.take(beam + CAPTURE_ALIGN))
+            .transpose()?;
         tables.finish()?;
 
         let mut session = Session {
@@ -356,6 +400,7 @@ impl Session {
             passes: 0,
             run_ahead: false,
             capture,
+            beam,
             bound: Vec::new(),
             unread: Vec::new(),
             poisoned: false,

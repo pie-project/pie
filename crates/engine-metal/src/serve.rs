@@ -1665,6 +1665,12 @@ impl PreparedLoad<'_> {
                 let mut plane = crate::program::Plane::new();
                 plane.set_flight(boot.budget.max_lanes, arms, boot.budget.readouts_per_lane);
                 plane.set_capture(capture_bytes);
+                // A beam group's lists span at most a sequence's pages, and
+                // a page it frees waits out the frames in flight.
+                plane.set_beam_bounds(
+                    paging.pages_per_slot,
+                    u32::try_from(arms).unwrap_or(u32::MAX),
+                );
                 plane
             },
             written: engine::extent::Written::default(),
@@ -2240,8 +2246,15 @@ impl Shell {
         self.pipelines.save_archive(path)
     }
 
-    /// Seals the pipelines built ([`Shell::warm_pipelines`]).
+    /// Seals the pipelines built ([`Shell::warm_pipelines`]), the beam
+    /// head step's with them: any decode envelope may state parents
+    /// (BEAM-PAGE-LISTS), and no fire builds a pipeline after ready.
     pub fn seal_pipelines(&self) {
+        for fire in kernels_metal::runtime::beam::pipelines() {
+            if let Err(fault) = self.pipelines.warm(&self.device, fire) {
+                tracing::warn!(%fault, "metal: the beam head step's pipeline did not build");
+            }
+        }
         self.pipelines.seal();
     }
 
@@ -3361,6 +3374,11 @@ impl Shell {
                 }
             }
         }
+        if waited.is_ok()
+            && let Some(check) = flight.beam_check.as_ref()
+        {
+            faulted.extend(beam_faulted(check));
+        }
         // The sink hears the fire here, the buffer complete and its
         // epilogues settled, before the harvest returns.
         if let Some(told) = flight.told.as_ref() {
@@ -4009,6 +4027,10 @@ impl Shell {
         // Each resolved envelope's instance, by the same index.
         let mut resolved_of: Vec<engine::InstanceId> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
+        // A decode envelope's beam groups (`crate::beam`): each one's
+        // parents cell, state and lanes; and each lane's group.
+        let mut beam_groups: Vec<crate::beam::Group> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<engine::InstanceId> =
                 attachments.iter().map(|a| a.instance).collect();
@@ -4064,6 +4086,42 @@ impl Shell {
                         ));
                     }
                     envelope_of[first + lane] = Some((held, lane));
+                }
+                if let Some((cell, at)) = self.programs.parents_cell(attached.instance)? {
+                    let Some((state, layout)) = self.programs.beam_state(attached.instance)? else {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents and holds no beam state",
+                                attached.instance
+                            ),
+                        ));
+                    };
+                    let parents = cell.address_at(at).ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!("instance {}'s parents cell has no address", attached.instance),
+                        )
+                    })?;
+                    if carried as u32 != layout.lanes {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents for {} beam(s) and runs {carried}                                  lane(s); every beam runs every fire",
+                                attached.instance, layout.lanes
+                            ),
+                        ));
+                    }
+                    for lane in 0..carried {
+                        group_of[first + lane] = Some(beam_groups.len());
+                    }
+                    beam_groups.push(crate::beam::Group {
+                        instance: attached.instance,
+                        parents,
+                        state,
+                        layout,
+                        lanes: Vec::new(),
+                    });
                 }
                 resolved.push(envelope);
                 resolved_of.push(attached.instance);
@@ -4414,6 +4472,15 @@ impl Shell {
             state_ids.extend_from_slice(&record);
             if fresh {
                 beginning.push(record.clone());
+            }
+            if let Some(group) = group_of[source] {
+                beam_groups[group].lanes.push(crate::beam::GroupLane {
+                    source,
+                    seat: seats.len(),
+                    row_offset: row.row_offset,
+                    have,
+                    rows: row.rows,
+                });
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -4925,6 +4992,54 @@ impl Shell {
             }
         }
         let geometries = geometries;
+        // The beam groups' head step, planned over the tables as staged
+        // (BEAM-PAGE-LISTS §6): its records point into this arm's inputs.
+        let (beam_records, beam_faults) = if beam_groups.is_empty() || self.warming {
+            (crate::inputs::BeamRecords::default(), Vec::new())
+        } else {
+            for group in &mut beam_groups {
+                group.lanes.sort_by_key(|lane| lane.source);
+            }
+            let inputs = &self.inputs[self.arena.current()][arm];
+            let addresses = inputs.beam_addresses().ok_or_else(|| {
+                Fault::program("serve::prepare", "the beam step's inputs have no address")
+            })?;
+            let tables = (0..geometries.len())
+                .map(|table| {
+                    inputs.table_addresses(table).ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!("page table {table} has no staged address"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let staged = crate::beam::Staged {
+                indptr: geometries.iter().map(|geometry| geometry.indptr.as_slice()).collect(),
+                tables,
+                windowed: self
+                    .pools
+                    .tables()
+                    .iter()
+                    .any(|paging_of| *paging_of != crate::store::TablePaging::List),
+                page: self.pools.paging().page_size,
+                addresses,
+                planes: self.pools.kv_page_planes(),
+            };
+            let pools = &self.pools;
+            crate::beam::plan(
+                &beam_groups,
+                &staged,
+                &|source| lanes[source].translation.to_vec(),
+                &|source| lanes[source].folded,
+                &mut |refs| {
+                    for &page in refs {
+                        pools.admit_list_page(page)?;
+                    }
+                    Ok((pools.kv_pages(refs, None)?, pools.kv_page_addresses(refs)?))
+                },
+            )?
+        };
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -5335,6 +5450,14 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
+        let (beam, beam_check) = if beam_records.groups.is_empty() {
+            (None, None)
+        } else {
+            let inputs = &mut self.inputs[self.arena.current()][arm];
+            let staged = inputs.stage_beam(&self.handles, &beam_records)?;
+            let reader = inputs.beam_fault_reader(beam_records.lanes)?;
+            (staged, Some((reader, beam_faults)))
+        };
         let group_masks = self.inputs[self.arena.current()][arm]
             .stage_group_masks(&self.handles, &group_masks)?;
 
@@ -5483,6 +5606,8 @@ impl Shell {
         };
 
         Ok(Prepared {
+            beam,
+            beam_check,
             zeroed,
             capture_rows,
             ends,
@@ -5837,6 +5962,33 @@ impl Shell {
         self.feed_inputs(&mut frame, p)?;
         self.feed_tokens(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
+        if !dry && let Some(beam) = p.beam {
+            // The beam groups' head step (BEAM-PAGE-LISTS §6): reorder and
+            // resolve, then the forks' tail copies, ahead of every append
+            // and read of the fire, in its own command buffer.
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+            {
+                let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+                kernels_metal::runtime::beam::beam_step(&sink, beam.groups, beam.group_count)
+                    .map_err(crate::error::kernel)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+            {
+                let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+                kernels_metal::runtime::beam::beam_copy_pages(
+                    &sink,
+                    beam.copies,
+                    beam.planes,
+                    beam.copy_count,
+                    beam.plane_count,
+                )
+                .map_err(crate::error::kernel)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
             #[cfg(target_vendor = "apple")]
@@ -5980,6 +6132,12 @@ impl CaptureLayout {
 pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 
 pub struct Prepared<'a> {
+    /// The fire's beam groups' head step, staged in its arm's inputs
+    /// (`crate::beam`); `None` where it has none.
+    beam: Option<crate::inputs::BeamStaged>,
+    /// Its fault words' reader and, a word each, the lane and instance it
+    /// faults.
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
     /// The fresh state records its lanes begin, zeroed at the head of its
@@ -6030,6 +6188,8 @@ pub struct Enqueued<'a> {
     /// What the harvest tells the completion sink, where the engine settles
     /// inside submit.
     told: Option<Told>,
+    /// The beam fault words the harvest reads, where it tells the sink.
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
     step: PhantomData<&'a ()>,
 }
 
@@ -6074,6 +6234,24 @@ struct Flight {
     attached: Vec<(engine::InstanceId, std::ops::Range<u32>)>,
     readbacks: Vec<Option<(String, u32, u64)>>,
     told: Option<Told>,
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
+}
+
+/// The lanes a fire's beam fault words fault (BEAM-PAGE-LISTS §7).
+fn beam_faulted(
+    check: &(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>),
+) -> Vec<Faulted> {
+    let (reader, lanes) = check;
+    reader
+        .read()
+        .into_iter()
+        .zip(lanes)
+        .filter(|(word, _)| *word != 0)
+        .map(|(word, &(lane, instance))| {
+            let at = u32::try_from(lane).unwrap_or(u32::MAX);
+            (at..at + 1, instance, crate::beam::fault_reason(word, lane))
+        })
+        .collect()
 }
 
 /// A fire's word to its completion sink, given why its buffer failed, or
@@ -6229,8 +6407,9 @@ impl engine::frame::Shell for Shell {
         // (one pass airborne an instance, so nothing commits between); the
         // harvest commits it on this thread when the runtime publishes the
         // landed step (`Engine::publish_landed`).
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
-            (None, Some(tell))
+        let beam_check = prepared.beam_check.take();
+        let (in_handler, at_harvest, beam_at_harvest, beam_in_handler) = if self.arms.depth() == 1 {
+            (None, Some(tell), beam_check, None)
         } else {
             let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
                 .iter()
@@ -6238,7 +6417,7 @@ impl engine::frame::Shell for Shell {
                     (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
                 })
                 .collect();
-            (Some((tell, checks)), None)
+            (Some((tell, checks)), None, None, beam_check)
         };
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
@@ -6260,6 +6439,11 @@ impl engine::frame::Shell for Shell {
                     {
                         faulted.push((lanes.clone(), *instance, why));
                     }
+                }
+                if refused.is_none()
+                    && let Some(check) = beam_in_handler.as_ref()
+                {
+                    faulted.extend(beam_faulted(check));
                 }
                 tell(refused, &faulted);
             }
@@ -6284,6 +6468,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told: at_harvest,
+            beam_check: beam_at_harvest,
             step: PhantomData,
         })
     }
@@ -6301,6 +6486,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told,
+            beam_check,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -6313,6 +6499,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told,
+            beam_check,
         });
         Ok(Landed {
             seq,

@@ -144,8 +144,30 @@ pub struct Plane {
     /// that reads them out, held in its `Instance` slots after its tables;
     /// 0 where the load reads out no scores.
     capture: u64,
+    /// The pages a beam group's lists span and the frames its pending
+    /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
+    /// in flight.
+    beam_bounds: (u32, u32),
     next_program: u64,
     next_instance: u64,
+}
+
+/// A beam group's resident state, as its instance lays it
+/// (BEAM-PAGE-LISTS §4): its beams, the list width and pool pages it is
+/// laid for, and its ring of pending pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamLayout {
+    pub lanes: u32,
+    pub cap: u32,
+    pub frames: u32,
+}
+
+impl BeamLayout {
+    /// The state's bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        kernels_metal::runtime::beam::beam_state_words(self.lanes, self.cap, self.frames) * 4
+    }
 }
 
 impl Default for Plane {
@@ -171,6 +193,7 @@ impl Plane {
             arms: 1,
             rows: 1,
             capture: 0,
+            beam_bounds: (0, 1),
             next_program: 1,
             next_instance: 1,
         }
@@ -356,6 +379,7 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let adopted = self.seats_for(&program.plan, channels)?;
         let capture = self.capture_of(program);
+        let beam = self.beam_of(program).map_or(0, |layout| layout.bytes());
         let session = match Session::bind(
             &program.compiled,
             &program.plan,
@@ -365,6 +389,7 @@ impl Plane {
             pooled,
             self.rows,
             capture,
+            beam,
             self.arms,
         ) {
             Ok(mut session) => {
@@ -569,6 +594,69 @@ impl Plane {
         self.capture = bytes;
     }
 
+    /// The pages a beam group's lists span (the context's) and the frames
+    /// its freed pages wait (the frames in flight).
+    pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
+        self.beam_bounds = (pages, frames.max(1));
+    }
+
+    /// A beam group's layout where `program` states each beam's parent
+    /// (`Port::Parents`, `[lanes]` u32 in a channel): its pool holds its
+    /// beams' pages (each at most a sequence's), the pages a fire hands
+    /// out, those pending over the frames in flight and the prompt's own
+    /// page (BEAM-PAGE-LISTS §3). `None` for any other program.
+    fn beam_of(&self, program: &Program) -> Option<BeamLayout> {
+        let binding = program
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
+        let channel = program.plan.package.channels.get(binding.channel as usize)?;
+        let lanes = u32::try_from(ChannelShape::of(channel).numel).ok()?;
+        let (pages, frames) = self.beam_bounds;
+        let cap = lanes
+            .saturating_mul(pages)
+            .saturating_add(lanes.saturating_mul(frames + 1))
+            .saturating_add(1);
+        Some(BeamLayout { lanes, cap, frames })
+    }
+
+    /// Instance `id`'s beam group: its state's GPU address now and its
+    /// layout; `None` for an instance whose program states no parents.
+    pub fn beam_state(&self, id: InstanceId) -> Result<Option<(u64, BeamLayout)>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        let Some(layout) = self.beam_of(program) else {
+            return Ok(None);
+        };
+        let address = bound.session.beam_row().ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} states parents and holds no beam state"),
+            )
+        })?;
+        Ok(Some((address, layout)))
+    }
+
+    /// The cell instance `id`'s next pass reads its beams' parents from
+    /// ([`Session::parents_cell`]).
+    pub fn parents_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.parents_cell(&program.plan)
+    }
+
     /// The score-row bytes an instance of `program` holds: the load's rows
     /// where it reads them out, none where it does not.
     fn capture_of(&self, program: &Program) -> u64 {
@@ -756,6 +844,7 @@ impl Plane {
             program.plan.package.channels.len(),
             self.rows,
             self.capture_of(program),
+            self.beam_of(program).map_or(0, |layout| layout.bytes()),
             self.arms,
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);

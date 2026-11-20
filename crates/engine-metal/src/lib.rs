@@ -8,6 +8,7 @@
     )
 )]
 
+pub(crate) mod beam;
 pub mod adapter;
 pub mod ane;
 pub mod api;
