@@ -18,7 +18,7 @@
 //! to f32 on the host ([`inverse_temperature`], `eta_ir::types`). A greedy
 //! step that changes no logit reads the model's f32 logits whole.
 //!
-//! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
+//! A runtime builds the guest code of [`standard`]'s shapes before ready:
 //! every knob's value, the temperature's reciprocal among them, rides in a
 //! channel the stage reads, so no value is in a program's text, its hash or
 //! its launch package, by which the engines key what they compile, and a
@@ -58,10 +58,9 @@ impl Shape {
     };
 }
 
-/// The shapes the SDK's requests take most: greedy, a temperature draw
-/// (Gumbel-max), top-p, top-k with top-p, and greedy landing its top
-/// logprobs. The knobs' values here are any request's.
-pub const STANDARD: [(&str, Shape); 5] = [
+/// The draws the SDK's requests take most: greedy, a temperature draw
+/// (Gumbel-max), top-p, and top-k with top-p.
+pub const DRAWS: [(&str, Shape); 4] = [
     ("greedy", Shape::GREEDY),
     (
         "gumbel-max",
@@ -87,14 +86,43 @@ pub const STANDARD: [(&str, Shape); 5] = [
             ..Shape::GREEDY
         },
     ),
-    (
-        "top logprobs",
-        Shape {
-            logprobs: Some(5),
-            ..Shape::GREEDY
-        },
-    ),
 ];
+
+/// How many alternatives a standard shape that lands logprobs lands.
+pub const STANDARD_TOP_LOGPROBS: u32 = 5;
+
+/// The standard shapes: each of [`DRAWS`] as it is, penalized, landing its
+/// top [`STANDARD_TOP_LOGPROBS`] logprobs, and both. A penalized request
+/// carries all three penalties, the ones it does not ask for at their
+/// neutral values (repetition 1, frequency and presence 0), so which it
+/// asks for is data, as their values are. The knobs' values here are any
+/// request's.
+#[must_use]
+pub fn standard() -> Vec<(String, Shape)> {
+    let extras: [(&str, &str, bool, Option<u32>); 4] = [
+        ("", "", false, None),
+        ("penalized ", "", true, None),
+        ("", " + top logprobs", false, Some(STANDARD_TOP_LOGPROBS)),
+        ("penalized ", " + top logprobs", true, Some(STANDARD_TOP_LOGPROBS)),
+    ];
+    extras
+        .iter()
+        .flat_map(|&(before, after, penalized, logprobs)| {
+            DRAWS.iter().map(move |(name, draw)| {
+                (
+                    format!("{before}{name}{after}"),
+                    Shape {
+                        repetition: penalized,
+                        frequency: penalized,
+                        presence: penalized,
+                        logprobs,
+                        ..*draw
+                    },
+                )
+            })
+        })
+        .collect()
+}
 
 /// The sampler's knob values as scalars.
 pub struct Knobs {

@@ -2126,21 +2126,12 @@ mod tests {
             b.build().expect("the standard sampler traces")
         }
 
-        /// The standard sampler's shapes and a penalized top-p one, each
-        /// its decode fire, by name.
+        /// The standard sampler's shapes ([`eta_dsl::sampler::standard`]),
+        /// each its decode fire, by name.
         pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
-            let penalized = eta_dsl::sampler::Shape {
-                temperature: true,
-                top_p: true,
-                repetition: true,
-                frequency: true,
-                presence: true,
-                ..eta_dsl::sampler::Shape::GREEDY
-            };
-            eta_dsl::sampler::STANDARD
+            eta_dsl::sampler::standard()
                 .iter()
                 .map(|(name, shape)| (format!("standard {name}"), standard(vocab, shape)))
-                .chain([("standard penalized top-p".to_string(), standard(vocab, &penalized))])
                 .collect()
         }
 
@@ -2263,8 +2254,9 @@ mod tests {
         let got: Vec<(&str, u64, u64)> =
             totals.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
         assert_eq!(got, STANDARD_SCRATCH);
-        for ((name, _, laid), f32_laid) in got.iter().zip(STANDARD_F32_LAID) {
-            assert!(*laid <= f32_laid, "{name}: {laid} bytes laid, {f32_laid} with f32");
+        for (name, f32_laid) in STANDARD_F32_LAID {
+            let (_, _, laid) = got.iter().find(|(n, _, _)| n == name).expect("a standard shape");
+            assert!(laid <= f32_laid, "{name}: {laid} bytes laid, {f32_laid} with f32");
         }
     }
 
@@ -2277,14 +2269,31 @@ mod tests {
         ("standard gumbel-max", 3_690_240, 1_792),
         ("standard top-p", 5_058_816, 457_728),
         ("standard top-k + top-p", 5_363_456, 990_720),
-        ("standard top logprobs", 4_910_592, 724_992),
+        ("standard penalized greedy", 9_465_856, 1_826_304),
+        ("standard penalized gumbel-max", 9_466_624, 1_826_816),
         ("standard penalized top-p", 10_835_200, 1_977_088),
+        ("standard penalized top-k + top-p", 11_139_840, 2_511_360),
+        ("standard greedy + top logprobs", 4_910_592, 724_992),
+        ("standard gumbel-max + top logprobs", 4_911_360, 725_504),
+        ("standard top-p + top logprobs", 5_975_552, 1_142_016),
+        ("standard top-k + top-p + top logprobs", 6_280_192, 1_294_592),
+        ("standard penalized greedy + top logprobs", 10_686_976, 2_549_760),
+        ("standard penalized gumbel-max + top logprobs", 10_687_744, 2_550_272),
+        ("standard penalized top-p + top logprobs", 12_056_320, 2_509_824),
+        ("standard penalized top-k + top-p + top logprobs", 12_360_960, 3_156_480),
     ];
 
     /// What each laid out with f32 intermediates and the output row copied
     /// into scratch (top-p on the f32 lane sampler): no fire lays out more,
     /// whichever dtype the sampler's intermediates take.
-    const STANDARD_F32_LAID: [u64; 6] = [1_536, 1_792, 1_368_832, 2_813_440, 1_901_312, 2_585_600];
+    const STANDARD_F32_LAID: &[(&str, u64)] = &[
+        ("standard greedy", 1_536),
+        ("standard gumbel-max", 1_792),
+        ("standard top-p", 1_368_832),
+        ("standard top-k + top-p", 2_813_440),
+        ("standard greedy + top logprobs", 1_901_312),
+        ("standard penalized top-p", 2_585_600),
+    ];
 
     /// No generated kernel of the programs inferlets ship names the bytes
     /// of a value its stage states to take none (a generated kernel
