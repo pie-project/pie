@@ -11,7 +11,7 @@ struct Params {
     int n;
     int k;
 };
-PIE_PARAMS_FIRED(3, Params, params);
+PIE_PARAMS(3, Params, params);
 
 #if !defined(PIE_GEMV_V)
 float load_x(uint row, uint kk) {
@@ -24,7 +24,7 @@ float load_w(uint col, uint kk) {
 #endif
 
 void write_out(uint row, uint col, float acc) {
-    if (row >= uint(PIE_FIRE(m)) || col >= uint(params.n)) {
+    if (row >= uint(params.m) || col >= uint(params.n)) {
         return;
     }
     slot_put(out_, row * uint(params.n) + col, acc);
@@ -44,7 +44,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     uint col = gid.y;
     uint row = gid.z;
     float acc = 0.0;
-    if (col < uint(params.n) && row < uint(PIE_FIRE(m))) {
+    if (col < uint(params.n) && row < uint(params.m)) {
         uint k = uint(params.k);
         uint kk = klane;
         for (; kk + 3u * PIE_KLANES < k; kk += 4u * PIE_KLANES) {
@@ -108,7 +108,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint col = group.x * PIE_NLANES + clane;
     // A row of workgroups a PIE_VROWS rows: this one's first and its count.
     uint row0 = group.y * PIE_VROWS;
-    uint m = min(uint(PIE_FIRE(m)) - min(row0, uint(PIE_FIRE(m))), PIE_VROWS);
+    uint m = min(uint(params.m) - min(row0, uint(params.m)), PIE_VROWS);
     uint n = uint(params.n);
     uint k8 = uint(params.k) / 8u;
     float acc[PIE_VROWS];
@@ -186,7 +186,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint flat = lane + 32u * sg;
     uint tile_row = group.y * CM_BM;
     uint tile_col = group.x * CM_BN;
-    uint m = uint(PIE_FIRE(m));
+    uint m = uint(params.m);
     uint n = uint(params.n);
     uint k = uint(params.k);
 
@@ -286,7 +286,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (uint e = flat; e < PIE_BM * PIE_BK; e += PIE_LANES) {
             uint r = e / PIE_BK;
             uint kk = e - r * PIE_BK;
-            bool live = kk < kn && (tile_row + r) < uint(PIE_FIRE(m));
+            bool live = kk < kn && (tile_row + r) < uint(params.m);
             xs[e] = live ? load_x(tile_row + r, kb + kk) : 0.0;
         }
         for (uint e = flat; e < PIE_BK * PIE_BN4; e += PIE_LANES) {
