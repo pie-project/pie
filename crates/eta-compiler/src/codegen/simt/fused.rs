@@ -19,6 +19,8 @@ use super::validate::validate_generated_region;
 pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_block0.cuh");
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
+/// The helpers a region whose rows split across blocks streams with.
+const SPLIT_ROW: &str = include_str!("../../../runtime/cuda/split_row.cuh");
 
 pub(crate) fn output_pitch(stage: &CompiledStage) -> u32 {
     eta_ir::op::output_pitch(&stage.normalized.ops)
@@ -528,6 +530,105 @@ pub(super) fn scans_model_row(direct: &ArgmaxScan, ops: &[OpView], node: usize) 
         && (direct.gumbel[node].is_some() || direct.intrinsic[node] != u16::MAX)
 }
 
+/// Whether `op` (result `base`) is a reshape a single-row region copies,
+/// whose result only later regions read: its blocks copy it a stretch each
+/// (`ptir_split_copy`), none reading another's.
+fn copies_apart(
+    stage: &CompiledStage,
+    region: &Region,
+    ops: &[OpView],
+    op: &OpView,
+    base: u32,
+) -> bool {
+    op.tag == tags::RESHAPE
+        && !op.args.is_empty()
+        && row_geometry(stage, region).is_none()
+        && !region
+            .nodes
+            .iter()
+            .any(|node| ops[node.index()].reads().any(|arg| arg == base))
+}
+
+/// Whether `region`'s rows may each run across several blocks of their lane
+/// (the launcher gives it its rows times a split, `rows_per_lane`): it
+/// streams its rows, every stream split-safe ([`super::stream::Streams::split_safe`]:
+/// maps, broadcasts, model-row reads and reductions of wide static rows),
+/// and its other ops read and write no row (scalars a block computes alike
+/// in every block), none a channel, an output, a random draw or a scatter.
+#[must_use]
+pub fn splits_rows(stage: &CompiledStage, region: &Region) -> bool {
+    if region.kind != crate::plan::RegionKind::Generated
+        || validate_generated_region(stage, region).is_err()
+    {
+        return false;
+    }
+    let Some(kinds) = stream_rows(stage, region) else {
+        return false;
+    };
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = result_bases(&ops);
+    let direct = analyze_direct_argmax(stage, region, &bases);
+    let claimed = direct.claimed();
+    let skipped = direct.skipped;
+    let direct_topk = analyze_direct_topk(stage);
+    let streams = super::stream::Streams::new(
+        stage,
+        region,
+        &ops,
+        &bases,
+        &kinds,
+        &claimed,
+        &skipped,
+        &direct_topk,
+    );
+    let row = |value: u32| kinds.get(value as usize).copied() == Some(1);
+    let mut streamed = false;
+    let mut at = 0usize;
+    while at < streams.order.len() {
+        let node = streams.order[at];
+        if left_out(&skipped, &ops, node) {
+            at += 1;
+            continue;
+        }
+        if let Some((covered, safe)) = streams.split_safe(at) {
+            if !safe {
+                return false;
+            }
+            streamed = true;
+            at += covered;
+            continue;
+        }
+        let op = &ops[node];
+        let base = bases[node];
+        at += 1;
+        if is_view(stage, region, op, base) {
+            continue;
+        }
+        if copies_apart(stage, region, &ops, op, base) {
+            streamed = true;
+            continue;
+        }
+        let touches_row =
+            op.args.iter().any(|&arg| row(arg)) || (0..op.results).any(|result| row(base + result));
+        if touches_row
+            || matches!(
+                op.tag,
+                tags::CHAN_TAKE
+                    | tags::CHAN_READ
+                    | tags::CHAN_PUT
+                    | tags::OUTPUT
+                    | tags::RNG
+                    | tags::RNG_KEYED
+                    | tags::SCATTER_ADD
+                    | tags::SCATTER_SET
+            )
+        {
+            return false;
+        }
+    }
+    streamed
+}
+
 pub fn emit_fused_region(
     dialect: Dialect,
     entry_name: &str,
@@ -553,33 +654,85 @@ pub fn emit_fused_region(
     let claimed = direct.claimed();
     let skipped = direct.skipped;
 
+    let split = splits_rows(stage, region);
     let mut source = runtime_source(dialect);
-    source.push_str(PROLOGUE);
+    let stream_kinds = stream_rows(stage, region);
+    let row_parallel = stream_kinds.is_some();
+    let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
+    // Each block narrows the values of its own row. A single-row region's
+    // values already are its one row, at row 0: they keep the dims they
+    // declare, which the ops that are not streams (a transpose, a gather
+    // along axis 0) index by. The table of which values a block narrows is
+    // read by value index, so it lies in constant memory: a kernel-local
+    // array indexed at run time is placed in a thread's private memory,
+    // which a HIP kernel asks the runtime to grow at its first launch.
+    let row_count = row_kinds.len().max(1);
+    if row_parallel {
+        let narrowed = row_geometry(stage, region).is_some();
+        let kinds: Vec<String> = row_kinds
+            .iter()
+            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
+            .collect();
+        let kinds = if kinds.is_empty() {
+            "0u".to_string()
+        } else {
+            kinds.join(", ")
+        };
+        let _ = writeln!(
+            source,
+            "__constant__ m1_u8 ptir_rowkind[{row_count}u] = {{{kinds}}};"
+        );
+    }
+    if split {
+        // The helpers go before the entry the prologue's last line opens.
+        let entry = PROLOGUE.rfind("extern \"C\"").unwrap_or(PROLOGUE.len());
+        source.push_str(&PROLOGUE[..entry]);
+        source.push_str(dialect.lane);
+        source.push_str(super::sampler::LANE_ARENA);
+        source.push_str(SPLIT_ROW);
+        source.push_str(&PROLOGUE[entry..]);
+    } else {
+        source.push_str(PROLOGUE);
+    }
     source.push_str(entry_name);
     source.push_str(SIGNATURE);
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
     source.push_str(PREAMBLE);
     emit_table_staging(&mut source, ops.len(), next_value as usize);
 
-    let stream_kinds = stream_rows(stage, region);
-    let row_parallel = stream_kinds.is_some();
-    let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
     if row_parallel {
-        // Each block narrows the values of its own row. A single-row region's
-        // values already are its one row, at row 0: they keep the dims they
-        // declare, which the ops that are not streams (a transpose, a gather
-        // along axis 0) index by.
+        let count = row_count;
         let narrowed = row_geometry(stage, region).is_some();
-        let kinds: Vec<String> = row_kinds
-            .iter()
-            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
-            .collect();
-        let count = kinds.len().max(1);
-        let _ = writeln!(
-            source,
-            "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};",
-            kinds.join(", ")
-        );
+        // A split row's block: its row, its part of the row's split, the
+        // row's work (its first block's temporary area) and its meeting word.
+        let row_index = if split { "ptir_row" } else { "lane_row" };
+        if split {
+            let rows = match row_kinds.iter().position(|&k| k == 1) {
+                Some(value) if narrowed => format!("descriptors[{value}u].rows"),
+                _ => "1u".to_string(),
+            };
+            let _ = writeln!(source, "  const m1_u32 ptir_rows = {rows};");
+            source.push_str(
+                "  const m1_u32 ptir_split = ptir_rows != 0u && lane_blocks >= 2u * ptir_rows ? lane_blocks / ptir_rows : 1u;\n",
+            );
+            source.push_str("  const m1_u32 ptir_row = lane_row / ptir_split;\n");
+            source.push_str("  const m1_u32 ptir_part = lane_row % ptir_split;\n");
+            // The row's shared work, where a reduction keeps its partials.
+            let reduces = region.nodes.iter().any(|node| {
+                matches!(
+                    ops[node.index()].tag,
+                    tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+                )
+            });
+            if reduces {
+                source.push_str(
+                    "  m1_u8* ptir_row_work = scratch + temporary_offset + (m1_u64)(ptir_row * ptir_split) * temporary_stride;\n",
+                );
+            }
+            source.push_str(
+                "  m1_u32* ptir_meet_word = reinterpret_cast<m1_u32*>(lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u)) + ptir_row;\n",
+            );
+        }
         let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
         let _ = writeln!(source, "  __shared__ m1_u64 ptir_rowshift[{count}u];");
         let _ = writeln!(
@@ -602,9 +755,9 @@ pub fn emit_fused_region(
             "    if (ptir_rowkind[v] == 1u) {
 ",
         );
-        source.push_str(
-            "      shift = (m1_u64)lane_row * (m1_u64)d.last * elem;
-",
+        let _ = writeln!(
+            source,
+            "      shift = (m1_u64){row_index} * (m1_u64)d.last * elem;"
         );
         source.push_str(
             "      d.len = d.last; d.rows = 1u; d.rank = 1u; d.dims[0] = d.last;
@@ -619,10 +772,7 @@ pub fn emit_fused_region(
             "    } else if (ptir_rowkind[v] == 2u) {
 ",
         );
-        source.push_str(
-            "      shift = (m1_u64)lane_row * elem;
-",
-        );
+        let _ = writeln!(source, "      shift = (m1_u64){row_index} * elem;");
         source.push_str(
             "      d.len = 1u; d.rows = 1u; d.last = 1u; d.dims[0] = 1u;
 ",
@@ -656,7 +806,7 @@ pub fn emit_fused_region(
     const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
     let direct_topk = analyze_direct_topk(stage);
     let streams = row_parallel.then(|| {
-        super::stream::Streams::new(
+        let mut streams = super::stream::Streams::new(
             stage,
             region,
             &ops,
@@ -665,7 +815,9 @@ pub fn emit_fused_region(
             &claimed,
             &skipped,
             &direct_topk,
-        )
+        );
+        streams.split = split;
+        streams
     });
 
     let order: Vec<usize> = match &streams {
@@ -695,6 +847,14 @@ pub fn emit_fused_region(
         }
         if is_view(stage, region, op, base) {
             aliases.elide(base, op.args[0]);
+            continue;
+        }
+        if split && copies_apart(stage, region, &ops, op, base) {
+            let from = aliases.resolve(op.args[0]);
+            let _ = writeln!(
+                source,
+                "  {{\n    ptir_split_copy(scratch + offsets[{from}u], scratch + offsets[{base}u], descriptors[{base}u].len, descriptors[{base}u].dtype, ptir_part, ptir_split);\n{TAIL}  }}"
+            );
             continue;
         }
         if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET)
@@ -1021,10 +1181,22 @@ fn emit_body(
             );
             source.push_str("    __syncthreads();\n");
         }
-        let _ = writeln!(
-            source,
-            "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
-        );
+        let integer_add = tag == tags::SCATTER_ADD
+            && matches!(
+                stage.normalized.value_types[op.args[0] as usize].dtype,
+                Dtype::I32 | Dtype::U32
+            );
+        if integer_add {
+            let _ = writeln!(
+                source,
+                "    ptir_parallel_scatter_add_int({a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        } else {
+            let _ = writeln!(
+                source,
+                "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        }
     } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
         source.push_str(cut_mark);
         let _ = writeln!(

@@ -5,7 +5,6 @@ use crate::tensor::Tensor;
 
 #[cfg(feature = "rocm")]
 use super::dense;
-#[cfg(feature = "rocm")]
 use dtype::Dtype;
 
 /// The workgroups (blocks) of the skinny kernel, ROCm's few-rows kernel,

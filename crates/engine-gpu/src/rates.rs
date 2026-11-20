@@ -13,6 +13,10 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
+//! - each of its vector matmul kernels (by the rows a workgroup carries) at
+//!   each of [`VECTOR_ROWS_TIMED`] over the widest plane, for
+//!   `vector_tflops_by_rows`, and each tiled kernel at each of [`TILE_ROWS`],
+//!   for `tile_tflops_by_rows`;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
 //!   longest keys, said beside it), through the kernel a served fire selects
@@ -107,22 +111,62 @@ pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-/// `few_row_tflops` and `workgroups_per_core` are not weighed here yet: no
-/// choice on these backends reads them, so a load measures neither.
-pub const KEYS: [&str; 6] = [
+/// `vector_tflops_by_rows` and `tile_tflops_by_rows` are each vector and
+/// tiled matmul kernel's rate by rows, which the dense matmul's kernel is
+/// chosen by (`crate::dense`). `few_row_tflops` and `workgroups_per_core`
+/// are not weighed here: no choice on these backends reads them, so a load
+/// measures neither.
+pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
+    "tile_tflops_by_rows",
+    "vector_tflops_by_rows",
 ];
+
+/// The `[rates]` keys a load measures where its profile lacks one: the
+/// estimate's [`KEYS`], and where the platform states a bound on one
+/// submission (`max_submit`) the margin a serving step is held to it at
+/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`).
+#[must_use]
+pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
+    let mut keys = KEYS.to_vec();
+    if max_submit.is_some() {
+        keys.push(profile::fire::SUBMIT_WORST_RATIO);
+        keys.push(profile::fire::ATTN_BY_ROWS_KEYS);
+    }
+    keys
+}
+
+/// The rows of a prompt step the prefixed attention curve is timed at
+/// (`profile::fire::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
+/// slang load on a bound-stating device lays its top at (wgpu's 512, native
+/// Vulkan's 1024, and the narrower a phone's room leaves).
+pub const PREFIX_ROWS: [u32; 4] = [128, 256, 512, 1024];
+/// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
+/// decode's few to the matmul curve's first.
+const TILE_ROWS: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+/// The rows each vector kernel is timed at for `vector_tflops_by_rows`: a
+/// decode's one to the matmul curve's first.
+const VECTOR_ROWS_TIMED: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
+
+/// The most single-fire frames a queued rates frame keeps in flight
+/// (`Rig::queue`): as many as the frames of all but the tiniest fires hold
+/// (a frame of 64 or fewer waits once, at its end, as an unqueued frame
+/// does: every wait between is a host round trip, which on wgpu ran 0.3 to
+/// 2.4 ms and read as the device's in a tiny fire's ratio), while a frame of
+/// hundreds of tiny fires holds no more command buffers than that at once.
+const QUEUED: usize = 64;
 
 /// The kv page the attention's pool is laid in.
 const PAGE: u32 = 16;
@@ -179,6 +223,23 @@ struct Rig<'a, B: Serve> {
     /// fire, which a settled frame's admission carries as its least worst
     /// ratio (the Adreno 840 swung ~10% inside one settled step).
     swing: std::cell::Cell<f64>,
+    /// Each fire of a frame its own submission, queued behind the one before
+    /// and the queue timed whole by the host's clock: so where the device
+    /// states a bound on one submission (but for the launch's chain, whose
+    /// dispatches are one submission by what it measures). No submission
+    /// then holds more than one fire's work, whatever the margin is yet
+    /// known to be, and the device stays loaded across them.
+    queue: std::cell::Cell<bool>,
+    /// The worst ratio of a warm-up rotation's time to the rotation before
+    /// it (its estimate: the slowest fire it had measured), over the
+    /// warm-up's rotations and the sustained ones after every rate: the
+    /// device's own drift between like frames of a large fire, what the
+    /// margin a serving step is held to carries (`[rates]
+    /// submit_worst_ratio`). The micro-shapes' frames are left out: theirs
+    /// is a submission's host latency against a tiny fire's work (a single
+    /// fire's frame ran 0.3 to 2.4 ms on an RTX under wgpu) and the
+    /// estimate's scaling between shapes, not the device.
+    drift: std::cell::Cell<f64>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -197,6 +258,8 @@ impl<'a, B: Serve> Rig<'a, B> {
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
+            queue: std::cell::Cell::new(max_submit.is_some()),
+            drift: std::cell::Cell::new(1.0),
         }
     }
 
@@ -220,6 +283,14 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// it fits the bound; a single fire past it refused by name.
     fn fitting(&self, count: u32) -> Result<u32> {
         let a = self.admission.get();
+        if self.queue.get() {
+            // Each fire its own submission: as many as asked where one fits.
+            return if a.fits(self.per_fire.get()) {
+                Ok(count.max(1))
+            } else {
+                Err(self.refuse(self.per_fire.get().unwrap_or(0.0), 1))
+            };
+        }
         a.fires(count, self.per_fire.get())
             .ok_or_else(|| self.refuse(self.per_fire.get().unwrap_or(0.0), 1))
     }
@@ -316,21 +387,64 @@ impl<'a, B: Serve> Rig<'a, B> {
             bound_ms = ?self.max_submit.map(|b| b.as_secs_f64() * 1e3),
             "submitting"
         );
-        // A frame whose estimate, at the worst error seen, passes the
+        // A submission whose estimate, at the worst error seen, passes the
         // device's bound on one submission is refused by name, never
-        // submitted: a submission past it loses the device.
-        if !self.admission.get().fits(estimate) {
-            return Err(self.refuse(self.per_fire.get().unwrap_or(0.0), count));
+        // submitted: a submission past it loses the device. Queued, each
+        // submission is one fire.
+        let queued = self.queue.get() && count > 1;
+        let submission = if queued {
+            self.per_fire.get()
+        } else {
+            estimate
+        };
+        if !self.admission.get().fits(submission) {
+            let refused = if queued { 1 } else { count };
+            return Err(self.refuse(self.per_fire.get().unwrap_or(0.0), refused));
         }
-        let mut f = self.device.frame()?;
-        {
-            let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-            for _ in 0..count {
+        let timed = if queued {
+            // Each fire its own frame, all but the last committed behind
+            // one another unawaited; the last, `then` on it, timed; the
+            // queue's time the host's from the first commit to the last
+            // landing (the adapter's span would time the last frame alone).
+            let started = std::time::Instant::now();
+            let mut pending = std::collections::VecDeque::with_capacity(QUEUED);
+            for _ in 1..count {
+                // No more than [`QUEUED`] frames in flight: the oldest
+                // waited for before the next is laid.
+                if pending.len() >= QUEUED
+                    && let Some(oldest) = pending.pop_front()
+                {
+                    crate::backend::Pending::wait(&oldest)?;
+                }
+                let f = self.device.frame()?;
+                {
+                    let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                    fire(&sink)?;
+                }
+                pending.push_back(crate::backend::Frame::commit_async(f, None)?);
+            }
+            let mut f = self.device.frame()?;
+            {
+                let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
                 fire(&sink)?;
             }
-        }
-        then(&mut f)?;
-        let timed = timer(f)?;
+            then(&mut f)?;
+            timer(f)?;
+            for p in &pending {
+                crate::backend::Pending::wait(p)?;
+            }
+            (None, started.elapsed().as_nanos() as u64)
+        } else {
+            let mut f = self.device.frame()?;
+            {
+                let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                for _ in 0..count {
+                    fire(&sink)?;
+                }
+            }
+            then(&mut f)?;
+            timer(f)?
+        };
         let took = timed.0.unwrap_or(timed.1) as f64;
         let mut admission = self.admission.get();
         admission.landed(estimate, took, count >= self.basis.get());
@@ -493,8 +607,47 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
+    stated: &Rates,
 ) -> Result<engine::rates::Measured> {
-    measure_saying::<B, T>(device, tactics, tier, timer, max_submit, &mut |_| {})
+    measure_saying::<B, T>(
+        device,
+        tactics,
+        tier,
+        timer,
+        max_submit,
+        stated,
+        &mut |_| {},
+    )
+}
+
+/// Which of [`KEYS`] a step measures over `stated`: those it lacks, and
+/// the launch and copy together where either is lacked (one timing gives
+/// both).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wanted {
+    launch: bool,
+    gemm: bool,
+    vectors: bool,
+    tiles: bool,
+    attn: bool,
+    elementwise: bool,
+    scan: bool,
+}
+
+impl Wanted {
+    fn of(stated: &Rates) -> Wanted {
+        let lacked = stated.missing(&KEYS);
+        let lacks = |key: &str| lacked.contains(&key);
+        Wanted {
+            launch: lacks("launch_ns") || lacks("hbm_gbps"),
+            gemm: lacks("gemm_tflops_by_rows"),
+            vectors: lacks("vector_tflops_by_rows"),
+            tiles: lacks("tile_tflops_by_rows"),
+            attn: lacks("attn_tflops_by_keys"),
+            elementwise: lacks("elementwise_gbps"),
+            scan: lacks("scan_gelems"),
+        }
+    }
 }
 
 /// [`measure`], saying how the warm-up ended and what each shape reached.
@@ -504,15 +657,24 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
+    stated: &Rates,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
+    // Only what `stated` lacks is timed; what it states stands in for the
+    // rates the timed ones read (the launch, the bandwidth, the curve's peak).
+    let want = Wanted::of(stated);
     let mut rig = Rig::<B>::new(device, max_submit);
     // The launch first: every rate below takes its dispatches' launches off.
-    let (bytes_per_ns, launch_ns) =
-        copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
-    rig.release();
+    let (bytes_per_ns, launch_ns) = match (want.launch, stated.hbm_gbps, stated.launch_ns) {
+        (false, Some(bytes), Some(launch)) => (bytes, launch),
+        _ => {
+            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
+            rig.release();
+            measured
+        }
+    };
     let launch = launch_ns as f64;
-    let (side, warmed) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
@@ -524,7 +686,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // the rows are multiples of every kernel's row tile, so the estimate's
     // padding to it (`row_tile`) lies between them.
     let mut gemm = Vec::new();
-    for w in engine::rates::GEMM_WIDTHS {
+    for w in engine::rates::GEMM_WIDTHS.into_iter().filter(|_| want.gemm) {
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
             let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
@@ -543,17 +705,97 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
+    // `vector_tflops_by_rows`: each vector kernel, by the rows a workgroup
+    // carries, at `VECTOR_ROWS_TIMED` of the widest plane, each fire reading
+    // the next plane past the last-level cache: its flops over its time,
+    // every weight pass it makes in it.
+    let w = engine::rates::GEMM_WIDTH;
+    let mut vector_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    let carried = if want.vectors {
+        kernels_slang::linear::gemm::VECTOR_ROWS.to_vec()
+    } else {
+        Vec::new()
+    };
+    for rows in carried {
+        let vector = kernels_slang::linear::gemm::Tactic {
+            vector: rows,
+            ..tactics.gemm(tier, 1)
+        };
+        let mut curve = Vec::new();
+        for m in VECTOR_ROWS_TIMED {
+            let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
+            rig.release();
+            let Some(rate) = dropped(&rig, rate, say)? else {
+                continue;
+            };
+            say(&format!(
+                "[rates]: vector matmul ({rows} rows a workgroup) {m}x{w}x{w}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        if !curve.is_empty() {
+            vector_curves.push((rows, curve));
+        }
+    }
+    // `tile_tflops_by_rows`: each tiled kernel the backend can take, at
+    // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
+    // its time, keyed by its row tile.
+    let mut tile_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    // Every tiled kernel the profile's path reaches at some timed rows (a
+    // device whose path takes the 32x32 tile below some rows and the
+    // cooperative-matrix tile above times both).
+    let mut tiled_kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
+    for m in TILE_ROWS.into_iter().filter(|_| want.tiles) {
+        for tactic in crate::dense::tiled_kernels(B::TARGET, tactics.gemm(tier, m)) {
+            if !tiled_kernels.contains(&tactic) {
+                tiled_kernels.push(tactic);
+            }
+        }
+    }
+    for tactic in tiled_kernels {
+        let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, w, w).row_tile();
+        let mut curve = Vec::new();
+        for m in TILE_ROWS {
+            let rate = matmul(&mut rig, tactic, timer, (m, w, w), launch);
+            rig.release();
+            let Some(rate) = dropped(&rig, rate, say)? else {
+                continue;
+            };
+            say(&format!(
+                "[rates]: {tile}-row tile matmul {m}x{w}x{w}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        if !curve.is_empty() && tile_curves.iter().all(|(at, _)| *at != tile) {
+            tile_curves.push((tile, curve));
+        }
+    }
+    tile_curves.sort_by_key(|(tile, _)| *tile);
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
-    let peak = gemm
+    let stated_gemm: Vec<(u32, Vec<(u32, f64)>)> = stated
+        .gemm_tflops_by_rows
+        .iter()
+        .flatten()
+        .map(|(w, curve)| (*w, curve.iter().map(|&(m, t)| (m, t * 1e3)).collect()))
+        .collect();
+    let peak = if want.gemm { &gemm } else { &stated_gemm }
         .iter()
         .flat_map(|(_, curve)| curve.iter().map(|&(_, rate)| rate))
         .fold(0.0, f64::max);
     let mut attn: Vec<(u32, f64)> = Vec::new();
     // A shape's first fire, estimated by its work at the last shape's rate.
-    let at_rate = |shape: engine::rates::AttnShape, rate: Option<f64>| first_fire_ns(shape, rate, launch);
-    for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
+    let at_rate =
+        |shape: engine::rates::AttnShape, rate: Option<f64>| first_fire_ns(shape, rate, launch);
+    let attn_keys = if want.attn {
+        engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE))
+    } else {
+        Vec::new()
+    };
+    for keys in attn_keys {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
         let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
         let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
@@ -570,7 +812,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let longest = attn
         .last()
         .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
-    for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
+    for d in engine::rates::ATTN_DIMS
+        .into_iter()
+        .filter(|&d| want.attn && d != 128)
+    {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
         let estimate = at_rate(shape, attn.last().map(|&(_, rate)| rate));
         let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
@@ -583,16 +828,124 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             rate / 1e3
         ));
     }
-    let elementwise = elementwise(&mut rig, timer, launch)?;
-    rig.release();
-    say(&format!("[rates]: per-row ops: {elementwise:.0} GB/s"));
-    let scan = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
-    rig.release();
+    // Under a stated submit bound, the attention of a prompt step's rows
+    // against a longer prefix, at each of [`PREFIX_ROWS`] against each of
+    // `engine::rates::ATTN_KEYS` past them: the shapes the steps that near
+    // the bound fire, which the square curve reads up to twice as fast as
+    // they run (`profile::fire::Rates::attn_tflops_by_rows_keys`). A point
+    // past the bound is dropped by name, as every rate's is.
+    //
+    // A point's first fire is estimated from the nearest shape measured: the
+    // point before it at these rows, else these keys at the rows before
+    // (fewer rows run slower, so it is estimated long), else not at all
+    // (estimated from its own frames as they land). Never from the square
+    // curve: a few rows against a prefix run several times slower than a
+    // square of the keys (128 rows ran at an eighth of it on an RTX), and a
+    // first fire estimated that far short would count that error into the
+    // margin as the device's.
+    let mut prefixed: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
+    if max_submit.is_some() && stated.attn_tflops_by_rows_keys.is_none() {
+        for rows in PREFIX_ROWS {
+            let mut curve: Vec<(u32, f64)> = Vec::new();
+            for keys in engine::rates::ATTN_KEYS.into_iter().filter(|&k| k > rows) {
+                let shape = engine::rates::AttnShape {
+                    rows,
+                    keys,
+                    ..engine::rates::ATTN_SHAPE
+                };
+                let nearest = curve.last().map(|&(_, tflops)| tflops * 1e3).or_else(|| {
+                    prefixed.last().and_then(|(_, before)| {
+                        before
+                            .iter()
+                            .find(|&&(k, _)| k == keys)
+                            .map(|&(_, tflops)| tflops * 1e3)
+                    })
+                });
+                let estimate = at_rate(shape, nearest);
+                let rate = attention(&mut rig, tactics, tier, timer, shape, launch, estimate);
+                rig.release();
+                let Some(rate) = dropped(&rig, rate, say)? else {
+                    continue;
+                };
+                say(&format!(
+                    "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s",
+                    rate / 1e3
+                ));
+                curve.push((keys, rate / 1e3));
+            }
+            if !curve.is_empty() {
+                prefixed.push((rows, curve));
+            }
+        }
+    }
+    let elementwise = if want.elementwise {
+        let gbps = elementwise(&mut rig, timer, launch)?;
+        rig.release();
+        say(&format!("[rates]: per-row ops: {gbps:.0} GB/s"));
+        Some(gbps)
+    } else {
+        None
+    };
+    let scan = if want.scan {
+        let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
+        rig.release();
+        Some(gelems)
+    } else {
+        None
+    };
+    // Under a stated submit bound, the clock the device settles at under
+    // sustained load: the warm-up's cube rotated again once every rate is
+    // timed (the device loaded for the whole step, past the drop a phone's
+    // clock takes some seconds in), its settled rate against the warm-up's.
+    // The margin a serving step is held to carries the drop as measured
+    // (an Adreno 840 halved its clock ~10 s into load).
+    let sustained = if max_submit.is_some() {
+        // Rotated as the warm-up rotated it: each fire its own submission,
+        // admitted at the worst ratio the warm-up's walk measured (not at
+        // the step's own worst since, which its micro-shapes' host latency
+        // inflates and would refuse the cube that fit then: x4.59 refused an
+        // 87 ms fire under a forced 300 ms bound on an RTX).
+        let step_admission = rig.admission.get();
+        rig.admission.set(engine::rates::Admission {
+            settled: true,
+            worst: walk_worst.max(1.0),
+            ..step_admission
+        });
+        let rotated = warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, walk_worst);
+        rig.admission.set(step_admission);
+        match rotated? {
+            Some(hot) => {
+                let drop = (warmed.rate / hot.rate.max(f64::MIN_POSITIVE)).max(1.0);
+                say(&format!(
+                    "[rates]: sustained: the {side}^3 matmul settled at {:.2} TFLOP/s after the \
+                     step, {:.2} at its start: x{drop:.2}",
+                    hot.rate / 1e3,
+                    warmed.rate / 1e3
+                ));
+                drop
+            }
+            None => {
+                // The cube's fire no longer fits the bound at the walk's
+                // ratio once loaded: not rotated whole, the drop is read off
+                // the fires it did run (the slowest against the fastest).
+                let drop = rig.swing.get().max(1.0);
+                tracing::warn!(
+                    side,
+                    drop,
+                    "rates: sustained: the warm-up's cube no longer fits the bound once loaded; \
+                     its drop is the swing of the fires it ran"
+                );
+                drop
+            }
+        }
+    } else {
+        1.0
+    };
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
     let rates = Rates {
-        launch_ns: Some(launch_ns),
+        launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
         gemm_tflops_by_rows: (!gemm.is_empty()).then(|| {
@@ -601,11 +954,23 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                 .collect()
         }),
         attn_tflops_by_keys: (!attn.is_empty()).then(|| tflops(attn)),
-        hbm_gbps: Some(bytes_per_ns),
-        elementwise_gbps: Some(elementwise),
-        scan_gelems: Some(scan),
+        hbm_gbps: want.launch.then_some(bytes_per_ns),
+        cached_gbps: None,
+        elementwise_gbps: elementwise,
+        scan_gelems: scan,
         few_row_tflops: None,
+        tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
+        vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
+        product_ns: None,
         workgroups_per_core: None,
+        // How much slower the device ran than its own measurements said:
+        // like frames' drift, the clock's swing and its sustained drop
+        // (`Rig::drift`, `sustained`): the margin a serving step's estimate
+        // is held to the bound at (`crate::submit`), measured where the
+        // platform states one.
+        submit_worst_ratio: max_submit
+            .map(|_| rig.drift.get().max(rig.swing.get()).max(sustained).max(1.0)),
+        attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
     };
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
@@ -620,6 +985,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         unsettled: rig.unsettled.get(),
     })
 }
+
 
 /// The per-row ops' bandwidth: the backend's rmsnorm, then its swiglu, at
 /// `engine::rates::ELEMENTWISE_SHAPE`, each fire the next of
@@ -672,7 +1038,7 @@ fn warm<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-) -> Result<(u32, engine::rates::Warmed)> {
+) -> Result<(u32, engine::rates::Warmed, f64)> {
     // The cube's side, walked up by real fires under the device's bound on
     // one submission (`engine::rates::warm_side`): each size's second fire
     // timed (its first builds and touches).
@@ -713,7 +1079,7 @@ fn warm<B: Serve>(
                 // is never admitted nearer the bound than that.
                 admission.worst = admission.worst.max(rig.swing.get());
                 rig.admission.set(admission);
-                return Ok((side, warmed));
+                return Ok((side, warmed, worst));
             }
             None if side > engine::rates::WARM_PROBE / 2 => side /= 2,
             None => {
@@ -778,7 +1144,15 @@ fn warm_at<B: Serve>(
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
-    let fits = |left: u32| rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left);
+    // Queued, each fire is its own submission: the whole rotation where one
+    // fire fits, none where it does not.
+    let fits = |left: u32| {
+        if rig.queue.get() {
+            rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, 1) * left
+        } else {
+            rotation_fires(rotations.get().bound, per_fire(), rotations.get().worst, left)
+        }
+    };
     let shrunk = std::cell::Cell::new(false);
     let warmed = engine::rates::warm_up(|| {
         let mut wall = 0u64;
@@ -805,6 +1179,9 @@ fn warm_at<B: Serve>(
             let mut r = rotations.get();
             r.landed(estimate, took as f64, true);
             rotations.set(r);
+            if let Some(e) = estimate.filter(|&e| e > 0.0) {
+                rig.drift.set(rig.drift.get().max(took as f64 / e));
+            }
             wall += took;
             left -= count;
         }
@@ -892,13 +1269,17 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         })
         .collect::<Result<Vec<(Tensor, KvPool)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    // The rows' own positions, all of request 0, no row masked.
-    let positions: Vec<u32> = (0..s.rows).collect();
+    // The rows' own positions, all of request 0, no row masked: the last
+    // `rows` of the `keys`, each attending every key held before it and
+    // its own rows up to itself (a square shape attends itself).
+    let positions: Vec<u32> = (s.keys.saturating_sub(s.rows)..s.keys).collect();
     let tables = kernels_slang::attn::sdpa::Tables {
         positions: rig.words(&positions, s.rows, 1, Dtype::I32)?,
         request_of_token: rig.zeros(s.rows, 1, Dtype::I32)?,
         mask: rig.zeros(1, 4, Dtype::U8)?,
         mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
+        row0: 0,
+        rows: s.rows,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     // A new shape's first fire is estimated before it is submitted (from
@@ -1019,6 +1400,9 @@ fn copy_and_launch<B: Serve>(
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     };
     let nothing = |_: &mut B::Frame| Ok(());
+    // The launch is what a dispatch adds inside one submission: its chains
+    // are one submission each (their tiny fires far inside any bound).
+    let queued = rig.queue.replace(false);
     rig.step(format!("launch: one {LAUNCH}^3 matmul"), None);
     rig.frame(timer, 1, &tiny, &nothing)?;
     let single = median(
@@ -1074,6 +1458,7 @@ fn copy_and_launch<B: Serve>(
     ));
     // The longest chain's: its gap the least moved by the frame's submit.
     let launch = gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64;
+    rig.queue.set(queued);
 
     let device = rig.device;
     let copy = COPY_BYTES.min(device.max_buffer()) & !3;
@@ -1185,6 +1570,76 @@ fn first_fire_ns(shape: engine::rates::AttnShape, rate: Option<f64>, launch: f64
 }
 
 #[cfg(test)]
+mod wanted_tests {
+    use super::*;
+
+    /// A profile lacking one key times that key alone (the launch and the
+    /// copy together); one stating none times every one.
+    #[test]
+    fn a_step_times_only_what_the_profile_lacks() {
+        let all = Rates {
+            launch_ns: Some(3000),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0)])]),
+            attn_tflops_by_keys: Some(vec![(512, 5.0)]),
+            hbm_gbps: Some(650.0),
+            cached_gbps: None,
+            elementwise_gbps: Some(700.0),
+            scan_gelems: Some(100.0),
+            few_row_tflops: None,
+            workgroups_per_core: None,
+            tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
+            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
+            product_ns: None,
+        };
+        let none = Wanted {
+            launch: false,
+            gemm: false,
+            vectors: false,
+            tiles: false,
+            attn: false,
+            elementwise: false,
+            scan: false,
+        };
+        assert_eq!(Wanted::of(&all), none);
+        let few = Rates {
+            vector_tflops_by_rows: None,
+            ..all.clone()
+        };
+        assert_eq!(
+            Wanted::of(&few),
+            Wanted {
+                vectors: true,
+                ..none
+            }
+        );
+        let copy = Rates {
+            hbm_gbps: None,
+            cached_gbps: None,
+            ..all.clone()
+        };
+        assert_eq!(
+            Wanted::of(&copy),
+            Wanted {
+                launch: true,
+                ..none
+            }
+        );
+        let every = Wanted::of(&Rates::default());
+        assert!(
+            every.launch
+                && every.gemm
+                && every.vectors
+                && every.tiles
+                && every.attn
+                && every.elementwise
+                && every.scan
+        );
+    }
+}
+
+#[cfg(test)]
 mod admission_tests {
     use super::*;
 
@@ -1203,7 +1658,10 @@ mod admission_tests {
         assert!(f64::from(fires) * slow <= BOUND.as_nanos() as f64);
         // The old sizing: the last fire's time at a ratio of 1.
         let old = rotation_fires(Some(BOUND), Some(fast), 1.0, 64);
-        assert!(f64::from(old) * slow > BOUND.as_nanos() as f64, "the old sizing passes the bound at the slowest fire");
+        assert!(
+            f64::from(old) * slow > BOUND.as_nanos() as f64,
+            "the old sizing passes the bound at the slowest fire"
+        );
     }
 
     /// Not one fire fits: the rotation stops (the cube halves), never
@@ -1231,8 +1689,17 @@ mod admission_tests {
         let estimate = first_fire_ns(d256, Some(rate), 0.0).unwrap();
         let ratio = attn_flops(d256) / attn_flops(d64);
         assert!((estimate / took - ratio).abs() < 1e-9);
-        let admission = engine::rates::Admission { settled: true, ..engine::rates::Admission::new(Some(BOUND)) };
-        assert!(!admission.fits(Some(estimate)), "the d256 first fire is refused unsubmitted");
-        assert!(admission.fits(Some(took)), "the d64 fire it was estimated from fits");
+        let admission = engine::rates::Admission {
+            settled: true,
+            ..engine::rates::Admission::new(Some(BOUND))
+        };
+        assert!(
+            !admission.fits(Some(estimate)),
+            "the d256 first fire is refused unsubmitted"
+        );
+        assert!(
+            admission.fits(Some(took)),
+            "the d64 fire it was estimated from fits"
+        );
     }
 }

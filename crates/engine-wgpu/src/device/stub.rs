@@ -137,6 +137,10 @@ impl Context {
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn bind_frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -153,6 +157,10 @@ impl Frame {
     }
 
     pub fn flush(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
+    pub fn submit_segment(&self) -> Result<()> {
         Err(Fault::Deviceless)
     }
 
@@ -383,6 +391,11 @@ impl Pipelines {
     #[must_use]
     pub fn new() -> Pipelines {
         Pipelines::default()
+    }
+
+    #[must_use]
+    pub fn bound(&self) -> u64 {
+        0
     }
 
     #[must_use]

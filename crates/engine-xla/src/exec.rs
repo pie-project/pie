@@ -26,7 +26,7 @@ pub fn run(
     // same shapes (another host bank, say) binds this trace's roots.
     let program = device.program(&text, sig.clone())?;
     let t2 = std::time::Instant::now();
-    let out = bind_and_run(device, &sig, &program, weights, pools, inputs, wait);
+    let out = bind_and_run(device, &sig, &program, weights, pools, inputs, &[], wait);
     if crate::serve::timing() {
         eprintln!(
             "  xla run: finish {:.2}ms ({} KiB) lookup {:.2}ms bind+run {:.2}ms",
@@ -58,7 +58,38 @@ pub fn run_program(
     inputs: &Inputs,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
-    bind_and_run(device, &program.sig, program, weights, pools, inputs, wait)
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        &[],
+        wait,
+    )
+}
+
+/// A readout program: [`run_program`] with its entries (`Source::Entry`),
+/// the planes its fire's forward returned.
+pub fn run_readout(
+    device: &Device,
+    program: &crate::device::Program,
+    weights: Option<&Weights>,
+    pools: &mut Pools,
+    inputs: &Inputs,
+    entries: &[Buffer],
+) -> Result<Vec<Buffer>> {
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        entries,
+        false,
+    )
 }
 
 /// A maintenance program: pools and `inputs` in, nothing out.
@@ -78,6 +109,7 @@ fn bind_and_run(
     weights: Option<&Weights>,
     pools: &mut Pools,
     inputs: &Inputs,
+    entries: &[Buffer],
     wait: bool,
 ) -> Result<Vec<Buffer>> {
     if device.is_dry() {
@@ -136,6 +168,7 @@ fn bind_and_run(
             Source::Weight { param, plane, .. } => {
                 weights.and_then(|w| w.buffer_plane(param, plane))
             }
+            Source::Entry { index } => entries.get(usize::from(index)),
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::HostBank { param } => pools.host_bank(param),
             Source::Stage => slot.and_then(|at| pools.ring_buffer(at)),

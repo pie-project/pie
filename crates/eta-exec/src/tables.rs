@@ -1,8 +1,8 @@
 //! A guest stage's bind-time tables, as every backend lays them: each
 //! value's descriptor ([`desc_words`], [`DESC_WORDS`] u32s), each op's
 //! params ([`OpParams`], `PARAM_WORDS` u32s), each value's byte offset in
-//! the stage's scratch and then each op's temporary area's, and the
-//! stage's config ([`Cfg`]). A step of the
+//! the stage's scratch, and the stage's config ([`Cfg`]); and each op's
+//! temporary area, which its steps' records carry. A step of the
 //! closed set (`eta_compiler::codegen::steps`) finds its node's operands
 //! here: the node's params name its argument and result values, whose
 //! descriptors and offsets these tables hold. [`stage_tables`] writes them
@@ -22,13 +22,13 @@ pub const DESC_WORDS: usize = 9;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cfg {
-    /// Where the offsets table's op areas begin: past each value's offset.
     pub value_count: u32,
+    /// The words of the stage's heap, past which the runtime refuses any
+    /// access (its `OUT_OF_BOUNDS` fault): word `CFG_HEAP_WORDS` of the
+    /// runtime's config table.
+    pub heap_words: u32,
     pub op_count: u32,
     pub lane: u32,
-    /// The words of the stage's heap, past which the runtime refuses any
-    /// access (its `OUT_OF_BOUNDS` fault).
-    pub heap_words: u32,
     pub pad: [u32; 4],
 }
 
@@ -56,9 +56,9 @@ impl Cfg {
     pub fn to_le_bytes(self) -> Vec<u8> {
         words_le(&[
             self.value_count,
+            self.heap_words,
             self.op_count,
             self.lane,
-            self.heap_words,
             self.pad[0],
             self.pad[1],
             self.pad[2],
@@ -173,14 +173,14 @@ pub fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
     }
 }
 
-/// The bytes of a stage's tables (descriptors, op params, value and op area offsets,
-/// config): what its value and op counts fix, whatever the extents a bind resolves.
+/// The bytes of a stage's tables (descriptors, op params, value offsets, config): what its
+/// value and op counts fix, whatever the extents a bind resolves.
 #[must_use]
 pub fn table_sizes(plan: &LaunchStagePlan) -> [u64; 4] {
     [
         (plan.value_types.len() * DESC_WORDS * 4).max(DESC_WORDS * 4) as u64,
         (plan.ops.len().max(1) * size_of::<OpParams>()) as u64,
-        ((plan.value_types.len() + plan.ops.len()).max(1) * 4) as u64,
+        (plan.value_types.len().max(1) * 4) as u64,
         size_of::<Cfg>() as u64,
     ]
 }
@@ -198,6 +198,9 @@ pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
 pub struct StageTables {
     pub descriptors: Vec<ValueDesc>,
     pub offsets: Vec<u64>,
+    /// Each op's temporary area's first word in the heap, 0 where it keeps
+    /// none: what its steps' uniforms carry (`StepUniform::area`).
+    pub areas: Vec<u32>,
     pub scratch: u64,
     pub tables: [Vec<u8>; 4],
 }
@@ -242,7 +245,8 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             .ok_or_else(|| "a guest stage's result ids past a u32".to_string())?;
     }
     // Each node's area where it keeps one ([`Stepping::launches`]), else
-    // none: a node that keeps none reads no area.
+    // none: a node that keeps none reads no area. Its steps' records carry
+    // it (`StepUniform::area`).
     let mut areas = vec![0u64; plan.ops.len()];
     let keeping = launches
         .each
@@ -255,8 +259,11 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
     let offsets: Vec<u32> = scratch
         .values
         .iter()
-        .chain(&areas)
         .map(|&at| word("value offset", at))
+        .collect::<Result<_, _>>()?;
+    let area_words: Vec<u32> = areas
+        .iter()
+        .map(|&at| word("area word", at / 4))
         .collect::<Result<_, _>>()?;
     // The heap the stage binds, which its runtime bounds every access by.
     let heap = scratch.total.max(256);
@@ -276,6 +283,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             sized(config.to_le_bytes(), 3)?,
         ],
         offsets: scratch.values,
+        areas: area_words,
         scratch: heap,
     })
 }

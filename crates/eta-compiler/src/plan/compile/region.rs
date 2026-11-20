@@ -85,6 +85,12 @@ pub(crate) fn singleton_partition(stage: &NormalizedStage, index: &StageIndex) -
     }
 }
 
+/// The most cells of a value one block covers in a single pass, a thread a
+/// cell: the most threads a block launches with on CUDA and HIP (their
+/// launch limit, engine-cuda's `MAX_BLOCK_THREADS`; a Metal region's 512
+/// threads cover it two cells a thread). A device fact, not a tuned cut.
+pub(crate) const BLOCK_CELLS: u64 = 1024;
+
 pub(crate) fn fused_partition(
     stage: &NormalizedStage,
     index: &StageIndex,
@@ -121,7 +127,31 @@ pub(crate) fn fused_partition(
             _ => None,
         })
         .collect();
+    // A node whose every value one block covers in a pass gains nothing from
+    // a block a row: it runs with its neighbours in one block, so a run of
+    // small ops (a beam's bookkeeping over its few rows) is one region and
+    // one launch, not one a shape.
+    let fits_a_block = |node: NodeIndex| {
+        let op = &stage.ops[node.index()];
+        let base = index.base(node).unwrap_or_default();
+        !matches!(op.tag(), eta_ir::op::tags::RNG | eta_ir::op::tags::RNG_KEYED)
+            && op.operands()
+            .into_iter()
+            .chain((0..op.result_count()).map(|result| base + result))
+            .all(|value| {
+                stage.value_types.get(value as usize).is_some_and(|ty| {
+                    ty.dims.iter().try_fold(1u64, |cells, dim| match dim {
+                        Dimension::Static(n) => Some(cells.saturating_mul(u64::from(*n))),
+                        _ => None,
+                    })
+                    .is_some_and(|cells| cells <= BLOCK_CELLS)
+                })
+            })
+    };
     let class = |node: NodeIndex| -> (Geometry, Option<ValueId>) {
+        if fits_a_block(node) {
+            return (Geometry::Single, None);
+        }
         match geometries[node.index()] {
             (Geometry::Rows { fixed, extent }, witness)
                 if arithmetic.contains(&(fixed, extent)) =>

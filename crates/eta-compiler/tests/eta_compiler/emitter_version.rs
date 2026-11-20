@@ -6,14 +6,14 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_module};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 78, 0x4879_590d_a635_8208),
-    ("hip", 38, 0xddab_1cb5_2d25_8e42),
-    ("metal", 69, 0x7641_169d_826d_d06b),
+    ("cuda", 83, 0x4ffd_5d75_0d7a_361a),
+    ("hip", 43, 0x0c58_2dcf_da3f_4592),
+    ("metal", 73, 0xe90d_7ade_0ce2_0d61),
 ];
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it
 /// writes: every call's module, in the order a stage's steps index them.
-const WGSL_PINNED: (u16, u64) = (8, 0x74a6_105a_bbbd_522d);
+const WGSL_PINNED: (u16, u64) = (9, 0xc901_c955_05d9_d257);
 
 fn wgsl_fingerprint() -> u64 {
     let mut bytes = Vec::new();
