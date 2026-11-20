@@ -1309,6 +1309,7 @@ impl SlotPool {
     pub fn census(&self, run: u32) -> String {
         let limit = self.state_limit().min(self.ceiling);
         let free = (0..self.total).filter(|&chunk| self.free.get(chunk)).count();
+        let past_limit = (limit..self.total).filter(|&chunk| self.free.get(chunk)).count();
         let open = self.open.iter_in(0, self.total).count();
         let fenced = (0..self.total).filter(|&chunk| self.fenced.get(chunk)).count();
         let empty_opened = self
@@ -1341,8 +1342,9 @@ impl SlotPool {
         stretches.truncate(5);
         let compaction = self.plan_compaction(run).map(|moves| moves.len());
         format!(
-            "run={run} committed={} reserved={} held={} act={} headroom={} free={free} \
-             open={open} fenced={fenced} opened_empty={empty_opened} \
+            "pool (scope: every chunk): run={run} committed={} reserved={} opened={} act={} \
+             headroom={} free_any={free} free_open_for_state={open} \
+             free_past_state_limit={past_limit} fenced={fenced} opened_empty={empty_opened} \
              shapes(opened,empty)={by_shape:?} segment_chunks={} state_limit={} ceiling={} \
              longest_open_by_segment={stretches:?} open_runs={} compaction_moves={compaction:?} \
              compacting={}",

@@ -6682,3 +6682,4 @@ async fn room_that_comes_free_on_any_path_wakes_the_waiter_it_serves() {
         assert!(matches!(task.await.unwrap(), Ok(super::acquire::Acquired::Granted(_))));
     }
 }
+

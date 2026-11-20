@@ -146,11 +146,23 @@ impl ResidencyPlanner {
             }
             let (pid, kind) = (waiter.pid, waiter.kind_name());
             let pids: Vec<ProcessId> = inner.procs.keys().copied().collect();
+            // What its last unpark refusal said, and what was recorded as
+            // its need: set beside the map, a refusal with fitting runs
+            // standing names the part or shape the map does not count.
+            let refusal = inner.procs.get(&waiter.pid).map(|proc| {
+                format!(
+                    "refused_on_this_pool={} roles_short={:?} bind_room={:?} why={:?}",
+                    proc.roles_short_gives == Some(gives),
+                    proc.roles_short.map(|need| (need.run, need.pieces)),
+                    proc.bind_room.map(|need| (need.run, need.pieces)),
+                    proc.roles_short_why,
+                )
+            });
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            Some((key, pid, kind, pids, again))
+            Some((key, pid, kind, pids, again, refusal))
         });
-        let Some((key, pid, kind, pids, again)) = stalled else {
+        let Some((key, pid, kind, pids, again, refusal)) = stalled else {
             return;
         };
         // What the head's step takes, read as the map and the step read it.
@@ -179,6 +191,7 @@ impl ResidencyPlanner {
             kind,
             need = ?need,
             again,
+            refusal = %refusal.unwrap_or_default(),
             free_runs = need.map(|(run, _)| self.port.guest_free_runs(run)),
             device = ?(free, total),
             queue = %self.debug_queue(),

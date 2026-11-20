@@ -193,11 +193,14 @@ impl ChunkMap {
             .headroom
             .is_some_and(|headroom| headroom < run);
         format!(
-            "map: run={run} free={} held={} emptiable={} stuck={stuck} candidates={} \
+            "map (scope: chunks a state shape may open, and chunks holding eviction \
+             candidates or parked state): run={run} open_for_state={} \
+             candidate_or_parked_held={} emptiable={} stuck={stuck} candidates={} \
              headroom={:?} segment_chunks={} longest_usable_stretch={longest} \
              longest_free_stretch={longest_free} free_runs={free_runs} \
              free_stretches_cut_at_segment_edges={cut_at_edge} \
-             headroom_short_for_one_run={headroom_short} cheapest={:?}",
+             headroom_short_for_one_run={headroom_short} \
+             cheapest_one_run_moves={:?}",
             free.len(),
             self.held.len(),
             emptiable.len(),
