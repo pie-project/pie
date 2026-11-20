@@ -904,6 +904,15 @@ impl Bodies {
         self.recorder.sealed_seen.clear();
     }
 
+    /// Drops the recorded bodies of bucket `bucket` (every kind) and what
+    /// was refused there, unsealed so they arm again; the other buckets'
+    /// stay armed. What a load's product choice re-arms where it timed a
+    /// choice over that bucket's rows (`Shell::routes_by_body`).
+    pub fn forget_bodies_at(&mut self, bucket: u32) {
+        self.map.forget_bucket(bucket);
+        self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)
@@ -1244,6 +1253,15 @@ struct Seating {
 }
 
 impl BodyMap {
+    fn forget_bucket(&mut self, bucket: u32) {
+        self.bodies.retain(|key, _| key.bucket != bucket);
+        self.body_order.retain(|key| key.bucket != bucket);
+        self.body_warm.retain(|key, _| key.bucket != bucket);
+        self.cold_refused.retain(|key| key.bucket != bucket);
+        self.bodies_refused.retain(|key| key.bucket != bucket);
+        self.sealed = false;
+    }
+
     fn holds(&self, key: &BodyKey) -> bool {
         self.bodies.contains_key(key)
     }

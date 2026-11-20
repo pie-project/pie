@@ -1114,8 +1114,9 @@ impl Shell {
     }
 
     /// The decode products `wanted` names, each timed in its real
-    /// neighbourhood: for each shape (by rows, ascending), the lattice armed
-    /// with that bank on the skinny kernel and then on the turned kernel
+    /// neighbourhood: for each shape (by rows, ascending), its bucket's
+    /// bodies armed with that bank on the skinny kernel and then on the
+    /// turned kernel (the other buckets' kept armed)
     /// (every bank decided before it as decided), and the decode body of its
     /// rows (that many one-row lanes) replayed [`BODY_ROUNDS`] rounds of
     /// [`BODY_FIRES`] fires under each. The faster past the rounds'
@@ -1145,7 +1146,9 @@ impl Shell {
             for kernel in [Kernel::Skinny, Kernel::Turned] {
                 self.device
                     .set_routes(std::sync::Arc::new(decided.forcing(shape, kernel)));
-                self.rearm_bodies()?;
+                // A product's rows in a body are its bucket's: only that
+                // bucket's bodies change with its kernel.
+                self.rearm_bucket(shape.m)?;
                 let (ns, spread) = self.time_decode_body(class, shape.m)?;
                 times.push((kernel, ns, spread));
             }
@@ -1154,7 +1157,11 @@ impl Shell {
             measured.extend(entries);
         }
         self.device.set_routes(decided);
-        self.rearm_bodies()?;
+        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).collect();
+        buckets.dedup();
+        for bucket in buckets {
+            self.rearm_bucket(bucket)?;
+        }
         Ok(measured)
     }
 
@@ -1191,6 +1198,19 @@ impl Shell {
             rounds[BODY_ROUNDS / 2],
             rounds[3 * BODY_ROUNDS / 4] - rounds[BODY_ROUNDS / 4],
         ))
+    }
+
+    /// Bucket `bucket`'s bodies forgotten and armed again, the other
+    /// buckets' kept: a re-arm allowed what the load's own arming took.
+    #[cfg(feature = "rocm")]
+    fn rearm_bucket(&mut self, bucket: u32) -> Result<()> {
+        self.cache.forget_bodies_at(bucket);
+        self.arm_only = Some(bucket);
+        self.rearming = true;
+        let armed = self.arm_bodies();
+        self.rearming = false;
+        self.arm_only = None;
+        armed
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
@@ -1528,10 +1548,13 @@ impl Shell {
             }
         }
         let LatticeTargets {
-            targets,
+            mut targets,
             top,
             unfireable,
         } = self.lattice_targets()?;
+        if let Some(bucket) = self.arm_only {
+            targets.retain(|(at, ..)| *at == bucket);
+        }
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its

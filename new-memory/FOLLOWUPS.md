@@ -764,9 +764,23 @@ added) are not expected to help.
 Tried, none kept: the norm weight fetched under the row loads (greedy +12 µs); the first tile's
 weight issued after the norm (no change).
 
-Next: shorten the tail at four rows. Compute each chunk of a wave's weight as it lands (partial
-vmcnt waits) rather than after all of it, on the skinny kernel for o-proj / down / qkv and the
-turned kernel for gate-up. Measure by the cold-weight A/B.
+In-wave pipelining, checked (2026-11-20):
+- The skinny kernel at m = 4 already computes each chunk as it lands: its ISA waits vmcnt(3),
+  (2), (1), (0), each before its group of MFMAs.
+- The turned folded kernel issued its weight loads, then each norm item's row loads followed by
+  vmcnt(0). The counter retires in issue order, so the norm waited for the whole weight share. A
+  two-phase norm (rows and the norm's weight loaded first from clamped places, then the weight,
+  then the stage's arithmetic in its order; bit-exact; ISA vmcnt(14…8)) overlaps them. It
+  measured slower: 4 parallel 1.482 / 1.480 vs 1.465 / 1.469 ms, beam-4 2.153 / 2.154 vs
+  2.140 / 2.145. Not kept. Issuing the weight after the norm made no difference either.
+
+So the norm's serial chain is not what the four-row products pay. Ruled out: occupancy, split-K,
+load ordering, in-wave pipelining; LDS conflicts were real (fixed, −5 µs). What remains is the
+per-byte work at four rows (each weight byte feeds four rows' MFMAs and reductions).
+
+Next: an MFMA shape that covers four rows without waste. The turned kernel's 16x16x16 spends
+three quarters of each product on padding rows at m = 4; skinny4's 4x4x4-per-block layout lost on
+narrow banks. Each candidate is judged by the cold-weight A/B.
 
 ## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
 
