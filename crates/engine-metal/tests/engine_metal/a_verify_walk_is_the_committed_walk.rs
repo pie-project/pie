@@ -525,6 +525,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             new_y,
             land,
             snapshots(bench, snaps.map(|s| s.1)),
+            false,
         )
         .expect("the verify conv");
     });
@@ -549,6 +550,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             paged_y,
             paged_land,
             None,
+            false,
         )
         .expect("the paged verify conv");
     });

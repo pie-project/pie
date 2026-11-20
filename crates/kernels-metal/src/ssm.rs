@@ -1569,6 +1569,7 @@ pub fn causal_conv1d_verify(
     y: Tensor,
     land: Tensor,
     snapshots: Option<Snapshots>,
+    own_only: bool,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d_committed";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_verify_bfloat16" });
@@ -1624,6 +1625,7 @@ pub fn causal_conv1d_verify(
             row_bytes,
             is_paged,
             state.segments.arg(),
+            i32::from(own_only).arg(),
         ],
     )
 }

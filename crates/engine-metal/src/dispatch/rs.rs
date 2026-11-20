@@ -337,6 +337,16 @@ impl Run<'_> {
                 ext_y,
                 self.tensor(y),
                 self.rs_snapshots(conv.state),
+                // The carried scan (a decode window over the corrected
+                // planes, through a page table) reads its own row alone.
+                paged.is_some()
+                    && seat
+                        .layout
+                        .in_of
+                        .get(&y.0)
+                        .is_some_and(|&plane| seat.layout.planes[plane].role == crate::rs::Role::Keys)
+                    && self.rs_snapshots(conv.state).is_none()
+                    && self.carried_window(seat),
             )?;
             return Ok(ext_y);
         }

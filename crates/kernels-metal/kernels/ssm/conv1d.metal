@@ -457,6 +457,9 @@ template <typename T>
     const constant uint& row_bytes [[buffer(20)]],
     const constant int& paged      [[buffer(21)]],
     const device ulong* map        [[buffer(22)]],
+    // A carried decode window reads no carried row's output (the carried
+    // scan reads its own row alone): only the own rows' outputs are made.
+    const constant int& own_only   [[buffer(23)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
@@ -528,7 +531,7 @@ template <typename T>
                       float(weight[(col + 3) * size_t(width) + size_t(k)]));
       }
     }
-    for (int t = first; t < span; t += rows) {
+    for (int t = (own_only != 0 ? rep : 0) + first; t < span; t += rows) {
       float4 acc = 0.0f;
       for (int k = 0; k < width; ++k) {
         const float4 in = tap(t - (width - 1 - k) * dil);
@@ -589,6 +592,7 @@ template <typename T>
       const constant int&, const constant int&, const device int*,      \
       const constant int&, device uchar*, const device int*,            \
       const constant uint&, const constant uint&, const constant uint&, \
-      const constant int&, const device ulong*, uint3, uint3, uint3);
+      const constant int&, const device ulong*, const constant int&,    \
+      uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)

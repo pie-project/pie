@@ -542,7 +542,7 @@ impl crate::run::Run<'_> {
     /// Whether this window's lanes each run one row of their own over at
     /// most [`ssm::GDN_CARRIED_MAX`] carried rows: a decode step the carried
     /// scan serves.
-    fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
+    pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
         let indptr = self.qo_indptr_host();
         let lane0 = self.window().span.lane_offset as usize;
         indptr.windows(2).enumerate().all(|(r, pair)| {
