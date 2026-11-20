@@ -467,6 +467,12 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<Vec<(f32, f32)>> 
         let step = got.first().copied().ok_or("the rescoring fire returned nothing")?;
         let picked = picked.take_host::<Vec<f32>>().await.context("rescore drain")?;
         let largest = largest.take_host::<Vec<f32>>().await.context("rescore drain")?;
+        // The beam's fire and the rescore round each logit independently, so
+        // each may sit one quantum from the true value on either side: the
+        // step's log-probability (target logit less the log-sum-exp, which
+        // the largest logit leads) may move by the target's quantum and the
+        // largest logit's, two quanta where they share a binade (the CUDA
+        // beam-4 run's 0.227 step against 0.25), and by its own quantum.
         let room =
             quantum(step) + picked.iter().chain(&largest).map(|&l| quantum(l)).sum::<f32>();
         steps.push((step, room));
