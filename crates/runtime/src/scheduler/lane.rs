@@ -1415,6 +1415,10 @@ impl Lane {
                         .weight_uses()
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
                         .map_err(Into::into),
+                    HostKvOp::BeamList(instance, beam) => engine
+                        .beam_list(instance, beam)
+                        .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
+                        .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())

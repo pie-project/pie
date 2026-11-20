@@ -15,7 +15,7 @@
 //! list names lies in the group's own working set's reserve, checked on the
 //! device, a lane faulting by name where one does not.
 
-use crate::eta::{Channel, StateGeometry, WorkingSet, kv_page_size};
+use crate::eta::{Channel, ForwardPass, StateGeometry, WorkingSet, kv_page_size};
 use eta_dsl::dtype;
 use eta_dsl::value::Tensor;
 
@@ -23,6 +23,8 @@ use eta_dsl::value::Tensor;
 pub struct BeamGroup {
     beams: u32,
     reserve: u32,
+    folded: u32,
+    steps: u32,
     positions: Channel,
     slots: Channel,
     parents: Channel,
@@ -59,6 +61,8 @@ impl BeamGroup {
         Ok(BeamGroup {
             beams,
             reserve,
+            folded,
+            steps,
             positions: Channel::from(vec![folded; beams as usize]),
             slots: Channel::from(vec![folded; beams as usize]),
             parents: Channel::from((0..beams).collect::<Vec<u32>>()),
@@ -73,6 +77,8 @@ impl BeamGroup {
             positions: Some(&self.positions),
             slots: Some(&self.slots),
             parents: Some(&self.parents),
+            // The search's depth: its folded slots and a slot a fire.
+            parents_end: Some(self.folded + self.steps),
             ..StateGeometry::default()
         }
     }
@@ -87,6 +93,24 @@ impl BeamGroup {
         self.slots.put(&slot + 1u32);
         let position = self.positions.take();
         self.positions.put(&position + 1u32);
+    }
+
+    /// Ends the search on beam `beam` after `fires` fires of `pass` (the
+    /// pass the group's geometry is bound to), once the last has landed:
+    /// the working set then holds that beam's hypothesis at slots
+    /// `[folded, folded + fires)` in its own order, its recurrent rows too
+    /// on a hybrid, and later passes bind it as any set; the other beams'
+    /// pages are let go (`BEAM-PAGE-LISTS.md` §6.6). On a hybrid its rows
+    /// are folded into the state by an ordinary pass that folds them.
+    pub fn finish(&self, pass: &ForwardPass, beam: u32, fires: u32) -> Result<(), String> {
+        if beam >= self.beams {
+            return Err(format!("beam {beam} of a group of {}", self.beams));
+        }
+        let end = self
+            .folded
+            .checked_add(fires)
+            .ok_or("the beams' slots pass the u32 range")?;
+        pass.adopt_beam(beam, end)
     }
 
     /// The beams.

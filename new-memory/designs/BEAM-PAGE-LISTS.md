@@ -65,8 +65,17 @@ rs buffer, on the same pool pages as its kv slots.
 - `s_t`: the slot every beam writes at fire `t` (`s_0 = folded`). Column
   `c_t = s_t / S - f0`, offset `o_t = s_t % S`. Entry `j` of a list covers
   slots `[(f0 + j) S, (f0 + j + 1) S)`.
-- `P` (list width): columns a list may hold, `P = ceil(reserved / S) - f0`
-  bounds it; an engine may size by its context pages (`pages_per_slot`).
+- `end`: the slot past the search's last row (`folded` plus its fires), the
+  depth the guest states at the bind (`state-geometry.parents-end`, required
+  with `parents`, refused by name without it; the SDK's `BeamGroup::geometry`
+  states `folded + steps`). It reaches the engine as the bind's `key_len`
+  (the most keys a lane reads).
+- Readout rows: one figure, the instance's. A group's instance reads its `B`
+  beams' rows (the bind's per-instance readout rows, `b` for the group), one
+  a lane; every engine checks its readout seats against that figure.
+- `P` (list width): columns a list may hold, `ceil(end / S)` pages a beam,
+  laid for the bind's depth, never the context's. A search whose rows pass
+  `end` faults `SHORT` by name (§6.5).
 - A pool page `q` is the set's page `f0 + q` of every paged plane the set
   holds: its kv pages and, on a hybrid (§11), its rs buffer pages, one
   reservation for both. `Q_t` below counts pool pages, each priced at the
@@ -95,11 +104,18 @@ rs buffer, on the same pool pages as its kv slots.
     fired          u32   fires run; 0 until the first fire primes
     pool           u32   the pool's pages at the last fire
 
-Stated in `engine::GuestState::resident`, part of the instance's bytes at
-its bind extents (bind to unbind; `scratch` and `scratch_arms` unchanged):
-`B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on `P`
-and `Q` (an engine may hold a word where a bit is stated, and may keep two
-copies of `map` to reorder in place). It is one copy, device-owned, changed
+It lives in the instance's **per-bind scratch**, sized by the engine's
+`guest_state(program, extents)` from the bind's `key_len` (`end`, §3), never
+in the per-program instance item (one program binds searches of many
+depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on
+`P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may hold a word where a
+bit is stated, and may keep two copies of `map` to reorder in place). That
+scratch is priced in the ledger at the bind like any guest slot, is a
+declared part of the instance's state that the roles move (it parks and
+restores with the set), and stands from the bind to the search's finish:
+it is cleared once, at the bind, and no fire writes it but the head step.
+engine-cuda lays it past the lane's value scratch in the instance's scratch
+item; engine-gpu, Metal and XLA keep it in the same per-bind place. It is one copy, device-owned, changed
 only by head kernels in queue order: never part of what an engine
 double-buffers for fires in flight, and never touched by staging a later
 fire on the host. It is pool-relative: it never names a physical page, so
@@ -188,12 +204,21 @@ every lane, faulted or not. A faulted lane fails its fire by name
 (`Overreach: lane b's page list ...`); the others proceed.
 
 **6.6 Finish.** A search ends when the guest names its chosen beam `b*`
-(`group.finish(b*)`) after its last fire lands: the runtime reads
-`map[b*][0..=c]` once (the search's one host read, off the per-fire path)
-and re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of
-every plane for `j <= c`; every other pool page is released. The set then
-holds the chosen hypothesis at slots `[folded, s_T + 1)` in its own order,
-and later passes bind it as any set (no `parents`).
+(`forward-pass.adopt-beam(b*, end)`, `group.finish`) after its last fire
+lands: the runtime reads `map[b*][0..=c]` once (the search's one host read,
+off the per-fire path, behind the pass's fires on the engine's lane) and
+re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of every
+plane for `j <= c` (on a hybrid, its rs entries slot by slot through
+`σ_{b*}`, §11); every other pool page is let go once the fires that may read
+it retire. Nothing is copied. The set then holds the chosen hypothesis at
+slots `[folded, end)` in its own order, and later passes bind it as any set
+(no `parents`; a hybrid folds the rows by an ordinary pass that folds them).
+
+`map` is the last fire's: its beams are those the last fire read, before its
+epilogue picked the next parents. A guest whose final pick is beam `l` of
+that epilogue (its hypothesis the parent's plus one token no fire fed)
+adopts `b* = parent[l]`, whose pages hold every row of that hypothesis.
+`end = folded + fires` (each fire writes one slot a beam).
 
 ## 7. Faults (one word a lane, read at settle)
 

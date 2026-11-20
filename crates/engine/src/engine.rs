@@ -399,6 +399,16 @@ pub trait Engine: Send {
         Err(self.unsupported("take_channel"))
     }
 
+    /// Beam `beam`'s page list of instance `instance`'s beam group, as its
+    /// last fire left it (`BEAM-PAGE-LISTS.md` §6.6): the pool page of each
+    /// column, the group's list width of them (columns past the last fire's
+    /// unspecified). Read once a search ends, after its fires have landed;
+    /// an engine waits for them.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let _ = (instance, beam);
+        Err(self.unsupported("beam_list"))
+    }
+
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
         let _ = registration;
         Err(self.unsupported("register_adapter"))

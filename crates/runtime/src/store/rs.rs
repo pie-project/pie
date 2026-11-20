@@ -91,6 +91,8 @@ pub(crate) struct WindowAdvance {
 pub enum RsError {
     #[error("unknown rs working set")]
     UnknownWorkingSet,
+    #[error("a beam search's finish: {0}")]
+    BeamFinish(&'static str),
     #[error("a fire writes slot {slot}, which its state already holds (it holds {frozen})")]
     BelowFrozen { slot: u32, frozen: u32 },
     #[error("rs batch contains the same working set more than once")]
@@ -2516,6 +2518,54 @@ impl RsStore {
         for (list, ids) in grant.windows.into_iter().enumerate() {
             self.list_pool(list).release_reserved(ids);
         }
+    }
+
+    /// A beam search's finish on a hybrid (`BEAM-PAGE-LISTS.md` §6.6,
+    /// §11): the set's buffered rows become its chosen beam's, slot by slot.
+    /// The buffer's entry holding slot `s` (`f0 S <= s < end`) becomes the
+    /// entry that held slot `(f0 + order[s / S - f0]) S + s mod S`; entries
+    /// on the frozen pages stay; every entry no longer named is let go once
+    /// the fires that may read it retire. Nothing is copied.
+    pub fn relist_beam(
+        &mut self,
+        ws: RsWorkingSetId,
+        f0: u32,
+        page: u32,
+        order: &[u32],
+        end: u32,
+    ) -> Result<(), RsError> {
+        let epoch = self.seq;
+        let (base, tokens) = {
+            let entry = self.entry(ws)?;
+            (self.buffer_base(entry), self.page_tokens(entry))
+        };
+        let entry = self.entry_mut(ws)?;
+        let old = entry.buffer.clone();
+        let count = end.saturating_sub(base).div_ceil(tokens) as usize;
+        let mut new = Vec::with_capacity(count);
+        for e in 0..count as u32 {
+            let slot = base + e * tokens;
+            if slot < f0 * page {
+                new.push(old.get(e as usize).copied().flatten());
+                continue;
+            }
+            let column = (slot / page - f0) as usize;
+            let q = *order.get(column).ok_or(RsError::BeamFinish(
+                "the chosen beam's list is shorter than its buffered rows",
+            ))?;
+            let sigma = (f0 + q) * page + slot % page;
+            let from = ((sigma - base) / tokens) as usize;
+            new.push(old.get(from).copied().flatten());
+        }
+        let freed: Vec<RsSlotId> = old
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|id| !new.contains(&Some(*id)))
+            .collect();
+        entry.buffer = new;
+        self.recycle(freed, epoch);
+        Ok(())
     }
 
     fn entry(&self, ws: RsWorkingSetId) -> Result<&RsEntry, RsError> {

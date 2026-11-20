@@ -2499,6 +2499,49 @@ impl KvStore {
         self.retire_idle();
     }
 
+    /// A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): the set's pages
+    /// from `f0` become its chosen beam's, page `f0 + j` the pool page
+    /// `order[j]` (pool page `q` is the set's page `f0 + q` now), for each
+    /// column `j` the search wrote; every other page past `f0` is let go
+    /// once the fires that may read it retire. The pages move, nothing is
+    /// copied.
+    pub fn relist_beam(
+        &mut self,
+        ws: WorkingSetId,
+        f0: u64,
+        order: &[u32],
+    ) -> Result<(), KvStoreError> {
+        let flat = self.table.flatten(ws)?;
+        let mut chosen = Vec::with_capacity(order.len());
+        for &q in order {
+            let index = f0 + u64::from(q);
+            let page = *flat.get(index as usize).ok_or(KvStoreError::BadWriteSet {
+                reason: "a chosen beam names a pool page past its set's backed pages",
+            })?;
+            if chosen.contains(&page) {
+                return Err(KvStoreError::BadWriteSet {
+                    reason: "a chosen beam names one pool page twice",
+                });
+            }
+            chosen.push(page);
+        }
+        let page_size = self.page_size as usize;
+        let pages = chosen
+            .iter()
+            .map(|&id| crate::store::kv::page_table::PublishedPage {
+                id,
+                token_hashes: vec![None; page_size],
+                page_hash: None,
+            })
+            .collect();
+        let mut freed = self.table.replace_tail(ws, f0, pages)?;
+        freed.retain(|backing| !matches!(backing, KvPageBacking::Resident(id) if chosen.contains(id)));
+        let epoch = self.current_epoch();
+        self.recycle_backings(freed, epoch);
+        self.refresh_flat(ws);
+        Ok(())
+    }
+
     pub fn flat_table(&mut self, ws: WorkingSetId) -> Result<&[PhysicalKvPageId], KvStoreError> {
         if !self.flat.get(&ws).is_some_and(Option::is_some) {
             let flat = self.table.flatten(ws)?;

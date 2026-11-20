@@ -190,6 +190,27 @@ impl Buffers {
             .take(widths.len())
             .map(|&(offset, _)| offset)
             .collect();
+        // A beam's fork copies a page's rows plane by plane
+        // (`Buffers::page_planes`, BEAM-PAGE-LISTS.md §11.2): the planes must
+        // tile each buffered layer's row, or a fork leaves a plane's rows
+        // stale.
+        for (layer, &width) in widths.iter().enumerate() {
+            let spanned: u64 = planes
+                .all()
+                .iter()
+                .filter(|plane| plane.layer as usize == layer)
+                .map(|plane| plane.width)
+                .sum();
+            if spanned != width {
+                return Err(Fault::program(
+                    "store::rs",
+                    format!(
+                        "recurrent layer {layer} buffers {width} elements a token and its \
+                         planes span {spanned}: a beam's fork would copy only those"
+                    ),
+                ));
+            }
+        }
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
         Ok(Some(Buffers {

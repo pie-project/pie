@@ -86,19 +86,11 @@ impl Program {
     /// lists past it where it states parents (laid for `beam`'s pages and
     /// frames), and past that a capturing lane's rows of `score_bytes`
     /// where it reads them.
-    fn held(&self, score_bytes: u64, beam: (u32, u32)) -> Held {
-        let mut held = Held::of(&self.plan.package.channels);
-        if let Some(lanes) = self.beam_lanes() {
-            // A group's pool holds its beams' pages (each at most a
-            // sequence's), the pages a fire hands out, those pending over the
-            // frames in flight and the prompt's own page (BEAM-PAGE-LISTS §3).
-            let (pages, frames) = beam;
-            let cap = lanes
-                .saturating_mul(pages)
-                .saturating_add(lanes.saturating_mul(frames + 1))
-                .saturating_add(1);
-            held = held.with_beam(lanes, cap, frames);
-        }
+    fn held(&self, score_bytes: u64, _beam: (u32, u32)) -> Held {
+        // A beam group's page lists lie in the instance's per-bind scratch,
+        // sized by its bind's depth ([`Plane::pair_room`]), not here: one
+        // program binds searches of many depths.
+        let held = Held::of(&self.plan.package.channels);
         if self.reads_scores() {
             held.with_scores(score_bytes)
         } else {
@@ -350,6 +342,10 @@ pub fn flight_lanes(members: u32) -> u32 {
 pub struct PairRoom {
     /// What a flight of the pair lays.
     pub flight: FireBytes,
+    /// A beam group's resident state (BEAM-PAGE-LISTS §4), past the lane's
+    /// scratch in the instance's: laid for the bind's depth, its offset
+    /// from the scratch's first aligned byte.
+    pub beam: Option<launch::BeamLayout>,
     /// The lanes the tables are laid for: a flight's most, no more than a
     /// fire carries.
     pub lanes: u32,
@@ -369,7 +365,11 @@ impl PairRoom {
     /// byte may take.
     #[must_use]
     pub fn instance_bytes(&self) -> u64 {
-        launch::SPAN_ALIGN + launch::lane_scratch(self.flight.scratch)
+        let scratch = launch::lane_scratch(self.flight.scratch);
+        launch::SPAN_ALIGN
+            + self.beam.map_or(scratch, |beam| {
+                beam.at + kernels_cuda::runtime::channel::beam_state_words(beam.lanes, beam.cap, beam.frames) * 4
+            })
     }
 
     /// Where the wave's tables lie in a pair's state at `base`.
@@ -459,10 +459,10 @@ impl Plane {
         self.score_bytes = bytes;
     }
 
-    /// The pages a beam group's lists and pool are laid for (the context's)
-    /// and the frames its pending pages wait (the frames in flight).
-    pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
-        self.beam_bounds = (pages, frames.max(1));
+    /// The kv page a beam group's lists count in, and the frames its
+    /// pending pages wait (the frames in flight): its depth is each bind's.
+    pub fn set_beam_bounds(&mut self, page: u32, frames: u32) {
+        self.beam_bounds = (page.max(1), frames.max(1));
     }
 
     /// Where instance `id`'s beam group keeps its page lists now, and how it
@@ -471,7 +471,7 @@ impl Plane {
     pub fn beam_state(&self, id: InstanceId) -> Option<(u64, super::program::launch::BeamLayout)> {
         let bound = self.instances.get(&id)?;
         let layout = bound.session.beam()?;
-        Some((bound.session.instance_base() + layout.at, layout))
+        Some((bound.scratch + layout.at, layout))
     }
 
     /// Where instance `id`'s capturing lane's rows lie now, its key row
@@ -533,8 +533,37 @@ impl Plane {
             lanes => lanes,
         };
         let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
+        // A beam group's state for the search's depth (the bind's `key_len`,
+        // its end slot): each beam's pages to it, the pages a fire hands out,
+        // those pending over the frames in flight and the prompt's own page
+        // (BEAM-PAGE-LISTS §3, §4). A search past it faults SHORT by name.
+        let beam = match program.beam_lanes() {
+            Some(lanes) => {
+                let (page, frames) = self.beam_bounds;
+                if extents.key_len <= 1 {
+                    return Err(Fault::program(
+                        "program::plane",
+                        "a beam group (parents) binds with no depth: its pass states the slot \
+                         past the search's last row (state-geometry parents-end)",
+                    ));
+                }
+                let pages = extents.key_len.div_ceil(page.max(1));
+                let cap = lanes
+                    .saturating_mul(pages)
+                    .saturating_add(lanes.saturating_mul(frames + 1))
+                    .saturating_add(1);
+                Some(launch::BeamLayout {
+                    at: launch::lane_scratch(flight.scratch).next_multiple_of(launch::BEAM_ALIGN),
+                    lanes,
+                    cap,
+                    frames,
+                })
+            }
+            None => None,
+        };
         Ok(PairRoom {
             flight,
+            beam,
             lanes: flight.max_lanes.min(fire_lanes).max(1),
             wave: (lane * u64::from(fire_lanes) + fixed).next_multiple_of(launch::SPAN_ALIGN),
         })
@@ -750,6 +779,10 @@ impl Plane {
             }
         };
         session.resolve_on(&program.plan, geometry, device, buffers_rs);
+        // A beam group's state lies in the instance's scratch, laid for this
+        // bind's depth and cleared with it above: it stands from the bind to
+        // the search's finish.
+        session.set_beam(room.beam);
         self.programs
             .get_mut(&program_id)
             .expect("just bound")
