@@ -356,6 +356,14 @@ pub struct WindowMap {
     pub own_row: Vec<i32>,
     pub stash: Vec<i32>,
     pub land: Vec<i32>,
+    /// The tail: each lane's extended rows past its commit, which it leaves
+    /// carried, in a `[lanes, tail_rows]` grid of extended rows (0 past its
+    /// own), its count, and for each own row its cell of the grid (`-1` for
+    /// a row its commit folds). `tail_rows` 0: no lane leaves any.
+    pub tail_rows: u32,
+    pub tail: Vec<i32>,
+    pub tail_count: Vec<i32>,
+    pub own_tail: Vec<i32>,
 }
 
 /// Out of every buffer's range: a write there is dropped.
@@ -463,6 +471,8 @@ impl WindowMap {
         let rows_own = indptr.last().copied().unwrap_or(0).max(0) as usize;
         map.stash = vec![DROP; rows_own];
         map.land = vec![0; rows_own];
+        // each lane's (first extended row, commit, first own row, own rows)
+        let mut tails: Vec<(i32, i32, u32, u32)> = Vec::new();
         let locate = |run: &Run, token: u32| -> Result<i32> {
             let page = token / page_tokens;
             let slot = *run.pages.get(page as usize).ok_or(Fault::Ceiling {
@@ -487,6 +497,7 @@ impl WindowMap {
                 continue;
             };
             let begin = map.from_buffer.len() as i32;
+            tails.push((begin, plan.commit as i32, start, rows));
             // a single-token lane's carried rows are its decode step's input
             // (`CarriedMap`), none replayed (`engine::fire::lane_carried`)
             let gathers: &[Run] = if rows == 1 { &[] } else { &plan.gathers };
@@ -530,6 +541,41 @@ impl WindowMap {
         map.buffer_row.resize(ext, 0);
         map.own_row.resize(ext, 0);
         map.rows_ext = ext as u32;
+        // a lane's extended rows run from `begin` to the next lane's (or
+        // the laid end): its tail is the part past its commit
+        let ends: Vec<i32> = tails
+            .iter()
+            .skip(1)
+            .map(|t| t.0)
+            .chain([laid as i32])
+            .collect();
+        let counts: Vec<i32> = tails
+            .iter()
+            .zip(&ends)
+            .map(|(&(begin, commit, _, _), &end)| (end - begin - commit).max(0))
+            .collect();
+        let widest = counts.iter().copied().max().unwrap_or(0) as u32;
+        if widest > 0 {
+            // a pow2 width, as the extended rows' (one program per width)
+            let t = widest.next_power_of_two();
+            map.tail_rows = t;
+            map.tail = vec![0; tails.len() * t as usize];
+            map.own_tail = vec![-1; rows_own];
+            for (r, (&(begin, commit, start, rows), &n)) in tails.iter().zip(&counts).enumerate() {
+                for j in 0..n {
+                    map.tail[r * t as usize + j as usize] = begin + commit + j;
+                }
+                // own row i sits at extended row begin + (span - rows) + i
+                let span = n + commit;
+                for i in 0..rows as i32 {
+                    let at = span - rows as i32 + i - commit;
+                    if at >= 0 {
+                        map.own_tail[(start as i32 + i) as usize] = r as i32 * t as i32 + at;
+                    }
+                }
+            }
+            map.tail_count = counts;
+        }
         Ok(map)
     }
 }
@@ -538,11 +584,23 @@ impl WindowMap {
 #[derive(Clone, Copy, Debug)]
 pub struct WindowInputs {
     pub rows_ext: u32,
+    /// The window's tail (`WindowMap::tail`), where any lane leaves one.
+    pub tail: Option<TailInputs>,
     pub from_buffer: crate::handle::Tensor,
     pub buffer_row: crate::handle::Tensor,
     pub own_row: crate::handle::Tensor,
     pub stash: crate::handle::Tensor,
     pub land: crate::handle::Tensor,
+}
+
+/// A window's tail staged (`WindowMap::tail`): the `[lanes, rows]` grid of
+/// extended rows, each lane's count, and each own row's cell (`-1` none).
+#[derive(Clone, Copy, Debug)]
+pub struct TailInputs {
+    pub rows: u32,
+    pub grid: crate::handle::Tensor,
+    pub count: crate::handle::Tensor,
+    pub own: crate::handle::Tensor,
 }
 
 /// A [`CarriedMap`] staged: each lane's carried rows' rs list rows
@@ -609,5 +667,39 @@ mod carried_map {
         assert!(map.buffer_rows[..4].iter().all(|&r| r == DROP));
         // a lane carrying past the grid is refused
         assert!(CarriedMap::of(&plans, 2, 0, 16, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tail_map {
+    use super::*;
+
+    #[test]
+    fn a_lanes_rows_past_its_commit_are_its_tail() {
+        let run = |from: u32, count: u32| Run {
+            pages: vec![0, 1],
+            from,
+            count,
+        };
+        // lane 0 replays 2 carried rows then 3 own rows and commits 3 of the
+        // 5; lane 1 commits all of its 2 own rows
+        let plans = vec![
+            LanePlan {
+                replay: 2,
+                commit: 3,
+                gathers: vec![run(4, 2)],
+                scatter: Some(run(6, 3)),
+                ..LanePlan::default()
+            },
+            LanePlan {
+                commit: 2,
+                ..LanePlan::default()
+            },
+        ];
+        let map = WindowMap::of(&plans, &[0, 3, 5], 0, 16, None).unwrap();
+        assert_eq!(map.tail_count, vec![2, 0]);
+        assert_eq!(map.tail_rows, 2);
+        assert_eq!(map.tail, vec![3, 4, 0, 0]);
+        assert_eq!(map.own_tail, vec![-1, 0, 1, -1, -1]);
     }
 }

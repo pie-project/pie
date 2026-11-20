@@ -270,7 +270,12 @@ impl Run<'_> {
                     l.land(ext_y, yv)?;
                     l.land(pool.new_conv_state, next)
                 })?;
-                self.rs_land(OP, &seat, ext_y, *y)
+                self.rs_land(OP, &seat, ext_y, *y)?;
+                // a gated-delta layer's keys ride the buffer with the rows
+                if let Some(&(keys, col0)) = seat.layout.keys_of.get(&y.0) {
+                    self.rs_stash_cols(OP, &seat, keys, self.tensor(*y), col0)?;
+                }
+                Ok(())
             }
             Ssm::GdnGates {
                 ba,
@@ -433,7 +438,61 @@ impl Run<'_> {
                     l.land(ext_y, yv)?;
                     l.land(pool.state, next)
                 })?;
-                self.rs_land(OP, &seat, ext_y, *y)
+                self.rs_land(OP, &seat, ext_y, *y)?;
+                // the rows its lanes leave past their commits: their
+                // corrected values, which a later decode step reads
+                let Some(tail) = self.rs_tail(OP, &seat)? else {
+                    return Ok(());
+                };
+                let &(_, u_plane) =
+                    seat.layout
+                        .corrected
+                        .get(&y.0)
+                        .ok_or_else(|| kernels_xla::Error::Backend {
+                            op: OP,
+                            detail: format!(
+                                "the recurrence landing value {} keeps no corrected rows",
+                                y.0
+                            ),
+                        })?;
+                let own_rows = self.tensor(*y).rows;
+                let u_own = self.rs_temp(own_rows, v_heads * v_dim, poem_ir::Dtype::F32);
+                lower(self.ctx(), |l| {
+                    let qkv = l.read(ext_qkv)?;
+                    let gates = l.read(ext_gates)?;
+                    let bank = l.read(pool.state)?;
+                    let slab = bank.val;
+                    let indptr = l.read(self.qo_indptr())?;
+                    let seat = read_seat(l, &committed, pool.map)?;
+                    let flat = |l: &mut Lower<'_, '_>, t| {
+                        let v = l.read(t)?.val;
+                        let all = l.f().ty(v).elements() as i64;
+                        let v = l.f().reshape(v, &[all])?;
+                        Ok::<_, kernels_xla::Error>(l.f().convert(v, kernels_xla::hlo::Elem::I32))
+                    };
+                    let grid = flat(l, tail.grid)?;
+                    let count = flat(l, tail.count)?;
+                    let own = flat(l, tail.own)?;
+                    let own = l.f().slice_axis(own, 0, 0, i64::from(own_rows))?;
+                    let u = ssm::gated_delta_tail(
+                        l.f(),
+                        qkv,
+                        gates,
+                        slab,
+                        bank,
+                        indptr,
+                        seat,
+                        grid,
+                        count,
+                        own,
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                    )?;
+                    l.land(u_own, u)
+                })?;
+                self.rs_stash_cols(OP, &seat, u_plane, u_own, 0)
             }
             Ssm::Kda {
                 mixed,

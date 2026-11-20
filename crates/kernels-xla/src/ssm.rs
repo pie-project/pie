@@ -2185,6 +2185,95 @@ pub fn gated_delta_carried(
     Ok((y, u, slab))
 }
 
+/// The corrected values of the rows a buffering fire's lanes leave past
+/// their commits (`carried::gdn_tail_corrected`), from the extended run's
+/// `[q | k | v]` and `[g_log | beta]` rows and the bank after the committed
+/// recurrence (`slab`, the state at each lane's commit in its slot): the
+/// tail rows are `grid`'s (`[lanes · rows]` extended rows, `count` each
+/// lane's), and each own row takes its cell `own` (`[own rows]`, `-1`: a
+/// folded row, zero). Returns `[own rows, v_heads · v_dim]`, f32.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_tail(
+    f: &mut Func,
+    qkv: Operand,
+    gates: Operand,
+    slab: Val,
+    state: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    grid: Val,
+    count: Val,
+    own: Val,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+) -> Result<Val, Error> {
+    const OP: &str = "ssm.gated_delta_tail";
+    let (hk, hv, dk, dv) = (
+        i64::from(k_heads),
+        i64::from(v_heads),
+        i64::from(k_dim),
+        i64::from(v_dim),
+    );
+    let per = slot_rows(
+        OP,
+        &format!("state ({hv} heads of {dk}x{dv})"),
+        state,
+        (hv * dk * dv) as u64,
+    )?;
+    let lanes = LaneTables::Committed { indptr, seat }.lanes(f, OP, i64::from(qkv.rows))?;
+    let l = f.dims(lanes.slot)[0];
+    let cells = f.ty(grid).elements() as i64;
+    if l == 0 || cells % l != 0 {
+        return Err(refuse(
+            OP,
+            "the tail grid is not the window's lanes of rows",
+        ));
+    }
+    let t = cells / l;
+    let s0 = take_slots(f, slab, lanes.slot, per)?;
+    let s0 = f.convert(s0, Elem::F32);
+    let s0 = f.reshape(s0, &[l, hv, dk, dv])?;
+    let ext = i64::from(qkv.rows);
+    let grid = f.reshape(grid, &[cells])?;
+    let grid = clamp_i(f, grid, 0, ext - 1)?;
+    let row = qkv.f32(f);
+    let rows = f.take_rows(row, grid)?; // [L·T, W]
+    let k = f.slice_axis(rows, 1, hk * dk, 2 * hk * dk)?;
+    let k = f.reshape(k, &[l, t, hk, dk])?;
+    let v = f.slice_axis(rows, 1, 2 * hk * dk, 2 * hk * dk + hv * dv)?;
+    let v = f.reshape(v, &[l, t, hv, dv])?;
+    let g = gates.f32(f);
+    let g = f.take_rows(g, grid)?;
+    let decays = f.slice_axis(g, 1, 0, hv)?;
+    let decays = f.reshape(decays, &[l, t, hv])?;
+    let betas = f.slice_axis(g, 1, hv, 2 * hv)?;
+    let betas = f.reshape(betas, &[l, t, hv])?;
+    let count = f.reshape(count, &[l])?;
+    let u = carried::gdn_tail_corrected(
+        f,
+        &carried::Tail {
+            state: s0,
+            keys: k,
+            values: v,
+            decays,
+            betas,
+            count,
+        },
+    )?;
+    let u = f.reshape(u, &[cells, hv * dv])?;
+    let n = f.ty(own).elements() as i64;
+    let own = f.reshape(own, &[n])?;
+    let at = clamp_i(f, own, 0, cells - 1)?;
+    let got = f.take_rows(u, at)?;
+    let none = f.like_i(own, 0);
+    let live = f.compare(Cmp::Ge, own, none)?;
+    let live = f.broadcast(live, &[n, hv * dv], &[0])?;
+    let zero = f.like_f(got, 0.0);
+    Ok(f.select(live, got, zero)?)
+}
+
 fn kda_in(
     op: &'static str,
     mixed: Operand,

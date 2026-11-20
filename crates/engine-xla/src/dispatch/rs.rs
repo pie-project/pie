@@ -52,6 +52,16 @@ impl Run<'_> {
             })
     }
 
+    /// The current window's tail (`rs::WindowMap::tail`), where any lane
+    /// leaves one.
+    pub(crate) fn rs_tail(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+    ) -> Result<Option<crate::rs::TailInputs>, Error> {
+        Ok(self.rs_window(op, seat)?.tail)
+    }
+
     /// The carried rows of the current window when it runs each layer's
     /// decode form (a window of single-token lanes), or none.
     pub(crate) fn rs_carried(&self, seat: &Seat) -> Option<CarriedInputs> {

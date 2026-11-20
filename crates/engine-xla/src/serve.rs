@@ -2930,6 +2930,12 @@ impl Shell {
                         key,
                         crate::rs::WindowInputs {
                             rows_ext: map.rows_ext,
+                            tail: (map.tail_rows > 0).then(|| crate::rs::TailInputs {
+                                rows: map.tail_rows,
+                                grid: inputs.i32s(handles, &map.tail, 1),
+                                count: inputs.i32s(handles, &map.tail_count, 1),
+                                own: inputs.i32s(handles, &map.own_tail, 1),
+                            }),
                             from_buffer: inputs.i32s(handles, &map.from_buffer, 1),
                             buffer_row: inputs.i32s(handles, &map.buffer_row, 1),
                             own_row: inputs.i32s(handles, &map.own_row, 1),
