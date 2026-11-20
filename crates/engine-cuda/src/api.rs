@@ -1471,6 +1471,10 @@ impl Engine for Cuda {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.shell.as_ref()?.host_kv_layout(1)
     }

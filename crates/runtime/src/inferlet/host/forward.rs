@@ -1496,6 +1496,96 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     }
 }
 
+impl ProcessCtx {
+    /// A beam search's finish (`forward.wit` `adopt-beam`,
+    /// `BEAM-PAGE-LISTS.md` §6.6): beam `beam`'s page list read from the
+    /// pass's instance (behind its fires, on the engine's lane), then its
+    /// working set's pages past `f0` re-listed to it, kv and (on a hybrid)
+    /// recurrent rows alike, up to slot `end`.
+    async fn core_adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        let (instance, scheduler, kv_rep, rs_rep) = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass.bindings.state.as_ref().and_then(|state| state.parents).is_none() {
+                return Ok(Err(
+                    "adopt-beam: the pass binds no parents (it runs no beam group)".to_string(),
+                ));
+            }
+            let bound = match pass.bound() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+            };
+            (
+                bound.bound_instance.instance_id,
+                bound.scheduler.clone(),
+                bound.kv_lanes.first().copied(),
+                bound.rs_ws.first().copied(),
+            )
+        };
+        let Some(kv_rep) = kv_rep else {
+            return Ok(Err("adopt-beam: the pass's lanes name no working set".to_string()));
+        };
+        let kv: crate::store::kv::working_set::KvWorkingSet =
+            self.ctx()
+                .table
+                .get(&Resource::<crate::store::kv::working_set::KvWorkingSet>::new_borrow(kv_rep))?
+                .clone();
+        let bytes = match scheduler
+            .host_kv(crate::scheduler::worker::HostKvOp::BeamList(instance, beam))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(Err(format!("adopt-beam: beam {beam}'s page list: {error}"))),
+        };
+        let list: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        let stores = crate::store::registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let folded = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.folded(kv.id)
+        }) {
+            Ok(folded) => u32::try_from(folded).unwrap_or(u32::MAX),
+            Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+        };
+        let f0 = folded / page;
+        if end <= f0 * page {
+            return Ok(Err(format!(
+                "adopt-beam: the search ends at slot {end}, below its first page's {}",
+                f0 * page
+            )));
+        }
+        let columns = ((end - 1) / page - f0 + 1) as usize;
+        let Some(order) = list.get(..columns) else {
+            return Ok(Err(format!(
+                "adopt-beam: the search's {columns} column(s) pass beam {beam}'s list of {}",
+                list.len()
+            )));
+        };
+        if let Err(error) = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.relist_beam(kv.id, u64::from(f0), order)
+        }) {
+            return Ok(Err(format!("adopt-beam: kv: {error}")));
+        }
+        if let Some(rs_rep) = rs_rep {
+            let rs: crate::store::rs::working_set::RsWorkingSet =
+                self.ctx()
+                    .table
+                    .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
+                    .clone();
+            if let Err(error) = stores.rs.lock().unwrap().relist_beam(rs.id, f0, page, order, end) {
+                return Ok(Err(format!("adopt-beam: recurrent rows: {error}")));
+            }
+        }
+        Ok(Ok(()))
+    }
+}
+
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
         self.core_new().await
@@ -1584,6 +1674,15 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         id: u32,
     ) -> Anyhow<Result<(), String>> {
         self.core_group(this, lane, id).await
+    }
+
+    async fn adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_adopt_beam(this, beam, end).await
     }
 
     async fn mask(

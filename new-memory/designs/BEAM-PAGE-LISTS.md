@@ -188,12 +188,21 @@ every lane, faulted or not. A faulted lane fails its fire by name
 (`Overreach: lane b's page list ...`); the others proceed.
 
 **6.6 Finish.** A search ends when the guest names its chosen beam `b*`
-(`group.finish(b*)`) after its last fire lands: the runtime reads
-`map[b*][0..=c]` once (the search's one host read, off the per-fire path)
-and re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of
-every plane for `j <= c`; every other pool page is released. The set then
-holds the chosen hypothesis at slots `[folded, s_T + 1)` in its own order,
-and later passes bind it as any set (no `parents`).
+(`forward-pass.adopt-beam(b*, end)`, `group.finish`) after its last fire
+lands: the runtime reads `map[b*][0..=c]` once (the search's one host read,
+off the per-fire path, behind the pass's fires on the engine's lane) and
+re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of every
+plane for `j <= c` (on a hybrid, its rs entries slot by slot through
+`σ_{b*}`, §11); every other pool page is let go once the fires that may read
+it retire. Nothing is copied. The set then holds the chosen hypothesis at
+slots `[folded, end)` in its own order, and later passes bind it as any set
+(no `parents`; a hybrid folds the rows by an ordinary pass that folds them).
+
+`map` is the last fire's: its beams are those the last fire read, before its
+epilogue picked the next parents. A guest whose final pick is beam `l` of
+that epilogue (its hypothesis the parent's plus one token no fire fed)
+adopts `b* = parent[l]`, whose pages hold every row of that hypothesis.
+`end = folded + fires` (each fire writes one slot a beam).
 
 ## 7. Faults (one word a lane, read at settle)
 

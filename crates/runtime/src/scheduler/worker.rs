@@ -380,6 +380,9 @@ pub(crate) enum HostKvOp {
     /// The engine's weight use record since it last answered
     /// (`Engine::weight_uses`), as JSON.
     WeightUses,
+    /// A beam group's beam's page list (`Engine::beam_list`), little-endian
+    /// u32s: behind every fire queued before it.
+    BeamList(::engine::InstanceId, u32),
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
