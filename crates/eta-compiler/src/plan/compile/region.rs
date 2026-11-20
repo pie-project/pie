@@ -86,10 +86,12 @@ pub(crate) fn singleton_partition(stage: &NormalizedStage, index: &StageIndex) -
 }
 
 /// The most cells of a value one block covers in a single pass, a thread a
-/// cell: the most threads a block launches with on CUDA and HIP (their
-/// launch limit, engine-cuda's `MAX_BLOCK_THREADS`; a Metal region's 512
-/// threads cover it two cells a thread). A device fact, not a tuned cut.
-pub(crate) const BLOCK_CELLS: u64 = 1024;
+/// cell, on every target a plan serves: the smallest region a backend
+/// launches whole, Metal's 512 threads (CUDA and HIP launch up to 1,024).
+/// Past it a Metal region walks two cells a thread, and beam's mask values
+/// of 513 to 1,024 cells read wrong ancestry there, so no value that size
+/// shares a region until that walk is right. A device fact, not a tuned cut.
+pub(crate) const BLOCK_CELLS: u64 = 512;
 
 pub(crate) fn fused_partition(
     stage: &NormalizedStage,
@@ -134,17 +136,22 @@ pub(crate) fn fused_partition(
     let fits_a_block = |node: NodeIndex| {
         let op = &stage.ops[node.index()];
         let base = index.base(node).unwrap_or_default();
-        !matches!(op.tag(), eta_ir::op::tags::RNG | eta_ir::op::tags::RNG_KEYED)
-            && op.operands()
+        !matches!(
+            op.tag(),
+            eta_ir::op::tags::RNG | eta_ir::op::tags::RNG_KEYED
+        ) && op
+            .operands()
             .into_iter()
             .chain((0..op.result_count()).map(|result| base + result))
             .all(|value| {
                 stage.value_types.get(value as usize).is_some_and(|ty| {
-                    ty.dims.iter().try_fold(1u64, |cells, dim| match dim {
-                        Dimension::Static(n) => Some(cells.saturating_mul(u64::from(*n))),
-                        _ => None,
-                    })
-                    .is_some_and(|cells| cells <= BLOCK_CELLS)
+                    ty.dims
+                        .iter()
+                        .try_fold(1u64, |cells, dim| match dim {
+                            Dimension::Static(n) => Some(cells.saturating_mul(u64::from(*n))),
+                            _ => None,
+                        })
+                        .is_some_and(|cells| cells <= BLOCK_CELLS)
                 })
             })
     };
@@ -482,7 +489,9 @@ pub(crate) enum Geometry {
 
 pub(crate) struct DirectTopK {
     pub(crate) intrinsic: NodeIndex,
+    /// The one element the row is divided by, or (`scales`) multiplied by.
     pub(crate) divisor: Option<ValueId>,
+    pub(crate) scales: bool,
 }
 
 pub(crate) fn direct_topk(
@@ -517,12 +526,21 @@ pub(crate) fn direct_topk(
     };
     let mut value = through_reshapes(input);
     let mut divisor = None;
-    if let Some(producer) = index.producer(value)
-        && let Op::Div(numerator, element) = stage.ops[producer.index()]
-        && one_element(element)
-    {
-        divisor = Some(element);
-        value = through_reshapes(numerator);
+    let mut scales = false;
+    if let Some(producer) = index.producer(value) {
+        // A temperature divided in, or multiplied in as its reciprocal.
+        match stage.ops[producer.index()] {
+            Op::Div(numerator, element) if one_element(element) => {
+                divisor = Some(element);
+                value = through_reshapes(numerator);
+            }
+            Op::Mul(numerator, element) if one_element(element) => {
+                divisor = Some(element);
+                scales = true;
+                value = through_reshapes(numerator);
+            }
+            _ => {}
+        }
     }
     let intrinsic = index.producer(value)?;
     if !matches!(stage.ops[intrinsic.index()], Op::Output { .. })
@@ -533,7 +551,11 @@ pub(crate) fn direct_topk(
     let plane = &stage.value_types.get(index.base(intrinsic)? as usize)?.dims;
     let ranked = &stage.value_types.get(input as usize)?.dims;
     let same_rows = value_rows(plane).is_some() && value_rows(plane) == value_rows(ranked);
-    (same_rows && plane.last() == ranked.last()).then_some(DirectTopK { intrinsic, divisor })
+    (same_rows && plane.last() == ranked.last()).then_some(DirectTopK {
+        intrinsic,
+        divisor,
+        scales,
+    })
 }
 
 pub fn value_rows(dims: &[Dimension]) -> Option<(u64, u32)> {

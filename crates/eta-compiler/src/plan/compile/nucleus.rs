@@ -80,12 +80,12 @@ const LANE_CUT_WIDTH: u32 = 1024;
 /// The standard sampler's bf16 draw (`eta_dsl::sampler`): the cut's
 /// probabilities a bf16 softmax of the f32 logits less their max rounded to
 /// bf16, over a constant temperature, one top-p or top-k cut of them, and
-/// a gumbel_argmax of the logits under the cut at that temperature. The
-/// lane sampler draws it on several blocks, reading the logits where the
-/// model left them:
+/// a gumbel_argmax of the logits under the cut at that temperature, which
+/// both apply as a multiply by its reciprocal `r`. The lane sampler draws
+/// it on several blocks, reading the logits where the model left them:
 ///
-/// `m = max(x); s = x - bf16(m); d = s / t; e = exp(d); q = e / sum(e);
-/// keep = pivot(q); token = gumbel_argmax(x, keep, t, state)`.
+/// `m = max(x); s = x - bf16(m); d = s * r; e = exp(d); q = e / sum(e);
+/// keep = pivot(q); token = gumbel_argmax(x, keep, r, state)`.
 fn match_draw_dataflow(
     stage: &NormalizedStage,
     final_node: NodeIndex,
@@ -100,7 +100,7 @@ fn match_draw_dataflow(
     let Op::GumbelArgmax {
         logits,
         keep,
-        divisor,
+        scale: divisor,
         state,
     } = *op(final_node)?
     else {
@@ -130,7 +130,8 @@ fn match_draw_dataflow(
     let (exp_node, &Op::Exp(scaled)) = made(exps)? else {
         return None;
     };
-    let (scale_node, &Op::Div(shifted, temperature)) = made(scaled)? else {
+    // The temperature's one form: a multiply by its reciprocal.
+    let (scale_node, &Op::Mul(shifted, temperature)) = made(scaled)? else {
         return None;
     };
     let (shift_node, &Op::Sub(row, narrow)) = made(shifted)? else {
@@ -152,7 +153,7 @@ fn match_draw_dataflow(
     if summed != exps || row != logits || maxed != logits {
         return None;
     }
-    // One constant temperature, above zero, divides both.
+    // One constant reciprocal temperature, above zero, scales both.
     let constant = |value: ValueId| match made(value)? {
         (_, Op::Const(Literal::F32(t))) if *t > 0.0 && t.is_finite() => Some(t.to_bits()),
         _ => None,

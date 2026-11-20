@@ -454,12 +454,12 @@ mod tests {
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let logits = intrinsics::output(0, "logits");
-                let probs = softmax(cast(&logits, dtype::bf16) / temperature);
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
                 let keep = pivot_threshold(probs, cummass_le(top_p));
                 let r = rng.take();
                 let r_next = &r + iota(2);
                 rng.put(&r_next);
-                let t = reshape(gumbel_argmax(&logits, &keep, temperature, &r), [1]);
+                let t = reshape(gumbel_argmax(&logits, &keep, 1.0 / temperature, &r), [1]);
                 tok_in.put(&t);
                 out.put(&t);
             });
@@ -477,11 +477,11 @@ mod tests {
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
                 let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-                let probs = softmax(cast(&logits, dtype::bf16) / temperature);
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
                 let ranked = pivot_threshold(&probs, rank_le(40u32));
                 let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
                 let keep = and(&ranked, &nucleus);
-                let token = reshape(gumbel_argmax(&logits, keep, temperature, &r), [1]);
+                let token = reshape(gumbel_argmax(&logits, keep, 1.0 / temperature, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);
@@ -498,7 +498,7 @@ mod tests {
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
                 let logits = intrinsics::output(0, "logits");
-                let token = reshape(gumbel_argmax(logits, true, 0.7f32, &r), [1]);
+                let token = reshape(gumbel_argmax(logits, true, 1.0 / 0.7f32, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);

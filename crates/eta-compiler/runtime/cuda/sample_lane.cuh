@@ -1511,16 +1511,17 @@ struct M1DrawRow {
 
 // The standard sampler's bf16 draw of each of a lane's rows, on the lane's
 // blocks (`eta_dsl::sampler`): the cut's probabilities q = e / sum(e), e =
-// exp((x - bf16(max x)) / t), each of the shifted row, its quotient, e and q
-// rounded to bf16 as their stores round them; the top-p or top-k cut of q
-// (stored as the bf16 `probs` plane); and gumbel_argmax(x, keep, t, state):
-// each kept lane x / t + gumbel in f32, never rounded. q rises with x, so
+// exp((x - bf16(max x)) * r), r the temperature's reciprocal, the shifted
+// row, its product, e and q rounded to bf16 as their stores round them; the
+// top-p or top-k cut of q (stored as the bf16 `probs` plane); and
+// gumbel_argmax(x, keep, r, state):
+// each kept lane x * r + gumbel in f32, never rounded. q rises with x, so
 // its bounds are those of the row's largest and least logits.
 template <bool RANK>
 __device__ M1_CALLEE void ptir_lane_draw(
     M1Lane& g,
     const M1DrawRow logits,
-    const float temperature,
+    const float inverse,
     const m1_u8* threshold,
     const M1ValueDesc threshold_desc,
     const m1_u8* state,
@@ -1540,7 +1541,7 @@ __device__ M1_CALLEE void ptir_lane_draw(
   // The cut's probability of a logit: every step rounded where the chain
   // stores bf16.
   auto prob = [&](float v, float shift, float sum) {
-    const float e = m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(v - shift) / temperature)));
+    const float e = m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(v - shift) * inverse)));
     return m1_round_bf16(e / sum);
   };
   const m1_u32 key = m1_load_u(state, 0u, state_desc.dtype);
@@ -1588,7 +1589,7 @@ __device__ M1_CALLEE void ptir_lane_draw(
     for (m1_u32 c = first_chunk + warp; c < end_chunk; c += warps) {
       const m1_u32 i = c * 32u + lane;
       float e = i < len
-          ? m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(x_at(i) - shift) / temperature)))
+          ? m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(x_at(i) - shift) * inverse)))
           : 0.0f;
       for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
         const float other = m1_chunk_down(e, offset);
@@ -1686,7 +1687,7 @@ __device__ M1_CALLEE void ptir_lane_draw(
       float value = m1_neg_inf();
       if (kept) {
         const float uniform = ptir_rng_hash_uniform(seed, base + i);
-        value = x_at(i) / temperature + (-logf(-logf(uniform)));
+        value = x_at(i) * inverse + (-logf(-logf(uniform)));
       }
       const M1ArgmaxCandidate next{value, i, m1_isnan(value) ? 0u : 1u, 0u};
       best = m1_argmax_combine(best, next);

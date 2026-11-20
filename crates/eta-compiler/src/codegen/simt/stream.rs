@@ -442,7 +442,7 @@ impl<'a> Streams<'a> {
                 })
             }
             tags::GUMBEL_ARGMAX => {
-                // logits / divisor + gumbel(state, i), -inf where keep is
+                // logits * scale + gumbel(state, i), -inf where keep is
                 // false: an argmax whose lanes the stream makes in f32. The
                 // fused draw takes one that reads the model's row itself.
                 if self.direct_intrinsic[node] != u16::MAX
@@ -1133,9 +1133,9 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     pass.registers.push((out, Dtype::F32));
 }
 
-/// Lane `i` of a gumbel_argmax `node`, as a register: `logits[i] /
-/// divisor + gumbel(state, i)`, `-inf` where keep is false, in the f32
-/// operations of `reduce_argmax(select(keep, logits / divisor, -inf) +
+/// Lane `i` of a gumbel_argmax `node`, as a register: `logits[i] *
+/// scale + gumbel(state, i)`, `-inf` where keep is false, in the f32
+/// operations of `reduce_argmax(select(keep, logits * scale, -inf) +
 /// rng_keyed(state))` (eta_ir::types), the noise lane running on from this
 /// block's row as a keyed draw's does.
 fn gumbel_lane(streams: &Streams<'_>, node: usize, pass: &mut Pass<'_>) -> String {
@@ -1160,7 +1160,7 @@ fn gumbel_lane(streams: &Streams<'_>, node: usize, pass: &mut Pass<'_>) -> Strin
         "      const float n{node} = -logf(-logf(u{node}));"
     ));
     pass.body.both(&format!(
-        "      const float g{node} = {keep} ? {x} / {divisor} + n{node} : m1_neg_inf();"
+        "      const float g{node} = {keep} ? {x} * {divisor} + n{node} : m1_neg_inf();"
     ));
     format!("g{node}")
 }

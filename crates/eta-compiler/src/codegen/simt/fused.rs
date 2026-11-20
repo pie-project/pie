@@ -151,6 +151,8 @@ pub(crate) const GUMBEL_ROUND_LOGITS: u32 = 1;
 pub(crate) const GUMBEL_ROUND_SCALED: u32 = 2;
 /// The perturbed row is bf16.
 pub(crate) const GUMBEL_ROUND_PERTURBED: u32 = 4;
+/// The divisor is a gumbel_argmax's scale: the draw multiplies by it.
+pub(crate) const GUMBEL_SCALE: u32 = 8;
 
 pub(crate) fn analyze_direct_argmax(
     stage: &CompiledStage,
@@ -215,8 +217,9 @@ pub(crate) fn analyze_direct_argmax(
         // A draw's own divisor where it is not one: the fused draw's.
         let mut draw_divisor: Option<u32> = None;
         if draw {
-            // A gumbel_argmax that keeps every lane at a divisor of one: the
-            // fused draw's own form (its lanes are f32, never rounded).
+            // A gumbel_argmax that keeps every lane, at a scale of one or one
+            // it multiplies by: the fused draw's own form (its lanes are
+            // f32, never rounded).
             let (logits, keep, divisor, state) = (
                 reduction.args[0],
                 reduction.args[1],
@@ -252,7 +255,12 @@ pub(crate) fn analyze_direct_argmax(
                     })
                     .map(|v| producers[v as usize])
                     .collect();
-                operands = Some((logits, logits, state, head, node as u32, 0));
+                let rounding = if draw_divisor.is_some() {
+                    GUMBEL_SCALE
+                } else {
+                    0
+                };
+                operands = Some((logits, logits, state, head, node as u32, rounding));
             }
         } else if single_consumer(value, node as u32)
             && ops[producers[value as usize] as usize].tag == tags::ADD
@@ -398,6 +406,9 @@ pub(crate) struct TopKDirect {
     pub(crate) intrinsic: u16,
     pub(crate) node: u32,
     pub(crate) divisor: Option<u32>,
+    /// The row is multiplied by `divisor` (a temperature's reciprocal), not
+    /// divided.
+    pub(crate) scales: bool,
 }
 
 pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirect>> {
@@ -415,6 +426,7 @@ pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirec
                 intrinsic: output_slot(stage, &ops[producer]),
                 node: producer as u32,
                 divisor: direct.divisor,
+                scales: direct.scales,
             })
         })
         .collect()

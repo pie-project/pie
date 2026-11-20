@@ -13,7 +13,9 @@
 //! `gumbel_argmax` over the logits as they are, the model's f32 row where
 //! no penalty or grammar mask changed them: temperature, the cut and the
 //! noise are applied per lane in f32 inside the reduction, so no
-//! perturbed row is rounded and no noise row is laid. A greedy step that
+//! perturbed row is rounded and no noise row is laid. Temperature has one
+//! form, in the cut and the draw alike: a multiply by `1 / T`, rounded once
+//! to f32 here on the host (`eta_ir::types`). A greedy step that
 //! changes no logit reads the model's f32 logits whole.
 //!
 //! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
@@ -245,10 +247,12 @@ pub fn sample(
     let token = match k.temperature {
         None => reduce_argmax(&logits),
         Some(temperature) => {
+            // The temperature's one form: a multiply by its reciprocal.
+            let inverse = 1.0 / temperature;
             let mut keep: Option<Tensor> = None;
             if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
                 // The cuts read bf16 probabilities of the scaled row.
-                let probs = cut_probabilities(&logits, temperature);
+                let probs = cut_probabilities(&logits, inverse);
                 if let Some(min_p) = &k.min_p {
                     let floor = reduce_max(&probs) * knob(min_p);
                     keep = Some(ge(&probs, floor));
@@ -269,8 +273,8 @@ pub fn sample(
                 }
             }
             match keep {
-                Some(keep) => gumbel_argmax(&logits, keep, temperature, r),
-                None => gumbel_argmax(&logits, true, temperature, r),
+                Some(keep) => gumbel_argmax(&logits, keep, inverse, r),
+                None => gumbel_argmax(&logits, true, inverse, r),
             }
         }
     };
@@ -305,12 +309,13 @@ fn shifted(row: &Tensor) -> Tensor {
     row - cast(reduce_max(row), dtype::bf16)
 }
 
-/// The probabilities the cuts read, `softmax(logits / temperature)`, as a
-/// bf16 row: the exponent is the row less its max rounded to bf16, divided
-/// by the temperature, so its largest values round near zero and no lane
-/// overflows; the one max the row needs is that shift.
-fn cut_probabilities(logits: &Tensor, temperature: f32) -> Tensor {
-    let e = exp(shifted(logits) / temperature);
+/// The probabilities the cuts read, `softmax(logits * inverse)` with
+/// `inverse` the temperature's reciprocal, as a bf16 row: the exponent is
+/// the row less its max rounded to bf16, times `inverse`, so its largest
+/// values round near zero and no lane overflows; the one max the row needs
+/// is that shift.
+fn cut_probabilities(logits: &Tensor, inverse: f32) -> Tensor {
+    let e = exp(shifted(logits) * inverse);
     &e / reduce_sum(&e)
 }
 

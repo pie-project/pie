@@ -648,7 +648,7 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let y = p.op(Op::GumbelArgmax {
                 logits: x,
                 keep,
-                divisor,
+                scale: divisor,
                 state,
             });
             p.output(y, &[r], Dtype::I32, exact, "f32, masked");
@@ -659,7 +659,7 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let y = p.op(Op::GumbelArgmax {
                 logits: h,
                 keep,
-                divisor,
+                scale: divisor,
                 state,
             });
             p.output(y, &[r], Dtype::I32, exact, "bf16, masked");
@@ -671,7 +671,7 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let y = p.op(Op::GumbelArgmax {
                 logits: l,
                 keep: every,
-                divisor: one,
+                scale: one,
                 state,
             });
             p.output(y, &[r], Dtype::I32, exact, "logits");

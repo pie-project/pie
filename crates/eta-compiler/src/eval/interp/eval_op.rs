@@ -391,17 +391,17 @@ fn eval_wide(
         Op::GumbelArgmax {
             logits,
             keep,
-            divisor,
+            scale,
             state,
         } => {
-            // Each lane as `select(keep, logits / divisor, -inf) +
+            // Each lane as `select(keep, logits * scale, -inf) +
             // rng_keyed(state)` holds it, in f32, then the argmax.
             let t = ty_of(logits);
             let x = lanes_f32(v(logits));
             let Value::Bool(k) = v(keep) else {
                 return Err(fault("gumbel_argmax keep".into()));
             };
-            let d = lanes_f32(v(divisor))[0];
+            let s = lanes_f32(v(scale))[0];
             let st = lanes_i64(v(state));
             let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
             let seed64 = rng::keyed_seed(key as u32, ctr as u32);
@@ -409,7 +409,7 @@ fn eval_wide(
             let perturbed: Vec<f32> = (0..x.len())
                 .map(|i| {
                     if k[pick(k.len(), i)] {
-                        x[i] / d + noise[i]
+                        x[i] * s + noise[i]
                     } else {
                         f32::NEG_INFINITY
                     }

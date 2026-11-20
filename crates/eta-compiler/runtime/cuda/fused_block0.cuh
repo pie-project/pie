@@ -1986,19 +1986,20 @@ __device__ __forceinline__ void ptir_fast_argmax(
   }
 }
 
-// gumbel_argmax (tag 0x34): lane `i` of a row is `logits[i] / divisor +
+// gumbel_argmax (tag 0x34): lane `i` of a row is `logits[i] * scale +
 // gumbel(state, i)`, -inf where `keep` is false, made in f32 with the f32
-// operations of `reduce_argmax(select(keep, logits / divisor, -inf) +
-// rng_keyed(state))` and never stored (eta_ir::types: a draw is never a bf16
+// operations of `reduce_argmax(select(keep, logits * scale, -inf) +
+// rng_keyed(state))` (a multiply, correctly rounded; no divide) and never
+// stored (eta_ir::types: a draw is never a bf16
 // row). The noise is lane `noise_index` of the keyed draw.
 __device__ __forceinline__ float ptir_gumbel_lane(
     const m1_u8* logits, m1_u32 logits_dtype, const m1_u8* keep,
-    const M1ValueDesc& keep_desc, float divisor, m1_u64 seed, m1_u32 at,
+    const M1ValueDesc& keep_desc, float scale, m1_u64 seed, m1_u32 at,
     m1_u32 noise_index) {
   if (!m1_load_b(keep, m1_pick(keep_desc.len, at), keep_desc.dtype)) return m1_neg_inf();
   const float uniform = ptir_rng_hash_uniform(seed, noise_index);
   const float noise = -logf(-logf(uniform));
-  return m1_load_f(logits, at, logits_dtype) / divisor + noise;
+  return m1_load_f(logits, at, logits_dtype) * scale + noise;
 }
 
 // Each row's gumbel_argmax, one block over the row: the index of its largest
@@ -2020,13 +2021,13 @@ __device__ __forceinline__ void ptir_gumbel_argmax(
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
   const m1_u64 seed = ptir_rng_state_seed(state, state_desc);
-  const float divide_by = m1_load_f(divisor, 0u, divisor_desc.dtype);
+  const float scale = m1_load_f(divisor, 0u, divisor_desc.dtype);
   for (m1_u32 row = 0; row < logits_desc.rows; ++row) {
     const m1_u32 base = row * logits_desc.last;
     M1ArgmaxCandidate candidate{m1_neg_inf(), 0u, 0u, 0u};
     for (m1_u32 index = threadIdx.x; index < logits_desc.last; index += blockDim.x) {
       const float value = ptir_gumbel_lane(
-          logits, logits_desc.dtype, keep, keep_desc, divide_by, seed, base + index,
+          logits, logits_desc.dtype, keep, keep_desc, scale, seed, base + index,
           noise_base + base + index);
       const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
       candidate = m1_argmax_combine(candidate, next);
@@ -2175,6 +2176,8 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
   const bool round_logits = (rounding & 1u) != 0u;
   const bool round_scaled = (rounding & 2u) != 0u;
   const bool round_perturbed = (rounding & 4u) != 0u;
+  // A gumbel_argmax's scale multiplies (8); a chain's divisor divides.
+  const bool multiplies = (rounding & 8u) != 0u;
   __shared__ M1ArgmaxCandidate candidates[32];
   int* result = reinterpret_cast<int*>(output);
   const m1_u32 lane = threadIdx.x & 31u;
@@ -2201,7 +2204,7 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
       for (m1_u32 k = 0; k < 8u; ++k) {
         const m1_u32 index = v * 8u + k;
         float value = __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
-        if (scaled) value = value / divide_by;
+        if (scaled) value = multiplies ? value * divide_by : value / divide_by;
         if (round_scaled) value = m1_round_bf16(value);
         const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
         value = value + (-logf(-logf(uniform)));
@@ -2215,7 +2218,7 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
          index += blockDim.x) {
       float value = m1_intrinsic_column_load(row_base, index, mode);
       if (round_logits) value = m1_round_bf16(value);
-      if (scaled) value = value / divide_by;
+      if (scaled) value = multiplies ? value * divide_by : value / divide_by;
       if (round_scaled) value = m1_round_bf16(value);
       const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
       value = value + (-logf(-logf(uniform)));

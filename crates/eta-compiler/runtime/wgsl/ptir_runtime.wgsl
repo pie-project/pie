@@ -591,10 +591,10 @@ const RED_SUM : u32 = 0u;
 const RED_MAX : u32 = 1u;
 const RED_MIN : u32 = 2u;
 const RED_ARGMAX : u32 = 3u;
-// gumbel_argmax (tag 0x34): an argmax over lanes logits[i] / divisor +
+// gumbel_argmax (tag 0x34): an argmax over lanes logits[i] * scale +
 // gumbel(state, i), -inf where keep is false, each made in f32 in the first
 // level and never stored (eta_ir::types: a draw is never a bf16 row). Its
-// operands: a0 the logits, a1 keep, a2 the divisor, imm the rng state.
+// operands: a0 the logits, a1 keep, a2 the scale, imm the rng state.
 const RED_GUMBEL : u32 = 4u;
 
 fn gumbel_seed(p : u32) -> U64 {
@@ -604,14 +604,14 @@ fn gumbel_seed(p : u32) -> U64 {
   return rng_keyed_seed(ld_u(st, 0u), ctr);
 }
 
-// Lane i of a gumbel_argmax: what `select(keep, logits / divisor, -inf) +
+// Lane i of a gumbel_argmax: what `select(keep, logits * scale, -inf) +
 // rng_keyed(state)` holds at i, in the same f32 operations.
 fn gumbel_lane(p : u32, seed : U64, i : u32) -> f32 {
   let kp = p_a1(p);
   if (!ld_b(kp, pick(d_len(kp), i))) { return NEG_INF(); }
   let u = rng_hash_uniform(seed, i);
   let noise = -log(-log(u));
-  return ld_f(p_a0(p), i) / ld_f(p_a2(p), 0u) + noise;
+  return ld_f(p_a0(p), i) * ld_f(p_a2(p), 0u) + noise;
 }
 
 fn POS_INF() -> f32 { return bitcast<f32>(0x7F800000u); }

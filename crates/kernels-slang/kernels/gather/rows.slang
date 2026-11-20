@@ -22,8 +22,12 @@
 [[vk::binding(0)]] StructuredBuffer<uint> src;
 [[vk::binding(1)]] RWStructuredBuffer<uint> dst;
 
+// `src` and `dst` are bound whole, the run at word `src_at` of one and
+// `dst_at` of the other: one group a pair of buffers, wherever the run lies.
 struct Params {
     int words;
+    uint src_at;
+    uint dst_at;
 };
 PIE_PARAMS(2, Params, params);
 
@@ -31,7 +35,7 @@ PIE_PARAMS(2, Params, params);
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     if (gid.x < uint(max(params.words, 0))) {
-        dst[gid.x] = src[gid.x];
+        dst[params.dst_at + gid.x] = src[params.src_at + gid.x];
     }
 }
 

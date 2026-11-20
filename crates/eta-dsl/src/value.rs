@@ -1166,20 +1166,22 @@ pub fn masked_argmax(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
 }
 
 /// A Gumbel-max draw over the last axis of `logits` (`[.., n]`, f32 or
-/// bf16): each row's index of its largest `logits / divisor + gumbel`,
+/// bf16): each row's index of its largest `logits * scale + gumbel`,
 /// lanes whose `keep` is false (a row-shaped or scalar bool) out. Every
 /// perturbed lane is made in f32 inside the reduction and never stored, so
 /// near ties of a bf16 row are not rounded together, and no noise row is
-/// laid (`eta_ir::types`). `state` is a `[2]` u32 rng state.
+/// laid (`eta_ir::types`). `state` is a `[2]` u32 rng state. A temperature
+/// `T` is applied as `scale = 1 / T`, rounded once to f32 (`eta_ir::types`:
+/// a temperature's one form is a multiply by its reciprocal).
 pub fn gumbel_argmax(
     logits: impl AsTensor,
     keep: impl AsTensor,
-    divisor: impl AsTensor,
+    scale: impl AsTensor,
     state: impl AsTensor,
 ) -> Tensor {
     let (logits, logits_type) = logits.to_arg().materialize();
     let (keep, _) = keep.to_arg().materialize();
-    let divisor = match divisor.to_arg() {
+    let scale = match scale.to_arg() {
         Arg::Const(c) if c.dtype != Dtype::F32 && c.shape.is_scalar() => Arg::Const(ConstData {
             shape: Shape::SCALAR,
             dtype: Dtype::F32,
@@ -1187,14 +1189,14 @@ pub fn gumbel_argmax(
         }),
         other => other,
     };
-    let (divisor, _) = divisor.materialize();
+    let (scale, _) = scale.materialize();
     let (state, _) = state.to_arg().materialize();
     let result_type = ValueType::new(reduce_shape(logits_type.shape), Dtype::I32);
     let result = push(
         Op::GumbelArgmax {
             logits,
             keep,
-            divisor,
+            scale,
             state,
         },
         &[result_type],

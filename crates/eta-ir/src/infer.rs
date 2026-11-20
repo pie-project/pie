@@ -344,10 +344,10 @@ fn infer(
         Op::GumbelArgmax {
             logits,
             keep,
-            divisor,
+            scale,
             state,
         } => {
-            let (tl, tk, td, ts) = (g(logits)?, g(keep)?, g(divisor)?, g(state)?);
+            let (tl, tk, td, ts) = (g(logits)?, g(keep)?, g(scale)?, g(state)?);
             if !is_float(tl.dtype)
                 || tk.dtype != Dtype::Bool
                 || !is_float(td.dtype)
@@ -692,7 +692,7 @@ mod tests {
     }
 
     /// `gumbel_argmax` takes a float row, a row-shaped or scalar bool, a
-    /// float scalar divisor and a `[2]` u32 state, and returns each row's
+    /// float scalar scale and a `[2]` u32 state, and returns each row's
     /// index.
     #[test]
     fn gumbel_argmax_types() {
@@ -701,10 +701,10 @@ mod tests {
             ValueType::new(Shape::matrix(3, 7), Dtype::Bool),
             ValueType::vector(2, Dtype::U32),
         ];
-        let draw = |keep, divisor| Op::GumbelArgmax {
+        let draw = |keep, scale| Op::GumbelArgmax {
             logits: 0,
             keep,
-            divisor,
+            scale,
             state: 2,
         };
         let base = || {
@@ -722,11 +722,11 @@ mod tests {
             let types = body_types(&ops, &ctx_with(&chans)).expect("types");
             assert_eq!(types[5], ValueType::vector(3, Dtype::I32));
         }
-        // The divisor is a float scalar; keep is a bool.
-        for (keep, divisor) in [(1, 1), (3, 3), (1, 0)] {
+        // The scale is a float scalar; keep is a bool.
+        for (keep, scale) in [(1, 1), (3, 3), (1, 0)] {
             let mut ops = base();
-            ops.push(draw(keep, divisor));
-            assert!(body_types(&ops, &ctx_with(&chans)).is_err(), "{keep} {divisor}");
+            ops.push(draw(keep, scale));
+            assert!(body_types(&ops, &ctx_with(&chans)).is_err(), "{keep} {scale}");
         }
     }
 

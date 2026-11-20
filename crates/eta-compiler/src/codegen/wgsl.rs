@@ -408,10 +408,12 @@ pub struct Stepwise {
 /// an invocation owning both elements of every word it writes.
 /// 8: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
 /// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
-/// the divisor and the keyed rng, with no noise row.
+/// the scale and the keyed rng, with no noise row.
 /// 9: a `gumbel_argmax`'s first level folds 8 lanes a job, not 32
 /// (`red_fan0`), so its hashes spread over four times the invocations.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 9;
+/// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
+/// (the temperature's reciprocal) where it divided by a divisor.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 10;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a

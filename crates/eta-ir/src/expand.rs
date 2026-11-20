@@ -206,7 +206,7 @@ pub fn nucleus_sample(
             Op::GumbelArgmax {
                 logits,
                 keep,
-                divisor: one,
+                scale: one,
                 state,
             },
             StepShape::ReducedIndex,

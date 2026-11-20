@@ -40,8 +40,8 @@ const READERS: [(&str, u32, EtaDtype); 11] = [
     ("top-5 values", TOP, EtaDtype::F32),
     ("top-5 ids", TOP, EtaDtype::U32),
     ("sum", 1, EtaDtype::F32),
-    ("gumbel_argmax of bf16 x, x > 0 kept, / 0.7", 1, EtaDtype::I32),
-    ("gumbel_argmax of f32 x / 0.7", 1, EtaDtype::I32),
+    ("gumbel_argmax of bf16 x, x > 0 kept, * (1 / 0.7)", 1, EtaDtype::I32),
+    ("gumbel_argmax of f32 x * (1 / 0.7)", 1, EtaDtype::I32),
 ];
 
 fn program() -> TraceContainer {
@@ -106,13 +106,13 @@ fn program() -> TraceContainer {
         Op::ChanPut { chan: 10, value: 28 },
         Op::Const(Literal::F32(0.0)),                             // 29
         Op::Gt(1, 29),                                            // 30 keep
-        Op::Const(Literal::F32(0.7)),                             // 31
+        Op::Const(Literal::F32(1.0 / 0.7)),                       // 31
         Op::Iota { len: 2 },                                      // 32 rng state
-        Op::GumbelArgmax { logits: 1, keep: 30, divisor: 31, state: 32 }, // 33
+        Op::GumbelArgmax { logits: 1, keep: 30, scale: 31, state: 32 }, // 33
         Op::Reshape { value: 33, shape: Shape::vector(1) },       // 34
         Op::ChanPut { chan: 11, value: 34 },
         Op::Const(Literal::Bool(true)),                           // 35
-        Op::GumbelArgmax { logits: 0, keep: 35, divisor: 31, state: 32 }, // 36
+        Op::GumbelArgmax { logits: 0, keep: 35, scale: 31, state: 32 }, // 36
         Op::Reshape { value: 36, shape: Shape::vector(1) },       // 37
         Op::ChanPut { chan: 12, value: 37 },
     ];
