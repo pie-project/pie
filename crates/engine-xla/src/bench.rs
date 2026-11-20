@@ -257,6 +257,17 @@ impl Bench {
         self.time_with(iters, &[], true, body)
     }
 
+    /// [`Bench::time_pipelined`] with `in_place` donated to the run that
+    /// writes them (a pool appended in place, as a fire's is).
+    pub fn time_pipelined_in_place(
+        &mut self,
+        iters: u32,
+        in_place: &[Tensor],
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+    ) -> Result<Option<f64>, String> {
+        self.time_with(iters, in_place, true, body)
+    }
+
     fn time_with(
         &mut self,
         iters: u32,

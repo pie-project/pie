@@ -751,3 +751,31 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F42. Lanes carry page deltas; each engine keeps a per-slot page table resident
+
+Every fire the runtime hands each lane its full page list (`Lane.tables`), so every
+backend walks every lane's pages every fire to lay its page tables. On XLA the paged
+walks read a dense `[lanes x max_pages]` table the device gathers from the CSR list each
+fire, at 6-9 ns an entry (24-64 µs a fire at today's shapes, ~200 µs at a fixed lane
+capacity of 128 lanes x 256 pages). Laying that table on the host instead, beside the CSR
+walk serve already does, was measured and withdrawn: about 4 ns an entry on the host at
+serving shapes (host stage of a prefill-sized fire 0.187 -> 0.253 ms), the device run no
+shorter (19.17 -> 19.37 ms), and mixed serving 2-4% slower (v6e qwen3-0.6b: staggered
+mixed load -3.6%, decode beside long prompts -4.0%). Without a resident table every
+layout of it is O(pages) a fire on one side or the other.
+
+Shape (GPU's):
+- each Lane carries its slot index and its page deltas: the pages granted and freed
+  since the slot's last fire, in order;
+- each engine keeps a per-slot device table, laid at load and sized by the pool's max
+  pages per slot (no allocation after load), and applies the deltas in the fire's own
+  command stream;
+- a slot reused by another set gets a reset delta;
+- the host walk becomes O(deltas) a fire.
+
+A coordinated change (the CUDA, engine-gpu, Metal and XLA halves), with a correctness
+test: a table built from deltas equals one built from the full list after arbitrary
+grant / free / reuse sequences. AMD's beam page lists already keep page state resident
+for beams; the two should converge. Paired with XLA's fixed-capacity lowering, where the
+table grows with the lane capacity.
