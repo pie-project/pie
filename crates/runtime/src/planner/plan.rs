@@ -224,12 +224,29 @@ impl ResidencyPlanner {
             super::grant::WAKE_BEAT => "beat",
             _ => "call (an arrival, a release)",
         };
-        for (kind, waited) in waits {
+        let now = (self.port.free_chunks(), self.port.device_stats().0, self.raw_swap_free());
+        for super::wait::LongWait {
+            kind,
+            lacked,
+            wanted: ([want_chunks, want_list, want_swap], [free_then, pages_then]),
+            waited,
+        } in waits
+        {
+            let want = |n: u64| if n == u64::MAX { "-".to_owned() } else { n.to_string() };
             if let Some(count) = self.stats.long_waits.get(usize::from(cause)) {
                 count.fetch_add(1, Ordering::Relaxed);
             }
             tracing::info!(
                 kind,
+                lacked,
+                want_chunks = %want(want_chunks),
+                want_list = %want(want_list),
+                want_swap = %want(want_swap),
+                free_chunks_then = free_then,
+                free_pages_then = pages_then,
+                free_chunks_after_pass = now.0,
+                free_pages_after_pass = now.1,
+                swap_free_after_pass = now.2,
                 waited_ms = waited.as_millis() as u64,
                 woken_by,
                 "planner: a wait past 100 ms served"
@@ -950,7 +967,12 @@ impl ResidencyPlanner {
                         if let Some(waiter) = inner.queue.remove(&key) {
                             let waited = waiter.since.elapsed();
                             if waited > super::wait::LONG_WAIT {
-                                inner.long_waits.push(("restore", waited));
+                                inner.long_waits.push(super::wait::LongWait {
+                                    kind: "restore",
+                                    lacked: waiter.lacked,
+                                    wanted: waiter.wanted,
+                                    waited,
+                                });
                             }
                         }
                         Board::Go(inner.accum.donate(need.kv_pages))

@@ -8454,3 +8454,71 @@ async fn with_no_one_resident_evicted_state_moves_down_for_a_held_restore() {
     }
     assert_eq!(*pool.moved.lock(), vec!["state"], "the second's state moves down for the first");
 }
+
+/// The L40S at 6 GiB on 5120cbc3c: restore waits served by pokes, up to
+/// 16.5 s, a few by the room signal. A restore refused in an earlier
+/// unpark and short of its state slots now: its step is the state slots
+/// (read ahead of its runs), but its want was the refusal's (more free
+/// chunks than stood), which state given back inside open chunks never
+/// moves. Any room given back wakes it, as for one never refused; its
+/// wait says what it lacked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand {
+                    kv_pages: 0,
+                    rs: RsUnits {
+                        slots: 1,
+                        ..RsUnits::default()
+                    },
+                },
+            },
+        )
+    });
+    planner.poke();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    let state = |planner: &ResidencyPlanner| planner.with_inner(|inner| inner.procs[&head].state);
+    assert_eq!(state(&planner), Residency::Evicted, "no state slot free");
+    assert_eq!(
+        planner.with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.lacked)),
+        Some("state slots, refused in its unpark before"),
+        "its lack is recorded for its long wait"
+    );
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    pool.rs_free.store(1, Ordering::Relaxed);
+    planner.returns.slots_freed(crate::store::slots::RoomCount {
+        tier: crate::store::slots::RoomTier::Device,
+        chunks: 0,
+        slots: 0,
+    });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(
+        planner.stats.plan_passes.load(Ordering::Relaxed) > passes,
+        "the room signal plans it, no fire landing"
+    );
+}

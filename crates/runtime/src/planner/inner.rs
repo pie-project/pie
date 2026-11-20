@@ -55,7 +55,7 @@ pub(super) struct Inner {
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
     /// Waits served this pass past [`super::wait::LONG_WAIT`]: the kind and
     /// how long.
-    pub(super) long_waits: Vec<(&'static str, std::time::Duration)>,
+    pub(super) long_waits: Vec<super::wait::LongWait>,
     /// The head held unserved on something in flight: since when, on what
     /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
     pub(super) held_in_flight:
@@ -236,6 +236,8 @@ impl Inner {
                 pid,
                 kind,
                 since: crate::rt::Instant::now(),
+                lacked: "behind the head",
+                wanted: ([u64::MAX; 3], [0; 2]),
             },
         );
         key
@@ -512,6 +514,7 @@ impl Inner {
                 continue;
             }
             let waited = waiter.since.elapsed();
+            let (lacked, wanted) = (waiter.lacked, waiter.wanted);
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -532,7 +535,12 @@ impl Inner {
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
             *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
             if waited > super::wait::LONG_WAIT {
-                long_waits.push(("allocation", waited));
+                long_waits.push(super::wait::LongWait {
+                    kind: "allocation",
+                    lacked,
+                    wanted,
+                    waited,
+                });
             }
             wake.push((key, demand.kv_pages, notify.clone()));
         }

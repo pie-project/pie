@@ -571,6 +571,33 @@ impl ResidencyPlanner {
             self.returns.want_nothing();
             return;
         };
+        let rs_short = !rs_need.is_zero() && !self.port.rs_stats().0.covers(rs_need);
+        // What it lacks, as the pass's step reads it (kv, then state slots,
+        // then runs): said with its wait if that runs long.
+        self.with_inner(|inner| {
+            let moving = inner
+                .queue
+                .get(&key)
+                .is_some_and(|waiter| inner.parked_moving.contains(&waiter.pid));
+            let bind = inner
+                .queue
+                .get(&key)
+                .and_then(|waiter| inner.procs.get(&waiter.pid))
+                .is_some_and(|proc| proc.bind_room.is_some());
+            if let Some(waiter) = inner.queue.get_mut(&key) {
+                waiter.lacked = match waiter.kind {
+                    WaitKind::BindRoom { rise: Some(_), .. } => "rise room",
+                    WaitKind::BindRoom { .. } => "bind room",
+                    _ if moving => "its parked state moving down",
+                    _ if kv_missing > 0 => "kv pages",
+                    _ if rs_short && refused => "state slots, refused in its unpark before",
+                    _ if rs_short => "state slots",
+                    _ if refused => "runs its unpark was refused",
+                    _ if bind => "its bind's runs",
+                    _ => "nothing the pool lacks",
+                };
+            }
+        });
         // A head refused on the room standing now (its unpark came up short
         // there): a count that room already meets moves nothing, so its
         // want is past what stands. Its chunk count met by the free chunks
@@ -600,12 +627,23 @@ impl ResidencyPlanner {
         // restore short of its state waited for a fire landing's poke, up
         // to 15 s (the L40S at 6 GiB on 22b0a3e83: restores served almost
         // all by pokes, about one a run by the room signal).
-        if !refused && !rs_need.is_zero() && !self.port.rs_stats().0.covers(rs_need) {
+        // Refused before in its unpark or not: its step is state slots
+        // (read ahead of its runs), and the refusal's want of more chunks
+        // than stood was a count state given back inside open chunks never
+        // moves (the L40S at 6 GiB on 5120cbc3c: restore waits served by
+        // pokes, up to 16.5 s, a few by the room signal).
+        if rs_short && (!refused || kv_missing == 0) {
             want_chunks = 0;
         }
         if want_chunks == u64::MAX && want_list == u64::MAX && want_swap == u64::MAX {
             want_chunks = u64::from(self.port.free_chunks()).saturating_add(1);
         }
+        let (free_chunks, free_pages) = (self.port.free_chunks(), self.port.device_stats().0);
+        self.with_inner(|inner| {
+            if let Some(waiter) = inner.queue.get_mut(&key) {
+                waiter.wanted = ([want_chunks, want_list, want_swap], [free_chunks, free_pages]);
+            }
+        });
         self.returns.want_chunks.store(want_chunks, Ordering::Release);
         self.returns.want_list.store(want_list, Ordering::Release);
         self.returns.want_swap.store(want_swap, Ordering::Release);
