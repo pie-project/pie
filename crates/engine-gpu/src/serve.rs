@@ -6035,6 +6035,21 @@ struct NamingLane<B: Serve> {
     /// The rows it holds before its own (its first row's position), which
     /// an rs lane folded at 0 replays from its buffer.
     carried: u32,
+    /// The rows it lands its state as of: a prompt's lane that snapshots,
+    /// whose scans take their snapshot twins.
+    snapshots: Vec<engine::fire::RsSnapshot>,
+}
+
+/// How a load's walk makes a lane's recurrent state.
+#[derive(Clone, Copy)]
+enum RsWalk {
+    /// Buffering its rows and carrying this many before them, which it
+    /// replays from its buffer: a speculative fire's committed scans.
+    Buffer(u32),
+    /// Folding every row and landing its state as of its first row in its
+    /// own seat: a prompt that snapshots, whose chunked scans take their
+    /// snapshot twins.
+    Snapshot,
 }
 
 struct NamingMedia {
@@ -6088,6 +6103,7 @@ fn lane_views<B: Serve>(
             pages: lane.by_ref.as_ref().map_or(&[][..], |(pages, _)| pages),
             record: lane.by_ref.as_ref().map(|(_, record)| record.as_slice()),
             rs: &lane.rs,
+            rs_snapshots: &lane.snapshots,
             ..Seated::of(Lane {
                 slot: at as u32,
                 word: lane.word,
@@ -6458,6 +6474,7 @@ impl<B: Serve> Shell<B> {
             by_ref: None,
             rs: engine::fire::RsVerb::Fold,
             carried: 0,
+            snapshots: Vec::new(),
         })
     }
 
@@ -6557,14 +6574,24 @@ impl<B: Serve> Shell<Named<B>> {
         &mut self,
         lanes: &[(usize, u32)],
         found: &mut Found,
-        rs: Option<u32>,
+        rs: Option<RsWalk>,
     ) -> Result<Option<poem_exec::KernelError>> {
         let owned = lanes
             .iter()
-            .map(|&(class, rows)| {
+            .enumerate()
+            .map(|(at, &(class, rows))| {
                 let mut lane = self.naming_lane(class, rows)?;
-                if let Some(carried) = rs {
-                    self.rs_walk_lane(&mut lane, rows, carried)?;
+                match rs {
+                    Some(RsWalk::Buffer(carried)) => {
+                        self.rs_walk_lane(&mut lane, rows, carried)?;
+                    }
+                    Some(RsWalk::Snapshot) => lane.snapshots.push(engine::fire::RsSnapshot {
+                        row: 1,
+                        slot: u32::try_from(at).unwrap_or(u32::MAX),
+                        pieces: Vec::new(),
+                        fixed: Vec::new(),
+                    }),
+                    None => {}
                 }
                 Ok(lane)
             })
@@ -6736,11 +6763,29 @@ impl<B: Serve> Shell<Named<B>> {
                     (0..classes).filter(|&c| !unservable.iter().any(|held| held.class == c))
                 {
                     for (rows, carried) in [(tokens.min(page), 0), (1, page)] {
-                        if let Some(refusal) =
-                            self.name_fire(&[(class, rows)], &mut found, Some(carried))?
-                        {
+                        if let Some(refusal) = self.name_fire(
+                            &[(class, rows)],
+                            &mut found,
+                            Some(RsWalk::Buffer(carried)),
+                        )? {
                             return Err(Fault::Fire(poem_exec::Error::Kernel(refusal)));
                         }
+                    }
+                }
+            }
+            // Where a prompt's lane lands its state as of rows inside it, a
+            // lane of each servable class run whole that snapshots: the
+            // chunked scans' snapshot twins (`StatePool::entry`).
+            if crate::rs::snapshots(self.trace()) > 0 {
+                let seat = self.seat_rows().unwrap_or(u64::from(tokens));
+                let rows = u32::try_from(u64::from(tokens).min(seat).max(2)).unwrap_or(u32::MAX);
+                for class in
+                    (0..classes).filter(|&c| !unservable.iter().any(|held| held.class == c))
+                {
+                    if let Some(refusal) =
+                        self.name_fire(&[(class, rows)], &mut found, Some(RsWalk::Snapshot))?
+                    {
+                        return Err(Fault::Fire(poem_exec::Error::Kernel(refusal)));
                     }
                 }
             }
