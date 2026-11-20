@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -692,7 +692,10 @@ impl Engine for Cuda {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cuda".to_string(),
-                domain: MemoryDomain::CudaDevice(u32::try_from(shell.ordinal()).unwrap_or(0)),
+                domain: MemoryDomain::Device {
+                    ordinal: u32::try_from(shell.ordinal()).unwrap_or(0),
+                    reach: DeviceReach::Peer,
+                },
                 sms: shell.sms(),
                 unified_memory: false,
                 fp8_native: false,
@@ -855,7 +858,10 @@ impl Engine for Cuda {
         use crate::store::Tier;
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let tier = |domain| match domain {
-            MemoryDomain::CudaDevice(_) => Some(Tier::Device),
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            } => Some(Tier::Device),
             MemoryDomain::HostPinned => Some(Tier::Host),
             MemoryDomain::LocalDisk => Some(Tier::Disk),
             _ => None,
@@ -1587,7 +1593,16 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
             "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
              reserve"
         }
-        (MemoryDomain::CudaDevice(_), MemoryDomain::CudaDevice(_)) => {
+        (
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            },
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            },
+        ) => {
             "`copy_kv` between two CUDA ordinals, which needs a peer mapping this load has not \
              opened"
         }
