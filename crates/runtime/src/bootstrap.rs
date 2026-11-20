@@ -325,6 +325,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler,
     } = config.model;
 
+    // The library forms programs are planned with: what every engine served
+    // here emits (`pipeline::program::serve_backend`), before any program
+    // (the standard samplers first) is registered.
+    for d in engine_configs.iter() {
+        if let Some(backend) = crate::engine::verbs::codegen_backend(&d.engine_backend) {
+            crate::pipeline::program::serve_backend(backend);
+        }
+    }
+
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
     // fixed store's rows bound the rows one fire reads out, which the
     // scheduler cuts its fires to; rows that land beside the activation
