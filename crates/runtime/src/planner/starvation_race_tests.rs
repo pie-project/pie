@@ -3080,9 +3080,15 @@ async fn a_gate_sleeps_through_policy_answers_and_is_refused_only_past_the_pool(
     assert!(!idle_gate.is_finished(), "still evicted");
     assert_eq!(parks(&planner), 1, "answers that are not its wake it not once");
 
-    // A restore queued short of host room: the answer of nothing is no
-    // refusal either; it waits for room, however long.
+    // A restore queued short of host room (and of a run for its roles, none
+    // standing): the answer of nothing is no refusal either; it plans again
+    // and waits for room, however long.
     let key = planner.with_inner(|inner| {
+        inner.procs.get_mut(&short).unwrap().roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
         inner.enqueue(
             short,
             WaitKind::Restore {
