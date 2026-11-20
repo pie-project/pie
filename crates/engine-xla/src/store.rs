@@ -18,6 +18,7 @@
 //! before anything traces); the table still moves chunks when the runtime
 //! asks ([`Pools::evacuate`]), which it does not for a fixed pool.
 
+pub mod beam;
 pub mod kv;
 pub mod layout;
 pub mod stage;
