@@ -15,16 +15,19 @@ fn the_knobs_are_no_longer_write_once() {
     assert_eq!(configured_submit_depth(), 5, "default window");
     assert_eq!(channel_capacity(), 11, "5 frames x k=2, plus the margin");
 
-    reconfigure(4, 3).expect("idle runtime accepts new knobs");
+    reconfigure(4).expect("idle runtime accepts a new frame size");
     assert_eq!(configured_frame_size(), 4);
-    assert_eq!(configured_dispatch_depth(), 3);
-    assert_eq!(configured_submit_depth(), 6);
-    assert_eq!(channel_capacity(), 25);
+    assert_eq!(
+        configured_dispatch_depth(),
+        2,
+        "the depth is the engines', unchanged"
+    );
+    assert_eq!(configured_submit_depth(), 5);
+    assert_eq!(channel_capacity(), 21);
 
-    reconfigure(1, 6).expect("second round");
+    reconfigure(1).expect("second round");
     assert_eq!(configured_frame_size(), 1);
-    assert_eq!(configured_dispatch_depth(), 6);
-    assert_eq!(configured_submit_depth(), 9);
+    assert_eq!(configured_dispatch_depth(), 2);
 }
 
 fn a_refusal_names_what_is_still_running() {

@@ -197,7 +197,16 @@ pub async fn sweep_all(
 
     for pass in 0..repeats {
         for (index, knobs) in candidates.iter().enumerate() {
-            runtime::scheduler::reconfigure(knobs.frame_size, knobs.dispatch_depth)
+            // the depth is the loaded engine's: a candidate of another
+            // depth belongs to another load
+            let running = runtime::scheduler::configured_dispatch_depth();
+            if running != knobs.dispatch_depth {
+                anyhow::bail!(
+                    "{knobs} wants {} frames in flight and the loaded engine runs {running}",
+                    knobs.dispatch_depth
+                );
+            }
+            runtime::scheduler::reconfigure(knobs.frame_size)
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("apply {knobs}"))?;
             let run = fleet::run(addr, program, inputs).await;
