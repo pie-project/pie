@@ -949,18 +949,41 @@ impl Lower<'_> {
     }
 
     /// The first `k` of `x` (`[B, R, n]` f32) in [`Self::sort_desc`]'s order
-    /// and their source indices (i32), as `[B, R, k]`: `chlo.top_k` over the
-    /// order keys (equal keys in index order), the values gathered from `x`
-    /// (v6e, the beam inferlet's top-4 of 4 x 151936 log-probs as one row:
-    /// the whole row's stable sort, sliced after, 5.9 ms a step; this 0.2
-    /// ms).
+    /// and their source indices (i32), as `[B, R, k]`, by selection, not a
+    /// sort: each row splits into chunks enough to fill an f32 tile's
+    /// sublanes, each chunk gives its first `k` ([`Self::select_first`]),
+    /// and the chunks' candidates give the row's. XLA lowers `chlo.top_k`
+    /// to a sort (v6e, the beam inferlet's guest stage: its top-1 of 151936
+    /// log-probs a whole-row sort, 793 us a step, its top-4 of 4 x 151936 a
+    /// sort of 128 chunks, 154 us).
     fn top_desc(&mut self, x: Val, k: i64) -> Lowering<(Val, Val)> {
         let dims = self.f.dims(x).to_vec();
         let flat = flat_rows(&dims);
         let (rows, n) = (flat[0], flat[1]);
         let key = self.order_key(x)?;
         let key = self.f.reshape(key, &flat)?;
-        let (_, index) = self.f.top_k(key, k)?;
+        // chunks of whole lane tiles, enough that the rows fill the sublanes,
+        // each holding more than its `k` candidates
+        let chunks = (F32_SUBLANES / rows).min(n / k.max(LANE_TILE)).max(1);
+        let index = self.f.iota(Elem::I32, &flat, 1);
+        let (key, index) = if chunks > 1 {
+            let width = ((n + chunks - 1) / chunks + LANE_TILE - 1) / LANE_TILE * LANE_TILE;
+            let pad = width * chunks - n;
+            let lowest = self.f.const_i(Elem::I32, i64::from(i32::MIN), &[]);
+            let far = self.f.const_i(Elem::I32, i64::from(i32::MAX), &[]);
+            let key = self.f.pad(key, lowest, &[0, 0], &[0, pad], &[0, 0])?;
+            let index = self.f.pad(index, far, &[0, 0], &[0, pad], &[0, 0])?;
+            let key = self.f.reshape(key, &[rows * chunks, width])?;
+            let index = self.f.reshape(index, &[rows * chunks, width])?;
+            let (key, index) = self.select_first(key, index, k, Some(n))?;
+            (
+                self.f.reshape(key, &[rows, chunks * k])?,
+                self.f.reshape(index, &[rows, chunks * k])?,
+            )
+        } else {
+            (key, index)
+        };
+        let (_, index) = self.select_first(key, index, k, None)?;
         // `x[r, index[r, j]]`, through the flat row-major plane
         let plane = self.f.reshape(x, &[rows * n])?;
         let base = self.f.iota(Elem::I32, &[rows, k], 0);
@@ -983,6 +1006,69 @@ impl Lower<'_> {
         let mut out = dims;
         *out.last_mut().expect("a last axis") = k;
         Ok((self.f.reshape(values, &out)?, self.f.reshape(index, &out)?))
+    }
+
+    /// The first `k` of each row of the order keys `key` (`[M, m]` i32,
+    /// beside their source indices `index`), in order: `k` rounds, each one
+    /// reduce taking the row's first still-held lane (the greater key, the
+    /// lower index on equal keys) and letting it go. A lane indexed at
+    /// `past` or beyond (a chunk's padding) is held by none. Exact: what a
+    /// stable descending sort's first `k` are.
+    fn select_first(
+        &mut self,
+        key: Val,
+        index: Val,
+        k: i64,
+        past: Option<i64>,
+    ) -> Lowering<(Val, Val)> {
+        let dims = self.f.dims(key).to_vec();
+        let mut held = match past {
+            Some(n) => {
+                let bound = self.f.const_i(Elem::I32, n, &dims);
+                let within = self.f.compare(Cmp::Lt, index, bound)?;
+                self.f.convert(within, Elem::I32)
+            }
+            None => self.f.const_i(Elem::I32, 1, &dims),
+        };
+        let none = self.f.const_i(Elem::I32, 0, &[]);
+        let lowest = self.f.const_i(Elem::I32, i64::from(i32::MIN), &[]);
+        let far = self.f.const_i(Elem::I32, i64::from(i32::MAX), &[]);
+        let (mut keys, mut picks) = (Vec::new(), Vec::new());
+        for round in 0..k {
+            let out = self.f.reduce_with(
+                &[held, key, index],
+                &[none, lowest, far],
+                &[1],
+                |f, a, b| {
+                    let more_held = f.compare(Cmp::Gt, a[0], b[0])?;
+                    let both = f.compare(Cmp::Eq, a[0], b[0])?;
+                    let gt = f.compare(Cmp::Gt, a[1], b[1])?;
+                    let eq = f.compare(Cmp::Eq, a[1], b[1])?;
+                    let lt = f.compare(Cmp::Lt, a[2], b[2])?;
+                    let tie = f.and(eq, lt)?;
+                    let first = f.or(gt, tie)?;
+                    let first = f.and(both, first)?;
+                    let take = f.or(more_held, first)?;
+                    Ok(vec![
+                        f.select(take, a[0], b[0])?,
+                        f.select(take, a[1], b[1])?,
+                        f.select(take, a[2], b[2])?,
+                    ])
+                },
+            )?;
+            let (got_key, got) = (out[1], out[2]);
+            keys.push(self.f.reshape(got_key, &[dims[0], 1])?);
+            picks.push(self.f.reshape(got, &[dims[0], 1])?);
+            if round + 1 < k {
+                let at = self.f.broadcast(got, &dims, &[0])?;
+                let taken = self.f.compare(Cmp::Eq, index, at)?;
+                let zero = self.f.const_i(Elem::I32, 0, &dims);
+                held = self.f.select(taken, zero, held)?;
+            }
+        }
+        let keys = self.f.concat(&keys, 1)?;
+        let picks = self.f.concat(&picks, 1)?;
+        Ok((keys, picks))
     }
 
     /// The order keys of `x` sorted descending (stably) along the last
@@ -2114,6 +2200,13 @@ fn fmod(f: &mut Func, x: Val, y: Val) -> kernels_xla::hlo::Built<Val> {
     let nan = f.const_f(Elem::F32, f64::NAN, &dims);
     f.select(bad, nan, res)
 }
+
+/// Rows an f32 tile holds on v6e's (and v5e's) vector unit, `T(8,128)`: a
+/// reduce along the lanes of fewer rows leaves sublanes idle.
+const F32_SUBLANES: i64 = 8;
+
+/// Lanes a tile holds, `T(8,128)`.
+const LANE_TILE: i64 = 128;
 
 /// `dims` as `[rows, n]`: every axis but the last folded into the rows
 /// (`chlo.top_k`'s operand).
