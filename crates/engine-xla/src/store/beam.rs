@@ -130,32 +130,16 @@ impl Pools {
                 ),
             });
         }
-        let page = i64::from(self.paging.page_size.max(1));
         let (inputs, params_t, pool_t) = head_inputs(handles, layout, head)?;
-        // The kv planes by view: planes of one dtype, width and row order are
-        // one reinterpretation of the pool apart from their maps, so each
-        // such group copies with one gather and one scatter (a scatter a
-        // plane cost ~27 us, 56 of them on qwen3-0.6b).
-        let mut planes: Vec<(
-            (dtype::Dtype, u32, Option<kernels_xla::hlo::PoolOrder>),
-            crate::handle::Tensor,
-            Vec<super::Map>,
-        )> = Vec::new();
-        let pool_rows = u64::from(self.root().rows);
-        for plane in &self.shape(kv)?.planes {
-            let (view, map) = self
-                .views
-                .iter()
-                .find(|(what, ..)| *what == plane.what)
-                .map(|&(_, view, map)| (view, map))
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!("pool plane {:?}, which has no view", plane.what),
-                })?;
-            let key = (plane.dtype, plane.width, super::kv_order(plane, pool_rows)?);
-            match planes.iter_mut().find(|(k, ..)| *k == key) {
-                Some((_, _, maps)) => maps.push(map),
-                None => planes.push((key, view, vec![map])),
-            }
+        // A page of the kv shape is one slot: every plane of it, whole pool
+        // rows from its grain's row on (`Pools::rows_at`).
+        let shape = self.shape(kv)?;
+        let grain_rows = i64::try_from(self.layout.grain(shape) / super::ROW_BYTES).unwrap_or(0);
+        let slot_rows = i64::try_from(shape.slot_bytes / super::ROW_BYTES).unwrap_or(0);
+        if grain_rows == 0 || slot_rows == 0 {
+            return Err(Fault::Unbound {
+                what: "a kv page narrower than a pool row, which a beam copy moves whole".to_string(),
+            });
         }
         let root = self.root();
         let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
@@ -207,8 +191,11 @@ impl Pools {
                 let w = cx.select(at_c, entries, none)?;
                 let write = cx.reduce(w, &[1], kernels_xla::hlo::Fold::Sum)?;
 
-                // the forks' tail copies, over every kv plane, before anything
-                // of the fire reads or appends (§6.4)
+                // The forks' tail copies (§6.4), before anything of the fire reads
+                // or appends: a forking beam's page copied whole, every plane at
+                // once (the slots past `tokens` it brings are written before any
+                // row reads them: a beam reads its own length, and its next
+                // append lands at `o`), one block a forking beam.
                 let src = cx.slice_axis(step.copies, 1, 0, 1)?;
                 let src = cx.reshape(src, &[b_n])?;
                 let dst = cx.slice_axis(step.copies, 1, 1, 2)?;
@@ -217,41 +204,47 @@ impl Pools {
                 let tok = cx.reshape(tok, &[b_n])?;
                 let src_g = kernels_xla::beam::resolve(cx, src, translation)?;
                 let dst_g = kernels_xla::beam::resolve(cx, dst, translation)?;
-                let t = cx.iota(Elem::I32, &[b_n, page], 1);
-                let tok_bc = cx.broadcast(tok, &[b_n, page], &[0])?;
-                let within = cx.compare(Cmp::Lt, t, tok_bc)?;
                 let zero_b = cx.const_i(Elem::I32, 0, &[b_n]);
+                let some = cx.compare(Cmp::Gt, tok, zero_b)?;
                 let clean = cx.compare(Cmp::Eq, step.faults, zero_b)?;
-                let clean = cx.broadcast(clean, &[b_n, page], &[0])?;
-                let moves = cx.and(within, clean)?;
-                for (_, view, maps) in &planes {
-                    let plane = cx.read(*view)?;
-                    let mut froms = Vec::with_capacity(maps.len());
-                    let mut tos = Vec::with_capacity(maps.len());
-                    for map in maps {
-                        let cell = |cx: &mut crate::emit::Cx<'_>, g| {
-                            let g = cx.broadcast(g, &[b_n, page], &[0])?;
-                            let stride = cx.const_i(Elem::I32, map.stride, &[b_n, page]);
-                            let offset = cx.const_i(Elem::I32, map.offset, &[b_n, page]);
-                            let pg = cx.const_i(Elem::I32, page, &[b_n, page]);
-                            let v = cx.mul(g, stride)?;
-                            let v = cx.add(v, offset)?;
-                            let v = cx.mul(v, pg)?;
-                            cx.add(v, t)
-                        };
-                        let from = cell(cx, src_g)?;
-                        let to = cell(cx, dst_g)?;
-                        // a cell no copy moves lands on itself
-                        let from = cx.select(moves, from, to)?;
-                        froms.push(cx.reshape(from, &[b_n * page])?);
-                        tos.push(cx.reshape(to, &[b_n * page])?);
-                    }
-                    let from = cx.concat(&froms, 0)?;
-                    let to = cx.concat(&tos, 0)?;
-                    let rows = cx.take_rows(plane, from)?;
-                    let next = cx.put_rows(plane, to, rows, Combine::Set)?;
-                    cx.write(*view, next)?;
-                }
+                let moves = cx.and(some, clean)?;
+                let grain_b = cx.const_i(Elem::I32, grain_rows, &[b_n]);
+                let src_row = cx.mul(src_g, grain_b)?;
+                let dst_row = cx.mul(dst_g, grain_b)?;
+                let moves_i = cx.convert(moves, Elem::I32);
+                let n_moves = cx.reduce(moves_i, &[0], kernels_xla::hlo::Fold::Sum)?;
+                // each forking beam's place among them
+                let rank = {
+                    let me = cx.broadcast(moves_i, &[b_n, b_n], &[1])?;
+                    let ei = cx.iota(Elem::I32, &[b_n, b_n], 1);
+                    let bi = cx.iota(Elem::I32, &[b_n, b_n], 0);
+                    let before = cx.compare(Cmp::Lt, ei, bi)?;
+                    let z = cx.const_i(Elem::I32, 0, &[b_n, b_n]);
+                    let me = cx.select(before, me, z)?;
+                    cx.reduce(me, &[1], kernels_xla::hlo::Fold::Sum)?
+                };
+                let whole = cx.read(root)?;
+                let zero = cx.const_i(Elem::I32, 0, &[]);
+                let out = cx.while_loop(
+                    &[zero, whole],
+                    |cx, a| cx.compare(Cmp::Lt, a[0], n_moves),
+                    |cx, a| {
+                        let k = cx.splat(a[0], &[b_n])?;
+                        let at = cx.compare(Cmp::Eq, rank, k)?;
+                        let pick = cx.and(at, moves)?;
+                        let z = cx.const_i(Elem::I32, 0, &[b_n]);
+                        let s_row = cx.select(pick, src_row, z)?;
+                        let s_row = cx.reduce(s_row, &[0], kernels_xla::hlo::Fold::Sum)?;
+                        let d_row = cx.select(pick, dst_row, z)?;
+                        let d_row = cx.reduce(d_row, &[0], kernels_xla::hlo::Fold::Sum)?;
+                        let lane0 = cx.const_i(Elem::I32, 0, &[]);
+                        let block = cx.dynamic_slice(a[1], &[s_row, lane0], &[slot_rows, ROW_WORDS])?;
+                        let next = cx.dynamic_update_slice(a[1], block, &[d_row, lane0])?;
+                        let one = cx.const_i(Elem::I32, 1, &[]);
+                        Ok(vec![cx.add(a[0], one)?, next])
+                    },
+                )?;
+                cx.write(root, out[1])?;
 
                 // the state after, and the results beside it
                 let whole = cx.read(root)?;
