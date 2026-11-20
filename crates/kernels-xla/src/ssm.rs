@@ -17,6 +17,7 @@
 //! chunk count, two matmuls a step), and the outputs are formed batched
 //! after it.
 
+pub mod carried;
 mod chunk;
 mod conv_step;
 pub mod dyn_conv;
