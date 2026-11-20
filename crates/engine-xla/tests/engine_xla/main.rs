@@ -2,6 +2,7 @@
 
 mod a_carried_conv_step_matches_the_sequential_window;
 mod a_carried_gdn_step_matches_the_sequential_fold;
+mod a_carried_gdn_tail_matches_the_sequential_fold;
 mod common;
 mod common_dit;
 mod common_llm;

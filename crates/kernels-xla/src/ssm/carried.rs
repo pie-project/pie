@@ -231,3 +231,81 @@ pub fn gdn_step_carried(f: &mut Func, c: &Carried, q_scale: f32) -> Built<Steppe
     let state = f.add(s0, rank)?; // [L, H, K, V]
     Ok(Stepped { y, u, state })
 }
+
+/// A tail's inputs, f32: the rows past each lane's commit that a buffering
+/// fire leaves carried, for a later decode step to read as a linear
+/// attention. `lanes` lanes, `rows` the tail rows laid (at least each
+/// lane's), `heads` value heads over `k_heads` key heads.
+#[derive(Clone, Copy, Debug)]
+pub struct Tail {
+    /// The state at the commit, `[lanes, heads, k_dim, v_dim]`.
+    pub state: Val,
+    /// The tail rows' raw keys `[lanes, rows, k_heads, k_dim]`, values
+    /// `[lanes, rows, heads, v_dim]`, log decays and betas `[lanes, rows,
+    /// heads]`.
+    pub keys: Val,
+    pub values: Val,
+    pub decays: Val,
+    pub betas: Val,
+    /// Each lane's tail rows (`[lanes]` i32, at most `rows`).
+    pub count: Val,
+}
+
+/// The tail rows' corrected values `u` (`[lanes, rows, heads, v_dim]`, zero
+/// past a lane's count): each row's `beta (v - exp(g) S^T k)` with `S` the
+/// state folded from the commit through the tail rows before it, the rows
+/// `gdn_step_carried` reads back (engine-cuda's `gated_delta_tail`). The
+/// fold itself is not kept: the tail is not committed.
+pub fn gdn_tail_corrected(f: &mut Func, t: &Tail) -> Built<Val> {
+    let sd = f.dims(t.state).to_vec();
+    let (lanes, heads, kd, vd) = (sd[0], sd[1], sd[2], sd[3]);
+    let rows = f.dims(t.keys)[1];
+    let keys = l2norm(f, t.keys)?;
+    let keys = to_value_heads(f, keys, heads)?; // [L, R, H, K]
+    let u0 = f.const_f(Elem::F32, 0.0, &[lanes, rows, heads, vd]);
+    let (keys, values, decays, betas, count) = (keys, t.values, t.decays, t.betas, t.count);
+    let out = f.for_loop(rows, &[t.state, u0], |f, j, a| {
+        let (s, u_acc) = (a[0], a[1]);
+        let z = f.const_i(Elem::I32, 0, &[]);
+        let row = |f: &mut Func, x: Val| -> Built<Val> {
+            let mut d = f.dims(x).to_vec();
+            let mut starts = vec![z; d.len()];
+            starts[1] = j;
+            d[1] = 1;
+            let v = f.dynamic_slice(x, &starts, &d)?;
+            d.remove(1);
+            f.reshape(v, &d)
+        };
+        let k = row(f, keys)?; // [L, H, K]
+        let v = row(f, values)?; // [L, H, V]
+        let g = row(f, decays)?; // [L, H]
+        let b = row(f, betas)?; // [L, H]
+        let e = f.exp(g);
+        let kb = f.broadcast(k, &[lanes, heads, kd, vd], &[0, 1, 2])?;
+        let sk = f.mul(s, kb)?;
+        let sk = f.reduce(sk, &[2], Fold::Sum)?; // [L, H, V]
+        let eb = f.broadcast(e, &[lanes, heads, vd], &[0, 1])?;
+        let a_ = f.mul(eb, sk)?;
+        let d = f.sub(v, a_)?;
+        let bb = f.broadcast(b, &[lanes, heads, vd], &[0, 1])?;
+        let u = f.mul(bb, d)?;
+        // live lanes: j < count
+        let jl = f.broadcast(j, &[lanes], &[])?;
+        let live = f.compare(Cmp::Lt, jl, count)?;
+        let zero_u = f.like_f(u, 0.0);
+        let live_u = f.broadcast(live, &[lanes, heads, vd], &[0])?;
+        let u = f.select(live_u, u, zero_u)?;
+        // S <- exp(g) S + k u^T on live lanes
+        let es = f.broadcast(e, &[lanes, heads, kd, vd], &[0, 1])?;
+        let decayed = f.mul(es, s)?;
+        let ub = f.broadcast(u, &[lanes, heads, kd, vd], &[0, 1, 3])?;
+        let outer = f.mul(kb, ub)?;
+        let next = f.add(decayed, outer)?;
+        let live_s = f.broadcast(live, &[lanes, heads, kd, vd], &[0])?;
+        let s = f.select(live_s, next, s)?;
+        let u1 = f.reshape(u, &[lanes, 1, heads, vd])?;
+        let u_acc = f.dynamic_update_slice(u_acc, u1, &[z, j, z, z])?;
+        Ok(vec![s, u_acc])
+    })?;
+    Ok(out[1])
+}
