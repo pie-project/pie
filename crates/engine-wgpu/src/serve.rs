@@ -36,7 +36,7 @@ impl Serve for Api {
 
     type Shelf = Shelf;
 
-    type Flight = ();
+    type Flight = engine_gpu::submit::DeviceTime;
 
     type Keep = std::convert::Infallible;
 
@@ -151,8 +151,22 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
-    fn walk_frame(device: &Context, _keep: bool) -> Result<Frame> {
-        device.frame()
+    fn walk_frame(device: &Context, _keep: bool, timed: bool) -> Result<Frame> {
+        // A timed step's device time is filled once its work is done
+        // (`Context::timed_frame`) and read at its landing (`collect`).
+        if timed {
+            device.timed_frame()
+        } else {
+            device.frame()
+        }
+    }
+
+    fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
+        Ok(if device.enabled().timestamps {
+            engine_gpu::submit::FireTiming::Timestamps
+        } else {
+            engine_gpu::submit::FireTiming::SubmitToDone
+        })
     }
 
     fn record_probe(_device: &Context, _record: &dyn Fn(&Frame) -> Result<()>) -> Result<()> {
@@ -314,9 +328,10 @@ impl Serve for Api {
         Ok(pending)
     }
 
-    fn fly(pending: Pending, _fed: Option<Pending>) {
-        #[cfg_attr(not(feature = "wgpu"), allow(clippy::drop_non_drop))]
-        drop(pending);
+    /// What a step in flight keeps: its device time, filled once its work
+    /// is done where it was walked timed.
+    fn fly(pending: Pending, _fed: Option<Pending>) -> engine_gpu::submit::DeviceTime {
+        pending.device_time()
     }
 
     fn reap(shell: &mut Shell<Api>) -> Result<()> {
@@ -360,8 +375,11 @@ fn collect(shell: &mut Shell<Api>) {
             .inflight
             .front()
             .is_some_and(|flight| flight.seq == step.seq)
+            && let Some(flight) = shell.inflight.pop_front()
         {
-            shell.inflight.pop_front();
+            // Under a stated submit bound, the step's device time, read
+            // without waiting once its backend filled it (`Shell::track`).
+            shell.timed(flight.estimate, flight.api);
         }
         if step.failed {
             shell.arms.give(step.arm);

@@ -165,11 +165,31 @@ impl Serve for Api {
         0
     }
 
-    fn walk_frame(device: &Context, keep: bool) -> Result<Frame> {
-        if keep {
-            device.frame_kept()
+    fn walk_frame(device: &Context, keep: bool, timed: bool) -> Result<Frame> {
+        // A timed step is spanned: its timestamps' reset and writes recorded
+        // with its work, so a kept one writes them anew on each replay, and
+        // its device time is read at its harvest (`Pending::span_ns`).
+        match (keep, timed) {
+            (true, true) => device.spanned_kept(),
+            (true, false) => device.frame_kept(),
+            (false, true) => device.spanned(),
+            (false, false) => device.frame(),
+        }
+    }
+
+    fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
+        if device.writes_timestamps() {
+            Ok(engine_gpu::submit::FireTiming::Timestamps)
         } else {
-            device.frame()
+            Err(Fault::Unbound {
+                what: format!(
+                    "a serving fire's device time on {}, whose queue family writes no timestamps \
+                     (timestampValidBits 0, or timestampPeriod 0): under the platform's stated \
+                     bound on one GPU submission each fire's time moves the scale the next \
+                     fires are estimated at",
+                    engine_gpu::backend::Context::name(device)
+                ),
+            })
         }
     }
 
@@ -419,6 +439,16 @@ impl Serve for Api {
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
+        // Under a stated submit bound, the step's device time from its
+        // timestamps, read now its fence was waited (`Shell::timed`).
+        if flight.estimate.is_some() {
+            let time = engine_gpu::submit::DeviceTime::default();
+            match flight.api.pending.span_ns()? {
+                Some(ns) => time.set(ns),
+                None => time.unread(),
+            }
+            shell.timed(flight.estimate, time);
+        }
         let mut raw = vec![0u8; end as usize];
         shell.readout[flight.arm].read(0, &mut raw)?;
         let rows = rows_from(&raw, &flight.rows);

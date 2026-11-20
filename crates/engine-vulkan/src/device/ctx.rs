@@ -1360,6 +1360,14 @@ impl Context {
         self.spanned_with(false)
     }
 
+    /// Whether the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`): a
+    /// spanned frame then reads its device time back.
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        self.core.stamp_bits() > 0
+    }
+
     fn spanned_with(&self, one_time: bool) -> Result<Frame> {
         let frame = self.frame_with(one_time)?;
         let core = &self.core;
@@ -2193,18 +2201,24 @@ impl Frame {
     /// A [`Context::spanned_kept`] frame, its closing timestamp written,
     /// kept to replay ([`Kept::replay_spanned`]).
     pub fn into_kept_spanned(self) -> Result<Kept> {
-        self.stamp_end();
         self.into_kept()
     }
 
+    /// Kept to replay; a spanned frame's closing timestamp written first,
+    /// so each replay writes both anew.
     pub fn into_kept(mut self) -> Result<Kept> {
+        self.stamp_end();
         self.end()?;
         Ok(Kept {
             inner: Arc::clone(&self.inner),
         })
     }
 
+    /// Submits; `on_done` runs once it lands. A spanned frame's closing
+    /// timestamp is written first, so [`Pending::span_ns`] reads its device
+    /// time once it landed.
     pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.stamp_end();
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {
@@ -2430,6 +2444,13 @@ impl Pending {
         }
         self.inner.harvest_timing();
         Ok(())
+    }
+
+    /// The device's time between a spanned frame's two timestamps, ns, read
+    /// once it landed (its fence waited: the read waits on nothing more);
+    /// `None` for a frame that writes none.
+    pub fn span_ns(&self) -> Result<Option<u64>> {
+        self.inner.span_ns()
     }
 }
 

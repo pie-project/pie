@@ -168,8 +168,15 @@ pub trait Serve: Backend {
         handles: &'f Handles<Self>,
     ) -> Self::Sink<'f>;
 
-    /// A frame a step walks into; `keep` where it is kept to replay.
-    fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
+    /// A frame a step walks into; `keep` where it is kept to replay;
+    /// `timed` where its device time is read once it lands, as
+    /// [`Serve::fire_timing`] states (under a stated submit bound).
+    fn walk_frame(device: &Self::Context, keep: bool, timed: bool) -> Result<Self::Frame>;
+
+    /// Where a serving fire's device time is read from under a stated
+    /// submit bound (`crate::submit::Measured`), stated at load; a device
+    /// whose backend reads it nowhere is refused by name.
+    fn fire_timing(device: &Self::Context) -> Result<crate::submit::FireTiming>;
 
     /// The probe's work (`record`, its dispatches into a frame) laid for
     /// [`Serve::replay_probe`]: recorded once into a spanned frame kept to
@@ -779,6 +786,13 @@ pub struct Shell<B: Serve> {
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
+    /// Under a stated submit bound, the next step's estimate at a ratio of
+    /// 1 (`crate::submit::SubmitBound::raw_ns`), which its flight carries
+    /// to its landing.
+    estimate_next: Option<f64>,
+    /// The landed fires whose device time is not yet read, each with its
+    /// estimate ([`Shell::timed`]).
+    timing: Vec<(f64, crate::submit::DeviceTime)>,
 
     pub handles: Handles<B>,
     trace: Trace,
@@ -1711,9 +1725,22 @@ impl<B: Serve> Shell<B> {
                     fire_lanes: budgets.tokens.max_lanes,
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
                     scale: 1.0,
+                    measured: crate::submit::Measured::default(),
+                };
+                // Each serving fire's device time, read once it lands, moves
+                // the scale its successors are read at
+                // (`crate::submit::Measured`): where it is read from is
+                // stated here, and a device it is read nowhere on is
+                // refused by name. A load that runs nothing on a device
+                // reads none.
+                let timing = if B::LANDS {
+                    Some(B::fire_timing(&device)?)
+                } else {
+                    None
                 };
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
+                    fire_timing = timing.map(|t| t.to_string()),
                     worst = held.worst,
                     worst_measured_this_load = device_profile.tuned().measured_this_load,
                     layers = held.layers,
@@ -2088,6 +2115,8 @@ impl<B: Serve> Shell<B> {
             probe,
             probed: 0,
             split_next: false,
+            estimate_next: None,
+            timing: Vec::new(),
             pipelines,
             asks,
             handles,
@@ -3709,6 +3738,43 @@ impl<B: Serve> Shell<B> {
         self.split_next = split;
     }
 
+    /// Under a stated submit bound, the next step this shell enqueues is
+    /// estimated at `ns` at a ratio of 1; `None` clears it.
+    pub fn estimate_next(&mut self, ns: Option<f64>) {
+        self.estimate_next = ns.filter(|_| self.submit_bound.is_some());
+    }
+
+    /// A step estimated at `estimate` (its flight's) landed; its device
+    /// time is read from `time` once its backend fills it, without waiting
+    /// ([`Shell::track`]). Nothing where the step carries no estimate (no
+    /// bound is stated).
+    pub fn timed(&mut self, estimate: Option<f64>, time: crate::submit::DeviceTime) {
+        if let Some(estimate) = estimate {
+            self.timing.push((estimate, time));
+        }
+    }
+
+    /// Under a stated submit bound, every landed fire's device time filled
+    /// so far is read against its estimate into the bound's measured ratios
+    /// (`crate::submit::Measured`), and what landed more than a bound ago
+    /// drops out: before a step is admitted. Reads only what the backends
+    /// filled where they saw the fires land; waits on nothing.
+    pub fn track(&mut self) {
+        let Some(held) = self.submit_bound.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        self.timing.retain(|(estimate, time)| match time.get() {
+            None => true,
+            Some(None) => false,
+            Some(Some(ns)) => {
+                held.measured.landed(now, *estimate, ns);
+                false
+            }
+        });
+        held.age(now);
+    }
+
     pub fn harvest_through(&mut self, seq: u64) -> Result<()> {
         while self
             .inflight
@@ -4942,7 +5008,7 @@ impl<B: Serve> Shell<B> {
         let mut frame = Some(if bind_only {
             B::bind_frame(&self.device)?
         } else {
-            B::walk_frame(&self.device, keep)?
+            B::walk_frame(&self.device, keep, self.submit_bound.is_some())?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
@@ -5402,6 +5468,10 @@ pub struct Flight<B: Serve> {
     pub rows: Vec<ReadSpan>,
     pub pixels: PixelSpans,
     pub api: B::Flight,
+    /// Under a stated submit bound, the step's estimate at a ratio of 1,
+    /// which its measured device time is read against once it lands
+    /// ([`Shell::timed`]).
+    pub estimate: Option<f64>,
 }
 
 impl<B: Serve> engine::frame::Shell for Shell<B> {
@@ -5644,6 +5714,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             rows,
             pixels,
             api: B::fly(pending, fed),
+            estimate: self.estimate_next.take(),
         });
         Ok(Landed {
             seq,

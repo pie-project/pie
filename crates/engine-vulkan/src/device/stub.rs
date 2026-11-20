@@ -149,6 +149,11 @@ impl Context {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -269,6 +274,10 @@ impl Pending {
     }
 
     pub fn wait(&self) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn span_ns(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 }

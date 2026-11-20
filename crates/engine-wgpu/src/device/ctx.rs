@@ -664,7 +664,11 @@ impl Context {
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
-            timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            // Every timestamp this backend writes is written into an
+            // encoder: both features, or none is written.
+            timestamps: features.contains(
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ),
         };
         // A slab is bound whole, so no larger than one storage binding takes
         // (past it a fire refuses the view rather than reading a cut slab),
@@ -859,6 +863,8 @@ impl Context {
                 timing: Mutex::new(Vec::new()),
                 span: Mutex::new(None),
                 pass: Mutex::new(None),
+                time: engine_gpu::submit::DeviceTime::default(),
+                wall: AtomicBool::new(false),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
@@ -909,6 +915,19 @@ impl Context {
         self.core.idle()
     }
 
+    /// A frame whose device time [`Pending::device_time`] reads once its
+    /// work is done, filled where that is seen (its work-done callback),
+    /// never by a wait of its own: spanned ([`Context::spanned`]) where the
+    /// device enabled timestamp queries, else timed by the host's clock
+    /// from its submit to its work done.
+    pub fn timed_frame(&self) -> Result<Frame> {
+        let frame = self.spanned()?;
+        if frame.inner.span.lock().expect("span lock poisoned").is_none() {
+            frame.inner.wall.store(true, Ordering::Release);
+        }
+        Ok(frame)
+    }
+
     /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
     pub fn bind_frame(&self) -> Result<Frame> {
         let mut frame = self.frame()?;
@@ -950,6 +969,13 @@ pub(crate) struct Inner {
     span: Mutex<Option<Span>>,
 
     pass: Mutex<Option<wgpu::ComputePass<'static>>>,
+
+    /// A timed frame's device time, filled once its work is done
+    /// ([`Context::timed_frame`]).
+    time: engine_gpu::submit::DeviceTime,
+    /// A timed frame on a device that writes no timestamps: its time is the
+    /// host's clock from its submit to its work done.
+    wall: AtomicBool,
 }
 
 impl Inner {
@@ -1487,7 +1513,35 @@ impl Frame {
     }
 
     pub fn commit_async(mut self, on_done: Option<OnDone>) -> Result<Pending> {
+        // A timed frame ([`Context::timed_frame`]): its closing timestamp
+        // resolved into its readback before the submit, the readback mapped
+        // once the work is done; or the host's clock across the submit.
+        let span = self.inner.span.lock().expect("span lock poisoned").take();
+        if let Some(span) = &span
+            && self.open
+        {
+            self.encode(|encoder| {
+                encoder.write_timestamp(&span.set, 1);
+                encoder.resolve_query_set(&span.set, 0..2, &span.resolve, 0);
+                encoder.copy_buffer_to_buffer(&span.resolve, 0, &span.readback, 0, Some(16));
+            })?;
+        }
+        let wall = self.inner.wall.load(Ordering::Acquire);
+        let submitted = std::time::Instant::now();
         self.submit()?;
+        if let Some(span) = span {
+            let (core, time) = (Arc::clone(&self.inner.core), self.inner.time.clone());
+            self.inner.core.queue.on_submitted_work_done(move || {
+                read_span(core, span, time);
+            });
+            self.inner.core.kick();
+        } else if wall {
+            let time = self.inner.time.clone();
+            self.inner.core.queue.on_submitted_work_done(move || {
+                time.set(submitted.elapsed().as_nanos() as u64);
+            });
+            self.inner.core.kick();
+        }
         let pending = Pending {
             inner: Arc::clone(&self.inner),
         };
@@ -1509,6 +1563,40 @@ impl Frame {
 
 pub use engine_gpu::backend::OnDone;
 
+/// A timed frame's span read once its work is done: its readback mapped
+/// and its two timestamps' distance filled into `time`, or `time` told
+/// unread where the map failed.
+fn read_span(core: Arc<Core>, span: Span, time: engine_gpu::submit::DeviceTime) {
+    let period = f64::from(core.queue.get_timestamp_period());
+    let readback = span.readback.clone();
+    readback.slice(0..16).map_async(wgpu::MapMode::Read, move |mapped| {
+        // Held to here: the set and its resolve outlive the read.
+        let span = span;
+        if mapped.is_err() {
+            time.unread();
+            return;
+        }
+        let slice = span.readback.slice(0..16);
+        let ticks = match slice.get_mapped_range() {
+            Ok(view) => {
+                let word = |i: usize| {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&view[i * 8..i * 8 + 8]);
+                    u64::from_le_bytes(b)
+                };
+                Some(word(1).saturating_sub(word(0)))
+            }
+            Err(_) => None,
+        };
+        span.readback.unmap();
+        match ticks {
+            Some(ticks) => time.set((ticks as f64 * period) as u64),
+            None => time.unread(),
+        }
+    });
+    core.kick();
+}
+
 impl Drop for Frame {
     fn drop(&mut self) {
         self.open = false;
@@ -1526,6 +1614,13 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
+    /// The frame's device time, filled once its work is done where it was
+    /// opened timed ([`Context::timed_frame`]); never filled otherwise.
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
+        self.inner.time.clone()
+    }
+
     /// Whether the frame has landed, read now without waiting: its
     /// submitted-work-done callback has run (the poller polls the device
     /// from the submit until its queue is empty).

@@ -142,6 +142,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn timed_frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn idle(&self) -> bool {
         match self.never {}
@@ -220,6 +224,11 @@ pub struct Pending {
 impl Pending {
     #[must_use]
     pub fn landed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
         match self.never {}
     }
 

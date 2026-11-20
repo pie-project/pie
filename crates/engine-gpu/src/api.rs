@@ -278,10 +278,14 @@ impl<B: Host> Gpu<B> {
     /// lane's where it carries no prompt). `None` where it is admitted.
     fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
         let shell = self.shell.as_mut()?;
+        // The fires landed so far move the scale this step is read at
+        // (`crate::submit::Measured`).
+        shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
         let admitted = held.admit(rows);
         let (whole, per_layer) = held.step_ns(rows);
+        let raw = held.raw_ns(rows).0;
         tracing::debug!(
             frame = at.frame.0,
             step = at.step,
@@ -293,7 +297,10 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
-            scale = held.scale,
+            probe_scale = held.scale,
+            measured_worst = held.measured.worst(),
+            measured_fires = held.measured.len(),
+            scale = held.scale_now(),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -322,6 +329,7 @@ impl<B: Host> Gpu<B> {
             ));
         }
         shell.split_next(admitted.split());
+        shell.estimate_next(Some(raw));
         None
     }
 
@@ -1501,6 +1509,7 @@ where
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
                 shell.split_next(false);
+                shell.estimate_next(None);
             }
             match fired {
                 Ok((ticket, step_pending)) => {

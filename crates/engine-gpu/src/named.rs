@@ -492,8 +492,15 @@ impl<B: Serve> Serve for Named<B> {
         0
     }
 
-    fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
+    fn walk_frame(_device: &Facts, _keep: bool, _timed: bool) -> Result<NoFrame> {
         Ok(NoFrame)
+    }
+
+    /// A naming load runs nothing on a device: no fire to time.
+    fn fire_timing(_device: &Facts) -> Result<crate::submit::FireTiming> {
+        Err(crate::error::Fault::Unbound {
+            what: "a fire's device time on a naming load, which runs nothing on a device".into(),
+        })
     }
 
     /// A naming load runs nothing on a device: no probe to lay.
