@@ -11,7 +11,6 @@ use super::plan::ServeOutcome;
 use super::proc::Residency;
 use super::rank::Rank;
 use super::reclaim::Reclaim;
-use super::residency_planner::HOST_RESERVE_DIVISOR;
 use super::victim::{Victim, VictimSet};
 use super::wait::{EntryKey, WaitKind};
 use super::{ProcessId, ResidencyPlanner};
@@ -189,7 +188,7 @@ impl ResidencyPlanner {
         let Some(victims) = self.victim_set() else {
             return;
         };
-        let (swap_free, swap_total) = self.swap_stats();
+        let (swap_free, _) = self.swap_stats();
         let deficit = self.bytes_of(victims.deficit);
         // A new ask leaves one set's state room on the host: a set at rest
         // there comes back by parking another in its place, so what rests
@@ -213,17 +212,14 @@ impl ResidencyPlanner {
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
             }
-            // Waiting on the supply holds only while something in flight
-            // can bring it ([`Inner::nothing_in_flight`]): the fleet counted
-            // stalled by its waiters' kinds (`is_wedged`) missed a resident
-            // blocked elsewhere (on another process, a sibling lane), and a
-            // swap tier nearly full deferred the head for good with no fire,
-            // move or kill to free anything (the disk-only M1 hang).
-            let in_flight = !self.with_inner(|inner| inner.nothing_in_flight());
-            if kv_deficit > 0
-                && ((swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total && in_flight)
-                    || !self.supply_stalled())
-            {
+            // Kv the head lacks waits on the supply only while some is on
+            // its way (`supply_stalled`: pages free, gathered, or an
+            // eviction landing). No share of the swap tiers is kept back
+            // from a victim: a fraction held there deferred the head for
+            // good under a tight disk budget, nothing in flight to free
+            // anything (the disk-only M1 hang), and a victim the swap
+            // cannot take is found unhostable when it is quoted.
+            if kv_deficit > 0 && !self.supply_stalled() {
                 self.stats
                     .eviction_deferrals
                     .fetch_add(1, Ordering::Relaxed);

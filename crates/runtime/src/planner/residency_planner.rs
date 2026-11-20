@@ -19,8 +19,6 @@ use super::stats::PlannerStats;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, exec};
 
-pub(super) const HOST_RESERVE_DIVISOR: u32 = 8;
-
 /// The fixed state sets a working set holds, resting or running
 /// (`state-chunk` decision 4). The copy-on-write set a lane's write takes
 /// while a fork or snapshot still reads the first is no part of it: the
@@ -86,7 +84,7 @@ pub struct ResidencyPlanner {
 
 /// How long a process waits at admission before it says why, and again
 /// after each such span: what a stall at the gates is read from.
-const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Waits on `wait` for [`ADMIT_SAYS_AFTER`] at most: `false` once that
 /// passed, for the caller to say why it waits and look again. With no
@@ -368,9 +366,10 @@ impl ResidencyPlanner {
     /// dropped by [`Self::reclaim_idle_once`] instead, never copied): whether
     /// a move is on its way (its landing frees the pages and pokes the
     /// planner). Only under
-    /// a waiter's want, never while pages stand free; what keeps back a
-    /// share of the host for suspends ([`HOST_RESERVE_DIVISOR`]) is not
-    /// spent on cache.
+    /// a waiter's want, never while pages stand free. No share of the host
+    /// is held back from it: a suspend takes its host room by dropping the
+    /// cache there first (`KvStore::prepare_suspend`), so what is paused
+    /// goes before what is cached with no fraction kept.
     ///
     /// `wanted`: the pages the head lacks. No more than that moves: a head
     /// short of one prompt's pages waited behind the copy of every idle page
@@ -384,17 +383,16 @@ impl ResidencyPlanner {
         }
         let (mut host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
-        let reserve = host_total / HOST_RESERVE_DIVISOR;
-        // A host with no room past its reserve is under pressure too: its
-        // own idle cache, lowest key first, goes on down to disk before the
-        // device's lands there, so the tiers keep the newer above the older
-        // and nothing on the host is dropped for want of room.
+        // A full host is under pressure too: its own idle cache, lowest key
+        // first, goes on down to disk before the device's lands there, as
+        // much as the demote wants, so the tiers keep the newer above the
+        // older and nothing on the host is dropped for want of room.
         if host_total > 0
-            && host_free <= reserve
+            && host_free == 0
             && disk_free > 0
             && !self.spill_failed.load(Ordering::Acquire)
         {
-            if let Some(txn) = self.port.prepare_spill(reserve.max(1) as usize) {
+            if let Some(txn) = self.port.prepare_spill(wanted.max(1) as usize) {
                 exec::spawn_spill(self.clone(), txn, Self::spill_done);
                 return true;
             }
@@ -402,7 +400,7 @@ impl ResidencyPlanner {
             host_free = self.port.host_stats().0;
         }
         let (disk_free, _) = self.port.disk_stats();
-        let room = (host_free.saturating_sub(reserve) + disk_free).min(wanted.max(1));
+        let room = (host_free + disk_free).min(wanted.max(1));
         let txn = (room > 0)
             .then(|| self.port.prepare_demote(room as usize))
             .flatten();
@@ -574,12 +572,9 @@ impl ResidencyPlanner {
         {
             return false;
         }
-        // The slots free now, idle cache's not counted: a sweep takes
-        // only what stands free.
-        let (host_free, host_total) = self.port.host_stats();
-        let (disk_free, disk_total) = self.port.disk_stats();
-        let (swap_free, swap_total) = (host_free + disk_free, host_total + disk_total);
-        let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
+        // The slots free now, idle cache's not counted: a sweep takes only
+        // what stands free, no share of it held back.
+        let room = (self.port.host_stats().0 + self.port.disk_stats().0) as usize;
         let (model, engine) = self.port.locus();
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set

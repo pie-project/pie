@@ -77,10 +77,12 @@ enum Board {
 }
 
 /// While a head stays unserved with nothing in flight, its stall dump is
-/// said again this often ([`ResidencyPlanner::dump_stall`]), the drain task
-/// looking with no plan pass: a stall that goes on is never silent, and no
-/// timer ends it.
-pub(super) const STALL_SAYS_AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// said again as often as a process waiting at admission says why
+/// ([`super::residency_planner::ADMIT_SAYS_AFTER`]), the drain task looking
+/// with no plan pass: a stall that goes on is never silent, and no timer
+/// ends it.
+pub(super) const STALL_SAYS_AGAIN: std::time::Duration =
+    super::residency_planner::ADMIT_SAYS_AFTER;
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {

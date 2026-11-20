@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::inner::{RESERVE_SHARE, RestoreGate};
+use super::inner::RestoreGate;
 use super::proc::{PendingBind, Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
@@ -1419,12 +1419,26 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
                     ..RsUnits::default()
                 }
             ),
+            ring,
+            "and a small ring holds back the lane's growth too, no fraction of it in its place"
+        );
+        assert_eq!(
+            inner.seating_reserve(
+                older,
+                ring,
+                prompt,
+                RsUnits {
+                    slots: 0,
+                    pages: 1,
+                    ..RsUnits::default()
+                }
+            ),
             RsUnits {
                 slots: 0,
                 pages: 1,
                 ..RsUnits::default()
             },
-            "and the growth holds back at most a thirty-second of the ring"
+            "never more than the ring"
         );
         assert!(inner.seating_reserve(seated, ring, prompt, roomy).is_zero());
         assert!(
@@ -1598,7 +1612,7 @@ fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
     });
     let seated = u32::try_from(grants.lock().len()).expect("a few lanes");
     let free = pool.free.load(Ordering::SeqCst);
-    let held_back = (2 * seated.saturating_sub(1)).min(RING / RESERVE_SHARE);
+    let held_back = (2 * seated.saturating_sub(1)).min(RING);
     assert!(seated > 0, "the ring seats prompts");
     assert!(
         free >= held_back,

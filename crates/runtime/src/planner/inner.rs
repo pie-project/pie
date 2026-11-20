@@ -13,11 +13,6 @@ use super::rank::Rank;
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind, Waiter};
 
-/// The most of the window lists the seated lanes' growth holds back from a prompt
-/// waiting to be seated: a thirty-second, as a small pool seats few lanes
-/// and serves their growth from what the others let go.
-pub(super) const RESERVE_SHARE: u32 = 32;
-
 #[derive(Default)]
 pub(super) struct Inner {
     /// The process suspended for a bind whose restore was served and that
@@ -154,15 +149,11 @@ impl Inner {
                 .count(),
         )
         .unwrap_or(u32::MAX);
+        // One growth for each seated lane, no fraction of the pool in its
+        // place: what the lanes' next pages take, never more than the pool.
         RsUnits {
-            slots: growth
-                .slots
-                .saturating_mul(seated)
-                .min(capacity.slots / RESERVE_SHARE),
-            pages: growth
-                .pages
-                .saturating_mul(seated)
-                .min(capacity.pages / RESERVE_SHARE),
+            slots: growth.slots.saturating_mul(seated).min(capacity.slots),
+            pages: growth.pages.saturating_mul(seated).min(capacity.pages),
             ..RsUnits::default()
         }
     }
