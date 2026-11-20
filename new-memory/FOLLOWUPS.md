@@ -861,6 +861,15 @@ shape for; seat the decodes and the prompts that fit beside them, and defer the 
 next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
 composition above.
 
+XLA standard samplers' guest stages, prewarmed before ready (Engine::prewarm_programs): 32
+programs x ~7.5 batch rungs = 240 stages, ~185-190 s on a cold v6e census boot (side by side under
+the guest compile ledger), ~1.3 s warm. Fewer rungs do not pay: rungs a factor 4 apart (144 stages)
+cost sampled c5 / c8 / c32 23-32% (a padded sampled stage costs about in proportion to its rows).
+Parked lever: the sampled stage's nucleus cut is ~50 masked reduces over rows x vocab from HBM
+(bisection, exact); a Mosaic body holding a row block in VMEM across the rounds would make it
+compute-bound (estimate: several x on the stage), shrinking the sampled step and the padding cost
+together, after which fewer rungs (and a shorter cold prewarm) could pay.
+
 Also after ready, and not a fire's: a built-in inferlet's guest stages compile at its first
 registration on a machine (v6e, beam_search at widths 1, 4, 8: six guest programs, a prompt
 and a decode epilogue a width, x 8 batch rungs = 48 compiles of ~23 KB texts, ~20 s for each
