@@ -90,8 +90,26 @@ impl Inner {
                 proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
             })
             .collect();
+        // Rung raises waiting for room (capped frames' and rises'): each
+        // with its process, its rung and whether it was served.
+        let raises: Vec<String> = self
+            .queue
+            .values()
+            .filter_map(|waiter| match waiter.kind {
+                WaitKind::BindRoom {
+                    rise: Some(rung),
+                    served,
+                    withdrawn,
+                    ..
+                } => Some(format!(
+                    "{}: rung={rung} served={served} withdrawn={withdrawn}",
+                    waiter.pid
+                )),
+                _ => None,
+            })
+            .collect();
         let blocked = format!(
-            "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?}",
+            "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?} raises={raises:?}",
             some_pids(self.host_swap_blocked.iter()),
             some_pids(self.prepare_blocked.iter())
         );
@@ -486,10 +504,15 @@ impl Inner {
                 // meanwhile. Kept, the eviction waited on fires whose
                 // finalizer was that bind, and the bind on the eviction
                 // (Mac Pro's M5 soak: evicting=1 for good, pool free 0).
+                // A rung raise for its capped frame is not: the frame is
+                // admitted work its eviction waits on, and it goes only
+                // once raised (Mac Pro at 2 GiB on 4cef0c7d3: the eviction
+                // waited on a capped frame whose raise it withdrew).
                 WaitKind::BindRoom {
                     notify,
                     served: false,
                     withdrawn,
+                    rise: None,
                     ..
                 } => {
                     *withdrawn = true;

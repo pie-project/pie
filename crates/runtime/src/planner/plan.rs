@@ -209,6 +209,18 @@ impl ResidencyPlanner {
             .join(" ")
     }
 
+    /// Frames the scheduler holds out under the fire cap (capped: complete,
+    /// wider than the rung in hand) as the engine's rung gate states them:
+    /// the widest one's rows and the process its raise is funded for.
+    pub(super) fn capped_line(&self) -> String {
+        let (_, engine) = self.port.locus();
+        format!(
+            "rows={} owner={:?}",
+            crate::store::shared::owed_cut_rows(engine),
+            crate::store::shared::owed_by(engine)
+        )
+    }
+
     /// A restore head's serve takes its state before its unpark: the free
     /// chunks the store would open for it ([`super::pool::PoolPort::serve_opens`], the
     /// store's own placement) are no room for its runs, and leave the map,
@@ -415,6 +427,7 @@ impl ResidencyPlanner {
             ?need_moves,
             %plan,
             %blocked,
+            capped = %self.capped_line(),
             swap = ?self.swap_stats(),
             %held_by,
             %store,

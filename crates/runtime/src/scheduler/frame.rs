@@ -299,13 +299,17 @@ impl FramePolicy {
         self.cut_owed_by().0
     }
 
-    /// [`Self::cut_owed`], and the lane whose frame holds that widest
-    /// fire: the process a raise to it is funded for.
+    /// [`Self::cut_owed`], and the process whose frame holds that widest
+    /// fire: the lane's owner, whom a raise to it is funded for (the lane
+    /// where it names none). Named by its lane, the raise asked the
+    /// planner for a process it did not know, was told "planner request
+    /// cancelled" every pass, and the capped frames sat for good (Mac Pro
+    /// at 2 GiB on 4cef0c7d3: four lanes capped, 82 such refusals).
     #[must_use]
     pub fn cut_owed_by(&self) -> (usize, Option<ProcessId>) {
         self.lanes
             .iter()
-            .filter_map(|(&pid, lane)| {
+            .filter_map(|(&lane_id, lane)| {
                 let front = lane.frames.front().filter(|front| front.is_complete())?;
                 let widest = front
                     .fires
@@ -313,7 +317,7 @@ impl FramePolicy {
                     .map(|fire| fire.rung_rows)
                     .filter(|&rows| rows > self.fire_cap)
                     .max()?;
-                Some((widest, pid))
+                Some((widest, lane.owner.unwrap_or(lane_id)))
             })
             .max_by_key(|&(rows, _)| rows)
             .map_or((0, None), |(rows, pid)| (rows, Some(pid)))
@@ -1740,6 +1744,20 @@ mod tests {
                 "no lane left expected: its complete frame goes"
             );
         }
+    }
+
+    /// Mac Pro at 2 GiB on 4cef0c7d3: four lanes' complete frames wider
+    /// than the cap, their raise asked of the planner for the lane's id,
+    /// which no process has: "planner request cancelled" every pass. The
+    /// raise is funded for the lane's owner.
+    #[test]
+    fn a_capped_frame_s_raise_is_owed_by_its_lane_s_owner() {
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let (lane, owner) = (pid(), pid());
+        policy.cap_fires(128);
+        policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(owner), 1, 1, 1, 1, 256);
+        assert_eq!(policy.cut_owed_by(), (256, Some(owner)), "the owner, not the lane");
     }
 
     /// The frame / eviction cycle (a process waited at admission behind a

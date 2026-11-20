@@ -649,7 +649,18 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     tracing::debug!(%pid, "planner: an eviction drains its detachable fires");
     drain_detachable(pid).await;
     let drained = began.elapsed();
-    tracing::debug!(%pid, sets = fence.handles.len(), "planner: an eviction waits for its sets' fires");
+    // What it waits on, said as it begins: the fires holding its sets'
+    // leases (submitted, or admitted and held in an unsealed frame), and the
+    // engine's capped frames with the raise they wait on (a capped frame of
+    // its own goes once raised: its raise stays queued through its
+    // eviction, [`super::inner::Inner::begin_eviction`]).
+    tracing::debug!(
+        %pid,
+        sets = fence.handles.len(),
+        leases = fence.handles.iter().map(KvSuspendHandle::active_leases).sum::<usize>(),
+        capped = %planner.capped_line(),
+        "planner: an eviction waits for its sets' fires"
+    );
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }

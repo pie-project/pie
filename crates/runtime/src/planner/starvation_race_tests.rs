@@ -8724,3 +8724,58 @@ async fn a_pass_that_stops_short_of_the_eviction_plan_says_where() {
     );
     drop(fire);
 }
+
+/// Mac Pro at 2 GiB on 4cef0c7d3: a bind-short eviction suspended
+/// 236c3046 and waited on its set's fires, one of them in a complete frame
+/// wider than the rung in hand (capped), which goes only once raised. Its
+/// eviction withdrew that raise's wait, and the eviction waited for good.
+/// A rung raise for a capped frame is queued for an owner being evicted,
+/// stays queued through its eviction, and is served once room frees: the
+/// frame goes, and the eviction's wait on it ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_capped_frame_s_raise_waits_through_its_owner_s_eviction_and_is_served() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let owner = ProcessId::new_v4();
+    planner.register(owner);
+    planner.note_admitted(owner);
+    let p = planner.clone();
+    let raised = crate::rt::spawn(async move {
+        p.fund_rise(owner, 3, || std::future::ready("raised")).await
+    });
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    let raise_queued = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                matches!(
+                    waiter.kind,
+                    WaitKind::BindRoom {
+                        rise: Some(3),
+                        withdrawn: false,
+                        ..
+                    }
+                )
+            })
+        })
+    };
+    assert!(raise_queued(&planner), "short of room: the raise waits");
+    // Its owner's eviction begins (a bind elsewhere picked it).
+    let wake = planner.with_inner(|inner| inner.begin_eviction(owner, Reclaim::default()));
+    for notify in wake {
+        notify.notify_waiters();
+    }
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(raise_queued(&planner), "its eviction waits on the frame: the raise stays");
+    assert!(!raised.is_finished());
+    // Room frees: the raise is served and taken.
+    pool.free.lock().extend(0..3);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    let taken = raised.await.expect("the wait ends");
+    assert_eq!(taken.expect("not refused"), Some("raised"), "served: the frame goes");
+}

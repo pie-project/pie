@@ -538,6 +538,7 @@ impl ResidencyPlanner {
                 quiet,
                 %plan,
                 %blocked,
+                capped = %self.capped_line(),
                 swap = ?self.swap_stats(),
                 %store,
                 %held_by,

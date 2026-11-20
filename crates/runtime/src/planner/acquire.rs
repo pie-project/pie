@@ -686,9 +686,12 @@ impl ResidencyPlanner {
         let notify = Arc::new(Notify::new());
         let key = self
             .with_inner(|inner| {
-                // Evicting already, it waits for its restore instead.
+                // Evicting already, it waits for its restore instead. A
+                // rung raise for its capped frame waits on: its eviction
+                // waits on that frame, which goes only once raised.
                 let proc = inner.procs.get(&pid)?;
-                if proc.state != Residency::Resident {
+                let raising = rise.is_some() && proc.state == Residency::Evicting;
+                if proc.state != Residency::Resident && !raising {
                     return Some(None);
                 }
                 Some(Some({
