@@ -611,35 +611,61 @@ impl Pointwise {
                 }
             })
         };
-        let probe = |v: ValueId| -> Option<Vec<f32>> {
-            let mut ops: Vec<Op> = region.ops[..(v - params + 1) as usize].to_vec();
-            ops.push(Op::Cast(v, crate::region::Elem::F32));
-            let probe = Region {
-                width: n,
-                params: region.params.clone(),
-                ops,
-                results: vec![params + (v - params + 1)],
-                rounds: Vec::new(),
-            };
-            let args: Vec<Arg> = region
-                .params
-                .iter()
-                .map(|shape| match shape {
-                    Shape::Scalar => Arg::Scalar(0.0),
-                    _ => Arg::Row(vec![0.0; n as usize]),
-                })
-                .collect();
-            interp::eval(&probe, &args)
-                .ok()
-                .map(|mut l| l.swap_remove(0))
-        };
-        read.iter()
-            .all(|&v| probe(v).is_some_and(|values| periodic(&values, false)))
+        self.probe(&read, n)
+            .is_some_and(|landed| landed.iter().all(|values| periodic(values, false)))
             && mates.iter().all(|&m| {
                 self.columns(m, n).is_some_and(|c| {
                     periodic(&c.iter().map(|x| *x as f32).collect::<Vec<_>>(), true)
                 })
             })
+    }
+
+    /// Each of `values` at each of `n` columns, landed as an f32 by the
+    /// region's own ops they read, its parameters each given zeros: one
+    /// evaluation for them all. An op none of them reads is a constant
+    /// there, so the probe costs what they read, not the whole region.
+    fn probe(&self, values: &[ValueId], n: u32) -> Option<Vec<Vec<f32>>> {
+        let region = &self.region;
+        let params = region.params.len() as u32;
+        let Some(&last) = values.iter().max() else {
+            return Some(Vec::new());
+        };
+        let mut needed = vec![false; params as usize + region.ops.len()];
+        for &v in values {
+            needed[v as usize] = true;
+        }
+        let mut ops: Vec<Op> = region.ops[..(last - params + 1) as usize].to_vec();
+        for (at, op) in ops.iter_mut().enumerate().rev() {
+            if needed[params as usize + at] {
+                for arg in op.args() {
+                    needed[arg as usize] = true;
+                }
+            } else {
+                *op = Op::Const(crate::region::Literal::F32(0.0));
+            }
+        }
+        let first = params + ops.len() as u32;
+        ops.extend(
+            values
+                .iter()
+                .map(|&v| Op::Cast(v, crate::region::Elem::F32)),
+        );
+        let probe = Region {
+            width: n,
+            params: region.params.clone(),
+            ops,
+            results: (first..).take(values.len()).collect(),
+            rounds: Vec::new(),
+        };
+        let args: Vec<Arg> = region
+            .params
+            .iter()
+            .map(|shape| match shape {
+                Shape::Scalar => Arg::Scalar(0.0),
+                _ => Arg::Row(vec![0.0; n as usize]),
+            })
+            .collect();
+        interp::eval(&probe, &args).ok()
     }
 
     /// Value `v`'s u32 at each of `n` columns, where it is a function of
@@ -662,26 +688,8 @@ impl Pointwise {
                 needed[arg as usize] = true;
             }
         }
-        // The region's own ops up to `v`, landing it as an f32 (a column's
-        // index is exact there): its parameters unread, each given zeros.
-        let mut ops: Vec<Op> = region.ops[..(v - params + 1) as usize].to_vec();
-        ops.push(Op::Cast(v, crate::region::Elem::F32));
-        let probe = Region {
-            width: n,
-            params: region.params.clone(),
-            ops,
-            results: vec![params + (v - params + 1)],
-            rounds: Vec::new(),
-        };
-        let args: Vec<Arg> = region
-            .params
-            .iter()
-            .map(|shape| match shape {
-                Shape::Scalar => Arg::Scalar(0.0),
-                _ => Arg::Row(vec![0.0; n as usize]),
-            })
-            .collect();
-        let landed = interp::eval(&probe, &args).ok()?;
+        // A column's index is exact as an f32.
+        let landed = self.probe(&[v], n)?;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Some(landed[0].iter().map(|x| *x as u32).collect())
     }

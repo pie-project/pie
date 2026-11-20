@@ -35,8 +35,17 @@ fn grid(op: &'static str, words: u32, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of(elementwise_rows(op, words, rows)?, [GROUP, 1, 1]))
 }
 
-/// `bytes` copied from `src` to `dst`, whole words.
-pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
+/// `bytes` copied from word `src_at` of `src` to word `dst_at` of `dst`,
+/// whole words. Both are bound whole, so a copy binds one group a pair of
+/// buffers wherever its run lies; a run past either is refused.
+pub fn copy_words(
+    ctx: &Ctx<'_>,
+    src: Tensor,
+    src_at: u32,
+    dst: Tensor,
+    dst_at: u32,
+    bytes: u64,
+) -> Result<(), Error> {
     const OP: &str = "gather.rs_copy";
     if bytes == 0 {
         return Ok(());
@@ -53,9 +62,27 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
             format!("{bytes} bytes is more than one launch addresses"),
         )
     })?;
+    for (what, t, at) in [("source", src, src_at), ("destination", dst, dst_at)] {
+        let held = u64::from(t.rows) * u64::from(t.width);
+        if u64::from(at) + u64::from(words) > held {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the run's words {at}..{} pass the {held} words of its {what}",
+                    u64::from(at) + u64::from(words)
+                ),
+            ));
+        }
+    }
     ctx.fire(
         Fire::at(ROWS, "gather_rows_copy_words").threads([words, 1, 1], [GROUP, 1, 1]),
-        &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
+        &[
+            src.arg(),
+            dst.arg_mut(),
+            stated(OP, words)?.arg(),
+            src_at.arg(),
+            dst_at.arg(),
+        ],
     )
 }
 
@@ -278,7 +305,13 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
         .ok_or_else(|| refuse(OP, format!("{out} rows of {pitch} words will not launch")))?;
     ctx.fire(
         Fire::at(ROWS, "gather_rows_copy_words").threads([total, 1, 1], [GROUP, 1, 1]),
-        &[x.arg(), y.arg_mut(), stated(OP, total)?.arg()],
+        &[
+            x.arg(),
+            y.arg_mut(),
+            stated(OP, total)?.arg(),
+            0u32.arg(),
+            0u32.arg(),
+        ],
     )
 }
 

@@ -1330,14 +1330,19 @@ impl Roles {
         }
         if state.per_pair > 0 {
             taken.pair = match self.items.get(&Owner::Pair(pair)) {
-                Some(item) if item.tier == Tier::Device => {
+                Some(item) if item.tier == Tier::Device && !item.shed => {
                     Some((pair, item.parts[0].clone(), false, item.generation))
                 }
                 // Parked with its instances: its contents are dead between
                 // fires, so it comes back on its own, fresh room on the
                 // device for this bind; its parked instances are rebound to
                 // it as they unpark.
-                Some(item) if item.tier == Tier::Host => {
+                // Parked where it lies, its dead part given back
+                // ([`Item::shed`]), it comes back the same way: bound to its
+                // emptied part, the bind named no place.
+                Some(item)
+                    if item.tier == Tier::Host || (item.tier == Tier::Device && item.shed) =>
+                {
                     let like = item.parts[0].clone();
                     match self.retake(&like) {
                         Ok(part) => {
@@ -1345,6 +1350,7 @@ impl Roles {
                             let item = self.items.get_mut(&Owner::Pair(pair)).expect("present");
                             item.parts = vec![part.clone()];
                             item.tier = Tier::Device;
+                            item.shed = false;
                             item.generation = generation;
                             Some((pair, part, false, generation))
                         }
@@ -1953,14 +1959,18 @@ impl Roles {
                     instances.insert(id);
                 }
                 // Its holders on the device; a parked one is rebound when it
-                // unparks.
+                // unparks. One parked where it lies (no tier below took its
+                // live parts, its dead ones given back: [`Item::shed`]) is
+                // parked too: rebound now, it named no scratch at all ("a
+                // guest item ... and its binding names []" on another
+                // process's restore of the pair).
                 Owner::Adapter(_) | Owner::Pair(_)
                     if item.stale && self.unparks_with(*owner, item, holder) =>
                 {
                     instances.extend(item.attached.iter().copied().filter(|id| {
                         self.items
                             .get(&Owner::Instance(*id))
-                            .is_some_and(|instance| instance.tier == Tier::Device)
+                            .is_some_and(|instance| instance.tier == Tier::Device && !instance.shed)
                     }));
                 }
                 _ => {}
@@ -1977,6 +1987,12 @@ impl Roles {
             })
             .chain(instances.into_iter().filter_map(|id| {
                 let item = self.items.get(&Owner::Instance(id))?;
+                // A guest part given back (its process parked where it lies,
+                // [`Item::shed`]) lies nowhere: never named to the engine;
+                // its own restore takes it back first, and rebinds it then.
+                if item.shed || item.parts.iter().any(|part| part.dead() && part.refs.is_empty()) {
+                    return None;
+                }
                 // Its pair not on the device yet: rebound once it lands,
                 // never told the pair lies nowhere.
                 if let Some(key) = item.pair

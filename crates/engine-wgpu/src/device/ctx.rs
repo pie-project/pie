@@ -158,10 +158,19 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<Held>>,
+    /// The uniform buffer frames write their dispatches' scalars to, made
+    /// at load, a region of it each frame in flight; and the regions free.
+    pub(crate) uniform_buffer: std::sync::OnceLock<Held>,
+    pub(crate) uniforms: Mutex<Vec<u64>>,
     pub(crate) scratch: Mutex<Vec<Held>>,
+    /// The uniform regions and scratch chunks stocked, free or held.
+    uniform_stock: std::sync::atomic::AtomicUsize,
+    scratch_stock: std::sync::atomic::AtomicUsize,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
+    /// The device's loss, once seen ([`Lost`]): every call after fails by
+    /// name ([`Fault::DeviceLost`]).
+    pub(crate) lost: Lost,
     pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     /// `None` without the subgroup feature.
@@ -180,12 +189,60 @@ pub(crate) struct Core {
     pub(crate) bound: u64,
 }
 
+/// A wgpu device's loss, once seen, and where: its lost callback (a driver
+/// fault, or `Device::destroy`), or a mapping it refused (wgpu refuses a map
+/// of a buffer the load made only once the device is lost: a submission the
+/// driver faulted). Nothing recovers it: once set it stands, and every call
+/// on the device after fails as [`Fault::DeviceLost`], never as the
+/// validation errors a lost device's objects raise.
+#[derive(Clone, Default)]
+pub(crate) struct Lost(Arc<Mutex<Option<(&'static str, String)>>>);
+
+impl Lost {
+    /// The device was lost at `what` for `why`: the first loss seen stands.
+    pub(crate) fn mark(&self, what: &'static str, why: impl ToString) {
+        let mut lost = self.0.lock().expect("lost lock poisoned");
+        if lost.is_none() {
+            let why = why.to_string();
+            tracing::error!(what, %why, "wgpu: the device was lost; every call on it fails from here");
+            *lost = Some((what, why));
+        }
+    }
+
+    /// The loss, by name, where the device was lost.
+    pub(crate) fn fault(&self) -> Option<Fault> {
+        self.0
+            .lock()
+            .expect("lost lock poisoned")
+            .as_ref()
+            .map(|(what, why)| Fault::DeviceLost {
+                what,
+                why: why.clone(),
+            })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.fault().map_or(Ok(()), Err)
+    }
+}
+
 impl Core {
+    /// `what` refused for `why`: a mapping refused marks the device lost,
+    /// and a lost device answers with its loss.
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
-        Fault::Wgpu {
+        if what == "map_async" {
+            self.lost.mark(what, why.to_string());
+        }
+        self.lost.fault().unwrap_or_else(|| Fault::Wgpu {
             what,
             why: why.to_string(),
-        }
+        })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.lost.alive()
     }
 
     pub(crate) fn take_error(&self, what: &'static str) -> Result<()> {
@@ -194,6 +251,9 @@ impl Core {
             .lock()
             .expect("last error lock poisoned")
             .take();
+        // A lost device's objects raise validation errors of their own (a
+        // buffer made on it is invalid): the loss is what names them.
+        self.alive()?;
         match taken {
             Some(why) => Err(Fault::Wgpu { what, why }),
             None => Ok(()),
@@ -241,22 +301,34 @@ impl Core {
         }
     }
 
-    /// Stocks a uniform and a scratch chunk for each of `frames` frames in
-    /// flight, at load: a frame takes at most one of each, and gives it back
-    /// when it is dropped.
+    /// Makes the uniform buffer frames write their dispatches' scalars to,
+    /// with the device: one buffer of a region a frame, so a bind group made
+    /// once binds every frame's scalars at a dynamic offset into its region,
+    /// for the most frames in flight any load of this engine takes
+    /// ([`engine::runahead::Runahead::MAX_FRAMES`]) and the one beside them.
+    pub(crate) fn stock_uniforms(&self) {
+        let frames = u64::from(engine::runahead::Runahead::MAX_FRAMES) + 1;
+        let buffer = self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie uniforms"),
+                size: UNIFORM_CHUNK * frames,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::UNIFORMS,
+        );
+        if self.uniform_buffer.set(buffer).is_ok() {
+            self.uniform_stock.fetch_add(
+                usize::try_from(frames).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
+            self.return_uniforms((0..frames).map(|at| at * UNIFORM_CHUNK).collect());
+        }
+    }
+
+    /// Stocks a scratch chunk for each of `frames` frames in flight, at load:
+    /// a frame takes at most one, and gives it back when it is dropped.
     pub(crate) fn stock_rings(&self, frames: usize) {
-        let uniforms = (0..frames).map(|_| {
-            self.held(
-                &wgpu::BufferDescriptor {
-                    label: Some("pie uniforms"),
-                    size: UNIFORM_CHUNK,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-                engine_gpu::books::owners::UNIFORMS,
-            )
-        });
-        self.return_uniforms(uniforms.collect());
         let scratch = (0..frames).map(|_| {
             self.held(
                 &wgpu::BufferDescriptor {
@@ -270,22 +342,26 @@ impl Core {
                 engine_gpu::books::owners::FRAME_SCRATCH,
             )
         });
+        self.scratch_stock.fetch_add(frames, Ordering::Relaxed);
         self.return_scratch(scratch.collect());
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Result<Held> {
+    /// The uniform buffer's region a frame takes, its first byte.
+    pub(crate) fn uniform_chunk(&self) -> Result<u64> {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
             .pop()
-            .ok_or(Fault::Ceiling {
-                what: "frames in flight holding a uniform chunk (stocked at load)",
-                need: 1,
-                have: 0,
+            .ok_or_else(|| {
+                let stock = self.uniform_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "uniform region",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
             })
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
+    pub(crate) fn return_uniforms(&self, chunks: Vec<u64>) {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
@@ -307,10 +383,12 @@ impl Core {
             .lock()
             .expect("scratch lock poisoned")
             .pop()
-            .ok_or(Fault::Ceiling {
-                what: "frames in flight holding a scratch chunk (stocked at load)",
-                need: 1,
-                have: 0,
+            .ok_or_else(|| {
+                let stock = self.scratch_stock.load(Ordering::Relaxed);
+                Fault::Device {
+                    call: "scratch chunk",
+                    why: format!("none free ({stock} held by frames in flight, stock {stock})"),
+                }
             })
     }
 
@@ -542,6 +620,13 @@ impl Context {
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
+        let lost = Lost::default();
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                lost.mark("device lost callback", format!("{reason:?}: {message}"));
+            });
+        }
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -569,9 +654,13 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
+            uniform_stock: std::sync::atomic::AtomicUsize::new(0),
+            scratch_stock: std::sync::atomic::AtomicUsize::new(0),
             last_error,
+            lost,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
@@ -584,6 +673,9 @@ impl Context {
             Memory::Device,
             engine_gpu::books::owners::DUMMY,
         )?;
+        // Every kernel dispatch reads its scalars from this buffer, the
+        // first at the load's rates pass, so it is made with the device.
+        core.stock_uniforms();
         let context = Context {
             max_buffer,
             core,
@@ -715,6 +807,7 @@ impl Context {
 
     pub fn frame(&self) -> Result<Frame> {
         let core = &self.core;
+        core.alive()?;
         let encoder = core
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -724,7 +817,7 @@ impl Context {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
                 encoder: Mutex::new(Some(encoder)),
-                uniforms: Mutex::new(UniformRing::default()),
+                uniforms: Mutex::new(UniformRegion::default()),
                 scratch: Mutex::new(UniformRing::default()),
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
@@ -733,20 +826,44 @@ impl Context {
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
+            bind_only: false,
         })
     }
+
+    /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
+    pub fn bind_frame(&self) -> Result<Frame> {
+        let mut frame = self.frame()?;
+        frame.bind_only = true;
+        Ok(frame)
+    }
+}
+
+/// The uniform buffer's region a frame holds, the bytes of it taken, and
+/// their image on the host: the frame writes the image through the queue
+/// once before it submits ([`Frame::land_uniforms`]), not a write a dispatch.
+#[derive(Default)]
+pub(crate) struct UniformRegion {
+    region: Option<u64>,
+    used: u64,
+    image: Vec<u8>,
+    /// The image's bytes already written through the queue.
+    written: u64,
 }
 
 #[derive(Default)]
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
     used: u64,
+    /// The end of the most the frame's encoder has staged through its
+    /// chunk: a copy gives its slot back once encoded, and a staging the
+    /// queue writes lies past this, where no command of the frame writes.
+    high: u64,
 }
 
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
     encoder: Mutex<Option<wgpu::CommandEncoder>>,
-    uniforms: Mutex<UniformRing>,
+    uniforms: Mutex<UniformRegion>,
     scratch: Mutex<UniformRing>,
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
@@ -764,12 +881,21 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Gives the frame's uniform region and scratch chunk back to the
+    /// load's stock: once it is submitted, or where it is dropped
+    /// unsubmitted.
+    fn release(&self) {
+        let ring = std::mem::take(&mut *self.uniforms.lock().expect("uniforms lock poisoned"));
+        self.core.return_uniforms(ring.region.into_iter().collect());
+        let scratch = std::mem::take(&mut *self.scratch.lock().expect("scratch lock poisoned"));
+        self.core.return_scratch(scratch.chunks);
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
-        let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
-        self.core.return_uniforms(ring.chunks);
-        let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
-        self.core.return_scratch(scratch.chunks);
+        self.release();
     }
 }
 
@@ -777,6 +903,10 @@ pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
     pub(crate) dispatches: std::cell::Cell<u64>,
+    /// A load's bind walk's ([`engine_gpu::serve::Shell::walk_binds`]): its
+    /// sink builds and keeps each dispatch's bind group, encodes nothing, and
+    /// the frame is never submitted.
+    pub(crate) bind_only: bool,
 }
 
 impl Frame {
@@ -784,17 +914,7 @@ impl Frame {
         self.inner.pass.lock().expect("pass lock poisoned").take();
     }
 
-    pub(crate) fn dispatch(
-        &self,
-        label: &'static str,
-        pipeline: &wgpu::ComputePipeline,
-        group: &wgpu::BindGroup,
-        groups: [u32; 3],
-    ) -> Result<()> {
-        self.dispatch_at(label, pipeline, group, &[], groups)
-    }
-
-    /// [`Frame::dispatch`] with `group`'s dynamic offsets.
+    /// Dispatches `pipeline` over `group`, read at its dynamic `offsets`.
     pub(crate) fn dispatch_at(
         &self,
         label: &'static str,
@@ -841,25 +961,70 @@ impl Frame {
         Ok(f(encoder))
     }
 
+    /// `bytes` of this frame's region of the uniform buffer: the buffer and
+    /// the slot's first byte in it.
     pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
+        let buffer = core.uniform_buffer.get().ok_or(Fault::Device {
+            call: "uniform region",
+            why: "the device made no uniform buffer".into(),
+        })?;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = match ring.region {
+            Some(region) => region,
+            None => {
+                let region = core.uniform_chunk()?;
+                ring.region = Some(region);
+                ring.used = 0;
+                ring.image.clear();
+                ring.written = 0;
+                region
+            }
+        };
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() {
-            ring.chunks.push(core.uniform_chunk()?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
-        }
         if at + bytes > UNIFORM_CHUNK {
             return Err(Fault::Ceiling {
-                what: "bytes of uniforms one frame writes (its chunk)",
+                what: "bytes of uniforms one frame writes (its region)",
                 need: at + bytes,
                 have: UNIFORM_CHUNK,
             });
         }
         ring.used = at + bytes;
-        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
+        Ok(((**buffer).clone(), region + at))
+    }
+
+    /// Puts `bytes` at byte `at` of the uniform buffer (a slot
+    /// [`Frame::uniform_slot`] gave), in the frame's image of its region.
+    pub(crate) fn write_uniform(&self, at: u64, bytes: &[u8]) -> Result<()> {
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let region = ring.region.ok_or(Fault::Device {
+            call: "write_uniform",
+            why: "a uniform written before its frame took a region".into(),
+        })?;
+        let from = usize::try_from(at - region).unwrap_or(usize::MAX);
+        let to = from + bytes.len();
+        if ring.image.len() < to {
+            ring.image.resize(to, 0);
+        }
+        ring.image[from..to].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Writes what the frame's image holds past what it wrote, in one write
+    /// through the queue, which lands it before the submission that follows.
+    fn land_uniforms(&self) {
+        let core = &self.inner.core;
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let (Some(region), Some(buffer)) = (ring.region, core.uniform_buffer.get()) else {
+            return;
+        };
+        let from = usize::try_from(ring.written).unwrap_or(usize::MAX);
+        if from < ring.image.len() {
+            core.queue
+                .write_buffer(buffer, region + ring.written, &ring.image[from..]);
+            ring.written = ring.image.len() as u64;
+        }
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -886,16 +1051,46 @@ impl Frame {
         Some((set, 2 * at))
     }
 
+    /// The bytes one slot of this frame's scratch can still hold: its
+    /// chunk's room past what it took, or a whole chunk before it takes one.
+    fn scratch_room(&self) -> u64 {
+        let core = &self.inner.core;
+        let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
+        let ring = self.inner.scratch.lock().expect("scratch lock poisoned");
+        match ring.chunks.last() {
+            None => core.pooled_scratch(),
+            Some(chunk) => chunk
+                .size()
+                .saturating_sub(ring.used.next_multiple_of(align)),
+        }
+    }
+
+    /// `bytes` of this frame's scratch the frame's encoder writes: the
+    /// chunk and the slot's first byte in it.
     pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, false)
+    }
+
+    /// `bytes` of this frame's scratch the queue writes, which lands before
+    /// any command of the frame runs: past every slot the encoder has
+    /// written, so no command of the frame writes over it.
+    pub(crate) fn scratch_slot_queued(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, true)
+    }
+
+    fn scratch_take(&self, bytes: u64, queued: bool) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
-        let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
+        let from = if queued {
+            ring.used.max(ring.high)
+        } else {
+            ring.used
+        };
+        let at = from.next_multiple_of(align);
         let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
         if at + bytes > room {
             return Err(Fault::Ceiling {
@@ -905,6 +1100,7 @@ impl Frame {
             });
         }
         ring.used = at + bytes;
+        ring.high = ring.high.max(ring.used);
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
@@ -937,16 +1133,45 @@ impl Frame {
         }
         crate::encode::record_copy();
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
+        if from != to {
+            return self.encode(|encoder| {
+                encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len))
+            });
+        }
         // wgpu refuses a copy whose ends are one buffer: it goes through
-        // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
-        self.encode(|encoder| match &stage {
-            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
-            Some((scratch, at)) => {
-                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
-                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+        // scratch a piece at a time, every piece through one slot (a frame's
+        // encoder runs its copies in order), so a copy of any length stages
+        // in what room the frame's chunk has. Where the destination lies past
+        // an overlapping source the pieces go from the end, so each reads its
+        // source as it was.
+        // The slot is given back once the copy is encoded: a later slot the
+        // encoder writes runs after the copy's pieces, and one the queue
+        // writes lies past it (`scratch_slot_queued`).
+        let piece = len.min(self.scratch_room() & !3).max(4);
+        let given = self
+            .inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used;
+        let (scratch, at) = self.scratch_slot(piece)?;
+        let mut starts: Vec<u64> = (0..len).step_by(piece as usize).collect();
+        if into_at > source_at && into_at < source_at + len {
+            starts.reverse();
+        }
+        self.encode(|encoder| {
+            for start in starts {
+                let bytes = piece.min(len - start);
+                encoder.copy_buffer_to_buffer(from, source_at + start, &scratch, at, Some(bytes));
+                encoder.copy_buffer_to_buffer(&scratch, at, to, into_at + start, Some(bytes));
             }
-        })
+        })?;
+        self.inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used = given;
+        Ok(())
     }
 
     pub fn fill_zero(&mut self, into: &super::Buffer, at: u64, len: u64) -> Result<()> {
@@ -973,9 +1198,43 @@ impl Frame {
         self.flush()
     }
 
+    /// [`engine_gpu::backend::Frame::submit_segment`]: the frame's encoder
+    /// submitted unawaited and a new one opened. WebGPU's queue orders the
+    /// next submission after it, and the frame's uniform region and scratch
+    /// chunk stay the frame's (given back at its commit).
+    pub fn submit_segment(&self) -> Result<()> {
+        self.close_pass();
+        self.land_uniforms();
+        let core = &self.inner.core;
+        core.alive()?;
+        let taken = self
+            .inner
+            .encoder
+            .lock()
+            .expect("encoder lock poisoned")
+            .take();
+        let Some(encoder) = taken else {
+            return Err(Fault::Device {
+                call: "submit_segment",
+                why: "this frame was already submitted".to_string(),
+            });
+        };
+        core.queue.submit(std::iter::once(encoder.finish()));
+        core.kick();
+        *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
+            core.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pie frame"),
+                }),
+        );
+        core.take_error("submit_segment")
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1004,7 +1263,9 @@ impl Frame {
         }
         self.open = false;
         self.close_pass();
+        self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1054,6 +1315,20 @@ impl Frame {
         crate::encode::record_read_phase(0, started.ns());
         let index = core.queue.submit(std::iter::once(finished));
         crate::encode::record_submit(started.ns(), 0);
+        // What the frame staged through goes back to the load's stock now,
+        // submitted, not when its work completes: the queue runs what any
+        // frame writes or dispatches after this one's (WebGPU's queue
+        // timeline), so the next frame to take them cannot reach them before
+        // this one's work is done with them. That holds for these two only
+        // because they are device-only: a scratch chunk (STORAGE and copies)
+        // and a uniform region (UNIFORM, written through the queue), neither
+        // mappable, so the host never reads one back. What the host maps or
+        // reads (the readout mirrors, the guest readback buffers, the read
+        // stagings) stays held until its work is done. The stock then covers
+        // the frames a step encodes at once, however many it has in flight:
+        // a step's copies (a same-buffer copy stages through scratch) and
+        // its walk, each submitted before the next is opened.
+        self.inner.release();
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {
             inner.done.store(true, Ordering::Release);
@@ -1143,6 +1418,61 @@ mod tests {
     use super::*;
     use crate::device::Buffer;
 
+    fn lost_by_name(fault: Fault) {
+        assert!(
+            matches!(fault, Fault::DeviceLost { .. }),
+            "refused as {fault}, not as DeviceLost"
+        );
+        assert!(fault.to_string().starts_with("DeviceLost: "), "{fault}");
+    }
+
+    /// The loss's state: none until marked; the first loss marked stands,
+    /// and every fault after names it.
+    #[test]
+    fn a_loss_once_marked_stands_and_names_every_fault_after() {
+        let lost = Lost::default();
+        assert!(lost.alive().is_ok());
+        lost.mark("map_async", "Validation");
+        lost.mark("device lost callback", "a later loss");
+        match lost.fault().expect("lost") {
+            Fault::DeviceLost { what, why } => {
+                assert_eq!(what, "map_async");
+                assert_eq!(why, "Validation");
+            }
+            other => panic!("{other}"),
+        }
+        lost_by_name(lost.alive().unwrap_err());
+    }
+
+    /// A device lost (here by `Device::destroy`, as a driver fault loses
+    /// it) fails every later call by name: a buffer, a frame, a write, a
+    /// read, a submit, never wgpu's "Buffer with '' label is invalid".
+    #[test]
+    fn a_lost_device_fails_every_later_call_as_device_lost() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
+        let owner = engine_gpu::books::owners::TEST;
+        let mut buffer = Buffer::zeroed(&device, 64, owner).unwrap();
+        // A frame opened before the loss and submitted after it.
+        let mut before = device.frame().unwrap();
+        before.copy(&buffer, 0, &buffer, 32, 16).unwrap();
+        device.core.device.destroy();
+        // The lost callback runs as the device is polled.
+        let _ = device.core.device.poll(wgpu::PollType::wait_indefinitely());
+        lost_by_name(before.commit().err().expect("refused"));
+        lost_by_name(Buffer::zeroed(&device, 64, owner).err().expect("refused"));
+        lost_by_name(device.frame().err().expect("refused"));
+        lost_by_name(buffer.write(0, &[1, 2, 3, 4]).err().expect("refused"));
+        let mut got = [0u8; 4];
+        lost_by_name(buffer.read(0, &mut got).err().expect("refused"));
+    }
+
     #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
         if !present() {
@@ -1165,6 +1495,58 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// A copy within one buffer longer than the whole scratch chunk lands,
+    /// in pieces through what room the frame's chunk has (some taken first
+    /// by a smaller staged copy), its overlapping ends read as they were
+    /// whichever side the destination lies on.
+    #[test]
+    fn a_copy_within_one_buffer_past_its_scratch_chunk_lands_in_pieces() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
+        let pooled = device.core().pooled_scratch();
+        let len = (pooled + pooled / 2) & !3;
+        let size = 3 * pooled + 8192;
+        let words: Vec<u8> = (0..size / 4)
+            .flat_map(|w| (w as u32).wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        // (source, destination): past an overlapping source, before one,
+        // and apart from it.
+        for (from, into) in [(0, 4096), (4096, 0), (0, len + 4096)] {
+            let mut buffer =
+                Buffer::zeroed(&device, size, engine_gpu::books::owners::TEST).unwrap();
+            buffer.write(0, &words).unwrap();
+            let mut frame = device.frame().unwrap();
+            frame
+                .copy(&buffer, size - 64, &buffer, size - 32, 16)
+                .unwrap();
+            frame.copy(&buffer, from, &buffer, into, len).unwrap();
+            // The copy gave its slot back: a view staged after it in the frame
+            // still finds the chunk's room.
+            frame.scratch_slot(pooled - 4096).unwrap();
+            frame.commit().unwrap();
+            let mut want = words.clone();
+            want.copy_within(
+                (size - 64) as usize..(size - 48) as usize,
+                (size - 32) as usize,
+            );
+            want.copy_within(from as usize..(from + len) as usize, into as usize);
+            let mut got = vec![0u8; size as usize];
+            buffer.read(0, &mut got).unwrap();
+            assert!(
+                got == want,
+                "a copy of {len} bytes from {from} to {into} (scratch chunk {pooled}) did not land \
+                 as one copy of the bytes as they were"
+            );
+        }
+        device.core.take_error("the copies").unwrap();
     }
 
     /// No buffer is made past the device's bound on one reservation: a

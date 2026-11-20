@@ -42,7 +42,12 @@ unsafe impl Sync for Raw {}
 pub(crate) type Slab = Arc<Raw>;
 
 impl Raw {
-    fn memory_type(core: &Core, need: &vk::MemoryRequirements, kind: Memory) -> Option<u32> {
+    fn memory_type(
+        core: &Core,
+        need: &vk::MemoryRequirements,
+        kind: Memory,
+        owner: Owner,
+    ) -> Option<u32> {
         let types = &core.memory.memory_types[..core.memory.memory_type_count as usize];
         let prefers = |flags: vk::MemoryPropertyFlags| {
             (0..core.memory.memory_type_count).find(|&i| {
@@ -53,6 +58,13 @@ impl Raw {
         use vk::MemoryPropertyFlags as F;
         match kind {
             Memory::Device => prefers(F::DEVICE_LOCAL).or_else(|| prefers(F::empty())),
+            // The fire block: the host writes it each fire and every dispatch
+            // reads it, so it lies on the device where the host can map it.
+            Memory::Host if owner == engine_gpu::books::owners::UNIFORMS => {
+                prefers(F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT)
+                    .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
+                    .or_else(|| prefers(F::HOST_VISIBLE))
+            }
             Memory::Host | Memory::Staging | Memory::Readback => {
                 prefers(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED)
                     .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
@@ -68,10 +80,14 @@ impl Raw {
         // The pool's segments hold guest configs a stage binds as a uniform,
         // and a guest stage's own buffers its steps' uniforms
         // (`guest::session`), beside everything bound as storage.
+        // The fire block holds each dispatch's scalars, bound as a uniform,
+        // and its group counts, read by an indirect dispatch.
         let uniform = if owner == engine_gpu::books::owners::POOL
             || owner == engine_gpu::books::owners::GUEST
         {
             vk::BufferUsageFlags::UNIFORM_BUFFER
+        } else if owner == engine_gpu::books::owners::UNIFORMS {
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER
         } else {
             vk::BufferUsageFlags::empty()
         };
@@ -90,7 +106,7 @@ impl Raw {
             unsafe { d.create_buffer(&info, None) }.map_err(|e| core.fault("vkCreateBuffer", e))?;
         // SAFETY: `buffer` was just created on `d`.
         let need = unsafe { d.get_buffer_memory_requirements(buffer) };
-        let Some(index) = Self::memory_type(core, &need, kind) else {
+        let Some(index) = Self::memory_type(core, &need, kind, owner) else {
             // SAFETY: `buffer` is ours, unbound and unused by any command.
             unsafe { d.destroy_buffer(buffer, None) };
             return Err(Fault::NoDevice {
@@ -348,7 +364,11 @@ impl Buffer {
     }
 
     pub fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
-        let slab = Raw::new(device.core(), bytes, kind, owner)?;
+        Buffer::on(device.core(), bytes, kind, owner)
+    }
+
+    pub(crate) fn on(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        let slab = Raw::new(core, bytes, kind, owner)?;
         let buffer = Buffer { slab, bytes };
         buffer.slab.zero(0, buffer.slab.size)?;
         Ok(buffer)

@@ -18,14 +18,33 @@ pub const WORKGROUP: u32 = 256;
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
 pub const SELECT_WORDS: u32 = 10320;
 
-/// What WGSL's kernels take of a lane's temporary area past the
-/// whole-value rule (`eta_exec::stage_temporaries`): nothing, by statement.
-/// Its sorts, reduction levels and pivots run over the whole value in
-/// place, in at most four words an element of it (`sort_cell`, `tmp_v`,
-/// `pivot_*` in the runtime: two buffers of two words), the rule's figure,
-/// and its one-row select keeps its state in the [`SELECT_WORDS`] reserved
-/// below the area, not in it.
-pub const TEMPORARY_NEEDS: &[crate::codegen::temporary::TemporaryNeed] = &[];
+/// The bytes the runtime keeps in a lane's temporary area while it runs a
+/// node of `tag` whose first argument holds `len` elements in `rows` rows,
+/// as its cells lay them: a sort, a top-k or a pivot two buffers of two
+/// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
+/// lie within them), a reduction two buffers of two words a 32-element
+/// group of each row (`tmp_v`), any other node none. Saturates past a
+/// `u64`, which no scratch holds.
+#[must_use]
+pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
+    if is_sort(tag) {
+        len.saturating_mul(16)
+    } else if is_reduce(tag) {
+        let rows = if rows == 0 { 1 } else { rows };
+        rows.saturating_mul((len / rows).div_ceil(32))
+            .saturating_mul(16)
+    } else {
+        0
+    }
+}
+
+/// Whether a node of `tag` runs the one-row select, which keeps its state
+/// in the [`SELECT_WORDS`] just below the temporary area (`sel_at`): a
+/// pivot's select ladder.
+#[must_use]
+pub const fn selects(tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD
+}
 
 const BARRIER: &str = "  storageBarrier();\n";
 
@@ -345,11 +364,14 @@ pub struct Step {
 impl Step {
     /// What the step's uniform holds.
     #[must_use]
-    pub fn uniform(&self) -> StepUniform {
+    /// The step's uniform, its node's temporary area at word `area` of the
+    /// stage's heap as the bind lays it.
+    pub fn uniform(&self, area: u32) -> StepUniform {
         StepUniform {
             node: self.node,
             rung: self.rung,
             selector: self.selector,
+            area,
         }
     }
 }
@@ -369,10 +391,19 @@ pub struct Stepwise {
 /// stage's cfg (the heap's words, its values, its ops), indices read from
 /// the heap by their own bounds, and a refused access writes the runtimes'
 /// fault status (state 3, `OUT_OF_BOUNDS`, the index, the limit).
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 3;
+/// 4: a step reads its tables, status and heap at the bases its record
+/// states, in the two pool segments a backend binds whole (the instance's
+/// slots, its heap), and its config from its config table: one bind group
+/// serves every instance whose slots and heap share two segments.
+/// 5: a node keeps its temporaries in an area of its own, at the heap word
+/// its step's record carries (`pie_step.area`), in place of the stage's one
+/// area its config table named.
+/// 6: a reshape that covers its source is read as its source whatever the
+/// stage's channel slots number, and launches nothing.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
 
-/// The binding of the uniform a step module reads its node, rung and
-/// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
+/// The binding of the record a step module reads its node, rung, selector
+/// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
 /// backend binds each step's at its own dynamic offset.
 pub const STEP_BINDING: u32 = 6;
 
@@ -485,9 +516,11 @@ pub fn step_module(entry: &str, call: &str) -> String {
     let mut source = String::with_capacity(RUNTIME.len() + 1024);
     source.push_str(RUNTIME);
     source.push('\n');
-    // The words at `steps::NODE_AT`, `RUNG_AT` and `SELECTOR_AT`.
+    // The words [`StepUniform::bytes`] lays.
     source.push_str(
-        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n}\n",
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n  \
+         status_base : u32,\n  descs_base : u32,\n  params_base : u32,\n  offs_base : u32,\n  \
+         cfg_base : u32,\n  heap_base : u32,\n  pad1 : u32,\n  pad2 : u32,\n}\n",
     );
     let _ = writeln!(
         source,
@@ -523,8 +556,16 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
-    // The stage's heap bound, read once ([`RUNTIME`]'s `hld` / `hst`).
-    source.push_str("  lim_heap = cfg.heap_words;\n");
+    // The step's bases, its heap bound ([`RUNTIME`]'s `hld` / `hst`) and
+    // its node's temporary area's first word, read once: the area from the
+    // record, as uniform as the node, with no table load ahead of it.
+    source.push_str(
+        "  b_status = pie_step.status_base;\n  b_descs = pie_step.descs_base;\n  \
+         b_params = pie_step.params_base;\n  b_offs = pie_step.offs_base;\n  \
+         b_heap = pie_step.heap_base;\n  \
+         lim_heap = tables[pie_step.cfg_base + CFG_HEAP_WORDS];\n  \
+         tmp_base = pie_step.area;\n",
+    );
     source.push_str(call);
     source.push_str("  heap_flush();\n}\n");
 }
@@ -1016,25 +1057,39 @@ mod stepwise_tests {
         );
     }
 
-    /// The runtime's temporaries are what [`TEMPORARY_NEEDS`] states of
-    /// them: two buffers of two words an element of the value a step runs
-    /// over (four words, the whole-value rule's figure), and the select's
-    /// state below the area.
+    /// The runtime's temporaries are what [`super::temporary_bytes`] states
+    /// of them: a sort's, top-k's or pivot's two buffers of two words an
+    /// element of the value it runs over, a reduction's two buffers of two
+    /// words a 32-element group of a row, and a pivot's select state below
+    /// the area ([`super::selects`]).
     #[test]
-    fn the_runtimes_temporaries_lie_within_the_whole_value_rule() {
-        assert!(super::TEMPORARY_NEEDS.is_empty());
+    fn the_runtimes_temporaries_lie_within_what_each_node_states() {
+        use super::{selects, temporary_bytes};
+        for tag in [tags::SORT_DESC, tags::TOP_K, tags::PIVOT_THRESHOLD] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
+        }
+        for tag in [tags::REDUCE_SUM, tags::REDUCE_MAX, tags::REDUCE_MIN, tags::REDUCE_ARGMAX] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
+        }
+        assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
+        assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
+        assert!(selects(tags::PIVOT_THRESHOLD));
+        assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
-            "return cfg.temporary + ((buf * n) + c) * 2u;",
-            "return cfg.temporary + (buf * span + row * stride + c) * 2u;",
-            "fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }",
-            "fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }",
-            "fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }",
-            "fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }",
-            "fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }",
+            "return tmp_base + ((buf * n) + c) * 2u;",
+            "return tmp_base + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
         ] {
             assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
         }
-        let named = RUNTIME.matches("cfg.temporary").count();
+        let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
         assert_eq!(named, 7, "a temporary cell this statement has not read");
         assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
     }

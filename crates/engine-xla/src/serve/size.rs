@@ -122,9 +122,13 @@ impl Shell {
         // The most rows a fire reads out, the store's (`readout_store_rows`),
         // shared over the lanes: each reads out its last rows up to its
         // share, so the widest fire reads out what a served one can and no
-        // more (it once read every row, past the ring).
-        let store = self.readout_store_rows().unwrap_or(u32::MAX);
-        let share = (store / lanes.max(1)).max(1);
+        // more (it once read every row, past the ring). A load with no store
+        // reads a lane's last row (a lane reading more is refused by name,
+        // `serve::readout_program`).
+        let share = match self.readout_store_rows() {
+            Some(store) => (store / lanes.max(1)).max(1),
+            None => 1,
+        };
         // Every lane at the page bound: its slot's every page, its rows
         // last.
         let owned: Vec<(Vec<u32>, Vec<u32>, crate::store::Scratch, Option<Masking>)> = rows

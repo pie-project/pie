@@ -35,7 +35,7 @@ struct Params {
     float limit;
 #endif
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float unit(float g, float u) {
 #if defined(PIE_SITU)
@@ -84,7 +84,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 struct Params {
     uint n;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> gate;
 [[vk::binding(1)]] StructuredBuffer<uint> up;
@@ -102,7 +102,7 @@ struct Params {
 #endif
     uint n;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 #endif
 
 float2 unit(float2 g, float2 u) {
@@ -132,10 +132,10 @@ float2 unit(float2 g, float2 u) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = 2u * gid.x;
-    if (i >= params.n) {
+    if (i >= PIE_FIRE(n)) {
         return;
     }
-    bool both = i + 1u < params.n;
+    bool both = i + 1u < PIE_FIRE(n);
 #if defined(PIE_GELU)
     float2 g = pair_at(x, i, both);
     float2 u = float2(0.0, 0.0);

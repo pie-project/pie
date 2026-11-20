@@ -274,24 +274,24 @@ pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout
 
 /// The groups the engine reads a tapped page's planes out in, as spans of a
 /// host slot; `None` where it taps nothing. Once asked, known.
-pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> {
+pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapGroups>> {
     type Known = Option<Option<::engine::TapGroups>>;
     static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = GROUPS.lock().unwrap().get(engine_id) {
-        return known.clone();
+        return Ok(known.clone());
     }
-    let bytes = scheduler_handle(engine_id)
-        .ok()?
+    let bytes = scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::TapGroups)
         .await
-        .ok()?;
-    let groups: Option<::engine::TapGroups> = serde_json::from_slice(&bytes).ok().flatten();
+        .map_err(|error| anyhow!("engine {engine_id}'s tap groups: {error}"))?;
+    let groups: Option<::engine::TapGroups> = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow!("engine {engine_id}'s tap groups did not parse: {error}"))?;
     let mut known = GROUPS.lock().unwrap();
     if known.len() <= engine_id {
         known.resize(engine_id + 1, None);
     }
     known[engine_id] = Some(groups.clone());
-    groups
+    Ok(groups)
 }
 
 pub fn configured_submit_deadline() -> Duration {

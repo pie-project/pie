@@ -26,6 +26,18 @@ pub struct Cursor {
     /// that only rises, since a lane that rewinds leaves the rows it wrote
     /// further on in its buffer, where a mask may still admit them.
     pub written: u32,
+    /// One past the slots the set holds written without a gap, by its own
+    /// fires or in the prefix it shares: what a fire staged now may read
+    /// ([`engine::KvDelta::readable`]). A page holds what its last owner
+    /// left until the set writes it, so unlike [`Self::written`] it never
+    /// counts what the set only reserved. Rows the host places count from
+    /// their fire's submission (and stop counting if it fails); rows the
+    /// device places, from where their fire reported they ended.
+    pub readable: u32,
+    /// A fire whose rows the device placed settled with no end told: what
+    /// it wrote is known to its engine alone, which from then on holds the
+    /// set's lanes to what the set wrote ([`engine::extent`]).
+    pub untold: bool,
     /// The fires staged on the set whose rows land where the device says,
     /// and which have not settled: where they land is not known until they
     /// do. A fork shares them, as it does the rows they write.
@@ -64,6 +76,11 @@ impl Cursor {
     pub fn stage(&mut self, fire: Arc<StagedRows>) {
         let (written, _) = self.standing();
         self.written = written;
+        self.readable = self.readable();
+        self.untold |= self
+            .staged
+            .iter()
+            .any(|fire| matches!(fire.settled.get(), Some(None)));
         self.staged.retain(|fire| fire.settled.get().is_none());
         self.staged.push(fire);
     }
@@ -80,6 +97,38 @@ impl Cursor {
             }
         }
         (written, staged)
+    }
+
+    /// The written end a fire staged now may read: [`Self::readable`] as
+    /// far as the device-placed fires that settled reported it. A fire that
+    /// reported no end moves it nowhere.
+    pub fn readable(&self) -> u32 {
+        self.staged
+            .iter()
+            .filter_map(|fire| fire.settled.get().copied().flatten())
+            .fold(self.readable, u32::max)
+    }
+
+    /// Whether the host knows the set's written end: no device-placed fire
+    /// is still to settle on it, and every one that settled told its end.
+    pub fn readable_known(&self) -> bool {
+        !self.untold
+            && self
+                .staged
+                .iter()
+                .all(|fire| fire.settled.get().is_some_and(Option::is_some))
+    }
+
+    /// The host placed rows ending at `end` on the set, in a fire just
+    /// submitted.
+    pub fn wrote(&mut self, end: u32) {
+        self.readable = self.readable.max(end);
+    }
+
+    /// A fire that wrote from `start` failed: its rows may never have
+    /// landed, so nothing from there on counts as written.
+    pub fn unwrote(&mut self, start: u32) {
+        self.readable = self.readable.min(start);
     }
 
     /// No more than this many rows stand unfolded in the set's buffer when
@@ -123,6 +172,8 @@ impl Default for Cursor {
             tail: Some(0),
             reserved: 0,
             written: 0,
+            readable: 0,
+            untold: false,
             staged: Vec::new(),
             spans: Vec::new(),
         }
@@ -386,6 +437,37 @@ mod tests {
     fn lag_every_case() {
         a_row_lags_the_spans_ending_before_it();
         a_write_drops_the_spans_from_where_it_starts();
+    }
+
+    /// What a set holds written, as a fire staged now may read it: never
+    /// what it only reserved, nor what a failed fire may not have landed.
+    #[test]
+    fn readable_every_case() {
+        let mut set = Cursor {
+            reserved: 64,
+            ..Cursor::default()
+        };
+        set.wrote(10);
+        assert_eq!((set.readable(), set.readable_known()), (10, true));
+        // A device-placed fire in flight: the host knows nothing past 10.
+        let told = StagedRows::new(2);
+        set.stage(told.clone());
+        assert!(!set.readable_known());
+        told.settle(Some(12));
+        assert_eq!((set.readable(), set.readable_known()), (12, true));
+        // One that told no end: its engine alone knows, and the set's lanes
+        // are its engine's to hold from then on.
+        let untold = StagedRows::new(2);
+        set.stage(untold.clone());
+        untold.settle(None);
+        assert_eq!(set.readable(), 12, "nothing it only reserved");
+        assert!(!set.readable_known());
+        set.stage(StagedRows::new(1));
+        assert!(set.untold && !set.readable_known(), "kept past the fire");
+        // A failed host fire's rows count no more.
+        set.wrote(20);
+        set.unwrote(14);
+        assert_eq!(set.readable(), 14);
     }
 
     fn a_row_lags_the_spans_ending_before_it() {

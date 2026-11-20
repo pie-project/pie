@@ -81,6 +81,12 @@ pub trait Backend:
         Self::with_frame(Frame::flush).unwrap_or(Ok(()))
     }
 
+    /// Submits what this thread's recording frame holds as a split step's
+    /// segment, unawaited ([`Frame::submit_segment`]), if one is recording.
+    fn submit_recording() -> Result<()> {
+        Self::with_frame(Frame::submit_segment).unwrap_or(Ok(()))
+    }
+
     /// Lays `len` bytes at `at` of `staging` by `fill`, handed the address
     /// of the first, before work the frame records next reads them.
     fn stage_rows(
@@ -170,6 +176,21 @@ pub trait Frame<B: Backend>: 'static {
         Ok(())
     }
 
+    /// [`Frame::copy_regions`] for the rows a fire reads out, which move
+    /// by the fire's lanes: at most `most` regions for any fire of the
+    /// frame's shape. A backend whose recordings keep what a fire changes
+    /// apart from their commands moves them so.
+    fn copy_rows(
+        &mut self,
+        source: &B::Buffer,
+        into: &B::Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        let _ = most;
+        self.copy_regions(source, into, regions)
+    }
+
     fn fill_zero(&mut self, into: &B::Buffer, at: u64, len: u64) -> Result<()>;
 
     /// Writes `bytes` at `at` of `into` in the frame's order: no work in
@@ -185,6 +206,16 @@ pub trait Frame<B: Backend>: 'static {
 
     /// Submits what the frame holds so far; it records on.
     fn flush(&self) -> Result<()>;
+
+    /// Submits what the frame holds so far without waiting for it to land;
+    /// it records on, queued behind it: a split step's segment (a layer),
+    /// which the platform's bound wants short, not waited on. The work
+    /// recorded next is ordered after it by the queue; the host writes
+    /// nothing it reads in between (no staging between a split step's
+    /// layers rides on it). Where the backend cannot, [`Frame::flush`].
+    fn submit_segment(&self) -> Result<()> {
+        self.flush()
+    }
 
     /// [`Frame::flush`], then every frame submitted before has landed too:
     /// the host may rewrite memory any of them reads.
@@ -225,7 +256,9 @@ pub trait Tactics: std::fmt::Debug {
 
     fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
 
-    /// The dense matmul tactic for a fire of `rows` activation rows.
+    /// The tiled dense matmul tactic at `rows` activation rows; whether a
+    /// rung takes the vector kernels instead is the load's choice
+    /// ([`crate::dense`]).
     fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
 
     /// Every dense matmul tactic some fire of 1 to `capacity` rows takes:

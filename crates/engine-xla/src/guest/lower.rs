@@ -948,6 +948,43 @@ impl Lower<'_> {
         Ok((sorted[2], sorted[1]))
     }
 
+    /// The first `k` of `x` (`[B, R, n]` f32) in [`Self::sort_desc`]'s order
+    /// and their source indices (i32), as `[B, R, k]`: `chlo.top_k` over the
+    /// order keys (equal keys in index order), the values gathered from `x`
+    /// (v6e, the beam inferlet's top-4 of 4 x 151936 log-probs as one row:
+    /// the whole row's stable sort, sliced after, 5.9 ms a step; this 0.2
+    /// ms).
+    fn top_desc(&mut self, x: Val, k: i64) -> Lowering<(Val, Val)> {
+        let dims = self.f.dims(x).to_vec();
+        let flat = flat_rows(&dims);
+        let (rows, n) = (flat[0], flat[1]);
+        let key = self.order_key(x)?;
+        let key = self.f.reshape(key, &flat)?;
+        let (_, index) = self.f.top_k(key, k)?;
+        // `x[r, index[r, j]]`, through the flat row-major plane
+        let plane = self.f.reshape(x, &[rows * n])?;
+        let base = self.f.iota(Elem::I32, &[rows, k], 0);
+        let stride = self.f.const_i(Elem::I32, n, &[rows, k]);
+        let base = self.f.mul(base, stride)?;
+        let at = self.f.add(base, index)?;
+        let at = self.f.reshape(at, &[rows, k, 1])?;
+        let values = self.f.gather(
+            plane,
+            at,
+            &kernels_xla::hlo::GatherDims {
+                offset_dims: vec![],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 2,
+                ..kernels_xla::hlo::GatherDims::default()
+            },
+            &[1],
+        )?;
+        let mut out = dims;
+        *out.last_mut().expect("a last axis") = k;
+        Ok((self.f.reshape(values, &out)?, self.f.reshape(index, &out)?))
+    }
+
     /// The order keys of `x` sorted descending (stably) along the last
     /// axis, with their source indices when `indexed`.
     fn sort_keys(&mut self, key: Val, indexed: bool) -> Lowering<(Val, Option<Val>)> {
@@ -1443,14 +1480,11 @@ impl Lower<'_> {
                 if k < 1 || k > n {
                     return refuse(format!("top-{k} of {n}"));
                 }
-                let (values, index) = self.sort_desc(grid)?;
-                let d = self.f.dims(values).to_vec();
-                let values = self
-                    .f
-                    .slice(values, &[0, 0, 0], &[d[0], d[1], k], &[1, 1, 1])?;
-                let index = self
-                    .f
-                    .slice(index, &[0, 0, 0], &[d[0], d[1], k], &[1, 1, 1])?;
+                let (values, index) = if k < n {
+                    self.top_desc(grid, k)?
+                } else {
+                    self.sort_desc(grid)?
+                };
                 let index = self.f.bitcast(index, Elem::U32)?;
                 let values = self.reshaped(values, &shape)?;
                 let second = self.shape(result + 1);
@@ -2079,4 +2113,11 @@ fn fmod(f: &mut Func, x: Val, y: Val) -> kernels_xla::hlo::Built<Val> {
     let res = f.select(pass, x, res)?;
     let nan = f.const_f(Elem::F32, f64::NAN, &dims);
     f.select(bad, nan, res)
+}
+
+/// `dims` as `[rows, n]`: every axis but the last folded into the rows
+/// (`chlo.top_k`'s operand).
+fn flat_rows(dims: &[i64]) -> Vec<i64> {
+    let (&n, lead) = dims.split_last().expect("a sorted value has an axis");
+    vec![lead.iter().product(), n]
 }

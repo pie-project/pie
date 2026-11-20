@@ -21,6 +21,8 @@ pub struct Pipeline {
 
     pub writable: Vec<bool>,
     pub push_bytes: u32,
+    /// The scalars the kernel reads from the fire block.
+    pub fire: Option<spirv::Fire>,
     pub local: [u32; 3],
 }
 
@@ -63,6 +65,23 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.order.borrow().len() as u64
+    }
+
+    /// The most bytes of scalars any built kernel takes.
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        self.built
+            .borrow()
+            .values()
+            .map(|pipeline| {
+                pipeline
+                    .fire
+                    .as_ref()
+                    .map_or(0, |fire| fire.bytes)
+                    .max(pipeline.push_bytes)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The kernels whose pipelines were built after the first `from`, in
@@ -120,10 +139,12 @@ impl Pipelines {
             .core()
             .limits
             .max_per_stage_descriptor_storage_buffers;
-        if declared.bindings > limit {
+        // The scalars' uniform is not a storage buffer.
+        let storage = declared.bindings - u32::from(declared.fire.is_some());
+        if storage > limit {
             return Err(Fault::StageBuffers {
                 kernel: key.to_string(),
-                binds: declared.bindings,
+                binds: storage,
                 limit,
             });
         }
@@ -131,7 +152,7 @@ impl Pipelines {
     }
 }
 
-fn build(
+pub(crate) fn build(
     core: &Arc<Core>,
     cache: vk::PipelineCache,
     file: &'static str,
@@ -147,9 +168,14 @@ fn build(
     let declared = spirv::declared(&words).map_err(shader)?;
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..declared.bindings)
         .map(|i| {
+            let ty = if declared.fire.as_ref().is_some_and(|fire| fire.binding == i) {
+                vk::DescriptorType::UNIFORM_BUFFER
+            } else {
+                vk::DescriptorType::STORAGE_BUFFER
+            };
             vk::DescriptorSetLayoutBinding::default()
                 .binding(i)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_type(ty)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
@@ -220,6 +246,7 @@ fn build(
                 used: declared.used,
                 writable: declared.writable,
                 push_bytes: declared.push_bytes,
+                fire: declared.fire,
                 local: declared.local,
             }),
             Err((_, e)) => {

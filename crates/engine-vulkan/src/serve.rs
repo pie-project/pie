@@ -14,6 +14,9 @@ use engine_gpu::error::{Fault, Result};
 pub struct Shelf {
     recorder: crate::record::Recorder,
 
+    /// Each arm's fire block, laid at load for the load's widest fire.
+    arms: Vec<std::sync::Arc<crate::device::ArmBlock>>,
+
     landed_seats: BTreeMap<u64, LandedSeat>,
 
     /// Bumped by every step: a landed seat a later step may have rewritten
@@ -29,14 +32,11 @@ struct LandedSeat {
     generation: u64,
 }
 
-/// A step in flight: its submission, the token feed it waits behind, and
-/// whether the host reads its rows back.
+/// A step in flight: its submission and the token feed it waits behind.
 pub struct Flight {
     pending: Pending,
 
     _fed: Option<Pending>,
-
-    read: bool,
 }
 
 impl Serve for Api {
@@ -67,6 +67,12 @@ impl Serve for Api {
     /// A pass keeps the cells only the device reads in `Channel` slots
     /// (`guest::session::Kept`).
     const CHANNEL_CELLS: bool = true;
+
+    /// A step's guest passes are submitted behind its forward on the one
+    /// queue before the step returns, so before any later fire, and every
+    /// frame waits for all work submitted before it: they read the rows
+    /// where the forward left them in its span.
+    const READS_SPAN: bool = true;
 
     const TARGET: kernels_slang::Target = kernels_slang::Target::Spirv;
 
@@ -138,6 +144,18 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
+    const BINDS_AT_LOAD: bool = false;
+
+    fn bind_frame(_device: &Context) -> Result<Frame> {
+        Err(engine_gpu::error::Fault::Unbound {
+            what: "a bind walk on Vulkan, which keeps no descriptor set per set of views".into(),
+        })
+    }
+
+    fn bound(_pipelines: &Pipelines) -> u64 {
+        0
+    }
+
     fn walk_frame(device: &Context, keep: bool) -> Result<Frame> {
         if keep {
             device.frame_kept()
@@ -147,11 +165,23 @@ impl Serve for Api {
     }
 
     fn shelf(
-        _device: &Context,
-        _pipelines: &Pipelines,
-        _readout: &[Buffer],
+        device: &Context,
+        pipelines: &Pipelines,
+        readout: &[Buffer],
         weights_stream: bool,
+        fires: engine_gpu::serve::FireBound,
+        _guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
+        // An arm's fire block holds what its widest fire lays: each dispatch's
+        // group counts and its scalars at the uniform alignment, each with
+        // its alignment's slack, and the readout copier's region tables.
+        let (uniform, storage) = device.fire_alignments();
+        let scalars = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+        let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
+        let bytes = u64::from(fires.dispatches.max(1)) * per_dispatch + fires.readout_rows * 16;
+        let arms = (0..readout.len())
+            .map(|_| crate::device::ArmBlock::new(device, bytes))
+            .collect::<Result<Vec<_>>>()?;
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
@@ -161,6 +191,7 @@ impl Serve for Api {
             } else {
                 crate::record::Recorder::new()
             },
+            arms,
             landed_seats: BTreeMap::new(),
             generation: 0,
         })
@@ -189,41 +220,54 @@ impl Serve for Api {
             && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole()))
         .then(|| record_key(shell, prepared));
 
-        let replayable = key
-            .and_then(|key| shell.shelf.recorder.get(key))
-            .map(|replay| (replay.layout.clone(), replay.launches));
+        let mut varying = None;
+        let kind = fire_kind(prepared);
+        let replayable = match key.map(|key| shell.shelf.recorder.next(key, kind)) {
+            Some(crate::record::Next::Replay(fill, _)) => {
+                Some((fill.layout.clone(), fill.launches))
+            }
+            Some(crate::record::Next::Walk(known)) => {
+                varying = known;
+                None
+            }
+            None => None,
+        };
         if let Some((rows, launches)) = replayable {
-            let key = key.expect("a recording was found under a key");
+            let key = key.expect("a fill was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
             let seq = shell.airborne.enter();
             let counts = shell.airborne.clone();
             let done = prepared.done.take();
             let fed = prepared.fed_check.clone();
-            let recording = shell
-                .shelf
-                .recorder
-                .get(key)
-                .expect("the recording was there a line ago");
+            let crate::record::Next::Replay(fill, recording) = shell.shelf.recorder.next(key, kind)
+            else {
+                unreachable!("the fill replayed a line ago");
+            };
+            // The fire's own scalars and group counts, where the recording's
+            // commands read them.
+            let filled = recording.kept.stage(&fill.image);
             // The segments an expert stage cut, each landed before its stage.
-            let staged = if recording.cuts.is_empty() {
-                Ok(())
-            } else {
-                match shell.weights.host() {
-                    None => Err(Fault::Unbound {
-                        what: "the host copy of the weight cache's banks".to_string(),
-                    }),
-                    Some(host) => {
-                        let planes = shell.weights.cached_planes(|at| {
-                            shell.row_caches.streams(at) || shell.expert_caches.streams(at)
-                        });
-                        recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
-                            recording.kept.replay_cut(at)?;
-                            shell.expert_caches.stage_cut(host, &planes, cut)
-                        })
+            let staged = filled.and_then(|()| {
+                if recording.cuts.is_empty() {
+                    Ok(())
+                } else {
+                    match shell.weights.host() {
+                        None => Err(Fault::Unbound {
+                            what: "the host copy of the weight cache's banks".to_string(),
+                        }),
+                        Some(host) => {
+                            let planes = shell.weights.cached_planes(|at| {
+                                shell.row_caches.streams(at) || shell.expert_caches.streams(at)
+                            });
+                            recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
+                                recording.kept.replay_cut(at)?;
+                                shell.expert_caches.stage_cut(host, &planes, cut)
+                            })
+                        }
                     }
                 }
-            };
+            });
             let pending = staged.and_then(|()| {
                 recording
                     .kept
@@ -259,23 +303,28 @@ impl Serve for Api {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        let split_rows = shell
-            .tuning
-            .profile()
-            .get::<crate::chip::SubmitSplitRows>()
-            .0;
-        // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = (split_rows > 0
-            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
-            || prepared.bindings.voxels.is_some();
+        // A step past the platform's bound on one submission walks a layer
+        // at a time by the shell's own admission (`engine_gpu::submit`);
+        // whole, a 512x512 VAE decode outlasts one Adreno submission and
+        // loses the device, and nothing estimates it.
+        let split = prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
+        // A shape whose family varies where its recording does not walks with
+        // those dispatches indirect, to record its family again.
+        shell
+            .device
+            .indirect_next(varying.filter(|_| keep.is_some()));
+        // The walk lays in its arm's fire block.
+        shell
+            .device
+            .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
         Ok(Plan::Walk { keep, split })
     }
 
     fn submit(
         shell: &mut Shell<Api>,
         frame: Frame,
-        _prepared: &mut Prepared<'_, Api>,
+        prepared: &mut Prepared<'_, Api>,
         launch: Launch<'_, Api>,
     ) -> Result<Pending> {
         let Launch {
@@ -302,29 +351,108 @@ impl Serve for Api {
                 counts.leave();
             });
         match keep {
-            Some(key) => frame.into_kept().and_then(|kept| {
-                let pending = kept.replay(Some(on_done))?;
+            Some(shape) => {
+                let kept = frame.into_kept()?;
                 // Each segment a flush cut must have an expert stage's host
                 // step to replay after it; a flush of anything else would
                 // not repeat, so such a fire is not kept.
-                if kept.cuts() == cuts.len() {
-                    shell.shelf.recorder.insert(
-                        key,
-                        crate::record::Recording::new(kept, layout.to_vec(), launches, cuts),
-                    );
+                let image = std::sync::Arc::new(kept.image().sealed());
+                if kept.cuts() != cuts.len() {
+                    kept.stage(&image)?;
+                    return kept.replay(Some(on_done));
                 }
+                // A walk whose commands are a held family's but for the fire
+                // block and the group counts its recording reads from there
+                // fills that recording; its own frame goes unsubmitted. A walk
+                // whose segments ran with it replays its own last segment.
+                let family = {
+                    let mut key = crate::record::KeyBuilder::new();
+                    key.hashed(&kept.baked());
+                    key.shown(&prepared.arm);
+                    if !cuts.is_empty() {
+                        key.hashed(&shape);
+                    }
+                    key.finish()
+                };
+                let groups = std::sync::Arc::new(kept.groups().to_vec());
+                enum Act {
+                    Fill,
+                    Record(std::sync::Arc<Vec<bool>>),
+                    Alone,
+                }
+                let act = match shell.shelf.recorder.family_mut(family) {
+                    Some(held) if cuts.is_empty() && held.recording.serves(&groups) => Act::Fill,
+                    Some(held) => {
+                        held.varies(&groups);
+                        if !cuts.is_empty() || held.covered_by(&kept) {
+                            Act::Record(std::sync::Arc::clone(&held.varying))
+                        } else {
+                            Act::Alone
+                        }
+                    }
+                    None => Act::Record(std::sync::Arc::new(
+                        (0..groups.len()).map(|at| kept.indirect(at)).collect(),
+                    )),
+                };
+                let pending = match act {
+                    Act::Fill => {
+                        shell.kept_none();
+                        let held = shell
+                            .shelf
+                            .recorder
+                            .family(family)
+                            .expect("the family was held a line ago");
+                        held.recording.kept.stage(&image)?;
+                        held.recording.kept.replay(Some(on_done))?
+                    }
+                    Act::Record(varying) => {
+                        kept.stage(&image)?;
+                        let pending = kept.replay(Some(on_done))?;
+                        tracing::debug!(
+                            arm = prepared.arm,
+                            rung = ?prepared.rung,
+                            classes = ?prepared.descriptor.classes,
+                            indirect = varying.iter().filter(|&&v| v).count(),
+                            "vulkan recorded a fire's commands"
+                        );
+                        shell.shelf.recorder.insert(
+                            family,
+                            crate::record::Recording::new(kept, cuts),
+                            varying,
+                        );
+                        pending
+                    }
+                    // Its family varies where neither its recording nor this
+                    // walk reads the counts from the block: this fire replays
+                    // its own walk, and the shape's next fire records the
+                    // family with them indirect.
+                    Act::Alone => {
+                        tracing::debug!(
+                            arm = prepared.arm,
+                            rung = ?prepared.rung,
+                            classes = ?prepared.descriptor.classes,
+                            "vulkan walked a fire its family's recording does not serve"
+                        );
+                        kept.stage(&image)?;
+                        kept.replay(Some(on_done))?
+                    }
+                };
+                let recorder = &mut shell.shelf.recorder;
+                recorder.insert_fill(
+                    shape,
+                    fire_kind(prepared),
+                    crate::record::Fill::new(family, groups, image, layout.to_vec(), launches),
+                );
+                let (recorded, filled) = recorder.counts();
+                tracing::debug!(recorded, filled, "vulkan filled a fire shape");
                 Ok(pending)
-            }),
+            }
             None => frame.commit_async(Some(on_done as engine_gpu::backend::OnDone)),
         }
     }
 
     fn fly(pending: Pending, fed: Option<Pending>) -> Flight {
-        Flight {
-            pending,
-            _fed: fed,
-            read: true,
-        }
+        Flight { pending, _fed: fed }
     }
 
     fn reap(shell: &mut Shell<Api>) -> Result<()> {
@@ -358,14 +486,10 @@ impl Serve for Api {
                 other => other,
             });
         }
-        if !flight.api.read {
-            shell.arms.give(flight.arm);
-            return Ok(());
-        }
         let end = flight
             .rows
             .iter()
-            .filter(|span| span.host)
+            .filter(|span| span.hosted)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
@@ -384,6 +508,17 @@ impl Serve for Api {
         shell.land(flight.seq, flight.arm, rows);
         Ok(())
     }
+}
+
+/// A fire's arm, rung and class subset: what a family is likely shared by.
+fn fire_kind(p: &Prepared<'_, Api>) -> crate::record::Key {
+    let mut key = crate::record::KeyBuilder::new();
+    key.hashed(&p.arm);
+    key.hashed(&p.rung);
+    for window in p.descriptor.classes.as_slice() {
+        key.hashed(&(window.rows > 0));
+    }
+    key.finish()
 }
 
 fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
@@ -424,6 +559,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 
     for lane in p.lanes {
         key.shown(&lane.readout);
+        key.shown(&lane.hosts);
         key.shown(&lane.reads);
         // A score room is its pair's place in the pool, which an unpark
         // or an evacuation moves: a recording binds the one it was taken at.
@@ -444,9 +580,6 @@ pub trait Seats {
     fn readout_seats(&self, landed: &Landed, lane: u32) -> Option<Vec<ReadSeat<'_>>>;
 
     fn forget_seat(&mut self, landed: &Landed);
-
-    /// Lets the host leave a step's rows unread: the device read them.
-    fn leave_unread(&mut self, landed: &Landed);
 }
 
 impl Seats for Shell<Api> {
@@ -462,16 +595,27 @@ impl Seats for Shell<Api> {
             }
         };
         let seat = self.readout.get(arm)?;
+        // A spanned read's rows lie in the fire's span: read only while no
+        // later fire was submitted to carve over them.
+        let span = self.span_buffer().ok()?;
+        let last = landed.seq + 1 == self.airborne.entered();
+        let reads: Vec<&ReadSpan> = (rows.iter())
+            .filter(|read| read.lane == lane && read.rows > 0)
+            .filter(|read| read.seated || read.spanned)
+            .collect();
+        if !last && reads.iter().any(|read| read.spanned) {
+            return None;
+        }
         Some(
-            rows.iter()
-                .filter(|span| span.lane == lane && span.rows > 0)
-                .map(|span| {
+            reads
+                .into_iter()
+                .map(|read| {
                     (
-                        seat,
-                        span.at,
-                        span.values(),
-                        span.dtype,
-                        self.output_name(span.plane),
+                        if read.spanned { span } else { seat },
+                        read.at,
+                        read.values(),
+                        read.dtype,
+                        self.output_name(read.plane),
                     )
                 })
                 .collect(),
@@ -480,11 +624,5 @@ impl Seats for Shell<Api> {
 
     fn forget_seat(&mut self, landed: &Landed) {
         self.shelf.landed_seats.remove(&landed.seq);
-    }
-
-    fn leave_unread(&mut self, landed: &Landed) {
-        if let Some(flight) = self.inflight.iter_mut().find(|f| f.seq == landed.seq) {
-            flight.api.read = false;
-        }
     }
 }
