@@ -209,6 +209,7 @@ pub fn load_gather_kernels() -> Result<(), Error> {
         "gather_bit_runs",
         "beam_step",
         "copy_pages",
+        "copy_rs_rows",
     ] {
         kernel(FILE, &format!("::pie::channel::{name}")).load()?;
     }
@@ -729,6 +730,76 @@ pub struct BeamListRun {
 
 const _: () = assert!(size_of::<BeamListRun>() == 40);
 
+/// A lane's rs page table [`beam_step`] resolves over its group's list, on a
+/// hybrid (`BEAM-PAGE-LISTS.md` §11; `channel.hip`'s `BeamRsRun`): its
+/// `entries` entries from `from`, entry e holding the `tokens` rows of slots
+/// `base + e * tokens` on, each resolved to the set's entry (`bases`, from
+/// its entry 0, `bases_len` of them) holding the same rows of its beam's
+/// list's page.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamRsRun {
+    pub pages: DevicePtr,
+    pub bases: DevicePtr,
+    pub lane: u32,
+    pub from: u32,
+    pub entries: u32,
+    pub base: u32,
+    pub tokens: u32,
+    pub bases_len: u32,
+}
+
+const _: () = assert!(size_of::<BeamRsRun>() == 40);
+
+/// A beam's rs copy (`BEAM-PAGE-LISTS.md` §6.4 on a hybrid, `channel.hip`'s
+/// `RsCopyRun`): the `[src, dst, tokens]` its group's step left at `copy`,
+/// moved row by row of each plane through the set's rs entries (`bases`,
+/// as [`BeamRsRun`]'s); slots below the buffer have no row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsCopyRun {
+    pub copy: DevicePtr,
+    pub bases: DevicePtr,
+    pub fault: DevicePtr,
+    pub reserve: u32,
+    pub page: u32,
+    pub tokens: u32,
+    pub base: u32,
+    pub f0: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+    pub bases_len: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<RsCopyRun>() == 64);
+
+/// Copies each of `run_count` [`RsCopyRun`]s at `runs` over its planes of
+/// `planes`, a block a (run, plane); `max_planes` is the most a run spans.
+pub fn copy_rs_rows(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    planes: DevicePtr,
+    run_count: u32,
+    max_planes: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.copy_rs_rows";
+    if run_count == 0 || max_planes == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::copy_rs_rows"))
+            .apply(Launch::grid([run_count, max_planes, 1], [PAGES_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(planes),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
 /// One beam group's step (`new-memory/designs/BEAM-PAGE-LISTS.md`,
 /// `channel.hip`'s `BeamStepRun`): its resident state, the parents its
 /// last epilogue wrote, its pool's device ids, its lanes' list runs and
@@ -758,10 +829,12 @@ pub struct BeamStepRun {
     /// names lies below them (the lowest-free rule), and one that does not
     /// faults its lane.
     pub backed: u32,
-    pub _pad: u32,
+    /// Its lanes' rs page tables (a hybrid's, §11), `rs_count` of them.
+    pub rs_count: u32,
+    pub rs: DevicePtr,
 }
 
-const _: () = assert!(size_of::<BeamStepRun>() == 80);
+const _: () = assert!(size_of::<BeamStepRun>() == 88);
 
 /// The most beams one group holds.
 pub const BEAM_MAX_LANES: u32 = 64;

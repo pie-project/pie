@@ -222,6 +222,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
                 row_count: 1,
                 token_count: rows,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },

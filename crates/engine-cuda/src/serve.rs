@@ -897,6 +897,26 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
+        // A hybrid's beam group pages its beams' recurrent rows by the same
+        // lists as their kv slots, slot by slot (`BEAM-PAGE-LISTS.md` §11):
+        // the rs page's rows must divide the kv page's. A load whose recipe
+        // does not says so at the bind, before any beam fires.
+        if device.contains(eta_ir::registry::Port::Parents)
+            && let Some(buffers) = self.buffers.as_ref()
+        {
+            let (tokens, page) = (buffers.page_tokens().max(1), self.pools.paging().page_size);
+            if page % tokens != 0 {
+                return Err(crate::error::Fault::program(
+                    "serve::bind",
+                    format!(
+                        "a beam group (parents) on this hybrid pages its beams' recurrent rows \
+                         by their kv page lists, and the load's recipe pages them {tokens} rows a \
+                         page against kv pages of {page}: the rs page's rows must divide the kv \
+                         page's (BEAM-PAGE-LISTS.md §11)"
+                    ),
+                ));
+            }
+        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;

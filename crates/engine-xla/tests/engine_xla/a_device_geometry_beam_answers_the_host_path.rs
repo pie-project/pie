@@ -244,6 +244,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 row_count: BEAMS,
                 token_count: BEAMS,
                 sampled_rows: BEAMS,
+                rows_per_lane: BEAMS,
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
@@ -479,6 +480,7 @@ fn device_fed_tokens_reach_the_next_fire() {
                 row_count: 1,
                 token_count: 1,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },

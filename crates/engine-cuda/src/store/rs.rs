@@ -27,6 +27,15 @@ impl Planes {
         self.0.get(&id.0).copied()
     }
 
+    /// Every buffered plane once, by layer and place.
+    #[must_use]
+    pub fn all(&self) -> Vec<Plane> {
+        let mut planes: Vec<Plane> = self.0.values().copied().collect();
+        planes.sort_by_key(|plane| (plane.layer, plane.at, plane.width));
+        planes.dedup_by_key(|plane| (plane.layer, plane.at, plane.width));
+        planes
+    }
+
     /// Whether `id` is a lone conv's rows, a layer of its own.
     #[must_use]
     pub fn lone(&self, id: ValueId) -> bool {
@@ -567,6 +576,23 @@ impl Buffers {
             off: run + plane.at * ELEMENT,
             stride: plane.width * ELEMENT,
         })
+    }
+
+    /// Every buffered plane as a page copy spans it: its rows' place in a
+    /// page's slot and the bytes a token's row takes (a beam's fork copies a
+    /// page's first rows of each, `BEAM-PAGE-LISTS.md` §11).
+    pub fn page_planes(&self) -> Result<Vec<kernels_cuda::runtime::channel::PagePlane>> {
+        self.planes
+            .all()
+            .into_iter()
+            .map(|plane| {
+                let place = self.place(plane)?;
+                Ok(kernels_cuda::runtime::channel::PagePlane {
+                    offset: place.off,
+                    cell: place.stride,
+                })
+            })
+            .collect()
     }
 
     /// The address of rs buffer page `page`'s slot: a page's rows of a

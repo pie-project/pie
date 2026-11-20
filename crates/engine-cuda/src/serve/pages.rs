@@ -61,6 +61,10 @@ pub struct GroupPlan {
     pub frames: u32,
     /// The pool pages staged from the first (`backed`).
     pub backed: u32,
+    /// Where its beams' rs page tables start in [`PageWork::rs`], and how
+    /// many (none off a hybrid).
+    pub rs_at: u32,
+    pub rs_count: u32,
 }
 
 /// The pool pages a group of `lanes` beams can name at the fire whose
@@ -90,7 +94,8 @@ pub struct ListPlan {
     pub rows: u32,
 }
 
-/// A beam's copy over the kv planes a page holds.
+/// A beam's copy over the planes a page holds: the kv planes over its
+/// pool's kv pages, or on a hybrid the rs planes over its rs pages (§11).
 #[derive(Clone, Copy, Debug)]
 pub struct CopyPlan {
     pub fault: u32,
@@ -101,6 +106,57 @@ pub struct CopyPlan {
     pub reserve: u32,
     pub page: u32,
     pub floor_rel: u32,
+    /// Its planes: `planes` of [`PageWork::planes`] from `plane_at`.
+    pub plane_at: u32,
+    pub planes: u32,
+}
+
+/// A beam's rs page table to resolve (a hybrid's, `BEAM-PAGE-LISTS.md`
+/// §11): its first entry in the fire's rs page table and how many, the
+/// buffer's first slot and its rows a page, and where the set's rs entries'
+/// slot addresses start in [`PageWork::bases`] and how many.
+#[derive(Clone, Copy, Debug)]
+pub struct RsListPlan {
+    pub lane: u32,
+    pub from: u32,
+    pub entries: u32,
+    pub base: u32,
+    pub tokens: u32,
+    pub bases_at: u32,
+    pub bases_len: u32,
+}
+
+/// A beam's rs copy (§6.4 on a hybrid): its group's copy, row by row of
+/// each rs plane through the set's rs entries (`copy_rs_rows`).
+#[derive(Clone, Copy, Debug)]
+pub struct RsCopyPlan {
+    pub fault: u32,
+    pub copy: u64,
+    pub bases_at: u32,
+    pub bases_len: u32,
+    pub reserve: u32,
+    pub page: u32,
+    pub tokens: u32,
+    pub base: u32,
+    pub f0: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+}
+
+/// What the plan reads of a fire's rs buffer (a hybrid's): its lanes' rs
+/// lanes by fire lane, the fire lane of each source lane, the rows a page
+/// holds, each source lane's buffer base and its set's rs pages, and the
+/// planes a page's rows lie in.
+pub struct RsFire<'a> {
+    pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
+    pub order: &'a [u32],
+    pub page_tokens: u32,
+    pub base: &'a dyn Fn(usize) -> Option<u32>,
+    /// A source lane's set's rs pages' slot addresses, every one of its
+    /// buffer (a beam's rows lie on any).
+    pub set: &'a dyn Fn(usize) -> Result<Vec<u64>>,
+    pub planes: Vec<PagePlane>,
 }
 
 /// What a fire's beam groups have the device run.
@@ -108,7 +164,11 @@ pub struct CopyPlan {
 pub struct PageWork {
     pub groups: Vec<GroupPlan>,
     pub lists: Vec<ListPlan>,
+    /// The beams' rs page tables (a hybrid's).
+    pub rs: Vec<RsListPlan>,
     pub copies: Vec<CopyPlan>,
+    /// The beams' rs copies (a hybrid's).
+    pub rs_copies: Vec<RsCopyPlan>,
     pub trans: Vec<i32>,
     pub bases: Vec<u64>,
     pub planes: Vec<PagePlane>,
@@ -169,6 +229,7 @@ pub fn plan(
     translation: &dyn Fn(usize) -> Vec<u32>,
     folded: &dyn Fn(usize) -> u32,
     planes: &[PagePlane],
+    rs: Option<&RsFire<'_>>,
     device_ids: &mut dyn FnMut(&mut [i32]) -> Result<()>,
     page_base: &mut dyn FnMut(u32) -> Result<u64>,
 ) -> Result<PageWork> {
@@ -185,6 +246,11 @@ pub fn plan(
     }
     let page = page.max(1);
     work.planes.extend_from_slice(planes);
+    let kv_planes = planes.len() as u32;
+    let rs_plane_at = work.planes.len() as u32;
+    if let Some(rs) = rs {
+        work.planes.extend_from_slice(&rs.planes);
+    }
     for group in groups {
         let first = group.lanes.first().ok_or_else(|| {
             Fault::program("serve::pages", "a beam group of no lanes".to_string())
@@ -256,6 +322,15 @@ pub fn plan(
             }
         }
         let list_count = work.lists.len() as u32 - lists_at;
+        // A hybrid's beams (§11): each beam's rs page table, column 0 at its
+        // entry `f0 - base / S`, resolved over the same list; the group's rs
+        // pool pages are the set's, as its lanes' tables stage them.
+        let rs_at = work.rs.len() as u32;
+        let mut rs_bases_at = None;
+        if let Some(rs) = rs {
+            rs_bases_at = rs_lists(&mut work, rs, group, f0, page, slot, backed)?;
+        }
+        let rs_count = work.rs.len() as u32 - rs_at;
         work.groups.push(GroupPlan {
             state: group.state,
             parents: group.parents,
@@ -271,6 +346,8 @@ pub fn plan(
             slot,
             frames: group.layout.frames,
             backed,
+            rs_at,
+            rs_count,
         });
         let bases_at = work.bases.len() as u32;
         for &p in pool {
@@ -289,8 +366,98 @@ pub fn plan(
                 reserve: backed,
                 page,
                 floor_rel: folded - f0 * page,
+                plane_at: 0,
+                planes: kv_planes,
             });
+            if let (Some(rs), Some((bases_at, bases_len, base))) = (rs, rs_bases_at) {
+                work.rs_copies.push(RsCopyPlan {
+                    fault: fault_at + beam,
+                    copy: group.state + (copies + 3 * u64::from(beam)) * 4,
+                    bases_at,
+                    bases_len,
+                    reserve: backed,
+                    page,
+                    tokens: rs.page_tokens,
+                    base,
+                    f0,
+                    floor_rel: folded - f0 * page,
+                    plane_at: rs_plane_at,
+                    planes: rs.planes.len() as u32,
+                });
+            }
         }
     }
     Ok(work)
+}
+
+/// A hybrid group's rs page tables (`BEAM-PAGE-LISTS.md` §11): each beam's
+/// entries for slots `base..=slot`, each resolved slot by slot through its
+/// list to the set's entry holding the same rows, and the set's rs entries'
+/// slot addresses (beam 0's table as staged: every beam's names the set's)
+/// in [`PageWork::bases`]; their run, its length and the buffer's base, or
+/// `None` for a group whose lanes buffer no rows. Refused by name where a
+/// page's rows do not divide a kv page, or where the buffer does not start
+/// on a row page (an entry would straddle two of a beam's pages).
+fn rs_lists(
+    work: &mut PageWork,
+    rs: &RsFire<'_>,
+    group: &PageGroup,
+    _f0: u32,
+    page: u32,
+    slot: u32,
+    _backed: u32,
+) -> Result<Option<(u32, u32, u32)>> {
+    let lane_of = |source: usize| -> Option<kernels_cuda::runtime::channel::RsLane> {
+        let fire_lane = *rs.order.get(source)? as usize;
+        rs.lanes
+            .get(fire_lane)
+            .copied()
+            .filter(|lane| lane.at != kernels_cuda::runtime::channel::RsLane::NONE)
+    };
+    let first = &group.lanes[0];
+    let (Some(_lane0), Some(base)) = (lane_of(first.source), (rs.base)(first.source)) else {
+        return Ok(None);
+    };
+    let tokens = rs.page_tokens.max(1);
+    if page % tokens != 0 || base % tokens != 0 {
+        return Err(Fault::program(
+            "serve::pages",
+            format!(
+                "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
+                 and their page lists page kv slots {page} a page: a hybrid's beams need the \
+                 rs page's rows to divide the kv page's and its buffer to start on a row page \
+                 (BEAM-PAGE-LISTS.md §11)",
+                group.instance
+            ),
+        ));
+    }
+    if slot < base {
+        return Ok(None);
+    }
+    let set = (rs.set)(first.source)?;
+    let bases_at = work.bases.len() as u32;
+    work.bases.extend_from_slice(&set);
+    let bases_len = set.len() as u32;
+    let entries = (slot - base) / tokens + 1;
+    for (beam, lane) in group.lanes.iter().enumerate() {
+        let rs_lane = lane_of(lane.source).ok_or_else(|| {
+            Fault::program(
+                "serve::pages",
+                format!(
+                    "instance {}'s beam {beam} buffers no recurrent rows where beam 0 does",
+                    group.instance
+                ),
+            )
+        })?;
+        work.rs.push(RsListPlan {
+            lane: beam as u32,
+            from: rs_lane.page_off,
+            entries,
+            base,
+            tokens,
+            bases_at,
+            bases_len,
+        });
+    }
+    Ok(Some((bases_at, bases_len, base)))
 }

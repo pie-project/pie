@@ -1472,6 +1472,13 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A hybrid beam's fork copies a page's first rows of each
+            // buffered plane (`BEAM-PAGE-LISTS.md` §11).
+            buffers
+                .as_ref()
+                .map(crate::store::rs::Buffers::page_planes)
+                .transpose()?
+                .map_or(0, |planes| planes.len()),
             // A stretch a packing an attention stating a mask reads.
             stated_feeds.len(),
         )?;

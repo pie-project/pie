@@ -145,6 +145,7 @@ fn fired(
                 row_count: rows,
                 token_count: rows,
                 sampled_rows: rows,
+                rows_per_lane: rows,
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },

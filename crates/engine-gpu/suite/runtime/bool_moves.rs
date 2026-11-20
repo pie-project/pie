@@ -205,6 +205,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
                 row_count: 1,
                 token_count: rows,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },

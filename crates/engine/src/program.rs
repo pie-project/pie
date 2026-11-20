@@ -45,7 +45,16 @@ pub struct ProgramRegistration {
 pub struct BindExtents {
     pub row_count: u32,
     pub token_count: u32,
+    /// The readout rows one instance reads (its rows per instance): what an
+    /// engine that lays a program's readout seats by the instance checks
+    /// (engine-cuda). A beam group's (`parents`) instance reads its `b`
+    /// beams' rows.
     pub sampled_rows: u32,
+    /// The readout rows one of its lanes reads: what an engine that lays
+    /// the seats by the lane checks (engine-metal). A beam group's beams are
+    /// each a lane reading one row; any other pass's lanes read what its
+    /// instance does.
+    pub rows_per_lane: u32,
     pub query_len: u32,
     pub key_len: u32,
 }
@@ -56,6 +65,7 @@ impl Default for BindExtents {
             row_count: 1,
             token_count: 1,
             sampled_rows: 1,
+            rows_per_lane: 1,
             query_len: 1,
             key_len: 1,
         }

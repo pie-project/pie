@@ -61,6 +61,11 @@ pub struct GroupPlan {
     /// Rows of its one lane the fire lands the state as of, each in a slot
     /// of its own (`Lane::rs_snapshots`).
     pub snapshots: Vec<u32>,
+    /// Whether its lanes are a beam group's (`parents`): each beam replays
+    /// every buffered slot through its own page list, which the engine's
+    /// head step resolves (`BEAM-PAGE-LISTS.md` §11), not the slots a mask
+    /// admits of one shared list.
+    pub beams: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,7 +614,9 @@ pub fn prepare_many(
         // A lane alone on its set replays every buffered slot of it; lanes
         // sharing a set replay the slots their masks admit, the ancestry
         // they state.
-        let lineage = if group.lanes.len() > 1 {
+        // A beam group's lanes each replay every buffered slot of their own
+        // list (the head step resolves it per beam, §11).
+        let lineage = if group.lanes.len() > 1 && !group.beams {
             engine::fire::Lineage::Admitted
         } else {
             engine::fire::Lineage::Set
@@ -643,6 +650,7 @@ pub fn prepare(store: &mut RsStore, ws: RsWorkingSetId, rows: u32) -> Result<Pre
         writes: None,
         fold: GroupFold::Host(rows),
         snapshots: Vec::new(),
+        beams: false,
     }]);
     prepare_many(store, &[ws], &plan, None)
 }
@@ -681,6 +689,7 @@ mod tests {
             writes: Some(writes),
             fold,
             snapshots: Vec::new(),
+            beams: false,
         }])
     }
 

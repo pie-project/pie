@@ -621,10 +621,13 @@ fn stage_pages(
     store: &mut Buffer,
     at: PagesAt,
     tables: &[TableHandles],
+    rs_pages: Option<u64>,
     work: &crate::serve::pages::PageWork,
     slot: u32,
 ) -> Result<Option<u64>> {
-    use kernels_cuda::runtime::channel::{BeamListRun, BeamStepRun, PageCopyRun, PagePlane};
+    use kernels_cuda::runtime::channel::{
+        BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
+    };
     if work.is_empty() {
         return Ok(None);
     }
@@ -653,6 +656,8 @@ fn stage_pages(
     fits("beam groups in one fire", work.groups.len(), at.groups_cap)?;
     fits("beam copies in one fire", work.copies.len(), at.copies_cap)?;
     fits("beam lanes in one fire", work.faults.len(), at.faults_cap)?;
+    fits("beam rs page tables in one fire", work.rs.len(), at.rs_cap)?;
+    fits("beam rs copies in one fire", work.rs_copies.len(), at.rs_cap)?;
     let base = store.ptr();
     let faults = at.faults + u64::from(slot) * at.faults_cap * 4;
     let bytes_of = |ptr: *const u8, len: usize| -> &[u8] {
@@ -693,6 +698,36 @@ fn stage_pages(
         at.lists,
         bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()),
     )?;
+    // A hybrid's beams' rs page tables (§11): each beam's entries in the
+    // fire's rs page table, over its group's rs pool pages.
+    let rs_runs: Vec<BeamRsRun> = work
+        .rs
+        .iter()
+        .map(|list| {
+            rs_pages
+                .map(|pages| BeamRsRun {
+                    pages,
+                    bases: base + at.bases + u64::from(list.bases_at) * 8,
+                    lane: list.lane,
+                    from: list.from,
+                    entries: list.entries,
+                    base: list.base,
+                    tokens: list.tokens,
+                    bases_len: list.bases_len,
+                })
+                .ok_or_else(|| {
+                    crate::error::Fault::program(
+                        "inputs::commit",
+                        "a beam group's rs page tables, in a fire that stages no rs tables",
+                    )
+                })
+        })
+        .collect::<crate::error::Result<_>>()?;
+    store.stage(
+        stream,
+        at.rs,
+        bytes_of(rs_runs.as_ptr().cast(), rs_runs.len() * size_of::<BeamRsRun>()),
+    )?;
     let groups: Vec<BeamStepRun> = work
         .groups
         .iter()
@@ -711,7 +746,8 @@ fn stage_pages(
             list_count: group.list_count,
             frames: group.frames,
             backed: group.backed,
-            _pad: 0,
+            rs_count: group.rs_count,
+            rs: base + at.rs + u64::from(group.rs_at) * size_of::<BeamRsRun>() as u64,
         })
         .collect();
     store.stage(
@@ -730,8 +766,8 @@ fn stage_pages(
             reserve: copy.reserve,
             page: copy.page,
             floor_rel: copy.floor_rel,
-            plane_at: 0,
-            planes: work.planes.len() as u32,
+            plane_at: copy.plane_at,
+            planes: copy.planes,
             _pad: 0,
         })
         .collect();
@@ -745,7 +781,39 @@ fn stage_pages(
         base + at.copies,
         base + at.planes,
         copies.len() as u32,
-        work.planes.len() as u32,
+        work.copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
+    )?;
+    // A hybrid's beams' rs copies (§6.4, §11): row by row of each rs plane.
+    let rs_copies: Vec<RsCopyRun> = work
+        .rs_copies
+        .iter()
+        .map(|copy| RsCopyRun {
+            copy: copy.copy,
+            bases: base + at.bases + u64::from(copy.bases_at) * 8,
+            fault: base + faults + u64::from(copy.fault) * 4,
+            reserve: copy.reserve,
+            page: copy.page,
+            tokens: copy.tokens,
+            base: copy.base,
+            f0: copy.f0,
+            floor_rel: copy.floor_rel,
+            plane_at: copy.plane_at,
+            planes: copy.planes,
+            bases_len: copy.bases_len,
+            _pad: 0,
+        })
+        .collect();
+    store.stage(
+        stream,
+        at.rs_copies,
+        bytes_of(rs_copies.as_ptr().cast(), rs_copies.len() * size_of::<RsCopyRun>()),
+    )?;
+    kernels_cuda::runtime::channel::copy_rs_rows(
+        device.ctx(),
+        base + at.rs_copies,
+        base + at.planes,
+        rs_copies.len() as u32,
+        work.rs_copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
     )?;
     Ok(Some(base + faults))
 }
@@ -830,6 +898,11 @@ struct PagesAt {
     copies_cap: u64,
     faults: u64,
     faults_cap: u64,
+    /// A hybrid's beams' rs page tables and rs copies
+    /// (`BEAM-PAGE-LISTS.md` §11).
+    rs: u64,
+    rs_cap: u64,
+    rs_copies: u64,
 }
 
 /// The kv planes a page holds that one copy run may span.
@@ -878,6 +951,7 @@ impl Inputs {
         schedule_streams: &[Option<u32>],
         state_ids: u32,
         rs_page_tokens: Option<u32>,
+        rs_planes: usize,
         group_mask_feeds: usize,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
@@ -918,8 +992,19 @@ impl Inputs {
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
         let pages_at = {
             use kernels_cuda::runtime::channel::{
-                BeamListRun, BeamStepRun, PageCopyRun, PagePlane,
+                BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
             };
+            // A hybrid's beams also resolve and copy their rs rows (§11): the
+            // set's rs entries' addresses (a sequence's at most, its pages of
+            // `rs_page_tokens` rows), an rs table and an rs copy a lane, the
+            // rs planes beside the kv ones.
+            let rs_side = u64::from(rs_planes > 0);
+            let rs_entries = rs_page_tokens.map_or(0, |tokens| {
+                u64::from(paging.pages_per_slot) * u64::from(paging.page_size)
+                    / u64::from(tokens.max(1))
+                    + 1
+            });
+            let planes_cap = PAGE_PLANES_CAP + rs_planes as u64;
             // A group's pool spans at most a sequence's pages, a lane's.
             let reserve = lanes * u64::from(paging.pages_per_slot);
             let lists_cap = lanes * page_tables as u64;
@@ -929,10 +1014,10 @@ impl Inputs {
             PagesAt {
                 trans: take(reserve * 4),
                 trans_cap: reserve,
-                bases: take(reserve * 8),
-                bases_cap: reserve,
-                planes: take(PAGE_PLANES_CAP * size_of::<PagePlane>() as u64),
-                planes_cap: PAGE_PLANES_CAP,
+                bases: take((reserve + lanes * rs_side * rs_entries) * 8),
+                bases_cap: reserve + lanes * rs_side * rs_entries,
+                planes: take(planes_cap * size_of::<PagePlane>() as u64),
+                planes_cap,
                 lists: take(lists_cap * size_of::<BeamListRun>() as u64),
                 lists_cap,
                 groups: take(lanes * size_of::<BeamStepRun>() as u64),
@@ -941,6 +1026,9 @@ impl Inputs {
                 copies_cap: lanes,
                 faults: take(lanes * 4 * in_flight),
                 faults_cap: lanes,
+                rs: take(lanes * rs_side * size_of::<BeamRsRun>() as u64),
+                rs_cap: lanes * rs_side,
+                rs_copies: take(lanes * rs_side * size_of::<RsCopyRun>() as u64),
             }
         };
         let mask_indptr = take((lanes + 1) * 8);
@@ -1836,8 +1924,15 @@ impl Inputs {
         )?;
         // Over the page tables just staged, ahead of the fire's appends and
         // reads in stream order: the copies first, then the lists.
-        let page_faults =
-            stage_pages(device, &mut *store, *pages_at, &page_tables, pages, slot.at())?;
+        let page_faults = stage_pages(
+            device,
+            &mut *store,
+            *pages_at,
+            &page_tables,
+            rs.as_ref().map(|handles| handles.pages),
+            pages,
+            slot.at(),
+        )?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

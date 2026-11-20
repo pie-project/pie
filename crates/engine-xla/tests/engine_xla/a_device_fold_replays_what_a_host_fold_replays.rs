@@ -127,6 +127,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
                 row_count: ROWS,
                 token_count: ROWS,
                 sampled_rows: ROWS,
+                rows_per_lane: ROWS,
                 query_len: ROWS,
                 ..engine::program::BindExtents::default()
             },

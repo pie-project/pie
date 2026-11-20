@@ -725,8 +725,87 @@ struct BeamListRun {
 
 static_assert(sizeof(BeamListRun) == 40, "BeamListRun: the Rust `channel::BeamListRun` mirrors this layout");
 
+// A lane's rs page table to resolve (§11, a hybrid's): its `entries`
+// entries from `from`, entry e holding the `tokens` buffered rows of slots
+// `base + e * tokens` on, each resolved to the set's entry holding the same
+// rows of its beam's list's page (`bases`: the set's entries' slot
+// addresses, `bases_len` of them, from its entry 0).
+struct BeamRsRun {
+    u64* pages;
+    const u64* bases;
+    u32 lane;
+    u32 from;
+    u32 entries;
+    u32 base;
+    u32 tokens;
+    u32 bases_len;
+};
+
+static_assert(sizeof(BeamRsRun) == 40, "BeamRsRun: the Rust `channel::BeamRsRun` mirrors this layout");
+
+// A beam's rs copy (§6.4 on a hybrid): the first `tokens` slots of pool page
+// `src` to pool page `dst` (the `[src, dst, tokens]` its group's step left
+// at `copy`), row by row of each plane, through the set's rs entries
+// (`bases`, as `BeamRsRun`'s): a slot below the buffer (the prompt's tail,
+// in the state) has no row and is skipped.
+struct RsCopyRun {
+    const u32* copy;
+    const u64* bases;
+    u32* fault;
+    u32 reserve;
+    u32 page;
+    u32 tokens;
+    u32 base;
+    u32 f0;
+    u32 floor_rel;
+    u32 plane_at;
+    u32 planes;
+    u32 bases_len;
+    u32 pad;
+};
+
+static_assert(sizeof(RsCopyRun) == 64, "RsCopyRun: the Rust `channel::RsCopyRun` mirrors this layout");
+
+// Copies each run's rows, a block a (run, plane), a slot's row a step.
+__global__ void copy_rs_rows(
+    const RsCopyRun* __restrict__ runs,
+    const PagePlane* __restrict__ planes,
+    u32 run_count)
+{
+    const u32 run = blockIdx.x;
+    if (run >= run_count) return;
+    const RsCopyRun r = runs[run];
+    if (blockIdx.y >= r.planes) return;
+    const u32 src = r.copy[0];
+    const u32 dst = r.copy[1];
+    const u32 tokens = r.copy[2];
+    if (tokens == 0u || src == dst) return;
+    if (src >= r.reserve || dst >= r.reserve || tokens > r.page
+        || static_cast<u64>(dst) * r.page < r.floor_rel) {
+        if (blockIdx.y == 0 && threadIdx.x == 0) atomicMax(r.fault, PIE_PAGES_COPY_BOUNDS);
+        return;
+    }
+    const PagePlane plane = planes[r.plane_at + blockIdx.y];
+    const u64 T = r.tokens == 0u ? 1u : r.tokens;
+    for (u32 k = 0u; k < tokens; ++k) {
+        const u64 from_slot = (static_cast<u64>(r.f0) + src) * r.page + k;
+        const u64 to_slot = (static_cast<u64>(r.f0) + dst) * r.page + k;
+        if (from_slot < r.base || to_slot < r.base) continue;
+        const u64 fe = (from_slot - r.base) / T, te = (to_slot - r.base) / T;
+        if (fe >= r.bases_len || te >= r.bases_len) {
+            if (threadIdx.x == 0) atomicMax(r.fault, PIE_PAGES_COPY_BOUNDS);
+            return;
+        }
+        const u8* from = reinterpret_cast<const u8*>(
+            r.bases[fe] + plane.offset + ((from_slot - r.base) % T) * plane.cell);
+        u8* to = reinterpret_cast<u8*>(r.bases[te] + plane.offset + ((to_slot - r.base) % T) * plane.cell);
+        for (u64 at = threadIdx.x; at < plane.cell; at += blockDim.x) to[at] = from[at];
+    }
+}
+
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device ids, its lanes' list runs and fault words, and the numbers of §3.
+// device ids, its lanes' list runs and fault words, the numbers of §3, and
+// on a hybrid its lanes' rs page tables (§11).
 struct BeamStepRun {
     u32* state;
     const u32* parents;
@@ -742,10 +821,11 @@ struct BeamStepRun {
     u32 list_count;
     u32 frames;
     u32 backed;
-    u32 pad;
+    u32 rs_count;
+    const BeamRsRun* rs;
 };
 
-static_assert(sizeof(BeamStepRun) == 80, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
+static_assert(sizeof(BeamStepRun) == 88, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
 
 #define PIE_BEAM_MAX_LANES 64u
 
@@ -939,6 +1019,36 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
                 continue;
             }
             l.write_page[row] = r.trans[q];
+        }
+    }
+    // §6.5 on a hybrid (§11): each lane's rs page table over the same list,
+    // slot by slot: entry e (slot `base + e T`) holds the rows of the set's
+    // slot (f0 + list[j]) S + (slot mod S), j its column; its write page
+    // among them.
+    for (u32 i = 0u; i < r.rs_count; ++i) {
+        const BeamRsRun l = r.rs[i];
+        const u32* list = map_new + l.lane * cap;
+        const u64 T = l.tokens == 0u ? 1u : l.tokens;
+        for (u32 e = threadIdx.x; e < l.entries; e += blockDim.x) {
+            const u64 slot = l.base + e * T;
+            if (slot < static_cast<u64>(f0) * S) continue;
+            const u64 j = slot / S - f0;
+            if (j >= cap) {
+                atomicMax(&r.faults[l.lane], PIE_PAGES_SHORT);
+                continue;
+            }
+            const u32 q = list[j];
+            if (q >= K) {
+                atomicMax(&r.faults[l.lane], q >= Q ? PIE_PAGES_PAST_RESERVE : PIE_PAGES_EXHAUSTED);
+                continue;
+            }
+            const u64 sigma = (static_cast<u64>(f0) + q) * S + slot % S;
+            const u64 at = (sigma - l.base) / T;
+            if (sigma < l.base || at >= l.bases_len) {
+                atomicMax(&r.faults[l.lane], PIE_PAGES_PAST_RESERVE);
+                continue;
+            }
+            l.pages[l.from + e] = l.bases[at];
         }
     }
     __syncthreads();

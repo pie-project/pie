@@ -330,6 +330,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 row_count: 1,
                 token_count: rows,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },
