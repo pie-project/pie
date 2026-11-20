@@ -156,8 +156,9 @@ interface model {
     // Tokens per KV page for the bound model/engine.
     kv-page-size: func() -> u32;
 
-    // Tokens one sequence may hold before a fire growing it is refused
-    // (`[engine] max_model_len` in whole pages); 0 when no engine sets one.
+    // Tokens one sequence may hold before a fire growing it is refused:
+    // the engine's context in whole KV pages, the least across engines; 0
+    // when no engine sets one.
     max-sequence-tokens: func() -> u32;
 
     // Waves per frame (k) for this deployment — a static constant fixed at

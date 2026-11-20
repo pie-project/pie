@@ -161,7 +161,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
         let tokens = crate::store::registry::all_for_model(0)
             .iter()
             .filter(|s| s.context_pages != 0)
-            .map(|s| s.context_pages * u64::from(s.kv_page_size))
+            .map(|s| s.context_pages.saturating_mul(u64::from(s.kv_page_size)))
             .min()
             .unwrap_or(0);
         Ok(u32::try_from(tokens).unwrap_or(u32::MAX))
