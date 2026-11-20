@@ -782,6 +782,22 @@ Next: an MFMA shape that covers four rows without waste. The turned kernel's 16x
 three quarters of each product on padding rows at m = 4; skinny4's 4x4x4-per-block layout lost on
 narrow banks. Each candidate is judged by the cold-weight A/B.
 
+### Restated against region-merge-2 (2026-11-20, tip bcbc1b430)
+
+With the split epilogue (region-merge-2 and the split partials' agent-scope stores), MI300X,
+Qwen3-0.6B, per step (32 → 160 tokens, median of 5, two rounds):
+
+| | ms a step | over greedy |
+|---|---|---|
+| greedy | 1.306 / 1.310 | 1 |
+| 4 parallel | 1.490 / 1.497 | 1.14 |
+| beam-4 | 1.696 / 1.701 | 1.30 (1.14 over 4 parallel) |
+
+Beam verify passes at w2 / w4 / w8 × 256. So beam-4 over greedy is ≈ 390 µs: about half is the
+four-row forward (4 parallel over greedy, ≈ 185 µs, the products' ≈ 130 of it by the cold
+ledger above) and about half beam-4 over 4 parallel (≈ 205 µs: the epilogue and the page
+lists). The user's beam cost rule (beam-4 ≈ one greedy step) needs both halves.
+
 ## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
 
 `runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark

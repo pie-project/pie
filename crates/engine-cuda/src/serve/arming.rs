@@ -1664,6 +1664,19 @@ impl Shell {
             }
             st.never += 1;
             if !st.group {
+                // Fired once, sealed, so nothing captures: its key is stated
+                // eager by name at load, and its fires walk eagerly by that
+                // statement (`BodyTally::stated_eager`), not as a body
+                // missing (`sealed_declines`).
+                self.cache.seal_bodies();
+                self.cache.state_eager(true);
+                let (lanes, media) = target.lanes();
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                let fired = self.fire_synthetic(&owned).and(self.device.synchronize());
+                self.cache.state_eager(false);
+                if let Err(why) = fired {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                }
                 return Ok(());
             }
             // An expert-parallel rank fires it anyway, sealed so nothing
@@ -1923,6 +1936,19 @@ impl Shell {
             "engine-cuda: {report}; armed in {:.1} s",
             st.began.elapsed().as_secs_f64()
         );
+        // Every composition arming stopped before (the report above says
+        // why), by name: they walk eagerly for the life of the load by this
+        // statement, their fires tallied as such (`BodyTally::stated_eager`).
+        let stated = self.cache.stated_eager();
+        if !stated.is_empty() {
+            eprintln!(
+                "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
+                 before them from bucket {}: {}",
+                stated.len(),
+                st.never_from,
+                stated.join(", ")
+            );
+        }
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
