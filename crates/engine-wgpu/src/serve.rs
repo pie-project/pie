@@ -65,7 +65,6 @@ impl Serve for Api {
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,
         handed: Option<crate::device::Handed>,
-        top_rows: u32,
     ) -> Result<(Context, crate::tuning::Tuning)> {
         let device = match handed {
             Some(handed) => Context::adopt(boot, allowance, handed)?,
@@ -86,9 +85,25 @@ impl Serve for Api {
             tuning,
             boot.profiles.as_deref(),
             crate::rates::STATED_SUBMIT_BOUND,
-            top_rows,
         )?;
         Ok((device, tuning))
+    }
+
+    fn rate_shapes(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        tuning: crate::tuning::Tuning,
+        shapes: &[(u32, u32)],
+        top_rows: u32,
+    ) -> Result<crate::tuning::Tuning> {
+        crate::rates::shapes_at_load(
+            device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::STATED_SUBMIT_BOUND,
+            shapes,
+            top_rows,
+        )
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {

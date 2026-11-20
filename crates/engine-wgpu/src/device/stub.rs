@@ -169,6 +169,10 @@ impl Frame {
         match self.never {}
     }
 
+    pub(crate) fn uniform_room(&self) -> (u64, u64) {
+        match self.never {}
+    }
+
     pub fn commit(self) -> Result<()> {
         match self.never {}
     }

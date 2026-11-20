@@ -48,7 +48,6 @@ pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates
         &tuning,
         crate::rates::STATED_SUBMIT_BOUND,
         &profile::fire::Rates::default(),
-        engine_gpu::rates::TUNED_TOP,
         say,
     )
     .map_err(|e| e.to_string())?;

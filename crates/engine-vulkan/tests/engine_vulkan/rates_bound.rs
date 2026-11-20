@@ -1,11 +1,13 @@
-//! The rates step under a bound on one submission, as a phone states one:
-//! simulated here on whatever device the suite opens. No frame it submits
+//! The rates steps under a bound on one submission, as a phone states one:
+//! simulated here on whatever device the suite opens. No frame they submit
 //! passes the bound on the device (its timestamps: a frame queued behind
-//! others waits for them on the host, not on the device), the kernels' curves stop before a fire that would, and
-//! where and why each stopped is said, so a load does not time them again.
+//! others waits for them on the host, not on the device); each dense
+//! kernel's curve at a model's planes stops before a fire that would, and
+//! where and why each stopped is kept with it, so a load does not time it
+//! again.
 
 use engine_vulkan::device::{Api, Context, Frame};
-use profile::fire::{KernelStop, Rates};
+use profile::fire::Rates;
 
 /// A bound tight enough that the slowest kernels' curves stop short of the
 /// rows asked: 25 ms a submission.
@@ -44,8 +46,8 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         longest.set(longest.get().max(span));
         Ok((None, ns))
     };
-    // Every rate but the kernels' curves stated: only those are timed. The
-    // bandwidth (a first fire's estimate) is a desktop GPU's.
+    // The device's rates the shapes' step reads (its launch and bandwidth
+    // a desktop GPU's), the attention prefix curve measured under the bound.
     let stated = Rates {
         launch_ns: Some(4000),
         gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
@@ -55,18 +57,40 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         scan_gelems: Some(100.0),
         ..Rates::default()
     };
-    let measured = engine_gpu::rates::measure_saying::<Api, _>(
+    let say = &mut |line: &str| eprintln!("{line}");
+    engine_gpu::rates::measure_saying::<Api, _>(
         &device,
         &tuning,
         tier,
         &timer,
         Some(BOUND),
         &stated,
-        TOP,
-        &mut |line| eprintln!("{line}"),
+        say,
     )
-    .expect("the rates step lands under the bound");
-    let rates = measured.rates;
+    .expect("the device's rates step lands under the bound");
+    // A model's planes: a 1024-wide layer's and its output head's.
+    let shapes = [(3072, 1024), (1024, 3072), (151_936, 1024)];
+    let kernels =
+        engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, TOP);
+    let wanted = engine_gpu::rates::lacking(
+        kernels_slang::Target::Spirv,
+        &kernels,
+        &stated,
+        &shapes,
+        TOP,
+    );
+    let curves = engine_gpu::rates::measure_shapes::<Api, _>(
+        &device,
+        &tuning,
+        tier,
+        &timer,
+        Some(BOUND),
+        &stated,
+        &wanted,
+        TOP,
+        say,
+    )
+    .expect("the shapes' step lands under the bound");
     let longest = longest
         .get()
         .max(engine_vulkan::encode::take_longest_frame_span_ns());
@@ -74,32 +98,37 @@ fn the_rates_step_stays_under_a_simulated_bound() {
     assert!(longest > 0, "the device's timestamps timed no frame");
     assert!(
         longest <= BOUND.as_nanos() as u64,
-        "a frame of the step ran {:.1} ms on the device, past the {:.0} ms bound",
+        "a frame of the steps ran {:.1} ms on the device, past the {:.0} ms bound",
         longest as f64 / 1e6,
         BOUND.as_secs_f64() * 1e3
     );
-    assert_eq!(rates.kernels_timed_to, Some(TOP));
-    let stops = rates
-        .kernel_stops
-        .expect("where the curves stopped is said");
-    let curves = |c: &Option<Vec<(u32, Vec<(u32, f64)>)>>| c.clone().unwrap_or_default();
-    for (kind, curves) in [
-        (KernelStop::VECTOR, curves(&rates.vector_tflops_by_rows)),
-        (KernelStop::TILE, curves(&rates.tile_tflops_by_rows)),
-    ] {
-        for (key, curve) in curves {
-            let reach = curve.last().map_or(0, |&(rows, _)| rows);
-            let stop = stops.iter().find(|s| s.kind == kind && s.key == key);
-            match stop {
-                Some(stop) => assert!(stop.rows > reach, "{kind}/{key}: stop {stop:?} at {reach}"),
-                None => assert_eq!(reach, TOP, "{kind}/{key} ends at {reach}, no stop said"),
+    assert_eq!(curves.len(), wanted.len());
+    let mut stopped = 0;
+    for c in &curves {
+        let reach = c.curve.last().map_or(0, |&(rows, _)| rows);
+        match c.stop {
+            Some((at, _)) => {
+                assert!(at > reach, "{c:?}");
+                stopped += 1;
             }
+            None => assert_eq!(reach, TOP, "{c:?} ends short with no stop"),
         }
+        assert!(c.serves(TOP));
     }
+    // A load of these shapes, the curves saved, times nothing again.
+    let saved = Rates {
+        kernel_tflops_by_shape: Some(curves),
+        ..stated
+    };
+    assert!(
+        engine_gpu::rates::lacking(kernels_slang::Target::Spirv, &kernels, &saved, &shapes, TOP)
+            .is_empty()
+    );
     eprintln!(
-        "longest frame on the device {:.1} ms (on the host, queue included, {:.1} ms); stops \
-         {stops:?}",
+        "longest frame on the device {:.1} ms (on the host, queue included, {:.1} ms); {stopped} \
+         of {} curves stopped",
         longest as f64 / 1e6,
-        worst.get() as f64 / 1e6
+        worst.get() as f64 / 1e6,
+        saved.kernel_tflops_by_shape.as_ref().map_or(0, Vec::len)
     );
 }

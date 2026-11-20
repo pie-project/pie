@@ -1125,14 +1125,6 @@ impl<'a> Walk<'a> {
                     rates.gemm_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
-                key @ "tile_tflops_by_rows" => {
-                    rates.tile_tflops_by_rows = self.width_curves(v, key);
-                    continue;
-                }
-                key @ "vector_tflops_by_rows" => {
-                    rates.vector_tflops_by_rows = self.width_curves(v, key);
-                    continue;
-                }
                 key @ crate::fire::ATTN_BY_ROWS_KEYS => {
                     rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
                     continue;
@@ -1145,24 +1137,8 @@ impl<'a> Walk<'a> {
                     rates.product_ns = self.product_times(v);
                     continue;
                 }
-                "kernel_stops" => {
-                    rates.kernel_stops = self.kernel_stops(v);
-                    continue;
-                }
-                "kernels_timed_to" => {
-                    match int(v.get_ref())
-                        .and_then(|i| u32::try_from(i).ok())
-                        .filter(|&r| r > 0)
-                    {
-                        Some(rows) => rates.kernels_timed_to = Some(rows),
-                        None => self.err(
-                            v.span().start,
-                            format!(
-                                "`rates.kernels_timed_to` is a whole number of rows, not {}",
-                                found(v.get_ref())
-                            ),
-                        ),
-                    }
+                "kernel_tflops_by_shape" => {
+                    rates.kernel_tflops_by_shape = self.kernel_curves(v);
                     continue;
                 }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
@@ -1195,9 +1171,8 @@ impl<'a> Walk<'a> {
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
-                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
-                             `submit_worst_ratio`, `attn_tflops_by_rows_keys`, `kernels_timed_to` \
-                             and `kernel_stops`, not `{other}`"
+                             `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys` and \
+                             `kernel_tflops_by_shape`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1221,52 +1196,6 @@ impl<'a> Walk<'a> {
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
     /// whole numbers then a positive time and a spread at least zero, no
     /// shape twice.
-    /// `rates.kernel_stops`: a list of `[kind, key, rows, why]`, whole
-    /// numbers each.
-    fn kernel_stops(
-        &mut self,
-        value: &Spanned<DeValue<'_>>,
-    ) -> Option<Vec<crate::fire::KernelStop>> {
-        let what = "`rates.kernel_stops` is a list of [kind, key, rows, why], whole numbers";
-        let DeValue::Array(entries) = value.get_ref() else {
-            self.err(
-                value.span().start,
-                format!("{what}, not {}", found(value.get_ref())),
-            );
-            return None;
-        };
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries.iter() {
-            let parsed = match entry.get_ref() {
-                DeValue::Array(f) if f.len() == 4 => {
-                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
-                    match (whole(0), whole(1), whole(2), whole(3)) {
-                        (Some(kind), Some(key), Some(rows), Some(why)) => {
-                            Some(crate::fire::KernelStop {
-                                kind,
-                                key,
-                                rows,
-                                why,
-                            })
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            match parsed {
-                Some(stop) => out.push(stop),
-                None => {
-                    self.err(
-                        entry.span().start,
-                        format!("{what}, not {}", found(entry.get_ref())),
-                    );
-                    return None;
-                }
-            }
-        }
-        Some(out)
-    }
 
     fn product_times(
         &mut self,
@@ -1338,8 +1267,67 @@ impl<'a> Walk<'a> {
         Some(out)
     }
 
-    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,
-    /// `vector_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
+    /// `rates.kernel_tflops_by_shape`: a list of `[kind, key, n, k, stopped
+    /// at rows, why, curve]`, whole numbers then a curve of `[rows, TFLOP/s]`
+    /// ascending in rows; no kernel and shape twice; a stop of `0, 0` is none.
+    fn kernel_curves(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::fire::KernelCurve>> {
+        let what = "`rates.kernel_tflops_by_shape` is a list of [kind, key, n, k, stopped at \
+                    rows, why, [[rows, TFLOP/s], ...]], no kernel and shape twice";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<crate::fire::KernelCurve> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let fields = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 7 => {
+                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    match (whole(0), whole(1), whole(2), whole(3), whole(4), whole(5)) {
+                        (Some(kind), Some(key), Some(n), Some(k), Some(at), Some(why))
+                            if n > 0 && k > 0 && (at == 0) == (why == 0) =>
+                        {
+                            Some((kind, key, n, k, (at > 0).then_some((at, why)), &f[6]))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some((kind, key, n, k, stop, points)) = fields
+                .filter(|&(kind, key, n, k, ..)| out.iter().all(|c| c.id() != (kind, key, n, k)))
+            else {
+                self.err(
+                    entry.span().start,
+                    format!("{what}, not {}", found(entry.get_ref())),
+                );
+                return None;
+            };
+            // A curve stopped at its first rows holds no point.
+            let empty = matches!(points.get_ref(), DeValue::Array(p) if p.is_empty());
+            let curve = if empty && stop.is_some() {
+                Vec::new()
+            } else {
+                self.curve(points, "kernel_tflops_by_shape")?
+            };
+            out.push(crate::fire::KernelCurve {
+                kind,
+                key,
+                n,
+                k,
+                curve,
+                stop,
+            });
+        }
+        Some(out)
+    }
+
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
     /// pairs, a whole positive outer key (a width, a row tile, rows) and a
     /// curve of `[x, TFLOP/s]` each, strictly ascending in the outer key.
     fn width_curves(

@@ -104,18 +104,27 @@ pub trait Serve: Backend {
     /// binding's offset.
     fn table_align(device: &Self::Context) -> u64;
 
-    /// Opens the device (adopting `handed` where the host handed one) and
-    /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
-    /// which the load takes no more than `allowance` caps, and its tuning,
-    /// its rates reaching `top_rows`, the most rows a fire of the load may
-    /// bring.
+    /// which the load takes no more than `allowance` caps, and its tuning.
     fn open(
         boot: &Self::DeviceBoot,
         allowance: engine::Allowance,
         handed: Option<Self::Handed>,
-        top_rows: u32,
     ) -> Result<(Self::Context, Self::Tuning)>;
+
+    /// `tuning` with each dense kernel's rate curve at each of the model's
+    /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
+    /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
+    /// those its profile lacks measured now, on `device`, and saved with the
+    /// device's rates (`crate::rates::measure_shapes`); what the dense
+    /// matmul's kernel at each rung is chosen by (`crate::dense`).
+    fn rate_shapes(
+        device: &Self::Context,
+        boot: &Self::DeviceBoot,
+        tuning: Self::Tuning,
+        shapes: &[(u32, u32)],
+        top_rows: u32,
+    ) -> Result<Self::Tuning>;
 
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
@@ -892,12 +901,7 @@ impl<B: Serve> Shell<B> {
     /// device binds.
     fn fit(boot: Boot<'_, B>) -> Result<(Boot<'_, B>, Fitted<B>)> {
         let mut boot = boot;
-        let (device, mut tuning) = B::open(
-            boot.device,
-            boot.residency.device,
-            boot.handed.take(),
-            boot.budget.max_tokens.max(1),
-        )?;
+        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
@@ -907,6 +911,23 @@ impl<B: Serve> Shell<B> {
             ..boot
         };
         B::admit(&device, &mut tuning, tier, &boot.trace)?;
+        // Each dense kernel's curve at the model's own planes, to the most
+        // rows a fire of the load brings: what its dense kernel at each rung
+        // is chosen by (`crate::dense`), for the naming walk and the load
+        // alike.
+        if tuning.profile().rates().complete(&crate::rates::KEYS) {
+            let shapes: Vec<(u32, u32)> = crate::dense::planes(&crate::top::counts(&boot.trace)?)
+                .into_iter()
+                .map(|(n, k, ..)| (n, k))
+                .collect();
+            tuning = B::rate_shapes(
+                &device,
+                boot.device,
+                tuning,
+                &shapes,
+                boot.budget.max_tokens.max(1),
+            )?;
+        }
 
         let profile = boot
             .profile
@@ -1207,13 +1228,13 @@ impl<B: Serve> Shell<B> {
         // feasible rungs to the estimate's fire top (its argmax over the
         // lattice to the context, `FireEstimate::fire_top`); a fire never
         // runs past the pick.
-        let device_profile = tuning.profile().clone();
-        let rated = device_profile.rates().complete(&crate::rates::KEYS);
+        let rated = tuning.profile().rates().complete(&crate::rates::KEYS);
         let counts = if rated {
             Some(crate::top::counts(&boot.trace)?)
         } else {
             None
         };
+        let device_profile = tuning.profile().clone();
         // The live range the ruling weighs a span against: the pool the room
         // leaves past one working set at the declared context, bound in the
         // segments the kernels bind.
@@ -1311,7 +1332,8 @@ impl<B: Serve> Shell<B> {
             .map_err(|why| Fault::Unbound { what: why })?;
             if class_outputs.is_empty() {
                 return Err(Fault::Unbound {
-                    what: "no output, so a fire would compute nothing a reader can take".to_string(),
+                    what: "no output, so a fire would compute nothing a reader can take"
+                        .to_string(),
                 });
             }
             let float = |out: &&poem_exec::feeds::ClassOutput| {
@@ -1339,14 +1361,14 @@ impl<B: Serve> Shell<B> {
                     readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
                 };
                 let rect_of = |value: ValueId, name: &str| {
-                    poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| {
-                        Fault::Unbound {
+                    poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(
+                        || Fault::Unbound {
                             what: format!(
                                 "value {}, of output `{name}`, which the carve gave no rectangle",
                                 value.0
                             ),
-                        }
-                    })
+                        },
+                    )
                 };
                 let mut readouts = Vec::new();
                 let mut pixels = Vec::new();
@@ -1436,7 +1458,10 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| {
                     let (seat, store) = reserved(rung.tokens);
-                    (rung.tokens, rung.bytes().max(seat).max(pixel_bytes).max(store))
+                    (
+                        rung.tokens,
+                        rung.bytes().max(seat).max(pixel_bytes).max(store),
+                    )
                 })
                 .collect();
             // Each rung as the pool weighs it: the span's chunks, the room
@@ -1467,7 +1492,13 @@ impl<B: Serve> Shell<B> {
                     .iter()
                     .find(|rung| rung.tokens == tokens)
                     .and_then(|rung| {
-                        crate::store::pool::infeasible(rung, kv_budget, chunk, least_chunks, binding)
+                        crate::store::pool::infeasible(
+                            rung,
+                            kv_budget,
+                            chunk,
+                            least_chunks,
+                            binding,
+                        )
                     })
             };
             if !said {
@@ -1604,13 +1635,8 @@ impl<B: Serve> Shell<B> {
                 .copied()
                 .filter(|rung| laid.is_none_or(|laid| rung.tokens <= laid))
                 .collect();
-            let widest = crate::store::pool::widest_rung(
-                &held,
-                kv_budget,
-                chunk,
-                least_chunks,
-                binding,
-            );
+            let widest =
+                crate::store::pool::widest_rung(&held, kv_budget, chunk, least_chunks, binding);
             match widest {
                 Some(widest) if widest < top => {
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
@@ -1678,7 +1704,10 @@ impl<B: Serve> Shell<B> {
                     prefixed: prefixed
                         .into_iter()
                         .map(|(rows, curve)| {
-                            (rows, curve.into_iter().map(|(keys, t)| (keys, t * 1e3)).collect())
+                            (
+                                rows,
+                                curve.into_iter().map(|(keys, t)| (keys, t * 1e3)).collect(),
+                            )
                         })
                         .collect(),
                     bound_ns: bound.as_nanos() as f64,
@@ -1722,12 +1751,20 @@ impl<B: Serve> Shell<B> {
                         poem_ir::Attn::Prefill {
                             mask: Some(_),
                             bias: None,
-                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
+                            selected: None
+                                | Some(poem_ir::Blocks {
+                                    per_head: false,
+                                    ..
+                                }),
                             ..
                         } | poem_ir::Attn::Decode {
                             mask: Some(_),
                             bias: None,
-                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
+                            selected: None
+                                | Some(poem_ir::Blocks {
+                                    per_head: false,
+                                    ..
+                                }),
                             ..
                         }
                     ))
@@ -1843,8 +1880,12 @@ impl<B: Serve> Shell<B> {
 
         // Sized for what a fire reads out (`readout_seat`); a fire reading
         // more grows its arm's.
-        let readout_bytes =
-            readout_seat(&readouts, &boot.budget, budgets.max_voxels(), span.capture());
+        let readout_bytes = readout_seat(
+            &readouts,
+            &boot.budget,
+            budgets.max_voxels(),
+            span.capture(),
+        );
         let readout = (0..arms)
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
@@ -2529,14 +2570,13 @@ impl<B: Serve> Shell<B> {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        let outputs =
-            poem_exec::feeds::class_outputs(
-                &self.trace,
-                &self.compiled,
-                self.paging().context(),
-                self.paging().page_size,
-            )
-                .unwrap_or_default();
+        let outputs = poem_exec::feeds::class_outputs(
+            &self.trace,
+            &self.compiled,
+            self.paging().context(),
+            self.paging().page_size,
+        )
+        .unwrap_or_default();
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
@@ -2831,7 +2871,10 @@ impl<B: Serve> Shell<B> {
     /// Fires `lanes` and reads back every output their programs read, the
     /// host's rows and those a reader on the device takes alike: each read's
     /// lane, output name and values (widened to f32), in the step's order.
-    pub fn fire_outputs(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<(u32, String, Vec<f32>)>> {
+    pub fn fire_outputs(
+        &mut self,
+        lanes: &[Seated<'_, B>],
+    ) -> Result<Vec<(u32, String, Vec<f32>)>> {
         use engine::frame::Shell as FrameShell;
         if lanes.iter().any(|lane| !lane.refs) {
             let seats = self.pools.seat_segments();
@@ -2859,7 +2902,11 @@ impl<B: Serve> Shell<B> {
         let read: Vec<&ReadSpan> = (layout.iter())
             .filter(|span| span.rows > 0 && span.seated)
             .collect();
-        let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
+        let end = read
+            .iter()
+            .map(|span| span.at + span.bytes())
+            .max()
+            .unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
         Ok(read
@@ -4279,7 +4326,8 @@ impl<B: Serve> Shell<B> {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let staged =
+            crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
@@ -4481,19 +4529,17 @@ impl<B: Serve> Shell<B> {
         }));
         // Each capturing lane's rows by their bases in the score room's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
-        let capture_table = self
-            .span
-            .capture()
-            .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
-        let (readout_rows, readout_layout) =
-            readout_table(
-                &composition,
-                lanes,
-                &self.readouts,
-                &scored,
-                |class| self.readout_for(class),
-                |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
-            )?;
+        let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
+            scored.table(&indptr_host, rows.keys, rows.pages)
+        });
+        let (readout_rows, readout_layout) = readout_table(
+            &composition,
+            lanes,
+            &self.readouts,
+            &scored,
+            |class| self.readout_for(class),
+            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+        )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4587,7 +4633,11 @@ impl<B: Serve> Shell<B> {
             .lanes()
             .iter()
             .enumerate()
-            .filter(|&(lane, _)| scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some())
+            .filter(|&(lane, _)| {
+                scored
+                    .row(u32::try_from(lane).unwrap_or(u32::MAX))
+                    .is_some()
+            })
             .find_map(|(_, row)| lanes[row.source as usize].scores)
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
         // A naming walk fires nothing: its capturing classes' rows bind the
@@ -4597,7 +4647,9 @@ impl<B: Serve> Shell<B> {
             _ => None,
         };
         let room = room.or(named.map(|buffer| (buffer, 0, u64::MAX)));
-        let slots = self.span.slots(&self.handles, rung, fire_rows, scored, room)?;
+        let slots = self
+            .span
+            .slots(&self.handles, rung, fire_rows, scored, room)?;
         self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(
             &self.handles,
@@ -5386,15 +5438,16 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // a source buffer: a pair of barriers each, not one a lane.
         let mut layout = prepared.readout_layout.clone();
         let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>)> = Vec::new();
-        for span in (layout.iter_mut())
-            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        for span in
+            (layout.iter_mut()).filter(|span| span.rows > 0 && (span.seated || span.spanned))
         {
             let plane = &self.readouts[span.plane as usize];
-            let (from, layers) = bases[span.plane as usize]
-                .as_ref()
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!("output `{}`, a read plane of no value", plane.output),
-                })?;
+            let (from, layers) =
+                bases[span.plane as usize]
+                    .as_ref()
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!("output `{}`, a read plane of no value", plane.output),
+                    })?;
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
             let (first, direct) = (span.first, span.direct);
@@ -5426,7 +5479,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             let copies = span_copies(span, layers, row_bytes, source_row)
                 .into_iter()
                 .map(|copy| (copy.from, copy.to, copy.bytes));
-            match regions.iter_mut().find(|(buffer, _)| buffer.slab_id() == from.slab_id()) {
+            match regions
+                .iter_mut()
+                .find(|(buffer, _)| buffer.slab_id() == from.slab_id())
+            {
                 Some((_, list)) => list.extend(copies),
                 None => regions.push((from.clone(), copies.collect())),
             }

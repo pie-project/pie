@@ -1,12 +1,15 @@
 //! The dense matmul's kernel: the vector kernels or one of the tiled ones,
 //! whichever the estimate (`engine::roofline`) weighs fastest over the
-//! model's dense planes, from the device's measured rates: each vector
-//! kernel (by the rows a workgroup carries) at its measured rate at the rows
-//! it lands (`vector_tflops_by_rows`); each tiled kernel at its own measured
-//! rate at the rows it lands (`tile_tflops_by_rows`). A measured rate holds
-//! every weight pass the kernel makes. No kernel is weighed past the rows it
-//! was timed at: it is no candidate there (the rates step times every kernel
-//! to the load's most rows, `crate::rates::reaching`).
+//! model's dense planes, from the device's measured rates: each kernel at
+//! each of the model's own plane shapes at its rate measured there, at the
+//! rows it lands (`kernel_tflops_by_shape`, timed once the model's shapes
+//! are known, `crate::rates::measure_shapes`). A measured rate holds every
+//! weight pass the kernel makes and the occupancy it reaches at that plane.
+//! No kernel is weighed past the rows it was timed at: it is no candidate
+//! there. A plane no kernel was timed at to a rung's rows (every curve at it
+//! stopped short, by the bound or the device's largest buffer) is not
+//! weighed there, nothing telling the kernels apart at it; a rung past every
+//! curve at every plane keeps the rung below's kernel.
 //!
 //! A backend that records its fires (one recording a rung) takes one kernel
 //! a rung, whatever rows a fire of it lands: the one whose worse cost over
@@ -62,6 +65,10 @@ pub struct Weighed {
     pub costs: Vec<(Tactic, f64, f64)>,
     /// The candidate taken (least regret).
     pub taken: usize,
+    /// Whether the rung keeps the rung below's kernel, no kernel timed at
+    /// its rows at any of the model's planes (`costs` holds it alone,
+    /// unpriced).
+    pub held: bool,
 }
 
 impl Weighed {
@@ -96,6 +103,15 @@ impl Weighed {
 
 impl std::fmt::Display for Weighed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.held {
+            return write!(
+                f,
+                "rung {}: {} held from the rung below (no kernel was timed at these rows at any \
+                 of the model's planes)",
+                self.top,
+                name(&self.costs[self.taken].0)
+            );
+        }
         write!(
             f,
             "rung {}: {} by the estimate (",
@@ -141,10 +157,28 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
     }
 }
 
-/// What a load is refused by where no kernel was timed at a rung's rows:
-/// the rates step times every kernel to the load's most rows
-/// (`crate::rates::reaching`), so the key whose curves stop short.
-pub const UNREACHED: &str = "tile_tflops_by_rows";
+/// What a load is refused by where no kernel was timed at its first rung's
+/// rows at any of its planes: the key whose curves it lacks.
+pub const UNREACHED: &str = "kernel_tflops_by_shape";
+
+/// `(n, k, planes, bytes a plane)` of every dense plane a row of the model
+/// `counts` describes reads: each dense shape, and the output head.
+#[must_use]
+pub fn planes(counts: &Counts) -> Vec<(u32, u32, u32, f64)> {
+    let mut planes: Vec<(u32, u32, u32, f64)> = counts
+        .gemm_shapes
+        .iter()
+        .filter(|s| !s.routed && s.planes > 0)
+        .map(|s| (s.n, s.k, s.planes, s.bytes as f64 / f64::from(s.planes)))
+        .collect();
+    if counts.readout_flops > 0 {
+        let depth = counts.readout_depth.max(1);
+        let vocab =
+            u32::try_from(counts.readout_flops / (2 * u64::from(depth))).unwrap_or(u32::MAX);
+        planes.push((vocab, depth, 1, counts.head_bytes as f64));
+    }
+    planes
+}
 
 /// The dense tactic over `rungs` (ascending rows) on `target`, the model's
 /// dense planes (`counts`: every dense shape and the output head, each a
@@ -162,34 +196,15 @@ pub fn choose(
     records: bool,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
-    let vectors = rates
-        .vector_tflops_by_rows
-        .as_ref()
-        .ok_or("vector_tflops_by_rows")?;
-    let tiles = rates
-        .tile_tflops_by_rows
-        .as_ref()
-        .ok_or("tile_tflops_by_rows")?;
-    // `(n, k, planes, bytes a plane)` of every dense plane a row reads.
-    let mut planes: Vec<(u32, u32, u32, f64)> = counts
-        .gemm_shapes
-        .iter()
-        .filter(|s| !s.routed && s.planes > 0)
-        .map(|s| (s.n, s.k, s.planes, s.bytes as f64 / f64::from(s.planes)))
-        .collect();
-    if counts.readout_flops > 0 {
-        let depth = counts.readout_depth.max(1);
-        let vocab =
-            u32::try_from(counts.readout_flops / (2 * u64::from(depth))).unwrap_or(u32::MAX);
-        planes.push((vocab, depth, 1, counts.head_bytes as f64));
-    }
+    let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
+    let planes = planes(counts);
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each
-    // vector kernel measured, and each tiled one.
+    // vector kernel, and each tiled one.
     let candidates = |kernel_rows: u32| -> Vec<Tactic> {
         let base = tiled(kernel_rows);
-        let mut all: Vec<Tactic> = vectors
+        let mut all: Vec<Tactic> = gemm::VECTOR_ROWS
             .iter()
-            .map(|&(rows, _)| Tactic {
+            .map(|&rows| Tactic {
                 vector: rows,
                 ..base
             })
@@ -197,53 +212,64 @@ pub fn choose(
         all.extend(tiled_kernels(target, base));
         all
     };
-    // The time `curves` (keyed `key`) state for `flops` of `rows`, in ns,
-    // where they state the key and reach the rows: the flops over the rate
-    // at the rows, between measured row counts in log rows; below the first
-    // row count timed, that count's time (a kernel takes no less for fewer
-    // rows than it was timed at, so its rate there is not held).
-    let measured =
-        |curves: &[(u32, Vec<(u32, f64)>)], key: u32, rows: u32, flops: &dyn Fn(u32) -> f64| {
-            let (_, curve) = curves.iter().find(|(at, _)| *at == key)?;
-            let (&(first, _), &(most, _)) = (curve.first()?, curve.last()?);
-            if rows > most {
-                return None;
-            }
-            let at = rows.max(first);
-            profile::fire::interpolate(curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
-        };
-    // `tactic`'s cost over every plane at `rows`, in ns: each plane at the
-    // kernel's measured rate at the rows it lands (timed as it runs, every
-    // weight pass it makes and whatever a cache spares it in the time), and
-    // a launch. `None` where its curve does not reach the rows: no kernel is
-    // weighed past the rows it was timed at.
-    let cost = |tactic: Tactic, rows: u32| -> Option<f64> {
-        let mut ns = 0.0;
-        for &(n, k, count, _) in &planes {
-            let flops = |rows: u32| 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
-            let kernel = gemm::tile_for(target, tactic, n, k);
-            let work = if tactic.vector > 0 {
-                measured(vectors, tactic.vector, rows, &flops)?
-            } else {
-                measured(tiles, kernel.row_tile().max(1), rows, &flops)?
-            };
-            ns += f64::from(count) * (c.launch_ns + work);
+    // `tactic`'s time at an `n x k` plane at `rows`, in ns, where its curve
+    // there reaches the rows: the flops over the rate at the rows, between
+    // measured row counts in log rows; below the first row count timed, that
+    // count's time (a kernel takes no less for fewer rows than it was timed
+    // at, so its rate there is not held).
+    let time_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> Option<f64> {
+        let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
+        let curve = &curves.iter().find(|c| c.id() == (kind, key, n, k))?.curve;
+        let (&(first, _), &(most, _)) = (curve.first()?, curve.last()?);
+        if rows > most {
+            return None;
         }
-        Some(ns)
+        let at = rows.max(first);
+        let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
+        profile::fire::interpolate(curve, f64::from(at)).map(|t| flops / (t * 1e3))
+    };
+    // `tactic`'s cost at `rows` over every plane some candidate of `among`
+    // was timed at to the rows, in ns: each at the kernel's rate measured
+    // there (every weight pass it makes and whatever a cache spares it in the
+    // time) and a launch. `None` where its curve at one of them does not
+    // reach the rows, or no plane was timed to them.
+    let cost = |among: &[Tactic], tactic: Tactic, rows: u32| -> Option<f64> {
+        let mut ns = 0.0;
+        let mut weighed = false;
+        for &(n, k, count, _) in &planes {
+            if among.iter().all(|&t| time_at(t, n, k, rows).is_none()) {
+                continue;
+            }
+            ns += f64::from(count) * (c.launch_ns + time_at(tactic, n, k, rows)?);
+            weighed = true;
+        }
+        weighed.then_some(ns)
     };
 
-    let mut by_rows = Vec::new();
+    let mut by_rows: Vec<(u32, Tactic)> = Vec::new();
     let mut weighed = Vec::with_capacity(rungs.len());
     let mut below = 0;
     for &rung in rungs {
         let bottom = (below + 1).min(rung);
+        let among = candidates(rung);
         // The candidates timed over the rung's rows, bottom to top.
-        let costs: Vec<(Tactic, f64, f64)> = candidates(rung)
-            .into_iter()
-            .filter_map(|t| Some((t, cost(t, bottom)?, cost(t, rung)?)))
+        let costs: Vec<(Tactic, f64, f64)> = among
+            .iter()
+            .filter_map(|&t| Some((t, cost(&among, t, bottom)?, cost(&among, t, rung)?)))
             .collect();
         if costs.is_empty() {
-            return Err(UNREACHED);
+            // Past every curve at every plane: the rung below's kernel.
+            let &(_, kept) = by_rows.last().ok_or(UNREACHED)?;
+            by_rows.push((rung, kept));
+            weighed.push(Weighed {
+                bottom,
+                top: rung,
+                costs: vec![(kept, f64::NAN, f64::NAN)],
+                taken: 0,
+                held: true,
+            });
+            below = rung;
+            continue;
         }
         let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
         let taken = Weighed::least_regret(&costs, &rows_of);
@@ -251,11 +277,13 @@ pub fn choose(
             by_rows.push((rung, costs[taken].0));
         } else {
             for rows in bottom..=rung {
-                let fastest = candidates(rows)
-                    .into_iter()
-                    .filter_map(|t| Some((t, cost(t, rows)?)))
+                let among = candidates(rows);
+                let fastest = among
+                    .iter()
+                    .filter_map(|&t| Some((t, cost(&among, t, rows)?)))
                     .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))))
                     .map(|(t, _)| t)
+                    .or_else(|| by_rows.last().map(|&(_, t)| t))
                     .ok_or(UNREACHED)?;
                 by_rows.push((rows, fastest));
             }
@@ -265,6 +293,7 @@ pub fn choose(
             top: rung,
             costs,
             taken,
+            held: false,
         });
         below = rung;
     }
@@ -300,23 +329,57 @@ mod tests {
         }
     }
 
+    /// A kernel's curve at the 4096-square planes of [`counts`].
+    fn at_4096(kind: u32, key: u32, curve: Vec<(u32, f64)>) -> profile::fire::KernelCurve {
+        profile::fire::KernelCurve {
+            kind,
+            key,
+            n: 4096,
+            k: 4096,
+            curve,
+            stop: None,
+        }
+    }
+
+    /// `r` with its vector kernels' curves at 4096 square `vectors`, `(rows a
+    /// workgroup carries, curve)`.
+    fn set_vectors(r: &mut profile::fire::Rates, vectors: Vec<(u32, Vec<(u32, f64)>)>) {
+        let curves = r.kernel_tflops_by_shape.get_or_insert_with(Vec::new);
+        curves.retain(|c| c.kind != profile::fire::KernelCurve::VECTOR);
+        curves.extend(
+            vectors
+                .into_iter()
+                .map(|(rows, curve)| at_4096(profile::fire::KernelCurve::VECTOR, rows, curve)),
+        );
+    }
+
     /// Rates whose vector kernels run at `few` TFLOP/s at every rows (none
-    /// stated where `None`) and tiled kernels at `tiles` below the curve.
+    /// stated where `None`) and tiled kernels at `tiles` (by row tile), all
+    /// at [`counts`]' 4096-square planes.
     fn rates(few: Option<f64>, tiles: Vec<(u32, Vec<(u32, f64)>)>) -> profile::fire::Rates {
-        profile::fire::Rates {
+        let mut r = profile::fire::Rates {
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (2048, 30.0)])]),
             hbm_gbps: Some(650.0),
             cached_gbps: None,
             elementwise_gbps: Some(700.0),
-            vector_tflops_by_rows: few.map(|t| {
+            kernel_tflops_by_shape: Some(
+                tiles
+                    .into_iter()
+                    .map(|(tile, curve)| at_4096(profile::fire::KernelCurve::TILE, tile, curve))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        if let Some(t) = few {
+            set_vectors(
+                &mut r,
                 gemm::VECTOR_ROWS
                     .map(|rows| (rows, vec![(1, t), (8192, t)]))
-                    .to_vec()
-            }),
-            tile_tflops_by_rows: Some(tiles),
-            ..Default::default()
+                    .to_vec(),
+            );
         }
+        r
     }
 
     /// A coopmat tile measured at a sixtieth of the curve's rate at 4 rows,
@@ -394,23 +457,81 @@ mod tests {
         assert_eq!(weighed[1].costs.len(), gemm::VECTOR_ROWS.len() + 2);
     }
 
-    /// A profile stating no vector rate, or no tiled kernel's, is refused by
-    /// its key.
+    /// A profile stating no kernel's curve, or none at the model's planes,
+    /// is refused by the key; one stating the tiled kernel's alone picks it.
     #[test]
     fn a_missing_rate_is_refused_by_its_key() {
-        let refused = choose(
+        let mut none = rates(Some(5.0), coopmat_tiles());
+        none.kernel_tflops_by_shape = None;
+        let refused = choose(Target::Spirv, &[1, 2], coopmat, &none, &counts(), true);
+        assert_eq!(refused.unwrap_err(), "kernel_tflops_by_shape");
+        let mut elsewhere = rates(Some(5.0), coopmat_tiles());
+        for c in elsewhere.kernel_tflops_by_shape.iter_mut().flatten() {
+            c.n = 1024;
+        }
+        let refused = choose(Target::Spirv, &[1, 2], coopmat, &elsewhere, &counts(), true);
+        assert_eq!(refused.unwrap_err(), UNREACHED);
+        let (dense, _) = choose(
             Target::Spirv,
             &[1, 2],
             coopmat,
             &rates(None, coopmat_tiles()),
             &counts(),
             true,
-        );
-        assert_eq!(refused.unwrap_err(), "vector_tflops_by_rows");
-        let mut no_tiles = rates(Some(5.0), coopmat_tiles());
-        no_tiles.tile_tflops_by_rows = None;
-        let refused = choose(Target::Spirv, &[1, 2], coopmat, &no_tiles, &counts(), true);
-        assert_eq!(refused.unwrap_err(), "tile_tflops_by_rows");
+        )
+        .unwrap();
+        assert_eq!(dense.at(1).vector, 0);
+    }
+
+    /// Each kernel is weighed at the model's own planes: where the narrow
+    /// tile measures faster at a 1024-wide plane than the wide one, a model
+    /// of such planes takes it, whatever the kernels measure at planes the
+    /// model does not hold (Qwen3-0.6B on the L40S's wgpu: the wide tile 2.5x
+    /// faster at 4096 square, the narrow faster at its own planes).
+    #[test]
+    fn each_kernel_is_weighed_at_the_models_own_planes() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let shape = |n, k| engine::load::GemmShape {
+            planes: 28,
+            ..engine::load::GemmShape::dense(n, k, 2 * u64::from(n * k), 2 * u64::from(n * k))
+        };
+        let model = Counts {
+            gemm_shapes: vec![shape(1024, 3072), shape(3072, 1024)],
+            ..counts()
+        };
+        let curve = |kind, key, n, k, rate: f64| profile::fire::KernelCurve {
+            kind,
+            key,
+            n,
+            k,
+            curve: vec![(1, rate / 100.0), (512, rate)],
+            stop: None,
+        };
+        let tile =
+            |wide, n, k| crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..tiled(0) }, n, k).1;
+        let tag = profile::fire::KernelCurve::TILE;
+        let mut curves = Vec::new();
+        for (n, k) in [(1024, 3072), (3072, 1024)] {
+            curves.push(curve(tag, tile(false, n, k), n, k, 9.0));
+            curves.push(curve(tag, tile(true, n, k), n, k, 6.0));
+            for rows in gemm::VECTOR_ROWS {
+                curves.push(curve(profile::fire::KernelCurve::VECTOR, rows, n, k, 0.5));
+            }
+        }
+        // At 4096 square, not a plane of the model: the wide tile far ahead.
+        curves.push(curve(tag, tile(true, 4096, 4096), 4096, 4096, 16.0));
+        curves.push(curve(tag, tile(false, 4096, 4096), 4096, 4096, 6.4));
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let (dense, weighed) = choose(Target::Wgsl, &[512], tiled, &r, &model, true).unwrap();
+        let at = dense.at(512);
+        assert!(at.vector == 0 && !at.wide, "{}", weighed[0]);
     }
 
     /// A fire fired eagerly takes the fastest kernel at its own rows.
@@ -464,10 +585,13 @@ mod tests {
     #[test]
     fn a_measured_rate_holds_the_passes_a_cache_spares() {
         let mut r = rates(Some(1.0), coopmat_tiles());
-        r.vector_tflops_by_rows = Some(vec![
-            (1, vec![(1, 1.0), (4, 4.0), (256, 4.0)]),
-            (4, vec![(1, 1.0), (4, 3.0), (256, 12.0)]),
-        ]);
+        set_vectors(
+            &mut r,
+            vec![
+                (1, vec![(1, 1.0), (4, 4.0), (256, 4.0)]),
+                (4, vec![(1, 1.0), (4, 3.0), (256, 12.0)]),
+            ],
+        );
         let (eager, _) = choose(Target::Wgsl, &[1, 2, 4], coopmat, &r, &counts(), false).unwrap();
         assert_eq!(eager.at(3).vector, 1);
     }
@@ -494,8 +618,9 @@ mod tests {
     }
 
     /// A tiled kernel whose curve stops short of a rung is no candidate
-    /// there (no pick from a rate it was never timed at), and a profile whose
-    /// curves all stop short of the load's most rows has them measured again.
+    /// there (no pick from a rate it was never timed at); a rung past every
+    /// curve keeps the rung below's kernel, and a first rung past them all
+    /// is refused by name.
     #[test]
     fn a_curve_that_stops_short_is_no_candidate_past_it() {
         let baseline = |_| Tactic {
@@ -510,7 +635,7 @@ mod tests {
             (256, vec![(1, 0.1), (256, 5.0), (4096, 8.0)]),
         ];
         let mut r = rates(Some(0.01), tiles);
-        r.vector_tflops_by_rows = Some(vec![(4, vec![(1, 0.01), (4096, 0.01)])]);
+        set_vectors(&mut r, vec![(4, vec![(1, 0.01), (4096, 0.01)])]);
         let (dense, weighed) = choose(
             Target::Spirv,
             &[256, 512, 1024],
@@ -525,22 +650,17 @@ mod tests {
             assert!(dense.at(rows).wide, "{rows}: {weighed:?}");
         }
         assert!(weighed[1].costs.iter().all(|c| c.0.wide || c.0.vector > 0));
-        // No kernel timed at 8192 rows: refused by name.
+        // No kernel timed at 8192 rows: the rung keeps 4096's; alone, it is
+        // refused by name.
+        let (dense, weighed) =
+            choose(Target::Spirv, &[4096, 8192], baseline, &r, &counts(), true).unwrap();
+        assert_eq!(dense.at(8192), dense.at(4096));
+        assert!(
+            weighed[1].held && weighed[1].to_string().contains("held"),
+            "{}",
+            weighed[1]
+        );
         let refused = choose(Target::Spirv, &[8192], baseline, &r, &counts(), true);
         assert_eq!(refused.unwrap_err(), UNREACHED);
-        // A profile timed to 4096 rows has its curves measured again for a
-        // load of 8192; to 4096 it keeps them.
-        let mut tuned = profile::fire::Tuned::default();
-        tuned.rates = profile::fire::Rates {
-            kernels_timed_to: Some(4096),
-            ..r
-        };
-        let chip = profile::Registry::new("test", &[], &[])
-            .defaults()
-            .with_tuned(tuned);
-        let again = crate::rates::reaching(chip.clone(), 8192).rates();
-        assert!(again.tile_tflops_by_rows.is_none() && again.vector_tflops_by_rows.is_none());
-        let kept = crate::rates::reaching(chip, 4096).rates();
-        assert!(kept.tile_tflops_by_rows.is_some() && kept.vector_tflops_by_rows.is_some());
     }
 }

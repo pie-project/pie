@@ -415,9 +415,18 @@ impl<B: Serve> Serve for Named<B> {
         _boot: &B::DeviceBoot,
         _allowance: engine::Allowance,
         _handed: Option<B::Handed>,
-        _top_rows: u32,
     ) -> Result<(Facts, B::Tuning)> {
         Err(Fault::Deviceless)
+    }
+
+    fn rate_shapes(
+        _device: &Facts,
+        _boot: &B::DeviceBoot,
+        tuning: B::Tuning,
+        _shapes: &[(u32, u32)],
+        _top_rows: u32,
+    ) -> Result<B::Tuning> {
+        Ok(tuning)
     }
 
     fn chunk_bytes(boot: &B::DeviceBoot) -> Option<u64> {

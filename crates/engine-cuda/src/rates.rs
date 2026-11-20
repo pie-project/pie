@@ -66,7 +66,7 @@ use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
 use profile::fire::Rates;
 
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
-/// `profile::fire::KEYS`, all but the slang backends' `tile_tflops_by_rows` and `vector_tflops_by_rows`):
+/// `profile::fire::KEYS`, every one):
 /// what a load whose profile lacks one measures.
 #[cfg(not(feature = "rocm"))]
 pub const KEYS: [&str; 8] = [
@@ -584,11 +584,8 @@ mod on_device {
                 workgroups_per_core: Some(f64::from(resident)),
                 submit_worst_ratio: None,
                 attn_tflops_by_rows_keys: None,
-                tile_tflops_by_rows: None,
-                vector_tflops_by_rows: None,
                 product_ns: None,
-                kernels_timed_to: None,
-                kernel_stops: None,
+                kernel_tflops_by_shape: None,
             },
             attn_by_dim,
         })
@@ -1183,11 +1180,8 @@ mod ensure_tests {
             workgroups_per_core: Some(4.0),
             submit_worst_ratio: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: None,
-            vector_tflops_by_rows: None,
             product_ns: None,
-            kernels_timed_to: None,
-            kernel_stops: None,
+            kernel_tflops_by_shape: None,
         }
     }
 
