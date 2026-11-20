@@ -256,6 +256,25 @@ impl Gpu {
 
 /// The tiers a kernel with a subgroup form is checked at: its subgroup form
 /// is SPIR-V's.
+/// A window's query CSR at int `at` of a table whose other ints are zero
+/// (a scan blind to `at` reads empty requests there): `at` 0 is the CSR
+/// alone, a later one a window's cut of the fire's packed table.
+pub fn csr_at(gpu: &mut Gpu, indptr: &[i32], at: usize) -> kernels_slang::ssm::Csr {
+    let mut table = vec![0i32; at];
+    table.extend_from_slice(indptr);
+    table.extend_from_slice(&[0; 3]);
+    let buf = gpu.up_i32(&table);
+    kernels_slang::ssm::Csr {
+        table: kernels_slang::Tensor::new(buf, table.len() as u32, 1, poem_ir::Dtype::I32),
+        at: at as u32,
+        lanes: indptr.len() as u32 - 1,
+    }
+}
+
+/// The ints a scan's CSR is placed at in the suite: alone, and as a
+/// window's cut of a packed table.
+pub const CSR_AT: [usize; 2] = [0, 5];
+
 pub fn tiers() -> &'static [kernels_slang::Tier] {
     if crate::backend::SPIRV {
         &[kernels_slang::Tier::Baseline, kernels_slang::Tier::Subgroup]

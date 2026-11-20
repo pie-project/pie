@@ -1802,6 +1802,47 @@ impl Shell {
         })
     }
 
+    /// The decode lanes a fire beside prompt rows is laid with: the warm
+    /// ladder's largest decode rung, the lanes left beside the smallest
+    /// prompt rung (`mixed_host_rung`) on the seats held. A mixed fire of
+    /// as many decodes or fewer pads them to it, so one program a row
+    /// bucket and prompt rung holds every decode count.
+    pub(crate) fn mixed_decode_capacity(&self) -> u32 {
+        let pad = self.pad;
+        let lanes_cap = self
+            .budgets
+            .tokens
+            .max_lanes
+            .saturating_sub(pad.mixed_host_rung)
+            .min(self.held.len() as u32);
+        let top = pad.rung(lanes_cap);
+        self.budgets
+            .tokens
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&d| d <= top && pad.rung(d) == d)
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// The decode lanes beside `prompt_lanes` prompt lanes (their rung, the
+    /// rest lane counted): the largest decode rung within the capacity
+    /// ([`Self::mixed_decode_capacity`]) that fits in the lanes they leave.
+    pub(crate) fn mixed_decode_lanes(&self, prompt_lanes: u32) -> u32 {
+        let pad = self.pad;
+        let left = self.budgets.tokens.max_lanes.saturating_sub(prompt_lanes);
+        let cap = self.mixed_decode_capacity().min(left);
+        self.budgets
+            .tokens
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&d| d <= cap && pad.rung(d) == d)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();
@@ -1888,9 +1929,16 @@ impl Shell {
             .tokens
             .max_lanes
             .saturating_sub(pad.rung(by[host].2 + 1).max(host_floor));
-        for (at, &(_, word, n, _)) in by.iter().enumerate() {
+        // A fire's decodes beside its prompt rows (a class of one row a lane)
+        // pad to the decode lanes their prompts' rung leaves
+        // (`mixed_decode_lanes`): every decode count up to it then shares the
+        // bucket's program at that prompt rung.
+        let beside = self.mixed_decode_lanes(pad.rung(by[host].2 + 1).max(host_floor));
+        for (at, &(_, word, n, rows)) in by.iter().enumerate() {
             let want = if at == host {
                 pad.rung(n + 1).max(host_floor) - 1
+            } else if mixed && rows == n && n <= beside {
+                beside
             } else if by.len() == 2 && pad.rung(n) > left && n <= left {
                 left
             } else {

@@ -35,14 +35,16 @@ pub fn step_stride(align: u64) -> u64 {
     u64::from(wgsl::STEP_BYTES).max(align).next_power_of_two()
 }
 
-/// A stage's step records, `stride` apart, in dispatch order, each with the
-/// instance's `bases`.
+/// A stage's step records, `stride` apart, in dispatch order, each with its
+/// node's area of `areas` (`StageTables::areas`) and the instance's
+/// `bases`.
 #[must_use]
-pub fn step_records(steps: &[wgsl::Step], stride: u64, bases: Bases) -> Vec<u8> {
+pub fn step_records(steps: &[wgsl::Step], areas: &[u32], stride: u64, bases: Bases) -> Vec<u8> {
     let stride = usize::try_from(stride).expect("a step stride fits the host");
     let mut bytes = vec![0u8; steps.len().max(1) * stride];
     for (at, step) in steps.iter().enumerate() {
-        let record = step.uniform().bytes(bases);
+        let area = areas.get(step.node as usize).copied().unwrap_or(0);
+        let record = step.uniform(area).bytes(bases);
         bytes[at * stride..at * stride + record.len()].copy_from_slice(&record);
     }
     bytes

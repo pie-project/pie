@@ -274,6 +274,59 @@ pub struct Gpu<B: Host> {
 }
 
 impl<B: Host> Gpu<B> {
+    /// `step` held to the platform's bound on one submission, where the
+    /// load states one (`crate::submit`): the shell told to walk it a layer
+    /// at a time where it is past the bound whole, and its lanes' refusal,
+    /// by name, where it is past it even so (its prompt lanes', or every
+    /// lane's where it carries no prompt). `None` where it is admitted.
+    fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
+        let shell = self.shell.as_mut()?;
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        let admitted = held.admit(rows);
+        let (whole, per_layer) = held.step_ns(rows);
+        tracing::debug!(
+            frame = at.frame.0,
+            step = at.step,
+            rows = rows.rows,
+            lanes = rows.lanes,
+            keys = rows.keys,
+            prompt = rows.prompt,
+            rung = held.rung_of(rows.rows),
+            estimate_ms = whole / 1e6,
+            per_layer_ms = per_layer / 1e6,
+            worst = held.worst,
+            bound_ms = held.bound_ns / 1e6,
+            split = admitted.split(),
+            refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
+            "submit bound: a step admitted"
+        );
+        if let crate::submit::Admitted::Refused { .. } = admitted {
+            let why = held.refusal(rows, &admitted);
+            tracing::warn!(frame = at.frame.0, step = at.step, %why, "submit bound: a step refused");
+            let prompts: Vec<u32> = (0..step.lanes.len() as u32)
+                .filter(|&lane| step.lanes[lane as usize].rows() > 1)
+                .collect();
+            let lanes = if prompts.is_empty() {
+                (0..step.lanes.len() as u32).collect()
+            } else {
+                prompts
+            };
+            return Some(Error::Lanes(
+                lanes
+                    .into_iter()
+                    .map(|lane| engine::LaneFault {
+                        lane,
+                        instance: None,
+                        reason: why.clone(),
+                    })
+                    .collect(),
+            ));
+        }
+        shell.split_next(admitted.split());
+        None
+    }
+
     #[must_use]
     pub fn new(boot: B::DeviceBoot, contract_for: ContractFor) -> Gpu<B> {
         Gpu {
@@ -349,6 +402,15 @@ impl<B: Host> Gpu<B> {
         }
     }
 
+    /// Counts the tier moves through the host that waited for the frames in
+    /// flight ([`engine::live::Tally::Drained`]).
+    fn count_drained(&mut self) {
+        let drained = self.shell.as_mut().map_or(0, Shell::drained_serving);
+        if drained > 0 {
+            self.live.tally(engine::live::Tally::Drained, drained);
+        }
+    }
+
     /// The guest pipelines built since the last count, which this one takes.
     fn guest_built_since(&mut self) -> u64 {
         let guest = self.programs.built_serving();
@@ -371,6 +433,14 @@ impl<B: Host> Gpu<B> {
                 "a registration built guest pipelines the load did not"
             );
         }
+    }
+
+    /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
+    fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
+        if result.is_err() {
+            self.live.tally(engine::live::Tally::Refused, 1);
+        }
+        result
     }
 
     /// Warns once of a build on a serving fire's path, the graph-capture
@@ -581,6 +651,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
+        | Fault::DeviceLost { .. }
         | Fault::NoDevice { .. }
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
@@ -867,7 +938,13 @@ where
                 max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(max_lanes),
                 max_context: paging.context(),
-                prefill_rows: 0,
+                // Where the platform states a bound on one submission, a
+                // prompt is cut to the widest laid rung whose step at the
+                // context is admitted under it (`crate::submit`).
+                prefill_rows: shell
+                    .submit_bound()
+                    .and_then(|held| held.prefill_rows(paging.context()))
+                    .unwrap_or(0),
                 prefill_lanes: 0,
                 max_readouts,
             },
@@ -1023,9 +1100,12 @@ where
             .landed
             .clone()
             .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
-        self.loaded_mut()?
+        let copied = self
+            .loaded_mut()?
             .copy_slots_landing(copy, landed)
-            .map_err(fault)
+            .map_err(fault);
+        self.count_drained();
+        copied
     }
 
     fn on_landed(&mut self, sink: engine::LandingSink) {
@@ -1033,14 +1113,18 @@ where
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+        let copied = self.loaded_mut()?.copy_slots(copy).map_err(fault);
+        self.count_drained();
+        copied
     }
 
     fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
     ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+        let read = self.loaded_mut()?.read_tier_slots(slots).map_err(fault);
+        self.count_drained();
+        read
     }
 
     fn write_tier_slots(
@@ -1048,9 +1132,12 @@ where
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
     ) -> EngineResult<()> {
-        self.loaded_mut()?
+        let written = self
+            .loaded_mut()?
             .write_tier_slots(slots, bytes)
-            .map_err(fault)
+            .map_err(fault);
+        self.count_drained();
+        written
     }
 
     fn weight_residency(
@@ -1070,79 +1157,22 @@ where
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
-        )?;
-        if let Some(shell) = self.shell.as_ref() {
-            let facts = &shell.trace().facts;
-            for step in &frame.steps {
-                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
-            }
+        let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            self.live.tally(engine::live::Tally::Refused, 1);
         }
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-
-        self.pending = None;
-        // The frame before can no longer be asked for its rows.
-        if let Some(shell) = self.shell.as_mut() {
-            shell.open_frame();
-        }
-
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        tracing::debug!(
-            engine = B::KIND,
-            frame = id.0,
-            steps = frame.steps.len(),
-            "submit"
-        );
-        let mut pending = Vec::with_capacity(frame.steps.len());
-        let mut refused = None;
-        for (index, step) in frame.steps.iter().enumerate() {
-            if let Some(next) = frame.steps.get(index + 1) {
-                self.expect_fire(next);
-            }
-
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            let fired = B::step(self, step, at);
-            match fired {
-                Ok((ticket, step_pending)) => {
-                    steps.push(ticket);
-                    pending.push(step_pending);
-                }
-                // A step's lanes refused past the first step: the frame is
-                // the steps before it (`engine::Error::Lanes`).
-                Err(error) if error.stops_frame_at(index) => {
-                    refused = Some(error);
-                    break;
-                }
-                Err(error) => {
-                    self.pending = None;
-                    self.count_built();
-                    return Err(error);
-                }
-            }
-        }
-        B::submitted(self);
-        self.count_built();
-        let mut ticket = FrameTicket::of(id, steps, refused);
-        self.pending = Some((id, pending));
-
-        if !self.settles_asynchronously() {
-            self.settle_frame(&mut ticket)?;
-            self.tell_wrote();
-        }
-        Ok(ticket)
+        self.refused(submitted)
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let registered = self.programs.register(registration).map_err(refusal);
         self.count_registered();
-        registered
+        self.refused(registered)
     }
 
     /// The program adopted and its stages lowered in the returned compile,
@@ -1162,14 +1192,14 @@ where
     /// compile that refused refuses here.
     fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
         let Ok(prepared) = prepared.0.downcast::<crate::program::Prepared>() else {
-            return Err(Error::Program(format!(
+            return self.refused(Err(Error::Program(format!(
                 "a prepared program the {} engine did not prepare",
                 B::KIND
-            )));
+            ))));
         };
         let finished = self.programs.finish(*prepared).map_err(refusal);
         self.count_registered();
-        finished
+        self.refused(finished)
     }
 
     fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
@@ -1394,6 +1424,98 @@ fn second_mover<B: Host>(programs: &B::Programs, step: &Step) -> Option<(Channel
         }
     }
     None
+}
+
+impl<B: Host> Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    /// [`Engine::submit`] as fired, before its refusal is counted.
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
+        if let Some(shell) = self.shell.as_ref() {
+            let facts = &shell.trace().facts;
+            for step in &frame.steps {
+                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+            }
+        }
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+
+        self.pending = None;
+        // The frame before can no longer be asked for its rows.
+        if let Some(shell) = self.shell.as_mut() {
+            shell.open_frame();
+        }
+
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        tracing::debug!(
+            engine = B::KIND,
+            frame = id.0,
+            steps = frame.steps.len(),
+            "submit"
+        );
+        let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
+        for (index, step) in frame.steps.iter().enumerate() {
+            if let Some(next) = frame.steps.get(index + 1) {
+                self.expect_fire(next);
+            }
+
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            // Held to the platform's bound on one submission, where it
+            // states one (`crate::submit`): a step past it whole walks a
+            // layer at a time; past it even so, its lanes are refused by
+            // name. Nothing is estimated where no bound is stated.
+            if let Some(refused_lanes) = self.admit_step(step, at) {
+                if refused_lanes.stops_frame_at(index) {
+                    refused = Some(refused_lanes);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(refused_lanes);
+            }
+            let fired = B::step(self, step, at);
+            if let Some(shell) = self.shell.as_mut() {
+                shell.split_next(false);
+            }
+            match fired {
+                Ok((ticket, step_pending)) => {
+                    steps.push(ticket);
+                    pending.push(step_pending);
+                }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
+                Err(error) => {
+                    self.pending = None;
+                    self.count_built();
+                    return Err(error);
+                }
+            }
+        }
+        B::submitted(self);
+        self.count_built();
+        let mut ticket = FrameTicket::of(id, steps, refused);
+        self.pending = Some((id, pending));
+
+        if !self.settles_asynchronously() {
+            self.settle_frame(&mut ticket)?;
+            self.tell_wrote();
+        }
+        Ok(ticket)
+    }
 }
 
 impl<B: Host> Gpu<B> {

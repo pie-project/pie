@@ -268,6 +268,8 @@ impl Rig {
                 commit,
                 ticket_offset: offset,
                 ticket_count: SLOTS as u32,
+                // No host verdict to copy to: the test reads `commit` itself.
+                commit_host: 0,
             });
         }
         let mut at = [0usize; 7];

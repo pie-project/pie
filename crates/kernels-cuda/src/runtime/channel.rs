@@ -114,10 +114,13 @@ pub struct SettleLane {
     pub commit: DevicePtr,
     pub ticket_offset: u32,
     pub ticket_count: u32,
+    /// Where the host reads the pass's verdict, which the settle copies
+    /// from `commit` (in the wave's device tables).
+    pub commit_host: DevicePtr,
 }
 
 const _: () = assert!(
-    core::mem::size_of::<SettleLane>() == 16,
+    core::mem::size_of::<SettleLane>() == 24,
     "channel::SettleLane: sizeof disagrees with `runtime/channel.cu`'s SettleLane",
 );
 

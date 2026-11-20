@@ -954,6 +954,8 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             launch_ns: None,
             few_row_tflops: None,
             workgroups_per_core: None,
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
             product_ns: None,
@@ -1045,6 +1047,10 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         (
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",
+        ),
+        (
+            "[rates]\nattn_tflops_by_rows_keys = [[512, [[4096, 0.3]]], [256, [[4096, 0.2]]]]\n",
+            "a non-empty list of [rows, [[keys, TFLOP/s], ...]] pairs, ascending in rows",
         ),
         ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
     ] {

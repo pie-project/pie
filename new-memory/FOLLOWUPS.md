@@ -674,6 +674,11 @@ was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts a
 The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
 are 0.
 
+**Correction (2026-11-20): the product rows below are warm-cache lower bounds; do not plan from
+them.** A duplicated launch re-reads the weights its first launch just pulled into the 256 MB
+Infinity Cache (8–13 MB a product here): it times a warm second run. At the kernel level the
+folded qkv at m = 4 duplicated read +0 µs. The cold-weight ledger below replaces them.
+
 The instrument that measures in context is ablation by duplication. Launch one product
 twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
 median of 5, two rounds):
@@ -727,6 +732,72 @@ Next:
 - the duplication switch is a scratch patch: a profile probe that times a kernel in place
   (in a captured body) would make it a standing instrument.
 
+### Cold-weight ledger (2026-11-20, tip a7052acfc + the padded turn rows)
+
+Each product is duplicated over the next layer's weight, last read about a step (≈ 1 GB of other
+weights) earlier, so the duplicate pays a real HBM stream. The lm head's one 311 MB weight is
+past the cache, so its plain duplicate is already cold. Δ step (µs, all layers), 32 → 160
+tokens, median of 5:
+
+| product (its kernel at 1 / 4 rows) | 1 row | 4 rows | 4-row extra |
+|---|---|---|---|
+| gate-up, folded (skinny / turned) | +207 (7.4 a call) | +274 (9.8) | +67 |
+| o-proj + down (skinny / skinny) | +237 (4.2 a call) | +275 (4.9) | +38 |
+| qkv, folded (skinny / skinny, F39's choice) | +171 (6.3 a call) | +195 (7.2) | +24 |
+| lm head (skinny / turned) | +71 | +72 | +1 |
+
+That is ≈ 130 µs of the 152 µs 4-parallel-over-greedy gap (1.456 vs 1.304 ms): the products
+are most of it.
+
+Counters on the gated turned product at m = 4:
+- 2 waves per SIMD (4-wave blocks, 160 AGPRs + 16 VGPRs; 2 blocks per CU by the 32 KB turn);
+- waves wait 61% of their cycles, mostly on memory;
+- LDS bank conflicts were 147 k a dispatch, fixed by padding the staged rows (sc/amd-gated-turn).
+
+Occupancy does not bind. 384 tiles × 4 waves is 1,536 waves, about 5 per CU against 8
+resident. Every wave's whole weight share is requested at once: 12.6 MB in flight, a floor of
+≈ 1 µs latency + 12.6 MB / 5.3 TB/s ≈ 3.4 µs. The rest is each block's serial tail after its
+data lands (the fold's dependent loads, the MFMAs, the cross-wave LDS reduction, the epilogue),
+longer at four rows. So split-K (no loads added in flight) and 8-wave blocks (no residency
+added) are not expected to help.
+
+Tried, none kept: the norm weight fetched under the row loads (greedy +12 µs); the first tile's
+weight issued after the norm (no change).
+
+In-wave pipelining, checked (2026-11-20):
+- The skinny kernel at m = 4 already computes each chunk as it lands: its ISA waits vmcnt(3),
+  (2), (1), (0), each before its group of MFMAs.
+- The turned folded kernel issued its weight loads, then each norm item's row loads followed by
+  vmcnt(0). The counter retires in issue order, so the norm waited for the whole weight share. A
+  two-phase norm (rows and the norm's weight loaded first from clamped places, then the weight,
+  then the stage's arithmetic in its order; bit-exact; ISA vmcnt(14…8)) overlaps them. It
+  measured slower: 4 parallel 1.482 / 1.480 vs 1.465 / 1.469 ms, beam-4 2.153 / 2.154 vs
+  2.140 / 2.145. Not kept. Issuing the weight after the norm made no difference either.
+
+So the norm's serial chain is not what the four-row products pay. Ruled out: occupancy, split-K,
+load ordering, in-wave pipelining; LDS conflicts were real (fixed, −5 µs). What remains is the
+per-byte work at four rows (each weight byte feeds four rows' MFMAs and reductions).
+
+Next: an MFMA shape that covers four rows without waste. The turned kernel's 16x16x16 spends
+three quarters of each product on padding rows at m = 4; skinny4's 4x4x4-per-block layout lost on
+narrow banks. Each candidate is judged by the cold-weight A/B.
+
+### Restated against region-merge-2 (2026-11-20, tip bcbc1b430)
+
+With the split epilogue (region-merge-2 and the split partials' agent-scope stores), MI300X,
+Qwen3-0.6B, per step (32 → 160 tokens, median of 5, two rounds):
+
+| | ms a step | over greedy |
+|---|---|---|
+| greedy | 1.306 / 1.310 | 1 |
+| 4 parallel | 1.490 / 1.497 | 1.14 |
+| beam-4 | 1.696 / 1.701 | 1.30 (1.14 over 4 parallel) |
+
+Beam verify passes at w2 / w4 / w8 × 256. So beam-4 over greedy is ≈ 390 µs: about half is the
+four-row forward (4 parallel over greedy, ≈ 185 µs, the products' ≈ 130 of it by the cold
+ledger above) and about half beam-4 over 4 parallel (≈ 205 µs: the epilogue and the page
+lists). The user's beam cost rule (beam-4 ≈ one greedy step) needs both halves.
+
 ## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
 
 `runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
@@ -751,3 +822,41 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F42. The first request after boot runs slow; the first served fire of each XLA shape too
+
+Two one-time costs after ready, measured on v6e qwen3-0.6b (census config), tip and the
+mixed decode capacity alike:
+
+- The server's first request of an inferlet: 117 ms against 22 ms for the next ones (a
+  12 ms install, guest registrations cache hits of ~1 ms). A burst that arrives first
+  piles up behind it: the first staggered load after boot runs 1508 tok/s against 2189 on
+  the next, and one tiny request beforehand brings the first staggered load to 2335
+  against 2345. It sits in the runtime's first launch of an inferlet program (not the
+  engine's programs); naming it is the runtime's.
+- XLA: the first served fire of each fire shape runs 2.5-6 ms longer on the device than
+  its median (PIE_XLA_TIMING: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
+  decode 5.6 against 2.2 ms; about 45-50 ms over the 20 shapes a first load touches; host
+  stage unchanged, nothing compiled or loaded after ready). Executing every laid program
+  once at load, on scratch, does not remove it (2.36 against 2.47 ms mean excess, at 17 s
+  of boot), so it is not an executable's first execution: something a served fire of a
+  shape first touches (its staged inputs' device buffers, its readout seats) that a
+  scratch fire does not. Unnamed; small next to the first item.
+
+## F43. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
+
+`canonical_pads` (engine-xla serve) pads a fire that prefills to rungs so a laid program
+holds it, and returns None where no laid shape exists; the fire then goes out at its exact
+lane counts and compiles mid-run. One composition the runtime forms: 35 three-row prompts
+beside 17 decodes (128 rows, 53 lanes, v6e qwen3-0.6b c64). Its prompts pad to the 64-lane
+rung, which leaves 16 decode lanes within max_lanes (80); 17 decodes fit neither 16 nor
+their rung 32 (96 lanes). Base's rule has the same gap (the decodes' rung 32 > the 16 left
+and 17 > 16); with the mixed decode capacity (decodes beside prompts pad to the largest
+decode rung their prompts' rung leaves) it hit 2 of 4 serving runs (a c64 pass at 642
+tok/s), base 0 of ~10.
+
+A contract bug: a served fire with no laid shape is a compile after ready. Fix on the
+cutter (runtime, every backend): never compose a mixed fire the engine has no canonical
+shape for; seat the decodes and the prompts that fit beside them, and defer the rest to the
+next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
+composition above.

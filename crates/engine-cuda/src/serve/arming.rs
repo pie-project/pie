@@ -1114,8 +1114,9 @@ impl Shell {
     }
 
     /// The decode products `wanted` names, each timed in its real
-    /// neighbourhood: for each shape (by rows, ascending), the lattice armed
-    /// with that bank on the skinny kernel and then on the turned kernel
+    /// neighbourhood: for each shape (by rows, ascending), its bucket's
+    /// bodies armed with that bank on the skinny kernel and then on the
+    /// turned kernel (the other buckets' kept armed)
     /// (every bank decided before it as decided), and the decode body of its
     /// rows (that many one-row lanes) replayed [`BODY_ROUNDS`] rounds of
     /// [`BODY_FIRES`] fires under each. The faster past the rounds'
@@ -1145,7 +1146,9 @@ impl Shell {
             for kernel in [Kernel::Skinny, Kernel::Turned] {
                 self.device
                     .set_routes(std::sync::Arc::new(decided.forcing(shape, kernel)));
-                self.rearm_bodies()?;
+                // A product's rows in a body are its bucket's: only that
+                // bucket's bodies change with its kernel.
+                self.rearm_bucket(shape.m)?;
                 let (ns, spread) = self.time_decode_body(class, shape.m)?;
                 times.push((kernel, ns, spread));
             }
@@ -1154,7 +1157,11 @@ impl Shell {
             measured.extend(entries);
         }
         self.device.set_routes(decided);
-        self.rearm_bodies()?;
+        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).collect();
+        buckets.dedup();
+        for bucket in buckets {
+            self.rearm_bucket(bucket)?;
+        }
         Ok(measured)
     }
 
@@ -1191,6 +1198,19 @@ impl Shell {
             rounds[BODY_ROUNDS / 2],
             rounds[3 * BODY_ROUNDS / 4] - rounds[BODY_ROUNDS / 4],
         ))
+    }
+
+    /// Bucket `bucket`'s bodies forgotten and armed again, the other
+    /// buckets' kept: a re-arm allowed what the load's own arming took.
+    #[cfg(feature = "rocm")]
+    fn rearm_bucket(&mut self, bucket: u32) -> Result<()> {
+        self.cache.forget_bodies_at(bucket);
+        self.arm_only = Some(bucket);
+        self.rearming = true;
+        let armed = self.arm_bodies();
+        self.rearming = false;
+        self.arm_only = None;
+        armed
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
@@ -1528,10 +1548,13 @@ impl Shell {
             }
         }
         let LatticeTargets {
-            targets,
+            mut targets,
             top,
             unfireable,
         } = self.lattice_targets()?;
+        if let Some(bucket) = self.arm_only {
+            targets.retain(|(at, ..)| *at == bucket);
+        }
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its
@@ -1622,7 +1645,7 @@ impl Shell {
         let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || (st.capped && spent.census.bytes >= self.bodies_mem)
+                || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -1641,6 +1664,19 @@ impl Shell {
             }
             st.never += 1;
             if !st.group {
+                // Fired once, sealed, so nothing captures: its key is stated
+                // eager by name at load, and its fires walk eagerly by that
+                // statement (`BodyTally::stated_eager`), not as a body
+                // missing (`sealed_declines`).
+                self.cache.seal_bodies();
+                self.cache.state_eager(true);
+                let (lanes, media) = target.lanes();
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                let fired = self.fire_synthetic(&owned).and(self.device.synchronize());
+                self.cache.state_eager(false);
+                if let Err(why) = fired {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                }
                 return Ok(());
             }
             // An expert-parallel rank fires it anyway, sealed so nothing
@@ -1900,6 +1936,19 @@ impl Shell {
             "engine-cuda: {report}; armed in {:.1} s",
             st.began.elapsed().as_secs_f64()
         );
+        // Every composition arming stopped before (the report above says
+        // why), by name: they walk eagerly for the life of the load by this
+        // statement, their fires tallied as such (`BodyTally::stated_eager`).
+        let stated = self.cache.stated_eager();
+        if !stated.is_empty() {
+            eprintln!(
+                "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
+                 before them from bucket {}: {}",
+                stated.len(),
+                st.never_from,
+                stated.join(", ")
+            );
+        }
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
@@ -2253,3 +2302,28 @@ const BODY_ROUNDS: usize = 9;
 /// a serving step is.
 #[cfg(feature = "rocm")]
 const BODY_FIRES: usize = 20;
+
+/// Whether bodies weighing `bytes` have spent an allowance of `allowance`:
+/// past it, not at it. A re-arm is allowed exactly what the arming before it
+/// took (`Shell::measured_refit`), and its compositions past the last new
+/// body re-capture bodies it already holds (a wide composition's key a
+/// mixed one's): at the allowance they cost nothing, and stopping there
+/// would leave them walking eagerly for the life of the load.
+fn allowance_spent(bytes: usize, allowance: usize) -> bool {
+    bytes > allowance
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::allowance_spent;
+
+    #[test]
+    fn a_re_arm_at_exactly_what_the_arming_before_took_arms_on() {
+        // The measuring boot's refit: 53 bodies weighing what the first
+        // arming's 53 weighed, ten compositions still to re-capture.
+        let took = 150 << 20;
+        assert!(!allowance_spent(took, took));
+        assert!(allowance_spent(took + 1, took));
+        assert!(!allowance_spent(took - 1, took));
+    }
+}
