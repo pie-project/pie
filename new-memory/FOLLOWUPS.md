@@ -868,3 +868,13 @@ new width's first request). They persist: the next boots' same registrations too
 and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the ladder (0
 misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
 built-ins' guest programs before ready is GPU's queued item.
+
+## F44. engine-cuda reads its cgroup room itself; move it onto engine::host_memory
+
+`engine::host_memory::available` now leaves a capped cgroup `memory.max` less `memory.current` less
+`memory.stat inactive_file` (v6e: 150 GiB user.slice, 115 GiB charged, 96 GiB of it file cache,
+read 2 GiB free before and ~95 GiB after; the XLA guest compile ledger had refused a 2.3 GiB stage
+by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-407), counting
+`inactive_file + active_file`. Move engine-cuda onto the shared reader and settle one rule for both:
+inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
+inactive + active (all file cache, which reclaim reaches under pressure).

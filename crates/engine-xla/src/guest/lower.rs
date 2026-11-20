@@ -1056,21 +1056,6 @@ impl Lower<'_> {
         Ok(y)
     }
 
-    /// Exclusive prefix sum along the last axis.
-    fn scan_exclusive(&mut self, x: Val) -> Lowering<Val> {
-        let dims = self.f.dims(x).to_vec();
-        let r = dims.len();
-        let n = dims[r - 1];
-        let mut hi = dims.clone();
-        hi[r - 1] = n - 1;
-        let kept = self.f.slice(x, &vec![0; r], &hi, &vec![1; r])?;
-        let zero = self.f.const_f(Elem::F32, 0.0, &[]);
-        let mut lo = vec![0; r];
-        lo[r - 1] = 1;
-        let shifted = self.f.pad(kept, zero, &lo, &vec![0; r], &vec![0; r])?;
-        self.scan(shifted, Fold::Sum)
-    }
-
     /// `x` (f32) sorted descending along the last axis in the interpreter's
     /// order (`sort_desc_order`): NaN last, -0 equal to +0, ties by the lower
     /// index. Returns the sorted values and their source indices (i32).
@@ -1225,16 +1210,6 @@ impl Lower<'_> {
             f.compare(Cmp::Gt, a[0], b[0])
         })?;
         Ok((sorted[0], Some(sorted[1])))
-    }
-
-    /// The value an order key stands for (-0 read as +0, NaN as a NaN).
-    fn key_value(&mut self, key: Val) -> Lowering<Val> {
-        let flip = self.f.like_i(key, 0x7FFF_FFFF);
-        let flipped = self.f.xor(key, flip)?;
-        let zero = self.f.like_i(key, 0);
-        let negative = self.f.compare(Cmp::Lt, key, zero)?;
-        let bits = self.f.select(negative, flipped, key)?;
-        Ok(self.f.bitcast(bits, Elem::F32)?)
     }
 
     /// Per row of the sorted `[B, R, n]` `plane`, the element at position
@@ -2160,58 +2135,49 @@ impl Lower<'_> {
                 self.f.and(keep, some)?
             }
             1 => {
-                // cummass_le(p): in descending order, a lane is kept while
-                // the mass before it is below p.
+                // cummass_le(p): in descending order (order keys, ties by the
+                // lower index), a lane is kept while the mass before it is
+                // below p.
                 if pd != Dtype::F32 {
                     return refuse("cummass_le over a non-float p");
                 }
                 let key = self.order_key(x)?;
-                let (sorted, index) = self.sort_keys(key, true)?;
-                let index = index.expect("indexed");
-                let values = self.key_value(sorted)?;
-                let before = self.scan_exclusive(values)?;
                 let p = self.f.broadcast(per_row, &grid, &[0, 1])?;
-                let kept = self.f.compare(Cmp::Lt, before, p)?;
-                let kept = self.f.convert(kept, Elem::I32);
-                // With no negative lane the mass before a lane only grows
-                // along the order, so the kept lanes are the first `L`: a
-                // lane is kept when it orders at or before the `L`-th. With
-                // a negative lane anywhere, sort the verdicts back by index.
                 let zero_f = self.f.const_f(Elem::F32, 0.0, &grid);
                 let negative = self.f.compare(Cmp::Lt, x, zero_f)?;
                 let all: Vec<i64> = vec![0, 1, 2];
                 let any = self.f.reduce(negative, &all, Fold::Or)?;
                 let branch = self.f.convert(any, Elem::I32);
                 let out_ty = Ty::new(Elem::I32, &grid);
-                let kept_rows = self.f.reduce(kept, &[2], Fold::Sum)?;
-                let one = self.f.const_i(Elem::I32, 1, &[b, rows]);
-                let last = self.f.sub(kept_rows, one)?;
-                let pivot_key = self.at_position(sorted, last, i64::from(i32::MIN))?;
-                let pivot_at = self.at_position(index, last, -1)?;
-                let prefix = Box::new(|f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
-                    let pk = f.broadcast(pivot_key, &grid, &[0, 1])?;
-                    let pi = f.broadcast(pivot_at, &grid, &[0, 1])?;
-                    let col = f.iota(Elem::I32, &grid, 2);
-                    let above = f.compare(Cmp::Gt, key, pk)?;
-                    let level = f.compare(Cmp::Eq, key, pk)?;
-                    let early = f.compare(Cmp::Le, col, pi)?;
-                    let tie = f.and(level, early)?;
-                    let keep = f.or(above, tie)?;
-                    let zero = f.like_i(kept_rows, 0);
-                    let some = f.compare(Cmp::Gt, kept_rows, zero)?;
-                    let some = f.broadcast(some, &grid, &[0, 1])?;
-                    let keep = f.and(keep, some)?;
+                // With no negative lane the mass before a lane only grows
+                // along the order, so the kept lanes are a prefix of it: the
+                // levels (keys) above a pivot level whole, and the pivot
+                // level's lanes up to a pivot index. Both are found by
+                // bisection, a masked reduce a round, without a sort
+                // (v6e census, sampled c64: the sort was most of the step).
+                let cut = Box::new(move |f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
+                    let keep = nucleus_prefix(f, x, key, p, per_row, &grid)?;
                     Ok(vec![f.convert(keep, Elem::I32)])
                 })
                     as Box<dyn FnOnce(&mut Func) -> kernels_xla::hlo::Built<Vec<Val>>>;
-                let back = Box::new(|f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
-                    let back = f.sort(&[index, kept], 2, false, |f, a, b| {
+                // With a negative lane the mass before a lane need not grow:
+                // the lanes in order, their verdicts sorted back by index.
+                let general = Box::new(move |f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
+                    let index = f.iota(Elem::I32, &grid, 2);
+                    let sorted = f.sort(&[key, index], 2, true, |f, a, b| {
+                        f.compare(Cmp::Gt, a[0], b[0])
+                    })?;
+                    let values = key_value_of(f, sorted[0])?;
+                    let before = scan_sum_exclusive(f, values)?;
+                    let kept = f.compare(Cmp::Lt, before, p)?;
+                    let kept = f.convert(kept, Elem::I32);
+                    let back = f.sort(&[sorted[1], kept], 2, false, |f, a, b| {
                         f.compare(Cmp::Lt, a[0], b[0])
                     })?;
                     Ok(vec![back[1]])
                 })
                     as Box<dyn FnOnce(&mut Func) -> kernels_xla::hlo::Built<Vec<Val>>>;
-                let verdict = self.f.case(branch, &[out_ty], vec![prefix, back])?;
+                let verdict = self.f.case(branch, &[out_ty], vec![cut, general])?;
                 let zero = self.f.const_i(Elem::I32, 0, &grid);
                 self.f.compare(Cmp::Ne, verdict[0], zero)?
             }
@@ -2424,4 +2390,141 @@ const LANE_TILE: i64 = 128;
 fn flat_rows(dims: &[i64]) -> Vec<i64> {
     let (&n, lead) = dims.split_last().expect("a sorted value has an axis");
     vec![lead.iter().product(), n]
+}
+
+/// The value an order key stands for (-0 read as +0, NaN as a NaN).
+fn key_value_of(f: &mut Func, key: Val) -> kernels_xla::hlo::Built<Val> {
+    let flip = f.like_i(key, 0x7FFF_FFFF);
+    let flipped = f.xor(key, flip)?;
+    let zero = f.like_i(key, 0);
+    let negative = f.compare(Cmp::Lt, key, zero)?;
+    let bits = f.select(negative, flipped, key)?;
+    f.bitcast(bits, Elem::F32)
+}
+
+/// The exclusive prefix sum of `x` (f32) along its last axis: log2(n)
+/// shifted adds.
+fn scan_sum_exclusive(f: &mut Func, x: Val) -> kernels_xla::hlo::Built<Val> {
+    let dims = f.dims(x).to_vec();
+    let r = dims.len();
+    let n = dims[r - 1];
+    let zero = f.const_f(Elem::F32, 0.0, &[]);
+    let shift = |f: &mut Func, v: Val, k: i64| -> kernels_xla::hlo::Built<Val> {
+        let mut hi = dims.clone();
+        hi[r - 1] = n - k;
+        let head = f.slice(v, &vec![0; r], &hi, &vec![1; r])?;
+        let mut lo = vec![0; r];
+        lo[r - 1] = k;
+        f.pad(head, zero, &lo, &vec![0; r], &vec![0; r])
+    };
+    let mut v = shift(f, x, 1)?;
+    let mut k = 1;
+    while k < n {
+        let moved = shift(f, v, k)?;
+        v = f.add(v, moved)?;
+        k *= 2;
+    }
+    Ok(v)
+}
+
+/// The kept lanes of `cummass_le(p)` over a row with no negative lane, as
+/// `[B, R, n]` bools: in descending order (order keys `key`, ties by the
+/// lower index), a lane is kept while the mass before it is below `p`
+/// (`[B, R, n]`, its row's `p` broadcast; `p_row` `[B, R]`). The kept lanes
+/// are a prefix of the order, so the pivot is found by bisection: the
+/// smallest key `T` whose mass above is below `p` (32 rounds over the keys
+/// as unsigned), the pivot level the least key at or above it (every level
+/// above is kept whole: its mass before is bounded by a kept key's), and in
+/// that level the last index whose mass before (the mass above the level,
+/// and the level's lanes of lower index) is below `p` (one round a bit of
+/// the row's length). A NaN lane (the least key) adds a NaN to any mass it
+/// enters, as the order's running sum does.
+fn nucleus_prefix(
+    f: &mut Func,
+    x: Val,
+    key: Val,
+    p: Val,
+    p_row: Val,
+    grid: &[i64; 3],
+) -> kernels_xla::hlo::Built<Val> {
+    let [b, rows, n] = *grid;
+    let row = [b, rows];
+    // the keys as unsigned, in the same order
+    let sign = f.like_i(key, i64::from(i32::MIN));
+    let ukey = f.xor(key, sign)?;
+    let ukey = f.bitcast(ukey, Elem::U32)?;
+    let zero_x = f.const_f(Elem::F32, 0.0, grid);
+    // the mass of the lanes whose key is above `at` (`[B, R]` u32)
+    let mass_above = |f: &mut Func, at: Val| -> kernels_xla::hlo::Built<Val> {
+        let at = f.broadcast(at, grid, &[0, 1])?;
+        let above = f.compare(Cmp::Gt, ukey, at)?;
+        let v = f.select(above, x, zero_x)?;
+        f.reduce(v, &[2], Fold::Sum)
+    };
+    // T: the least u32 K with mass(key > K) < p. mass(key > max) is 0.
+    let lo0 = f.const_i(Elem::U32, 0, &row);
+    let hi0 = f.const_i(Elem::U32, i64::from(u32::MAX), &row);
+    let m0 = mass_above(f, lo0)?;
+    let below0 = f.compare(Cmp::Lt, m0, p_row)?;
+    let out = f.for_loop(32, &[lo0, hi0], |f, _, st| {
+        let (lo, hi) = (st[0], st[1]);
+        let span = f.sub(hi, lo)?;
+        let one = f.like_i(span, 1);
+        let half = f.shr(span, one)?;
+        let mid = f.add(lo, half)?;
+        let m = mass_above(f, mid)?;
+        let ok = f.compare(Cmp::Lt, m, p_row)?;
+        let hi = f.select(ok, mid, hi)?;
+        let lo = f.select(ok, lo, mid)?;
+        Ok(vec![lo, hi])
+    })?;
+    let t = f.select(below0, lo0, out[1])?;
+    // the pivot level: the least key at or above T
+    let t_grid = f.broadcast(t, grid, &[0, 1])?;
+    let at_or_above = f.compare(Cmp::Ge, ukey, t_grid)?;
+    let top = f.like_i(ukey, i64::from(u32::MAX));
+    let candidates = f.select(at_or_above, ukey, top)?;
+    let level = f.reduce(candidates, &[2], Fold::Min)?;
+    let above = mass_above(f, level)?;
+    let level_grid = f.broadcast(level, grid, &[0, 1])?;
+    let in_level = f.compare(Cmp::Eq, ukey, level_grid)?;
+    let level_x = f.select(in_level, x, zero_x)?;
+    let col = f.iota(Elem::I32, grid, 2);
+    // J: the last index whose mass before is below p (index 0 always is:
+    // the mass above the level is below p, the level's key at or above T)
+    let mass_before = |f: &mut Func, j: Val| -> kernels_xla::hlo::Built<Val> {
+        let j = f.broadcast(j, grid, &[0, 1])?;
+        let earlier = f.compare(Cmp::Lt, col, j)?;
+        let v = f.select(earlier, level_x, zero_x)?;
+        let s = f.reduce(v, &[2], Fold::Sum)?;
+        f.add(above, s)
+    };
+    let bits = 64 - (n as u64).leading_zeros() as i64;
+    let jlo = f.const_i(Elem::I32, 0, &row);
+    let jhi = f.const_i(Elem::I32, n, &row);
+    let out = f.for_loop(bits, &[jlo, jhi], |f, _, st| {
+        let (lo, hi) = (st[0], st[1]);
+        let span = f.sub(hi, lo)?;
+        let one = f.like_i(span, 1);
+        let half = f.shr(span, one)?;
+        let mid = f.add(lo, half)?;
+        let next = f.add(lo, one)?;
+        let mid = f.max(mid, next)?;
+        let m = mass_before(f, mid)?;
+        let ok = f.compare(Cmp::Lt, m, p_row)?;
+        let lo = f.select(ok, mid, lo)?;
+        let hi = f.select(ok, hi, mid)?;
+        Ok(vec![lo, hi])
+    })?;
+    let last = out[0];
+    // the kept lanes: above the level, or in it up to the last index; none
+    // where p is not above zero (the first lane's mass before, 0, is not
+    // below it)
+    let level_up = f.compare(Cmp::Gt, ukey, level_grid)?;
+    let last_grid = f.broadcast(last, grid, &[0, 1])?;
+    let early = f.compare(Cmp::Le, col, last_grid)?;
+    let tie = f.and(in_level, early)?;
+    let keep = f.or(level_up, tie)?;
+    let positive = f.compare(Cmp::Gt, p, zero_x)?;
+    f.and(keep, positive)
 }

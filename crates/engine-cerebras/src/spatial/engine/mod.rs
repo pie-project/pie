@@ -234,6 +234,8 @@ impl Engine for Spatial {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
+                // what it planned with before forms were stated: every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools,
             chunks,
@@ -268,6 +270,8 @@ impl Engine for Spatial {
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: engine::MixedLanes::Any,
+            // one frame at a time: no run-ahead
+            frames_in_flight: 1,
         };
         self.facts = Some(facts);
         self.caps = Some(caps.clone());

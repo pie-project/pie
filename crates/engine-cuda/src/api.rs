@@ -844,6 +844,8 @@ impl Engine for Cuda {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: Some(CODEGEN.to_string()),
+                // its CUDA / HIP emitters serve every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools: PoolFacts {
                 adapter_banks: shell
@@ -896,6 +898,9 @@ impl Engine for Cuda {
             // compute device).
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: u32::from(
+                engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
+            ),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a

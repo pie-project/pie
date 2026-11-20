@@ -158,6 +158,10 @@ pub struct EngineConfig {
     /// What a guest stage's cost is held to
     /// ([`::engine::Capabilities::guest_cost`]).
     pub guest_cost: ::engine::GuestCost,
+    /// The frames the engine keeps in flight
+    /// ([`::engine::Capabilities::frames_in_flight`]): the scheduler's
+    /// dispatch depth and a beam group's pool's `F`.
+    pub frames_in_flight: u32,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
@@ -217,6 +221,26 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
 /// The admission cap: `cap`, held to the `seats` a seated-first kv pool
 /// seats where the model holds no recurrent state (whose processes its
 /// planner admits against the state pool instead).
+/// The frames the model's engines keep in flight
+/// ([`::engine::Capabilities::frames_in_flight`]): one number, so engines
+/// stating different ones are refused by name.
+fn frames_in_flight(engines: &[EngineConfig]) -> Result<u32> {
+    let mut stated = engines.iter().map(|e| e.frames_in_flight);
+    let Some(first) = stated.next() else {
+        anyhow::bail!("a model served by no engine states no frames in flight");
+    };
+    if first == 0 {
+        anyhow::bail!("an engine states no frame in flight; a fire needs one");
+    }
+    if let Some(other) = stated.find(|&f| f != first) {
+        anyhow::bail!(
+            "the model's engines keep {first} and {other} frames in flight; the scheduler \
+             dispatches by one number"
+        );
+    }
+    Ok(first)
+}
+
 fn seat_cap(cap: usize, has_state: bool, seats: Option<usize>) -> usize {
     match seats {
         Some(seats) if !has_state && cap > seats.max(1) => seats.max(1),
@@ -326,12 +350,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     // The library forms programs are planned with: what every engine served
-    // here emits (`pipeline::program::serve_backend`), before any program
+    // here states (`pipeline::program::serve_forms`), before any program
     // (the standard samplers first) is registered.
     for d in engine_configs.iter() {
-        if let Some(backend) = crate::engine::verbs::codegen_backend(&d.engine_backend) {
-            crate::pipeline::program::serve_backend(backend);
-        }
+        let facts = d.engine_backend.device_facts().ok_or_else(|| {
+            anyhow::anyhow!(
+                "an engine states no device facts, so no library forms its emitters serve; \
+                 programs are planned with the forms every engine states"
+            )
+        })?;
+        crate::pipeline::program::serve_forms(&facts.backend, facts.library_forms);
     }
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
@@ -350,7 +378,24 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
-    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
+    // The frames the engines keep in flight: the one number the scheduler
+    // dispatches by and a beam group's pool is sized with.
+    let engine_frames = frames_in_flight(&engine_configs)?;
+    // the warm run that measures the host cover stays within every engine's
+    // context (`measure_host_cover`)
+    let warm_context = engine_configs
+        .iter()
+        .map(|d| d.limits.max_context)
+        .filter(|&c| c > 0)
+        .min()
+        .unwrap_or(0);
+    // The frame size, its ceiling and the depth, before anything reads a
+    // channel's capacity (`scheduler::channel_capacity`): the standard
+    // samplers' prewarm below traces its programs at the capacity a
+    // request's programs take.
+    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
+    crate::scheduler::set_frame_ceiling(scheduler.frame_size as usize);
+    crate::scheduler::set_dispatch_depth(engine_frames as usize);
     // A model with fixed recurrent state is admitted by its planner, which
     // charges each process the fixed set its working set holds against the
     // state pool, beside a copy-on-write set per lane a fire runs
@@ -845,8 +890,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));
-    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
-    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load
     // returns, so before any fire is submitted: none reads from the host a
@@ -892,6 +935,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler_shutdown.shutdown().await.ok();
         return Err(error);
     }
+    // The host cover, measured through the ordinary pipeline before ready.
+    match measure_host_cover(&name, warm_context).await {
+        Ok(cover) => crate::scheduler::set_host_cover(cover),
+        Err(error) => {
+            tracing::error!(%error, "measuring the host cover at load");
+            scheduler_shutdown.shutdown().await.ok();
+            return Err(error.context("measuring the host cover at load"));
+        }
+    }
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
@@ -900,6 +952,135 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine_ids: engines,
         }),
     })
+}
+
+/// The host cover (`scheduler::host_cover`), measured before ready on warm
+/// runs of the standard sampler through the ordinary pipeline at one frame
+/// in flight: the cover is a lane's guest turnaround (its frame landing to
+/// its next frame's submit, the quorum probes' turnaround) over one frame's
+/// device time (the fires' launch to retire, at depth 1 nothing queued),
+/// rounded up. Rounds of twice the tokens each, from one frame's; each
+/// round's counters' growth over it alone, and the cover from two rounds'
+/// difference (a decode frame's marginal cost: the prompt fire and every
+/// fixed cost cancel, as in the beam rule's T(256) - T(32)), until two
+/// successive differences give the same cover (or a round would pass the
+/// engines' context). The cover is the largest any difference gave: a
+/// difference spanning few frames swings with the turnaround's noise, and a
+/// cover too small leaves the device idle where one too large costs only
+/// window.
+async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
+    let depth = crate::scheduler::configured_dispatch_depth();
+    crate::scheduler::set_dispatch_depth(1);
+    let reference = program::ProgramRef::parse("compat-openai")?;
+    let built = program::resolve(None, &reference).await?;
+    program::load(&built).await?;
+    let frame = crate::scheduler::configured_frame_size().max(1);
+    let mut tokens = frame;
+    let mut last: Option<usize> = None;
+    let mut most = 0usize;
+    // the previous round's growth: fires, device us, turnarounds, turnaround us
+    let mut prev: Option<(u64, u64, u64, u64)> = None;
+    let measured = loop {
+        let before = crate::scheduler::get_stats().await;
+        let input = serde_json::json!({
+            "path": "/v1/chat/completions",
+            "body": {
+                "model": model,
+                "messages": [{"role": "user", "content": "Write a short story about a robot."}],
+                "max_tokens": tokens,
+                "temperature": 0.8,
+                "top_p": 0.9,
+            },
+            "time": 0,
+        })
+        .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        process::spawn(
+            "pie".to_string(),
+            built.clone(),
+            input,
+            std::sync::Arc::new(Default::default()),
+            None,
+            false,
+            Some(tx),
+            None,
+            crate::policy::Arrival::default(),
+            Vec::new(),
+        )?;
+        match rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(why)) => anyhow::bail!("the warm run failed: {why}"),
+            Err(_) => anyhow::bail!("the warm run ended unanswered"),
+        }
+        let after = crate::scheduler::get_stats().await;
+        let fires = after.total_batches.saturating_sub(before.total_batches);
+        let device_us = after
+            .cumulative_batch_latency_us
+            .saturating_sub(before.cumulative_batch_latency_us);
+        let turns = after
+            .fire
+            .quorum
+            .turnaround_n
+            .saturating_sub(before.fire.quorum.turnaround_n);
+        let turn_us = after
+            .fire
+            .quorum
+            .turnaround_sum_us
+            .saturating_sub(before.fire.quorum.turnaround_sum_us);
+        let grown = (fires, device_us, turns, turn_us);
+        let next = tokens.saturating_mul(2);
+        let past_context = context > 0 && next >= context;
+        if let Some((f0, d0, n0, t0)) = prev {
+            let (df, dd, dn, dt) = (
+                fires.saturating_sub(f0),
+                device_us.saturating_sub(d0),
+                turns.saturating_sub(n0),
+                turn_us.saturating_sub(t0),
+            );
+            // too short a difference to hold a frame and a turnaround: the
+            // next round, twice as long, measures
+            if df == 0 || dn == 0 || dd == 0 {
+                if past_context {
+                    anyhow::bail!(
+                        "warm runs up to the engines' context of {context} timed no decode \
+                         frame's turnaround ({df} fires, {dn} turnarounds more)"
+                    );
+                }
+                prev = Some(grown);
+                tokens = next;
+                continue;
+            }
+            let frame_us = dd as f64 / df as f64;
+            let turnaround_us = dt as f64 / dn as f64;
+            let cover = (turnaround_us / frame_us).ceil() as usize;
+            tracing::info!(
+                tokens,
+                frame_us,
+                turnaround_us,
+                cover,
+                "a warm run of the standard sampler, measuring the host cover"
+            );
+            most = most.max(cover);
+            if last == Some(cover) || past_context {
+                break (most, frame_us, turnaround_us);
+            }
+            last = Some(cover);
+        } else if past_context {
+            anyhow::bail!("the engines' context of {context} holds no second warm run");
+        }
+        prev = Some(grown);
+        tokens = next;
+    };
+    crate::scheduler::set_dispatch_depth(depth);
+    let (cover, frame_us, turnaround_us) = measured;
+    tracing::info!(
+        cover,
+        frame_us,
+        turnaround_us,
+        frames_in_flight = depth,
+        "the host cover, measured at load: a guest turnaround over one frame's device time"
+    );
+    Ok(cover)
 }
 
 /// What each built-in's name runs for the system (the operator's install of

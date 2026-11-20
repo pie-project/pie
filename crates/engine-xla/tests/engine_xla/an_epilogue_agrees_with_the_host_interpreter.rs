@@ -1185,6 +1185,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
 
     the_statistics_agree(device, &mut stages);
     a_flat_top_k_agrees(device, &mut stages);
+    a_nucleus_cut_agrees(device, &mut stages);
     the_gumbel_draws_agree(device, &mut stages);
     the_bf16_rules_agree(device, &mut stages);
     a_near_tie_draws_evenly(device, &mut stages);
@@ -1575,6 +1576,117 @@ fn a_cast_rounds_a_plane_by_what_it_may_hold(device: &Device, stages: &mut Stage
         &want[0],
         "a bf16 cast of a plane stated free of denormals",
     );
+}
+
+/// The nucleus cut (`cummass_le(p)`) over crafted rows, a p a row: a plain
+/// softmax row, a tie straddling the cut, zeros of both signs past it, NaN
+/// lanes, a cut landing exactly on a running sum, p of 0 and p past the
+/// row's mass; with no negative lane anywhere (the cut found by bisection)
+/// and with one negative row (the order and its verdicts sorted back).
+fn nucleus_cut() -> (TraceContainer, Vec<u32>) {
+    let grid = Shape::matrix(ROWS, VOCAB);
+    let mut p = Program::new();
+    let (_, top_p) = p.input(Shape::vector(ROWS), Dtype::F32);
+    let x = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: grid,
+        dtype: Dtype::F32,
+    });
+    let keep = p.op(Op::PivotThreshold {
+        input: x,
+        predicate: Predicate::CummassLe(top_p),
+    });
+    let outs = vec![p.output(grid, Dtype::Bool, keep)];
+    (p.container(), outs)
+}
+
+fn nucleus_plane(negative_row: bool) -> Vec<f32> {
+    let n = VOCAB as usize;
+    let mut plane = vec![0.0f32; ROWS as usize * n];
+    let mut row = |r: usize, f: &dyn Fn(usize) -> f32| {
+        for i in 0..n {
+            plane[r * n + i] = f(i);
+        }
+    };
+    // 0: a softmax row
+    let logits = logits_plane(1, VOCAB, 3);
+    let mx = logits.iter().copied().fold(f32::MIN, f32::max);
+    let e: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+    let sum: f32 = e.iter().sum();
+    row(0, &|i| e[i] / sum);
+    // 1: 100 equal lanes scattered over the row, the cut inside them
+    row(1, &|i| {
+        if i % 37 == 5 && i / 37 < 100 {
+            0.01
+        } else {
+            0.0
+        }
+    });
+    // 2: ten lanes of 0.1, then zeros of both signs (one key, by index)
+    row(2, &|i| {
+        if i % 400 == 17 && i / 400 < 10 {
+            0.1
+        } else if i % 2 == 0 {
+            0.0
+        } else {
+            -0.0
+        }
+    });
+    // 3: a few lanes and NaNs past them
+    row(3, &|i| match i {
+        3 => 0.4,
+        900 => 0.3,
+        1200 | 7 | 4000 => f32::NAN,
+        _ => 0.0,
+    });
+    // 4: signed lanes (a negative row), else a second softmax row
+    if negative_row {
+        let l = logits_plane(1, VOCAB, 4);
+        row(4, &|i| l[i] * 0.01);
+    } else {
+        row(4, &|i| e[(i * 7) % n] / sum);
+    }
+    // 5, 6: the softmax row at p 0 and p past its mass
+    row(5, &|i| e[i] / sum);
+    row(6, &|i| e[i] / sum);
+    // 7: 0.5, 0.25, 0.25: the running sum lands on p exactly
+    row(7, &|i| match i {
+        10 => 0.5,
+        20 | 30 => 0.25,
+        _ => 0.0,
+    });
+    plane
+}
+
+fn a_nucleus_cut_agrees(device: &Device, stages: &mut Stages) {
+    let (container, outs) = nucleus_cut();
+    let plan = plan_of(container, VOCAB);
+    let ps = vec![0.9, 0.505, 1.5, 2.0, 0.8, 0.0, 1.5, 0.75];
+    let seeds = vec![(0, Value::F32(ps))];
+    for negative_row in [false, true] {
+        let plane = nucleus_plane(negative_row);
+        let want = host(&plan, &seeds, &plane, ROWS, &outs);
+        let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+        let got = on_device(
+            device,
+            stages,
+            &plan,
+            &seeds,
+            Some(&kept),
+            bound(&plan, &kept, 0),
+            &outs,
+        );
+        exact(
+            &got[0],
+            &want[0],
+            if negative_row {
+                "the nucleus cut, a negative row (sorted back)"
+            } else {
+                "the nucleus cut, no negative lane (bisection)"
+            },
+        );
+    }
 }
 
 fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {

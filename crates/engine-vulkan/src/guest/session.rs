@@ -153,6 +153,20 @@ impl Library {
         pipelines.iter().filter(|built| built.is_ok()).count()
     }
 
+    /// Why call `call` has no pipeline built, or `None` where it has one.
+    #[must_use]
+    pub fn unbuilt(&self, call: u32) -> Option<String> {
+        let pipelines = self.pipelines.lock().expect("library lock poisoned");
+        match pipelines.get(call as usize) {
+            Some(Ok(_)) => None,
+            Some(Err(why)) => Some(why.clone()),
+            None => Some(format!(
+                "call {call} is past the {} the library holds",
+                pipelines.len()
+            )),
+        }
+    }
+
     /// The pipelines built after the load, each at a bind that found its
     /// call missing: none, where the load built every call.
     #[must_use]

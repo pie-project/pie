@@ -9,7 +9,8 @@
 //! so each from the process's own group (`0::<path>` in
 //! `/proc/self/cgroup`) up to the root `/sys/fs/cgroup` is read: where it
 //! states a numeric `memory.max`, it leaves `memory.max` less its
-//! `memory.current`. `max` there means no limit, and a group with no
+//! `memory.current` (less its inactive file pages, `memory.stat`, which the
+//! kernel reclaims before a charge fails). `max` there means no limit, and a group with no
 //! `memory.max` (the root, or one without the memory controller) caps
 //! nothing. A process with no cgroup v2 path is capped by none.
 //!
@@ -147,7 +148,22 @@ fn group_room(
         )
     })?;
     let current = number("memory.current", current.trim())?;
-    Ok(Some(max.saturating_sub(current)))
+    // `memory.current` counts the group's page cache; its inactive file
+    // pages are what the kernel reclaims first, before any charge fails,
+    // so they are room (the working set, as container runtimes count it).
+    // A group stating no `memory.stat` reclaims nothing counted here.
+    let reclaimable = match file("memory.stat")? {
+        Some(stat) => stat
+            .lines()
+            .find_map(|line| line.strip_prefix("inactive_file "))
+            .map(|n| number("memory.stat", n.trim()))
+            .transpose()?
+            .unwrap_or(0),
+        None => 0,
+    };
+    Ok(Some(
+        max.saturating_sub(current.saturating_sub(reclaimable)),
+    ))
 }
 
 #[cfg(test)]
@@ -212,6 +228,27 @@ mod tests {
             ("/cg/user.slice/memory.current", format!("{}", 11 * GIB)),
         ];
         assert_eq!(read(Some(OWN), &over).unwrap().bytes(), 0);
+    }
+
+    #[test]
+    fn a_cgroups_inactive_page_cache_is_room() {
+        // v6e: 150 GiB capped, 115 GiB charged of which 96 GiB is file cache,
+        // 60 GiB of it inactive: 95 GiB of room, not 35.
+        let texts = [
+            ("/cg/user.slice/memory.max", format!("{}\n", 150 * GIB)),
+            ("/cg/user.slice/memory.current", format!("{}\n", 115 * GIB)),
+            (
+                "/cg/user.slice/memory.stat",
+                format!(
+                    "anon {}\nfile {}\ninactive_file {}\nactive_file {}\n",
+                    19 * GIB,
+                    96 * GIB,
+                    60 * GIB,
+                    36 * GIB
+                ),
+            ),
+        ];
+        assert_eq!(read(Some(OWN), &texts).unwrap().cgroup, Some(95 * GIB));
     }
 
     #[test]
