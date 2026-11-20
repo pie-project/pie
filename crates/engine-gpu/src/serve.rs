@@ -2628,22 +2628,42 @@ impl<B: Serve> Shell<B> {
         now - std::mem::replace(&mut self.bound, now)
     }
 
+    /// The decode buckets a recording backend keeps a body for: every count
+    /// of lanes up to the widest row tile of the vector GEMM (the kernel
+    /// table's last `VECTOR_ROWS`), whose bodies carry the live lanes as M
+    /// and so pay no padding compute, then each rung past it up to the
+    /// lane cap, where a decode pads to the narrowest that holds it (the
+    /// matmul's cost steps there anyway). Ascending.
+    #[must_use]
+    pub fn decode_buckets(&self) -> Vec<usize> {
+        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+            .last()
+            .expect("the vector GEMM states its row tiles") as usize;
+        let cap = (self.budgets.tokens.max_lanes.max(1) as usize).max(1);
+        let mut buckets: Vec<usize> = (1..=tile.min(cap)).collect();
+        buckets.extend(
+            (self.span.rungs().iter())
+                .map(|rung| rung.tokens as usize)
+                .filter(|&tokens| tokens > tile && tokens <= cap),
+        );
+        buckets.dedup();
+        buckets
+    }
+
     /// The lanes a decode of `lanes` one-row lanes pads to on a backend
-    /// that keeps recordings: the narrowest rung that holds them, where
-    /// that is wider and the load seats that many. A padded decode is its
-    /// bucket, so every decode of a bucket replays one body. `None` where
-    /// it fires as it is: a load with recurrent state, whose lanes' records
-    /// a copy would share (step (b) of VULKAN-RECORD-AT-LOAD).
+    /// that keeps recordings: the narrowest decode bucket that holds them
+    /// ([`Shell::decode_buckets`]), where that is wider. A padded decode is
+    /// its bucket, so every decode of a bucket replays one body. `None`
+    /// where it fires as it is: a count of lanes that is a bucket, or a load
+    /// with recurrent state, whose lanes' records a copy would share (step
+    /// (b) of VULKAN-RECORD-AT-LOAD).
     #[must_use]
     pub fn pad_bucket(&self, lanes: usize) -> Option<usize> {
         if !B::RECORDS || self.rs_layout.is_some() || lanes == 0 {
             return None;
         }
-        let bucket = (self.span.rungs().iter())
-            .map(|rung| rung.tokens as usize)
-            .filter(|&tokens| tokens >= lanes)
-            .min()?;
-        (bucket > lanes && bucket <= self.budgets.tokens.max_lanes as usize).then_some(bucket)
+        let bucket = self.decode_buckets().into_iter().find(|&bucket| bucket >= lanes)?;
+        (bucket > lanes).then_some(bucket)
     }
 
     /// The steps walked to be kept since the last count: each is a shape a
@@ -6149,8 +6169,8 @@ impl<B: Serve> Shell<B> {
 
     /// Records, on a backend that keeps recordings, the body of every
     /// decode the load serves before it serves: for each class a plain
-    /// one-row request lands in, a decode of each bucket's lanes
-    /// ([`Shell::pad_bucket`]) up to the lane cap, on every arm. Its lanes
+    /// one-row request lands in, a decode of each decode bucket's lanes
+    /// ([`Shell::decode_buckets`]), smallest first, on every arm. Its lanes
     /// pad (they read the pool's walk refs and write nothing), so the fire
     /// runs as a decode of the bucket does and is recorded, and the first
     /// serving decode of the bucket replays it. The bodies recorded.
@@ -6172,17 +6192,12 @@ impl<B: Serve> Shell<B> {
         let classes: Vec<usize> = (0..decoding.len())
             .filter(|&class| decoding[class] && !self.captures(class))
             .collect();
-        let cap = self.budget().max_lanes.max(1) as usize;
-        let mut buckets: Vec<usize> = (self.span.rungs().iter())
-            .map(|rung| rung.tokens as usize)
-            .filter(|&tokens| tokens <= cap)
-            .collect();
-        buckets.dedup();
+        let buckets = self.decode_buckets();
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
-        for &class in &classes {
-            for &bucket in &buckets {
+        for &bucket in &buckets {
+            for &class in &classes {
                 for arm in 0..depth {
                     let owned = (0..bucket)
                         .map(|_| {

@@ -83,8 +83,22 @@ So two numbers must be kept apart:
   function of `narrowest`, it adds nothing to the key.
 
 The rungs are the powers of two from 1 up to the top
-(`serve.rs` ~1020), so a decode of 9 lanes takes bucket 16 and a decode of
-17 lanes takes 32.
+(`serve.rs` ~1020).
+
+**Decode buckets follow the vector GEMM's row tile, not the rung ladder**
+(step (a), measured). A decode body carries M (its lanes) as a push
+constant: read from the fire block it cost about 1 µs a GEMV dispatch,
+113 a fire (+110 µs at 4 rows on the L40S, per-node timestamps). Padding a
+decode to the next power of two makes M the bucket's, but the vector GEMV
+then computes the padding rows: 5 lanes padded to 8 ran −4.7% against the
+tip (the load's estimate: gemv ×8 2290 µs at 5 rows, 2486 µs at 8). So the
+decode buckets are every count of lanes up to the widest vector row tile
+(the kernel table's last `kernels_slang::linear::gemm::VECTOR_ROWS`, 16
+today), each body's M its live lanes and no padding compute, then each rung
+past it up to the lane cap, where a decode pads to the narrowest rung that
+holds it and the matmul's cost steps anyway (`Shell::decode_buckets`). A
+decode of 9 lanes takes its own body; one of 17 takes 32. Prefill and mixed
+buckets stay the rung ladder.
 
 ## 4. What goes into tables
 
@@ -255,7 +269,8 @@ mixed / wide / tower / idle) on Vulkan's ladder:
 
 - **buckets**: the rung ladder, the powers of two from 1 to the top rung.
   Qwen3-0.6B on the L40S: top 1024, so 11 buckets. A decode-only ladder
-  stops at the most lanes a fire seats.
+  is the decode buckets of §3 (every count of lanes up to the vector row
+  tile, then the rungs), up to the most lanes a fire seats.
 - **ladders**: the plain classes present, in order. Qwen3-0.6B serves text
   on two plain classes (prefill c0, decode c2) of its 24, so there are three
   ladders: decode alone, prefill alone, and prefill + decode. A beam's mask
