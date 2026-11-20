@@ -157,8 +157,8 @@ impl std::fmt::Display for Weighed {
         if self.held {
             return write!(
                 f,
-                "rung {}: {} held from the rung below (no kernel was timed at these rows at any \
-                 of the model's planes)",
+                "rung {}: {} held from the rung below, or the profile's path's below none (no \
+                 kernel was timed at these rows at any of the model's planes)",
                 self.top,
                 name(&self.costs[self.taken].0)
             );
@@ -208,8 +208,8 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
     }
 }
 
-/// What a load is refused by where no kernel was timed at its first rung's
-/// rows at any of its planes: the key whose curves it lacks.
+/// What a load is refused by where its profile states no kernel's curve at
+/// all: the key it lacks.
 pub const UNREACHED: &str = "kernel_tflops_by_shape";
 
 /// The `(n, k)` of every weight a dense matmul of `trace` multiplies by
@@ -384,8 +384,10 @@ fn pick(
             .filter_map(|&t| Some((t, cost(&among, t, bottom)?, cost(&among, t, rung)?)))
             .collect();
         if costs.is_empty() {
-            // Past every curve at every plane: the rung below's kernel.
-            let &(_, kept) = by_rows.last().ok_or(UNREACHED)?;
+            // Past every curve at every plane: the rung below's kernel, else
+            // (no kernel timed at any rows, every curve stopped at its first
+            // by the bound or the buffer) the profile's path's own.
+            let kept = by_rows.last().map_or_else(|| tiled(rung), |&(_, t)| t);
             by_rows.push((rung, kept));
             weighed.push(Weighed {
                 bottom,
@@ -410,7 +412,7 @@ fn pick(
                     .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))))
                     .map(|(t, _)| t)
                     .or_else(|| by_rows.last().map(|&(_, t)| t))
-                    .ok_or(UNREACHED)?;
+                    .unwrap_or_else(|| tiled(rows));
                 by_rows.push((rows, fastest));
             }
         }
@@ -600,8 +602,9 @@ mod tests {
         assert_eq!(weighed[1].costs.len(), gemm::VECTOR_ROWS.len() + 2);
     }
 
-    /// A profile stating no kernel's curve, or none at the model's planes,
-    /// is refused by the key; one stating the tiled kernel's alone picks it.
+    /// A profile stating no kernel's curve is refused by the key; one stating
+    /// none at the model's planes takes the profile's path's own tactic; one
+    /// stating the tiled kernel's alone picks it.
     #[test]
     fn a_missing_rate_is_refused_by_its_key() {
         let mut none = rates(Some(5.0), coopmat_tiles());
@@ -629,7 +632,11 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(refused.unwrap_err(), UNREACHED);
+        // No kernel timed at the model's planes: the profile's path's own,
+        // said as held, never a refused load.
+        let (dense, weighed) = refused.unwrap();
+        assert_eq!(dense.at(1, 4096, 4096), coopmat(1));
+        assert!(weighed.iter().all(|w| w.held), "{weighed:?}");
         let (dense, _) = choose(
             Target::Spirv,
             &[1, 2],
@@ -1011,7 +1018,7 @@ mod tests {
     /// A tiled kernel whose curve stops short of a rung is no candidate
     /// there (no pick from a rate it was never timed at); a rung past every
     /// curve keeps the rung below's kernel, and a first rung past them all
-    /// is refused by name.
+    /// the profile's path's.
     #[test]
     fn a_curve_that_stops_short_is_no_candidate_past_it() {
         let baseline = |_| Tactic {
@@ -1069,6 +1076,9 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(refused.unwrap_err(), UNREACHED);
+        // Alone, no rung below: the profile's path's own tactic.
+        let (dense, weighed) = refused.unwrap();
+        assert_eq!(dense.at(8192, 4096, 4096), baseline(8192));
+        assert!(weighed[0].held);
     }
 }

@@ -596,6 +596,32 @@ mod tests {
         );
     }
 
+    /// A user file an older pie wrote, stating rates this pie no longer
+    /// reads, is read for the rest (those left unread, named); a checked-in
+    /// file stating one is refused by it.
+    #[test]
+    fn a_user_files_obsolete_rates_are_left_unread_and_the_rest_read() {
+        let text = "api = 1\n[rates]\nlaunch_ns = 904\nhbm_gbps = 650.0\n\
+                    vector_tflops_by_rows = [[1, [[1, 0.5]]]]\nkernel_stops = []\n";
+        let registry = crate::Registry::new("test", &[], &[]);
+        let file = registry
+            .parse(text, "user", crate::registry::Strict::User)
+            .unwrap();
+        assert_eq!(file.tuned.rates.launch_ns, Some(904));
+        assert_eq!(file.tuned.rates.hbm_gbps, Some(650.0));
+        assert_eq!(file.ignored_rates, ["vector_tflops_by_rows", "kernel_stops"]);
+        let read = registry.load_user(text, "user").unwrap().rates();
+        assert_eq!(read.launch_ns, Some(904));
+        let refused = registry
+            .parse(text, "checked in", crate::registry::Strict::CheckedIn)
+            .unwrap_err();
+        assert_eq!(refused.stale_rates, ["vector_tflops_by_rows", "kernel_stops"]);
+        // A save drops them.
+        let (kept, dropped) = registry.prune(text);
+        assert!(!kept.contains("vector_tflops_by_rows"), "{kept}");
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+    }
+
     /// The margin a load measures under a stated submit bound is saved with
     /// the rates and read back: a boot on saved rates holds its steps at it.
     #[test]

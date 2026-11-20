@@ -132,3 +132,88 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         saved.kernel_tflops_by_shape.as_ref().map_or(0, Vec::len)
     );
 }
+
+/// A bound tighter than one 512^3 matmul (a few microseconds on a desktop
+/// GPU): no warm-up cube fits it, nor most points. The shapes' step still
+/// lands: the clock unwarmed, each point admitted by its own estimate, each
+/// curve that cannot go on stopped by the bound with the reason kept, and
+/// the dense kernel still chosen (the profile's path's where nothing was
+/// timed). A sizing never fails the load.
+#[test]
+fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
+    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let tight = std::time::Duration::from_micros(10);
+    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
+    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
+    let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
+    let stated = Rates {
+        launch_ns: Some(4000),
+        hbm_gbps: Some(600.0),
+        ..Rates::default()
+    };
+    let shapes = [(3072, 1024), (1024, 3072)];
+    let kernels =
+        engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, TOP);
+    let wanted = engine_gpu::rates::lacking(
+        kernels_slang::Target::Spirv,
+        &kernels,
+        &stated,
+        &shapes,
+        TOP,
+    );
+    let curves = engine_gpu::rates::measure_shapes::<Api, _>(
+        &device,
+        &tuning,
+        tier,
+        &timer,
+        Some(tight),
+        &stated,
+        &wanted,
+        TOP,
+        &mut |line| eprintln!("{line}"),
+    )
+    .expect("a bound no cube fits stops curves, never the step");
+    assert_eq!(curves.len(), wanted.len());
+    let mut bound = 0;
+    for c in &curves {
+        let reach = c.curve.last().map_or(0, |&(rows, _)| rows);
+        match c.stop {
+            Some((at, why)) => {
+                assert!(at > reach, "{c:?}");
+                bound += usize::from(why == profile::fire::KernelCurve::BOUND);
+            }
+            None => assert_eq!(reach, TOP, "{c:?}"),
+        }
+    }
+    assert!(
+        bound > 0,
+        "no curve stopped by a {tight:?} bound: {curves:?}"
+    );
+    let rates = Rates {
+        kernel_tflops_by_shape: Some(curves),
+        gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
+        attn_tflops_by_keys: Some(vec![(512, 5.0), (8192, 10.0)]),
+        elementwise_gbps: Some(600.0),
+        scan_gelems: Some(100.0),
+        ..stated
+    };
+    let planes: Vec<(u32, u32, u32, f64)> = shapes
+        .iter()
+        .map(|&(n, k)| (n, k, 28, f64::from(2 * n * k)))
+        .collect();
+    let rungs = [1, 16, 256, TOP];
+    engine_gpu::dense::choose(
+        kernels_slang::Target::Spirv,
+        &rungs,
+        |rows| engine_gpu::backend::Tactics::gemm(&tuning, tier, rows),
+        &rates,
+        &planes,
+        true,
+        Some(TOP),
+    )
+    .expect("the dense kernel is chosen whatever the curves reached");
+}

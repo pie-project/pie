@@ -114,6 +114,10 @@ pub struct File {
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
     /// `[rates]` ([`crate::fire`]).
     pub tuned: crate::fire::Tuned,
+    /// `[rates]` keys a user file states that this pie no longer reads:
+    /// left unread (the rest of the file is read, a load measures what it
+    /// lacks, and a save drops them, [`Registry::prune`]).
+    pub ignored_rates: Vec<String>,
 }
 
 impl Registry {
@@ -386,6 +390,7 @@ impl Registry {
             walk.err(0, format!("a profile starts with `api = {API}`"));
         }
         walk.file_lints(&file);
+        file.ignored_rates = std::mem::take(&mut walk.ignored_rates);
         if walk.diags.is_empty() {
             Ok(file)
         } else {
@@ -639,6 +644,9 @@ struct Walk<'a> {
     inherited: &'a [(usize, i64)],
     /// `[rates]` keys stated that no rate reads.
     stale_rates: Vec<String>,
+    /// Of `stale_rates`, those a user file states: left unread, the file
+    /// read for the rest.
+    ignored_rates: Vec<String>,
     /// What the file states that this pie no longer reads: each key (or a
     /// list's item) by name, and where it lies ([`Registry::prune`]).
     unread: Vec<(String, Unread)>,
@@ -669,6 +677,7 @@ impl<'a> Walk<'a> {
             under: &NONE,
             inherited: &[],
             stale_rates: Vec::new(),
+            ignored_rates: Vec::new(),
             unread: Vec::new(),
         }
     }
@@ -1165,6 +1174,14 @@ impl<'a> Walk<'a> {
                     self.stale_rates.push(other.to_string());
                     self.unread
                         .push((format!("rates.{other}"), Unread::Entry(v.span())));
+                    // A user file is a load's own output, written by an
+                    // older pie: a rate this pie no longer reads is left
+                    // unread, the rest of the file read (a checked-in file
+                    // stating one is refused by name).
+                    if self.strict == Strict::User {
+                        self.ignored_rates.push(other.to_string());
+                        continue;
+                    }
                     self.err(
                         k.span().start,
                         format!(

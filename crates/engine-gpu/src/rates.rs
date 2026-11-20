@@ -1153,12 +1153,29 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     };
     let launch = launch_ns as f64;
     let mut rig = Rig::<B>::new(device, max_submit);
-    let (side, warmed, _) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
-    say(&format!(
-        "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
-        warmed.rotations,
-        warmed.rate / 1e3
-    ));
+    // Under a stated bound, the probe first: every estimate grows from it.
+    rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
+    // The clock warmed by the warm-up's cube where one fits the bound at the
+    // worst ratio measured; where none does, the curves are timed unwarmed,
+    // each point admitted by its own estimate (one past the bound stops its
+    // curve, `KernelCurve::BOUND`): a sizing never fails the load.
+    match warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer) {
+        Ok((side, warmed, _)) => say(&format!(
+            "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
+            warmed.rotations,
+            warmed.rate / 1e3
+        )),
+        Err(why) if max_submit.is_some() => {
+            rig.past_bound.borrow_mut().take();
+            rig.release();
+            tracing::info!(
+                why = %why,
+                "rates: no warm-up cube fits the bound; the kernels' curves are timed unwarmed, \
+                 each point admitted by its own estimate"
+            );
+        }
+        Err(why) => return Err(why),
+    }
     let rows = timed_rows(top);
     let largest = rig.device.max_buffer();
     // Each shape's tiled kernels first: a vector kernel stops where it runs

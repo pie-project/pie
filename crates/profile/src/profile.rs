@@ -700,6 +700,13 @@ impl Registry {
                     continue;
                 }
             };
+            if !file.ignored_rates.is_empty() {
+                eprintln!(
+                    "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
+                     read and what it lacks is measured",
+                    file.ignored_rates.join(", ")
+                );
+            }
             let spelled = match facts {
                 Some(facts) => match self.admits(&file, facts) {
                     Ok(spelled) => spelled,
