@@ -396,6 +396,9 @@ struct Stage {
     args: Held,
     /// The steps the records are for.
     lowered: Vec<eta_compiler::codegen::wgsl::Step>,
+    /// Each node's temporary area, which its steps' records carry
+    /// (`StageTables::areas`).
+    areas: Vec<u32>,
     stride: u64,
 
     groups: u32,
@@ -590,7 +593,10 @@ impl Session {
                 .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
             stage
                 .args
-                .write(0, &step_records(&stage.lowered, stage.stride, bases))?;
+                .write(
+                    0,
+                    &step_records(&stage.lowered, &stage.areas, stage.stride, bases),
+                )?;
         }
         let (start, end) = self.status.run_span(self.slot_bytes);
         let mut runs = vec![Run {
@@ -1035,6 +1041,7 @@ fn build_stage(
     let StageTables {
         descriptors,
         offsets,
+        areas,
         ..
     } = resolved;
     let steps = lowered
@@ -1047,6 +1054,7 @@ fn build_stage(
         steps,
         args,
         lowered: lowered.steps.clone(),
+        areas,
         stride,
         groups: if lowered.strides_the_grid {
             groups_for(&descriptors, device.cores())
@@ -1299,7 +1307,16 @@ mod tests {
                 (at, words(&[desc(4), desc(4)].concat())),
                 (at + 128, words(&op)),
                 (at + 256, words(&[0, o_at])),
-                (at + 320, words(&[2, 0, 1, 0, heap_words, 0, 0, 0])),
+                (
+                    at + 320,
+                    eta_exec::tables::Cfg {
+                        value_count: 2,
+                        heap_words,
+                        op_count: 1,
+                        ..eta_exec::tables::Cfg::default()
+                    }
+                    .to_le_bytes(),
+                ),
             ] {
                 segment.write(from, &bytes).unwrap();
             }

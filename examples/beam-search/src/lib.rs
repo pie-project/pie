@@ -19,7 +19,8 @@
 //!
 //! The search runs `max_tokens` steps: a beam is not retired at end of
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
-//! length (the beam identity, checked every step against the raw argmax).
+//! length (the beam identity, checked under `verify` every step against the
+//! raw argmax).
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -50,7 +51,8 @@ struct Input {
     /// Rescore each final hypothesis as a lone sequence, one token a fire on
     /// a working set of its own, and require its summed log-probability to
     /// equal its beam's score: each beam read its own ancestry and nothing of
-    /// its siblings'.
+    /// its siblings'; and read each step's raw-logit argmax beside its picks,
+    /// which width 1 must equal (the beam identity).
     #[serde(default)]
     verify: bool,
     /// A negative control of `verify`, a beam broken on purpose: `parent`
@@ -150,7 +152,10 @@ async fn main(input: Input) -> Result<String> {
     let embed_indptr_p = Channel::from([0u32, n]);
     let out_p = Channel::new([b], dtype::i32);
     let scr_p = Channel::new([b], dtype::f32);
-    let greedy_p = Channel::new([1], dtype::i32);
+    // The raw-logit argmax beside each pick, a cross-check run only under
+    // `verify`: serving reads no argmax it does not use.
+    let verify = input.verify;
+    let greedy_p = verify.then(|| Channel::new([1], dtype::i32));
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p
@@ -161,7 +166,9 @@ async fn main(input: Input) -> Result<String> {
         let (s, i) = top_k(log_softmax(&logits), b);
         out_p.put(cast(&i, dtype::i32));
         scr_p.put(&s);
-        greedy_p.put(reshape(reduce_argmax(&logits), [1]));
+        if let Some(greedy_p) = greedy_p {
+            greedy_p.put(reshape(reduce_argmax(&logits), [1]));
+        }
     });
     fwd_p.submit(&pipeline).context("prefill submit")?;
     let first = out_p
@@ -172,11 +179,14 @@ async fn main(input: Input) -> Result<String> {
         .take_host::<Vec<f32>>()
         .await
         .context("prefill drain")?;
-    let greedy = greedy_p
-        .take_host::<Vec<i32>>()
-        .await
-        .context("prefill drain")?;
-    let mut greedy_mismatches = usize::from(first.first() != greedy.first());
+    let mut greedy_mismatches = 0;
+    if let Some(greedy_p) = greedy_p {
+        let greedy = greedy_p
+            .take_host::<Vec<i32>>()
+            .await
+            .context("prefill drain")?;
+        greedy_mismatches += usize::from(first.first() != greedy.first());
+    }
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
     // Each lane's score after each of its steps, its ancestry's first.
     let mut scored: Vec<Vec<f32>> = final_scores.iter().map(|&s| vec![s]).collect();
@@ -187,7 +197,8 @@ async fn main(input: Input) -> Result<String> {
         let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
         let out_par = Channel::new([b], dtype::u32).capacity(channel_capacity() as u32);
         let out_scr = Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
-        let out_greedy = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+        let out_greedy =
+            verify.then(|| Channel::new([b], dtype::i32).capacity(channel_capacity() as u32));
         let lanes_b = Channel::from_iter(0u32..=b);
 
         let corrupt_parent = input.corrupt.as_deref() == Some("parent");
@@ -233,7 +244,9 @@ async fn main(input: Input) -> Result<String> {
             out_par.put(&parent);
             out_scr.put(&s);
             // Cross-check: at `beams == 1` the raw-logit argmax must equal the beam pick every step.
-            out_greedy.put(reshape(reduce_argmax(&logits), [b]));
+            if let Some(out_greedy) = out_greedy {
+                out_greedy.put(reshape(reduce_argmax(&logits), [b]));
+            }
 
             let base = fill.take(); // [1]
             let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]
@@ -292,10 +305,13 @@ async fn main(input: Input) -> Result<String> {
                     .take_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("@{step}"))?;
-                let greedy = out_greedy
-                    .take_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("@{step}"))?;
+                let greedy = match out_greedy {
+                    Some(out_greedy) => out_greedy
+                        .take_host::<Vec<i32>>()
+                        .await
+                        .with_context(|| format!("@{step}"))?,
+                    None => picked.clone(),
+                };
                 if stop_wait || parents.iter().enumerate().any(|(i, &p)| p as usize != i) {
                     if let Some(ref ckpt_ws) = held_ckpt {
                         if let Ok(restore_ws) = ckpt_ws.fork(&pipeline) {
@@ -335,10 +351,13 @@ async fn main(input: Input) -> Result<String> {
                     .take_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("@{step}"))?;
-                let greedy = out_greedy
-                    .take_host::<Vec<i32>>()
-                    .await
-                    .with_context(|| format!("@{step}"))?;
+                let greedy = match out_greedy {
+                    Some(out_greedy) => out_greedy
+                        .take_host::<Vec<i32>>()
+                        .await
+                        .with_context(|| format!("@{step}"))?,
+                    None => picked.clone(),
+                };
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 scored = advance(&scored, &final_scores, &parents)?;
@@ -399,14 +418,14 @@ async fn main(input: Input) -> Result<String> {
             worst = worst.max((total - final_scores[lane]).abs());
         }
         format!(
-            " verified={} worst_apart={worst:.4} worst_step={closest:.3}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3}",
             hypotheses.len()
         )
     } else {
         String::new()
     };
     Ok(format!(
-        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}{verified}",
+        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4}{verified}",
         final_scores[best_lane]
     ))
 }

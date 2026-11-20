@@ -102,7 +102,7 @@ fn writes_only_its_heap_and_its_status(call: &str, source: &str) -> Result<(), S
         "b_offs",
         "b_heap",
         "lim_heap",
-        "cfg_temporary",
+        "tmp_base",
     ];
     let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
     let named = |name: &str| {
