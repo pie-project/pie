@@ -41,7 +41,9 @@ impl Serve for Api {
     type Keep = std::convert::Infallible;
 
     /// Eager by design: the probe is encoded at each fire.
-    type Probed = ();
+    type Probed = crate::device::Stamps;
+
+    type Stamps = crate::device::Stamps;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
@@ -87,13 +89,22 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::stated_submit_bound(),
+            <Self as Serve>::submit_bound(boot),
         )?;
         Ok((device, tuning))
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {
+        #[cfg(feature = "test-limits")]
+        if let Some(bound) = boot.submit_bound {
+            return Some(bound);
+        }
+        let _ = boot;
+        crate::rates::stated_submit_bound()
     }
 
     fn tier(device: &Context) -> kernels_slang::Tier {
@@ -151,14 +162,22 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
-    fn walk_frame(device: &Context, _keep: bool, timed: bool) -> Result<Frame> {
-        // A timed step's device time is filled once its work is done
-        // (`Context::timed_frame`) and read at its landing (`collect`).
-        if timed {
-            device.timed_frame()
-        } else {
-            device.frame()
+    fn walk_frame(
+        device: &Context,
+        _keep: bool,
+        timed: Option<&crate::device::Stamps>,
+    ) -> Result<Frame> {
+        // A timed step writes its arm's timestamps; its device time is
+        // filled once its work is done (`Context::timed_frame`) and read at
+        // its landing (`collect`), before the arm's next step goes out.
+        match timed {
+            Some(stamps) => device.timed_frame(stamps),
+            None => device.frame(),
         }
+    }
+
+    fn lay_stamps(device: &Context) -> Result<crate::device::Stamps> {
+        device.stamps()
     }
 
     fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
@@ -169,16 +188,22 @@ impl Serve for Api {
         })
     }
 
-    fn record_probe(_device: &Context, _record: &dyn Fn(&Frame) -> Result<()>) -> Result<()> {
-        Ok(())
+    /// Eager by design, the probe records nothing: its timestamps alone
+    /// are laid here, at load, and every probe writes them.
+    fn record_probe(
+        device: &Context,
+        _record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<crate::device::Stamps> {
+        device.stamps()
     }
 
     fn replay_probe(
         device: &Context,
-        _probed: &(),
+        probed: &crate::device::Stamps,
         record: &dyn Fn(&Frame) -> Result<()>,
     ) -> Result<Option<u64>> {
-        let frame = device.spanned()?;
+        // Into the timestamps laid at load: a probe lays nothing.
+        let frame = device.spanned_into(probed)?;
         record(&frame)?;
         frame.commit_spanned()
     }

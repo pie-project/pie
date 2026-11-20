@@ -142,7 +142,15 @@ impl Context {
         match self.never {}
     }
 
-    pub fn timed_frame(&self) -> Result<Frame> {
+    pub fn timed_frame(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn stamps(&self) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps) -> Result<Frame> {
         match self.never {}
     }
 
@@ -215,6 +223,9 @@ impl Frame {
 }
 
 pub use engine_gpu::backend::OnDone;
+
+#[derive(Clone, Debug)]
+pub enum Stamps {}
 
 #[derive(Debug)]
 pub struct Pending {

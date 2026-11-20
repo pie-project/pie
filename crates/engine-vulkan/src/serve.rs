@@ -65,6 +65,8 @@ impl Serve for Api {
     /// The probe recorded at load into a spanned frame kept to replay.
     type Probed = crate::device::Kept;
 
+    type Stamps = crate::device::Stamps;
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = "the least of VkPhysicalDeviceLimits::\
@@ -109,13 +111,22 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::stated_submit_bound(),
+            <Self as Serve>::submit_bound(boot),
         )?;
         Ok((device, tuning))
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {
+        #[cfg(feature = "test-limits")]
+        if let Some(bound) = boot.submit_bound {
+            return Some(bound);
+        }
+        let _ = boot;
+        crate::rates::stated_submit_bound()
     }
 
     fn tier(_device: &Context) -> kernels_slang::Tier {
@@ -165,16 +176,25 @@ impl Serve for Api {
         0
     }
 
-    fn walk_frame(device: &Context, keep: bool, timed: bool) -> Result<Frame> {
-        // A timed step is spanned: its timestamps' reset and writes recorded
-        // with its work, so a kept one writes them anew on each replay, and
-        // its device time is read at its harvest (`Pending::span_ns`).
-        match (keep, timed) {
-            (true, true) => device.spanned_kept(),
-            (true, false) => device.frame_kept(),
-            (false, true) => device.spanned(),
-            (false, false) => device.frame(),
+    fn walk_frame(
+        device: &Context,
+        keep: bool,
+        timed: Option<&crate::device::Stamps>,
+    ) -> Result<Frame> {
+        // A timed step is spanned into its arm's timestamps: their reset and
+        // writes recorded with its work, so a kept one (kept under its arm,
+        // `record_key`) writes them anew on each replay, and its device time
+        // is read at its harvest (`Pending::span_ns`), before the arm's next
+        // step goes out.
+        match (timed, keep) {
+            (Some(stamps), keep) => device.spanned_into(stamps, keep),
+            (None, true) => device.frame_kept(),
+            (None, false) => device.frame(),
         }
+    }
+
+    fn lay_stamps(device: &Context) -> Result<crate::device::Stamps> {
+        device.stamps()
     }
 
     fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {

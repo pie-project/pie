@@ -992,8 +992,7 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::stated_submit_bound()
-                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }

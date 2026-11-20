@@ -218,7 +218,7 @@ fn a_frame_after_the_device_idled_is_re_timed_and_stays_under_the_bound() {
 /// timestamp queries) the host's clock from its submit to its work done.
 /// A fire of a cube four times the probe's work reads a time past half
 /// the probe's and within the host's clock around it, walked once or kept
-/// and replayed.
+/// and replayed, each fire writing the one arm's timestamps laid before.
 #[test]
 fn a_timed_step_reads_its_device_time_once_it_lands() {
     let Some(mut gpu) = Gpu::open() else {
@@ -239,9 +239,12 @@ fn a_timed_step_reads_its_device_time_once_it_lands() {
     let probed = probe.fire(&gpu.device).expect("the probe fires");
     // Warmed: the cube's pipeline built and its operands touched.
     gpu.run(|c| gemm::matmul(c, tactic, act, w, y));
-    for keep in [false, true] {
+    // One arm's timestamps, laid once and written by every fire after,
+    // walked and kept alike, one in flight at a time.
+    let stamps = gpu.stamps();
+    for keep in [false, true, false, true] {
         let started = std::time::Instant::now();
-        let ns = gpu.fired(keep, |c| gemm::matmul(c, tactic, act, w, y));
+        let ns = gpu.fired(&stamps, keep, |c| gemm::matmul(c, tactic, act, w, y));
         let host = started.elapsed().as_nanos() as u64;
         let ns = ns.unwrap_or_else(|| panic!("a timed step's device time is read (keep {keep})"));
         assert!(ns > 0 && ns <= host, "keep {keep}: {ns} ns on the device, {host} ns on the host");

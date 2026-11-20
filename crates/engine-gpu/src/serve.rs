@@ -72,6 +72,12 @@ pub trait Serve: Backend {
     /// recordings, so no serving fire of it is unrecorded.
     type Probed;
 
+    /// The timestamps a timed step writes ([`Serve::walk_frame`]): laid at
+    /// load, one an arm (the most steps in flight), where a bound is
+    /// stated, and written by the one step in flight on the arm, so no
+    /// serving step lays any.
+    type Stamps;
+
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
@@ -122,6 +128,12 @@ pub trait Serve: Backend {
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
 
+    /// The bound on one GPU submission a load of `boot` holds every serving
+    /// step to: the platform's (`crate::rates::stated_submit_bound`), or
+    /// the one a test's boot states in its place (`test-limits`); none
+    /// where neither states one.
+    fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
+
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
@@ -169,9 +181,17 @@ pub trait Serve: Backend {
     ) -> Self::Sink<'f>;
 
     /// A frame a step walks into; `keep` where it is kept to replay;
-    /// `timed` where its device time is read once it lands, as
-    /// [`Serve::fire_timing`] states (under a stated submit bound).
-    fn walk_frame(device: &Self::Context, keep: bool, timed: bool) -> Result<Self::Frame>;
+    /// `timed` (its arm's timestamps) where its device time is read once it
+    /// lands, as [`Serve::fire_timing`] states (under a stated submit
+    /// bound).
+    fn walk_frame(
+        device: &Self::Context,
+        keep: bool,
+        timed: Option<&Self::Stamps>,
+    ) -> Result<Self::Frame>;
+
+    /// One arm's timestamps ([`Serve::Stamps`]), laid at load.
+    fn lay_stamps(device: &Self::Context) -> Result<Self::Stamps>;
 
     /// Where a serving fire's device time is read from under a stated
     /// submit bound (`crate::submit::Measured`), stated at load; a device
@@ -793,6 +813,9 @@ pub struct Shell<B: Serve> {
     /// The landed fires whose device time is not yet read, each with its
     /// estimate ([`Shell::timed`]).
     timing: Vec<(f64, crate::submit::DeviceTime)>,
+    /// Under a stated submit bound, each arm's timestamps, laid at load
+    /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
+    stamps: Vec<B::Stamps>,
 
     pub handles: Handles<B>,
     trace: Trace,
@@ -1671,7 +1694,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let mut submit_bound = match crate::rates::stated_submit_bound() {
+        let mut submit_bound = match B::submit_bound(boot.device) {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
@@ -1856,6 +1879,16 @@ impl<B: Serve> Shell<B> {
         let page_tables = rows.tables.len();
 
         let arms = boot.runahead.frames().max(1);
+        // Under a stated submit bound, each arm's timestamps, laid here
+        // (`Serve::Stamps`): a timed step writes its arm's, so serving lays
+        // none. A load that runs nothing on a device times nothing.
+        let stamps = if submit_bound.is_some() && B::LANDS {
+            (0..arms)
+                .map(|_| B::lay_stamps(&device))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         let gathers_readout = boot
             .trace
@@ -2117,6 +2150,7 @@ impl<B: Serve> Shell<B> {
             split_next: false,
             estimate_next: None,
             timing: Vec::new(),
+            stamps,
             pipelines,
             asks,
             handles,
@@ -5008,7 +5042,7 @@ impl<B: Serve> Shell<B> {
         let mut frame = Some(if bind_only {
             B::bind_frame(&self.device)?
         } else {
-            B::walk_frame(&self.device, keep, self.submit_bound.is_some())?
+            B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends

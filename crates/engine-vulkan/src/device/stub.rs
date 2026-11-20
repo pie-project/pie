@@ -154,6 +154,14 @@ impl Context {
         match self.never {}
     }
 
+    pub fn stamps(&self) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps, _keep: bool) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -162,6 +170,9 @@ impl Context {
 pub struct Frame {
     never: std::convert::Infallible,
 }
+
+#[derive(Clone, Debug)]
+pub enum Stamps {}
 
 impl Frame {
     pub fn flush_settled(&self) -> Result<()> {

@@ -141,11 +141,27 @@ impl Timing {
 }
 
 /// A spanned frame's two timestamps ([`Context::spanned`]): the set they
-/// are written to, the buffer it resolves into, and the host's copy.
+/// are written to, the buffer it resolves into, and the host's copy;
+/// `busy` from the frame that writes them opening until their readback is
+/// read and unmapped, so one frame writes them at a time.
 pub(crate) struct Span {
     set: wgpu::QuerySet,
     resolve: Held,
     readback: wgpu::Buffer,
+    busy: AtomicBool,
+}
+
+/// The timestamps a timed frame writes ([`Context::stamps`]), laid at load
+/// and written by one frame at a time: a set, its resolve and readback
+/// where the device enabled timestamp queries; nothing where it did not
+/// (a timed frame is then timed by the host's clock).
+#[derive(Clone)]
+pub struct Stamps(Option<Arc<Span>>);
+
+impl std::fmt::Debug for Stamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Stamps").field(&self.0.is_some()).finish()
+    }
 }
 
 /// The bytes a span's buffers take: two timestamps, at the resolve's
@@ -876,12 +892,20 @@ impl Context {
     /// timestamp written into its encoder before its work and one after it,
     /// where the device enabled timestamp queries; a plain frame elsewhere.
     pub fn spanned(&self) -> Result<Frame> {
-        let frame = self.frame()?;
+        let stamps = self.stamps()?;
+        self.spanned_into(&stamps)
+    }
+
+    /// The timestamps a timed frame writes, laid now ([`Stamps`]): a set of
+    /// two, its resolve and its readback where the device enabled
+    /// timestamp queries, else none.
+    pub fn stamps(&self) -> Result<Stamps> {
         let core = &self.core;
+        core.alive()?;
         if !core.enabled.timestamps {
-            return Ok(frame);
+            return Ok(Stamps(None));
         }
-        let span = Span {
+        Ok(Stamps(Some(Arc::new(Span {
             set: core.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("pie span"),
                 ty: wgpu::QueryType::Timestamp,
@@ -902,9 +926,30 @@ impl Context {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            busy: AtomicBool::new(false),
+        }))))
+    }
+
+    /// A frame writing its two timestamps into `stamps` (laid before,
+    /// [`Context::stamps`]); a plain frame where they hold none. Stamps a
+    /// frame before still reads (its readback not yet unmapped, which the
+    /// one frame in flight on an arm never leaves) are not written over:
+    /// the frame goes out unspanned and says so, its time told unread.
+    pub fn spanned_into(&self, stamps: &Stamps) -> Result<Frame> {
+        let frame = self.frame()?;
+        let Some(span) = &stamps.0 else {
+            return Ok(frame);
         };
+        if span.busy.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "timestamps: a frame's laid timestamps are still read for the frame before; \
+                 this frame goes out untimed"
+            );
+            frame.inner.time.unread();
+            return Ok(frame);
+        }
         frame.encode(|encoder| encoder.write_timestamp(&span.set, 0))?;
-        *frame.inner.span.lock().expect("span lock poisoned") = Some(span);
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(Arc::clone(span));
         Ok(frame)
     }
 
@@ -920,11 +965,12 @@ impl Context {
     /// never by a wait of its own: spanned ([`Context::spanned`]) where the
     /// device enabled timestamp queries, else timed by the host's clock
     /// from its submit to its work done.
-    pub fn timed_frame(&self) -> Result<Frame> {
-        let frame = self.spanned()?;
-        if frame.inner.span.lock().expect("span lock poisoned").is_none() {
-            frame.inner.wall.store(true, Ordering::Release);
+    pub fn timed_frame(&self, stamps: &Stamps) -> Result<Frame> {
+        if stamps.0.is_some() {
+            return self.spanned_into(stamps);
         }
+        let frame = self.frame()?;
+        frame.inner.wall.store(true, Ordering::Release);
         Ok(frame)
     }
 
@@ -966,7 +1012,7 @@ pub(crate) struct Inner {
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
     timing: Mutex<Vec<Timing>>,
-    span: Mutex<Option<Span>>,
+    span: Mutex<Option<Arc<Span>>>,
 
     pass: Mutex<Option<wgpu::ComputePass<'static>>>,
 
@@ -1002,6 +1048,11 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.release();
+        // Timestamps a frame dropped unsubmitted held are free again: a
+        // submitted frame took them, and frees them once read.
+        if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
+            span.busy.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1508,6 +1559,7 @@ impl Frame {
             word(1).saturating_sub(word(0))
         };
         span.readback.unmap();
+        span.busy.store(false, Ordering::Release);
         let period = f64::from(core.queue.get_timestamp_period());
         Ok(Some((ticks as f64 * period) as u64))
     }
@@ -1566,13 +1618,12 @@ pub use engine_gpu::backend::OnDone;
 /// A timed frame's span read once its work is done: its readback mapped
 /// and its two timestamps' distance filled into `time`, or `time` told
 /// unread where the map failed.
-fn read_span(core: Arc<Core>, span: Span, time: engine_gpu::submit::DeviceTime) {
+fn read_span(core: Arc<Core>, span: Arc<Span>, time: engine_gpu::submit::DeviceTime) {
     let period = f64::from(core.queue.get_timestamp_period());
     let readback = span.readback.clone();
     readback.slice(0..16).map_async(wgpu::MapMode::Read, move |mapped| {
-        // Held to here: the set and its resolve outlive the read.
-        let span = span;
         if mapped.is_err() {
+            span.busy.store(false, Ordering::Release);
             time.unread();
             return;
         }
@@ -1589,6 +1640,7 @@ fn read_span(core: Arc<Core>, span: Span, time: engine_gpu::submit::DeviceTime) 
             Err(_) => None,
         };
         span.readback.unmap();
+        span.busy.store(false, Ordering::Release);
         match ticks {
             Some(ticks) => time.set((ticks as f64 * period) as u64),
             None => time.unread(),
