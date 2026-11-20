@@ -465,6 +465,8 @@ pub fn lower(
         b: i64::from(batch.lanes.max(1)),
         env: HashMap::new(),
         splats: HashSet::new(),
+        denormal: HashSet::new(),
+        making_denormal: true,
     };
     let pack = (layout.in_words > 0).then(|| {
         l.f.param(Ty::new(Elem::U32, &[l.b, layout.in_words as i64]), None)
@@ -518,6 +520,7 @@ pub fn lower(
         let v = l.unpack(cells, 0, dtype, n)?;
         let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
         l.env.insert(slot.value, v);
+        l.denormal.insert(slot.value);
     }
 
     // Roots.
@@ -549,6 +552,8 @@ pub fn lower(
             }
         };
         l.env.insert(id, v);
+        // a loaded value may hold a denormal (`Lower::denormal`)
+        l.denormal.insert(id);
     }
 
     for op in &stage.ops {
@@ -610,6 +615,13 @@ struct Lower<'p> {
     /// one. A division by one keeps XLA's divide, which it turns into a
     /// multiply and shifts.
     splats: HashSet<u32>,
+    /// Values that may hold an f32 denormal on the device: loaded ones,
+    /// transcendental results, and what moves them unchanged. v6e's float
+    /// arithmetic flushes denormal operands and results to zero, so a sum,
+    /// product, quotient or matmul never holds one (`round_bf16`).
+    denormal: HashSet<u32>,
+    /// Whether the op being lowered may make a denormal (`Lower::op`).
+    making_denormal: bool,
 }
 
 impl Lower<'_> {
@@ -659,11 +671,16 @@ impl Lower<'_> {
         }
         // A bf16 value's store rounds its f32 to bf16, nearest-even, a NaN
         // quiet, and holds the f32 that bf16 stands for.
-        let v = if self.stored(id) == Dtype::Bf16 {
+        let v = if self.stored(id) != Dtype::Bf16 {
+            v
+        } else if self.making_denormal {
             self.round_bf16(v)?
         } else {
-            v
+            self.round_bf16_normal(v)?
         };
+        if self.making_denormal {
+            self.denormal.insert(id);
+        }
         self.env.insert(id, v);
         Ok(())
     }
@@ -692,6 +709,31 @@ impl Lower<'_> {
         let is_nan = self.f.compare(Cmp::Ne, v, v)?;
         let out = self.f.select(is_nan, nan, rounded)?;
         Ok(self.f.bitcast(out, Elem::F32)?)
+    }
+
+    /// [`Self::round_bf16`] of a value that holds no denormal (a sum,
+    /// product, quotient or matmul: v6e flushes them): `reduce_precision`
+    /// rounds a normal or zero f32 to bf16 nearest-even as `bf16_bits` does
+    /// (it flushes a denormal, which such a value never is), a NaN made
+    /// quiet as `bf16_bits` makes it. One op where the bit form takes ten
+    /// (v6e qwen3-0.6b sampled c64: the bit form's rounding ~1.5%).
+    fn round_bf16_normal(&mut self, v: Val) -> Lowering<Val> {
+        let ty = self.f.ty(v).clone();
+        let rounded = self.f.op_named(
+            "stablehlo.reduce_precision",
+            &[v],
+            "exponent_bits = 8 : i32, mantissa_bits = 7 : i32",
+            vec![ty],
+        )[0];
+        let bits = self.f.bitcast(v, Elem::U32)?;
+        let dims = self.f.dims(bits).to_vec();
+        let quiet = self.f.const_i(Elem::U32, 0x0040_0000, &dims);
+        let top = self.f.const_i(Elem::U32, 0xFFFF_0000, &dims);
+        let nan = self.f.or(bits, quiet)?;
+        let nan = self.f.and(nan, top)?;
+        let nan = self.f.bitcast(nan, Elem::F32)?;
+        let is_nan = self.f.compare(Cmp::Ne, v, v)?;
+        Ok(self.f.select(is_nan, nan, rounded)?)
     }
 
     /// `v` (one lane's value is `[B, ..]` of any shape with the same count)
@@ -1308,6 +1350,42 @@ impl Lower<'_> {
             return refuse(format!("result {result} is past the package's values"));
         }
         let shape = self.shape(result);
+        // Whether this op's results may hold a denormal: never a computed
+        // one (the device flushes them), what moves a value unchanged where
+        // an operand may, and everything else (a transcendental, a load).
+        self.making_denormal = match op.tag {
+            tags::ADD
+            | tags::SUB
+            | tags::MUL
+            | tags::DIV
+            | tags::REM
+            | tags::MATMUL
+            | tags::REDUCE_SUM
+            | tags::CUMSUM
+            | tags::CUMPROD => false,
+            tags::ABS
+            | tags::NEG
+            | tags::SELECT
+            | tags::MAX_ELEM
+            | tags::MIN_ELEM
+            | tags::RESHAPE
+            | tags::BROADCAST
+            | tags::TRANSPOSE
+            | tags::GATHER
+            | tags::GATHER_ROW
+            | tags::SORT_DESC
+            | tags::TOP_K
+            | tags::REDUCE_MAX
+            | tags::REDUCE_MIN
+            | tags::SCATTER_SET
+            | tags::SCATTER_ADD
+            | tags::CAST
+            | tags::MASK_APPLY_PACKED
+            | tags::CAUSAL_MASK
+            | tags::SLIDING_WINDOW_MASK
+            | tags::SINK_WINDOW_MASK => op.args.iter().any(|a| self.denormal.contains(a)),
+            _ => true,
+        };
         let dt =
             |l: &Self, i: usize| -> Dtype { op.args.get(i).map_or(Dtype::F32, |&a| l.dtype(a)) };
         match op.tag {
