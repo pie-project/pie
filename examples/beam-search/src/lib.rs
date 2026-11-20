@@ -503,12 +503,14 @@ impl Rescored {
     ///   also rounds, on the beam alone, the relative score and the
     ///   candidate (relative plus log-probability) to bf16, and its scores
     ///   either side to f32;
-    /// - a drift: fires of other rows run other kernels (other tiles, splits
-    ///   and reduction orders, compounding through every layer and the cache
-    ///   rows written), which the user allows (no batch invariance); `drift`
-    ///   is this step's own measure of it, the log-probability moved between
-    ///   a 1-row fire and one of the beam's width. Both sides may carry one:
-    ///   twice the drift.
+    /// - a drift: the beam's fires run other kernels than a 1-row fire
+    ///   folding every step (other tiles, splits and reduction orders for
+    ///   their rows, a recurrence read through an unfolded run, compounding
+    ///   through every layer and the cache rows written), which the user
+    ///   allows (no batch invariance); `drift` is this step's own measure of
+    ///   it, the log-probability moved between that 1-row fire and the
+    ///   hypothesis run as the beam's fires run ([`rescore`]). Both sides may
+    ///   carry one: twice the drift.
     fn room(&self, took: f32, carried: Option<(f32, f32, f32)>) -> Room {
         let candidate = carried.map_or(0.0, |(before, after, best)| {
             ulp_bf16(before - best) + ulp_bf16(after - best) + ulp_f32(before) + ulp_f32(after)
@@ -552,13 +554,17 @@ impl std::fmt::Display for Room {
 }
 
 /// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
-/// on working sets of its own ([`teacher_forced`]), as a 1-row fire and as a
-/// fire of `width` rows (the hypothesis and copies of itself: as many rows as
-/// the beam's own fires take): what a beam that read only its own ancestry
-/// takes there, and how far its 1-row and `width`-row fires drift apart.
+/// on working sets of its own ([`teacher_forced`]): as a 1-row fire folding
+/// every step, what a beam that read only its own ancestry takes there; and
+/// as the beam's own fires run, `width` rows (the hypothesis and copies of
+/// itself) with nothing folded past the prompt, how far the beam's kernels
+/// drift from it. A recurrent layer read through a long unfolded run is
+/// another computation from one folded every step, and the gap grows with
+/// the run (Qwen3.5: up to 0.375 at log-probability -7 by step 255, with
+/// row counts alone drifting 0 there).
 async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
-    let one = teacher_forced(prompt, hypothesis, 1).await?;
-    let wide = teacher_forced(prompt, hypothesis, width).await?;
+    let one = teacher_forced(prompt, hypothesis, 1, Fold::All).await?;
+    let wide = teacher_forced(prompt, hypothesis, width, Fold::None).await?;
     Ok(one
         .iter()
         .zip(&wide)
@@ -574,11 +580,13 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<R
 /// Each step's log-probability of `hypothesis` after `prompt`, its target
 /// logit and its largest logit, teacher-forced one token a fire as `copies`
 /// rows (the hypothesis repeated, each copy on a working set of its own),
-/// read off the first.
+/// read off the first. The prompt is folded; each step after it folds by
+/// `fold`.
 async fn teacher_forced(
     prompt: &[u32],
     hypothesis: &[u32],
     copies: u32,
+    fold: Fold<'static>,
 ) -> Result<Vec<(f32, f32, f32)>> {
     let v = model::output_vocab_size();
     let sets: Vec<WorkingSet> = (0..copies).map(|_| WorkingSet::new()).collect();
@@ -601,7 +609,11 @@ async fn teacher_forced(
         let largest = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
-        fwd.state(&bound, StateGeometry::folding())
+        let geometry = StateGeometry {
+            fold: if at == 0 { Fold::All } else { fold },
+            ..StateGeometry::default()
+        };
+        fwd.state(&bound, geometry)
             .context("bind the rescoring sets")?;
         fwd.epilogue(move || {
             // The first copy's row, at the sampler's bf16 grain.
