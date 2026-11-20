@@ -2713,6 +2713,172 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// A beam's ancestry-mask step on the device answers what the host
+    /// interpreter answers at every mask size: each beam inherits its
+    /// parent's row (`gather(mask, parent)`) and marks its own new cell
+    /// (`or` with `iota == cell`), over `[beams, cells]` bools from below to
+    /// past one 1,024-thread block. (On the tiny-region merge of 3ee539f31
+    /// the step's put shared a streamed step with the `or` writing its
+    /// value, and packing eight bools a byte read cells the other
+    /// threadgroup had not yet written: past cell 512 the mask came back
+    /// zero, and a beam of 7 read the wrong ancestry.)
+    #[test]
+    fn a_beam_mask_step_answers_what_the_interpreter_answers_at_every_size() {
+        use eta_compiler::contract::wire;
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let mut wrong = Vec::new();
+        for (beams, cells) in [(7u32, 105u32), (8, 120), (4, 252), (7, 77), (7, 161), (6, 90)] {
+            let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+            let indptr = leak(Channel::from(vec![0u32, 1]));
+            let mask = leak(Channel::seeded([beams, cells], dtype::bool));
+            let parent = leak(Channel::seeded([beams], dtype::u32));
+            let cell = leak(Channel::seeded([beams], dtype::u32));
+            let out = leak(Channel::new([beams, cells], dtype::bool).capacity(1));
+            let vocab = 8u32;
+            let logits = OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            };
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(vec![vec![logits.clone()]]);
+            b.bind_port(Port::EmbedIndptr, indptr);
+            b.stage(Attach::Epilogue, move || {
+                let inherited = gather(mask.take(), parent.read());
+                let columns = broadcast(reshape(iota(cells), [1, cells]), [beams, cells]);
+                let mine = broadcast(reshape(cell.read(), [beams, 1]), [beams, cells]);
+                let marked = or(inherited, eq(columns, mine));
+                mask.put(&marked);
+                out.put(&marked);
+            });
+            mask.note_host_put();
+            out.note_host_take();
+            let traced = b.build().expect("the mask step traces");
+            let bound = eta_ir::validate::bind(
+                traced.container().clone(),
+                vec![vec![logits]],
+                EngineCaps {
+                    lora: true,
+                    attn_page_mask: true,
+                },
+            )
+            .expect("the mask step binds");
+            let stages = compile_bound(&bound);
+            let backend = Backend::parse("metal").expect("the metal codegen backend");
+            let registration = ProgramRegistration {
+                program_hash: bound.hash ^ u64::from(beams * 10_000 + cells),
+                emitted_kernels: emit_program(backend, &stages, &bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            };
+            let order = traced.channel_order();
+            let index = |c: &Channel| -> u32 {
+                u32::try_from(order.iter().position(|&gid| gid == c.gid()).expect("a channel"))
+                    .expect("a channel index")
+            };
+            let bits = |v: &[bool]| -> Vec<u8> {
+                let mut packed = vec![0u8; v.len().div_ceil(8)];
+                for (k, &bit) in v.iter().enumerate() {
+                    if bit {
+                        packed[k / 8] |= 1 << (k % 8);
+                    }
+                }
+                packed
+            };
+            let start: Vec<bool> = (0..beams * cells).map(|k| (k * 7 + k / 5) % 3 == 0).collect();
+            let parents: Vec<u32> = (0..beams).map(|k| (k * 3 + 1) % beams).collect();
+            let cells_at: Vec<u32> = (0..beams).map(|k| (k * 13 + 5) % cells).collect();
+            let u32s = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+            let mut plane = Plane::new();
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let count = bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind_placed(
+                    &context,
+                    program,
+                    &[
+                        (index(indptr), u32s(&[0, 1])),
+                        (index(mask), bits(&start)),
+                        (index(parent), u32s(&parents)),
+                        (index(cell), u32s(&cells_at)),
+                    ],
+                    Extents {
+                        row_count: 1,
+                        sampled_rows: 1,
+                        query_len: 1,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the instance binds");
+            let logits_plane = crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a plane");
+            plane
+                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, vocab, vocab, 1)
+                .expect("the logits bind");
+            let mut reference = Instance::new(
+                &bound,
+                &[
+                    (index(indptr), Value::U32(vec![0, 1])),
+                    (index(mask), Value::Bool(start.clone())),
+                    (index(parent), Value::U32(parents.clone())),
+                    (index(cell), Value::U32(cells_at.clone())),
+                ],
+            )
+            .expect("the interpreter instantiates");
+            // Three steps: each reads the mask the step before put.
+            for step in 0..3 {
+                let fired = plane.fire(&context, id, Attach::Epilogue).expect("the step fires");
+                assert!(matches!(fired, Fired::Committed), "{fired:?}");
+                let stepped = reference
+                    .step(
+                        &bound,
+                        &PassInputs {
+                            outputs: vec![("logits".to_string(), 0, Value::F32(vec![0.0; vocab as usize]))],
+                        },
+                        &mut NoKernels,
+                    )
+                    .expect("the interpreter steps");
+                assert!(stepped.committed, "{:?}", stepped.missed);
+                let want = wire(&reference.host_take(&bound, index(out)).expect("a cell"));
+                let got = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(index(out))
+                    .expect("a take")
+                    .expect("a cell");
+                if got != want {
+                    let apart = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+                    wrong.push(format!(
+                        "[{beams}, {cells}] ({} elements), step {step}: {apart} of {} bytes differ",
+                        beams * cells,
+                        want.len()
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// [`beam_steps_answer_what_the_interpreter_answers`] with the served
     /// beam's seeds: a prompt past the mask's first word.
     #[test]

@@ -621,6 +621,10 @@ enum Plan {
         text: String,
         value: u32,
         len: Vec<Dimension>,
+        /// The value is bool: the put packs eight of its cells a byte, so a
+        /// thread reads cells other threads write, and it reads them only
+        /// once the step that writes them has ended.
+        packs: bool,
     },
     Single(String),
     Select {
@@ -1266,6 +1270,10 @@ pub fn emit_streamed_region(
                 ),
                 value: reads.first().copied().unwrap_or(base),
                 len: reads.first().map_or_else(Vec::new, |&v| key_of(v)),
+                packs: reads
+                    .first()
+                    .and_then(|&v| wire_dtype(value_types, v))
+                    .is_some_and(|dtype| dtype == 3),
             },
             StepKind::Wide => {
                 let probe = BTreeMap::new();
@@ -1483,9 +1491,20 @@ pub fn emit_streamed_region(
                 o.writes.insert(*writes);
                 o.nodes.push(node);
             }
-            Plan::Put { text, value, len } => {
+            Plan::Put {
+                text,
+                value,
+                len,
+                packs,
+            } => {
+                // A packing put reads cells across threads: never in the
+                // step whose threads write them (a grid has no barrier).
+                if *packs && sched.open.as_ref().is_some_and(|o| o.writes.contains(value)) {
+                    sched.flush_open();
+                }
                 sched.ensure_open(*value, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len || len.is_empty())
+                        && !(*packs && o.writes.contains(value))
                 });
                 sched.close_loop();
                 let o = sched.open.as_mut().expect("opened");

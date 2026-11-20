@@ -30,7 +30,7 @@ pub use streamed_topk::{TOPK_ROW_BYTES, emit_streamed_topk, streamed_topk_tempor
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 73;
+pub const METAL_M1_EMITTER_VERSION: u16 = 74;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 
