@@ -43,7 +43,7 @@
 //! biases it.
 
 use engine::rates::{SCAN_SHAPE, Touched, attn_flops, gemm_flops, scan_elements, weights_at};
-use kernels_slang::{KvPool, RaggedTensor, Tensor};
+use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 use profile::fire::Rates;
 
@@ -1345,6 +1345,11 @@ fn scan<B: Serve>(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let csr = kernels_slang::ssm::Csr {
+        table: indptr,
+        at: 0,
+        lanes: indptr.rows.saturating_sub(1),
+    };
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("scan {} tokens", s.tokens), None);
     let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
@@ -1353,7 +1358,8 @@ fn scan<B: Serve>(
         next.set(next.get() + 1);
         kernels_slang::ssm::conv1d::conv1d_chunked(
             sink,
-            RaggedTensor { data: raw, indptr },
+            raw,
+            csr,
             weight,
             conv_state,
             s.conv_width,
@@ -1362,16 +1368,7 @@ fn scan<B: Serve>(
         )
         .map_err(fault("rates: conv"))?;
         kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-            sink,
-            tactic,
-            RaggedTensor { data: qkv, indptr },
-            gates,
-            scan_state,
-            s.k_heads,
-            s.v_heads,
-            s.k_dim,
-            s.v_dim,
-            y,
+            sink, tactic, qkv, csr, gates, scan_state, s.k_heads, s.v_heads, s.k_dim, s.v_dim, y,
         )
         .map_err(fault("rates: scan"))
     })?;

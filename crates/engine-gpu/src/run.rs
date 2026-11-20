@@ -432,6 +432,18 @@ impl<'c, B: Backend> Run<'c, B> {
         self.window().indptr
     }
 
+    /// The window's query CSR as the scans bind it: the fire's packed
+    /// windows table whole (one view whatever window a fire cuts), the
+    /// window's boundaries from their int in it.
+    pub fn csr(&self) -> kernels_slang::ssm::Csr {
+        let window = self.window();
+        kernels_slang::ssm::Csr {
+            table: self.windows.table(),
+            at: window.indptr_at,
+            lanes: u32::try_from(window.indptr_host.len().saturating_sub(1)).unwrap_or(u32::MAX),
+        }
+    }
+
     pub fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
     }
