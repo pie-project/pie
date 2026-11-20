@@ -136,9 +136,15 @@ pub struct Plane {
     /// The most lanes one fire flies, and the frames in flight.
     lanes: u32,
     arms: usize,
-    /// The readout rows a lane may take in one fire: what an instance's
-    /// row table is laid for.
+    /// The readout rows a lane reads by default (the model's
+    /// `readouts_per_lane`): a bind reading fewer is laid for these.
     rows: u32,
+    /// The readout rows the load's readout planes hold (`max_lanes ×
+    /// readouts_per_lane`, at most a fire's tokens): the most rows a
+    /// program may state. An instance is laid and priced for the rows its
+    /// program states ([`Self::program_rows`]), never the frame shape; a
+    /// program stating more than these is refused at registration.
+    span_rows: u32,
     /// The bytes a capturing lane's score rows take
     /// (`crate::serve::CaptureLayout`): state of each instance of a program
     /// that reads them out, held in its `Instance` slots after its tables;
@@ -170,6 +176,7 @@ impl Plane {
             lanes: 64,
             arms: 1,
             rows: 1,
+            span_rows: 1,
             capture: 0,
             next_program: 1,
             next_instance: 1,
@@ -183,14 +190,14 @@ impl Plane {
     /// its address in the batch's lane scratch table, so the pair's state
     /// does not grow with the lanes' scratch.
     fn pair_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<(usize, usize, u64)>> {
-        let _ = extents;
+        let rows = self.rows_for(program, extents)?;
         let channels = u32::try_from(program.plan.package.channels.len()).unwrap_or(u32::MAX);
         let mut sets = Vec::new();
         for (stage, plan) in program.compiled.plans.iter().enumerate() {
             if !session::launches(&program.compiled, stage) || !plan.needs.grouped_valid {
                 continue;
             }
-            let bytes = launch::Batch::bytes_for(plan, channels, self.lanes, self.rows);
+            let bytes = launch::Batch::bytes_for(plan, channels, self.lanes, rows);
             for arm in 0..self.arms {
                 sets.push((stage, arm, bytes));
             }
@@ -283,6 +290,17 @@ impl Plane {
                 step: Step::Registered(existing),
             });
         }
+        let stated = Self::stated_rows(&registration.launch);
+        if stated > self.span_rows {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "this program reads {stated} readout rows a lane, and the load's readout \
+                     planes hold {} (its lanes times the rows a lane reads out)",
+                    self.span_rows
+                ),
+            ));
+        }
         let plan = adopt_launch_package(registration.launch.clone())?;
         let planned = self.cache.plan(
             context,
@@ -363,7 +381,7 @@ impl Plane {
             extents,
             &adopted,
             pooled,
-            self.rows,
+            self.rows_for(program, &extents)?,
             capture,
             self.arms,
         ) {
@@ -608,6 +626,59 @@ impl Plane {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
         self.rows = rows.max(1);
+        self.span_rows = self.span_rows.max(self.rows);
+    }
+
+    /// The readout rows the load's readout planes hold: the most rows a
+    /// program may state ([`Self::program_rows`]).
+    pub fn set_readout_span(&mut self, rows: u32) {
+        self.span_rows = rows.max(self.rows);
+    }
+
+    /// The readout rows `program` states a lane: its readout port's rows,
+    /// else its embedded rows (its `EmbedIndptr` boundaries less one), as
+    /// the DSL counts the rows a pass reads; one where it states neither.
+    fn stated_rows(package: &eta_compiler::codegen::launch::LaunchPackage) -> u32 {
+        use eta_ir::registry::Port;
+        let numel = |port: Port| -> Option<u32> {
+            let binding = package.ports.iter().find(|binding| binding.port == port)?;
+            let dims: &[u32] = if binding.is_const {
+                &binding.const_shape
+            } else {
+                &package.channels.get(binding.channel as usize)?.shape
+            };
+            Some(dims.iter().product::<u32>())
+        };
+        numel(Port::Readout)
+            .or_else(|| numel(Port::EmbedIndptr).map(|n| n.saturating_sub(1)))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The readout rows an instance of `program` is laid and priced for:
+    /// the rows its program states, never fewer than the load's default.
+    /// Registration refused a program stating more than the readout planes
+    /// hold.
+    fn program_rows(&self, program: &Program) -> u32 {
+        self.rows.max(Self::stated_rows(&program.plan.package))
+    }
+
+    /// The readout rows a bind of `program` at `extents` is laid for
+    /// ([`Self::program_rows`]); a bind reading more rows than its program
+    /// states is refused by name.
+    fn rows_for(&self, program: &Program, extents: &Extents) -> Result<u32> {
+        let rows = self.program_rows(program);
+        if extents.sampled_rows > rows {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "this bind reads {} readout rows a lane, past the {rows} its program \
+                     states (its readout port, or its embedded rows)",
+                    extents.sampled_rows
+                ),
+            ));
+        }
+        Ok(rows)
     }
 
     /// Plans the batch sets pair `pair` fires its grouped stages with, one a
@@ -751,10 +822,12 @@ impl Plane {
             .programs
             .get(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {id}")))?;
+        // An instance's tables, laid at its bind for the rows its program
+        // states (`Self::program_rows`), priced here for the same.
         let sizes = Session::table_sizes(
             &program.compiled,
             program.plan.package.channels.len(),
-            self.rows,
+            self.program_rows(program),
             self.capture_of(program),
             self.arms,
         );
@@ -2427,6 +2500,214 @@ mod tests {
                         break 'steps;
                     }
                 }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A bind may read the readout rows its program states, past the rows a
+    /// lane reads by default, up to what the load's readout planes hold: a
+    /// beam of width 8 on a load whose default is 5 rows a lane (the
+    /// model's `readouts_per_lane`) binds, and its step (the rows'
+    /// log-softmax, the top 8 over the flattened rows, each row's argmax)
+    /// answers what the host interpreter answers. A bind past its program's
+    /// rows, and a program past the planes, are refused by name.
+    /// (Metal laid every bind for the default and refused a beam of 8:
+    /// "this bind reads 8 readout rows a lane, and the load lays the rows of
+    /// 5".)
+    #[test]
+    fn a_bind_reads_the_rows_it_states_up_to_the_readout_planes() {
+        use eta_compiler::contract::wire;
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        const WIDTH: u32 = 8;
+        const VOCAB: u32 = 997;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+        let indptr = leak(Channel::from(vec![0u32, WIDTH]));
+        // The rows the step reads out: all eight of the beam's.
+        let readout = leak(Channel::from((0..WIDTH).collect::<Vec<u32>>()));
+        let scores = leak(Channel::new([WIDTH], dtype::f32).capacity(1));
+        let parents = leak(Channel::new([WIDTH], dtype::u32).capacity(1));
+        let tokens = leak(Channel::new([WIDTH], dtype::u32).capacity(1));
+        let best = leak(Channel::new([WIDTH], dtype::i32).capacity(1));
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: VOCAB,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let mut b = Builder::new(VOCAB, 16);
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.bind_port(Port::Readout, readout);
+        b.stage(Attach::Epilogue, move || {
+            let rows = reshape(intrinsics::output(0, "logits"), [WIDTH, VOCAB]);
+            let (s, i) = top_k(reshape(log_softmax(&rows), [WIDTH * VOCAB]), WIDTH);
+            scores.put(&s);
+            parents.put(&(&i / VOCAB));
+            tokens.put(&(&i % VOCAB));
+            best.put(&reduce_argmax(&rows));
+        });
+        for reader in [scores, parents, tokens, best] {
+            reader.note_host_take();
+        }
+        let traced = b.build().expect("the step traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the step binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let registration = ProgramRegistration {
+            program_hash: bound.hash,
+            emitted_kernels: emit_program(backend, &stages, &bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        };
+        let order = traced.channel_order();
+        let index = |c: &Channel| -> u32 {
+            u32::try_from(order.iter().position(|&gid| gid == c.gid()).expect("a channel"))
+                .expect("a channel index")
+        };
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let mut plane = Plane::new();
+        // Planes of 6 rows hold no program of 8.
+        let mut narrow = Plane::new();
+        narrow.set_flight(1, 1, 5);
+        narrow.set_readout_span(6);
+        let refused = narrow
+            .register(&context, &registration)
+            .expect_err("a program past the readout planes is refused");
+        assert!(
+            format!("{refused}").contains("reads 8 readout rows a lane, and the load's readout planes hold 6"),
+            "refused by name: {refused}"
+        );
+        // The default 5 rows a lane over 4 lanes: planes of 20 rows.
+        plane.set_flight(4, 1, 5);
+        plane.set_readout_span(20);
+        let program = plane.register(&context, &registration).expect("registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let indptr_bytes: Vec<u8> = [0u32, WIDTH].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let readout_bytes: Vec<u8> = (0..WIDTH).flat_map(u32::to_le_bytes).collect();
+        let extents = |rows: u32| Extents {
+            row_count: rows,
+            sampled_rows: rows,
+            query_len: rows,
+            ..Extents::default()
+        };
+        // Past its program's rows: refused by name.
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let refused = plane
+            .bind_placed(
+                &context,
+                program,
+                &[(index(indptr), indptr_bytes.clone()), (index(readout), readout_bytes.clone())],
+                extents(32),
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect_err("a bind past its program's rows is refused");
+        assert!(
+            format!("{refused}").contains("reads 32 readout rows a lane, past the 8 its program states"),
+            "refused by name: {refused}"
+        );
+        let id = plane
+            .bind_placed(
+                &context,
+                program,
+                &[(index(indptr), indptr_bytes), (index(readout), readout_bytes)],
+                extents(WIDTH),
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("a beam of 8 binds past the default 5 rows a lane");
+        let bf16 = |x: f32| {
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+        let mut x = 0x2545_f491u32;
+        let values: Vec<f32> = (0..WIDTH * VOCAB)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                bf16((x % 16_000) as f32 / 1000.0 - 8.0)
+            })
+            .collect();
+        let halves: Vec<u8> = values
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let mut plane_bytes =
+            crate::device::Buffer::zeroed(&context, halves.len() as u64).expect("a logits plane");
+        plane_bytes.write(0, &halves).expect("the logits upload");
+        plane
+            .bind_output(id, "logits", 0, &plane_bytes, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, WIDTH)
+            .expect("the logits bind");
+        let fired = plane.fire(&context, id, Attach::Epilogue).expect("the step fires");
+        assert!(matches!(fired, Fired::Committed), "{fired:?}");
+        let mut reference = Instance::new(
+            &bound,
+            &[
+                (index(indptr), Value::U32(vec![0, WIDTH])),
+                (index(readout), Value::U32((0..WIDTH).collect())),
+            ],
+        )
+            .expect("the interpreter instantiates");
+        let stepped = reference
+            .step(
+                &bound,
+                &PassInputs {
+                    outputs: vec![("logits".to_string(), 0, Value::F32(values))],
+                },
+                &mut NoKernels,
+            )
+            .expect("the interpreter steps");
+        assert!(stepped.committed, "{:?}", stepped.missed);
+        let mut wrong = Vec::new();
+        for (reader, name) in [(scores, "scores"), (parents, "parents"), (tokens, "tokens"), (best, "argmax")] {
+            let want = reference.host_take(&bound, index(reader)).expect("a cell");
+            let got = plane
+                .instance_mut(id)
+                .expect("bound")
+                .take(index(reader))
+                .expect("a take")
+                .expect("a cell");
+            let agree = match &want {
+                Value::F32(w) => got
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .zip(w)
+                    .all(|(g, w)| (g - w).abs() <= 1e-4 * w.abs().max(1.0)),
+                other => got == wire(other),
+            };
+            if !agree {
+                wrong.push(format!("{name}: {got:02x?} != {:02x?}", wire(&want)));
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));

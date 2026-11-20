@@ -645,8 +645,8 @@ impl Grouped {
             return Err(Fault::program(
                 "program::launch",
                 format!(
-                    "this bind reads {readout_rows} readout rows a lane, and the load lays \
-                     the rows of {} (the readouts a lane may take in one fire)",
+                    "this bind reads {readout_rows} readout rows a lane, and its tables are \
+                     laid for {} (the rows its extents state, `Plane::rows_for`)",
                     rows_bound.max(1)
                 ),
             ));

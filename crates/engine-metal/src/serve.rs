@@ -1664,6 +1664,10 @@ impl PreparedLoad<'_> {
             programs: {
                 let mut plane = crate::program::Plane::new();
                 plane.set_flight(boot.budget.max_lanes, arms, boot.budget.readouts_per_lane);
+                plane.set_readout_span(
+                    u32::try_from(poem_compiler::arena::readouts_ceiling(&boot.budget))
+                        .unwrap_or(u32::MAX),
+                );
                 plane.set_capture(capture_bytes);
                 plane
             },
