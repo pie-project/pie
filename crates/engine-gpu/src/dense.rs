@@ -279,7 +279,11 @@ pub fn choose(
     records: bool,
     full: Option<u32>,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
-    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records, full)?;
+    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records, full, None)?;
+    // What each plane's own pick must beat, and what a plane no kernel was
+    // timed at keeps: the one kernel a rung (or a row count) weighed over
+    // every plane together, as a load picked before planes picked their own.
+    let together = |rows: u32| at_rows(&by_rows, rows);
     // Each plane its own pick, by its own curves (a kernel beaten at one
     // plane, an output head's, may win another): a plane no kernel was timed
     // at takes the pick over every plane together.
@@ -288,7 +292,16 @@ pub fn choose(
         if own.iter().any(|(at, _)| *at == (n, k)) {
             continue;
         }
-        if let Ok((by_rows, _)) = pick(target, rungs, &tiled, rates, &[*plane], records, full) {
+        if let Ok((by_rows, _)) = pick(
+            target,
+            rungs,
+            &tiled,
+            rates,
+            &[*plane],
+            records,
+            full,
+            Some(&together),
+        ) {
             own.push(((n, k), by_rows));
         }
     }
@@ -302,7 +315,10 @@ pub fn choose(
 }
 
 /// [`choose`] over `planes` together: one tactic a rung (or a row count)
-/// for all of them, and each rung's weighing.
+/// for all of them, and each rung's weighing. With an `incumbent` (the pick
+/// over every plane together, for one plane's own), the pick replaces it
+/// only past the two kernels' measured spread, and a rung no kernel was
+/// timed at keeps it.
 fn pick(
     target: Target,
     rungs: &[u32],
@@ -311,6 +327,7 @@ fn pick(
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
+    incumbent: Option<&dyn Fn(u32) -> Tactic>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
     let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
@@ -352,6 +369,30 @@ fn pick(
     // there (every weight pass it makes and whatever a cache spares it in the
     // time) and a launch. `None` where its curve at one of them does not
     // reach the rows, or no plane was timed to them.
+    // The planes `among` are weighed at, at `rows`: those every candidate
+    // timed at some plane to the rows was timed at (a plane some of them
+    // were not tells nothing between them; its own pick sees it).
+    let weighed_at = |among: &[Tactic], n: u32, k: u32, rows: u32| -> bool {
+        let priced = |t: Tactic| time_at(t, n, k, rows).is_some();
+        let timed_somewhere = |t: Tactic| {
+            planes
+                .iter()
+                .any(|&(pn, pk, ..)| time_at(t, pn, pk, rows).is_some())
+        };
+        among.iter().any(|&t| priced(t)) && among.iter().all(|&t| priced(t) || !timed_somewhere(t))
+    };
+    // Whether `tactic`'s curve at some plane stopped as beaten short of
+    // `rows` (`KernelCurve::BEATEN`): shown slower there than a tile.
+    let beaten_by = |tactic: Tactic, rows: u32| -> bool {
+        planes.iter().any(|&(n, k, ..)| {
+            let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
+            curves.iter().any(|c| {
+                c.id() == (kind, key, n, k)
+                    && matches!(c.stop, Some((at, why))
+                        if why == profile::fire::KernelCurve::BEATEN && rows >= at)
+            })
+        })
+    };
     // `tactic`'s measured spread at an `n x k` plane at `rows` (its points'
     // repeats, `(max - min) / median`, between its points in log rows): 0
     // where none was measured.
@@ -368,7 +409,7 @@ fn pick(
     let noise = |among: &[Tactic], tactic: Tactic, rows: u32| -> f64 {
         planes
             .iter()
-            .filter(|&&(n, k, ..)| among.iter().any(|&t| time_at(t, n, k, rows).is_some()))
+            .filter(|&&(n, k, ..)| weighed_at(among, n, k, rows))
             .map(|&(n, k, ..)| spread_at(tactic, n, k, rows))
             .fold(0.0, f64::max)
     };
@@ -376,7 +417,7 @@ fn pick(
         let mut ns = 0.0;
         let mut weighed = false;
         for &(n, k, count, _) in planes {
-            if among.iter().all(|&t| time_at(t, n, k, rows).is_none()) {
+            if !weighed_at(among, n, k, rows) {
                 continue;
             }
             ns += f64::from(count) * (c.launch_ns + time_at(tactic, n, k, rows)?);
@@ -403,10 +444,13 @@ fn pick(
             .filter_map(|&t| Some((t, cost(&among, t, bottom)?, cost(&among, t, rung)?)))
             .collect();
         if costs.is_empty() {
-            // Past every curve at every plane: the rung below's kernel, else
-            // (no kernel timed at any rows, every curve stopped at its first
-            // by the bound or the buffer) the profile's path's own.
-            let kept = by_rows.last().map_or_else(|| tiled(rung), |&(_, t)| t);
+            // Past every curve at every plane: the incumbent's kernel, else
+            // the rung below's, else (no kernel timed at any rows, every
+            // curve stopped at its first by the bound or the buffer) the
+            // profile's path's own.
+            let kept = incumbent
+                .map(|of| of(rung))
+                .unwrap_or_else(|| by_rows.last().map_or_else(|| tiled(rung), |&(_, t)| t));
             by_rows.push((rung, kept));
             weighed.push(Weighed {
                 bottom,
@@ -420,11 +464,18 @@ fn pick(
         }
         let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
         let mut taken = Weighed::least_regret(&costs, &rows_of);
-        // The profile path's own tactic keeps the rung unless the pick beats
-        // it by more than the two kernels' measured spread there: a gap
-        // narrower than their repeats spread over is no difference.
-        let path = tiled(rung);
-        if let Some(kept) = costs.iter().position(|c| c.0 == path) {
+        // The incumbent keeps the rung unless the pick beats it by more than
+        // the two kernels' measured spread there: a gap narrower than their
+        // repeats spread over is no difference.
+        let path = incumbent.map(|of| of(rung));
+        // An incumbent no curve at the plane prices keeps the rung, unless
+        // its curve there stopped as beaten.
+        let unpriced = path.filter(|&path| {
+            costs.iter().all(|c| c.0 != path) && !beaten_by(path, bottom) && !beaten_by(path, rung)
+        });
+        if let Some((path, kept)) =
+            path.and_then(|path| Some((path, costs.iter().position(|c| c.0 == path)?)))
+        {
             let best = |of: fn(&(Tactic, f64, f64)) -> f64| {
                 costs
                     .iter()
@@ -441,7 +492,7 @@ fn pick(
             }
         }
         if records {
-            by_rows.push((rung, costs[taken].0));
+            by_rows.push((rung, unpriced.unwrap_or(costs[taken].0)));
         } else {
             for rows in bottom..=rung {
                 let among = candidates(rows);
@@ -453,11 +504,12 @@ fn pick(
                     .iter()
                     .copied()
                     .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))));
-                let path = tiled(rows);
-                // The path's tactic unless the fastest beats it by more than
+                let path = incumbent.map(|of| of(rows));
+                // The incumbent unless the fastest beats it by more than
                 // their spreads at these rows.
-                let pick = match (fastest, priced.iter().find(|p| p.0 == path)) {
-                    (Some((t, ns)), Some(&(_, path_ns))) => {
+                let priced_path = path.and_then(|path| priced.iter().find(|p| p.0 == path));
+                let pick = match (fastest, priced_path) {
+                    (Some((t, ns)), Some(&(path, path_ns))) => {
                         let spread = noise(&among, t, rows) + noise(&among, path, rows);
                         if (path_ns - ns) / path_ns.max(f64::MIN_POSITIVE) > spread {
                             Some(t)
@@ -465,9 +517,14 @@ fn pick(
                             Some(path)
                         }
                     }
-                    (fastest, _) => fastest.map(|(t, _)| t),
+                    // An incumbent no curve here prices keeps the rows.
+                    (fastest, None) => path
+                        .filter(|&path| !beaten_by(path, rows))
+                        .or(fastest.map(|(t, _)| t)),
+                    (None, Some(&(path, _))) => Some(path),
                 };
                 let pick = pick
+                    .or(path)
                     .or_else(|| by_rows.last().map(|&(_, t)| t))
                     .unwrap_or_else(|| tiled(rows));
                 by_rows.push((rows, pick));
@@ -869,7 +926,8 @@ mod tests {
 
     /// Each plane takes its own kernel at a rung: the vector kernel the
     /// layers' planes it wins, the tile the head where the vector kernel was
-    /// beaten (or stopped by the bound).
+    /// beaten; stopped by the bound instead, the head keeps the kernel the
+    /// planes take together.
     #[test]
     fn each_plane_takes_its_own_kernel_at_one_rung() {
         let tiled = |_| Tactic {
@@ -948,7 +1006,7 @@ mod tests {
         assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{:?}", dense.runs());
         assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{:?}", dense.runs());
         let _ = weighed;
-        // Stopped by the bound at the head instead: the same.
+        // Stopped by the bound at the head instead: not shown beaten.
         curves[3].stop = Some((64, profile::fire::KernelCurve::BOUND));
         let r = profile::fire::Rates {
             kernel_tflops_by_shape: Some(curves),
@@ -964,8 +1022,10 @@ mod tests {
             None,
         )
         .unwrap();
+        // Stopped by the bound, no measurement says x16 loses at the head
+        // there: it keeps the pick over every plane together.
         assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", weighed[0]);
-        assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{}", weighed[0]);
+        assert_eq!(dense.at(128, 8192, 1024).vector, 16, "{}", weighed[0]);
     }
 
     /// The rung full prompt chunks land on is picked at its top rows: on the
@@ -1037,23 +1097,24 @@ mod tests {
         assert_eq!(full.at(512, n, k), spread.at(512, n, k));
     }
 
-    /// The profile path's tactic keeps a rung unless the pick beats it by
-    /// more than their measured spread: a wide tile 5% faster than the
-    /// path's narrow one replaces it at a 1% spread, not at 10%.
+    /// A plane's own pick replaces the pick over every plane together only
+    /// past their measured spread: at a plane where the wide tile runs 5%
+    /// faster than the narrow one the model's other plane takes, it is taken
+    /// at a 1% spread and not at 10%.
     #[test]
-    fn a_pick_replaces_the_paths_tactic_only_past_their_spread() {
+    fn a_planes_pick_replaces_the_models_only_past_their_spread() {
         let narrow = |_| Tactic {
             tier: Tier::Subgroup,
             vector: 0,
             wide: false,
         };
-        let (n, k) = (1024, 1024);
-        let key =
-            |wide| crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..narrow(0) }, n, k).1;
+        let key = |wide, n, k| {
+            crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..narrow(0) }, n, k).1
+        };
         let with = |spread: f64| {
-            let curve = |wide, rate: f64| profile::fire::KernelCurve {
+            let curve = |wide, n, k, rate: f64| profile::fire::KernelCurve {
                 kind: profile::fire::KernelCurve::TILE,
-                key: key(wide),
+                key: key(wide, n, k),
                 n,
                 k,
                 curve: vec![(1, rate / 100.0), (256, rate)],
@@ -1061,16 +1122,23 @@ mod tests {
                 spread: vec![(1, spread), (256, spread)],
             };
             profile::fire::Rates {
-                kernel_tflops_by_shape: Some(vec![curve(false, 10.0), curve(true, 10.5)]),
+                kernel_tflops_by_shape: Some(vec![
+                    // The plane the model's pick follows: narrow far ahead.
+                    curve(false, 4096, 4096, 10.0),
+                    curve(true, 4096, 4096, 5.0),
+                    // A small plane: wide 5% ahead.
+                    curve(false, 1024, 1024, 10.0),
+                    curve(true, 1024, 1024, 10.5),
+                ]),
                 ..rates(None, Vec::new())
             }
         };
-        let shape = engine::load::GemmShape {
+        let shape = |n: u32, k: u32| engine::load::GemmShape {
             planes: 28,
             ..engine::load::GemmShape::dense(n, k, 2 * u64::from(n * k), 2 * u64::from(n * k))
         };
         let model = Counts {
-            gemm_shapes: vec![shape],
+            gemm_shapes: vec![shape(4096, 4096), shape(1024, 1024)],
             ..counts()
         };
         let planes = planes(&model, None);
@@ -1087,11 +1155,101 @@ mod tests {
                 )
                 .unwrap()
                 .0
-                .at(256, n, k)
+                .at(256, 1024, 1024)
                 .wide
             };
             assert!(wide(0.01), "records {records}");
             assert!(!wide(0.10), "records {records}");
+        }
+    }
+
+    /// A head-shaped plane whose only timed kernel is the tile, stopped at 4
+    /// rows by the bound, keeps the pick over every plane together (a vector
+    /// kernel at decode rows) at 1 row and past its curves: a kernel no
+    /// curve there prices is not shown beaten, and a tile at one row of a
+    /// 152k-wide head is a hundred milliseconds a step.
+    #[test]
+    fn a_head_stopped_at_four_rows_keeps_the_models_kernel() {
+        let wide = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: true,
+        };
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            kind,
+            key,
+            n,
+            k,
+            curve: points,
+            stop,
+            spread: Vec::new(),
+        };
+        let (v, t) = (
+            profile::fire::KernelCurve::VECTOR,
+            profile::fire::KernelCurve::TILE,
+        );
+        let tile = |n, k| crate::rates::curve_key(Target::Wgsl, wide(0), n, k).1;
+        let (head_n, head_k) = (151_936, 1024);
+        let bound = Some((4, profile::fire::KernelCurve::BOUND));
+        let mut curves = vec![
+            // The layers: the vector kernel well ahead of the tile to 64 rows.
+            curve(
+                t,
+                tile(1024, 1024),
+                1024,
+                1024,
+                vec![(1, 0.01), (64, 0.6)],
+                None,
+            ),
+            curve(v, 8, 1024, 1024, vec![(1, 0.5), (64, 6.0)], None),
+            // The head: the tile alone timed, stopped at 4 rows (the vector
+            // kernels' curves there stopped at their first rows).
+            curve(
+                t,
+                tile(head_n, head_k),
+                head_n,
+                head_k,
+                vec![(1, 0.01), (2, 0.02)],
+                bound,
+            ),
+        ];
+        curves.sort_by_key(profile::fire::KernelCurve::id);
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let shape = |n: u32, k: u32, planes| engine::load::GemmShape {
+            planes,
+            ..engine::load::GemmShape::dense(
+                n,
+                k,
+                2 * u64::from(n) * u64::from(k),
+                2 * u64::from(n) * u64::from(k),
+            )
+        };
+        let model = Counts {
+            gemm_shapes: vec![shape(1024, 1024, 28), shape(head_n, head_k, 1)],
+            ..counts()
+        };
+        let rungs = [1, 2, 4, 8, 16, 32, 64];
+        for records in [true, false] {
+            let (dense, _) = choose(
+                Target::Wgsl,
+                &rungs,
+                wide,
+                &r,
+                &planes(&model, None),
+                records,
+                None,
+            )
+            .unwrap();
+            for rows in [1, 4, 16, 64] {
+                assert!(
+                    dense.at(rows, head_n, head_k).vector > 0,
+                    "records {records}, {rows} rows: {:?}",
+                    dense.runs()
+                );
+            }
         }
     }
 
