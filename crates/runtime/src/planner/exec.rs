@@ -1003,6 +1003,24 @@ async fn restore(
             return;
         }
     };
+    // Every instance its rebinds name must be placed once this unpark
+    // commits: one left unbound (moving, parked apart, its pair away) is
+    // waited for here, nothing committed, its process waiting and not in
+    // flight; then it goes again, queued. Committed with one, it waited
+    // Restoring on a rebind nothing made (Mac Pro at 2 GiB on 1e87ab171).
+    if let Some(store) = stores.roles.as_ref() {
+        let watch = store.lock().unwrap().room_watch();
+        let unbound = store.lock().unwrap().unbound_after(pid, roles.as_ref());
+        if !unbound.is_empty() {
+            abort(model, engine, Move::Restore { kv, rs, roles });
+            tracing::debug!(%pid, ?unbound, "planner: a restore waits, uncommitted, for its rebinds' parts");
+            planner.rebind_waiting(pid, Some(format!("{unbound:?} (uncommitted)")));
+            watch.freed().await;
+            planner.rebind_waiting(pid, None);
+            planner.requeue_restore(pid);
+            return;
+        }
+    }
     // Suspended by a bind short of guest-state room, it comes back only
     // with room for that bind past what its own items took: else it would
     // bind short again at once. It waits, queued, as a restore short of

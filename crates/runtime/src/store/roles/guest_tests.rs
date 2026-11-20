@@ -3065,3 +3065,76 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
     assert!(bound.is_ok(), "served, never refused: {bound:?}");
     assert_eq!(long_engine.borrow().bindings.len(), 1);
 }
+
+/// Mac Pro at 2 GiB disk-only on 1e87ab171: a process's bind short of two
+/// runs of nine Instance chunks, the process evicted to disk and restored
+/// ~95 ms later, then "a restore waits for its instances' rebinds
+/// (InstanceId(5))" until teardown: the restore committed with an instance
+/// whose rebind named a dead part no slots held, and nothing made room for
+/// it. Such an instance's dead parts are its unpark's to take fresh, in
+/// their class, before the restore commits: its need counts their runs, an
+/// unpark short of them is refused (the restore waits queued for room the
+/// planner makes, nothing committed), and once they stand it unparks, and
+/// its rebind names them; nothing is left unbound.
+#[test]
+fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let (program, mut engine) = runs_of(8, 3, 2, 0);
+    let id = bind_as(&roles, &mut engine, program, 1).expect("two runs of three");
+    // Its scratch has no slots (given back, as a bind short of it left
+    // it), the instance still bound on the device.
+    {
+        let mut roles = roles.lock().unwrap();
+        let item = roles.items.get_mut(&Owner::Instance(id)).expect("bound");
+        let dead: Vec<super::Part> = item.parts.iter().filter(|part| part.dead()).cloned().collect();
+        assert!(!dead.is_empty(), "a scratch part");
+        for part in item.parts.iter_mut().filter(|part| part.dead()) {
+            part.refs.clear();
+        }
+        let device = std::sync::Arc::clone(&roles.device);
+        roles.give(&device, &dead);
+    }
+    let singles = fill_with_singles(&roles);
+    assert!(
+        roles.lock().unwrap().unpark_need(holder(1)).contains(&(3, 2)),
+        "its need counts the runs its rebind names: {:?}",
+        roles.lock().unwrap().unpark_need(holder(1))
+    );
+    let short = roles.lock().unwrap().prepare_unpark(holder(1));
+    assert!(
+        matches!(short, Err(RolesError::UnparkShort(_))),
+        "no two runs of three: refused, nothing committed: {short:?}"
+    );
+    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "not bound where it lies");
+    assert_eq!(
+        roles.lock().unwrap().unbound_after(holder(1), None),
+        vec![id],
+        "committed now, it would stay unbound"
+    );
+    // Room made (the planner's moves): it unparks and is rebound.
+    for single in singles {
+        roles.lock().unwrap().close_instance(single);
+    }
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .expect("room stands")
+        .expect("its scratch is taken");
+    assert!(
+        roles.lock().unwrap().unbound_after(holder(1), Some(&unpark)).is_empty(),
+        "committed, every instance its rebinds name is placed"
+    );
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let [Rebind::Instance { id: rebound, scratch, .. }] = stale.as_slice() else {
+        panic!("one rebind of the instance: {stale:?}");
+    };
+    assert_eq!(*rebound, id);
+    assert_eq!(pieces_of(&device, scratch).len(), 2, "two runs: {scratch:?}");
+    for rebind in stale {
+        engine.rebind_slots(rebind).unwrap();
+        roles.lock().unwrap().rebound(Owner::Instance(id));
+    }
+    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");
+}

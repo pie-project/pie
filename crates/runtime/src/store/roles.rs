@@ -538,6 +538,18 @@ impl Item {
         }
     }
 
+    /// On the device and short of a dead part (guest scratch, a pair's
+    /// state) its rebind must name: parked where it lies ([`Self::shed`]),
+    /// or a dead part with no slots. Its unpark takes fresh ones in their
+    /// class before its restore commits, the runs counted in its need
+    /// ([`Roles::unpark_need`]): let through, the restore committed and
+    /// waited on a rebind no room was made for (Mac Pro at 2 GiB on
+    /// 1e87ab171: InstanceId(5), its process Restoring until teardown).
+    fn takes_fresh(&self) -> bool {
+        self.tier == Tier::Device
+            && (self.shed || self.parts.iter().any(|part| part.dead() && part.refs.is_empty()))
+    }
+
     fn refs(&self) -> Vec<u32> {
         self.parts
             .iter()
@@ -1310,8 +1322,7 @@ impl Roles {
         };
         let mut own: Vec<OwnPiece> = Vec::new();
         for (owner, item) in &self.items {
-            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
-                || (item.tier == Tier::Device && item.shed);
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk) || item.takes_fresh();
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
@@ -1363,7 +1374,7 @@ impl Roles {
         let mut slots: HashMap<SlotRole, u64> = HashMap::new();
         for (owner, item) in &self.items {
             let below = matches!(item.tier, Tier::Host | Tier::Disk);
-            let parked = below || (item.tier == Tier::Device && item.shed);
+            let parked = below || item.takes_fresh();
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
@@ -1415,8 +1426,7 @@ impl Roles {
     pub fn unpark_census(&self, holder: Holder, need: Option<(u32, u32)>) -> String {
         let mut items = Vec::new();
         for (owner, item) in &self.items {
-            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
-                || (item.tier == Tier::Device && item.shed);
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk) || item.takes_fresh();
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
@@ -2203,12 +2213,13 @@ impl Roles {
             .collect();
         // Items that shed their dead parts at the park take fresh ones in
         // their class, their live parts where they lie: nothing is copied.
+        // So does one on the device with a dead part its rebind must name
+        // and no slots for it ([`Item::takes_fresh`]): the restore commits
+        // only with every part its rebinds name in place.
         let shed_owners: Vec<Owner> = self
             .items
             .iter()
-            .filter(|(owner, item)| {
-                item.tier == Tier::Device && item.shed && self.unparks_with(**owner, item, holder)
-            })
+            .filter(|(owner, item)| item.takes_fresh() && self.unparks_with(**owner, item, holder))
             .map(|(owner, _)| *owner)
             .collect();
         // An instance whose pair is on its way back with another process's
@@ -2247,7 +2258,7 @@ impl Roles {
                 parts
                     .iter()
                     .enumerate()
-                    .filter(move |(_, part)| !*shed || part.dead())
+                    .filter(move |(_, part)| !*shed || (part.dead() && part.refs.is_empty()))
                     .map(move |(index, _)| (at, index))
             })
             .collect();
@@ -2551,7 +2562,20 @@ impl Roles {
     pub fn abort(&mut self, txn: RoleMove) {
         for (owner, parts) in txn.shed {
             if !txn.out {
-                let dead: Vec<Part> = parts.into_iter().filter(|part| part.dead()).collect();
+                // Only the dead parts the unpark took fresh: one the item
+                // held in place already ([`Item::takes_fresh`]) stays its.
+                let had: Vec<Part> = self
+                    .items
+                    .get(&owner)
+                    .map_or_else(Vec::new, |item| item.parts.clone());
+                let dead: Vec<Part> = parts
+                    .into_iter()
+                    .zip(had.iter().map(Some).chain(std::iter::repeat(None)))
+                    .filter(|(part, had)| {
+                        part.dead() && had.is_none_or(|had| had.refs.is_empty())
+                    })
+                    .map(|(part, _)| part)
+                    .collect();
                 let device = Arc::clone(&self.device);
                 self.give(&device, &dead);
             }
@@ -2723,11 +2747,49 @@ impl Roles {
                 Owner::Instance(id)
                     if item.holder == Some(holder)
                         && item.open
-                        && (item.tier != Tier::Device || item.shed || item.stale) =>
+                        && (item.tier != Tier::Device || item.stale || item.takes_fresh()) =>
                 {
                     Some(id)
                 }
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// `holder`'s open instances an unpark of `txn` (none: nothing to
+    /// unpark) would leave unbound, its rebinds unable to name them: off
+    /// the device or moving and not in it, short of a dead part it does
+    /// not take ([`Item::takes_fresh`]), or holding a pair that is not on
+    /// the device and not in it. A restore commits only once this is empty
+    /// ([`Self::prepare_unpark`] then [`Self::commit`]): committed with
+    /// one, it waited Restoring on a rebind nothing would make (Mac Pro at
+    /// 2 GiB on 1e87ab171, InstanceId(5)).
+    #[must_use]
+    pub fn unbound_after(&self, holder: Holder, txn: Option<&RoleMove>) -> Vec<InstanceId> {
+        let moved = |owner: Owner| {
+            txn.is_some_and(|txn| {
+                txn.items.iter().chain(&txn.shed).any(|(moved, _)| *moved == owner)
+            })
+        };
+        self.items
+            .iter()
+            .filter_map(|(owner, item)| {
+                let Owner::Instance(id) = *owner else {
+                    return None;
+                };
+                if item.holder != Some(holder) || !item.open {
+                    return None;
+                }
+                let placed = moved(*owner)
+                    || (item.tier == Tier::Device && !item.shed && !item.takes_fresh());
+                let pair = item.pair.is_none_or(|key| {
+                    moved(Owner::Pair(key))
+                        || self
+                            .items
+                            .get(&Owner::Pair(key))
+                            .is_some_and(|pair| pair.tier == Tier::Device && !pair.takes_fresh())
+                });
+                (!placed || !pair).then_some(id)
             })
             .collect()
     }
