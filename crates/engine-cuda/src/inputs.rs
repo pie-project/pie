@@ -27,22 +27,38 @@ const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 /// 512 lanes its 16-row tiles run unsplit and ask nothing).
 fn prefill_float_bytes(
     facts: &SpaceFacts,
+    page_size: u32,
     shapes: impl Iterator<Item = (u32, u32)>,
     device: &Device,
     toggles: Toggles,
 ) -> Result<u64> {
     let mut most = 0usize;
     for (rows, lanes) in shapes {
-        most = most.max(prefill_graph_float_bytes(
+        let asked = prefill_graph_float_bytes(
             rows,
             lanes,
             facts.q_heads,
             facts.kv_heads,
             facts.head_dim,
+            page_size,
             facts.window,
             device,
             toggles,
-        )?);
+        )
+        .map_err(|refused| crate::error::Fault::Unbound {
+            what: format!(
+                "the prefill workspace grant: the graph form of {rows} rows over {lanes} \
+                 lanes ({} query heads over {} kv heads, {} wide, window {:?}, pages of \
+                 {page_size}, {} SMs at {} CTAs an SM) refused: {refused}",
+                facts.q_heads,
+                facts.kv_heads,
+                facts.head_dim,
+                facts.window,
+                device.num_sm,
+                toggles.prefill_ctas_per_sm,
+            ),
+        })?;
+        most = most.max(asked);
     }
     Ok((most as u64).next_multiple_of(ALIGN) + 2 * ALIGN)
 }
@@ -82,6 +98,7 @@ fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
 fn plan_floats(
     budget: &Budget,
     fire_lanes: u32,
+    page_size: u32,
     facts: &Facts,
     device: &Device,
     toggles: Toggles,
@@ -103,6 +120,7 @@ fn plan_floats(
             // kernel): a row a lane.
             prefill_float_bytes(
                 &reading,
+                page_size,
                 (1..=lanes).map(|lanes| (lanes, lanes)),
                 device,
                 toggles,
@@ -110,6 +128,7 @@ fn plan_floats(
         } else {
             prefill_float_bytes(
                 &reading,
+                page_size,
                 buckets
                     .iter()
                     .flat_map(|&rows| (1..=lanes).map(move |lanes| (rows, lanes))),
@@ -146,12 +165,13 @@ fn plan_floats(
 pub fn attention_workspace_bytes(
     budget: &Budget,
     fire_lanes: u32,
+    page_size: u32,
     facts: &Facts,
     device: &Device,
     toggles: Toggles,
     schedule_streams: &[Option<u32>],
 ) -> Result<u64> {
-    let floats_of = plan_floats(budget, fire_lanes, facts, device, toggles)?;
+    let floats_of = plan_floats(budget, fire_lanes, page_size, facts, device, toggles)?;
     let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut own = 0u64;
     for (plan, floats) in floats_of.iter().enumerate() {
@@ -802,7 +822,14 @@ impl Inputs {
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let runs = runs.max(1);
-        let floats_of = plan_floats(budget, fire_lanes, facts, &device, toggles)?;
+        let floats_of = plan_floats(
+            budget,
+            fire_lanes,
+            paging.page_size,
+            facts,
+            &device,
+            toggles,
+        )?;
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();
         for (plan, floats) in floats_of.iter().enumerate() {
@@ -1898,7 +1925,8 @@ mod prefill_grant_tests {
                 readouts_per_lane: 1,
             };
             let lanes = crate::chip::Engine::of(&crate::chip::profile("")).fire_lanes_of(max_lanes);
-            let grant = plan_floats(&budget, lanes, &facts, &device, toggles).unwrap()[0].unwrap();
+            let grant =
+                plan_floats(&budget, lanes, 16, &facts, &device, toggles).unwrap()[0].unwrap();
             for &rows in &budget.buckets {
                 for lanes in 1..=lanes {
                     let live = lanes.min(rows);
