@@ -443,13 +443,6 @@ pub struct RsTables {
     pub replay_tok: DevicePtr,
     /// Each replayed row's page slot address.
     pub replay_slot: DevicePtr,
-    /// The decode lanes' buffered rows, a table of fixed shape: lane `l`'s
-    /// row `j` at `l * dec_stride + j` of `dec_slot` and `dec_tok` (its
-    /// token in the page), `dec_n[l]` of them.
-    pub dec_slot: DevicePtr,
-    pub dec_tok: DevicePtr,
-    pub dec_n: DevicePtr,
-    pub dec_stride: u32,
     /// The rows a page holds.
     pub page_tokens: u32,
 }

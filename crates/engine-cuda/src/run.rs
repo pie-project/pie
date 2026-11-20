@@ -206,8 +206,6 @@ pub struct RsScratch {
     /// value.
     carried: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
     carried_of: std::cell::RefCell<std::collections::HashMap<(u32, u32), u64>>,
-    /// The rows a decode table's carried plane holds (`Inputs::dec_rows`).
-    dec_rows: u32,
 }
 
 /// A window's extended rows, as `channel.rs_ext_csr` lays them on the
@@ -243,16 +241,7 @@ impl RsScratch {
             ext: std::cell::RefCell::new(std::collections::HashMap::new()),
             carried: std::cell::RefCell::new(std::collections::HashMap::new()),
             carried_of: std::cell::RefCell::new(std::collections::HashMap::new()),
-            dec_rows: 0,
         }
-    }
-
-    /// The scratch with room for a decode table's carried planes of
-    /// `dec_rows` rows.
-    #[must_use]
-    pub fn decoding(mut self, dec_rows: u32) -> Self {
-        self.dec_rows = dec_rows;
-        self
     }
 
     /// The carried plane of rows `row_bytes` wide, laid at its first ask.
@@ -261,7 +250,7 @@ impl RsScratch {
         if let Some(&base) = self.carried.borrow().get(&row_bytes) {
             return Ok(self.ptr + base);
         }
-        let base = self.lay(u64::from(self.rows.max(self.dec_rows)) * row_bytes)?;
+        let base = self.lay(u64::from(self.rows) * row_bytes)?;
         self.carried.borrow_mut().insert(row_bytes, base);
         Ok(self.ptr + base)
     }
@@ -1426,10 +1415,6 @@ impl<'c> Run<'c> {
             pages: tables.pages,
             replay_tok: tables.replay_tok,
             replay_slot: tables.replay_slot,
-            dec_slot: tables.dec_slot,
-            dec_tok: tables.dec_tok,
-            dec_n: tables.dec_n,
-            dec_stride: tables.dec_stride,
             commit_len: pool.commit_len.ptr,
             scratch,
             page_tokens: tables.page_tokens.max(1),

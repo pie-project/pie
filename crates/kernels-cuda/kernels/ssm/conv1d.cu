@@ -771,16 +771,11 @@ __global__ void conv1d_carried(
     const int cs = rows.atoms;
     const int ci = c % cs;
     T* state = rows.piece<T>(rid, c / cs);
-    const int n = carry.dec_count(rl);
+    const int n = carry.carried(lane);
     const int span = (K - 1) * dil + 1;
     auto at = [&](int t) -> float {
         if (t < 0) return Elem<T>::to_f32(state[(span + t) * cs + ci]);
-        if (t < n) {
-            u64 slot;
-            u32 tok;
-            carry.dec_at(rl, t, slot, tok);
-            return Elem<T>::to_f32(carry.plane_at<const T>(slot, tok, 0)[c]);
-        }
+        if (t < n) return Elem<T>::to_f32(carry.carried_row<T>(lane, t, 0)[c]);
         return Elem<T>::to_f32(x_own);
     };
     const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
@@ -855,7 +850,7 @@ __global__ void conv1d_carried_vec8(
     const int cs = rows.atoms;
     const int ci = c0 % cs;
     T* state = rows.piece<T>(rid, c0 / cs);
-    const int n = carry.dec_count(rl);
+    const int n = carry.carried(lane);
     const int commit = carry.commit(rl, n + 1);
     const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
     const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
@@ -865,10 +860,7 @@ __global__ void conv1d_carried_vec8(
         if (t < 0) {
             v.raw = *reinterpret_cast<const uint4*>(state + (long long)(K + t) * cs + ci);
         } else if (t < n) {
-            u64 slot;
-            u32 tok;
-            carry.dec_at(rl, t, slot, tok);
-            v.raw = *reinterpret_cast<const uint4*>(carry.plane_at<const T>(slot, tok, 0) + c0);
+            v.raw = *reinterpret_cast<const uint4*>(carry.carried_row<T>(lane, t, 0) + c0);
         } else {
             v = xo;
         }

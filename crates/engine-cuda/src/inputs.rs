@@ -194,16 +194,9 @@ pub struct RsHandles {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
-    /// Each replayed row's page slot address, resolved on the host.
+    /// Each replayed row's page slot address, resolved on the host: a
+    /// decode step reads a buffered row through it in one load.
     pub replay_slot: u64,
-    /// The decode lanes' buffered rows in a table of fixed shape, which a
-    /// decode step reads by its lane alone: lane `l`'s row `j` lies at
-    /// `l * dec_stride + j` of `dec_slot` (its page slot) and `dec_tok` (its
-    /// token in the page), `dec_n[l]` of them.
-    pub dec_slot: u64,
-    pub dec_tok: u64,
-    pub dec_n: u64,
-    pub dec_stride: u32,
 }
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
@@ -221,9 +214,6 @@ pub struct RsFire<'a> {
     pub pages: &'a [u64],
     pub replay_tok: &'a [u32],
     pub replay_slot: &'a [u64],
-    /// Each fire lane's decode rows (page slot, token in the page), the
-    /// decode table's content: a lane not decoding, none.
-    pub dec_rows: &'a [Vec<(u64, u32)>],
 }
 
 /// The rs section's offsets and capacities.
@@ -235,10 +225,6 @@ struct RsAt {
     replay_tok: u64,
     replay_slot: u64,
     replay_cap: u64,
-    dec_slot: u64,
-    dec_tok: u64,
-    dec_n: u64,
-    dec_stride: u64,
 }
 
 const AXES: u64 = 3;
@@ -736,8 +722,6 @@ impl Inputs {
         // A fire replays no more rows than the widest bucket's tokens
         // (`engine::fire::rung_rows`): the tables hold those, and the pages
         // they and its own rows lie in.
-        let dec_stride =
-            (runahead.submit_depth() * usize::from(engine::runahead::Runahead::STEPS_MAX) + 1) as u64;
         let rs = rs_page_tokens.map(|tokens| {
             let replay_cap = rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
@@ -748,14 +732,6 @@ impl Inputs {
                 replay_tok: take(replay_cap * 4),
                 replay_slot: take(replay_cap * 8),
                 replay_cap,
-                // A decode lane carries no more rows than the binding's
-                // run-ahead window can leave unaccepted (its submit depth of
-                // frames of at most `STEPS_MAX` fires), and one accepted row
-                // its next fire folds.
-                dec_slot: take(lanes * dec_stride * 8),
-                dec_tok: take(lanes * dec_stride * 4),
-                dec_n: take(lanes * 4),
-                dec_stride,
             }
         });
         // A group's mask is a bit a (query, key) pair of its rows, from a
@@ -1254,32 +1230,6 @@ impl Inputs {
                     )
                 };
                 put(at.replay_slot, slots, "staged rs replay slots")?;
-                let stride = at.dec_stride as usize;
-                let lanes_n = (table_lanes as usize).max(tables.dec_rows.len());
-                let mut dec_slot = vec![0u64; lanes_n * stride];
-                let mut dec_tok = vec![0u32; lanes_n * stride];
-                let mut dec_n = vec![0u32; lanes_n];
-                for (lane, rows) in tables.dec_rows.iter().enumerate() {
-                    if rows.len() > stride {
-                        return Err(crate::error::Fault::Ceiling {
-                            what: "buffered rows a decode lane carries into its step",
-                            need: rows.len() as u64,
-                            have: stride as u64,
-                        });
-                    }
-                    dec_n[lane] = rows.len() as u32;
-                    for (j, &(slot, tok)) in rows.iter().enumerate() {
-                        dec_slot[lane * stride + j] = slot;
-                        dec_tok[lane * stride + j] = tok;
-                    }
-                }
-                // SAFETY: plain integers, read as their bytes.
-                let raw = unsafe {
-                    core::slice::from_raw_parts(dec_slot.as_ptr().cast::<u8>(), dec_slot.len() * 8)
-                };
-                put(at.dec_slot, raw, "staged rs decode slots")?;
-                put(at.dec_tok, u32_bytes_of(&dec_tok), "staged rs decode tokens")?;
-                put(at.dec_n, u32_bytes_of(&dec_n), "staged rs decode counts")?;
                 Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
             }
         };
@@ -1607,19 +1557,11 @@ impl Inputs {
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
                 copy(at.replay_slot, *toks as usize * 8)?;
-                let dec_lanes = u64::from(table_lanes.max(lanes));
-                copy(at.dec_slot, (dec_lanes * at.dec_stride) as usize * 8)?;
-                copy(at.dec_tok, (dec_lanes * at.dec_stride) as usize * 4)?;
-                copy(at.dec_n, dec_lanes as usize * 4)?;
                 Some(RsHandles {
                     lanes: base + at.lanes,
                     pages: base + at.pages,
                     replay_tok: base + at.replay_tok,
                     replay_slot: base + at.replay_slot,
-                    dec_slot: base + at.dec_slot,
-                    dec_tok: base + at.dec_tok,
-                    dec_n: base + at.dec_n,
-                    dec_stride: u32::try_from(at.dec_stride).unwrap_or(u32::MAX),
                 })
             }
             _ => None,
@@ -1887,16 +1829,5 @@ mod rs_lane_table_tests {
         );
         let last = std::ptr::addr_of!(lanes[66].ext) as usize - lanes.as_ptr() as usize;
         assert!(last + 4 <= rs_lane_table_bytes(lanes.len() as u64) as usize);
-    }
-}
-
-impl Inputs {
-    /// The decode lanes' carried scratch rows the decode table addresses: a
-    /// lane's `dec_stride` rows and its own, every lane the slab seats.
-    #[must_use]
-    pub fn dec_rows(&self) -> u32 {
-        self.rs.map_or(0, |at| {
-            u32::try_from(u64::from(self.max_lanes) * (at.dec_stride + 1)).unwrap_or(u32::MAX)
-        })
     }
 }
