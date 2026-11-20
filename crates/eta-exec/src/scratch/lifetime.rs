@@ -3,14 +3,13 @@
 
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{Dimension, RegionKind, is_row_vector, same_rows, value_rows};
-use eta_ir::Dtype;
 use eta_ir::op::tags;
 use eta_ir::types::MAX_RANK;
 
 use super::{
-    ChunkLayout, Layout, Lifetime, Pieces, TooLarge, layout, layout_chunked, layout_reusing,
+    Area, ChunkLayout, Layout, Lifetime, Pieces, TooLarge, chunked_with, reusing_with,
 };
-use crate::extent::{Extents, Unresolvable, ValueDesc, describe};
+use crate::extent::{Extents, Unresolvable, ValueDesc, describe, element_bytes};
 
 /// Nodes of a stage an engine runs together. A node may lie in several
 /// launches (a reduction whose partial pass and final pass are dispatched
@@ -31,6 +30,18 @@ pub struct Launch<'a> {
     pub row_alias: Option<u64>,
     /// Values that hold to its end whatever reads them.
     pub held: Vec<u32>,
+    /// A temporary area of its own, alive over its steps alone, in place
+    /// of the stage's ([`Launches::temporary`]): what its kernels keep
+    /// while it runs, as the engine states it.
+    pub keeps: Option<Keeps>,
+}
+
+/// What a launch keeps in a temporary area of its own: `bytes`, with
+/// `reserve` bytes clear right below them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Keeps {
+    pub reserve: u64,
+    pub bytes: u64,
 }
 
 impl<'a> Launch<'a> {
@@ -55,12 +66,14 @@ impl<'a> Launch<'a> {
                 .copied()
                 .chain(region.sinks.iter().map(|sink| sink.value))
                 .collect(),
+            keeps: None,
         }
     }
 
-    /// `node` as a launch of its own, one step in one block.
+    /// `node` as a launch of its own, one step in one block, keeping
+    /// `keeps` in an area of its own.
     #[must_use]
-    pub fn of_node(node: &'a u32) -> Launch<'a> {
+    pub fn of_node(node: &'a u32, keeps: Option<Keeps>) -> Launch<'a> {
         Launch {
             nodes: core::slice::from_ref(node),
             stepwise: false,
@@ -68,6 +81,7 @@ impl<'a> Launch<'a> {
             row_value: None,
             row_alias: None,
             held: Vec::new(),
+            keeps,
         }
     }
 }
@@ -89,8 +103,9 @@ pub struct Launches<'a> {
     pub hollow: Vec<u32>,
     /// Bytes held clear below the temporary area.
     pub reserve: u64,
-    /// The bytes the temporary area holds: the most its launches' kernels
-    /// keep there.
+    /// The bytes the stage's temporary area holds, alive across the stage:
+    /// the most its launches' kernels keep there, those that keep an area
+    /// of their own ([`Launch::keeps`]) aside.
     pub temporary: u64,
 }
 
@@ -159,7 +174,7 @@ pub fn value_lifetimes(plan: &LaunchStagePlan, run: &Launches<'_>) -> Option<Vec
         let Some(ty) = plan.value_types.get(value as usize) else {
             return 0;
         };
-        let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
+        let elem = element_bytes(ty.dtype);
         let alias = launch.row_alias;
         if ty.axes.len() >= 2
             && value_rows(&ty.axes).is_some_and(|shape| same_rows(shape, geometry, alias))
@@ -281,17 +296,68 @@ pub fn value_lifetimes(plan: &LaunchStagePlan, run: &Launches<'_>) -> Option<Vec
     Some(lifetimes)
 }
 
-/// `plan`'s scratch under `run`: values share bytes where their lifetimes
-/// part, each its own where a node is neither launched nor idle.
+/// The areas the launches of `run` that keep one take ([`Launch::keeps`]),
+/// in launch order: each alive from its launch's first step to its last,
+/// as a value its launch writes and reads, sharing no bytes with a value
+/// its launch reads or writes, nor within a launch across blocks with a
+/// row of any value.
+#[must_use]
+pub fn launch_areas(run: &Launches<'_>) -> Vec<Area> {
+    let mut areas = Vec::new();
+    let mut step = 0u32;
+    for (index, launch) in run.each.iter().enumerate() {
+        let first = step;
+        let steps = if launch.stepwise {
+            u32::try_from(launch.nodes.len()).unwrap_or(u32::MAX)
+        } else {
+            1
+        };
+        step = step.saturating_add(steps);
+        let Some(keeps) = launch.keeps else {
+            continue;
+        };
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
+        let class = if launch.blocks > 1 {
+            0
+        } else {
+            Lifetime::SEQUENTIAL
+        };
+        areas.push(Area {
+            life: Lifetime {
+                def: first,
+                last: step.saturating_sub(1).max(first),
+                dead: false,
+                // Every kernel writes what it keeps there before it reads it.
+                reusable: true,
+                launch_def: index,
+                launch_last: index,
+                class_def: class,
+                class_last: class,
+            },
+            reserve: keeps.reserve,
+            bytes: keeps.bytes,
+        });
+    }
+    areas
+}
+
+/// `plan`'s scratch under `run`: values, and the areas launches keep of
+/// their own ([`launch_areas`]), share bytes where their lifetimes part;
+/// each value its own, and each area its own past them, where a node is
+/// neither launched nor idle.
 pub fn lay_out(
     plan: &LaunchStagePlan,
     descriptors: &[ValueDesc],
     run: &Launches<'_>,
 ) -> Result<Layout, TooLarge> {
-    match value_lifetimes(plan, run) {
-        Some(lifetimes) => layout_reusing(descriptors, &lifetimes, run.reserve, run.temporary),
-        None => layout(descriptors),
-    }
+    let lifetimes = value_lifetimes(plan, run).unwrap_or_default();
+    reusing_with(
+        descriptors,
+        &lifetimes,
+        run.reserve,
+        run.temporary,
+        &launch_areas(run),
+    )
 }
 
 /// `plan`'s scratch under `run` in `pieces` ([`layout_chunked`]): values
@@ -305,7 +371,14 @@ pub fn lay_out_chunked(
     pieces: Pieces,
 ) -> Result<ChunkLayout, TooLarge> {
     let lifetimes = value_lifetimes(plan, run).unwrap_or_default();
-    layout_chunked(descriptors, &lifetimes, run.reserve, run.temporary, pieces)
+    chunked_with(
+        descriptors,
+        &lifetimes,
+        run.reserve,
+        run.temporary,
+        &launch_areas(run),
+        pieces,
+    )
 }
 
 /// The rows each of `plan`'s regions walks: its row value's, one where it
@@ -425,8 +498,9 @@ pub fn describe_launched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scratch::SELECT_RESERVE;
+    use crate::scratch::{SELECT_RESERVE, layout};
     use eta_compiler::codegen::launch::{LaunchOp, LaunchPlanValue};
+    use eta_ir::Dtype;
 
     const WIDE: u32 = 1024;
 
@@ -465,7 +539,7 @@ mod tests {
     /// Each of `launched` a launch of its own, the rest of `plan` idle.
     fn each_alone<'a>(plan: &LaunchStagePlan, launched: &'a [u32]) -> Launches<'a> {
         Launches {
-            each: launched.iter().map(Launch::of_node).collect(),
+            each: launched.iter().map(|node| Launch::of_node(node, None)).collect(),
             idle: (0..plan.ops.len() as u32)
                 .filter(|node| !launched.contains(node))
                 .collect(),
@@ -481,6 +555,7 @@ mod tests {
         a_hollow_value_takes_no_bytes();
         a_node_neither_launched_nor_idle_lays_each_value_its_own();
         the_reserve_and_the_temporary_bytes_reach_the_layout();
+        a_launch_that_keeps_an_area_lays_it_over_its_own_steps();
     }
 
     /// take, a + a, b + b, c + c, put: one launch an op.
@@ -649,5 +724,57 @@ mod tests {
         assert!(held.temporary >= laid.temporary + SELECT_RESERVE);
         assert_eq!(laid.temporary_bytes, 0);
         assert_eq!(held.temporary_bytes, stated);
+    }
+
+    /// A launch that keeps an area lays it alive over its own steps, as a
+    /// value it writes and reads: over the chain, the last add's area
+    /// takes the bytes of the take's value and the first add's result,
+    /// dead by then, and none of what that add reads or writes; a launch
+    /// across blocks shares its area with no row of its own.
+    fn a_launch_that_keeps_an_area_lays_it_over_its_own_steps() {
+        let (plan, descriptors) = chain();
+        let launched = [1u32, 2, 3];
+        let keeps = Keeps {
+            reserve: SELECT_RESERVE,
+            bytes: 2 * u64::from(WIDE) * 4,
+        };
+        let run = Launches {
+            each: launched
+                .iter()
+                .map(|node| Launch::of_node(node, (*node == 3).then_some(keeps)))
+                .collect(),
+            idle: vec![0, 4],
+            staged: vec![0],
+            kept: vec![3],
+            ..Launches::default()
+        };
+        let [area] = &launch_areas(&run)[..] else {
+            panic!("the last add alone keeps an area");
+        };
+        assert_eq!((area.life.def, area.life.last, area.life.launch_def), (2, 2, 2));
+        assert_eq!((area.reserve, area.bytes), (keeps.reserve, keeps.bytes));
+        let laid = lay_out(&plan, &descriptors, &run).expect("fits");
+        let [first] = laid.areas[..] else {
+            panic!("one area laid");
+        };
+        let (low, high) = (first - keeps.reserve, first + keeps.bytes);
+        let word = u64::from(WIDE) * 4;
+        for value in [2usize, 3] {
+            let at = laid.values[value];
+            assert!(at + word <= low || high <= at, "value {value}: {laid:?}");
+        }
+        let take = laid.values[0];
+        assert!(low <= take + word && take < high, "{laid:?}");
+        assert_eq!(laid.temporary_bytes, 0);
+
+        let mut wide = Launches {
+            each: run.each.clone(),
+            ..Launches::default()
+        };
+        wide.each[2].blocks = 4;
+        let [across] = &launch_areas(&wide)[..] else {
+            panic!("one area");
+        };
+        assert_eq!((across.life.class_def, across.life.class_last), (0, 0));
     }
 }

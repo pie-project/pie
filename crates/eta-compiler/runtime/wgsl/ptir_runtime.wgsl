@@ -11,11 +11,9 @@ const DT_I32 : u32 = 1u;
 const DT_U32 : u32 = 2u;
 const DT_BOOL : u32 = 3u;
 
-// A stage's config table, by word: its values, its temporary words' first
-// heap word, its ops, its lane, and its heap's words (no access reaches past
-// them).
-const CFG_TEMPORARY : u32 = 1u;
-const CFG_HEAP_WORDS : u32 = 4u;
+// A stage's config table, by word: its values, its heap's words (no access
+// reaches past them), its ops and its lane.
+const CFG_HEAP_WORDS : u32 = 1u;
 
 // The fault classes this runtime writes (eta-compiler codegen::fault).
 const OUT_OF_BOUNDS : u32 = 0xB5u;
@@ -63,14 +61,14 @@ var<private> sel_groups : u32;
 var<private> lim_heap : u32;
 
 // Where the step's tables, status and heap start, in words of their
-// segments, and its temporary words' first heap word: read once at the
-// step's entry from its record and its config table.
+// segments, and the first heap word of its node's temporary area: read once
+// at the step's entry from its record.
 var<private> b_status : u32;
 var<private> b_descs : u32;
 var<private> b_params : u32;
 var<private> b_offs : u32;
 var<private> b_heap : u32;
-var<private> cfg_temporary : u32;
+var<private> tmp_base : u32;
 
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
@@ -574,7 +572,7 @@ const PTIR_REDUCE_LEVELS : u32 = 7u;
 fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
-  return cfg_temporary + (buf * span + row * stride + c) * 2u;
+  return tmp_base + (buf * span + row * stride + c) * 2u;
 }
 
 fn red_read_buf(level : u32) -> u32 { return level % 2u; }
@@ -1148,7 +1146,7 @@ fn key_less(ah : u32, al : u32, bh : u32, bl : u32) -> bool {
 }
 
 fn sort_cell(buf : u32, n : u32, c : u32) -> u32 {
-  return cfg_temporary + ((buf * n) + c) * 2u;
+  return tmp_base + ((buf * n) + c) * 2u;
 }
 
 fn sort_rows_of(p : u32, a : u32) -> u32 {
@@ -1222,10 +1220,10 @@ fn op_sort_round(p : u32, r : u32) {
   }
 }
 
-fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }
-fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }
-fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }
-fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }
+fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }
+fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }
+fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }
+fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }
 
 const PIVOT_UNROLL : u32 = 32u;
 
@@ -1516,7 +1514,7 @@ var<workgroup> sel_wg_key : array<u32, 1024>;
 var<workgroup> sel_wg_idx : array<u32, 1024>;
 var<workgroup> sel_wg_skip : u32;
 
-fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }
+fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }
 fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
 fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
 fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }

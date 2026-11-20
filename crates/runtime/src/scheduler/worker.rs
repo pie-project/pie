@@ -2853,6 +2853,13 @@ impl BatchScheduler {
                 _ => None,
             };
             let retired = in_flight_launches.pop_front().expect("front batch exists");
+            tracing::debug!(
+                target: "pie::launch",
+                lanes = retired.requests.len(),
+                tokens = retired.total_tokens,
+                fire_us = retired.started.elapsed().as_micros() as u64,
+                "fire retired"
+            );
             if wave_trace() {
                 wave_trace_emit(format!(
                     "[wave-trace] t={}us retire lanes={}",
