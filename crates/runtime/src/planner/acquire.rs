@@ -240,6 +240,8 @@ impl ResidencyPlanner {
             Parked::NotResident => Ok(Acquired::Yield),
             Parked::Entry(key, notify) => {
                 self.stats.parks.fetch_add(1, Ordering::Relaxed);
+                // Queued for room: its owner is parked here until served.
+                let _parked = crate::inferlet::process::parks_here();
                 ptrace!("park key={:?} pid={} kv={:?}", key, pid, demand.kv_pages);
                 crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
                 let mut registration = WaitRegistration {
@@ -460,6 +462,8 @@ impl ResidencyPlanner {
                 return Err(error);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
+            // Waiting its restore turn: its owner is parked here.
+            let _parked = crate::inferlet::process::parks_here();
             Self::await_residency_change(&signal, || {
                 self.is_resident(pid) || self.restore_never_fits_now(pid)
             })
@@ -566,6 +570,8 @@ impl ResidencyPlanner {
                 })
             })
             .ok_or(PlannerError::Cancelled)?;
+        // Queued for room: its owner is parked here until served.
+        let _parked = crate::inferlet::process::parks_here();
         // Off the queue however the wait ends.
         let _registration = WaitRegistration {
             planner: self,

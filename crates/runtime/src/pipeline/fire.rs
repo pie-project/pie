@@ -1095,6 +1095,8 @@ impl RungAsk {
                 if crate::store::shared::fire_cap(engine) >= width {
                     return Ok(());
                 }
+                // Waiting on a raise of the rung: its owner is parked here.
+                let _parked = crate::inferlet::process::parks_here();
                 watch.await;
             }
         })
@@ -2885,6 +2887,8 @@ pub(crate) async fn seat_lane_slots(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
         }
+        // Waiting for seats let go: its owner is parked here.
+        let _parked = crate::inferlet::process::parks_here();
         freed.await;
     }
 }
