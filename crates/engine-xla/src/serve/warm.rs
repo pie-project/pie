@@ -457,7 +457,7 @@ impl Shell {
         &mut self,
         layout: kernels_xla::beam::Layout,
         head: &crate::store::beam::Head,
-    ) -> Result<()> {
+    ) -> Result<crate::pjrt::Buffer> {
         self.pools
             .run_beam_head(&self.device, &self.handles, layout, head)
     }

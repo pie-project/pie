@@ -180,6 +180,13 @@ impl Latch {
         }
     }
 
+    /// Lane `lane` (attached to `instance`) faulted for `why`; the rest of
+    /// the step commits.
+    pub(crate) fn fault_lane(&self, lane: u32, instance: InstanceId, why: &str) {
+        let mut faults = self.lane_faults.lock().expect("lane faults lock poisoned");
+        faults.fault_lanes(lane..lane + 1, Some(instance), why);
+    }
+
     /// The step's reported lanes wrote `writes`: told with its landing.
     pub(crate) fn report(&self, writes: Vec<engine::KvWrites>) {
         self.writes

@@ -1832,6 +1832,7 @@ impl Xla {
         // lanes its beams; each group's head runs before the fire.
         let mut beam_lanes: Vec<Option<crate::beam::BeamLane>> = vec![None; submission.lanes.len()];
         let mut heads: Vec<(kernels_xla::beam::Layout, crate::store::beam::Head)> = Vec::new();
+        let mut groups: Vec<(InstanceId, u32, u32)> = Vec::new();
         for attachment in &submission.attachments {
             let Some(seat) = self.programs.beam_seat(attachment.instance) else {
                 continue;
@@ -1914,6 +1915,7 @@ impl Xla {
                 },
             ));
             self.programs.beam_fired(attachment.instance);
+            groups.push((attachment.instance, first as u32, live32));
         }
         let mut verbs: Vec<engine::fire::RsVerb> = submission
             .lanes
@@ -2164,8 +2166,9 @@ impl Xla {
         // The readout stays on the device: guest passes read it there, and
         // the host copy is made only for a row something on the host reads.
         // each beam group's head, on the pool before the fire (stream order)
-        for (layout, head) in &heads {
-            shell.run_beam_head(*layout, head).map_err(fault)?;
+        let mut head_faults = Vec::with_capacity(heads.len());
+        for ((layout, head), group) in heads.iter().zip(&groups) {
+            head_faults.push((*group, shell.run_beam_head(*layout, head).map_err(fault)?));
         }
         shell.feed_tokens(token_feeds);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
@@ -2187,6 +2190,24 @@ impl Xla {
             }
         }
 
+        // Each beam group's fault words (§7), read once its head lands: a
+        // faulted beam fails by name, the rest of the step commits.
+        for ((instance, first, live), words) in head_faults {
+            latch.hold();
+            let hold = std::sync::Arc::clone(latch);
+            std::thread::spawn(move || {
+                let outcome = words.download().map_err(|e| e.to_string()).map(|bytes| {
+                    for (b, word) in bytes.chunks_exact(4).take(live as usize).enumerate() {
+                        let code = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                        if code != 0 {
+                            let lane = first + b as u32;
+                            hold.fault_lane(lane, instance, &crate::beam::fault_reason(code, lane));
+                        }
+                    }
+                });
+                hold.release(outcome);
+            });
+        }
         let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()

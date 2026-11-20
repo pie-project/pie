@@ -64,8 +64,7 @@ pub fn run_rows(layout: Layout) -> i64 {
 }
 
 impl Pools {
-    /// Lays (compiles) the head programs of width rungs `layouts`: traced in
-    /// turn, compiled side by side.
+    /// Lays (compiles) the head programs of width rungs `layouts`.
     pub fn lay_beam_heads(
         &mut self,
         device: &Device,
@@ -82,25 +81,15 @@ impl Pools {
         };
         let mut texts = Vec::with_capacity(layouts.len());
         for &layout in layouts {
-            let (tracer, _) = self.beam_head_tracer(handles, layout, &blank)?;
-            texts.push(tracer.finish(&[]));
+            let (tracer, _, faults) = self.beam_head_tracer(handles, layout, &blank)?;
+            texts.push(tracer.finish(&[faults]));
         }
-        let compiled: Vec<Result<std::sync::Arc<crate::device::Program>>> =
-            std::thread::scope(|scope| {
-                let jobs: Vec<_> = texts
-                    .iter()
-                    .map(|(text, sig)| scope.spawn(move || device.program(text, sig.clone())))
-                    .collect();
-                jobs.into_iter()
-                    .map(|job| {
-                        job.join().unwrap_or_else(|_| {
-                            Err(Fault::Unbound {
-                                what: "a beam head's compile panicked".to_string(),
-                            })
-                        })
-                    })
-                    .collect()
-            });
+        // In turn: on v6e census, compiled side by side the seven rungs took
+        // 10.8 s against 4.4 s one after another (libtpu's compiles contend).
+        let compiled: Vec<Result<std::sync::Arc<crate::device::Program>>> = texts
+            .iter()
+            .map(|(text, sig)| device.program(text, sig.clone()))
+            .collect();
         for (&layout, program) in layouts.iter().zip(compiled) {
             let program = program?;
             self.beam_heads.retain(|(laid, _)| *laid != layout);
@@ -111,13 +100,14 @@ impl Pools {
 
     /// Runs group `head`'s step on width rung `layout` (laid at load),
     /// before its fire: its inputs staged as the laid program reads them.
+    /// Returns its fault words (`[lanes]` i32, §7), for the fire's settle.
     pub fn run_beam_head(
         &mut self,
         device: &Device,
         handles: &Handles,
         layout: Layout,
         head: &Head,
-    ) -> Result<()> {
+    ) -> Result<crate::pjrt::Buffer> {
         let program = self
             .beam_heads
             .iter()
@@ -130,7 +120,10 @@ impl Pools {
                 ),
             })?;
         let (inputs, ..) = head_inputs(handles, layout, head)?;
-        crate::exec::run_program(device, &program, None, self, &inputs, false).map(|_| ())
+        let mut outs = crate::exec::run_program(device, &program, None, self, &inputs, false)?;
+        outs.pop().ok_or_else(|| Fault::Unbound {
+            what: "a beam head that returned no fault words".to_string(),
+        })
     }
 
     fn beam_head_tracer<'h>(
@@ -138,7 +131,7 @@ impl Pools {
         handles: &'h Handles,
         layout: Layout,
         head: &Head,
-    ) -> Result<(Tracer<'h>, crate::inputs::Inputs)> {
+    ) -> Result<(Tracer<'h>, crate::inputs::Inputs, kernels_xla::hlo::Val)> {
         let Some(kv) = self.kv_shape() else {
             return Err(Fault::Unbound {
                 what: "a beam group's pages on a load that keeps no kv".to_string(),
@@ -167,6 +160,7 @@ impl Pools {
         }
         let root = self.root();
         let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
+        let faults_out: std::cell::Cell<Option<kernels_xla::hlo::Val>> = std::cell::Cell::new(None);
         let (b_n, words) = (layout.lanes, layout.words());
         let (state_rows, result_rows) = (rows_of(words), rows_of(results_words(layout)));
         {
@@ -206,6 +200,7 @@ impl Pools {
                 let parents = cx.reshape(parents, &[ROW_WORDS])?;
                 let parents = cx.slice_axis(parents, 0, 0, b_n)?;
                 let step = kernels_xla::beam::step(cx, layout, state, parents, at)?;
+                faults_out.set(Some(step.faults));
                 let entries = kernels_xla::beam::resolve(cx, step.lists, translation)?;
                 // each beam's write page: its entry at the fire's column
                 let col = cx.iota(Elem::I32, &[b_n, cap], 1);
@@ -306,7 +301,10 @@ impl Pools {
                 cx.write(root, whole)
             })?;
         }
-        Ok((tracer, inputs))
+        let faults = faults_out.get().ok_or_else(|| Fault::Unbound {
+            what: "a beam head that traced no step".to_string(),
+        })?;
+        Ok((tracer, inputs, faults))
     }
 }
 
