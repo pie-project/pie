@@ -1329,6 +1329,7 @@ impl ProcessCtx {
                 ..Default::default()
             };
             let pricing_rows = prog.pricing.rows;
+            let shadow_plan = prog.shadow_plan();
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1340,10 +1341,12 @@ impl ProcessCtx {
                     Ok(bytes) => bytes,
                     Err(e) => return Ok(Err(format!("pipeline: channel {dense} seed: {e}"))),
                 };
-                instance_seeds.push(crate::pipeline::instance::ChannelSeed {
-                    channel: dense as u32,
-                    data: bytes.clone(),
-                });
+                if shadow_plan.reads(dense as u32) {
+                    instance_seeds.push(crate::pipeline::instance::ChannelSeed {
+                        channel: dense as u32,
+                        data: bytes.clone(),
+                    });
+                }
                 let wire = if cell.dtype == eta_ir::types::Dtype::Bool {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);

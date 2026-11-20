@@ -631,6 +631,21 @@ impl Adapters {
         self.slots.release(binding.slot);
     }
 
+    pub fn rebind(&mut self, key: &Key) -> Option<Binding> {
+        self.slots
+            .occupants
+            .iter()
+            .flatten()
+            .any(|held| held.key == *key)
+            .then(|| self.slots.acquire(key.clone()).ok())
+            .flatten()
+            .map(|grant| Binding {
+                slot: grant.slot,
+                shared: matches!(key, Key::Shared(_)),
+                landed: false,
+            })
+    }
+
     pub fn key(&self, source: &Source<'_>) -> Result<Key> {
         match source {
             Source::Own { planes, .. } => Ok(Key::Planes(planes_fingerprint(planes))),

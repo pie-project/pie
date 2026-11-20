@@ -65,6 +65,7 @@ pub struct Cuda {
     tap_sink: Option<engine::TapSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
+    landed: BTreeMap<Vec<(u32, ChannelId)>, crate::blob::Key>,
     replay: Option<crate::replay::Replay>,
     /// This rank's place in its expert-parallel group (`size` 1 outside
     /// one): which experts' planes its banks load.
@@ -95,6 +96,7 @@ impl Cuda {
             tap_sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            landed: BTreeMap::new(),
             replay: None,
             expert: World::default(),
             before_arming: None,
@@ -464,11 +466,24 @@ fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
     instance: InstanceId,
-    seeds: &[(u32, Vec<u8>)],
+    seeds: &[(u32, &[u8])],
+    channels: &[ChannelId],
+    landed: &mut BTreeMap<Vec<(u32, ChannelId)>, crate::blob::Key>,
 ) -> EngineResult<Option<crate::Binding>> {
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
+    let seeded_by: Vec<(u32, ChannelId)> = sink
+        .planes
+        .iter()
+        .filter_map(|&(_, channel)| channels.get(channel as usize).map(|&id| (sink.sites, id)))
+        .collect();
+    if let Some(bound) = landed
+        .get(&seeded_by)
+        .and_then(|key| shell.rebind_adapter(key))
+    {
+        return Ok(Some(bound));
+    }
     let seats = shell.bank_seats();
     let site = sink.site().map_err(fault)?;
     let mut built: Vec<(String, Vec<u8>)> = Vec::new();
@@ -476,7 +491,7 @@ fn adapter_of(
         let wire = seeds
             .iter()
             .find(|(seeded, _)| seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
+            .map(|(_, bytes)| *bytes)
             .ok_or_else(|| {
                 Error::Load(format!(
                     "this program's `lora` sink reads its `{}` plane out of channel \
@@ -496,13 +511,22 @@ fn adapter_of(
             bytes,
         })
         .collect();
-    shell
+    let bound = shell
         .bind_adapter(crate::AdapterSource::Own {
             instance,
             planes: &planes,
         })
-        .map(Some)
-        .map_err(fault)
+        .map_err(fault)?;
+    if let Some((_, held)) = shell
+        .adapters()
+        .slots()
+        .resident()
+        .into_iter()
+        .find(|(slot, _)| *slot == bound.slot)
+    {
+        landed.insert(seeded_by, held.key.clone());
+    }
+    Ok(Some(bound))
 }
 
 impl Engine for Cuda {
@@ -1123,17 +1147,19 @@ impl Engine for Cuda {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
-        let seeds: Vec<(u32, Vec<u8>)> = binding
+        let seeds: Vec<(u32, &[u8])> = binding
             .seeds
             .iter()
-            .map(|seed| (seed.channel, seed.bytes.clone()))
+            .map(|seed| (seed.channel, seed.bytes.as_slice()))
             .collect();
         let adopted: Vec<Option<Arc<crate::program::Endpoint>>> = binding
             .channels
             .iter()
             .map(|id| self.channels.get(id).cloned())
             .collect();
-        let shell = self.loaded_mut()?;
+        let Some(shell) = self.shell.as_mut() else {
+            return Err(Error::Load("the cuda engine has no model loaded".into()));
+        };
         let id = shell
             .bind_program(
                 binding.program,
@@ -1145,7 +1171,14 @@ impl Engine for Cuda {
                 &binding.channels,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(
+            shell,
+            binding.program,
+            id,
+            &seeds,
+            &binding.channels,
+            &mut self.landed,
+        );
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {
@@ -1174,6 +1207,8 @@ impl Engine for Cuda {
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
         self.channels.remove(&id);
+        self.landed
+            .retain(|planes, _| planes.iter().all(|&(_, held)| held != id));
         Ok(())
     }
 
