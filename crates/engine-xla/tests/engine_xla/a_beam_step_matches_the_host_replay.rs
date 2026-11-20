@@ -1,6 +1,7 @@
 //! The beam group's step on the device (`kernels_xla::beam::step`) is the
 //! host replay's (`engine::beam::step`, `BEAM-PAGE-LISTS.md` §9) fire by
-//! fire: widths 2, 4, 8; a prompt ending mid-page and one on a page; at least
+//! fire: widths 2, 4, 8, and 3 and 5 on the width rungs 4 and 8 (the beams
+//! past a group's own dead); a prompt ending mid-page and one on a page; at least
 //! `3S` fires, the pool growing a column at a time; parents drawn with forks
 //! and retirements, and one parent past the beams. After every fire the
 //! state (fires, pool, each list's live columns, free, pending), the copies,
@@ -26,13 +27,13 @@ const PAGE: u32 = 16;
 const FRAMES: u32 = 2;
 
 /// One search: the replay's results a fire, and the device's.
-fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
+fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
     let f0 = folded / PAGE;
     let columns = (folded + steps - 1) / PAGE - f0 + 1;
     let total = lanes * (columns + 2) + lanes * FRAMES + 1;
     let cap = total + 8;
     let layout = Layout {
-        lanes: i64::from(lanes),
+        lanes: i64::from(rung),
         cap: i64::from(cap),
         frames: i64::from(FRAMES),
         page: i64::from(PAGE),
@@ -69,19 +70,21 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
             },
         );
         parents_all.extend(parents.iter().map(|&p| p as i32));
-        at_all.extend([folded as i32, reserve as i32, slot as i32]);
+        // the rung's dead beams continue themselves
+        parents_all.extend((lanes..rung).map(|b| b as i32));
+        at_all.extend([folded as i32, reserve as i32, slot as i32, lanes as i32]);
         want.push((step, state.clone(), c));
     }
 
     let mut b = Bench::new();
     let n = steps;
-    let parents_t = b.i32(n, lanes, &parents_all);
-    let at_t = b.i32(n, 3, &at_all);
+    let parents_t = b.i32(n, rung, &parents_all);
+    let at_t = b.i32(n, 4, &at_all);
     let state0 = b.i32(1, words, &vec![0; words as usize]);
     let states = b.zeros(dtype::Dtype::I32, n, words);
-    let lists = b.zeros(dtype::Dtype::I32, n, lanes * cap);
-    let copies = b.zeros(dtype::Dtype::I32, n, lanes * 3);
-    let faults = b.zeros(dtype::Dtype::I32, n, lanes);
+    let lists = b.zeros(dtype::Dtype::I32, n, rung * cap);
+    let copies = b.zeros(dtype::Dtype::I32, n, rung * 3);
+    let faults = b.zeros(dtype::Dtype::I32, n, rung);
     let ran = b
         .run(|ctx| {
             engine_xla::lower::lower(ctx, |l| {
@@ -95,15 +98,15 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
                 let inits = [
                     s0,
                     z(f, words),
-                    z(f, lanes * cap),
-                    z(f, lanes * 3),
-                    z(f, lanes),
+                    z(f, rung * cap),
+                    z(f, rung * 3),
+                    z(f, rung),
                 ];
                 let out = f.for_loop(i64::from(n), &inits, |f, ci, st| {
                     let zero = f.const_i(Elem::I32, 0, &[]);
-                    let p = f.dynamic_slice(parents_v, &[ci, zero], &[1, i64::from(lanes)])?;
-                    let p = f.reshape(p, &[i64::from(lanes)])?;
-                    let a = f.dynamic_slice(at_v, &[ci, zero], &[1, 3])?;
+                    let p = f.dynamic_slice(parents_v, &[ci, zero], &[1, i64::from(rung)])?;
+                    let p = f.reshape(p, &[i64::from(rung)])?;
+                    let a = f.dynamic_slice(at_v, &[ci, zero], &[1, 4])?;
                     let scalar = |f: &mut Func, k: i64| -> kernels_xla::hlo::Built<_> {
                         let v = f.slice_axis(a, 1, k, k + 1)?;
                         f.reshape(v, &[])
@@ -112,15 +115,16 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
                         folded: scalar(f, 0)?,
                         reserve: scalar(f, 1)?,
                         slot: scalar(f, 2)?,
+                        live: scalar(f, 3)?,
                     };
                     let step = kernels_xla::beam::step(f, layout, st[0], p, at)?;
                     let row = |f: &mut Func, v, w: u32| -> kernels_xla::hlo::Built<_> {
                         f.reshape(v, &[1, i64::from(w)])
                     };
                     let s_row = row(f, step.state, words)?;
-                    let l_row = row(f, step.lists, lanes * cap)?;
-                    let c_row = row(f, step.copies, lanes * 3)?;
-                    let f_row = row(f, step.faults, lanes)?;
+                    let l_row = row(f, step.lists, rung * cap)?;
+                    let c_row = row(f, step.copies, rung * 3)?;
+                    let f_row = row(f, step.faults, rung)?;
                     Ok(vec![
                         step.state,
                         f.dynamic_update_slice(st[1], s_row, &[ci, zero])?,
@@ -143,9 +147,9 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
     let got_lists = b.read_i32(lists);
     let got_copies = b.read_i32(copies);
     let got_faults = b.read_i32(faults);
-    let (cap_u, lanes_u) = (cap as usize, lanes as usize);
+    let (cap_u, lanes_u, rung_u) = (cap as usize, lanes as usize, rung as usize);
     for (t, (step, after, c)) in want.iter().enumerate() {
-        let tag = format!("lanes {lanes} folded {folded} seed {seed} fire {t}");
+        let tag = format!("lanes {lanes} rung {rung} folded {folded} seed {seed} fire {t}");
         let row = |v: &[i32], w: usize| v[t * w..(t + 1) * w].to_vec();
         let st = row(&got_states, words as usize);
         assert_eq!(st[0] as u32, after.fired, "{tag}: fires");
@@ -160,7 +164,7 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
                 "{tag}: beam {bm}'s map"
             );
         }
-        let at_free = 2 + lanes_u * cap_u;
+        let at_free = 2 + rung_u * cap_u;
         let free: Vec<bool> = st[at_free..at_free + cap_u]
             .iter()
             .map(|&x| x != 0)
@@ -168,7 +172,7 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
         assert_eq!(free, after.free, "{tag}: free");
         let pending: Vec<bool> = st[at_free + cap_u..].iter().map(|&x| x != 0).collect();
         assert_eq!(pending, after.pending, "{tag}: pending");
-        let lists_t = row(&got_lists, lanes_u * cap_u);
+        let lists_t = row(&got_lists, rung_u * cap_u);
         for (bm, list) in step.lists.iter().enumerate() {
             let got: Vec<u32> = lists_t[bm * cap_u..bm * cap_u + list.len()]
                 .iter()
@@ -176,7 +180,7 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
                 .collect();
             assert_eq!(&got, list, "{tag}: beam {bm}'s list");
         }
-        let copies_t = row(&got_copies, lanes_u * 3);
+        let copies_t = row(&got_copies, rung_u * 3);
         for (bm, copy) in step.copies.iter().enumerate() {
             let got = [
                 copies_t[bm * 3] as u32,
@@ -189,21 +193,22 @@ fn search(lanes: u32, folded: u32, steps: u32, seed: u64) -> Option<()> {
                 assert_eq!(&got, copy, "{tag}: beam {bm}'s copy");
             }
         }
-        let faults_t: Vec<u32> = row(&got_faults, lanes_u)
-            .iter()
-            .map(|&x| x as u32)
-            .collect();
-        assert_eq!(faults_t, step.faults, "{tag}: faults");
+        let faults_t: Vec<u32> = row(&got_faults, rung_u).iter().map(|&x| x as u32).collect();
+        assert_eq!(faults_t[..lanes_u], step.faults[..], "{tag}: faults");
+        assert!(
+            faults_t[lanes_u..].iter().all(|&f| f == 0),
+            "{tag}: a dead beam faults"
+        );
     }
     Some(())
 }
 
 #[test]
 fn a_beam_step_matches_the_host_replay() {
-    for lanes in [2u32, 4, 8] {
+    for (lanes, rung) in [(2u32, 2u32), (4, 4), (8, 8), (3, 4), (5, 8)] {
         for folded in [37u32, 32] {
             for seed in 0..2 {
-                if search(lanes, folded, 3 * PAGE + 9, seed).is_none() {
+                if search(lanes, rung, folded, 3 * PAGE + 9, seed).is_none() {
                     return;
                 }
             }

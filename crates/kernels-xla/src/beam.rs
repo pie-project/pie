@@ -42,12 +42,16 @@ impl Layout {
 }
 
 /// The fire's numbers (§3), i32 scalars: the set's frozen slots, its pool
-/// pages past them (the reserve), and the slot every beam writes.
+/// pages past them (the reserve), the slot every beam writes, and the
+/// group's beams (at most the layout's lanes: a group runs on the smallest
+/// width rung that holds it, the beams past its own dead, holding and
+/// taking no page and faulting nothing).
 #[derive(Clone, Copy, Debug)]
 pub struct At {
     pub folded: Val,
     pub reserve: Val,
     pub slot: Val,
+    pub live: Val,
 }
 
 /// One step's results: the state after it, each beam's list (`[lanes,
@@ -172,6 +176,8 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
 
     let q_iota = f.iota(i, &[cap], 0);
     let b_iota = f.iota(i, &[b_n], 0);
+    let live_b = f.splat(at.live, &[b_n])?;
+    let alive = f.compare(Cmp::Lt, b_iota, live_b)?;
     let q_zero = f.like_i(q_iota, 0);
     let is_q0 = f.compare(Cmp::Eq, q_iota, q_zero)?;
     let tail_q = f.splat(has_tail, &[cap])?;
@@ -188,7 +194,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let is_col0 = f.compare(Cmp::Eq, col_iota, col0)?;
     let zeros_map = f.like_i(map, 0);
     let map_p = f.select(is_col0, row_iota, zeros_map)?;
-    let lanes_q = f.like_i(q_iota, b_n);
+    let lanes_q = f.splat(at.live, &[cap])?;
     let past_lanes = f.compare(Cmp::Ge, q_iota, lanes_q)?;
     let free_p = f.and(in_pool, past_lanes)?;
     let free_p = f.and(free_p, not_frozen0)?;
@@ -200,6 +206,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let tail_o = f.and(has_tail, o_pos)?;
     let tail_o = f.splat(tail_o, &[b_n])?;
     let copy_p = f.and(not_b0, tail_o)?;
+    let copy_p = f.and(copy_p, alive)?;
     let zero_b = f.like_i(b_iota, 0);
     let tail_b = f.splat(tail, &[b_n])?;
     let copy_p_tokens = f.select(copy_p, tail_b, zero_b)?;
@@ -214,8 +221,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
         let c_off = f.compare(Cmp::Ne, c, zero)?;
         let short = f.const_i(i, fault::SHORT, &[]);
         let short = f.select(c_off, short, zero)?;
-        let lanes_s = scalar(f, b_n);
-        let over = f.compare(Cmp::Gt, lanes_s, q_n)?;
+        let over = f.compare(Cmp::Gt, at.live, q_n)?;
         let ex = f.const_i(i, fault::RESERVE_EXHAUSTED, &[]);
         let ex = f.select(over, ex, zero)?;
         let worst = f.max(short, ex)?;
@@ -230,12 +236,13 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let joined_free = i32_of(f, not_frozen0);
     let free0 = f.select(joined, joined_free, free)?;
     // §6.1
-    let lanes_b = f.like_i(b_iota, b_n);
     let ge0 = f.compare(Cmp::Ge, parents, zero_b)?;
-    let lt = f.compare(Cmp::Lt, parents, lanes_b)?;
+    let lt = f.compare(Cmp::Lt, parents, live_b)?;
     let valid = f.and(ge0, lt)?;
+    let valid = f.and(valid, alive)?;
     let par = f.select(valid, parents, b_iota)?;
     let bad = f.not(valid);
+    let bad = f.and(bad, alive)?;
     let parent_fault = f.like_i(b_iota, fault::PARENT);
     let faults_s = f.select(bad, parent_fault, zero_b)?;
     // §6.2: first child of its parent, the need for a fresh page, its rank
@@ -250,6 +257,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let o_zero = f.compare(Cmp::Eq, o, zero)?;
     let o_zero_b = f.splat(o_zero, &[b_n])?;
     let need = f.or(o_zero_b, not_first)?;
+    let need = f.and(need, alive)?;
     let need_i = i32_of(f, need);
     let need_e = f.broadcast(need_i, &[b_n, b_n], &[1])?;
     let zeros_bb = f.like_i(need_e, 0);
@@ -346,11 +354,16 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
         let old = f.broadcast(map, &[b_n, b_n, cap], &[0, 2])?; // [p, b, j] = map[p, j]
         let new = f.broadcast(map_s, &[b_n, b_n, cap], &[1, 2])?; // [p, b, j] = map'[b, j]
         let same = f.compare(Cmp::Eq, old, new)?;
+        // only a live beam holds a page
+        let holder = f.broadcast(alive, &[b_n, b_n, cap], &[1])?;
+        let same = f.and(same, holder)?;
         let held = any(f, same, &[1])?; // [p, j]
         let cp_bc = f.splat(cp, &[b_n, cap])?;
         let through = f.compare(Cmp::Le, col_iota, cp_bc)?;
         let not_held = f.not(held);
         let gone = f.and(through, not_held)?;
+        let was_live = f.broadcast(alive, &[b_n, cap], &[0])?;
+        let gone = f.and(gone, was_live)?;
         // page 0 under a mid-page prompt is never freed
         let map_zero = f.like_i(map, 0);
         let is0 = f.compare(Cmp::Eq, map, map_zero)?;
@@ -443,6 +456,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let copy_f = f.like_i(b_iota, fault::COPY_BOUNDS);
     let copy_f = f.select(bad_copy, copy_f, zero_b)?;
     faults2 = f.max(faults2, copy_f)?;
+    let faults2 = f.select(alive, faults2, zero_b)?;
 
     // ---- the state after
     let fired2 = f.add(fired, one)?;
