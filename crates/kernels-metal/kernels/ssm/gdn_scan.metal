@@ -451,7 +451,7 @@ constant constexpr int kVerifyChunk = 16;
 
 // The ints of a lane's row in a recurrent buffer's page table.
 #ifndef PIE_RS_PAGE_INTS
-#define PIE_RS_PAGE_INTS 8
+#define PIE_RS_PAGE_INTS 72
 #endif
 
 // Row `e` of a lane's extended rows in its buffer's plane, `slab` the

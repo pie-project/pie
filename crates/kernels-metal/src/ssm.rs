@@ -1190,7 +1190,7 @@ pub fn gated_delta_committed_landing(
 
 /// The ints of one lane's row in a recurrent buffer's page table
 /// (`PIE_RS_PAGE_INTS`).
-pub const RS_PAGE_INTS: u32 = 8;
+pub const RS_PAGE_INTS: u32 = 72;
 
 /// A recurrent buffer's plane as a verify arm reads it through the fire's
 /// page table: `slab` from the plane's first row in the buffer's first

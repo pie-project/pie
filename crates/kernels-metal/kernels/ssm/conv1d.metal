@@ -10,7 +10,7 @@ using namespace metal;
 
 // The ints of a lane's row in a recurrent buffer's page table.
 #ifndef PIE_RS_PAGE_INTS
-#define PIE_RS_PAGE_INTS 8
+#define PIE_RS_PAGE_INTS 72
 #endif
 
 
