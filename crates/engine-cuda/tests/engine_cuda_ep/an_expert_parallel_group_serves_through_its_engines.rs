@@ -12,7 +12,7 @@
 //! which way differs from one process to the next), which the micro's
 //! routes carry a few percent of the logits' spread four layers on.
 
-use engine::Engine;
+use engine::{Completion, Engine};
 use poem::{Dtype, Platform, Request};
 
 use crate::micro::{

@@ -8,11 +8,11 @@ use checkpoint::contract::ModelContract;
 use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::ChannelId;
-use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::{Channels, Engine, Programs};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
@@ -222,7 +222,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         .expect("the epilogue binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
     let program = engine
-        .register_program(&ProgramRegistration {
+        .register(&ProgramRegistration {
             program_hash: 0x0e7,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -237,8 +237,9 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     .enumerate()
     .map(|(at, (shape, dtype, host_role))| {
         let id = ChannelId(at as u64 + 1);
-        engine
-            .register_channel(&ChannelRegistration {
+        Channels::open(
+            &mut engine,
+            &ChannelRegistration {
                 id,
                 shape,
                 dtype: ChanDType::Concrete(dtype),
@@ -247,14 +248,15 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        )
+        .expect("the channel registers");
         id
     })
     .collect();
     let rows = 3u32;
     let instance = engine
-        .bind_instance(&InstanceBinding {
+        .bind(&InstanceBinding {
             program,
             channels: channels.clone(),
             seeds: Vec::new(),
@@ -273,7 +275,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     let t = 0.375f32;
     assert!(
         engine
-            .publish_channel(instance, 2, &t.to_le_bytes())
+            .publish(instance, 2, &t.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -308,7 +310,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
 
     let take = |engine: &mut backend::Engine, dense: u32| {
         engine
-            .take_channel(instance, dense)
+            .take(instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell")
     };

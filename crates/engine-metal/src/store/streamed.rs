@@ -1,5 +1,5 @@
-//! The weight cache (CONTRACT: `ChunkFacts::weights`, `Engine::weight_residency`,
-//! `Engine::weight_uses`) on unified memory: token-id-gathered table rows and
+//! The weight cache (CONTRACT: `ChunkFacts::weights`, `WeightCache::set_residency`,
+//! `WeightCache::uses`) on unified memory: token-id-gathered table rows and
 //! routed experts in read-only pool slots, read through tables of GPU
 //! addresses.
 //!
@@ -34,7 +34,7 @@
 //! weight), so no recorded program holds the weight, and dropping it needs
 //! no re-arm.
 //!
-//! **Residency** (`Engine::weight_residency`): every frame drains, the atoms
+//! **Residency** (`WeightCache::set_residency`): every frame drains, the atoms
 //! newly named a slot are blitted from the weight into their slots, and every
 //! address table is rewritten on the host before the next fire. Evacuation
 //! rewrites them again. A use of an atom that is not named reads the weight

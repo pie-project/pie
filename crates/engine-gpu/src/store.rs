@@ -1091,7 +1091,7 @@ impl<B: Backend> Pools<B> {
         Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
     }
 
-    /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
+    /// Slots of one shape copied as [`engine::Tiers::copy`] states
     /// them: on the device (whole slots, and token runs of the list),
     /// between the device and the host chunks, or between the device and
     /// the slot file. A host or disk copy waits out its frame.
@@ -1228,7 +1228,7 @@ impl<B: Backend> Pools<B> {
         Ok(spans)
     }
 
-    /// See [`engine::Engine::read_tier_slots`]: the bytes of host tier
+    /// See [`engine::Tiers::read`]: the bytes of host tier
     /// slots, shape by shape, each laid out as `copy_slots` moves it. The
     /// caller has drained every frame.
     pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
@@ -1267,7 +1267,7 @@ impl<B: Backend> Pools<B> {
         Ok(out)
     }
 
-    /// See [`engine::Engine::write_tier_slots`]: `bytes`, laid out as
+    /// See [`engine::Tiers::write`]: `bytes`, laid out as
     /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
     /// whole when the byte count differs. The caller has drained every
     /// frame.

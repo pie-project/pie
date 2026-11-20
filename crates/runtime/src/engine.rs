@@ -36,7 +36,7 @@ pub type EngineId = usize;
 pub mod verbs {
     use anyhow::Result;
 
-    use ::engine::ChannelRegistration;
+    use ::engine::{ChannelRegistration, Engine};
 
     use super::{EngineBox, EngineId, RegisteredChannel, SubmissionCompletion};
 
@@ -47,12 +47,21 @@ pub mod verbs {
             .and_then(|facts| facts.codegen_backend.as_deref())
     }
 
+    pub fn serve<'a, F: ?Sized>(
+        engine: &'a mut EngineBox,
+        family: fn(&'a mut dyn Engine) -> Option<&'a mut F>,
+        verb: &'static str,
+    ) -> engine::Result<&'a mut F> {
+        let kind = engine.kind();
+        family(engine.as_mut()).ok_or(engine::Error::unsupported(kind, verb))
+    }
+
     pub fn register_adapter(
         engine: &mut EngineBox,
         registration: &engine::adapter::AdapterRegistration,
     ) -> Result<()> {
-        engine
-            .register_adapter(registration)
+        serve(engine, Engine::programs, "register_adapter")
+            .and_then(|programs| programs.adapter(registration))
             .map_err(anyhow::Error::from)
     }
 
@@ -68,7 +77,9 @@ pub mod verbs {
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel> {
         let table = waker::WakerTable::global();
-        let answered = match engine.register_channel(registration) {
+        let answered = match serve(engine, Engine::channels, "register_channel")
+            .and_then(|channels| channels.open(registration))
+        {
             Ok(answer) => Some(answer),
             Err(engine::Error::Unsupported { .. }) => None,
             Err(error) => return Err(anyhow::Error::from(error)),

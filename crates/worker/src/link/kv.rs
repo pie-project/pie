@@ -1,5 +1,5 @@
 //! Reading another worker's kv in place. A worker whose engine exported its
-//! kv (`engine::Engine::export_kv_handle`) opens one transfer agent, its kv
+//! kv (`engine::Peers::export`) opens one transfer agent, its kv
 //! registered with it, and says so in its peer [`Hello`]; a worker that
 //! greets it and holds kv of the same layout learns its agent, and reads its
 //! pages straight into its own.

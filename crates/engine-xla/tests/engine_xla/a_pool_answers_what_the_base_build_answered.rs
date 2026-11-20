@@ -97,7 +97,7 @@ fn a_windowed_model_answers_bit_for_bit_past_its_window() {
 /// slots (`write_tier_slots`), as a snapshot restores. Every readout.
 fn parked(name: &str, park: bool, disk: Option<&std::path::Path>, bytes: bool) -> Vec<Vec<u32>> {
     use crate::common_llm::{Refs, Seq, bits, tokens};
-    use engine::Engine;
+    use engine::Tiers;
     use engine::chunk::SlotCopy;
     use engine::transfer::MemoryDomain;
     let mut model = Model::load_with(name, None, 256, 7, disk);
@@ -121,7 +121,7 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>, bytes: bool) -
         let copy = |model: &mut Model, shape, src, dst, slots: Vec<(u32, u32)>| {
             model
                 .engine
-                .copy_slots(&SlotCopy {
+                .copy(&SlotCopy {
                     shape,
                     src,
                     dst,
@@ -150,7 +150,7 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>, bytes: bool) -
             let len = facts.shape(shape).expect("a fixed shape").slot_bytes as usize;
             let read = model
                 .engine
-                .read_tier_slots(&[(shape, refs.clone())])
+                .read(&[(shape, refs.clone())])
                 .expect("the host slots read");
             assert_eq!(
                 read.len(),
@@ -160,24 +160,24 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>, bytes: bool) -
             assert!(
                 model
                     .engine
-                    .write_tier_slots(&[(shape, refs.clone())], &read[1..])
+                    .write(&[(shape, refs.clone())], &read[1..])
                     .is_err(),
                 "{name}: a byte count that differs is refused"
             );
             let zeros = vec![0u8; read.len()];
             model
                 .engine
-                .write_tier_slots(&[(shape, refs.clone())], &zeros)
+                .write(&[(shape, refs.clone())], &zeros)
                 .expect("the host slots write");
             let again: Vec<u32> = refs.iter().rev().copied().collect();
             model
                 .engine
-                .write_tier_slots(&[(shape, again.clone())], &read)
+                .write(&[(shape, again.clone())], &read)
                 .expect("the host slots write");
             assert_eq!(
                 model
                     .engine
-                    .read_tier_slots(&[(shape, refs.clone())])
+                    .read(&[(shape, refs.clone())])
                     .expect("the host slots read"),
                 read.chunks(len)
                     .rev()

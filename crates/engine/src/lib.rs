@@ -37,12 +37,13 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
+    Channels, Completion, CompletionSink, Engine, KvWrites, Peers, Pool, Programs, StepDone,
+    StepOutcome, TapGroups, TapSink, Tapped, Taps, Tiers, WeightCache,
 };
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
+    LaneReadout, Mask, Masking, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Reload, Reloaded, Residency};
 pub use program::{

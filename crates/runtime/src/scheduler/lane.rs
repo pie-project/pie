@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::engine::ChannelRegistration;
+use ::engine::{ChannelRegistration, Engine};
 
+use crate::engine::verbs::serve;
 use crate::engine::{
     BoundInstance, ChannelJoin, EngineBox, RegisteredChannel, SubmissionCompletion,
 };
@@ -340,8 +341,10 @@ impl Lane {
             if let Err(error) = engine.bind_thread() {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
-            engine.on_tapped(crate::offload::stream::sink());
-            if engine.settles_asynchronously() {
+            if let Some(taps) = engine.taps() {
+                taps.subscribe(crate::offload::stream::sink());
+            }
+            if let Some(engine) = engine.completion() {
                 engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
                     // What lanes wrote is kept before their step is published
                     // settled, so the fires that asked find it.
@@ -457,7 +460,9 @@ impl Lane {
                         .cloned()
                         .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
-                        if let Err(error) = engine.publish_landed() {
+                        if let Some(completion) = engine.completion()
+                            && let Err(error) = completion.publish_landed()
+                        {
                             tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
                         }
                         for instance in instances {
@@ -547,8 +552,9 @@ impl Lane {
         {
             if let LaneRequest::Launch { submission, .. } = &queued
                 && let Some(first) = submission.steps.first()
+                && let Some(completion) = engine.completion()
             {
-                engine.expect_fire(&first.submission);
+                completion.expect_fire(&first.submission);
             }
             *stash = Some(queued);
         }
@@ -591,7 +597,7 @@ impl Lane {
             }
         };
 
-        let asynchronous = engine.settles_asynchronously();
+        let asynchronous = engine.completion().is_some();
         if asynchronous {
             landed.insert(
                 ticket.id,
@@ -669,9 +675,15 @@ impl Lane {
                 let operation = plan.label();
                 let submitted = backend(engine).and_then(|engine| {
                     crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
+                        PreLaunchCopy::Kv(plan) => {
+                            serve(engine, Engine::tiers, "copy_kv")?.copy_kv(&plan)
+                        }
+                        PreLaunchCopy::State(plan) => {
+                            serve(engine, Engine::tiers, "copy_state")?.copy_state(&plan)
+                        }
+                        PreLaunchCopy::Slots(plan) => {
+                            serve(engine, Engine::tiers, "copy_slots")?.copy(&plan)
+                        }
                     })
                 });
                 match submitted {
@@ -736,7 +748,10 @@ impl Lane {
                 if let Some(plan) = &program {
                     let backend = crate::engine::verbs::codegen_backend(engine);
                     let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
-                    match engine.register_program(plan).map_err(anyhow::Error::from) {
+                    match serve(engine, Engine::programs, "register_program")
+                        .and_then(|programs| programs.register(plan))
+                        .map_err(anyhow::Error::from)
+                    {
                         Ok(program_id) => bind.binding.program = program_id,
                         Err(error) => {
                             tracing::error!(
@@ -807,9 +822,15 @@ impl Lane {
             QueuedItem::CopyTracked { plan, completion } => {
                 match backend(engine).and_then(|engine| {
                     crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
+                        PreLaunchCopy::Kv(plan) => {
+                            serve(engine, Engine::tiers, "copy_kv")?.copy_kv(&plan)
+                        }
+                        PreLaunchCopy::State(plan) => {
+                            serve(engine, Engine::tiers, "copy_state")?.copy_state(&plan)
+                        }
+                        PreLaunchCopy::Slots(plan) => {
+                            serve(engine, Engine::tiers, "copy_slots")?.copy(&plan)
+                        }
                     })
                 }) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
@@ -825,9 +846,15 @@ impl Lane {
             QueuedItem::Pool { op, response } => {
                 let result = backend(engine).and_then(|engine| {
                     match op {
-                        PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
-                        PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
-                        PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+                        PoolOp::CommitSegments(segments) => {
+                            serve(engine, Engine::pool, "commit_segments")?.commit(segments)
+                        }
+                        PoolOp::ReleaseSegments(segments) => {
+                            serve(engine, Engine::pool, "release_segments")?.release(segments)
+                        }
+                        PoolOp::Evacuate(evacuation) => {
+                            serve(engine, Engine::pool, "evacuate")?.evacuate(&evacuation)
+                        }
                     }
                     .map_err(anyhow::Error::from)
                 });
@@ -836,44 +863,50 @@ impl Lane {
             }
             QueuedItem::HostKv { op, response } => {
                 let result = backend(engine).and_then(|engine| match op {
-                    HostKvOp::Write(slots, bytes) => engine
-                        .write_host_kv(&slots, &bytes)
+                    HostKvOp::Write(slots, bytes) => serve(engine, Engine::peers, "write_host_kv")
+                        .and_then(|peers| peers.write(&slots, &bytes))
                         .map(|()| Vec::new())
                         .map_err(Into::into),
-                    HostKvOp::CopyRead(copy, slots) => engine
-                        .copy_kv(&copy)
-                        .and_then(|()| engine.read_host_kv(&slots))
+                    HostKvOp::CopyRead(copy, slots) => serve(engine, Engine::tiers, "copy_kv")
+                        .and_then(|tiers| tiers.copy_kv(&copy))
+                        .and_then(|()| serve(engine, Engine::peers, "read_host_kv"))
+                        .and_then(|peers| peers.read(&slots))
                         .map_err(Into::into),
-                    HostKvOp::Read(slots) => engine.read_host_kv(&slots).map_err(Into::into),
-                    HostKvOp::ReadState(slots, pages) => {
-                        engine.read_host_state(&slots, &pages).map_err(Into::into)
+                    HostKvOp::Read(slots) => serve(engine, Engine::peers, "read_host_kv")
+                        .and_then(|peers| peers.read(&slots))
+                        .map_err(Into::into),
+                    HostKvOp::ReadTier(slots) => serve(engine, Engine::tiers, "read_tier_slots")
+                        .and_then(|tiers| tiers.read(&slots))
+                        .map_err(Into::into),
+                    HostKvOp::WriteTier(slots, bytes) => {
+                        serve(engine, Engine::tiers, "write_tier_slots")
+                            .and_then(|tiers| tiers.write(&slots, &bytes))
+                            .map(|()| Vec::new())
+                            .map_err(Into::into)
                     }
-                    HostKvOp::WriteState(slots, pages, bytes) => engine
-                        .write_host_state(&slots, &pages, &bytes)
-                        .map(|()| Vec::new())
-                        .map_err(Into::into),
-                    HostKvOp::ReadTier(slots) => engine.read_tier_slots(&slots).map_err(Into::into),
-                    HostKvOp::WriteTier(slots, bytes) => engine
-                        .write_tier_slots(&slots, &bytes)
-                        .map(|()| Vec::new())
-                        .map_err(Into::into),
                     HostKvOp::TapGroups => {
-                        Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
+                        let groups = engine.taps().and_then(|taps| taps.groups());
+                        Ok(serde_json::to_vec(&groups).unwrap_or_default())
                     }
-                    HostKvOp::WeightResidency(residency) => engine
-                        .weight_residency(&residency)
-                        .map(|()| Vec::new())
-                        .map_err(Into::into),
-                    HostKvOp::WeightUses => engine
-                        .weight_uses()
+                    HostKvOp::WeightResidency(residency) => {
+                        serve(engine, Engine::weights, "weight_residency")
+                            .and_then(|weights| weights.set_residency(&residency))
+                            .map(|()| Vec::new())
+                            .map_err(Into::into)
+                    }
+                    HostKvOp::WeightUses => serve(engine, Engine::weights, "weight_uses")
+                        .and_then(|weights| weights.uses())
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
                         .map_err(Into::into),
-                    HostKvOp::ReloadWeights(checkpoint) => engine
-                        .reload_weights(&::engine::Reload { checkpoint })
-                        .map(|written| serde_json::to_vec(&written).unwrap_or_default())
-                        .map_err(Into::into),
+                    HostKvOp::ReloadWeights(checkpoint) => {
+                        serve(engine, Engine::weights, "reload_weights")
+                            .and_then(|weights| weights.reload(&::engine::Reload { checkpoint }))
+                            .map(|written| serde_json::to_vec(&written).unwrap_or_default())
+                            .map_err(Into::into)
+                    }
                     HostKvOp::Layout => Ok(engine
-                        .host_kv_layout()
+                        .peers()
+                        .and_then(|peers| peers.layout())
                         .and_then(|layout| serde_json::to_vec(&layout).ok())
                         .unwrap_or_default()),
                 });
@@ -881,9 +914,11 @@ impl Lane {
                 LaneCommit::None
             }
             QueuedItem::CloseInstance { id, .. } => {
-                match backend(engine)
-                    .and_then(|engine| engine.close_instance(id).map_err(anyhow::Error::from))
-                {
+                match backend(engine).and_then(|engine| {
+                    serve(engine, Engine::programs, "close_instance")
+                        .and_then(|programs| programs.close(id))
+                        .map_err(anyhow::Error::from)
+                }) {
                     Ok(()) => {
                         channels.unbind(id);
                         LaneCommit::CloseInstance { id }
@@ -919,14 +954,16 @@ impl Lane {
         channels: &mut ChannelJoin,
         plan: &crate::engine::InstanceBindingPlan,
     ) -> Result<BoundInstance> {
-        let bound = engine.bind_instance(&plan.binding)?;
+        let bound = serve(engine, Engine::programs, "bind_instance")?.bind(&plan.binding)?;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
         Ok(bound)
     }
 
     fn close_channel(engine: &mut EngineBox, id: ::engine::ChannelId) -> Result<()> {
-        match engine.close_channel(id) {
+        match serve(engine, Engine::channels, "close_channel")
+            .and_then(|channels| channels.close(id))
+        {
             Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
             Err(error) => Err(anyhow::Error::from(error)),
         }
@@ -943,7 +980,7 @@ impl Lane {
         for plan in plans {
             if channels.contains(plan.id) {
                 for channel_id in registered_ids.iter().rev() {
-                    let _ = engine.close_channel(*channel_id);
+                    let _ = Self::close_channel(engine, *channel_id);
                     channels.remove(*channel_id);
                 }
                 return Err(anyhow!("channel {} is already registered", plan.id));
@@ -956,7 +993,7 @@ impl Lane {
                 }
                 Err(cause) => {
                     for channel_id in registered_ids.iter().rev() {
-                        let _ = engine.close_channel(*channel_id);
+                        let _ = Self::close_channel(engine, *channel_id);
                         channels.remove(*channel_id);
                     }
                     return Err(cause);

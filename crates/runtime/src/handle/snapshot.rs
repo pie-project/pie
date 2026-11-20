@@ -442,30 +442,12 @@ async fn read_state(
     // A window list's table rides as the buffer.
     let table = set.windows.first().unwrap_or(&set.buffer);
     let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
-    let shared = stores.rs.lock().unwrap().is_shared();
-    let bytes = if shared {
-        read_tier_state(engine, &stores, &held, &pages).await?
-    } else {
-        // Without a host tier, rows are read where they rest on the host: a
-        // read parks nothing.
-        let (row_slots, row_pages) = {
-            let store = stores.rs.lock().unwrap();
-            if held.iter().chain(&pages).any(|&id| !store.on_host(id)) {
-                return Err(HandleError::quota(
-                    "the host has no room to read this recurrent state out",
-                ));
-            }
-            let ids = |ids: &[RsSlotId]| {
-                ids.iter()
-                    .map(|&id| store.engine_id(id))
-                    .collect::<Vec<_>>()
-            };
-            (ids(&held), ids(&pages))
-        };
-        scheduler::read_host_state(engine, row_slots, row_pages)
-            .await
-            .map_err(|error| failed("reading recurrent state", error))?
-    };
+    if !stores.rs.lock().unwrap().is_shared() {
+        return Err(HandleError::invalid(
+            "a state outside a shared pool is not saved to the host",
+        ));
+    }
+    let bytes = read_tier_state(engine, &stores, &held, &pages).await?;
     Ok((
         SavedState {
             state_size: rs.geom.state_size,
@@ -1026,13 +1008,11 @@ async fn load_state(
     }
     let slots = usize::from(saved.folded);
     let pages = saved.buffer.iter().filter(|&&page| page).count();
-    let (rows, ids) = {
+    let rows = {
         let mut store = stores.rs.lock().unwrap();
-        let rows = store
+        store
             .take_host(slots, pages)
-            .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?;
-        let ids: Vec<u32> = rows.iter().map(|&id| store.engine_id(id)).collect();
-        (rows, ids)
+            .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?
     };
     let tier = {
         let store = stores.rs.lock().unwrap();
@@ -1041,16 +1021,9 @@ async fn load_state(
     let written = match tier {
         // A shared pool's host rows are host tier slots (CONTRACT-BC 22).
         Some(refs) => scheduler::write_tier_slots(engine, refs, bytes.to_vec()).await,
-        None => {
-            let (row_slots, row_pages) = ids.split_at(slots);
-            scheduler::write_host_state(
-                engine,
-                row_slots.to_vec(),
-                row_pages.to_vec(),
-                bytes.to_vec(),
-            )
-            .await
-        }
+        None => Err(anyhow::anyhow!(
+            "a state outside a shared pool is not saved to the host"
+        )),
     };
     let mut store = stores.rs.lock().unwrap();
     if let Err(error) = written {

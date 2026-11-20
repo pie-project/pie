@@ -10,8 +10,8 @@
 use crate::common_dit;
 
 use common_dit::{Rig, Weights, assert_close, attach};
-use engine::Engine;
 use engine::fire::{Lane, Readout};
+use engine::{Channels, Programs};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -210,7 +210,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     ];
     let instance = rig
         .engine
-        .bind_instance(&engine::program::InstanceBinding {
+        .bind(&engine::program::InstanceBinding {
             program,
             channels,
             seeds: Vec::new(),
@@ -252,7 +252,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         ] {
             assert!(
                 rig.engine
-                    .publish_channel(instance, chan, &cell)
+                    .publish(instance, chan, &cell)
                     .expect("the cell publishes"),
                 "the ring had room"
             );

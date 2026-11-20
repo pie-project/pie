@@ -1328,7 +1328,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`: on the device in queue order; to or from
+    /// See `Tiers::copy`: on the device in queue order; to or from
     /// the host chunks or the slot file once every frame has landed.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
@@ -1348,7 +1348,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::read`: every frame and copy lands first.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -1357,7 +1357,7 @@ impl<B: Serve> Shell<B> {
         self.pools.read_tier_slots(slots)
     }
 
-    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::write`: every frame and copy lands first.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -1440,7 +1440,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: every slot newly named filled from
+    /// See `WeightCache::set_residency`: every slot newly named filled from
     /// the host before the next fire, every block's entry rewritten. The
     /// first after a load that seated its weights says how many atoms it
     /// names elsewhere (each filled again there).
@@ -1530,7 +1530,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
         let (mut uses, mut held) = self.row_caches.uses()?;

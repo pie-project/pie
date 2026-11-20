@@ -5,8 +5,6 @@
 
 use std::path::PathBuf;
 
-#[cfg(feature = "vulkan")]
-use engine::Engine;
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireTicket, Step};
 use engine::transfer::MemoryDomain;
@@ -210,7 +208,7 @@ fn defers(gpu: &Vulkan, step: &Step) -> bool {
     #[cfg(feature = "vulkan")]
     {
         gpu.sink.is_some()
-            && gpu.settles_asynchronously()
+            && Api::settles_asynchronously(gpu)
             && step.attachments.len() == 1
             && !step.attachments[0].adapter_only
             && gpu.programs.defers(step.attachments[0].instance)

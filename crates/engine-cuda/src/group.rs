@@ -1,16 +1,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::DeviceFacts;
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
-use engine::fire::MediaEncode;
 use engine::fire::{FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle};
+use engine::{Channels, Completion, Engine, Peers, Programs, Tiers, WeightCache};
 use eta_ir::container::HostRole;
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, World};
@@ -359,10 +358,6 @@ impl Engine for Group {
         self.facts.as_ref()
     }
 
-    fn export_kv_handle(&self) -> Option<KvHandle> {
-        None
-    }
-
     fn bind_thread(&mut self) -> EngineResult<()> {
         Ok(())
     }
@@ -407,20 +402,76 @@ impl Engine for Group {
         Ok(answers.swap_remove(0))
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        let registration = registration.clone();
-        self.lead(move |rank| rank.register_program(&registration))
+    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        let frame = frame.clone();
+        self.each(move |rank| rank.submit(&frame))
+            .map(|mut tickets| tickets.swap_remove(0))
     }
 
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        let registered = self.on(0, |rank| rank.register_channel(registration))?;
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        let template = ticket.clone();
+        let mut settled = self.each(move |rank| {
+            let mut own = template.clone();
+            rank.settle_frame(&mut own)?;
+            Ok(own)
+        })?;
+        *ticket = settled.swap_remove(0);
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        Some(self)
+    }
+}
+
+impl Programs for Group {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        let registration = registration.clone();
+        self.lead(move |rank| rank.register(&registration))
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        let binding = binding.clone();
+        self.lead(move |rank| rank.bind(&binding))
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+        self.lead(move |rank| Programs::close(rank, id))
+    }
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        let registration = registration.clone();
+        self.lead(move |rank| rank.adapter(&registration))
+    }
+}
+
+impl Channels for Group {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        let registered = self.on(0, |rank| Channels::open(rank, registration))?;
         if registration.host_role == HostRole::None {
             for rank in 1..self.ranks.len() {
                 self.on(rank, |shell| {
-                    shell.register_channel(registration).map(|_| ())
+                    Channels::open(shell, registration).map(|_| ())
                 })?;
             }
         } else {
@@ -438,44 +489,32 @@ impl Engine for Group {
         Ok(registered)
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let binding = binding.clone();
-        self.lead(move |rank| rank.bind_instance(&binding))
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.lead(move |rank| Channels::close(rank, id))
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.lead(move |rank| rank.close_instance(id))
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        self.on(0, |rank| rank.publish(instance, channel, cell))
     }
 
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.lead(move |rank| rank.close_channel(id))
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.on(0, |rank| rank.take(instance, channel))
+    }
+}
+
+impl WeightCache for Group {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        let _ = residency;
+        Err(Error::unsupported(self.kind(), "weight_residency"))
     }
 
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.on(0, |rank| rank.publish_channel(instance, channel, cell))
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        Err(Error::unsupported(self.kind(), "weight_uses"))
     }
 
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.on(0, |rank| rank.take_channel(instance, channel))
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let registration = registration.clone();
-        self.lead(move |rank| rank.register_adapter(&registration))
-    }
-
-    fn reload_weights(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+    fn reload(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
         let reload = reload.clone();
-        let ranks = self.each(move |rank| rank.reload_weights(&reload))?;
+        let ranks = self.each(move |rank| rank.reload(&reload))?;
         Ok(ranks
             .iter()
             .fold(engine::Reloaded::default(), |sum, rank| engine::Reloaded {
@@ -483,20 +522,9 @@ impl Engine for Group {
                 bytes: sum.bytes + rank.bytes,
             }))
     }
+}
 
-    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        let frame = frame.clone();
-        self.each(move |rank| rank.submit(&frame))
-            .map(|mut tickets| tickets.swap_remove(0))
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.ranks[0]
-            .try_lock()
-            .map(|rank| rank.settles_asynchronously())
-            .unwrap_or(true)
-    }
-
+impl Completion for Group {
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         let silent: engine::CompletionSink = Arc::new(|_, _| {});
         for (rank, shell) in self.ranks.iter().enumerate() {
@@ -508,17 +536,6 @@ impl Engine for Group {
                 });
             }
         }
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        let template = ticket.clone();
-        let mut settled = self.each(move |rank| {
-            let mut own = template.clone();
-            rank.settle_frame(&mut own)?;
-            Ok(own)
-        })?;
-        *ticket = settled.swap_remove(0);
-        Ok(())
     }
 
     fn publish_landed(&mut self) -> EngineResult<()> {
@@ -533,23 +550,17 @@ impl Engine for Group {
             }
         }
     }
+}
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
-        let copy = copy.clone();
-        self.lead(move |rank| rank.copy_kv(&copy))
+impl Peers for Group {
+    fn export(&self) -> Option<KvHandle> {
+        None
     }
 
-    /// Each rank moves its band of every slot to and from its own tiers
-    /// (CONTRACT-BC 22).
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        let copy = copy.clone();
-        self.lead(move |rank| rank.copy_slots(&copy))
-    }
-
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
+    fn layout(&self) -> Option<state::PageLayout> {
         let ranks = u32::try_from(self.ranks.len()).ok()?;
         let rank = self.ranks.first()?.try_lock().ok()?;
-        let one = rank.host_kv_layout()?;
+        let one = rank.layout()?;
         Some(state::PageLayout {
             ranks,
             page_tokens: one.page_tokens,
@@ -565,15 +576,15 @@ impl Engine for Group {
     }
 
     /// Rank after rank: each holds its own heads of every slot.
-    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
         let mut out = Vec::new();
         for rank in 0..self.ranks.len() {
-            out.extend(self.on(rank, |shell| shell.read_host_kv(slots))?);
+            out.extend(self.on(rank, |shell| Peers::read(shell, slots))?);
         }
         Ok(out)
     }
 
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         let ranks = self.ranks.len();
         if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
             return Err(Error::Device(format!(
@@ -583,24 +594,23 @@ impl Engine for Group {
         }
         let share = bytes.len() / ranks;
         for (rank, bytes) in bytes.chunks(share).enumerate() {
-            self.on(rank, |shell| shell.write_host_kv(slots, bytes))?;
+            self.on(rank, |shell| Peers::write(shell, slots, bytes))?;
         }
         Ok(())
     }
+}
 
+impl Tiers for Group {
     /// Rank after rank: each holds its own share of every slot.
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         let mut out = Vec::new();
         for rank in 0..self.ranks.len() {
-            out.extend(self.on(rank, |shell| shell.read_tier_slots(slots))?);
+            out.extend(self.on(rank, |shell| Tiers::read(shell, slots))?);
         }
         Ok(out)
     }
 
-    fn write_tier_slots(
+    fn write(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
@@ -614,21 +624,21 @@ impl Engine for Group {
         }
         let share = bytes.len() / ranks;
         for (rank, bytes) in bytes.chunks(share).enumerate() {
-            self.on(rank, |shell| shell.write_tier_slots(slots, bytes))?;
+            self.on(rank, |shell| Tiers::write(shell, slots, bytes))?;
         }
         Ok(())
     }
 
-    fn encode(&mut self, plan: &mut MediaEncode) -> EngineResult<()> {
-        self.on(0, |rank| rank.encode(plan))
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+        let copy = copy.clone();
+        self.lead(move |rank| rank.copy_kv(&copy))
     }
 
-    fn disconnect(&self, message: &str) {
-        for rank in &self.ranks {
-            if let Ok(rank) = rank.try_lock() {
-                rank.disconnect(message);
-            }
-        }
+    /// Each rank moves its band of every slot to and from its own tiers
+    /// (CONTRACT-BC 22).
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let copy = copy.clone();
+        self.lead(move |rank| rank.copy(&copy))
     }
 }
 
