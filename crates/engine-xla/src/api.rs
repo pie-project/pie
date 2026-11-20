@@ -595,6 +595,8 @@ impl Engine for Xla {
             classes: shell.classes(),
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // the staging ring's slots less the one being written
+            frames_in_flight: shell.staging_facts().ring_slots.saturating_sub(1).max(1),
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());

@@ -896,6 +896,9 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            frames_in_flight: u32::from(
+                engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
+            ),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
