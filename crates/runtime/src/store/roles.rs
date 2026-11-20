@@ -441,6 +441,9 @@ struct Part {
     pieces: u32,
     chunks: u32,
     run: u32,
+    /// A guest's resident state ([`GuestState::resident`]): live, one run
+    /// of adjacent slots, moved as the instance's tables are.
+    resident: bool,
 }
 
 impl Part {
@@ -575,6 +578,7 @@ pub struct Taken {
 #[derive(Debug, Default)]
 pub struct GuestTaken {
     scratch: Option<Part>,
+    resident: Option<Part>,
     pair: Option<(FireKey, Part, bool, u64)>,
 }
 
@@ -607,6 +611,12 @@ impl Taken {
         scratch(&self.parts).map_or(ScratchPlace::None, |part| place(part, self.chunk_slots))
     }
 
+    /// [`::engine::InstanceBinding::resident`].
+    #[must_use]
+    pub fn resident(&self) -> ScratchPlace {
+        resident(&self.parts).map_or(ScratchPlace::None, |part| place(part, self.chunk_slots))
+    }
+
     /// [`::engine::InstanceBinding::pair`].
     #[must_use]
     pub fn pair(&self) -> ScratchPlace {
@@ -629,6 +639,11 @@ impl Taken {
 /// An instance's scratch: its dead part.
 fn scratch(parts: &[Part]) -> Option<&Part> {
     parts.iter().find(|part| part.dead())
+}
+
+/// An instance's resident guest state: its live run past its tables.
+fn resident(parts: &[Part]) -> Option<&Part> {
+    parts.iter().find(|part| part.resident)
 }
 
 /// Where a dead part lies: its run's first slot ref and slots, or each of
@@ -1114,6 +1129,7 @@ impl Roles {
             pieces: 0,
             chunks: 0,
             run: 0,
+            resident: false,
         };
         if slots == 0 {
             return Ok(part(Vec::new()));
@@ -1168,6 +1184,7 @@ impl Roles {
             pieces,
             chunks: if pieces > 0 { run } else { 0 },
             run: slots,
+            resident: false,
         })
     }
 
@@ -1557,7 +1574,12 @@ impl Roles {
         let mut taken = Vec::with_capacity(like.len());
         for part in like {
             let took = match (part.dead(), device) {
-                (false, _) => self.take(on, part.role, part.refs.len() as u32, part.contiguous),
+                (false, _) => self
+                    .take(on, part.role, part.refs.len() as u32, part.contiguous)
+                    .map(|taken| Part {
+                        resident: part.resident,
+                        ..taken
+                    }),
                 (true, true) => self.retake(part).map_err(|room| {
                     let (run, _) = part.chunk_runs();
                     let committable = self.device.lock().unwrap().pool().committable_runs(run);
@@ -1701,6 +1723,9 @@ impl Roles {
                 },
             };
         }
+        // After the rings ([`own_rings`] reads them in order after the
+        // tables): its resident state, live, then its scratch.
+        taken.parts.extend(guest.resident);
         taken.parts.extend(guest.scratch);
         taken.pair = guest.pair;
         Ok(taken)
@@ -1774,9 +1799,10 @@ impl Roles {
         }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
-        // The instance's own bytes: its resident part and every scratch arm
-        // (none taken per fire yet), placed at the bind.
-        let per_instance = state.instance_bytes();
+        // The instance's dead bytes: every scratch arm (none taken per fire
+        // yet), placed at the bind. Its resident state is a live part of its
+        // own, taken below.
+        let per_instance = state.instance_bytes().saturating_sub(state.resident);
         if (per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
@@ -1814,6 +1840,32 @@ impl Roles {
                 Err(error) => {
                     self.untake_guest(taken);
                     return Err(error.asking(whole));
+                }
+            }
+        }
+        // Its resident state: one run of adjacent Instance slots, live from
+        // the bind to the close, moved as its tables are (copied on a park,
+        // copied back on the unpark).
+        if state.resident > 0 {
+            let device = Arc::clone(&self.device);
+            let slots = match self.shape(SlotRole::Instance) {
+                Ok(shape) => u32::try_from(state.resident.div_ceil(shape.slot_bytes.max(1)))
+                    .unwrap_or(u32::MAX),
+                Err(error) => {
+                    self.untake_guest(taken);
+                    return Err(error);
+                }
+            };
+            match self.take(&device, SlotRole::Instance, slots, true) {
+                Ok(part) => {
+                    taken.resident = Some(Part {
+                        resident: true,
+                        ..part
+                    });
+                }
+                Err(error) => {
+                    self.untake_guest(taken);
+                    return Err(self.bind_short(error));
                 }
             }
         }
@@ -1934,7 +1986,7 @@ impl Roles {
     /// A guest state taken for a bind that registered nothing, or failed
     /// before its instance's take: its chunks go back.
     pub fn untake_guest(&mut self, guest: GuestTaken) {
-        if let Some(part) = &guest.scratch {
+        for part in guest.scratch.iter().chain(&guest.resident) {
             self.give(&self.device, std::slice::from_ref(part));
         }
         if let Some((_, part, true, _)) = guest.pair {
@@ -2133,6 +2185,9 @@ impl Roles {
         let mut shed = Vec::new();
         for owner in owners {
             let parts = self.items[&owner].parts.clone();
+            if let Some(part) = resident(&parts) {
+                tracing::debug!(?owner, slots = ?part.refs, "a guest's resident run parks");
+            }
             let emptied = |parts: &[Part]| -> Vec<Part> {
                 parts
                     .iter()
@@ -2290,6 +2345,11 @@ impl Roles {
                 shed.push((owner, parts));
             } else {
                 items.push((owner, parts));
+            }
+        }
+        for (owner, parts) in &items {
+            if let Some(part) = resident(parts) {
+                tracing::debug!(?owner, slots = ?part.refs, "a guest's resident run comes back");
             }
         }
         let below: Vec<Tier> = items.iter().map(|(owner, _)| self.items[owner].tier).collect();
@@ -2688,6 +2748,8 @@ impl Roles {
                     adapter: self.adapter_refs(item),
                     scratch: scratch(&item.parts)
                         .map_or(ScratchPlace::None, |part| place(part, self.chunk_slots)),
+                    resident: resident(&item.parts)
+                        .map_or(ScratchPlace::None, |part| place(part, self.chunk_slots)),
                     pair: item
                         .pair
                         .and_then(|key| self.items.get(&Owner::Pair(key)))
@@ -3034,6 +3096,7 @@ pub fn bind_taken(
         ring_slots: taken.ring_slots(),
         adapter_slots: taken.adapter_slots(),
         scratch: taken.scratch(),
+        resident: taken.resident(),
         pair: taken.pair(),
         pair_generation: taken.pair_generation(),
         ..binding.clone()

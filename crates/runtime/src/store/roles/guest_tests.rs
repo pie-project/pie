@@ -181,8 +181,8 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                resident: per_instance,
-                scratch: 0,
+                resident: 0,
+                scratch: per_instance,
                 scratch_arms: 1,
                 per_pair,
                 run: 1,
@@ -2976,4 +2976,94 @@ fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
             .expect("it comes back");
         roles.lock().unwrap().commit(back);
     }
+}
+
+/// Binds an instance whose guest states `resident` bytes beside a chunk of
+/// scratch, parks it, lets another instance take the room it gave back, and
+/// unparks it: the resident state's run of slots is copied out whole and
+/// copied back into the fresh run the engine is told of, and nothing of the
+/// scratch is copied. Returns whether the copies went to the disk tier.
+fn resident_moves_with_its_instance(roles: &RolesHandle, device: &Shared) -> bool {
+    const RESIDENT: u64 = 5 * SLOT - 7;
+    let mut engine = GuestEngine::new(CHUNK, 0);
+    engine.state.resident = RESIDENT;
+    let before = held(device);
+    let id = bind(roles, &mut engine, 1).unwrap();
+    let bound = engine.bindings[0].clone();
+    let was = refs_of(&bound.resident);
+    assert!(
+        matches!(bound.resident, ScratchPlace::Run { slots: 5, .. }),
+        "one run of the slots its bytes take: {:?}",
+        bound.resident
+    );
+    assert!(matches!(bound.scratch, ScratchPlace::Chunks { .. }), "{:?}", bound.scratch);
+    assert_eq!(held(device) - before, CHUNK + 5 * SLOT, "both priced at the bind");
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let out: Vec<u32> = park.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    let below: Vec<u32> = park.copies().iter().flat_map(|copy| copy.host.clone()).collect();
+    let disk = park.copies().iter().all(|copy| copy.disk);
+    assert_eq!(out, was, "its resident run copied out whole, nothing else");
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(device), before, "parked: every device slot given back");
+
+    // The room it gave back is taken meanwhile: its state must move.
+    let mut other = GuestEngine::new(0, 0);
+    other.state.resident = 64 * SLOT;
+    other.next = 100;
+    learn_program(roles, &mut other, ProgramId(8)).unwrap();
+    bind_instance(
+        Some(roles),
+        &mut other,
+        &InstanceBinding {
+            program: ProgramId(8),
+            ..InstanceBinding::default()
+        },
+        Some(holder(2)),
+        |_| false,
+    )
+    .unwrap();
+    let others = refs_of(&other.bindings[0].resident);
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    let back: Vec<u32> = unpark.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    let from: Vec<u32> = unpark.copies().iter().flat_map(|copy| copy.host.clone()).collect();
+    assert_eq!(from, below, "copied back from where the park put it");
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let [Rebind::Instance { id: rebound, resident, .. }] = stale.as_slice() else {
+        panic!("one rebind of the instance: {stale:?}");
+    };
+    assert_eq!(*rebound, id);
+    let now = refs_of(resident);
+    assert!(matches!(resident, ScratchPlace::Run { slots: 5, .. }), "{resident:?}");
+    assert_eq!(now, back, "the engine is told the run its bytes were copied into");
+    assert!(now.iter().all(|slot| !others.contains(slot)), "{now:?} {others:?}");
+    assert_ne!(now, was, "it moved: its old run is another instance's");
+    disk
+}
+
+/// A guest's resident state (a beam group's page lists) is live: a park
+/// copies it to the host tier and the unpark copies it back into fresh
+/// slots, the scratch beside it given back and copied nowhere.
+#[test]
+fn a_resident_guest_state_parks_on_the_host_and_comes_back_in_fresh_slots() {
+    let Pools { device, roles } = pools(64);
+    assert!(!resident_moves_with_its_instance(&roles, &device), "the host tier holds it");
+}
+
+/// With no host tier (unified memory), the resident state goes down to
+/// the disk tier's slot file and comes back as the host case does.
+#[test]
+fn with_no_host_tier_a_resident_guest_state_goes_to_disk_and_comes_back() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    roles.lock().unwrap().set_disk(super::tests::FakeDisk::with(64));
+    assert!(resident_moves_with_its_instance(&roles, &device), "the disk tier holds it");
 }

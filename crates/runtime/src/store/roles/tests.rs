@@ -547,6 +547,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
         }],
         adapter: Vec::new(),
         scratch: ::engine::ScratchPlace::None,
+        resident: ::engine::ScratchPlace::None,
         pair: ::engine::ScratchPlace::None,
         pair_generation: 0,
     }));
@@ -1451,6 +1452,7 @@ fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: ::engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: ::engine::ScratchPlace::None,
             pair_generation: 0,
         })
@@ -1540,10 +1542,10 @@ fn a_park_gives_an_instance_s_slots_back_at_once_to_the_next_owner() {
 /// The disk tier's slot file as a fake: whole free chunks taken and given
 /// back.
 #[derive(Default)]
-struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
+pub(super) struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
 
 impl FakeDisk {
-    fn with(chunks: u32) -> Arc<Self> {
+    pub(super) fn with(chunks: u32) -> Arc<Self> {
         Arc::new(Self(Mutex::new((0..chunks).collect()), Default::default()))
     }
 
