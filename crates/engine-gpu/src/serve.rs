@@ -841,6 +841,14 @@ pub struct Shell<B: Serve> {
 
     corrected: poem_ir::ClassSet,
 
+    /// The classes whose decode steps carry a lane's buffered rows in their
+    /// own kernels (`dispatch::ssm`, `kernels_slang::ssm::Carry`): every
+    /// recurrence their windows run is a gated delta's decode step or a
+    /// conv's. A lane of one replays no row through the extended run; a
+    /// class running a decode step with no carried form (KDA's, the n-gram
+    /// id window's) replays its lanes' rows extended.
+    carrying: poem_ir::ClassSet,
+
     adapter_fact: Option<u32>,
 
     adapters: crate::adapter::Slots,
@@ -1202,6 +1210,7 @@ impl<B: Serve> Shell<B> {
                 voxel_seat,
                 rows.pieces,
                 capture,
+                rows.rs.as_ref().map(|rs| rs.tokens),
                 binding,
             )
         };
@@ -1788,6 +1797,24 @@ impl<B: Serve> Shell<B> {
             }
         }
 
+        let carrying = {
+            let steps = poem_exec::feeds::classes_running(&boot.trace, &compiled, |op| {
+                matches!(op, poem_ir::Operation::Ssm(poem_ir::Ssm::GatedDelta { .. }))
+            });
+            let uncarried = poem_exec::feeds::classes_running(&boot.trace, &compiled, |op| {
+                matches!(
+                    op,
+                    poem_ir::Operation::Ssm(poem_ir::Ssm::Kda { .. })
+                        | poem_ir::Operation::Gather(poem_ir::Gather::NgramIds { .. })
+                )
+            });
+            let mut carrying = poem_ir::ClassSet::default();
+            for class in steps.iter().filter(|&class| !uncarried.contains(class)) {
+                carrying.insert(class);
+            }
+            carrying
+        };
+
         let mut corrected = poem_ir::ClassSet::default();
         for region in compiled.template() {
             let runs_correction = region.nodes.clone().any(|node| {
@@ -2146,6 +2173,7 @@ impl<B: Serve> Shell<B> {
             copies: false,
             masked,
             corrected,
+            carrying,
             adapter_fact,
             adapters: adapter_slots,
 
@@ -3975,6 +4003,9 @@ impl<B: Serve> Shell<B> {
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
 
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        // Whether each lane's decode steps carry its buffered rows in their
+        // own kernels (its class is [`Shell::carrying`]'s).
+        let mut rs_carried: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
 
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -4292,6 +4323,7 @@ impl<B: Serve> Shell<B> {
                 rs_active = true;
             }
             rs_plans.push(plan);
+            rs_carried.push(self.carrying.contains(row.class as usize));
 
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
@@ -4554,7 +4586,32 @@ impl<B: Serve> Shell<B> {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        // A carrying lane's buffered rows are its decode steps' data, no
+        // rows of the extended run (`engine::fire::lane_carried`).
+        let rows_ext = rows.saturating_add(
+            rs_plans
+                .iter()
+                .zip(&rs_carried)
+                .filter(|(_, carried)| !**carried)
+                .map(|(plan, _)| plan.replay)
+                .sum::<u32>(),
+        );
+        // The staged rs table: every lane's header, then its carried
+        // tokens and its buffer pages. A fire carries no more rows than the
+        // widest bucket's tokens, the most the runtime lets one carry.
+        let rs_carry = if rs_active {
+            let carried: u32 = rs_plans.iter().map(|plan| plan.replay).sum();
+            if carried > self.budget().max_tokens {
+                return Err(Fault::Ceiling {
+                    what: "buffered recurrent rows a fire carries ahead of its own",
+                    need: u64::from(carried),
+                    have: u64::from(self.budget().max_tokens),
+                });
+            }
+            Some(carry_table(&rs_plans)?)
+        } else {
+            None
+        };
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
@@ -4672,6 +4729,7 @@ impl<B: Serve> Shell<B> {
                 slot_of_row: &slot_of_row,
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
+                rs_carry: rs_carry.as_deref(),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
@@ -4889,7 +4947,9 @@ impl<B: Serve> Shell<B> {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
                 };
-                let (Some(replay), Some(commit)) = (bound.rs_replay, bound.rs_commit) else {
+                let (Some(replay), Some(commit), Some(carry)) =
+                    (bound.rs_replay, bound.rs_commit, bound.rs_carry)
+                else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat's per-lane tables".to_string(),
                     });
@@ -4903,8 +4963,10 @@ impl<B: Serve> Shell<B> {
                     self.pools.segments(&self.handles)?,
                     held,
                     rs_plans,
+                    rs_carried,
                     replay,
                     commit,
+                    carry,
                     bound.slot_ids,
                     rows_ext,
                 )?);
@@ -5686,6 +5748,48 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             launches,
         })
     }
+}
+
+/// A buffering fire's staged rs table (`kernels_slang::ssm::Carry`): each
+/// lane's header (where its own rows land in its buffer, or -1; the rows it
+/// carries; where its carried tokens and its pages start; its commit
+/// length), then each lane's carried tokens and its buffer pages (units of
+/// the pool's rs list).
+fn carry_table(plans: &[engine::rs::LanePlan]) -> Result<Vec<i32>> {
+    let header = kernels_slang::ssm::CARRY_HEADER as usize;
+    let mut table = vec![0i32; plans.len() * header];
+    let int = |n: u64| {
+        i32::try_from(n).map_err(|_| Fault::Ceiling {
+            what: "an entry of the staged rs table",
+            need: n,
+            have: i32::MAX as u64,
+        })
+    };
+    for (lane, plan) in plans.iter().enumerate() {
+        let at = lane * header;
+        table[at] = match &plan.scatter {
+            Some(run) => int(u64::from(run.from))?,
+            None => -1,
+        };
+        table[at + 1] = int(u64::from(plan.replay))?;
+        table[at + 2] = int(table.len() as u64)?;
+        for run in &plan.gathers {
+            for token in run.from..run.from + run.count {
+                table.push(int(u64::from(token))?);
+            }
+        }
+        table[at + 3] = int(table.len() as u64)?;
+        let pages = plan
+            .scatter
+            .as_ref()
+            .or(plan.gathers.first())
+            .map_or(&[][..], |run| run.pages.as_slice());
+        for &page in pages {
+            table.push(int(u64::from(page))?);
+        }
+        table[at + 4] = int(u64::from(plan.commit))?;
+    }
+    Ok(table)
 }
 
 /// The walk's sink: a kernel's fire, its absent argument, the target and

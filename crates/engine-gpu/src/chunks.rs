@@ -35,7 +35,10 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         tma_rows: false,
         state_f32: true,
         rs_mamba2: false,
-        rs_corrected: false,
+        // A gated-delta decode step reads its carried rows as a linear
+        // attention over their keys and corrected values
+        // (`kernels/ssm/gdn_carried.slang`).
+        rs_corrected: true,
         token_slot: Some(page_size),
         one_window: false,
         // A window as wide as the context keeps every token: a list row.
