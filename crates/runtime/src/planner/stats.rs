@@ -2,6 +2,8 @@ use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Default)]
 pub struct PlannerStats {
+    /// Plan passes run (`ResidencyPlanner::plan`).
+    pub plan_passes: AtomicU64,
     pub parks: AtomicU64,
     pub serves: AtomicU64,
     pub evictions_started: AtomicU64,

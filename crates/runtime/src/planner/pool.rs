@@ -480,6 +480,11 @@ pub trait PoolPort: Send + Sync + 'static {
     fn set_room_signal(&self, signal: crate::store::slots::RoomSignal) {
         let _ = signal;
     }
+    /// Free chunks of the device pool a state shape may open now: what a
+    /// head's runs are weighed against before the planner is woken.
+    fn free_chunks(&self) -> u32 {
+        self.chunk_stats().pages.0
+    }
     /// The runs of `run` adjacent chunks `pid`'s restore takes for its own
     /// parked guest state before a bind's room
     /// ([`crate::store::roles::Roles::unpark_runs`]): what the chunk map
@@ -723,17 +728,31 @@ impl PoolPort for RegistryPool {
         comes
     }
 
+    fn free_chunks(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or_else(
+                || self.device_stats().0,
+                |shared| shared.lock().unwrap().pool().free_chunks(),
+            )
+    }
+
     fn set_room_signal(&self, signal: crate::store::slots::RoomSignal) {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
             return;
         };
         // The device's slots, the host tier's, and the kv store's host and
         // disk slots: every tier room comes back on.
+        use crate::store::slots::RoomTier;
         if let Some(shared) = &stores.shared {
-            shared.lock().unwrap().pool().set_room_signal(signal.clone());
+            let shared = shared.lock().unwrap();
+            let list = shared.list().map(|list| list.pool);
+            shared.pool().set_room_signal(signal.clone(), RoomTier::Device, list);
         }
         if let Some(host) = &stores.host {
-            host.lock().unwrap().pool().set_room_signal(signal.clone());
+            let host = host.lock().unwrap();
+            let list = host.list().map(|list| list.pool);
+            host.pool().set_room_signal(signal.clone(), RoomTier::Swap, list);
         }
         crate::store::registry::with_kv_lock(&stores.kv, "planner-room-signal", |kv| {
             kv.set_room_signal(signal);

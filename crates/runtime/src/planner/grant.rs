@@ -45,6 +45,17 @@ pub(super) struct RoomReturns {
     /// gathered for a head that left) wake nothing, or a pass would wake
     /// its own next pass.
     pub(super) planning: std::sync::atomic::AtomicBool,
+    /// What the queue's head lacks, as the last plan pass left it
+    /// ([`super::ResidencyPlanner::publish_wants`]): the device's free
+    /// chunks its runs take, the kv list's free slots its pages take, and
+    /// the swap tiers' free slots its victims' moves wait on; `u64::MAX`
+    /// where it lacks none of that kind. Room coming free wakes the planner
+    /// only once a count crosses one: trickling frees that meet no need
+    /// plan nothing (woken on each, the planner admitted what fit at that
+    /// instant and split fires into smaller batches).
+    pub(super) want_chunks: AtomicU64,
+    pub(super) want_list: AtomicU64,
+    pub(super) want_swap: AtomicU64,
 }
 
 impl RoomReturns {
@@ -64,15 +75,37 @@ impl RoomReturns {
     /// Device slots came free: counted, and, outside a plan pass, the
     /// planner woken while anyone waits. Lock-free: the pool's release
     /// calls it under its own lock and its caller's.
-    pub(super) fn slots_freed(&self) {
+    pub(super) fn slots_freed(&self, count: crate::store::slots::RoomCount) {
         self.freed.fetch_add(1, Ordering::AcqRel);
         if self.planning.load(Ordering::Acquire) || self.waiters.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if !self.met(count) {
             return;
         }
         match self.drain.get() {
             Some(drain) => drain.notify_one(),
             None => self.room.notify_waiters(),
         }
+    }
+
+    /// Whether `count` meets what the head lacks of its tier.
+    pub(super) fn met(&self, count: crate::store::slots::RoomCount) -> bool {
+        use crate::store::slots::RoomTier;
+        match count.tier {
+            RoomTier::Device => {
+                count.chunks >= self.want_chunks.load(Ordering::Acquire)
+                    || count.slots >= self.want_list.load(Ordering::Acquire)
+            }
+            RoomTier::Swap => count.slots >= self.want_swap.load(Ordering::Acquire),
+        }
+    }
+
+    /// The head lacks nothing room coming free can meet.
+    pub(super) fn want_nothing(&self) {
+        self.want_chunks.store(u64::MAX, Ordering::Release);
+        self.want_list.store(u64::MAX, Ordering::Release);
+        self.want_swap.store(u64::MAX, Ordering::Release);
     }
 
     /// A plan pass begins: the frees it reads as given.

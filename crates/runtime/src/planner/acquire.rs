@@ -287,7 +287,9 @@ impl ResidencyPlanner {
                             }
                             // Room returned since: a dropped grant's, or
                             // slots the pool freed on any path.
-                            if self.returns.epoch() != seen || self.returns.freed_since_plan() {
+                            if self.returns.epoch() != seen
+                                || (self.returns.freed_since_plan() && self.wants_met_now())
+                            {
                                 self.poke();
                             }
                             let Some(error) = self.never_fits(key) else {

@@ -58,6 +58,9 @@ pub struct ResidencyPlanner {
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
+    /// The last eviction pass found no swap room for a victim: the head
+    /// waits on swap slots coming free ([`Self::publish_wants`]).
+    pub(super) swap_bound: AtomicBool,
     pub(super) port: Arc<dyn PoolPort>,
     pub(super) stats: PlannerStats,
     /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
@@ -108,8 +111,9 @@ impl ResidencyPlanner {
         // release itself.
         let returns: Arc<RoomReturns> = Arc::default();
         let signal = Arc::clone(&returns);
-        port.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move || {
-            signal.slots_freed();
+        returns.want_nothing();
+        port.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move |count| {
+            signal.slots_freed(count);
         })));
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
@@ -124,6 +128,7 @@ impl ResidencyPlanner {
             parking_down: AtomicBool::new(false),
             park_down_failed: AtomicU64::new(u64::MAX),
             no_grow: AtomicBool::new(false),
+            swap_bound: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
             seated_first: false,
@@ -373,10 +378,10 @@ impl ResidencyPlanner {
     /// plans nothing on the clock: events plan.
     pub(super) fn tick(self: &Arc<Self>) {
         // The backstop, never the main path: room that came free since the
-        // last pass began (a free that raced that pass, or a path that
-        // woke no one) is planned on now, within a beat; with nothing
-        // freed, nothing is planned.
-        if self.returns.freed_since_plan() {
+        // last pass began and now meets what the head lacks (a free that
+        // raced that pass, or a path that woke no one) is planned on within
+        // a beat; frees that meet nothing plan nothing.
+        if self.returns.freed_since_plan() && self.wants_met_now() {
             self.plan();
         }
         self.report_short();
@@ -402,6 +407,65 @@ impl ResidencyPlanner {
             notify.notify_waiters();
         }
         self.dump_stall();
+    }
+
+    /// Publishes what the queue's head lacks for room coming free to be
+    /// weighed against without a lock ([`RoomReturns::met`]): the free
+    /// chunks its runs take, the kv list slots its pages take, the swap
+    /// slots its victims' moves wait on. A head whose lack none of those
+    /// measures (state slots, a gate) is woken by any chunk coming free.
+    pub(super) fn publish_wants(&self) {
+        let head = self.with_inner(|inner| {
+            inner.unmet_head().map(|(key, waiter)| {
+                (
+                    key,
+                    waiter.kv_need().saturating_sub(inner.accum.len() as u32),
+                )
+            })
+        });
+        let Some((key, kv_missing)) = head else {
+            self.returns.want_nothing();
+            return;
+        };
+        let mut want_chunks = self
+            .head_room(key)
+            .map_or(u64::MAX, |(run, pieces)| u64::from(run) * u64::from(pieces));
+        let want_list = if kv_missing > 0 {
+            u64::from(kv_missing)
+        } else {
+            u64::MAX
+        };
+        let want_swap = if self.swap_bound.load(Ordering::Acquire) {
+            u64::from(self.raw_swap_free()).saturating_add(1)
+        } else {
+            u64::MAX
+        };
+        if want_chunks == u64::MAX && want_list == u64::MAX && want_swap == u64::MAX {
+            want_chunks = u64::from(self.port.free_chunks()).saturating_add(1);
+        }
+        self.returns.want_chunks.store(want_chunks, Ordering::Release);
+        self.returns.want_list.store(want_list, Ordering::Release);
+        self.returns.want_swap.store(want_swap, Ordering::Release);
+    }
+
+    /// Whether the pool as it stands meets what the head lacks
+    /// ([`Self::publish_wants`]).
+    pub(super) fn wants_met_now(&self) -> bool {
+        use crate::store::slots::{RoomCount, RoomTier};
+        self.returns.met(RoomCount {
+            tier: RoomTier::Device,
+            chunks: u64::from(self.port.free_chunks()),
+            slots: u64::from(self.port.device_stats().0),
+        }) || self.returns.met(RoomCount {
+            tier: RoomTier::Swap,
+            chunks: 0,
+            slots: u64::from(self.raw_swap_free()),
+        })
+    }
+
+    /// The host's and the disk's free slots, idle cache's not counted.
+    pub(super) fn raw_swap_free(&self) -> u32 {
+        self.port.host_stats().0.saturating_add(self.port.disk_stats().0)
     }
 
     pub(super) fn poke(self: &Arc<Self>) {

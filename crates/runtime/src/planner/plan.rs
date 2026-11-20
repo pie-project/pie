@@ -90,16 +90,26 @@ impl ResidencyPlanner {
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
-        self.returns.planning.store(true, Ordering::Release);
-        self.returns.plan_begins();
+        self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
         let on_grow = loop {
-            let seen = self.returns.epoch();
-            let on_grow = self.plan_once();
-            if self.returns.epoch() == seen {
+            self.returns.planning.store(true, Ordering::Release);
+            self.returns.plan_begins();
+            self.swap_bound.store(false, Ordering::Release);
+            let on_grow = loop {
+                let seen = self.returns.epoch();
+                let on_grow = self.plan_once();
+                if self.returns.epoch() == seen {
+                    break on_grow;
+                }
+            };
+            self.returns.planning.store(false, Ordering::Release);
+            self.publish_wants();
+            // Room that came free while the pass ran (its signal woke no one
+            // then) and meets what the head lacks now: planned on at once.
+            if !(self.returns.freed_since_plan() && self.wants_met_now()) {
                 break on_grow;
             }
         };
-        self.returns.planning.store(false, Ordering::Release);
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
             self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())

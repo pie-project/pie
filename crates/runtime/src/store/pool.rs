@@ -169,7 +169,11 @@ impl<I: PoolId> Pool<I> {
             self.available += 1;
         }
         if freed && let Some(signal) = &self.signal {
-            (signal.0)();
+            (signal.0)(super::slots::RoomCount {
+                tier: super::slots::RoomTier::Swap,
+                chunks: 0,
+                slots: self.available as u64,
+            });
         }
     }
 
@@ -245,7 +249,7 @@ mod tests {
         let told = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = std::sync::Arc::clone(&told);
         let mut pool = Pool::<u32>::new(12);
-        pool.set_room_signal(super::super::slots::RoomSignal(std::sync::Arc::new(move || {
+        pool.set_room_signal(super::super::slots::RoomSignal(std::sync::Arc::new(move |_| {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })));
         let told_now = || told.load(std::sync::atomic::Ordering::Relaxed);

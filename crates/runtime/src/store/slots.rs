@@ -587,16 +587,36 @@ pub struct RoomGiven {
     gives: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
     /// Told each time slots come free, of any shape, in an open chunk or
-    /// not (a release, a fire's epoch retiring): the one place every
-    /// return of device room passes, so a waiter the room serves is woken
-    /// whichever path gave it back ([`SlotPool::set_room_signal`]).
-    signal: std::sync::OnceLock<RoomSignal>,
+    /// not (a release, a fire's epoch retiring), with the pool's counts
+    /// after: the one place every return of room passes, so the waiter it
+    /// can serve is woken whichever path gave it back
+    /// ([`SlotPool::set_room_signal`]). Its tier, and the shape whose free
+    /// slots it counts.
+    signal: std::sync::OnceLock<(RoomSignal, RoomTier, Option<ShapeId>)>,
+}
+
+/// Which tier a [`RoomCount`] is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomTier {
+    Device,
+    /// The host or the disk tier: where a victim's move goes.
+    Swap,
+}
+
+/// A pool's room as slots came free: its free chunks and the free slots of
+/// the shape it counts (the kv list's), read under its own lock and handed
+/// to the signal, which takes none.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomCount {
+    pub tier: RoomTier,
+    pub chunks: u64,
+    pub slots: u64,
 }
 
 /// What [`RoomGiven::signal`] calls: lock-free, for a release may run under
 /// the pool's lock and its caller's.
 #[derive(Clone)]
-pub struct RoomSignal(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+pub struct RoomSignal(pub std::sync::Arc<dyn Fn(RoomCount) + Send + Sync>);
 
 impl std::fmt::Debug for RoomSignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -610,11 +630,7 @@ impl RoomGiven {
         self.notify.notify_waiters();
     }
 
-    fn slots_freed(&self) {
-        if let Some(signal) = self.signal.get() {
-            (signal.0)();
-        }
-    }
+
 }
 
 /// A watch on room given back from when it was taken ([`SlotPool::room_watch`]).
@@ -2226,14 +2242,26 @@ impl SlotPool {
             self.give_back(slot);
         }
         if freed {
-            self.given.slots_freed();
+            self.slots_freed();
         }
     }
 
-    /// Calls `signal` each time slots come free ([`RoomGiven::signal`]):
-    /// set once, by the planner of the engine this pool backs.
-    pub fn set_room_signal(&self, signal: RoomSignal) {
-        let _ = self.given.signal.set(signal);
+    /// Calls `signal` with this pool's counts each time slots come free
+    /// ([`RoomGiven::signal`]), once a release or a retire however many
+    /// came: set once, by the planner of the engine this pool backs, its
+    /// tier and the shape whose free slots it counts.
+    pub fn set_room_signal(&self, signal: RoomSignal, tier: RoomTier, counts: Option<ShapeId>) {
+        let _ = self.given.signal.set((signal, tier, counts));
+    }
+
+    fn slots_freed(&self) {
+        if let Some((signal, tier, counts)) = self.given.signal.get() {
+            (signal.0)(RoomCount {
+                tier: *tier,
+                chunks: u64::from(self.free_chunks()),
+                slots: counts.map_or(0, |shape| self.available(shape)),
+            });
+        }
     }
 
     /// Every fire through `epoch` has retired: what waited on them is free.
@@ -2271,7 +2299,7 @@ impl SlotPool {
             freed = true;
         }
         if freed {
-            self.given.slots_freed();
+            self.slots_freed();
         }
     }
 
@@ -3383,9 +3411,13 @@ mod tests {
         let mut pool = run_pool();
         let told = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = std::sync::Arc::clone(&told);
-        pool.set_room_signal(RoomSignal(std::sync::Arc::new(move || {
-            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })));
+        pool.set_room_signal(
+            RoomSignal(std::sync::Arc::new(move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })),
+            RoomTier::Device,
+            Some(0),
+        );
         let holder = Holder::WorkingSet(1);
         let slots = pool.acquire(holder, 0, 10).unwrap();
         let told_now = || told.load(std::sync::atomic::Ordering::Relaxed);

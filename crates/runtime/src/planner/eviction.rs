@@ -214,6 +214,7 @@ impl ResidencyPlanner {
             // restore head with a plan (an eviction, or the compaction
             // after it) issuing nothing on a disk full of parked kv.
             if kv_deficit > 0 && (!self.port.suspend_capable() || swap_free == 0) {
+                self.swap_bound.store(true, Ordering::Release);
                 self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
@@ -356,6 +357,7 @@ impl ResidencyPlanner {
             }
         }
         if !unhostable.is_empty() {
+            self.swap_bound.store(true, Ordering::Release);
             let pool_now = self.pool_now();
             self.with_inner(|inner| {
                 for pid in &unhostable {

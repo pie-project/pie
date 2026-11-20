@@ -374,7 +374,7 @@ fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
     kv.set_tiers(list.id, host, tiers.disk_slots);
     let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let count = Arc::clone(&told);
-    kv.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move || {
+    kv.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move |_| {
         count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     })));
     let chunks = kv

@@ -68,7 +68,12 @@ impl RacePool {
         free.extend((0..n).map(|i| PhysicalKvPageId(base + i)));
         drop(free);
         if let Some(signal) = self.signal.lock().clone() {
-            (signal.0)();
+            let free = self.free.lock().len() as u64;
+            (signal.0)(crate::store::slots::RoomCount {
+                tier: crate::store::slots::RoomTier::Device,
+                chunks: free,
+                slots: free,
+            });
         }
     }
 
@@ -6876,4 +6881,78 @@ async fn a_restore_with_its_runs_and_kv_pages_free_is_granted() {
         }
     }
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "granted at once");
+}
+
+/// The L40S at 4 GiB on 3d177c213 (+23%: rows per dispatch 14 to 10.67):
+/// woken on every free, the planner admitted what fit at that instant and
+/// split fires into smaller batches. Room coming free wakes it only once
+/// what the head lacks is met: frees trickling in short of the head's need
+/// plan nothing; the one that meets it wakes the planner within a turn.
+#[tokio::test(flavor = "current_thread")]
+async fn trickling_frees_short_of_the_head_s_need_plan_nothing() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::new(4));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let (holder, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [holder, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let held = planner
+        .grant_now(
+            holder,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    std::mem::forget(held);
+    let p = planner.clone();
+    let task = crate::rt::spawn(async move {
+        p.acquire(
+            head,
+            head,
+            Demand {
+                kv_pages: 3,
+                rs: RsUnits::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 1, "the head parks, short of 3");
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    // Two pages, one at a time: short of the head's three.
+    pool.free_quietly(1);
+    pool.free_quietly(1);
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert_eq!(
+        planner.stats.plan_passes.load(Ordering::Relaxed),
+        passes,
+        "frees short of its need plan nothing"
+    );
+    assert!(!task.is_finished());
+    // The third meets it.
+    pool.free_quietly(1);
+    for _ in 0..50 {
+        if task.is_finished() {
+            break;
+        }
+        crate::rt::yield_now().await;
+    }
+    assert!(task.is_finished(), "the free that meets its need wakes it within a turn");
+    assert!(matches!(task.await.unwrap(), Ok(super::acquire::Acquired::Granted(_))));
 }

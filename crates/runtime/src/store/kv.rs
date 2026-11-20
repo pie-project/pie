@@ -463,7 +463,8 @@ impl KvStore {
     /// waiter blocked on swap room (a victim's move with no slot below)
     /// waits on.
     pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
-        self.host_pool.set_room_signal(signal.clone());
+        self.host_pool
+            .set_room_signal(signal.clone(), super::slots::RoomTier::Swap);
         self.disk_pool.set_room_signal(signal);
     }
 
