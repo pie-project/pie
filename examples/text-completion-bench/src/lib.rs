@@ -121,8 +121,8 @@ struct Output {
 /// `top_p < 1` (`top_p >= 1` keeps every token, so it is no knob). The same
 /// shapes the runtime's prewarm builds, so a request builds nothing.
 struct SampleKnobs {
-    /// The temperature as its reciprocal (`sampler::inverse_temperature`),
-    /// a channel like every other knob: no temperature is its own program.
+    /// The temperature's reciprocal (`sampler::inverse_temperature`), data
+    /// the stage reads, so every temperature runs one program.
     temperature: Option<Channel>,
     top_p: Option<Channel>,
 }

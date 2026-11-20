@@ -833,9 +833,7 @@ impl Shell {
         let before = self.programs.built_late();
         let registered = self.programs.register(&self.device, registration);
         let late = self.programs.built_late() - before;
-        if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
-        }
+        self.count_built_at_register(late);
         registered
     }
 
@@ -846,6 +844,21 @@ impl Shell {
         registrations: &[engine::program::ProgramRegistration],
     ) -> Result<()> {
         self.programs.prewarm(&self.device, registrations)
+    }
+
+    /// `late` guest region modules a registration built that no prewarm
+    /// had: counted, and said, so a knob's value that keys a program (it
+    /// should be data) shows in the log.
+    fn count_built_at_register(&self, late: u64) {
+        if late == 0 {
+            return;
+        }
+        self.live.tally(engine::live::Tally::BuiltAtRegister, late);
+        let total = self.live.tallied(engine::live::Tally::BuiltAtRegister);
+        eprintln!(
+            "engine-cuda: a program's registration built {late} guest region(s) no prewarm had; \
+             {total} since load (Tally::BuiltAtRegister)"
+        );
     }
 
     /// A program's registration, first step ([`crate::program::Plane::prepare`]):
@@ -859,9 +872,7 @@ impl Shell {
         let before = self.programs.built_late();
         let prepared = self.programs.prepare(&self.device, registration);
         let late = self.programs.built_late() - before;
-        if late != 0 {
-            self.live.tally(engine::live::Tally::BuiltAtRegister, late);
-        }
+        self.count_built_at_register(late);
         prepared
     }
 

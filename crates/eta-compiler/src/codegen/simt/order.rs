@@ -76,6 +76,9 @@ const BODY: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -167,10 +170,11 @@ const BODY: &str = r#"
       }
       for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
         const m1_u32 index = order_in[at];
-        m1_store_f(
+        m1_store_fd(
             order_values,
             order_row * order_width + at,
-            m1_load_f(order_input, order_base + index, order_input_desc.dtype));
+            m1_load_f(order_input, order_base + index, order_input_desc.dtype),
+            order_values_dtype);
         m1_store_u(order_indices, order_row * order_width + at, index);
       }
       __syncthreads();
@@ -194,6 +198,9 @@ const BODY_SELECT: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -214,7 +221,9 @@ const BODY_SELECT: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u32 sel_hist[256];
@@ -445,10 +454,11 @@ const BODY_SELECT: &str = r#"
       if (sel_lands) {
         for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
           const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
-          m1_store_f(
+          m1_store_fd(
               order_values,
               order_row * order_width + at,
-              order_value(order_row, index));
+              order_value(order_row, index),
+              order_values_dtype);
           m1_store_u(order_indices, order_row * order_width + at, index);
         }
       }
@@ -551,6 +561,9 @@ const BODY_SELECT_REGISTERS: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -571,7 +584,9 @@ const BODY_SELECT_REGISTERS: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u64 sel_lists[32u * kSelectCap];
@@ -663,10 +678,11 @@ const BODY_SELECT_REGISTERS: &str = r#"
       if (sel_lands) {
         for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
           const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
-          m1_store_f(
+          m1_store_fd(
               order_values,
               order_row * order_width + at,
-              order_value(order_row, index));
+              order_value(order_row, index),
+              order_values_dtype);
           m1_store_u(order_indices, order_row * order_width + at, index);
         }
       }
@@ -757,7 +773,11 @@ pub fn emit_order_region(
     if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
         let cap = select_cap(width);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
-        let _ = writeln!(source, "  constexpr m1_u32 kSplit = {}u;", u32::from(top_k_splits(width)));
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kSplit = {}u;",
+            u32::from(top_k_splits(width))
+        );
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;"
@@ -780,10 +800,19 @@ pub fn emit_order_region(
         );
         let _ = writeln!(
             source,
+            "  constexpr bool kDirectScales = {};",
+            direct.is_some_and(|d| d.scales)
+        );
+        let _ = writeln!(
+            source,
             "  constexpr m1_u32 kIntrinsicSlots = {}u;",
             super::fused::output_pitch(stage)
         );
-        source.push_str(if registers { BODY_SELECT_REGISTERS } else { BODY_SELECT });
+        source.push_str(if registers {
+            BODY_SELECT_REGISTERS
+        } else {
+            BODY_SELECT
+        });
     } else {
         source.push_str(BODY);
     }

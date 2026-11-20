@@ -115,6 +115,12 @@ impl<'a> Streams<'a> {
         match self.class(value) {
             RowClass::Scalar => return true,
             RowClass::Full(_) => {}
+            // An output read in place through its views of one row.
+            RowClass::Other if self.output_source(value) == Some(value) => {
+                if self.output_row(value).is_none() {
+                    return false;
+                }
+            }
             RowClass::Other => return false,
         }
         let Some(&node) = self.producers.get(value as usize) else {
@@ -124,7 +130,10 @@ impl<'a> Streams<'a> {
             return false;
         }
         let node = node as usize;
-        if !self.region.nodes.iter().any(|n| n.index() == node) {
+        // An output is read in place from any region of the stage.
+        if !self.region.nodes.iter().any(|n| n.index() == node)
+            && self.ops[node].tag != tags::OUTPUT
+        {
             return false;
         }
         let op = &self.ops[node];
@@ -152,9 +161,68 @@ impl<'a> Streams<'a> {
             && self.role(node, &mut None).is_some()
     }
 
+    /// Whether `node` is an argmax that scans the model's row where it lies
+    /// (the fused emitter's direct or Gumbel scan), its operand unread.
+    fn scans_model_row(&self, node: usize) -> bool {
+        matches!(
+            self.ops[node].tag,
+            tags::REDUCE_ARGMAX | tags::GUMBEL_ARGMAX
+        ) && self.direct_intrinsic[node] != u16::MAX
+    }
+
     fn topk_reads_direct(&self, node: usize, value: u32) -> bool {
         self.direct_topk.get(node).copied().flatten().is_some()
             && self.ops[node].args.first() == Some(&value)
+    }
+
+    /// The model output a value is a view of ([`output_source`]): a stream
+    /// reads such a value's row in place, in the output's own storage.
+    fn output_source(&self, value: u32) -> Option<u32> {
+        output_source(self.stage, self.ops, &self.producers, value)
+    }
+
+    /// The row width an output is read at in place: its own, where it is a
+    /// row, or that of the views of it this region reads, each a whole row
+    /// of the output's width (so the output is that one row).
+    fn output_row(&self, out: u32) -> Option<Dimension> {
+        if let RowClass::Full(dim) = self.class(out) {
+            return Some(dim);
+        }
+        let ty = &self.stage.normalized.value_types[out as usize];
+        let last = *ty.dims.last()?;
+        let readers = self.readers.get(out as usize)?;
+        let viewed = !readers.is_empty()
+            && readers.iter().all(|&reader| {
+                let view = self.bases[reader];
+                self.ops[reader].tag == tags::RESHAPE
+                    && self.output_source(view) == Some(out)
+                    && self.class(view) == RowClass::Full(last)
+                    && matches!(last, Dimension::Static(_))
+            });
+        viewed.then_some(last)
+    }
+
+    /// The nodes past `value`'s views that read it: a view of an output is
+    /// read where its readers read it.
+    fn readers_through_views(&self, value: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            for &reader in self
+                .readers
+                .get(value as usize)
+                .map_or(&[][..], Vec::as_slice)
+            {
+                let view = self.bases[reader];
+                if self.ops[reader].tag == tags::RESHAPE && self.output_source(view) == Some(value)
+                {
+                    pending.push(view);
+                } else {
+                    out.push(reader);
+                }
+            }
+        }
+        out
     }
 
     fn dtype(&self, value: u32) -> Dtype {
@@ -192,7 +260,7 @@ impl<'a> Streams<'a> {
         let out_dtype = self.dtype(out);
         if !matches!(
             out_dtype,
-            Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+            Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool | Dtype::Bf16
         ) {
             return None;
         }
@@ -215,7 +283,7 @@ impl<'a> Streams<'a> {
             values.iter().all(|&v| {
                 matches!(
                     self.dtype(v),
-                    Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+                    Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool | Dtype::Bf16
                 )
             })
         };
@@ -342,14 +410,18 @@ impl<'a> Streams<'a> {
                     return None;
                 }
                 let mut w = *width;
-                if !full(out, &mut w) {
+                let Some(row) = self.output_row(out) else {
                     return None;
+                };
+                match w {
+                    Some(dim) if dim != row => return None,
+                    _ => w = Some(row),
                 }
                 *width = w;
                 Some(Role::Intrinsic)
             }
             tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX => {
-                if op.args.len() != 1 || self.dtype(op.args[0]) != Dtype::F32 {
+                if op.args.len() != 1 || !eta_ir::types::is_float(self.dtype(op.args[0])) {
                     return None;
                 }
                 if tag == tags::REDUCE_ARGMAX && self.direct_intrinsic[node] != u16::MAX {
@@ -368,6 +440,28 @@ impl<'a> Streams<'a> {
                 } else {
                     Role::Reduce
                 })
+            }
+            tags::GUMBEL_ARGMAX => {
+                // logits * scale + gumbel(state, i), -inf where keep is
+                // false: an argmax whose lanes the stream makes in f32. The
+                // fused draw takes one that reads the model's row itself.
+                if self.direct_intrinsic[node] != u16::MAX
+                    || op.args.len() != 4
+                    || !eta_ir::types::is_float(self.dtype(op.args[0]))
+                    || self.dtype(op.args[1]) != Dtype::Bool
+                    || !eta_ir::types::is_float(self.dtype(op.args[2]))
+                    || self.dtype(op.args[3]) != Dtype::U32
+                    || self.class(op.args[2]) != RowClass::Scalar
+                    || self.class(out) != RowClass::Scalar
+                {
+                    return None;
+                }
+                let mut w = *width;
+                if !full(op.args[0], &mut w) || !indexed(op.args[1], &mut w) {
+                    return None;
+                }
+                *width = w;
+                Some(Role::Argmax)
             }
             tags::PIVOT_THRESHOLD => {
                 if op.pred_tag != eta_ir::wire::predicate_tags::PROB_GE
@@ -398,7 +492,15 @@ impl<'a> Streams<'a> {
     pub(super) fn split_safe(&self, at: usize) -> Option<(usize, bool)> {
         let members = self.plan(at)?;
         let safe = members.iter().all(|member| match member.role {
-            Role::Map | Role::Broadcast | Role::Intrinsic => true,
+            Role::Map | Role::Broadcast => true,
+            // An output read in place through its views (one row of no row
+            // geometry of its own) keeps its region whole, as a copied one
+            // did.
+            Role::Intrinsic => {
+                matches!(self.class(self.bases[member.node]), RowClass::Full(_))
+            }
+            // A draw's lanes run on from its block's row whole.
+            Role::Argmax if self.ops[member.node].tag == tags::GUMBEL_ARGMAX => false,
             Role::Reduce | Role::Argmax => self.ops[member.node].args.first().is_some_and(|&arg| {
                 matches!(
                     self.class(arg),
@@ -427,7 +529,14 @@ impl<'a> Streams<'a> {
             }
             members.push(Member { node, role });
         }
-        if members.is_empty() {
+        // An output read in place alone holds no row of its own: where it is
+        // read past its views' readers, it is copied as it was.
+        let in_place_alone = members.len() == 1
+            && members[0].role == Role::Intrinsic
+            && !matches!(self.class(self.bases[members[0].node]), RowClass::Full(_));
+        if members.is_empty()
+            || (in_place_alone && self.escapes(self.bases[members[0].node], &members))
+        {
             None
         } else {
             Some(members)
@@ -435,19 +544,62 @@ impl<'a> Streams<'a> {
     }
 
     fn escapes(&self, value: u32, members: &[Member]) -> bool {
-        let outside: Vec<usize> = self
-            .readers
-            .get(value as usize)
-            .map(|list| {
-                list.iter()
-                    .copied()
-                    .filter(|node| !members.iter().any(|m| m.node == *node))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // An output read in place is read through its views; a view a later
+        // region or a sink reads holds its bytes, so the output does.
+        let in_place = self.ops[self.producers[value as usize] as usize].tag == tags::OUTPUT;
+        let readers = if in_place {
+            let mut views = vec![value];
+            let mut at = 0;
+            while at < views.len() {
+                for &reader in self
+                    .readers
+                    .get(views[at] as usize)
+                    .map_or(&[][..], Vec::as_slice)
+                {
+                    let view = self.bases[reader];
+                    if self.ops[reader].tag == tags::RESHAPE
+                        && self.output_source(view) == Some(views[at])
+                    {
+                        views.push(view);
+                    }
+                }
+                at += 1;
+            }
+            if views
+                .iter()
+                .any(|&view| self.region.sinks.iter().any(|s| s.value == view))
+            {
+                return true;
+            }
+            // Read past this region, the row is read in place there too, or
+            // the bytes are kept for whoever reads them.
+            let beyond = views.iter().any(|view| self.region.outputs.contains(view))
+                || self
+                    .readers_through_views(value)
+                    .iter()
+                    .any(|&node| !self.region.nodes.iter().any(|n| n.index() == node));
+            if beyond && !read_in_place_beyond(self.stage, self.region, value) {
+                return true;
+            }
+            self.readers_through_views(value)
+                .into_iter()
+                .filter(|&node| self.region.nodes.iter().any(|n| n.index() == node))
+                .collect()
+        } else {
+            self.readers
+                .get(value as usize)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let outside: Vec<usize> = readers
+            .into_iter()
+            .filter(|node| !members.iter().any(|m| m.node == *node))
+            .collect();
         let remat = self.rematerializable(value);
         let served = |node: &usize| {
-            (remat && self.stream_reader(*node)) || self.topk_reads_direct(*node, value)
+            (remat && self.stream_reader(*node))
+                || self.topk_reads_direct(*node, value)
+                || (in_place && self.scans_model_row(*node))
         };
         if outside.iter().any(|node| !served(node)) {
             return true;
@@ -471,7 +623,11 @@ impl<'a> Streams<'a> {
         let reduction = |tag: u8| {
             matches!(
                 tag,
-                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
+                tags::REDUCE_SUM
+                    | tags::REDUCE_MAX
+                    | tags::REDUCE_MIN
+                    | tags::REDUCE_ARGMAX
+                    | tags::GUMBEL_ARGMAX
             )
         };
         let channel = |tag: u8| matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT);
@@ -538,8 +694,129 @@ impl<'a> Streams<'a> {
     }
 }
 
+/// Whether every reader of model output `value` (through its views) past
+/// `region` reads the row in place: a node of a generated region whose
+/// stream reads it through the output, or an argmax that scans the model's
+/// row itself. Only then does `region` leave the row unwritten.
+pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value: u32) -> bool {
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = crate::codegen::op_view::result_bases(&ops);
+    let mut producers = vec![u32::MAX; stage.normalized.value_types.len()];
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); stage.normalized.value_types.len()];
+    for (node, op) in ops.iter().enumerate() {
+        for result in 0..op.results {
+            if let Some(slot) = producers.get_mut((bases[node] + result) as usize) {
+                *slot = node as u32;
+            }
+        }
+        for arg in op.reads() {
+            if let Some(list) = readers.get_mut(arg as usize) {
+                list.push(node);
+            }
+        }
+    }
+    let Some(source) = output_source(stage, &ops, &producers, value) else {
+        return false;
+    };
+    // The readers past the views, wherever they are.
+    let mut pending = vec![source];
+    let mut outside = Vec::new();
+    while let Some(at) = pending.pop() {
+        for &reader in &readers[at as usize] {
+            let view = bases[reader];
+            if ops[reader].tag == tags::RESHAPE
+                && output_source(stage, &ops, &producers, view) == Some(at)
+            {
+                pending.push(view);
+            } else if !region.nodes.iter().any(|n| n.index() == reader) {
+                outside.push(reader);
+            }
+        }
+    }
+    outside.iter().all(|&reader| {
+        let Some(home) = stage
+            .fused
+            .regions
+            .iter()
+            .find(|r| r.nodes.iter().any(|n| n.index() == reader))
+        else {
+            return false;
+        };
+        // The lane sampler's bf16 draw reads the model's row where it lies.
+        if let Some(values) = super::sampler::sampler_values(stage, home) {
+            return values
+                .draw
+                .and_then(|draw| draw.output)
+                .is_some_and(|(node, _)| bases[node as usize] == source);
+        }
+        if home.kind != crate::plan::RegionKind::Generated
+            || super::validate::validate_generated_region(stage, home).is_err()
+        {
+            return false;
+        }
+        let Some(kinds) = super::fused::stream_rows(stage, home) else {
+            return false;
+        };
+        let direct = super::fused::analyze_direct_argmax(stage, home, &bases);
+        let direct_topk = super::fused::analyze_direct_topk(stage);
+        let claimed = direct.claimed();
+        let streams = Streams::new(
+            stage,
+            home,
+            &ops,
+            &bases,
+            &kinds,
+            &claimed,
+            &direct.skipped,
+            &direct_topk,
+        );
+        streams.scans_model_row(reader)
+            || (streams.stream_reader(reader) && streams.rematerializable(source))
+    })
+}
+
+/// The model output `value` is a view of: `value` itself where an output
+/// produces it, or the output a reshape covering it (the same elements in
+/// the same order) reads, in any region of the stage. The row is the
+/// model's for the whole stage, so any region may read it where it lies.
+pub(super) fn output_source(
+    stage: &CompiledStage,
+    ops: &[OpView],
+    producers: &[u32],
+    value: u32,
+) -> Option<u32> {
+    let node = *producers.get(value as usize)?;
+    if node == u32::MAX {
+        return None;
+    }
+    let op = &ops[node as usize];
+    match op.tag {
+        tags::OUTPUT => Some(value),
+        tags::RESHAPE if !op.args.is_empty() => {
+            let source = op.args[0];
+            let producer = *producers.get(source as usize)?;
+            (producer != u32::MAX
+                && ops[producer as usize].tag == tags::OUTPUT
+                && crate::codegen::alias::covers(&stage.normalized.value_types, source, value))
+            .then_some(source)
+        }
+        _ => None,
+    }
+}
+
+/// The dtype a stream computes and holds a value in: a `bf16` value is an
+/// f32 in a register, the stored value exactly (each `bf16` result is
+/// rounded once where it is computed, [`typed_expr`]).
+fn compute(dtype: Dtype) -> Dtype {
+    if dtype == Dtype::Bf16 {
+        Dtype::F32
+    } else {
+        dtype
+    }
+}
+
 fn c_type(dtype: Dtype) -> &'static str {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => "float",
         Dtype::I32 => "int",
         Dtype::U32 => "m1_u32",
@@ -548,7 +825,7 @@ fn c_type(dtype: Dtype) -> &'static str {
 }
 
 fn letter(dtype: Dtype) -> char {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => 'f',
         Dtype::I32 => 'i',
         Dtype::U32 => 'u',
@@ -559,6 +836,7 @@ fn letter(dtype: Dtype) -> char {
 fn code(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::F32 => 0,
+        Dtype::Bf16 => u32::from(eta_ir::types::WIRE_BF16),
         Dtype::I32 => 1,
         Dtype::U32 => 2,
         _ => 3,
@@ -566,6 +844,7 @@ fn code(dtype: Dtype) -> u32 {
 }
 
 fn convert(expr: &str, from: Dtype, to: Dtype) -> String {
+    let (from, to) = (compute(from), compute(to));
     if from == to {
         return expr.into();
     }
@@ -632,24 +911,28 @@ impl Bodies {
         self.touch(ptr);
     }
 
+    /// A stored value: a `bf16` one an element's two bytes (`m1_store_h`)
+    /// a scalar iteration, a vector iteration's four elements eight bytes,
+    /// the two words they fill, by the thread that computed them.
     fn store(&mut self, dtype: Dtype, ptr: &str, reg: &str) {
         let l = letter(dtype);
+        let st = if dtype == Dtype::Bf16 { 'h' } else { l };
         let _ = writeln!(
             self.s,
-            "      if (stream_live) m1_store_{l}({ptr}, i, {reg});"
+            "      if (stream_live) m1_store_{st}({ptr}, i, {reg});"
         );
         let _ = writeln!(self.pre, "        {} w_{reg};", vec_type(dtype));
         let _ = writeln!(self.v, "      m1_set4_{l}(w_{reg}, j, {reg});");
         let _ = writeln!(
             self.post,
-            "        if (stream_live) m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});"
+            "        if (stream_live) m1_store4_{st}({ptr}, i4 >> 2u, w_{reg});"
         );
         self.touch(ptr);
     }
 }
 
 fn vec_type(dtype: Dtype) -> &'static str {
-    match dtype {
+    match compute(dtype) {
         Dtype::F32 => "float4",
         Dtype::I32 => "int4",
         Dtype::U32 => "uint4",
@@ -669,6 +952,12 @@ struct Pass<'p> {
 }
 
 fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> String {
+    let want = compute(want);
+    // A view of an output is the output's row, read in place.
+    let value = match streams.output_source(value) {
+        Some(source) if streams.rematerializable(source) => source,
+        _ => value,
+    };
     if let Some((_, from)) = pass.registers.iter().find(|(v, _)| *v == value) {
         return convert(&format!("r{value}"), *from, want);
     }
@@ -715,7 +1004,7 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
         rng_read(streams, node, out, pass);
     } else {
         let out_dtype = streams.dtype(out);
-        let expr = map_expr(streams, node, out_dtype, pass);
+        let expr = typed_expr(streams, node, out_dtype, pass);
         pass.body.both(&format!(
             "      const {} r{out} = {expr};",
             c_type(out_dtype)
@@ -795,7 +1084,11 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
         let _ = writeln!(
             p,
             "    p{node}.intrinsic_row_offset = intrinsic_offsets[intrinsic_index{node}] + {};",
-            if streams.split { "ptir_row" } else { "lane_row" }
+            if streams.split {
+                "ptir_row"
+            } else {
+                "lane_row"
+            }
         );
         let _ = writeln!(
             p,
@@ -840,6 +1133,49 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     pass.registers.push((out, Dtype::F32));
 }
 
+/// Lane `i` of a gumbel_argmax `node`, as a register: `logits[i] *
+/// scale + gumbel(state, i)`, `-inf` where keep is false, in the f32
+/// operations of `reduce_argmax(select(keep, logits * scale, -inf) +
+/// rng_keyed(state))` (eta_ir::types), the noise lane running on from this
+/// block's row as a keyed draw's does.
+fn gumbel_lane(streams: &Streams<'_>, node: usize, pass: &mut Pass<'_>) -> String {
+    let op = &streams.ops[node];
+    let (logits, state) = (op.args[0], op.args[3]);
+    let sp = (pass.pointer)(state);
+    let _ = writeln!(
+        pass.prologue,
+        "    const m1_u64 seed{node} = ptir_rng_state_seed({sp}, descriptors[{state}u]);"
+    );
+    let _ = writeln!(
+        pass.prologue,
+        "    const m1_u32 noise{node} = lane_row * descriptors[{logits}u].len;"
+    );
+    let x = read(streams, logits, Dtype::F32, pass);
+    let keep = read(streams, op.args[1], Dtype::Bool, pass);
+    let divisor = read(streams, op.args[2], Dtype::F32, pass);
+    pass.body.both(&format!(
+        "      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + noise{node});"
+    ));
+    pass.body.both(&format!(
+        "      const float n{node} = -logf(-logf(u{node}));"
+    ));
+    pass.body.both(&format!(
+        "      const float g{node} = {keep} ? {x} * {divisor} + n{node} : m1_neg_inf();"
+    ));
+    format!("g{node}")
+}
+
+/// `node`'s value as its register holds it: a `bf16` result rounded once,
+/// as its store rounds it, so a reader in the stream sees the stored value.
+fn typed_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
+    let expr = map_expr(streams, node, compute(out_dtype), pass);
+    if out_dtype == Dtype::Bf16 {
+        format!("m1_round_bf16({expr})")
+    } else {
+        expr
+    }
+}
+
 fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
     let op = &streams.ops[node];
     let tag = op.tag;
@@ -865,7 +1201,7 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         let x = read(streams, op.args[0], Dtype::Bool, pass);
         format!("(!{x})")
     } else if matches!(tag, tags::NEG | tags::ABS | tags::SIGN) {
-        let path = streams.dtype(op.args[0]);
+        let path = compute(streams.dtype(op.args[0]));
         let x = read(streams, op.args[0], path, pass);
         match (tag, path) {
             (tags::NEG, Dtype::F32) => format!("(-{x})"),
@@ -900,7 +1236,12 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         let b = read(streams, op.pred_payload, Dtype::F32, pass);
         format!("({a} >= {b})")
     } else {
-        let path = streams.dtype(op.args[0]);
+        // Float operands compute in f32 whichever float dtype each is.
+        let path = if eta_ir::types::is_float(streams.dtype(op.args[1])) {
+            Dtype::F32
+        } else {
+            compute(streams.dtype(op.args[0]))
+        };
         let a = read(streams, op.args[0], path, pass);
         let b = read(streams, op.args[1], path, pass);
         match (tag, path) {
@@ -960,12 +1301,22 @@ pub(super) fn emit_stream(
                     .find(|&a| matches!(streams.class(a), RowClass::Full(_)))
             }
         })
+        .or_else(|| {
+            // An output read in place, one row of its views' width.
+            members
+                .iter()
+                .find(|m| m.role == Role::Intrinsic)
+                .map(|m| bases[m.node])
+        })
         .expect("a stream has a full value");
     // A row a stream reads is a static width: a reduction's slots are laid
     // out from it.
     let stream_width = match streams.class(witness) {
         RowClass::Full(Dimension::Static(width)) => Some(width),
-        _ => None,
+        _ => match streams.output_row(witness) {
+            Some(Dimension::Static(width)) => Some(width),
+            _ => None,
+        },
     };
 
     let mut s = String::new();
@@ -973,12 +1324,14 @@ pub(super) fn emit_stream(
     s.push_str("    const m1_u32 stream_lane = threadIdx.x & 31u;\n");
     s.push_str("    const m1_u32 stream_warp = threadIdx.x >> 5u;\n");
     s.push_str("    const m1_u32 stream_warps = blockDim.x >> 5u;\n");
-    if streams.split {
+    // Only a reduction keeps anything in the temporary area.
+    let reduces = members.iter().any(|m| m.role == Role::Reduce);
+    if streams.split && reduces {
         // The row's reductions' first levels lie in its work, every block's
         // partials at their chunks; each block folds them in its own area.
         s.push_str("    float* stream_work = reinterpret_cast<float*>(ptir_row_work);\n");
         s.push_str("    float* stream_own = reinterpret_cast<float*>(temporary);\n");
-    } else {
+    } else if reduces {
         s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
     }
     let _ = writeln!(
@@ -986,7 +1339,9 @@ pub(super) fn emit_stream(
         "    const m1_u32 stream_width = descriptors[{witness}u].len;"
     );
     if streams.split {
-        s.push_str("    const m1_u32 stream_lo = ptir_stretch(stream_width, ptir_part, ptir_split);\n");
+        s.push_str(
+            "    const m1_u32 stream_lo = ptir_stretch(stream_width, ptir_part, ptir_split);\n",
+        );
         s.push_str(
             "    const m1_u32 stream_hi = ptir_stretch(stream_width, ptir_part + 1u, ptir_split);\n",
         );
@@ -1037,7 +1392,7 @@ pub(super) fn emit_stream(
         let tag = op.tag;
         match member.role {
             Role::Map | Role::Broadcast => {
-                let expr = map_expr(streams, node, out_dtype, &mut pass);
+                let expr = typed_expr(streams, node, out_dtype, &mut pass);
                 pass.body.both(&format!(
                     "      const {} r{out} = {expr};",
                     c_type(out_dtype)
@@ -1086,7 +1441,11 @@ pub(super) fn emit_stream(
                 let _ = writeln!(
                     pass.body.fold_s,
                     "      if (stream_lane == 0u) {};",
-                    work_put(streams.split, &format!("{slot}u + (stream_base >> 5u)"), &format!("red{node}"))
+                    work_put(
+                        streams.split,
+                        &format!("{slot}u + (stream_base >> 5u)"),
+                        &format!("red{node}")
+                    )
                 );
                 let _ = writeln!(pass.body.pre, "        float red{node}[4];");
                 let _ = writeln!(pass.body.v, "      red{node}[j] = {x};");
@@ -1144,7 +1503,10 @@ pub(super) fn emit_stream(
                     // one-block answer.
                     let meet = streams.meets.get() + 1;
                     streams.meets.set(meet);
-                    let _ = writeln!(epilogue, "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);");
+                    let _ = writeln!(
+                        epilogue,
+                        "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
+                    );
                     let _ = writeln!(
                         epilogue,
                         "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_own + {}u, stream_own + {}u);",
@@ -1165,7 +1527,11 @@ pub(super) fn emit_stream(
                 let _ = writeln!(epilogue, "    }}");
             }
             Role::Argmax => {
-                let x = read(streams, op.args[0], Dtype::F32, &mut pass);
+                let x = if tag == tags::GUMBEL_ARGMAX {
+                    gumbel_lane(streams, node, &mut pass)
+                } else {
+                    read(streams, op.args[0], Dtype::F32, &mut pass)
+                };
                 argmaxes += 1;
                 let _ = writeln!(
                     pass.prologue,
@@ -1204,7 +1570,10 @@ pub(super) fn emit_stream(
                         "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, ptir_row, ptir_part, cand{node});"
                     );
                     let _ = writeln!(epilogue, "    }}");
-                    let _ = writeln!(epilogue, "    ptir_meet(ptir_meet_word, {meet}u * ptir_split);");
+                    let _ = writeln!(
+                        epilogue,
+                        "    ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
+                    );
                     let _ = writeln!(epilogue, "    if (stream_warp == 0u) {{");
                     let _ = writeln!(
                         epilogue,
@@ -1250,7 +1619,10 @@ pub(super) fn emit_stream(
         s,
         "      for (m1_u32 stream_base = {lo}stream_warp * 128u; stream_base < {hi}; stream_base += blockDim.x * 4u) {{"
     );
-    let _ = writeln!(s, "        const bool stream_live = stream_base + stream_lane * 4u < {hi};");
+    let _ = writeln!(
+        s,
+        "        const bool stream_live = stream_base + stream_lane * 4u < {hi};"
+    );
     s.push_str(
         "        const m1_u32 i4 = stream_live ? stream_base + stream_lane * 4u : stream_width - 4u;\n",
     );
@@ -1268,7 +1640,10 @@ pub(super) fn emit_stream(
         s,
         "    for (m1_u32 stream_base = {lo}stream_warp * 32u; stream_base < {hi}; stream_base += blockDim.x) {{"
     );
-    let _ = writeln!(s, "      const bool stream_live = stream_base + stream_lane < {hi};");
+    let _ = writeln!(
+        s,
+        "      const bool stream_live = stream_base + stream_lane < {hi};"
+    );
     s.push_str(
         "      const m1_u32 i = stream_live ? stream_base + stream_lane : stream_width - 1u;\n",
     );
@@ -1365,7 +1740,9 @@ fn unnamed_values(
     for node in region.nodes.iter().map(|n| n.index()) {
         let base = bases[node];
         if view(node) {
-            if !read_past.contains(&base) {
+            if !read_past.contains(&base)
+                || super::fused::output_view_read_in_place(stage, region, base)
+            {
                 unnamed.push(base);
             }
         } else if left_out(node) {
@@ -1454,7 +1831,9 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
 /// unseen.
 fn work_put(split: bool, at: &str, value: &str) -> String {
     if split {
-        format!("M1_LANE_PUT32(reinterpret_cast<m1_u32*>(stream_work + ({at})), __float_as_uint({value}))")
+        format!(
+            "M1_LANE_PUT32(reinterpret_cast<m1_u32*>(stream_work + ({at})), __float_as_uint({value}))"
+        )
     } else {
         format!("stream_work[{at}] = {value}")
     }
