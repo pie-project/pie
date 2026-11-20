@@ -6402,3 +6402,131 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
     assert!(members(&planner).contains(&victim), "fired once: a candidate again");
     drop(running);
 }
+
+/// Mac Pro's restore heads (need (9, 2), five free runs, nothing issued):
+/// a restore refused short of its roles names the part it came up short
+/// on, and its whole unpark takes more. Its need is the whole unpark: here
+/// one run of two recorded, its own parts two such runs, one free run
+/// standing, refused on this very map. Asked the recorded run, the map saw
+/// it free, moved no one, and the restore never went again; asked the
+/// whole, the resident holding a run beside it is moved.
+#[tokio::test(flavor = "current_thread")]
+async fn a_roles_short_restore_is_funded_for_its_whole_unpark() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend([0, 1, 4]);
+    // Its own parts: two runs of two.
+    pool.own.lock().extend([20, 21, 22, 23]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(2, resident), (3, resident), (5, resident), (6, resident), (7, resident)]);
+    let gives = pool.room_gives();
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        proc.roles_short_gives = Some(gives);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(pool.guest_room_free(2, 1), "the recorded run stands");
+    assert!(!pool.guest_room_free(2, 2), "the whole unpark's two do not");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the resident is moved for the whole unpark"
+    );
+}
+
+/// The M1's disk-only stall (a plan in the map, nothing issued, no evict,
+/// restore or compaction line): with the swap tiers full of parked kv, a
+/// head short of chunk runs is still funded, its occupant moved, for the
+/// chunks empty as guest scratch is given back and state moves, which a
+/// full swap does not stop. Only kv the head itself lacks waits on swap.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_short_of_runs_is_funded_with_the_swap_full() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    // No host tier and no free disk slot: the swap is full.
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().idle = true);
+    *pool.occupant.lock() = Some(resident);
+    assert_eq!(planner.swap_stats().0, 0, "the swap is full");
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the occupant is moved though no swap slot is free"
+    );
+    bind.abort();
+}
+
+/// The M1's first stall (a restore with no recorded need, free room,
+/// nothing issued) and the L40S's guest-only restore (kv 0, rs 0): a
+/// restore asking nothing past what stands is served from it at once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_asking_nothing_is_served_from_free_room() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "served at once");
+}

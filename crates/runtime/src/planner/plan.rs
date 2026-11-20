@@ -452,6 +452,12 @@ impl ResidencyPlanner {
                     need: (run, pieces),
                     fund,
                 } => {
+                    // What the restore's step takes, as the map and the
+                    // census read it ([`Self::head_room`]).
+                    let (run, pieces) = self
+                        .with_inner(|inner| inner.unmet_head().map(|(key, _)| key))
+                        .and_then(|key| self.head_room(key))
+                        .unwrap_or((run, pieces));
                     // Its runs stand free (a completion or a commit gave
                     // them back): it goes again, once a need. Short again
                     // with the same need, the need understates its unpark

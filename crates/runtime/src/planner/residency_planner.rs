@@ -502,17 +502,33 @@ impl ResidencyPlanner {
                 WaitKind::Restore { .. } => {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
-                    let suspended = (proc.bind_room.is_some() && proc.roles_short.is_none())
-                        .then_some(waiter.pid);
-                    Some((need, suspended))
+                    let suspended = proc.bind_room.is_some() && proc.roles_short.is_none();
+                    Some((need, Some((waiter.pid, suspended))))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
         Some(match suspended {
-            Some(pid) => self.beside_own(pid, need),
+            // A bind's runs beside what its own unpark takes back first.
+            Some((pid, true)) => self.beside_own(pid, need),
+            // Short of its roles: the whole unpark, not the part it came up
+            // short on (its own runs count that part among them).
+            Some((pid, false)) => self.whole_unpark(pid, need),
             None => need,
         })
+    }
+
+    /// The runs a restore short of its roles takes when its unpark runs:
+    /// the whole unpark (`PoolPort::unpark_runs`, its parts' runs, the one
+    /// it came up short on among them) where that is more than the part
+    /// its refusal named, never more than the pool stands. Asked the part
+    /// alone, the map saw it free and moved no one, the refusal came again
+    /// with those runs standing, and the need grew a run a refusal (9x3,
+    /// then 9x4) while nothing was issued.
+    pub(super) fn whole_unpark(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> (u32, u32) {
+        let own = self.port.unpark_runs(pid, run);
+        let most = self.port.state_chunks() / run.max(1);
+        (run, own.min(most).max(pieces))
     }
 
     /// The runs a restore a bind suspended asks of the chunk map: its bind's

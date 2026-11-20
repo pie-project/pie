@@ -207,7 +207,13 @@ impl ResidencyPlanner {
         // for state it lacks moves now, as nothing else frees its chunks.
         let kv_deficit = victims.deficit.pages.saturating_sub(victims.rs_pages);
         if victims.deficit.pages > 0 {
-            if !self.port.suspend_capable() || swap_free == 0 {
+            // No room below for kv: only kv the head itself lacks waits on
+            // it. Chunks a head's runs need empty as their occupants' guest
+            // scratch is given back and their state moves, which a full
+            // swap tier does not stop; returning here for them left a
+            // restore head with a plan (an eviction, or the compaction
+            // after it) issuing nothing on a disk full of parked kv.
+            if kv_deficit > 0 && (!self.port.suspend_capable() || swap_free == 0) {
                 self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;

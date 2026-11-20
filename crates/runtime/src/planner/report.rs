@@ -262,6 +262,10 @@ impl ResidencyPlanner {
         let (run, pieces) = recorded
             .iter()
             .fold(need, |(run, pieces), had| (run.max(had.run), pieces.max(had.pieces)));
+        // The whole unpark, not the part its refusal named: recorded so, the
+        // need is fixed as the restore takes it, and a refusal while those
+        // runs stand is one the need truly understates.
+        let (run, pieces) = self.whole_unpark(pid, (run, pieces));
         // The map as the refusal leaves it: its epoch and its runs of the
         // need's length.
         let gives = self.port.room_gives();
