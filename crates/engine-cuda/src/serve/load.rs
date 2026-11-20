@@ -1495,12 +1495,9 @@ impl Shell {
         if let Some(layout) = &capture {
             programs.set_score_bytes(layout.row_bytes());
         }
-        // A beam group's page lists span at most a sequence's pages, and a
-        // page it frees waits out the frames in flight.
-        programs.set_beam_bounds(
-            boot.context.div_ceil(boot.page_size.max(1)),
-            u32::from(boot.runahead.frames_in_flight),
-        );
+        // A beam group's page lists count in kv pages to its bind's depth,
+        // and a page it frees waits out the frames in flight.
+        programs.set_beam_bounds(boot.page_size, u32::from(boot.runahead.frames_in_flight));
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;

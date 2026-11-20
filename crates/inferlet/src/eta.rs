@@ -477,6 +477,9 @@ pub struct StateGeometry<'a> {
     /// `[lanes]` u32: per lane, the beam of the fire before it continues; the
     /// engine keeps the beams' own page lists (`forward.wit`, `crate::beam`).
     pub parents: Option<&'a Channel>,
+    /// With `parents`, the slot past the search's last row: the depth its
+    /// page lists are laid for (`crate::beam::BeamGroup::geometry`).
+    pub parents_end: Option<u32>,
 }
 
 impl StateGeometry<'_> {
@@ -758,6 +761,7 @@ impl ForwardPass {
                 kv_len: wits[2].as_deref(),
                 fold: wits[3].as_deref(),
                 parents: wits[4].as_deref(),
+                parents_end: geom.parents_end,
             },
         )?;
         let mut inner = self.inner.borrow_mut();

@@ -49,6 +49,10 @@ interface forward {
         kv-len:    option<borrow<channel>>,
         fold:      option<borrow<channel>>,
         parents:   option<borrow<channel>>,
+        // With `parents`: the slot past the search's last row (its folded
+        // slots and its fires), which its page lists are laid for
+        // (`BEAM-PAGE-LISTS.md` §3); required there, absent otherwise.
+        parents-end: option<u32>,
     }
 
     /// A forward-pass builder. Construction is empty; descriptor resources are

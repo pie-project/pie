@@ -24,6 +24,7 @@ pub struct BeamGroup {
     beams: u32,
     reserve: u32,
     folded: u32,
+    steps: u32,
     positions: Channel,
     slots: Channel,
     parents: Channel,
@@ -61,6 +62,7 @@ impl BeamGroup {
             beams,
             reserve,
             folded,
+            steps,
             positions: Channel::from(vec![folded; beams as usize]),
             slots: Channel::from(vec![folded; beams as usize]),
             parents: Channel::from((0..beams).collect::<Vec<u32>>()),
@@ -75,6 +77,8 @@ impl BeamGroup {
             positions: Some(&self.positions),
             slots: Some(&self.slots),
             parents: Some(&self.parents),
+            // The search's depth: its folded slots and a slot a fire.
+            parents_end: Some(self.folded + self.steps),
             ..StateGeometry::default()
         }
     }

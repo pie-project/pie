@@ -511,6 +511,7 @@ impl ProcessCtx {
             kv_len,
             fold,
             parents,
+            parents_end,
         } = geom;
         if lanes.is_empty() {
             return Ok(Err(
@@ -535,6 +536,19 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
+            if parents_end.is_none_or(|end| end == 0) {
+                return Ok(Err(
+                    "forward pass state binds parents with no parents-end; a beam group states \
+                     the slot past its search's last row, which its page lists are laid for"
+                        .to_string(),
+                ));
+            }
+        } else if parents_end.is_some() {
+            return Ok(Err(
+                "forward pass state states a parents-end with no parents; only a beam group \
+                 has a search's depth"
+                    .to_string(),
+            ));
         }
         for channel in [&positions, &slots, &kv_len, &fold, &parents]
             .into_iter()
@@ -558,6 +572,7 @@ impl ProcessCtx {
             kv_len: kv_len.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
             parents: parents.map(|resource| resource.rep()),
+            parents_end,
         };
         let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
@@ -1356,6 +1371,16 @@ impl ProcessCtx {
                 seeds: instance_seeds,
             };
             let process_id = self.id();
+            // A beam group's depth (`parents-end`): its page lists are laid
+            // for it at the bind, as the most keys a lane reads.
+            let beam_end = self
+                .ctx()
+                .table
+                .get(&this)?
+                .bindings
+                .state
+                .as_ref()
+                .and_then(|state| state.parents_end);
             let (registered, bound_instance, scheduler) = match crate::inferlet::process::said(
                 "bind",
                 process_id,
@@ -1368,8 +1393,10 @@ impl ProcessCtx {
                     seed_values,
                     geometry_class,
                     ::engine::BindExtents {
-                        sampled_rows: bind_rows(decode_envelope, pricing_rows).0,
-                        rows_per_lane: bind_rows(decode_envelope, pricing_rows).1,
+                        // The rows the instance reads: a beam group's
+                        // instance reads its beams' rows, one a lane.
+                        sampled_rows: pricing_rows.max(1),
+                        key_len: beam_end.unwrap_or(::engine::BindExtents::default().key_len),
                         ..::engine::BindExtents::default()
                     },
                     // The ports the program computes on the device: the
@@ -1929,6 +1956,7 @@ mod tests {
             kv_len: Some(4),
             fold: Some(6),
             parents: None,
+            parents_end: None,
         };
         let forks = StateBinding {
             lanes: vec![7, 8],
@@ -1940,36 +1968,5 @@ mod tests {
             ..forks
         };
         assert_eq!(state_rebind_diff(&bound, &moved), Some("positions"));
-    }
-}
-
-/// The readout rows a pass's bind states, by instance and by lane: an
-/// instance reads the rows its program prices; a beam group's (`parents`)
-/// beams are each a lane reading one row of them, any other pass's lanes
-/// read what the instance does. An engine checks the figure its readout
-/// seats are laid by (engine-cuda the instance's, engine-metal the lane's).
-fn bind_rows(envelope: Option<PortMask>, pricing_rows: u32) -> (u32, u32) {
-    let instance = pricing_rows.max(1);
-    if envelope.is_some_and(|ports| ports.contains(eta_ir::registry::Port::Parents)) {
-        (instance, 1)
-    } else {
-        (instance, instance)
-    }
-}
-
-#[cfg(test)]
-mod bind_rows_tests {
-    use super::{PortMask, bind_rows};
-
-    #[test]
-    fn a_beam_group_of_eight_reads_eight_rows_an_instance_and_one_a_lane() {
-        let parents = PortMask::NONE.with(eta_ir::registry::Port::Parents);
-        // Eight beams: the instance reads all eight rows (engine-cuda's
-        // seats), each beam's lane one (a load laying fewer rows a lane than
-        // the beams, Metal's 5, binds them).
-        assert_eq!(bind_rows(Some(parents), 8), (8, 1));
-        // A pass of no beam group: its lanes read what its instance does.
-        assert_eq!(bind_rows(Some(PortMask::NONE), 8), (8, 8));
-        assert_eq!(bind_rows(None, 0), (1, 1));
     }
 }

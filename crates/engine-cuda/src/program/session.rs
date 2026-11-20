@@ -408,10 +408,16 @@ impl Session {
             && engine::ports::engine_resolves(class, device, Port::Parents);
     }
 
-    /// Where the instance's item keeps its beam group's page lists, laid how.
+    /// Where the instance's scratch keeps its beam group's page lists, laid
+    /// how (offset from the scratch's first aligned byte).
     #[must_use]
     pub fn beam(&self) -> Option<super::launch::BeamLayout> {
         self.beam
+    }
+
+    /// The beam group's state as its bind laid it in the instance's scratch.
+    pub fn set_beam(&mut self, beam: Option<super::launch::BeamLayout>) {
+        self.beam = beam;
     }
 
     /// Where the instance's item lies now.
