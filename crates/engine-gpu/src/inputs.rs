@@ -148,6 +148,9 @@ pub struct Handles {
 
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    /// The fire's staged rs table (`kernels_slang::ssm::Carry`), bound at
+    /// its room whatever the fire stages: one view for every fire.
+    pub rs_carry: Option<Tensor>,
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -215,6 +218,7 @@ pub struct Fire<'a> {
 
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    pub rs_carry: Option<&'a [i32]>,
 
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
@@ -271,6 +275,8 @@ pub struct Laid {
 
     rs_replay: u64,
     rs_commit: u64,
+    /// The rs table's place and ints, where the load buffers rs rows.
+    rs_carry: Option<(u64, u64)>,
 
     group_of_lane: u64,
     packings: Vec<PackingAt>,
@@ -322,6 +328,7 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
+        rs_page_tokens: Option<u32>,
         binding: u64,
     ) -> Laid {
         let pieces = pieces.max(1);
@@ -394,6 +401,14 @@ impl Laid {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        // A fire's lanes carry no more buffered rows than its widest
+        // bucket's tokens (`engine::fire::rung_rows`, refused past at the
+        // stage): the table holds a header a lane, those rows' tokens, and
+        // the pages they and the lanes' own rows lie in.
+        let rs_carry = rs_page_tokens.map(|tokens| {
+            let ints = rs_carry_ints(lanes, rows, tokens);
+            (take(ints * 4), ints)
+        });
         let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
@@ -456,6 +471,7 @@ impl Laid {
             mrope,
             rs_replay,
             rs_commit,
+            rs_carry,
             group_of_lane,
             packings,
             seats,
@@ -679,6 +695,32 @@ impl<B: Backend> Inputs<B> {
                 true
             }
             _ => false,
+        };
+        let rs_carry = match (fire.rs_carry, self.laid.rs_carry) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Fault::Unbound {
+                    what: "the rs table of a fire on a load that buffers no rs rows".to_string(),
+                });
+            }
+            (Some(table), Some((at, ints))) => {
+                if table.len() as u64 > ints {
+                    return Err(Fault::Ceiling {
+                        what: "ints of the staged rs table: lanes' headers, carried tokens \
+                               and buffer pages",
+                        need: table.len() as u64,
+                        have: ints,
+                    });
+                }
+                self.store.write(at, bytes_of(table))?;
+                Some(i32s(
+                    handles,
+                    &self.store,
+                    at,
+                    u32::try_from(ints).unwrap_or(u32::MAX),
+                    self.laid.room(at)?,
+                )?)
+            }
         };
 
         let adapter_routes = match fire.adapter_routes {
@@ -1188,6 +1230,7 @@ impl<B: Backend> Inputs<B> {
             } else {
                 None
             },
+            rs_carry,
             group_of_lane,
             packings,
             inputs,
@@ -1223,6 +1266,16 @@ impl<B: Backend> Inputs<B> {
             slot_of_row: views.slot_of_row,
         }
     }
+}
+
+/// The ints a fire's staged rs table holds for fires of `lanes` lanes and
+/// `rows` tokens over rs pages of `page_tokens`: a header a lane, as many
+/// carried tokens as the fire's rows, and the pages those and the lanes' own
+/// rows lie in (two partial pages a lane at most).
+#[must_use]
+pub fn rs_carry_ints(lanes: u64, rows: u64, page_tokens: u32) -> u64 {
+    let pages = (2 * rows).div_ceil(u64::from(page_tokens.max(1))) + 2 * lanes;
+    lanes * u64::from(kernels_slang::ssm::CARRY_HEADER) + rows + pages
 }
 
 fn i32s<B: Backend>(
@@ -1315,6 +1368,7 @@ mod tests {
             None,
             2,
             true,
+            Some(16),
             1 << 30,
         );
         let rooms: Vec<(u64, u64)> = laid.rooms.iter().map(|(&at, &room)| (at, room)).collect();

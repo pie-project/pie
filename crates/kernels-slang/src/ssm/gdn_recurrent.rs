@@ -3,12 +3,13 @@
 
 use dtype::Dtype;
 
-use super::{Committed, Csr, RowSpan, StatePool, head_width};
+use super::{Carry, CarryPlane, Committed, Csr, RowSpan, StatePool, head_width};
 use crate::encode::{Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, every, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
 const GDN_RECURRENT: &str = "ssm/gdn_recurrent.slang";
+const GDN_CARRIED: &str = "ssm/gdn_carried.slang";
 
 const GROUP: u32 = 128;
 
@@ -231,6 +232,8 @@ pub fn gated_delta_committed(
     v_dim: u32,
     y: Tensor,
     row0: u32,
+    carry: &Carry,
+    [k_plane, u_plane]: [CarryPlane; 2],
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_committed";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
@@ -262,6 +265,7 @@ pub fn gated_delta_committed(
                 gates.arg(),
                 work.arg_mut(),
                 y.arg_mut(),
+                carry.table.arg(),
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
@@ -275,6 +279,95 @@ pub fn gated_delta_committed(
             ],
             &[csr.at.arg()],
             &state.snap_lane0(OP)?,
+            &carry.page_args(OP)?,
+            &k_plane.args(),
+            &u_plane.args(),
+        ]
+        .concat(),
+    )
+}
+
+/// A gated-delta layer's gate prep: its `[b | a]` rows (bf16), `dt_bias`
+/// (bf16) and `A_log` (f32), which a carried step forms its rows' gates
+/// from.
+#[derive(Clone, Copy, Debug)]
+pub struct Gated {
+    pub ba: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+}
+
+/// One decode step a lane over its buffered rows then its own
+/// (`kernels/ssm/gdn_carried.slang`): the committed state read once, each
+/// buffered row read where it lies in the lane's rs buffer pages (its
+/// `[b | a]`, keys and corrected value: `planes`, in that order) as a linear
+/// attention, the rows the lane commits folded, the own row's keys, `u` and
+/// `[b | a]` landed in its buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    qkv: Tensor,
+    gated: Gated,
+    state: &StatePool,
+    carry: &Carry,
+    planes: [CarryPlane; 3],
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    span: RowSpan,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_carried";
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) {
+        return Err(refuse(
+            OP,
+            format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if k_dim != REGISTER_K || v_dim > GROUP {
+        return Err(refuse(
+            OP,
+            format!(
+                "the carried step holds a {REGISTER_K}-wide key row a value column in \
+                 registers, at most {GROUP} columns; this layer's keys are {k_dim} wide and \
+                 its values {v_dim}"
+            ),
+        ));
+    }
+    let heads = Heads {
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+    };
+    let launched = span.rows(OP, &[qkv, y])?;
+    let [kh, vh, kd, vd] = heads.args(OP)?;
+    let [ba_plane, k_plane, u_plane] = planes;
+    ctx.fire(
+        Fire::at(GDN_CARRIED, "ssm_gdn_carried_r128_bf16")
+            .tier(tactic.tier)
+            .apply(heads.grid(launched)),
+        &[
+            &[
+                qkv.arg(),
+                gated.ba.arg(),
+                gated.dt_bias.arg(),
+                gated.a_log.arg(),
+                carry.slots.arg(),
+                carry.table.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.piece_args(true),
+            &[stated(OP, carry.lane0)?.arg(), kh, vh, kd, vd, span.row0.arg()],
+            &carry.page_args(OP)?,
+            &ba_plane.args(),
+            &k_plane.args(),
+            &u_plane.args(),
         ]
         .concat(),
     )
