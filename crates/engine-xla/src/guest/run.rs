@@ -123,7 +123,7 @@ pub struct Stages {
     /// (`Shell::guest_planes`): output, rows, width, layers, readout flag,
     /// dtype. A registration's outputs are checked against these, and each
     /// stage compiled for them.
-    pub planes: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    pub planes: Vec<(String, u32, u32, u32, bool, Dtype, bool)>,
     /// Stages a fire compiled (`Stages::get` past `compile_all`): a defect.
     pub fire_compiles: u64,
 }
@@ -338,6 +338,7 @@ impl Stages {
                         layers: p.3,
                         width: p.2,
                         dtype: p.5,
+                        normal: p.6,
                     })
                     .collect();
                 combos = combos
@@ -521,6 +522,7 @@ pub fn batch_of(
                     layers: plane.layers,
                     width: plane.width,
                     dtype: plane.dtype,
+                    normal: plane.normal,
                 })
             })
             .collect()

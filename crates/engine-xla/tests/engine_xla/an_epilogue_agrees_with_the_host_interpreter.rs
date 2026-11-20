@@ -480,6 +480,24 @@ fn bf16_rules() -> (TraceContainer, Vec<u32>) {
     (p.container(), outs)
 }
 
+/// The logits cast to bf16 and put out as they are: the cast's rounding
+/// alone.
+fn bf16_cast() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let half = p.op(Op::Cast {
+        value: logits,
+        dtype: Dtype::Bf16,
+    });
+    let outs = vec![p.output(Shape::matrix(ROWS, VOCAB), Dtype::Bf16, half)];
+    (p.container(), outs)
+}
+
 /// The compat sampler over one row: penalties over a carried histogram, a
 /// grammar mask (bools and packed words), temperature, top-k, top-p and a
 /// keyed Gumbel draw; plus the greedy token and the next histogram.
@@ -1167,6 +1185,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_gumbel_draws_agree(device, &mut stages);
     the_bf16_rules_agree(device, &mut stages);
     a_near_tie_draws_evenly(device, &mut stages);
+    a_cast_rounds_a_plane_by_what_it_may_hold(device, &mut stages);
     the_acceptance_rule_agrees(device, &mut stages);
     the_corners_agree(device, &mut stages);
     the_sampler_agrees(device, &mut stages, VOCAB);
@@ -1208,6 +1227,7 @@ fn registration_compiles_every_pass(device: &Device) {
         read.layers,
         read.readout,
         read.dtype,
+        read.normal,
     )];
     // A program registers on a served model, its load's ladder sealed:
     // registration compiles are no ladder misses.
@@ -1488,6 +1508,67 @@ fn a_near_tie_draws_evenly(device: &Device, stages: &mut Stages) {
     assert!(
         counts.iter().all(|&c| (96..=160).contains(&c)),
         "near-tie draws {counts:?}"
+    );
+}
+
+/// A bf16 cast of a plane rounds as `bf16_bits` does whichever form the
+/// lowering takes: a plane the engine does not state free of denormals
+/// (host-written here, denormals of both signs and at the bf16 halfway
+/// among them) takes the bit form and keeps them; a plane it states free
+/// of them (a matmul's) takes `reduce_precision`.
+fn a_cast_rounds_a_plane_by_what_it_may_hold(device: &Device, stages: &mut Stages) {
+    let (container, outs) = bf16_cast();
+    let plan = plan_of(container, VOCAB);
+    let mut plane = logits_plane(ROWS, VOCAB, 41);
+    let free = plane.clone();
+    for (i, x) in [
+        1e-40f32,
+        -3.0e-39,
+        5.877_472e-39,
+        f32::from_bits(0x0000_8000),
+        -1.0e-45,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        plane[i * 997 + 3] = x;
+    }
+    let want = host(&plan, &[], &plane, ROWS, &outs);
+    let may = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&may),
+        bound(&plan, &may, 0),
+        &outs,
+    );
+    exact(
+        &got[0],
+        &want[0],
+        "a bf16 cast of a plane that may hold denormals",
+    );
+    let want = host(&plan, &[], &free, ROWS, &outs);
+    let mut stated = kept(device, &free, ROWS, vec![(0, ROWS)]);
+    stated.planes = stated
+        .planes
+        .into_iter()
+        .map(|p| p.with_normal(true))
+        .collect();
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&stated),
+        bound(&plan, &stated, 0),
+        &outs,
+    );
+    exact(
+        &got[0],
+        &want[0],
+        "a bf16 cast of a plane stated free of denormals",
     );
 }
 

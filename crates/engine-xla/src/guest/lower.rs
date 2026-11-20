@@ -55,6 +55,8 @@ pub struct Read {
     pub layers: u32,
     pub width: u32,
     pub dtype: Dtype,
+    /// The plane holds no denormal (`readout::Plane::normal`).
+    pub normal: bool,
 }
 
 /// The shape of one lowering: how many lanes, and the outputs the device
@@ -551,9 +553,21 @@ pub fn lower(
                 }
             }
         };
+        // A loaded value may hold a denormal (`Lower::denormal`), but for a
+        // row of a plane the engine states free of them, or a constant
+        // that is not one.
+        let normal = if value.source == ValueOrigin::Const {
+            let x = f32::from_bits(value.literal_bits);
+            value.dtype != Dtype::F32 || x == 0.0 || x.is_normal() || !x.is_finite()
+        } else {
+            layout.inputs.iter().find(|s| s.value == id).is_some_and(
+                |s| matches!(s.feed, Feed::Row { read, .. } if layout.reads[read].normal),
+            )
+        };
         l.env.insert(id, v);
-        // a loaded value may hold a denormal (`Lower::denormal`)
-        l.denormal.insert(id);
+        if !normal {
+            l.denormal.insert(id);
+        }
     }
 
     for op in &stage.ops {
