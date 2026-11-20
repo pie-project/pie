@@ -618,11 +618,13 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
         device = name,
         available = room.available,
         defended = room.defended,
+        cgroup = ?room.cgroup,
         floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
         "read at bind: the device shares the host's memory, so the load takes what it has \
-         available, less what lmkd keeps free past it, less the floor"
+         available, less what lmkd keeps free past it, capped at what \
+         its cgroups leave, less the floor"
     );
     Ok(Some(room.room.saturating_add(held)))
 }
