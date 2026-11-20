@@ -88,11 +88,23 @@ struct Params {
     int head_dim;
     float norm_eps;
     float gate_floor;
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    // The window's CSR lies at int `indptr_at` of the fire's packed windows
+    // table, which is bound whole: one view whatever window a fire cuts.
+    int indptr_at;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+// The window's CSR boundary `i`.
+int csr(uint i) {
+    return indptr[uint(params.indptr_at) + i];
+}
+#endif
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
@@ -198,11 +210,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_COMMITTED)
     uint lane = uint(params.lane0) + r;
     if (tid == 0u) {
-        int begin = indptr[r];
+        int begin = csr(r);
         for (uint j = 0; j < r; j++) {
             begin += replay[uint(params.lane0) + j];
         }
-        int span = (indptr[r + 1] - indptr[r]) + replay[lane];
+        int span = (csr(r + 1) - csr(r)) + replay[lane];
         kda_lo = begin;
         kda_hi = pie_state_none(lane) ? begin : begin + span;
         kda_keep = min(commit[lane], span);
@@ -245,8 +257,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 #elif defined(PIE_CHUNKED)
     if (tid == 0u) {
-        kda_lo = indptr[r];
-        kda_hi = indptr[r + 1];
+        kda_lo = csr(r);
+        kda_hi = csr(r + 1);
     }
     GroupMemoryBarrierWithGroupSync();
     // Read uniformly: they bound the token loop.
