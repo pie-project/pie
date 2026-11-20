@@ -162,10 +162,12 @@ async fn main(input: Input) -> Result<String> {
         .state(&[&ws], StateGeometry::folding())
         .context("bind the prompt prefill")?;
     fwd_p.epilogue(move || {
-        let logits = reshape(intrinsics::output(0, "logits"), [v]);
+        // The vocabulary-sized rows are bf16; the scores the host and the
+        // next fire read are f32.
+        let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
         let (s, i) = top_k(log_softmax(&logits), b);
         out_p.put(cast(&i, dtype::i32));
-        scr_p.put(&s);
+        scr_p.put(cast(&s, dtype::f32));
         if let Some(greedy_p) = greedy_p {
             greedy_p.put(reshape(reduce_argmax(&logits), [1]));
         }
@@ -232,9 +234,20 @@ async fn main(input: Input) -> Result<String> {
         .context("bind the beam pool")?;
         fwd.epilogue(move || {
             // `logits()` squeezes a one-row fire to `[v]`: reshape so `beams == 1` meets `[B, 1]` scores.
-            let logits = reshape(intrinsics::output(0, "logits"), [b, v]);
-            let cand = broadcast(reshape(scores.take(), [b, 1]), [b, v]) + log_softmax(&logits);
+            let logits = cast(
+                reshape(intrinsics::output(0, "logits"), [b, v]),
+                dtype::bf16,
+            );
+            // The candidates are bf16, each beam's score taken relative to
+            // the best (whose rows then round no score at all): a bf16
+            // absolute score would round a long hypothesis's sum by more
+            // than a step's log-probability.
+            let carried = scores.take();
+            let best = reduce_max(&carried);
+            let relative = cast(&carried - &best, dtype::bf16);
+            let cand = broadcast(reshape(relative, [b, 1]), [b, v]) + log_softmax(&logits);
             let (s, i) = top_k(reshape(cand, [b * v]), b);
+            let s = cast(&s, dtype::f32) + &best;
             let parent = &i / v;
             let tok_i = cast(&i % v, dtype::i32);
 
@@ -521,15 +534,18 @@ async fn teacher_forced(
         fwd.state(&bound, StateGeometry::folding())
             .context("bind the rescoring sets")?;
         fwd.epilogue(move || {
-            // The first copy's row.
-            let logits = reshape(
-                gather(reshape(intrinsics::output(0, "logits"), [copies, v]), iota(1)),
-                [v],
+            // The first copy's row, at the sampler's bf16 grain.
+            let logits = cast(
+                reshape(
+                    gather(reshape(intrinsics::output(0, "logits"), [copies, v]), iota(1)),
+                    [v],
+                ),
+                dtype::bf16,
             );
             let wanted = wanted.take();
             picked.put(cast(&gather(&logits, &wanted), dtype::f32));
             largest.put(cast(&reshape(reduce_max(&logits), [1]), dtype::f32));
-            out.put(gather(log_softmax(&logits), &wanted));
+            out.put(cast(gather(log_softmax(&logits), &wanted), dtype::f32));
         });
         fwd.submit(&pipeline).context("rescore submit")?;
         let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;

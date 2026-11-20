@@ -40,6 +40,9 @@ impl Serve for Api {
 
     type Keep = std::convert::Infallible;
 
+    /// Eager by design: the probe is encoded at each fire.
+    type Probed = ();
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = "the least of wgpu::Limits::max_buffer_size, \
@@ -84,7 +87,7 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
         )?;
         Ok((device, tuning))
     }
@@ -100,7 +103,7 @@ impl Serve for Api {
             device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
             shapes,
             top_rows,
         )
@@ -167,6 +170,20 @@ impl Serve for Api {
 
     fn walk_frame(device: &Context, _keep: bool) -> Result<Frame> {
         device.frame()
+    }
+
+    fn record_probe(_device: &Context, _record: &dyn Fn(&Frame) -> Result<()>) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay_probe(
+        device: &Context,
+        _probed: &(),
+        record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        let frame = device.spanned()?;
+        record(&frame)?;
+        frame.commit_spanned()
     }
 
     const BINDS_AT_LOAD: bool = true;

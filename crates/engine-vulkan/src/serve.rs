@@ -62,6 +62,9 @@ impl Serve for Api {
 
     type Keep = crate::record::Key;
 
+    /// The probe recorded at load into a spanned frame kept to replay.
+    type Probed = crate::device::Kept;
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = "the least of VkPhysicalDeviceLimits::\
@@ -106,7 +109,7 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
         )?;
         Ok((device, tuning))
     }
@@ -122,7 +125,7 @@ impl Serve for Api {
             device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
             shapes,
             top_rows,
         )
@@ -185,6 +188,23 @@ impl Serve for Api {
         } else {
             device.frame()
         }
+    }
+
+    fn record_probe(
+        device: &Context,
+        record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<crate::device::Kept> {
+        let frame = device.spanned_kept()?;
+        record(&frame)?;
+        frame.into_kept_spanned()
+    }
+
+    fn replay_probe(
+        _device: &Context,
+        probed: &crate::device::Kept,
+        _record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        probed.replay_spanned()
     }
 
     fn shelf(

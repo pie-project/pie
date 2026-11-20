@@ -53,7 +53,7 @@ __device__ __forceinline__ void ptir_m1_execute(
     const m1_u32 logical_bytes =
         d0.dtype == 3
             ? (p.bool_storage == 1u ? (d0.len + 7u) / 8u : d0.len)
-            : d0.len * 4u;
+            : d0.len * m1_elem_bytes(d0.dtype);
     if (d0.dtype == 3 && p.bool_storage > 1u) {
       m1_fault(status, p.tag);
       return;
@@ -148,11 +148,11 @@ __device__ __forceinline__ void ptir_m1_execute(
     for (m1_u32 i = 0; i < out0.len; ++i) {
       const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
       if (p.tag == 0x01)
-        m1_store_f(o0, i, expf(value));
+        m1_store_fd(o0, i, expf(value), out0.dtype);
       else if (p.tag == 0x02)
-        m1_store_f(o0, i, logf(value));
+        m1_store_fd(o0, i, logf(value), out0.dtype);
       else
-        m1_store_f(o0, i, 1.0f / value);
+        m1_store_fd(o0, i, 1.0f / value, out0.dtype);
     }
     return;
   }
@@ -160,20 +160,20 @@ __device__ __forceinline__ void ptir_m1_execute(
     for (m1_u32 i = 0; i < out0.len; ++i) {
       const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
       if (p.tag == 0x08)
-        m1_store_f(o0, i, sinf(value));
+        m1_store_fd(o0, i, sinf(value), out0.dtype);
       else if (p.tag == 0x09)
-        m1_store_f(o0, i, cosf(value));
+        m1_store_fd(o0, i, cosf(value), out0.dtype);
       else if (p.tag == 0x0A)
-        m1_store_f(o0, i, sqrtf(value));
+        m1_store_fd(o0, i, sqrtf(value), out0.dtype);
       else
-        m1_store_f(o0, i, 1.0f / sqrtf(value));
+        m1_store_fd(o0, i, 1.0f / sqrtf(value), out0.dtype);
     }
     return;
   }
   if (p.tag == 0x03 || p.tag == 0x05 || p.tag == 0x06) {
     for (m1_u32 i = 0; i < out0.len; ++i) {
       const m1_u32 source_index = m1_pick(d0.len, i);
-      if (d0.dtype == 0) {
+      if (m1_is_float(d0.dtype)) {
         const float value = m1_load_f(a0, source_index, d0.dtype);
         const float result =
             p.tag == 0x03
@@ -183,7 +183,7 @@ __device__ __forceinline__ void ptir_m1_execute(
                        : (value > 0
                               ? 1.0f
                               : (value < 0 ? -1.0f : 0.0f)));
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out0.dtype);
       } else if (d0.dtype == 1) {
         const int value = m1_load_i(a0, source_index, d0.dtype);
         int result = value;
@@ -215,8 +215,8 @@ __device__ __forceinline__ void ptir_m1_execute(
   if (p.tag == 0x07) {
     for (m1_u32 i = 0; i < out0.len; ++i) {
       const m1_u32 source_index = m1_pick(d0.len, i);
-      if (out0.dtype == 0)
-        m1_store_f(o0, i, m1_load_f(a0, source_index, d0.dtype));
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(o0, i, m1_load_f(a0, source_index, d0.dtype), out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(o0, i, m1_load_i(a0, source_index, d0.dtype));
       else if (out0.dtype == 2)
@@ -237,7 +237,7 @@ __device__ __forceinline__ void ptir_m1_execute(
           const bool x = m1_load_b(a0, xindex, d0.dtype);
           const bool y = m1_load_b(a1, yindex, d1.dtype);
           result = p.tag == 0x1C ? x && y : x || y;
-        } else if (d0.dtype == 0) {
+        } else if (m1_is_float(d0.dtype) || m1_is_float(d1.dtype)) {
           const float x = m1_load_f(a0, xindex, d0.dtype);
           const float y = m1_load_f(a1, yindex, d1.dtype);
           if (p.tag == 0x16) result = x > y;
@@ -266,7 +266,7 @@ __device__ __forceinline__ void ptir_m1_execute(
           else result = x <= y;
         }
         m1_store_b(o0, i, result);
-      } else if (d0.dtype == 0) {
+      } else if (m1_is_float(out0.dtype)) {
         const float x = m1_load_f(a0, xindex, d0.dtype);
         const float y = m1_load_f(a1, yindex, d1.dtype);
         float result = 0.0f;
@@ -277,7 +277,7 @@ __device__ __forceinline__ void ptir_m1_execute(
         else if (p.tag == 0x14) result = m1_element_max(x, y);
         else if (p.tag == 0x15) result = m1_element_min(x, y);
         else result = fmodf(x, y);
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out0.dtype);
       } else if (d0.dtype == 1) {
         const int x = m1_load_i(a0, xindex, d0.dtype);
         const int y = m1_load_i(a1, yindex, d1.dtype);
@@ -325,12 +325,13 @@ __device__ __forceinline__ void ptir_m1_execute(
           m1_load_b(a0, m1_pick(d0.len, i), d0.dtype);
       const m1_u32 xi = m1_pick(d1.len, i);
       const m1_u32 yi = m1_pick(d2.len, i);
-      if (out0.dtype == 0)
-        m1_store_f(
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(
             o0,
             i,
             select ? m1_load_f(a1, xi, d1.dtype)
-                   : m1_load_f(a2, yi, d2.dtype));
+                   : m1_load_f(a2, yi, d2.dtype),
+            out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(
             o0,
@@ -354,7 +355,7 @@ __device__ __forceinline__ void ptir_m1_execute(
   }
 
   if (p.tag >= 0x30 && p.tag <= 0x32) {
-    if (d0.dtype == 0)
+    if (m1_is_float(d0.dtype))
       m1_reduce_float(p.tag, a0, o0, temporary, d0);
     else
       m1_reduce_integer(p.tag, a0, o0, temporary, d0);
@@ -393,8 +394,8 @@ __device__ __forceinline__ void ptir_m1_execute(
         if (source_dim != 1)
           source_index += coordinate * source_stride[dim];
       }
-      if (out0.dtype == 0)
-        m1_store_f(o0, linear, m1_load_f(a0, source_index, d0.dtype));
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(o0, linear, m1_load_f(a0, source_index, d0.dtype), out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(o0, linear, m1_load_i(a0, source_index, d0.dtype));
       else if (out0.dtype == 2)
@@ -417,9 +418,9 @@ __device__ __forceinline__ void ptir_m1_execute(
     const m1_u32 n = d0.dims[1];
     for (m1_u32 index = 0; index < m * n; ++index) {
       const m1_u32 source_index = (index % m) * n + index / m;
-      if (out0.dtype == 0)
-        m1_store_f(
-            o0, index, m1_load_f(a0, source_index, d0.dtype));
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(
+            o0, index, m1_load_f(a0, source_index, d0.dtype), out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(
             o0, index, m1_load_i(a0, source_index, d0.dtype));
@@ -455,7 +456,7 @@ __device__ __forceinline__ void ptir_m1_execute(
           const float value = m1_load_f(a0, index, d0.dtype);
           accumulated_f = is_sum ? accumulated_f + value
                                  : accumulated_f * value;
-          m1_store_f(o0, index, accumulated_f);
+          m1_store_fd(o0, index, accumulated_f, out0.dtype);
         }
       }
     }
@@ -480,7 +481,7 @@ __device__ __forceinline__ void ptir_m1_execute(
           best_index = candidate;
         }
       }
-      m1_store_f(o0, position, best_value);
+      m1_store_fd(o0, position, best_value, out0.dtype);
       m1_store_u(o1, position, best_index);
     }
     return;
@@ -508,7 +509,7 @@ __device__ __forceinline__ void ptir_m1_execute(
             best_index = candidate;
           }
         }
-        m1_store_f(o0, row * count + position, best_value);
+        m1_store_fd(o0, row * count + position, best_value, out0.dtype);
         m1_store_u(o1, row * count + position, best_index);
       }
     }
@@ -655,11 +656,12 @@ __device__ __forceinline__ void ptir_m1_execute(
         const bool valid = index >= 0 && (m1_u64)index < n0;
         const m1_u32 source_index =
             valid ? (m1_u32)index * rest + r : 0;
-        if (out0.dtype == 0)
-          m1_store_f(
+        if (m1_is_float(out0.dtype))
+          m1_store_fd(
               o0,
               output_index,
-              valid ? m1_load_f(a0, source_index, d0.dtype) : 0.0f);
+              valid ? m1_load_f(a0, source_index, d0.dtype) : 0.0f,
+              out0.dtype);
         else if (out0.dtype == 1)
           m1_store_i(
               o0,
@@ -687,11 +689,12 @@ __device__ __forceinline__ void ptir_m1_execute(
       const bool valid = column >= 0 && (m1_u64)column < columns;
       const m1_u32 source_index =
           valid ? row * columns + (m1_u32)column : 0;
-      if (out0.dtype == 0)
-        m1_store_f(
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(
             o0,
             row,
-            valid ? m1_load_f(a0, source_index, d0.dtype) : 0.0f);
+            valid ? m1_load_f(a0, source_index, d0.dtype) : 0.0f,
+            out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(
             o0,
@@ -719,6 +722,10 @@ __device__ __forceinline__ void ptir_m1_execute(
       rest = n0 == 0 ? 1u : d0.len / n0;
     }
     const bool scalar = d2.len == 1 && d1.len * rest != 1;
+    if (d0.dtype == M1_DT_BF16) {
+      m1_scatter_bf16(p.tag == 0x62, a1, a2, o0, d1.len, d1.dtype, d2.dtype, n0, rest, scalar);
+      return;
+    }
     for (m1_u32 k = 0; k < d1.len; ++k) {
       const long long index = m1_load_index(a1, k, d1.dtype);
       if (index < 0 || (m1_u64)index >= n0) continue;
@@ -766,12 +773,13 @@ __device__ __forceinline__ void ptir_m1_execute(
       const m1_u32 word = column >> 5;
       const m1_u32 mask =
           word < d1.len ? m1_load_u(a1, word, d1.dtype) : 0u;
-      m1_store_f(
+      m1_store_fd(
           o0,
           i,
           ((mask >> (column & 31)) & 1u) != 0
               ? m1_load_f(a0, i, d0.dtype)
-              : m1_neg_inf());
+              : m1_neg_inf(),
+          out0.dtype);
     }
     return;
   }

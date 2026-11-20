@@ -2127,6 +2127,31 @@ impl Shell {
         Ok(false)
     }
 
+    /// Slot ref `slot` of shape `id`, read whole on the host once every
+    /// copy has settled.
+    pub fn read_slot_bytes(&mut self, id: engine::chunk::ShapeId, slot: u32) -> Result<Vec<u8>> {
+        self.settle_copies()?;
+        self.pools.read_slot_bytes(id, slot)
+    }
+
+    /// Writes one slot's `bytes` into slot ref `slot` of shape `id` once
+    /// every copy has settled.
+    pub fn write_slot_bytes(
+        &mut self,
+        id: engine::chunk::ShapeId,
+        slot: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.settle_copies()?;
+        self.pools.write_slot_bytes(id, slot, bytes)
+    }
+
+    /// The bytes one disk chunk takes (CONTRACT-BC 22).
+    #[must_use]
+    pub fn disk_chunk_bytes(&self) -> u64 {
+        self.pools.disk_chunk_bytes()
+    }
+
     /// See `Engine::settle_copies`: the last copy's command buffer retires.
     pub fn settle_copies(&mut self) -> Result<()> {
         if let Some(grafted) = self.grafted.take() {

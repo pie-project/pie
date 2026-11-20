@@ -113,6 +113,15 @@ pub trait Context<B: Backend> {
     /// A frame to record into.
     fn frame(&self) -> Result<B::Frame>;
 
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written before its work and one after it, where the
+    /// device's queue writes timestamps; a plain frame where it writes none.
+    fn spanned(&self) -> Result<B::Frame>;
+
+    /// Whether every submission made on the device so far has landed, read
+    /// now without waiting: the device's queue is empty.
+    fn idle(&self) -> bool;
+
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
 
@@ -219,6 +228,11 @@ pub trait Frame<B: Backend>: 'static {
 
     /// Submits; `on_done` runs once the frame lands.
     fn commit_async(self, on_done: Option<OnDone>) -> Result<B::Pending>;
+
+    /// Submits and waits: the device's own time across the frame's work,
+    /// ns, from the timestamps a [`Context::spanned`] frame wrote; `None`
+    /// for any other frame, or where the device writes no timestamps.
+    fn commit_spanned(self) -> Result<Option<u64>>;
 }
 
 /// How a backend runs kernels-slang's entries on its device: the tactics its
@@ -349,6 +363,9 @@ pub trait Tactics: std::fmt::Debug {
 pub trait Pending: std::fmt::Debug {
     /// Blocks until the frame lands.
     fn wait(&self) -> Result<()>;
+
+    /// Whether the frame has landed, read now without waiting.
+    fn landed(&self) -> bool;
 }
 
 /// A device reservation as the shared engine moves bytes through it.

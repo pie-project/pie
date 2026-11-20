@@ -67,6 +67,11 @@ pub trait Serve: Backend {
     /// The key a walked step is kept under to replay.
     type Keep;
 
+    /// The submit bound's probe as the backend holds it between fires
+    /// ([`crate::submit::Probe`]): recorded at load where the backend keeps
+    /// recordings, so no serving fire of it is unrecorded.
+    type Probed;
+
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
@@ -177,6 +182,25 @@ pub trait Serve: Backend {
 
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
+
+    /// The probe's work (`record`, its dispatches into a frame) laid for
+    /// [`Serve::replay_probe`]: recorded once into a spanned frame kept to
+    /// replay, where the backend keeps recordings.
+    fn record_probe(
+        device: &Self::Context,
+        record: &dyn Fn(&Self::Frame) -> Result<()>,
+    ) -> Result<Self::Probed>;
+
+    /// The probe fired and waited for: the device's time across its work,
+    /// ns (`None` where the device writes no timestamps). A backend that
+    /// keeps recordings replays what [`Serve::record_probe`] recorded; one
+    /// that keeps none (eager by design) records `record` into a spanned
+    /// frame now.
+    fn replay_probe(
+        device: &Self::Context,
+        probed: &Self::Probed,
+        record: &dyn Fn(&Self::Frame) -> Result<()>,
+    ) -> Result<Option<u64>>;
 
     /// Whether the backend builds what a dispatch binds for each set of
     /// views it binds and keeps it (wgpu's bind groups): its load then
@@ -758,6 +782,12 @@ pub struct Shell<B: Serve> {
     /// The platform's bound on one submission and what holds a serving step
     /// to it (`crate::submit`); none where it states none.
     submit_bound: Option<crate::submit::SubmitBound>,
+    /// Under a stated submit bound, the probe a frame that follows an idle
+    /// device re-times its clock by, and the clock it last read
+    /// ([`Shell::retime`]).
+    probe: Option<(crate::submit::Probe<B>, crate::submit::Clock)>,
+    /// The probes fired since the last count ([`Shell::probed_serving`]).
+    probed: u64,
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
@@ -1664,7 +1694,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let submit_bound = match crate::rates::STATED_SUBMIT_BOUND {
+        let mut submit_bound = match crate::rates::stated_submit_bound() {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
@@ -1720,6 +1750,7 @@ impl<B: Serve> Shell<B> {
                     layers: crate::submit::layers(&boot.trace),
                     fire_lanes: budgets.tokens.max_lanes,
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
+                    scale: 1.0,
                 };
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
@@ -1733,6 +1764,31 @@ impl<B: Serve> Shell<B> {
                 );
                 Some(held)
             }
+        };
+
+        // The probe a frame after an idle device re-times its clock by
+        // (`crate::submit::Probe`), laid and fired once here, before the
+        // load is ready: its pipeline built, its clock read. Its curve time
+        // is the estimate's own matmul curve at its shape, plus a launch. A
+        // load that runs nothing on a device (a naming load, which lands no
+        // bytes: `Backend::LANDS`) submits nothing to re-time.
+        let probe = match submit_bound.as_mut() {
+            Some(held) if B::LANDS => {
+                let (m, n, k) = crate::submit::PROBE;
+                let rates = &held.estimate.rates;
+                let mut clock =
+                    crate::submit::Clock::new(rates.gemm_compute_ns(m, n, k) + rates.launch_ns);
+                let probe = crate::submit::Probe::<B>::new(&device, tuning.gemm(tier, m))?;
+                clock.probed(probe.fire(&device)?);
+                held.scale = clock.scale();
+                tracing::info!(
+                    curve_us = clock.curve_ns / 1e3,
+                    ratio = clock.ratio,
+                    "submit bound: the probe re-times the device's clock after it idles"
+                );
+                Some((probe, clock))
+            }
+            _ => None,
         };
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1892,17 +1948,23 @@ impl<B: Serve> Shell<B> {
         let readout = (0..arms)
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
-        // The recurrent planes and work plane, for the top rung's rows and
-        // lanes: reservations of their own beside the span
-        // ([`crate::rs::Reservation`]).
+        // The recurrent planes, for the top rung's rows, and the work plane,
+        // for the lanes one committed dispatch fills the device with (its
+        // workgroups are lanes times the scan's heads): reservations of their
+        // own beside the span ([`crate::rs::Reservation`]); a fire of more
+        // lanes takes as many dispatches.
         let rs_held = match rs_layout.as_deref() {
             Some(layout) => {
                 let top = span.rungs().last().map_or(1, |rung| rung.tokens);
+                let fills = tuning
+                    .sdpa_split_groups()
+                    .div_ceil(layout.work_heads.max(1))
+                    .clamp(1, top.min(boot.budget.max_lanes).max(1));
                 Some(crate::rs::Reservation::lay(
                     &device,
                     layout,
                     top.saturating_mul(2),
-                    top.min(boot.budget.max_lanes),
+                    fills,
                     device.max_buffer(),
                 )?)
             }
@@ -2075,6 +2137,8 @@ impl<B: Serve> Shell<B> {
             readout_tally: (0, 0),
             weighed,
             submit_bound,
+            probe,
+            probed: 0,
             split_next: false,
             pipelines,
             asks,
@@ -2175,8 +2239,12 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// Unstated `budget`: `seats` sequences at `context` and at least the
-    /// pool's kv pages, within a quarter of the free disk.
+    /// The disk tier: a slot file of `budget` bytes in disk chunks, any
+    /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
+    /// [`Pools::disk_division`] lay them; stated at load. Unstated
+    /// `budget`: a disk chunk for each of the pool's chunks, and at least
+    /// the kv pages of `seats` sequences at `context`, within a quarter of
+    /// the free disk. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2186,15 +2254,20 @@ impl<B: Serve> Shell<B> {
     ) -> Result<u32> {
         let Some(dir) = dir else { return Ok(0) };
         let paging = self.pools.paging();
+        let layout = *self.pools.layout();
+        let chunk = self.pools.disk_chunk_bytes();
         let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
+            let pages =
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
             engine::disk::unstated_budget(
                 dir,
                 0,
                 0,
-                paging.pages(),
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.page_bytes(),
+                u64::from(layout.total_chunks),
+                pages.div_ceil(per_list),
+                chunk,
             )
         });
         if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
@@ -2203,7 +2276,25 @@ impl<B: Serve> Shell<B> {
             }
             self.pools.unseat_disk();
         }
-        Ok(self.pools.disk_pages())
+        let chunks = self.pools.disk_chunks();
+        if chunks > 0 {
+            let division = self
+                .pools
+                .disk_division()
+                .iter()
+                .map(|(id, per, bytes)| format!("shape {id}: {per} slots of {bytes} bytes"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::info!(
+                budget,
+                chunks,
+                chunk_bytes = chunk,
+                %division,
+                "the disk tier's slot file: disk chunks of a pool chunk each, laid out \
+                 as the device's, any state shape's slots in any chunk"
+            );
+        }
+        Ok(chunks)
     }
 
     /// Copies whole fixed slots (slot refs) `(src, dst)`: a record written
@@ -2680,6 +2771,12 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// The submit-bound probes fired since the last count
+    /// ([`engine::live::Tally::Probed`]): apart from every model fire.
+    pub fn probed_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.probed)
     }
 
     /// The tier moves through the host since the last count that waited
@@ -3611,6 +3708,57 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn submit_bound(&self) -> Option<&crate::submit::SubmitBound> {
         self.submit_bound.as_ref()
+    }
+
+    /// Under a stated submit bound, re-times the device's clock where frame
+    /// `frame` follows an idle device: where the device's queue is empty as
+    /// its first step goes out (every submission made on it so far landed,
+    /// a forward's, a sampler's, a guest pass's or a copy's alike, read
+    /// without waiting: `backend::Context::idle`), the probe is fired alone and timed, and its time over its
+    /// curve time is the scale every step's estimate is read at from here
+    /// ([`crate::submit::SubmitBound::scale`]). A frame queued behind work
+    /// still running follows no idle and keeps the scale. Nothing is done
+    /// where no bound is stated.
+    pub fn retime(&mut self, frame: engine::FrameId) -> Result<()> {
+        if self.probe.is_none() {
+            return Ok(());
+        }
+        if !crate::backend::Context::idle(&self.device) {
+            return Ok(());
+        }
+        let (Some((probe, clock)), Some(held)) = (self.probe.as_mut(), self.submit_bound.as_mut())
+        else {
+            return Ok(());
+        };
+        // The probe is admitted by its own estimate, as every submission is.
+        let estimate = clock.probe_ns() * held.worst.max(1.0);
+        if estimate > held.bound_ns {
+            return Err(Fault::Device {
+                call: "submit bound: probe",
+                why: format!(
+                    "the probe ({:?} matmul) is estimated at {:.1} ms at its last ratio {:.3} \
+                     and the worst ratio {:.3}, past the platform's stated bound of {:.0} ms on \
+                     one GPU submission: not submitted",
+                    crate::submit::PROBE,
+                    estimate / 1e6,
+                    clock.ratio,
+                    held.worst,
+                    held.bound_ns / 1e6
+                ),
+            });
+        }
+        let took = probe.fire(&self.device)?;
+        self.probed += 1;
+        clock.probed(took);
+        held.scale = clock.scale();
+        tracing::debug!(
+            frame = frame.0,
+            took_us = took / 1e3,
+            curve_us = clock.curve_ns / 1e3,
+            scale = held.scale,
+            "submit bound: the device idled; re-timed"
+        );
+        Ok(())
     }
 
     /// The next step this shell enqueues walks a layer at a time (or, at
@@ -6108,12 +6256,12 @@ impl<B: Serve> Shell<B> {
         // Where the trace buffers a recurrence, a lane buffering its rows at
         // each power of two of rows: the committed scans bind the rung's
         // recurrent planes, which every speculative fire of the rung binds.
-        // Its lanes buffer a page of rows each, as speculative lanes buffer
-        // few, so a rung's rows spread over as many lanes as they take. A
-        // rung's fires extend past half its tokens and up to twice them, so
-        // each rung is walked at the least rows that choose it and at its
-        // tokens (a scan's kernel follows the rows), and once with a lane
-        // replaying a page it carries (the buffer's rows gathered back).
+        // A lane buffering its rows at each rung's least rows and at its
+        // tokens (a rung's fires extend past half its tokens and up to twice
+        // them, and a scan's kernel follows the rows; the planes and the
+        // work plane are one view whatever the lanes), and one replaying a
+        // page it carries (the buffer's rows gathered back). One lane each:
+        // what binds is the rung and the rows, never the lanes.
         let rs_shapes = shapes.len();
         let mut carried = vec![0u32; shapes.len()];
         if let Some(rs) = self
@@ -6121,26 +6269,18 @@ impl<B: Serve> Shell<B> {
             .as_ref()
             .filter(|_| self.rs_layout.is_some())
         {
-            let page = u64::from(rs.page_tokens());
+            let page = rs.page_tokens();
             for class in (0..self.compiled.classes.classes.len()).filter(|&c| !self.captures(c)) {
-                let mut tokens = 1u64;
-                while tokens <= u64::from(top) {
+                let mut tokens = 1u32;
+                while tokens <= top {
                     for rows in [tokens / 2 + 1, tokens] {
-                        let lanes = rows.div_ceil(page).min(u64::from(lanes_cap)).max(1);
-                        shapes.push(
-                            (0..lanes)
-                                .map(|at| {
-                                    let own = spread(rows, lanes, at);
-                                    (class, u32::try_from(own).unwrap_or(u32::MAX))
-                                })
-                                .collect(),
-                        );
+                        shapes.push(vec![(class, rows)]);
                         carried.push(0);
                     }
                     tokens = tokens.saturating_mul(2);
                 }
                 shapes.push(vec![(class, 1)]);
-                carried.push(u32::try_from(page).unwrap_or(u32::MAX));
+                carried.push(page);
             }
         }
         let depth = self.arms.depth();
@@ -6194,37 +6334,16 @@ impl<B: Serve> Shell<B> {
             .iter()
             .map(|&(class, rows)| {
                 let mut lane = self.naming_lane(class, rows)?;
-                let carried = rs.unwrap_or(0);
-                if rs.is_some() || lanes.len() > self.held.len() {
-                    // Refs the pool takes as any lane's: a bind-only fire
-                    // reads and writes none, and a load need lay no seat
-                    // runs ([`Pools::walk_refs`]).
-                    let page = self.pools.paging().page_size.max(1);
-                    let held = (rows + carried).div_ceil(page).max(1);
-                    lane.by_ref = Some(self.pools.walk_refs(held)?);
-                }
-                if rs.is_some() {
-                    lane.carried = carried;
-                    // A masked class's mask reaches the rows it carries too.
-                    if lane.mask.is_some() {
-                        let extent = rows + carried;
-                        lane.mask = Some(Masking::Extent(engine::fire::Mask::new(
-                            vec![0, extent],
-                            u64::from(extent),
-                        )));
+                match rs {
+                    Some(carried) => self.rs_walk_lane(&mut lane, rows, carried)?,
+                    None if lanes.len() > self.held.len() => {
+                        // Refs the pool takes as any lane's: a bind-only fire
+                        // reads and writes none, and a load need lay no seat
+                        // runs ([`Pools::walk_refs`]).
+                        let page = self.pools.paging().page_size.max(1);
+                        lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                     }
-                    // A fresh lane buffering its own rows and carrying none,
-                    // its rs pages refs as its kv pages are.
-                    let page = self.rs_buffers.as_ref().map_or(1, |rs| rs.page_tokens());
-                    lane.rs = engine::fire::RsVerb::Buffer {
-                        pages: self
-                            .pools
-                            .walk_rs_refs((rows + carried).div_ceil(page).max(1))?,
-                        base: 0,
-                        folded: 0,
-                        fold: engine::fire::FoldLen::Host(0),
-                        lineage: engine::fire::Lineage::Set,
-                    };
+                    None => {}
                 }
                 Ok(lane)
             })
@@ -6256,6 +6375,39 @@ impl<B: Serve> Shell<B> {
             &mut Cursor::new(&place),
         )?;
         Ok(arm)
+    }
+
+    /// `lane` (of `rows` rows) as a load's walks make an rs lane: buffering
+    /// its rows (`RsVerb::Buffer`, folded at 0) and carrying `carried` rows
+    /// before them, which it replays from its buffer; its kv and rs pages
+    /// named by ref, as a walk's lanes past the seats are (a walk reads and
+    /// writes none of them), and a masked class's mask reaching the rows it
+    /// carries too.
+    fn rs_walk_lane(&self, lane: &mut NamingLane<B>, rows: u32, carried: u32) -> Result<()> {
+        let page = self.pools.paging().page_size.max(1);
+        lane.by_ref = Some(
+            self.pools
+                .walk_refs((rows + carried).div_ceil(page).max(1))?,
+        );
+        lane.carried = carried;
+        if lane.mask.is_some() {
+            let extent = rows + carried;
+            lane.mask = Some(Masking::Extent(engine::fire::Mask::new(
+                vec![0, extent],
+                u64::from(extent),
+            )));
+        }
+        let rs_page = self.rs_buffers.as_ref().map_or(1, |rs| rs.page_tokens());
+        lane.rs = engine::fire::RsVerb::Buffer {
+            pages: self
+                .pools
+                .walk_rs_refs((rows + carried).div_ceil(rs_page).max(1))?,
+            base: 0,
+            folded: 0,
+            fold: engine::fire::FoldLen::Host(0),
+            lineage: engine::fire::Lineage::Set,
+        };
+        Ok(())
     }
 
     /// Whether a lane of `class` runs a region of `axis`.
@@ -6472,10 +6624,17 @@ impl<B: Serve> Shell<Named<B>> {
         &mut self,
         lanes: &[(usize, u32)],
         found: &mut Found,
+        rs: Option<u32>,
     ) -> Result<Option<poem_exec::KernelError>> {
         let owned = lanes
             .iter()
-            .map(|&(class, rows)| self.naming_lane(class, rows))
+            .map(|&(class, rows)| {
+                let mut lane = self.naming_lane(class, rows)?;
+                if let Some(carried) = rs {
+                    self.rs_walk_lane(&mut lane, rows, carried)?;
+                }
+                Ok(lane)
+            })
             .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
         let (seated, media, clips) = lane_views(&owned);
         // Its seat-addressed lanes read the seats' runs: back their segments
@@ -6601,7 +6760,7 @@ impl<B: Serve> Shell<Named<B>> {
             let mut found = Found::new(regions);
             for class in 0..classes {
                 let lanes = self.alone(class, u64::from(tokens));
-                if let Some(refusal) = self.name_fire(&lanes, &mut found)?
+                if let Some(refusal) = self.name_fire(&lanes, &mut found, None)?
                     && !unservable.iter().any(|held| held.class == class)
                 {
                     tracing::warn!(
@@ -6626,8 +6785,29 @@ impl<B: Serve> Shell<Named<B>> {
                     .collect();
                 for trio in self.cuts(&refused) {
                     let lanes = trio.map(|class| (class, rows));
-                    if let Some(refusal) = self.name_fire(&lanes, &mut found)? {
+                    if let Some(refusal) = self.name_fire(&lanes, &mut found, None)? {
                         mixes.push((trio, refusal));
+                    }
+                }
+            }
+            // Where the trace buffers a recurrence, a lane of each servable
+            // class buffering its rows, and one replaying a page it carries:
+            // a speculative fire's committed scans and the buffer's gather.
+            if let Some(page) = self
+                .rs_buffers
+                .as_ref()
+                .filter(|_| self.rs_layout.is_some())
+                .map(|rs| rs.page_tokens())
+            {
+                for class in
+                    (0..classes).filter(|&c| !unservable.iter().any(|held| held.class == c))
+                {
+                    for (rows, carried) in [(tokens.min(page), 0), (1, page)] {
+                        if let Some(refusal) =
+                            self.name_fire(&[(class, rows)], &mut found, Some(carried))?
+                        {
+                            return Err(Fault::Fire(poem_exec::Error::Kernel(refusal)));
+                        }
                     }
                 }
             }

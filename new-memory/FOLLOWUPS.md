@@ -860,3 +860,11 @@ cutter (runtime, every backend): never compose a mixed fire the engine has no ca
 shape for; seat the decodes and the prompts that fit beside them, and defer the rest to the
 next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
 composition above.
+
+Also after ready, and not a fire's: a built-in inferlet's guest stages compile at its first
+registration on a machine (v6e, beam_search at widths 1, 4, 8: six guest programs, a prompt
+and a decode epilogue a width, x 8 batch rungs = 48 compiles of ~23 KB texts, ~20 s for each
+new width's first request). They persist: the next boots' same registrations took 0.017 s
+and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the ladder (0
+misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
+built-ins' guest programs before ready is GPU's queued item.

@@ -76,9 +76,6 @@ pub trait Host: Serve {
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)>;
 
-    /// Every step of a frame is submitted.
-    fn submitted(gpu: &Gpu<Self>);
-
     /// Before `step` resolves its inputs: the passes whose cells its forward
     /// reads. A pass that refuses (its instance poisoned, a guard) faults
     /// its own attachment's lanes into `faulted`; the others' run on.
@@ -296,6 +293,7 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
+            scale = held.scale,
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -390,6 +388,12 @@ impl<B: Host> Gpu<B> {
         if guest > 0 {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
+        }
+        // The submit-bound probes, apart from the model's fires: recorded at
+        // load where the backend keeps recordings.
+        let probed = self.shell.as_mut().map_or(0, Shell::probed_serving);
+        if probed > 0 {
+            self.live.tally(engine::live::Tally::Probed, probed);
         }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
@@ -973,12 +977,13 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::STATED_SUBMIT_BOUND
+                    submit_bound_ns: crate::rates::stated_submit_bound()
                         .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }
             },
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         self.shell = Some(shell);
@@ -1450,6 +1455,10 @@ where
         // The frame before can no longer be asked for its rows.
         if let Some(shell) = self.shell.as_mut() {
             shell.open_frame();
+            // Under a stated submit bound, a frame that follows an idle
+            // device re-times its clock before its first step is admitted
+            // (`crate::submit`); nothing runs where no bound is stated.
+            shell.retime(id).map_err(fault)?;
         }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
@@ -1505,7 +1514,6 @@ where
                 }
             }
         }
-        B::submitted(self);
         self.count_built();
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
