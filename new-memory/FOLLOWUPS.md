@@ -488,9 +488,19 @@ Streamed PLE rows (per-fire row indices, no cut) could roll as adapter banks do.
 Host RAM is attacked by shrinking the ladder instead: logprobs sharing the forward's
 programs, and prefill buckets chosen from measured costs.
 
-## F36. Vulkan: a fire's class windows bind at offsets the fire moves
+## F42. Vulkan: a fire's class windows bind at offsets the fire moves
 A fire that mixes classes (prefill rows with decode lanes) binds each class
 window's views at the window's row / lane offset, which moves with the rows of
 the classes before it, so those fires still record a family per prefill length
 after the fire block (sc/l40s-vkrec-fireblock). The kernels take a window offset
 (a fire-block word) and bind the views at the window's base.
+
+## F43. A buffering recurrent fire makes more dispatches than the load's bound
+A fire whose lanes buffer their recurrent rows (`RsVerb::Buffer`: a beam's, a
+draft's) moves rows into and out of the rs buffer a page at a time
+(`engine-gpu dispatch/rs.rs` `rs_move` / `rs_copy`), so its dispatches grow
+with its rows and pages. The load names its kernels from such a fire at the
+naming rung, but the dispatch bound (`Asks::dispatches`, which sizes the
+fire block) is the folding fires'. The copies become one kernel over the
+lane's page table (the rs copy loop in VULKAN-RECORD-AT-LOAD §4), after
+which the buffering fire's count is rung-free and joins the bound.

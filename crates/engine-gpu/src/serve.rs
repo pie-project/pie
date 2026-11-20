@@ -5805,6 +5805,7 @@ impl<B: Serve> Shell<Named<B>> {
     fn name_fire(
         &mut self,
         lanes: &[(usize, u32)],
+        rs: &engine::fire::RsVerb,
         found: &mut Found,
     ) -> Result<Option<poem_exec::KernelError>> {
         let owned = lanes
@@ -5819,6 +5820,7 @@ impl<B: Serve> Shell<Named<B>> {
                 adapter: lane.adapter,
                 inputs: &lane.inputs,
                 reads: &lane.reads,
+                rs,
                 ..Seated::of(Lane {
                     slot: at as u32,
                     word: lane.word,
@@ -5974,7 +5976,8 @@ impl<B: Serve> Shell<Named<B>> {
             let mut found = Found::new(regions);
             for class in 0..classes {
                 let lanes = self.alone(class, u64::from(tokens));
-                if let Some(refusal) = self.name_fire(&lanes, &mut found)?
+                if let Some(refusal) =
+                    self.name_fire(&lanes, &engine::fire::RsVerb::Fold, &mut found)?
                     && !unservable.iter().any(|held| held.class == class)
                 {
                     tracing::warn!(
@@ -5989,6 +5992,43 @@ impl<B: Serve> Shell<Named<B>> {
                     });
                 }
             }
+            // A load with recurrent state buffers a lane's rows where it
+            // does not fold them all (a beam's or a draft's): its rows are
+            // moved into and out of the buffer, and its recurrent layers
+            // commit as of the fold, kernels a folding fire never asks for.
+            // Its kernels only: its copies go a page at a time, so what it
+            // makes grows with its rows, and the bound is the folding
+            // fires' (FOLLOWUPS F43).
+            if self.rs_layout.is_some() {
+                // One lane, of the rows its seat's rs run holds at most: a
+                // seat-addressed lane's pages are its seat's, so only their
+                // count is read.
+                let page = self.pools.rs_rows().map_or(1, |rs| rs.tokens.max(1));
+                let per = self.pools.paging().pages_per_slot.max(1);
+                let rows = tokens.min(page.saturating_mul(per));
+                let buffer = engine::fire::RsVerb::Buffer {
+                    pages: vec![0; rows.div_ceil(page) as usize],
+                    base: 0,
+                    folded: 0,
+                    fold: engine::fire::FoldLen::Host(0),
+                    lineage: engine::fire::Lineage::Set,
+                };
+                for class in 0..classes {
+                    if unservable.iter().any(|held| held.class == class) {
+                        continue;
+                    }
+                    let lanes = [(class, rows)];
+                    let mut kernels_only = Found::new(regions);
+                    if let Some(refusal) = self.name_fire(&lanes, &buffer, &mut kernels_only)? {
+                        tracing::warn!(
+                            class,
+                            rung = tokens,
+                            "the kernels refuse a fire of this lane class that buffers its \
+                             recurrent rows: {refusal}"
+                        );
+                    }
+                }
+            }
             // Three lanes of a row or more each.
             if tokens >= naming_lanes() && self.held.len() >= naming_lanes() as usize {
                 mixed = true;
@@ -5999,7 +6039,9 @@ impl<B: Serve> Shell<Named<B>> {
                     .collect();
                 for trio in self.cuts(&refused) {
                     let lanes = trio.map(|class| (class, rows));
-                    if let Some(refusal) = self.name_fire(&lanes, &mut found)? {
+                    if let Some(refusal) =
+                        self.name_fire(&lanes, &engine::fire::RsVerb::Fold, &mut found)?
+                    {
                         mixes.push((trio, refusal));
                     }
                 }

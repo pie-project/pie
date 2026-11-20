@@ -1124,6 +1124,61 @@ fn a_hybrid_miniature_fires_every_rung_from_what_the_load_built() {
     every_rung_fires_what_the_load_built("qwen35-tiny");
 }
 
+/// A hybrid's lane that buffers its recurrent rows (a beam's, a draft's)
+/// moves them through the buffer and commits as of the fold: kernels no
+/// folding fire asks for, which the load names and builds all the same.
+#[test]
+fn a_hybrid_miniatures_buffering_fires_build_nothing_the_load_did_not() {
+    use engine::fire::{FoldLen, Lineage, RsVerb};
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let built = shell.compiled();
+    let per_page = shell
+        .pools()
+        .rs_rows()
+        .expect("a hybrid's pool lays an rs list")
+        .tokens
+        .max(1);
+    shell.open(0).expect("the slot opens");
+    let tokens: Vec<u32> = (0..8).map(|at| (at * 37 + 11) % 256).collect();
+    let buffer = |folded: u32, fold: u32| RsVerb::Buffer {
+        pages: vec![0; 8u32.div_ceil(per_page) as usize],
+        base: 0,
+        folded,
+        fold: FoldLen::Host(fold),
+        lineage: Lineage::Set,
+    };
+    // A prefill that folds, two rows buffered, then one row that replays
+    // them and folds them.
+    let fires = [
+        (0u32, 4usize, RsVerb::Fold),
+        (4, 2, buffer(4, 0)),
+        (6, 1, buffer(4, 2)),
+    ];
+    for (held, rows, rs) in &fires {
+        let seated = [Seated {
+            rs,
+            held: Some(*held),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, *rows as u32),
+                tokens: &tokens[*held as usize..*held as usize + rows],
+            })
+        }];
+        let got = shell
+            .fire_seated(&seated)
+            .unwrap_or_else(|why| panic!("{rows} row(s) held {held} under {rs:?} fire: {why}"));
+        assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
+        assert_eq!(
+            shell.compiled(),
+            built,
+            "{rows} row(s) held {held} under {rs:?} built a pipeline the load's walks did not name"
+        );
+    }
+}
+
 #[test]
 fn a_windowed_miniature_fires_every_rung_from_what_the_load_built() {
     every_rung_fires_what_the_load_built("gemma4-e4b-mini-l1");
