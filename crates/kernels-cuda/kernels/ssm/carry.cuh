@@ -36,12 +36,18 @@ struct Carry {
     // Each replayed row's page slot address (the host resolved
     // `pages[page_off + tok / page_tokens]`).
     const u64* replay_slot;
+    // The decode lanes' rows in a table of fixed shape: lane `rl`'s row `j`
+    // at `rl * dec_stride + j` (its page slot, its token in the page),
+    // `dec_n[rl]` of them; read by the lane alone, no lane table first.
+    const u64* dec_slot;
+    const u32* dec_tok;
+    const u32* dec_n;
     const int* commit_len;
     u8* scratch;
     u64 plane_off[3];
     u64 plane_stride[3];
     u32 page_tokens;
-    u32 pad_;
+    u32 dec_stride;
 
     __device__ __forceinline__ CarryLane lane(int rl) const {
         if (lanes == nullptr) return CarryLane{CARRY_NONE, 0u, 0u, 0u, 0u};
@@ -83,6 +89,24 @@ struct Carry {
     __device__ __forceinline__ T* own_row(const CarryLane& l, int e, int p) const {
         if (lanes == nullptr || l.at == CARRY_NONE) return nullptr;
         return at_tok<T>(l, l.at + static_cast<u32>(e), p);
+    }
+
+    // The rows decode lane `rl` carries (the fixed-shape table's count).
+    __device__ __forceinline__ int dec_count(int rl) const {
+        return dec_n == nullptr ? 0 : static_cast<int>(dec_n[rl]);
+    }
+
+    // Decode lane `rl`'s row `j`: its page slot and its token in the page.
+    __device__ __forceinline__ void dec_at(int rl, int j, u64& slot, u32& tok) const {
+        const long long at = static_cast<long long>(rl) * dec_stride + j;
+        slot = dec_slot[at];
+        tok = dec_tok[at];
+    }
+
+    // Decode lane `rl`'s carried scratch rows: `dec_stride` of its rows', then
+    // its own.
+    __device__ __forceinline__ long long dec_row(int rl, int j) const {
+        return static_cast<long long>(rl) * (dec_stride + 1) + j;
     }
 
     // The page slot of the lane's j-th carried row, and its token in it:

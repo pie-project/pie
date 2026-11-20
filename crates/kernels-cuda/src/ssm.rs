@@ -47,15 +47,18 @@ pub struct Carry {
     pub pages: u64,
     pub replay_tok: u64,
     pub replay_slot: u64,
+    pub dec_slot: u64,
+    pub dec_tok: u64,
+    pub dec_n: u64,
     pub commit_len: u64,
     pub scratch: u64,
     pub plane_off: [u64; 3],
     pub plane_stride: [u64; 3],
     pub page_tokens: u32,
-    pub pad: u32,
+    pub dec_stride: u32,
 }
 
-const _: () = assert!(size_of::<Carry>() == 104);
+const _: () = assert!(size_of::<Carry>() == 128);
 
 impl Carry {
     pub const NONE: Carry = Carry {
@@ -63,12 +66,15 @@ impl Carry {
         pages: 0,
         replay_tok: 0,
         replay_slot: 0,
+        dec_slot: 0,
+        dec_tok: 0,
+        dec_n: 0,
         commit_len: 0,
         scratch: 0,
         plane_off: [0; 3],
         plane_stride: [0; 3],
         page_tokens: 1,
-        pad: 0,
+        dec_stride: 0,
     };
 
     /// The kernels' argument.

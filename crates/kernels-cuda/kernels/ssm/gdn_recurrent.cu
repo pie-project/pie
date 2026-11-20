@@ -514,7 +514,7 @@ __global__ void __launch_bounds__(32) gdn_gates_carried(
     const int group = V_h / K_h;
     const int K_dim = K_h * K_d;
     const CarryLane cl = carry.lane(rl);
-    const int n = carry.carried(cl);
+    const int n = carry.dec_count(rl);
     float2* weights = reinterpret_cast<float2*>(carry.scratch);
     // Every load the warp needs, issued together: the own row's `[b | a]`,
     // q and k (four elements a lane), and each buffered row's page slot (a
@@ -539,17 +539,28 @@ __global__ void __launch_bounds__(32) gdn_gates_carried(
         gates[(long long)r_row * 2 * V_h + h] = glog_own;
         gates[(long long)r_row * 2 * V_h + V_h + h] =
             1.f / (1.f + __expf(-Elem<bf16>::to_f32(own_ba[h])));
-        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
-            dst[h] = own_ba[h];
-            dst[V_h + h] = own_ba[V_h + h];
-        }
     }
-    if (carry.scratch == nullptr) return;
+    // The own row's `[b | a]` lands in its buffer, at the end: its place
+    // waits on the lane's table.
+    auto land = [&]() {
+        if (lane < group) {
+            const int h = h_k * group + lane;
+            if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+                dst[h] = own_ba[h];
+                dst[V_h + h] = own_ba[V_h + h];
+            }
+        }
+    };
+    if (carry.scratch == nullptr) {
+        land();
+        return;
+    }
     if (n == 0) {
         if (lane < group) {
-            weights[(static_cast<long long>(cl.ext)) * V_h + h_k * group + lane] =
+            weights[carry.dec_row(rl, carry.dec_stride) * V_h + h_k * group + lane] =
                 make_float2(__expf(glog_own), 0.f);
         }
+        land();
         return;
     }
     float qs = 0.f;
@@ -576,7 +587,7 @@ __global__ void __launch_bounds__(32) gdn_gates_carried(
         const int rows = min(B, n - base);
         u64 slot = 0;
         u32 tok = 0;
-        if (lane < rows) carry.carried_at(cl, base + lane, slot, tok);
+        if (lane < rows) carry.dec_at(rl, base + lane, slot, tok);
         // The rows' keys, a row's four elements a lane, all in flight.
         float sq[B], sk[B], kk[B];
         #pragma unroll
@@ -638,7 +649,7 @@ __global__ void __launch_bounds__(32) gdn_gates_carried(
             const float total = __shfl_sync(0xffffffffu, later, 0);
             if (lane < rows) {
                 const float w = __expf(after[gi] + later - glog[gi]);
-                weights[(static_cast<long long>(cl.ext) + base + lane) * V_h + h_k * group + gi] =
+                weights[carry.dec_row(rl, base + lane) * V_h + h_k * group + gi] =
                     make_float2(w * dk, w * dq);
             }
             after[gi] += total;
@@ -648,8 +659,9 @@ __global__ void __launch_bounds__(32) gdn_gates_carried(
         float a = after[0];
         #pragma unroll
         for (int gi = 1; gi < 4; ++gi) a = lane == gi ? after[gi] : a;
-        weights[(static_cast<long long>(cl.ext) + n) * V_h + h_k * group + lane] = make_float2(__expf(a), 0.f);
+        weights[carry.dec_row(rl, carry.dec_stride) * V_h + h_k * group + lane] = make_float2(__expf(a), 0.f);
     }
+    land();
 }
 
 // `gdn_step_fused` over a lane's buffered rows then its own: the warp loads
@@ -737,13 +749,11 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         tl.fold = folds(write_state, write_state_mask, tl.rl);
         tl.j0 = vt * 16 + (lane & 1) * VEC;
         tl.cell = rows.atom<__nv_bfloat16>(rid, tl.h, (long long)K_d * V_d) + tl.j0;
-        const CarryLane cl = carry.lane(tl.rl);
-        tl.n = carry.carried(cl);
+        tl.n = carry.dec_count(tl.rl);
         tl.commit = carry.commit(tl.rl, tl.n + 1);
-        tl.ext = cl.ext;
-        tl.g0 = weights[(static_cast<long long>(cl.ext) + tl.n) * V_h + tl.h].x;
+        tl.g0 = weights[carry.dec_row(tl.rl, carry.dec_stride) * V_h + tl.h].x;
         const int j = CH * ((tl.n + CH - 1) / CH - 1) + lane;
-        if (tl.n > 0 && lane < CH && j < tl.n) carry.carried_at(cl, j, tl.slot, tl.tok);
+        if (tl.n > 0 && lane < CH && j < tl.n) carry.dec_at(tl.rl, j, tl.slot, tl.tok);
         return tl;
     };
     auto issue = [&](const Tile& tl, int stage) {
@@ -775,7 +785,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             for (int q = 0; q < 4; ++q) gdn_cp16(cs + lane * 64 + q * 16, ur + 4 * q, true);
             const int j = CH * ((tl.n + CH - 1) / CH - 1) + lane;
             const float* wsrc = reinterpret_cast<const float*>(
-                weights + (static_cast<long long>(tl.ext) + j) * V_h + tl.h);
+                weights + carry.dec_row(tl.rl, j) * V_h + tl.h);
             gdn_cp4(cs + CH * 64 + lane * 8, wsrc, true);
             gdn_cp4(cs + CH * 64 + lane * 8 + 4, wsrc + 1, true);
         }
@@ -814,16 +824,15 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         auto resolve = [&](const CarryLane& cl, int n, int j, u64& slot, u32& tok) {
             slot = 0;
             tok = 0;
-            if (j < n) carry.carried_at(cl, j, slot, tok);
+            if (j < n) carry.dec_at(cur.rl, j, slot, tok);
         };
         auto read_chunk = [&](const CarryLane& cl, int n, int base) {
             const int j = base + lane;
             if (lane >= CH || j >= n) return;
             u64 slot;
             u32 tok;
-            carry.carried_at(cl, j, slot, tok);
-            reinterpret_cast<float2*>(cs + CH * 64)[lane] =
-                weights[(static_cast<long long>(cl.ext) + j) * V_h + cur.h];
+            carry.dec_at(cur.rl, j, slot, tok);
+            reinterpret_cast<float2*>(cs + CH * 64)[lane] = weights[carry.dec_row(cur.rl, j) * V_h + cur.h];
             const float4* ur = reinterpret_cast<const float4*>(
                 carry.plane_at<const float>(slot, tok, 2) + (long long)cur.h * V_d + (cur.j0 & ~15));
             float4* sr = reinterpret_cast<float4*>(su + lane * 16);
@@ -973,6 +982,13 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
                 dst[0] = make_float4(o[0], o[1], o[2], o[3]);
                 dst[1] = make_float4(o[4], o[5], o[6], o[7]);
+            }
+            // The head's first tile lands the own row's `[b | a]` pair.
+            if ((cur.j0 & ~15) == 0 && lane < 2) {
+                if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+                    const int at = lane * V_h + cur.h;
+                    dst[at] = ba[(long long)cur.r_row * 2 * V_h + at];
+                }
             }
         }
         __syncwarp();

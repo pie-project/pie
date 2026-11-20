@@ -446,6 +446,11 @@ pub struct RsTables {
     /// Each replayed row's page slot address (a CUDA decode step's; HIP's
     /// kernels read the page table).
     pub replay_slot: DevicePtr,
+    /// The decode lanes' buffered rows (a CUDA decode step's).
+    pub dec_slot: DevicePtr,
+    pub dec_tok: DevicePtr,
+    pub dec_n: DevicePtr,
+    pub dec_stride: u32,
     /// The rows a page holds.
     pub page_tokens: u32,
 }

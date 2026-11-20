@@ -914,7 +914,9 @@ impl FireCtx<'_> {
         let rs_scratch = self
             .rs_scratch
             .filter(|_| p.rs.rows_ext > 0)
-            .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes, p.rs.rows_ext));
+            .map(|(ptr, bytes)| {
+                crate::run::RsScratch::new(ptr, bytes, p.rs.rows_ext).decoding(self.inputs.dec_rows())
+            });
         if p.rs.body.buffers()
             && let Some(buffers) = self.buffers
         {
@@ -930,6 +932,10 @@ impl FireCtx<'_> {
                     pages: tables.pages,
                     replay_tok: tables.replay_tok,
                     replay_slot: tables.replay_slot,
+                    dec_slot: tables.dec_slot,
+                    dec_tok: tables.dec_tok,
+                    dec_n: tables.dec_n,
+                    dec_stride: tables.dec_stride,
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,
