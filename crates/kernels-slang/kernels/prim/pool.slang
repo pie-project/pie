@@ -19,6 +19,8 @@
 //   PIE_POOL_VIEW_RO(k_pages, uint16_t, 2u * params.k_origin)
 //
 // after which `k_pages[i]` reads virtual element `k_origin + i`.
+//
+// `PIE_ONE_SEGMENT` reads `pie_seg0` alone, so WGSL drops the other three bindings.
 
 #define PIE_POOL_SEGMENTS(access_, type_, binding_) \
     [[vk::binding(binding_)]] access_<type_> pie_seg0; \
@@ -26,6 +28,40 @@
     [[vk::binding(binding_ + 2)]] access_<type_> pie_seg2; \
     [[vk::binding(binding_ + 3)]] access_<type_> pie_seg3;
 
+#if defined(PIE_ONE_SEGMENT)
+#define PIE_POOL_READ(type_, seg_) \
+    type_ pie_pool_get(uint v) { \
+        return pie_seg0[v]; \
+    } \
+    void pie_pool_at(uint v, out uint seg, out uint local) { \
+        seg = 0u; \
+        local = v; \
+    } \
+    void pie_pool_find(uint v, out uint seg, out uint local) { \
+        seg = 0u; \
+        local = v; \
+    } \
+    struct pie_pool_chain_ro { \
+        __subscript(uint i)->type_ { \
+            get { return pie_pool_get(i); } \
+        } \
+    }; \
+    static pie_pool_chain_ro pie_pool_chain;
+#define PIE_POOL_ON(seg_, body_) { body_(pie_seg0) }
+#define PIE_POOL_ON_RW(seg_, body_) { body_(pie_seg0) }
+#define PIE_POOL_BRANCH(seg_, body_) { body_(pie_seg0) }
+#define PIE_POOL_WRITE(type_, seg_) \
+    void pie_pool_set(uint v, type_ x) { \
+        pie_seg0[v] = x; \
+    } \
+    struct pie_pool_chain_rw_t { \
+        __subscript(uint i)->type_ { \
+            get { return pie_pool_get(i); } \
+            set { pie_pool_set(i, newValue); } \
+        } \
+    }; \
+    static pie_pool_chain_rw_t pie_pool_chain_rw;
+#else
 #define PIE_POOL_READ(type_, seg_) \
     type_ pie_pool_get(uint v) { \
         uint s = (seg_); \
@@ -130,6 +166,7 @@
         } \
     }; \
     static pie_pool_chain_rw_t pie_pool_chain_rw;
+#endif
 
 // A record cut into pieces (SPEC 4: a fixed row larger than a slot is cut on
 // its atom axis into equal pieces, each in a slot of its own at one common

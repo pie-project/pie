@@ -42,7 +42,11 @@ void pie_xt_at(uint e, uint atom_first, uint seg_words, uint unit_words, uint at
     uint unit = pie_xt_units[a];
     if (unit != PIE_XT_NOT_HELD) {
         uint v = unit * unit_words;
+#if defined(PIE_ONE_SEGMENT)
+        uint s = 0u;
+#else
         uint s = min(v / max(seg_words, 1u), 3u);
+#endif
         pie_xt_which = s;
         pie_xt_base = v - s * seg_words;
     } else {
@@ -63,6 +67,7 @@ uint pie_xt_word(uint i) {
     if (pie_xt_which == 0u) {
         return pie_seg0[at];
     }
+#if !defined(PIE_ONE_SEGMENT)
     if (pie_xt_which == 1u) {
         return pie_seg1[at];
     }
@@ -72,6 +77,7 @@ uint pie_xt_word(uint i) {
     if (pie_xt_which == 3u) {
         return pie_seg3[at];
     }
+#endif
     if (pie_xt_which == 4u) {
         return pie_xt_stage[at];
     }

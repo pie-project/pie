@@ -12,9 +12,10 @@ fn main() {
     std::fs::create_dir_all(&out).expect("create the output directory");
     let mut index = String::from("[\n");
     for (i, (key, file, wgsl)) in kernels_slang::WGSL.iter().enumerate() {
+        let base = key.strip_suffix(".seg1").unwrap_or(key);
         let tier = kernels_slang::CENSUS
             .iter()
-            .find(|(k, ..)| k == key)
+            .find(|(k, ..)| *k == base)
             .map_or("baseline", |(_, _, tier, _)| *tier);
         std::fs::write(out.join(format!("{key}.wgsl")), promote_storage(wgsl))
             .expect("write a shader");
