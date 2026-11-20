@@ -1068,6 +1068,8 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         request_of_token: rig.zeros(s.rows, 1, Dtype::I32)?,
         mask: rig.zeros(1, 4, Dtype::U8)?,
         mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
+        row0: 0,
+        rows: s.rows,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     // A new shape's first fire is estimated before it is submitted (from
