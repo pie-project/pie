@@ -2123,8 +2123,12 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// Unstated `budget`: `seats` sequences at `context` and at least the
-    /// pool's kv pages, within a quarter of the free disk.
+    /// The disk tier: a slot file of `budget` bytes in disk chunks, any
+    /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
+    /// [`Pools::disk_division`] lay them; stated at load. Unstated
+    /// `budget`: a disk chunk for each of the pool's chunks, and at least
+    /// the kv pages of `seats` sequences at `context`, within a quarter of
+    /// the free disk. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2134,15 +2138,20 @@ impl<B: Serve> Shell<B> {
     ) -> Result<u32> {
         let Some(dir) = dir else { return Ok(0) };
         let paging = self.pools.paging();
+        let layout = *self.pools.layout();
+        let chunk = self.pools.disk_chunk_bytes();
         let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
+            let pages =
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
             engine::disk::unstated_budget(
                 dir,
                 0,
                 0,
-                paging.pages(),
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.page_bytes(),
+                u64::from(layout.total_chunks),
+                pages.div_ceil(per_list),
+                chunk,
             )
         });
         if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
@@ -2151,7 +2160,25 @@ impl<B: Serve> Shell<B> {
             }
             self.pools.unseat_disk();
         }
-        Ok(self.pools.disk_pages())
+        let chunks = self.pools.disk_chunks();
+        if chunks > 0 {
+            let division = self
+                .pools
+                .disk_division()
+                .iter()
+                .map(|(id, per, bytes)| format!("shape {id}: {per} slots of {bytes} bytes"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::info!(
+                budget,
+                chunks,
+                chunk_bytes = chunk,
+                %division,
+                "the disk tier's slot file: disk chunks of a pool chunk each, laid out \
+                 as the device's, any state shape's slots in any chunk"
+            );
+        }
+        Ok(chunks)
     }
 
     /// Copies whole fixed slots (slot refs) `(src, dst)`: a record written
