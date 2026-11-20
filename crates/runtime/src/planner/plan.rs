@@ -731,7 +731,22 @@ impl ResidencyPlanner {
                         !other_restoring,
                         "selected only with no other restoring that can still fire"
                     );
-                    if pid.is_some_and(|pid| self.port.room_beside_own(pid, need.run, need.pieces)) {
+                    // The one placement its restore is sent on: its serve's
+                    // state, every piece of its unpark, then the bind's runs
+                    // ([`super::pool::PoolPort::restore_stands`]). Read
+                    // beside its dead parts alone, the bind stood here while
+                    // the restore's own check, after its unpark took its live
+                    // parts and its runs of two, did not: sent, refused
+                    // (PendingBindShort), sent again (Mac Pro at 2 GiB on
+                    // 7e75af541: 52k no-step lines, free runs (7, 3)).
+                    let state = self.with_inner(|inner| {
+                        inner.queue.get(&key).map(super::wait::Waiter::rs_need).unwrap_or_default()
+                    });
+                    let bind = RunNeed::one(need.run, need.pieces);
+                    if pid.is_some_and(|pid| {
+                        self.port.restore_stands(pid, &bind, state, Some((need.run, need.pieces)))
+                    }) {
+                        self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
                         continue;
                     }

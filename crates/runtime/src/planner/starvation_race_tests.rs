@@ -2573,12 +2573,16 @@ impl BindRoomPool {
 impl PoolPort for BindRoomPool {
     fn restore_stands(
         &self,
-        _pid: ProcessId,
+        pid: ProcessId,
         need: &super::pool::RunNeed,
         state: RsUnits,
-        _bind: Option<(u32, u32)>,
+        bind: Option<(u32, u32)>,
     ) -> bool {
-        !self.store_refuses.load(Ordering::Relaxed) && self.guest_need_free(need, state)
+        !self.store_refuses.load(Ordering::Relaxed)
+            && match bind {
+                Some((run, pieces)) => self.room_beside_own(pid, run, pieces),
+                None => self.guest_need_free(need, state),
+            }
     }
     fn chunk_stats(&self) -> ChunkStats {
         let rs = self.rs_free.load(Ordering::Relaxed);
@@ -8962,4 +8966,70 @@ fn an_eviction_copy_refused_untouched_keeps_its_process() {
         assert!(inner.prepare_blocked.contains(&pid), "no victim until the pool moves");
         assert!(inner.evicting.is_empty(), "its eviction is settled");
     });
+}
+
+/// Mac Pro at 2 GiB on 7e75af541: a 52k-line no-step spin, head dc373c1e
+/// a bind-suspended restore, free runs (7, 3) beside its need, refused each
+/// time by its own check (PendingBindShort, free runs after its own unpark
+/// 1). The pass read the bind's runs beside its dead parts alone and sent
+/// it; the restore, after its unpark took the rest, refused. The pass now
+/// reads the one placement the restore is checked by, and where that does
+/// not stand it is not sent: room is made for it instead.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(16, 0..0, 64)
+    });
+    pool.free.lock().extend(0..16);
+    pool.store_refuses.store(true, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(PendingBind {
+            run: 7,
+            pieces: 2,
+            pages: 14,
+        });
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    for _ in 0..20 {
+        planner.pages_freed();
+        planner.poke();
+        for _ in 0..5 {
+            crate::rt::yield_now().await;
+        }
+    }
+    let state = planner.with_inner(|inner| inner.procs[&pid].state);
+    assert_eq!(state, Residency::Evicted, "its placement does not stand: not sent");
+    let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
+    assert!(!plan.contains("bind-suspended restore sent"), "{plan}");
+    // Its placement stands: sent.
+    pool.store_refuses.store(false, Ordering::Relaxed);
+    planner.pages_freed();
+    planner.poke();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if planner.with_inner(|inner| inner.procs[&pid].state) != Residency::Evicted {
+            break;
+        }
+    }
+    let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
+    assert_ne!(
+        planner.with_inner(|inner| inner.procs[&pid].state),
+        Residency::Evicted,
+        "sent once its placement stands: {plan} {}",
+        planner.debug_queue()
+    );
 }
