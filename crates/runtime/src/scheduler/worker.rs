@@ -1610,6 +1610,13 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // Frames held out under the cap are owed a raise: the cap's
+            // owner is told, its walk raising the rung to them (a hold with
+            // nothing in flight waited on a raise nothing asked for).
+            crate::store::shared::owe_cut_rows(
+                engine_id,
+                u32::try_from(frame_policy.cut_owed()).unwrap_or(u32::MAX),
+            );
             progress |= dispatched;
             if stopping
                 && pending.is_empty()

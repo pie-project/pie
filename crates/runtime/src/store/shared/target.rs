@@ -152,7 +152,9 @@ impl SharedGrow {
     /// where nothing moves. Not the engine's whole lane count: a pool with
     /// one live lane rests at a small rung.
     fn walk_rows(&self) -> u32 {
-        super::wanted_rows(self.engine).max((self.live_lanes)())
+        super::wanted_rows(self.engine)
+            .max((self.live_lanes)())
+            .max(super::owed_cut_rows(self.engine))
     }
 
     /// The rows the walk holds the rung to while a process's demand waits
@@ -160,7 +162,9 @@ impl SharedGrow {
     /// admitted work needs; a throughput ask (a cuttable pass's) waits
     /// behind every process demand.
     fn waiting_rows(&self) -> u32 {
-        (self.live_lanes)().max(1)
+        (self.live_lanes)()
+            .max(1)
+            .max(super::owed_cut_rows(self.engine))
     }
 
     pub(crate) async fn walk_rung(&self) {
@@ -238,11 +242,14 @@ impl SharedGrow {
                     }
                     Err(_) if blocked => Ok(RungStep::Wait),
                     // No throughput raise past what is set aside while a
-                    // process's demand waits.
+                    // process's demand waits; a raise to the frames held
+                    // out under the cap is admitted work, and goes.
                     Ok(RungStep::Raise { ref evacuation, .. })
                         if waits
                             && pool.pool().act_chunks(evacuation.rung)
-                                > pool.pool().act_reserved() =>
+                                > pool.pool().act_reserved()
+                            && pool.rung_for(super::owed_cut_rows(self.engine))
+                                < evacuation.rung =>
                     {
                         Ok(RungStep::Wait)
                     }

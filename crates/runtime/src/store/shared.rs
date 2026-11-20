@@ -88,6 +88,13 @@ struct RungGate {
     /// `u32::MAX` at the largest and where no pool steers the engine): no
     /// step wider reaches it ([`engine_rows`]).
     held: std::sync::atomic::AtomicU32,
+    /// The widest rung rows of a frame the scheduler holds out under the
+    /// cap ([`owe_cut_rows`]): fires cut under a wider cap before it came
+    /// down, queued and no longer cuttable. Admitted work, not throughput:
+    /// the walk holds the rung to it even while a process's demand waits,
+    /// or the frame waited on a raise nothing asked for, nothing in flight
+    /// to wake it. 0 where none is held.
+    owed: std::sync::atomic::AtomicU32,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -118,10 +125,33 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
+                owed: std::sync::atomic::AtomicU32::new(0),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
         })
+}
+
+/// The scheduler of `engine` holds frames out under the cap whose widest
+/// fire takes `rows` rung rows (0: none): what the walk raises the rung to
+/// as admitted work ([`RungGate::owed`]). A change asks the walk to look,
+/// so the raise is triggered by the hold itself, not by a fire that may
+/// never come.
+pub fn owe_cut_rows(engine: usize, rows: u32) {
+    let was = rung_gate(engine)
+        .owed
+        .swap(rows, std::sync::atomic::Ordering::AcqRel);
+    if rows > 0 && rows != was {
+        ask_walk(engine);
+    }
+}
+
+/// See [`owe_cut_rows`].
+#[must_use]
+pub fn owed_cut_rows(engine: usize) -> u32 {
+    rung_gate(engine)
+        .owed
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Asks `engine`'s walker to look now: what waits on it (a bind whose term
@@ -189,10 +219,15 @@ pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
 }
 
 fn set_fire_cap(engine: usize, tokens: u32) {
-    rung_gate(engine)
+    let was = rung_gate(engine)
         .cap
-        .store(tokens, std::sync::atomic::Ordering::Release);
+        .swap(tokens, std::sync::atomic::Ordering::AcqRel);
     rung_changed(engine);
+    // A cap risen to frames the scheduler holds out: it looks again now,
+    // nothing in flight being sure to wake it.
+    if tokens > was && owed_cut_rows(engine) > 0 {
+        crate::scheduler::nudge(engine);
+    }
 }
 
 /// The rows a step on `engine` may take: the rung the engine holds
