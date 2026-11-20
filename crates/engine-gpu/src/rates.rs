@@ -103,22 +103,81 @@ pub const COPY_BYTES: u64 = 256 << 20;
 /// So the bound stated on Android is `adreno_drawobj_timeout`'s 2 s, the
 /// one duration the driver states; where the GMU's bail-out is shorter, the per-submit
 /// trace (`RUST_LOG=engine_gpu::rates=debug`) shows the estimate and time
-/// of every submission up to the one that faults. None stated elsewhere.
+/// of every submission up to the one that faults.
 ///
-/// Every engine that submits through the platform's GPU driver (Vulkan,
-/// wgpu) states this one.
-pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> =
-    stated_submit_bound(cfg!(target_os = "android"));
-
-/// [`STATED_SUBMIT_BOUND`] on a platform that is Android or not: the
-/// driver's 2 s there, none elsewhere.
+/// On Windows the bound is the display driver's timeout detection (TDR): a
+/// submission past `TdrDelay` seconds resets the GPU and loses the device.
+/// The platform states it in the registry (`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`):
+/// `TdrDelay`, 2 when absent (Windows' own
+/// default), and none where `TdrLevel` is 0 (detection off). None stated
+/// elsewhere.
+///
+/// Read once, at the first load. Every engine that submits through the
+/// platform's GPU driver (Vulkan, wgpu) states this one.
 #[must_use]
-pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
-    if android {
-        Some(std::time::Duration::from_secs(2))
-    } else {
-        None
+pub fn stated_submit_bound() -> Option<std::time::Duration> {
+    static STATED: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *STATED.get_or_init(platform_submit_bound)
+}
+
+#[cfg(target_os = "android")]
+fn platform_submit_bound() -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(2))
+}
+
+#[cfg(windows)]
+fn platform_submit_bound() -> Option<std::time::Duration> {
+    tdr_bound(tdr_value("TdrLevel"), tdr_value("TdrDelay"))
+}
+
+#[cfg(not(any(target_os = "android", windows)))]
+fn platform_submit_bound() -> Option<std::time::Duration> {
+    None
+}
+
+/// The bound Windows' timeout detection states: none where `TdrLevel` is 0
+/// (detection off), else `TdrDelay` seconds, 2 where the registry states
+/// none.
+#[must_use]
+pub fn tdr_bound(level: Option<u32>, delay: Option<u32>) -> Option<std::time::Duration> {
+    if level == Some(0) {
+        return None;
     }
+    Some(std::time::Duration::from_secs(u64::from(
+        delay.unwrap_or(2),
+    )))
+}
+
+/// A `GraphicsDrivers` DWORD the registry states, or none.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn tdr_value(name: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
+    };
+    let wide = |text: &str| {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let key = wide(r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers");
+    let value = wide(name);
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: the key and value names are NUL-terminated UTF-16 that outlive
+    // the call, and `data` holds the `size` bytes a DWORD takes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut data).cast(),
+            &raw mut size,
+        )
+    };
+    (status == 0).then_some(data)
 }
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
@@ -1644,10 +1703,22 @@ fn scan<B: Serve>(
             s.conv_width,
             1,
             qkv,
+            0,
         )
         .map_err(fault("rates: conv"))?;
         kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-            sink, tactic, qkv, csr, gates, scan_state, s.k_heads, s.v_heads, s.k_dim, s.v_dim, y,
+            sink,
+            tactic,
+            qkv,
+            csr,
+            gates,
+            scan_state,
+            s.k_heads,
+            s.v_heads,
+            s.k_dim,
+            s.v_dim,
+            y,
+            kernels_slang::ssm::RowSpan::whole(qkv),
         )
         .map_err(fault("rates: scan"))
     })?;

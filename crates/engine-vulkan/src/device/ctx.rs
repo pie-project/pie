@@ -459,14 +459,30 @@ pub struct Context {
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
 /// build marks it changed, and it reaches its file shortly after rather
-/// than at shutdown: a phone kills an app's process more often than the app
-/// shuts down.
+/// than at shutdown (a phone kills an app's process more often than the app
+/// shuts down), written by a thread of its own once builds have paused: no
+/// submission waits on the driver's serialization of the cache or on the
+/// file.
 pub struct PipelineCache {
     core: Arc<Core>,
     cache: vk::PipelineCache,
     path: Option<std::path::PathBuf>,
-    changed: std::sync::atomic::AtomicBool,
-    written: Mutex<std::time::Instant>,
+    signal: Arc<CacheSignal>,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// What a build tells the cache's writer: when the cache last changed, and
+/// that it is to stop (writing what changed first).
+#[derive(Default)]
+struct CacheSignal {
+    state: Mutex<CacheState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CacheState {
+    changed_at: Option<std::time::Instant>,
+    stop: bool,
 }
 
 /// How long a changed cache waits for more builds before it is written.
@@ -489,12 +505,20 @@ impl PipelineCache {
         let cache = make(&initial)
             .or_else(|_| make(&[]))
             .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
+        let signal = Arc::new(CacheSignal::default());
+        let writer = path.clone().map(|path| {
+            let (core, signal) = (Arc::clone(core), Arc::clone(&signal));
+            std::thread::Builder::new()
+                .name("pipeline cache".into())
+                .spawn(move || write_settled(&core, cache, &path, &signal))
+                .expect("a pipeline cache writer thread")
+        });
         Ok(PipelineCache {
             core: Arc::clone(core),
             cache,
             path,
-            changed: std::sync::atomic::AtomicBool::new(false),
-            written: Mutex::new(std::time::Instant::now()),
+            signal,
+            writer: Mutex::new(writer),
         })
     }
 
@@ -508,59 +532,89 @@ impl PipelineCache {
         self.path.as_deref()
     }
 
-    /// Marks the cache changed by a build.
+    /// Marks the cache changed by a build: its writer writes it once builds
+    /// have paused for [`PIPELINE_CACHE_SETTLE`].
     pub fn built(&self) {
-        self.changed.store(true, Ordering::Release);
+        let mut state = self.signal.state.lock().expect("cache signal poisoned");
+        state.changed_at = Some(std::time::Instant::now());
+        self.signal.wake.notify_one();
     }
+}
 
-    /// Writes a changed cache once builds have paused for a moment.
-    pub fn settle(&self) {
-        let due = self.changed.load(Ordering::Acquire)
-            && self
-                .written
-                .lock()
-                .expect("written lock poisoned")
-                .elapsed()
-                >= PIPELINE_CACHE_SETTLE;
-        if due && let Err(fault) = self.persist() {
-            tracing::warn!(%fault, "writing the pipeline cache");
-        }
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        if !self.changed.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        // SAFETY: `self.cache` is a live cache of `self.core.device`; reading
-        // its data may race pipeline builds that use it, which Vulkan allows,
-        // as `vkGetPipelineCacheData` does not need it externally synchronized.
-        let bytes = unsafe { self.core.device.get_pipeline_cache_data(self.cache) }
-            .map_err(|e| self.core.fault("vkGetPipelineCacheData", e))?;
-        let io = |call: &'static str| {
-            move |e: std::io::Error| Fault::Device {
-                call,
-                why: e.to_string(),
+/// The cache's writer: waits for a change, then for builds to pause for
+/// [`PIPELINE_CACHE_SETTLE`], and writes the cache to `path`; on stop, writes
+/// what changed and returns.
+fn write_settled(
+    core: &Core,
+    cache: vk::PipelineCache,
+    path: &std::path::Path,
+    signal: &CacheSignal,
+) {
+    let mut state = signal.state.lock().expect("cache signal poisoned");
+    loop {
+        match state.changed_at {
+            None if state.stop => return,
+            None => {
+                state = signal.wake.wait(state).expect("cache signal poisoned");
             }
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+            Some(at) if !state.stop && at.elapsed() < PIPELINE_CACHE_SETTLE => {
+                let left = PIPELINE_CACHE_SETTLE - at.elapsed();
+                state = signal
+                    .wake
+                    .wait_timeout(state, left)
+                    .expect("cache signal poisoned")
+                    .0;
+            }
+            Some(_) => {
+                state.changed_at = None;
+                drop(state);
+                if let Err(fault) = write_cache(core, cache, path) {
+                    tracing::warn!(%fault, "writing the pipeline cache");
+                }
+                state = signal.state.lock().expect("cache signal poisoned");
+            }
         }
-        // Whole or not at all: a reader never meets a half-written file.
-        let partial = path.with_extension("partial");
-        std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
-        std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
     }
+}
+
+/// The cache's data, written whole to `path`.
+fn write_cache(core: &Core, cache: vk::PipelineCache, path: &std::path::Path) -> Result<()> {
+    // SAFETY: `cache` is a live cache of `core.device` (its owner joins this
+    // thread before destroying it); reading its data may race pipeline
+    // builds that use it, which Vulkan allows, as `vkGetPipelineCacheData`
+    // does not need it externally synchronized.
+    let bytes = unsafe { core.device.get_pipeline_cache_data(cache) }
+        .map_err(|e| core.fault("vkGetPipelineCacheData", e))?;
+    let io = |call: &'static str| {
+        move |e: std::io::Error| Fault::Device {
+            call,
+            why: e.to_string(),
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+    }
+    // Whole or not at all: a reader never meets a half-written file.
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
+    std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
-        let _ = self.persist();
-        // SAFETY: this is the last `Arc<PipelineCache>`, so no build is using
-        // the cache; pipelines made from it do not depend on it.
+        // The writer writes what changed and returns before the cache goes.
+        self.signal
+            .state
+            .lock()
+            .expect("cache signal poisoned")
+            .stop = true;
+        self.signal.wake.notify_one();
+        if let Some(writer) = self.writer.lock().expect("writer lock poisoned").take() {
+            let _ = writer.join();
+        }
+        // SAFETY: this is the last `Arc<PipelineCache>` and its writer has
+        // returned, so nothing uses the cache; pipelines made from it do not
+        // depend on it.
         unsafe { self.core.device.destroy_pipeline_cache(self.cache, None) };
     }
 }
@@ -634,11 +688,13 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
         device = name,
         available = room.available,
         defended = room.defended,
+        cgroup = ?room.cgroup,
         floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
         "read at bind: the device shares the host's memory, so the load takes what it has \
-         available, less what lmkd keeps free past it, less the floor"
+         available, less what lmkd keeps free past it, capped at what \
+         its cgroups leave, less the floor"
     );
     Ok(Some(room.room.saturating_add(held)))
 }
@@ -2357,6 +2413,33 @@ mod tests {
     use std::time::Instant;
 
     use super::{Context, Ordering};
+
+    /// A build marks the cache changed and returns without writing it (no
+    /// submission or build waits on the file); the cache's writer writes it,
+    /// at the latest when the cache goes.
+    #[test]
+    fn a_built_cache_is_written_off_the_build_and_by_the_time_it_goes() {
+        let dir = std::env::temp_dir().join(format!("pie-vk-cache-{}", std::process::id()));
+        let path = dir.join("pipelines.bin");
+        let _ = std::fs::remove_file(&path);
+        let boot = crate::api::DeviceBoot {
+            pipeline_cache: Some(path.clone()),
+            ..crate::api::DeviceBoot::default()
+        };
+        let bound = Context::bind(&boot, engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        context.pipeline_cache().built();
+        assert!(!path.exists(), "the build wrote the cache itself");
+        drop(context);
+        assert!(
+            path.exists(),
+            "the cache went without its writer writing it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A replayed frame's fence has one waiter, the watcher that runs its
     /// `on_done`; the caller's wait returns when that watcher releases it,

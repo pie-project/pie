@@ -76,9 +76,6 @@ pub trait Host: Serve {
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)>;
 
-    /// Every step of a frame is submitted.
-    fn submitted(gpu: &Gpu<Self>);
-
     /// Before `step` resolves its inputs: the passes whose cells its forward
     /// reads. A pass that refuses (its instance poisoned, a guard) faults
     /// its own attachment's lanes into `faulted`; the others' run on.
@@ -974,7 +971,7 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::STATED_SUBMIT_BOUND
+                    submit_bound_ns: crate::rates::stated_submit_bound()
                         .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
@@ -1510,7 +1507,6 @@ where
                 }
             }
         }
-        B::submitted(self);
         self.count_built();
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
