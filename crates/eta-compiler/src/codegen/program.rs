@@ -95,6 +95,16 @@ impl Backend {
             Backend::Metal => crate::codegen::metal::METAL_M1_EMITTER_VERSION as u32,
         }
     }
+
+    /// The library forms this backend's emitters serve
+    /// ([`crate::plan::LibraryForms`]): what the planner may form for it.
+    #[must_use]
+    pub const fn library_forms(self) -> crate::plan::LibraryForms {
+        match self {
+            Backend::Metal => crate::codegen::metal::LIBRARY_FORMS,
+            Backend::Cuda | Backend::Hip => crate::plan::LibraryForms::ALL,
+        }
+    }
 }
 
 pub fn emit_program(
