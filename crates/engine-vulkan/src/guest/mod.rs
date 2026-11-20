@@ -23,22 +23,18 @@ pub enum Slot {
     Stepped,
 }
 
-/// The layout every guest pipeline binds (group 0): storage buffers, the
-/// config a uniform, and the step's node, rung and selector a uniform at its offset.
+/// The layout every guest pipeline binds (group 0): the status, the
+/// tables and the heap storage buffers, and the step's record a uniform at
+/// its offset.
 #[must_use]
 pub fn stage_layout() -> Vec<(u32, Slot)> {
-    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING, STEP_BINDING};
-    (0..BINDINGS)
-        .map(|at| {
-            let slot = if at == CFG_BINDING {
-                Slot::Uniform
-            } else {
-                Slot::Storage
-            };
-            (at, slot)
-        })
-        .chain([(STEP_BINDING, Slot::Stepped)])
-        .collect()
+    use engine_gpu::guest::session::{HEAP_BINDING, STATUS_BINDING, STEP_BINDING, TABLES_BINDING};
+    vec![
+        (STATUS_BINDING, Slot::Storage),
+        (TABLES_BINDING, Slot::Storage),
+        (HEAP_BINDING, Slot::Storage),
+        (STEP_BINDING, Slot::Stepped),
+    ]
 }
 
 /// The descriptor type a layout binds `slot` as.

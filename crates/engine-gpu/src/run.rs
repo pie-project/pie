@@ -287,6 +287,9 @@ pub struct Run<'c, B: Backend> {
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
     tier: kernels_slang::Tier,
+
+    /// The dense matmul's tactic at each rung.
+    dense: &'c crate::dense::Dense,
 }
 
 impl<'c, B: Backend> Run<'c, B> {
@@ -311,6 +314,7 @@ impl<'c, B: Backend> Run<'c, B> {
         hashes: &'c crate::weights::NgramHashes<B>,
         tuning: &'c B::Tuning,
         tier: kernels_slang::Tier,
+        dense: &'c crate::dense::Dense,
         rows: Option<&'c crate::experts::Gathered<B>>,
         host: Option<&'c crate::experts::HostTier<B>>,
     ) -> Self {
@@ -341,11 +345,17 @@ impl<'c, B: Backend> Run<'c, B> {
             tuning,
             split: None,
             tier,
+            dense,
         }
     }
 
     pub fn tier(&self) -> kernels_slang::Tier {
         self.tier
+    }
+
+    /// The dense matmul's tactic at each rung.
+    pub fn dense(&self) -> &'c crate::dense::Dense {
+        self.dense
     }
 
     /// Submits the frame each time a node of a new layer has run.
@@ -411,6 +421,45 @@ impl<'c, B: Backend> Run<'c, B> {
         }
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
+    }
+
+    /// A row-shaped value as attention binds it: in a window of the fire's
+    /// own rows, the fire's whole value, the window's rows from
+    /// [`Self::row0`] on (so its views are the ones the load bound, whatever
+    /// window a fire cuts); in a gathered window, its compacted column.
+    pub fn attended(&self, id: ValueId) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.tensor(id)
+        } else {
+            self.uncut(id)
+        }
+    }
+
+    /// A fire table as attention binds it, as [`Self::attended`]: whole, or
+    /// a gathered window's own.
+    pub fn attended_rows(&self, handle: Tensor) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.cut_rows(handle)
+        } else {
+            handle
+        }
+    }
+
+    /// The row of what [`Self::attended`] binds the window's first row is.
+    pub fn row0(&self) -> u32 {
+        if self.window().gathered.is_some() {
+            0
+        } else {
+            self.window().span.row_offset
+        }
+    }
+
+    /// The window's rows.
+    pub fn window_rows(&self) -> u32 {
+        match &self.window().gathered {
+            Some(gathered) => gathered.positions.rows,
+            None => self.window().span.rows,
+        }
     }
 
     pub fn at_region(&self) -> u32 {

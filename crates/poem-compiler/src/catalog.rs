@@ -319,22 +319,40 @@ impl Catalog {
     pub fn splits(&self) -> impl Iterator<Item = &Deployment> {
         self.splits
             .get_or_init(|| {
-                self.deployments
-                    .iter()
-                    .flat_map(|whole| {
-                        RANKS.into_iter().filter_map(|tp| {
-                            let deploy = Deploy {
-                                tp,
-                                ..whole.deploy.clone()
-                            };
-                            let split =
-                                Deployment::of(Arc::clone(&whole.package), &whole.model, deploy);
-                            split.check(Platform::Cuda).is_ok().then_some(split)
-                        })
-                    })
+                self.split_candidates()
+                    .filter(|split| split.check(Platform::Cuda).is_ok())
                     .collect()
             })
             .iter()
+    }
+
+    /// Each split the model admits whose trace builds and shards on
+    /// `platform` (on CUDA, each of [`Catalog::splits`]), with that trace:
+    /// for a sweep that traces every split, tracing each once where
+    /// `splits` traced it to list it and the sweep would trace it again.
+    pub fn traced_splits(
+        &self,
+        platform: Platform,
+    ) -> impl Iterator<Item = (Deployment, Trace)> + '_ {
+        self.split_candidates().filter_map(move |split| {
+            split.model.admits(&split.deploy).ok()?;
+            let trace = split.try_trace(platform).ok()?;
+            Some((split, trace))
+        })
+    }
+
+    /// Each listed deployment at every count of [`RANKS`], whether or not
+    /// it shards across them.
+    fn split_candidates(&self) -> impl Iterator<Item = Deployment> + '_ {
+        self.deployments.iter().flat_map(|whole| {
+            RANKS.into_iter().map(|tp| {
+                let deploy = Deploy {
+                    tp,
+                    ..whole.deploy.clone()
+                };
+                Deployment::of(Arc::clone(&whole.package), &whole.model, deploy)
+            })
+        })
     }
 
     /// A listed deployment or one of its splits, by name.
@@ -701,6 +719,10 @@ pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
 
 pub fn splits() -> impl Iterator<Item = &'static Deployment> {
     repository().splits()
+}
+
+pub fn traced_splits(platform: Platform) -> impl Iterator<Item = (Deployment, Trace)> {
+    repository().traced_splits(platform)
 }
 
 #[must_use]

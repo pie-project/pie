@@ -322,26 +322,46 @@ fn the_arena_holds_no_score_row() {
 /// (`engine_cpu::Forward` on this backend's own trace and the fixture's
 /// planes): the attention mass a key of the load's context, summed over the
 /// layers and averaged over the query heads, and that summed a kv page of
-/// the load's own (its chunk recipe's, not the boot's). A fire of 256 lanes,
-/// one capturing, lays that lane's rows alone. The load's fire top is a
-/// rung a prompt of its context holds (`engine::load::fire_top`), and a
-/// lane carries a token, so the context holds the fire's 261 tokens: at a
-/// smaller one the load carries fewer lanes than the fire asks.
+/// the load's own (its chunk recipe's, not the boot's). A fire as wide as the
+/// load carries, one lane capturing, lays that lane's rows alone. The boot
+/// asks for 256 lanes and 512 tokens, but the load's fire top is the rung its
+/// ruling picks on this device (`engine::load::fire_top`), which may be
+/// narrower: the fire takes the lanes and tokens the load states
+/// (`Shell::budget`), the capturing lane's prompt and a token each for the
+/// rest.
 #[test]
 fn the_score_rows_are_the_oracles() {
-    const LANES: u32 = 256;
     const CONTEXT: u32 = 512;
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
-    let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, LANES, 512) else {
+    let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, 256, 512) else {
         return;
     };
     let room = room(&shell);
     let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
-    let one: Vec<Vec<u32>> = (1..LANES).map(|lane| vec![(lane * 7) % 256]).collect();
+    let budget = shell.budget();
+    let tokens = budget.max_tokens.checked_sub(prompt.len() as u32).unwrap_or_else(|| {
+        panic!(
+            "the load's fire top of {} tokens holds no {}-token prompt",
+            budget.max_tokens,
+            prompt.len()
+        )
+    });
+    let lanes = budget.max_lanes.min(1 + tokens);
+    assert!(
+        lanes > 1,
+        "the load carries {} lanes and {} tokens: no lane beside the capturing one",
+        budget.max_lanes,
+        budget.max_tokens
+    );
+    eprintln!(
+        "a fire of {lanes} lanes against the load's {} lanes and {} tokens",
+        budget.max_lanes, budget.max_tokens
+    );
+    let one: Vec<Vec<u32>> = (1..lanes).map(|lane| vec![(lane * 7) % 256]).collect();
     let reads = vec![KEYS.to_string(), PAGES.to_string()];
     let fire = |shell: &mut Shell, captures: bool| {
-        let seated: Vec<Seated<'_>> = (0..LANES)
+        let seated: Vec<Seated<'_>> = (0..lanes)
             .map(|slot| {
                 let tokens: &[u32] = if slot == 0 { &prompt } else { &one[slot as usize - 1] };
                 let capturing = captures && slot == 0;
@@ -367,10 +387,10 @@ fn the_score_rows_are_the_oracles() {
         "a fire of no capturing lane laid a score row"
     );
 
-    // One capturing lane among 256 lays one lane's rows.
+    // One capturing lane among them lays one lane's rows.
     fire(&mut shell, true);
     let rows = shell.score_rows().expect("the rows read back");
-    assert_eq!(rows.len(), 1, "one capturing lane of {LANES} laid {} rows", rows.len());
+    assert_eq!(rows.len(), 1, "one capturing lane of {lanes} laid {} rows", rows.len());
     let (source, keys, pages) = &rows[0];
     assert_eq!(*source, 0, "the row is the capturing lane's");
     assert_eq!(keys.len(), CONTEXT as usize, "a mass a key of the context");

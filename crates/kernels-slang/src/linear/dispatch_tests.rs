@@ -92,7 +92,10 @@ fn axes(entry: &str, target: Target, s: Shape) -> [(u32, u32); 3] {
     let one = (1, 1);
     match entry {
         // A workgroup a tile, from `SV_GroupID`: columns on x, rows on y.
-        "linear_gemm_gemv_v_bf16" => [(s.n, 8), one, one],
+        "linear_gemm_gemv_v_bf16" => [(s.n, 8), (s.m, 4), one],
+        "linear_gemm_gemv_v1_bf16" => [(s.n, 8), (s.m, 1), one],
+        "linear_gemm_gemv_v8_bf16" => [(s.n, 8), (s.m, 8), one],
+        "linear_gemm_gemv_v16_bf16" => [(s.n, 8), (s.m, 16), one],
         "linear_gemm_tiled_bm_64_bf16" => [(s.n, 64), (s.m, 64), one],
         // `gemm_register.slang`: `PIE_BN` columns, 32 lanes of eight rows.
         "linear_gemm_register_bf16" => [(s.n, 64), (s.m, 256), one],
@@ -101,7 +104,11 @@ fn axes(entry: &str, target: Target, s: Shape) -> [(u32, u32); 3] {
         "linear_gemm_pairs_tiled_bm_16_bf16" => [(s.n, 64), (s.m, 16), one],
         "linear_gemm_pairs_tiled_bf16" => [(s.n, 64), (s.m, 64), one],
         // An invocation a column (y) and row (z), 32 lanes folding k.
-        "linear_gemm_gemv_bf16" | "linear_gemm_pairs_gemv_bf16" => [one, (s.n, 8), (s.m, 1)],
+        "linear_gemm_gemv_bf16" => [one, (s.n, 8), (s.m, 1)],
+        "linear_gemm_pairs_gemv_bf16" => [one, (s.n, 8), (s.m, 4)],
+        "linear_gemm_pairs_gemv_v1_bf16" => [one, (s.n, 8), (s.m, 1)],
+        "linear_gemm_pairs_gemv_v8_bf16" => [one, (s.n, 8), (s.m, 8)],
+        "linear_gemm_pairs_gemv_v16_bf16" => [one, (s.n, 8), (s.m, 16)],
         "linear_moe_route_sort" | "linear_moe_route_sort_256" => [one, one, one],
         "linear_moe_route_sort_gather" => match target {
             Target::Spirv => [(s.k, 256), (s.padded, 1), one],
@@ -211,16 +218,28 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
                 }
                 let rec = Recorder::new(target);
                 let shape = Shape::dense(m, n, k);
-                gemm::matmul(
-                    &rec,
-                    gemm::Tactic { tier },
-                    t(0, m, k, Dtype::Bf16),
-                    t(1, n, k, Dtype::Bf16),
-                    t(2, m, n, Dtype::Bf16),
-                )
-                .unwrap();
-                let what = format!("gemm {m} x {n} x {k} on {target:?} at {}", tier.name());
-                seen.extend(assert_covers(&rec, &what, shape));
+                for (vector, wide) in [
+                    (0, false),
+                    (0, true),
+                    (1, false),
+                    (4, false),
+                    (8, false),
+                    (16, false),
+                ] {
+                    gemm::matmul(
+                        &rec,
+                        gemm::Tactic { tier, vector, wide },
+                        t(0, m, k, Dtype::Bf16),
+                        t(1, n, k, Dtype::Bf16),
+                        t(2, m, n, Dtype::Bf16),
+                    )
+                    .unwrap();
+                    let what = format!(
+                        "gemm {m} x {n} x {k} on {target:?} at {} (vector {vector}, wide {wide})",
+                        tier.name()
+                    );
+                    seen.extend(assert_covers(&rec, &what, shape));
+                }
                 gemm::lane(
                     &rec,
                     "linear.matmul",
@@ -229,18 +248,25 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
                     t(2, m, n, Dtype::F32),
                 )
                 .unwrap();
-                seen.extend(assert_covers(&rec, &format!("lane {what}"), shape));
+                let what = format!("lane gemm {m} x {n} x {k} on {target:?} at {}", tier.name());
+                seen.extend(assert_covers(&rec, &what, shape));
             }
         }
     }
     for form in [
         "linear_gemm_gemv_v_bf16",
+        "linear_gemm_gemv_v1_bf16",
+        "linear_gemm_gemv_v8_bf16",
+        "linear_gemm_gemv_v16_bf16",
         "linear_gemm_gemv_bf16",
         "linear_gemm_tiled_bm_64_bf16",
         "linear_gemm_register_bf16",
         "linear_gemm_register_bn_32_bf16",
         "linear_gemm_tiled_bf16",
         "linear_gemm_pairs_gemv_bf16",
+        "linear_gemm_pairs_gemv_v1_bf16",
+        "linear_gemm_pairs_gemv_v8_bf16",
+        "linear_gemm_pairs_gemv_v16_bf16",
         "linear_gemm_pairs_tiled_bm_16_bf16",
         "linear_gemm_pairs_tiled_bf16",
     ] {

@@ -2033,3 +2033,75 @@ async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() 
     }
     assert_eq!(held(&device), before);
 }
+
+/// The disk-only home's "KV restore failed: rebind Instance(...): a guest
+/// item of 2508288 bytes takes one run of 613 Instance slot(s) ... and its
+/// binding names []": two processes' instances share a pair; with no tier
+/// below, each parks where it lies, its live parts kept and its scratch
+/// given back ([`Item::shed`]); the pair, all dead, parks once both have.
+/// One process's restore brings the pair back and rebinds its holders on
+/// the device: the other process's instance, still parked where it lies,
+/// was rebound too, its scratch emptied, and named no place. It is rebound
+/// only with its own restore, which takes its scratch back; no rebind ever
+/// names an emptied guest part.
+#[test]
+fn a_restore_of_a_shared_pair_leaves_another_s_instance_parked_where_it_lies_unbound() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles = Arc::new(Mutex::new(
+        Roles::new(&device, None).expect("the pool states an Instance shape"),
+    ));
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let a = bind(&roles, &mut engine, 1).unwrap();
+    let b = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 2);
+    park(&roles, 1);
+    let named_nothing = |rebinds: &[Rebind]| {
+        rebinds.iter().any(|rebind| {
+            matches!(
+                rebind,
+                Rebind::Instance {
+                    scratch: ScratchPlace::Run { slots: 0, .. },
+                    ..
+                } | Rebind::Instance {
+                    pair: ScratchPlace::Run { slots: 0, .. },
+                    ..
+                }
+            ) || matches!(rebind, Rebind::Instance { scratch: ScratchPlace::Chunks { pieces, .. }, .. } if pieces.is_empty())
+        })
+    };
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("process 1's items come back");
+    roles.lock().unwrap().commit(back);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    assert!(
+        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == a)),
+        "its own instance is rebound: {stale:?}"
+    );
+    assert!(
+        !stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        "the other's instance, parked where it lies, is not: {stale:?}"
+    );
+    assert!(!named_nothing(&stale), "no rebind names an emptied part: {stale:?}");
+    for rebind in stale {
+        roles.lock().unwrap().rebound(super::Owner::of(&rebind));
+    }
+    // The other's restore takes its scratch back and rebinds it.
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .expect("process 2's items come back");
+    roles.lock().unwrap().commit(back);
+    let stale = roles.lock().unwrap().stale(holder(2));
+    assert!(
+        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        "rebound with its own restore: {stale:?}"
+    );
+    assert!(!named_nothing(&stale), "with its scratch: {stale:?}");
+}

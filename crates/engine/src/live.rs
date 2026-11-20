@@ -67,6 +67,11 @@ pub enum Tally {
     /// this one. A backend that does not yet tell a registration's builds
     /// apart counts them here too.
     BuiltInFire,
+    /// What a dispatch binds (a bind group, a descriptor set) built after
+    /// ready on a fire's path: one a backend that builds them per set of
+    /// views made for a fire the load's bind walk did not reach. The rule
+    /// is that the load builds every one a fire can bind, so this reads 0.
+    BoundInFire,
     /// A call that waited for every frame in flight to land before the host
     /// touched device memory (a tier move through the host): dispatch fell
     /// to depth one for it. Counted while such a move is not yet on the
@@ -75,7 +80,7 @@ pub enum Tally {
 }
 
 impl Tally {
-    pub const ALL: [Tally; 8] = [
+    pub const ALL: [Tally; 9] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -83,6 +88,7 @@ impl Tally {
         Tally::Eager,
         Tally::BuiltAtRegister,
         Tally::BuiltInFire,
+        Tally::BoundInFire,
         Tally::Drained,
     ];
 
@@ -97,6 +103,7 @@ impl Tally {
             Tally::Eager => "eager",
             Tally::BuiltAtRegister => "built_at_register",
             Tally::BuiltInFire => "built_in_fire",
+            Tally::BoundInFire => "bound_in_fire",
             Tally::Drained => "drained",
         }
     }
