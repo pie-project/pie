@@ -394,12 +394,14 @@ impl<'c, B: Backend> Run<'c, B> {
         };
         if let Some(held) = split.layer.filter(|&held| held != layer) {
             let at = std::time::Instant::now();
-            let flushed = B::flush_recording();
+            let flushed = B::submit_recording();
             let done = std::time::Instant::now();
             // Each layer's submission said where the platform's bound is
             // held (`crate::submit`): the wall from the last submission's
-            // return to this one's, which waits for it to land, and the
-            // submit-and-wait alone.
+            // return to this one's (the host's encoding of the layer, or
+            // the queue's backpressure), and the submit alone. A layer's
+            // submission is queued unawaited: the bound wants each short,
+            // not waited on.
             tracing::debug!(
                 target: "engine_gpu::api",
                 frame = split.step.map(|s| s.frame.0),

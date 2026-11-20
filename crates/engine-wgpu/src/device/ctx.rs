@@ -1134,6 +1134,38 @@ impl Frame {
         self.flush()
     }
 
+    /// [`engine_gpu::backend::Frame::submit_segment`]: the frame's encoder
+    /// submitted unawaited and a new one opened. WebGPU's queue orders the
+    /// next submission after it, and the frame's uniform region and scratch
+    /// chunk stay the frame's (given back at its commit).
+    pub fn submit_segment(&self) -> Result<()> {
+        self.close_pass();
+        self.land_uniforms();
+        let core = &self.inner.core;
+        core.alive()?;
+        let taken = self
+            .inner
+            .encoder
+            .lock()
+            .expect("encoder lock poisoned")
+            .take();
+        let Some(encoder) = taken else {
+            return Err(Fault::Device {
+                call: "submit_segment",
+                why: "this frame was already submitted".to_string(),
+            });
+        };
+        core.queue.submit(std::iter::once(encoder.finish()));
+        core.kick();
+        *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
+            core.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pie frame"),
+                }),
+        );
+        core.take_error("submit_segment")
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
         self.land_uniforms();
