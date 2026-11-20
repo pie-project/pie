@@ -40,7 +40,7 @@ pub struct SamplerValues {
     pub rank: bool,
     /// A lone cut (`LaneCut`): `probs` in, `keep` out, the rest unused.
     pub cut_only: bool,
-    /// The bf16 draw (a gumbel_argmax over the f32 logits at a constant
+    /// The bf16 draw (a gumbel_argmax over the logits, f32 or bf16, at a constant
     /// temperature, its cut's probabilities a bf16 softmax), where the
     /// region is one.
     pub draw: Option<Draw>,
@@ -297,7 +297,7 @@ pub fn emit_sampler_region(
             }
             None => format!(
                 "
-  const M1DrawRow draw_row{{scratch + offsets[{logits}], 0u, descriptors[{logits}u].last, 0u, descriptors[{logits}u].rows}};"
+  const M1DrawRow draw_row{{scratch + offsets[{logits}], descriptors[{logits}u].dtype == M1_DT_BF16 ? 1u : 0u, descriptors[{logits}u].last, 0u, descriptors[{logits}u].rows}};"
             ),
         };
         source.push_str(&row);

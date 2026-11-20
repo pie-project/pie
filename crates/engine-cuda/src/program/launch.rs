@@ -2188,7 +2188,7 @@ mod tests {
         ("standard top-p", 5_058_560, 457_472),
         ("standard top-k + top-p", 5_363_200, 990_464),
         ("standard top logprobs", 4_910_592, 724_992),
-        ("standard penalized top-p", 10_834_688, 2_358_528),
+        ("standard penalized top-p", 10_834_688, 1_976_832),
     ];
 
     /// What each laid out with f32 intermediates and the output row copied

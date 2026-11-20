@@ -167,7 +167,8 @@ fn match_draw_dataflow(
         _ => return None,
     };
     let _ = width;
-    if logits_type.dtype != Dtype::F32 || logits_type.rank() != 1 {
+    // The model's f32 row, or a bf16 row a penalty or mask made of it.
+    if !matches!(logits_type.dtype, Dtype::F32 | Dtype::Bf16) || logits_type.rank() != 1 {
         return None;
     }
     for value in [shifted, scaled, exps, probs] {
