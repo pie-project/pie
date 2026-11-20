@@ -405,6 +405,8 @@ impl<B: Serve> Serve for Named<B> {
 
     type Keep = std::convert::Infallible;
 
+    type Probed = ();
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = B::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = B::MAX_BUFFER_SOURCE;
@@ -487,6 +489,22 @@ impl<B: Serve> Serve for Named<B> {
 
     fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
         Ok(NoFrame)
+    }
+
+    /// A naming load runs nothing on a device: no probe to lay.
+    fn record_probe(
+        _device: &Facts,
+        _record: &dyn Fn(&NoFrame) -> Result<()>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay_probe(
+        _device: &Facts,
+        _probed: &(),
+        _record: &dyn Fn(&NoFrame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        Ok(None)
     }
 
     fn shelf(

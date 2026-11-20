@@ -1320,7 +1320,18 @@ impl Context {
     /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`); a plain
     /// frame where it writes none.
     pub fn spanned(&self) -> Result<Frame> {
-        let frame = self.frame_with(true)?;
+        self.spanned_with(true)
+    }
+
+    /// [`Context::spanned`] kept to replay ([`Frame::into_kept_spanned`],
+    /// [`Kept::replay_spanned`]): its timestamps' reset and writes recorded
+    /// with its work, so each replay writes them anew.
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        self.spanned_with(false)
+    }
+
+    fn spanned_with(&self, one_time: bool) -> Result<Frame> {
+        let frame = self.frame_with(one_time)?;
         let core = &self.core;
         if core.stamp_bits() == 0 {
             return Ok(frame);
@@ -1559,6 +1570,35 @@ impl Drop for Inner {
             }
         }
         self.core.return_fence(self.fence);
+    }
+}
+
+impl Inner {
+    /// The device's time between a spanned frame's two timestamps, ns, once
+    /// it landed; `None` for a frame that writes none.
+    fn span_ns(&self) -> Result<Option<u64>> {
+        let Some(pool) = *self.span.lock().expect("span lock poisoned") else {
+            return Ok(None);
+        };
+        let core = &self.core;
+        let mut ticks = [0u64; 2];
+        // SAFETY: the frame's fence was waited on, so both queries are
+        // written; `ticks` holds one u64 for each with `TYPE_64`.
+        unsafe {
+            core.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+        .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
+        let bits = core.stamp_bits();
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
+        Ok(Some(
+            (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
+        ))
     }
 }
 
@@ -2081,6 +2121,18 @@ impl Frame {
     /// Submits and waits: the device's time between the two timestamps a
     /// [`Context::spanned`] frame writes, ns; `None` for another frame.
     pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        self.stamp_end();
+        self.submit()?;
+        Pending {
+            inner: Arc::clone(&self.inner),
+            landing: None,
+        }
+        .wait()?;
+        self.inner.span_ns()
+    }
+
+    /// A spanned frame's closing timestamp, written while it is open.
+    fn stamp_end(&self) {
         let span = *self.inner.span.lock().expect("span lock poisoned");
         if let Some(pool) = span
             && self.open
@@ -2096,34 +2148,13 @@ impl Frame {
                 );
             }
         }
-        self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()?;
-        let Some(pool) = span else {
-            return Ok(None);
-        };
-        let core = &self.inner.core;
-        let mut ticks = [0u64; 2];
-        // SAFETY: the frame's fence was waited on, so both queries are
-        // written; `ticks` holds one u64 for each with `TYPE_64`.
-        unsafe {
-            core.device.get_query_pool_results(
-                pool,
-                0,
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-            )
-        }
-        .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
-        let bits = core.stamp_bits();
-        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
-        Ok(Some(
-            (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
-        ))
+    }
+
+    /// A [`Context::spanned_kept`] frame, its closing timestamp written,
+    /// kept to replay ([`Kept::replay_spanned`]).
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        self.stamp_end();
+        self.into_kept()
     }
 
     pub fn into_kept(mut self) -> Result<Kept> {
@@ -2214,6 +2245,13 @@ impl Kept {
             .map_err(|e| core.fault("vkWaitForFences", e))?;
         // SAFETY: the wait returned, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
+    }
+
+    /// Replays a [`Frame::into_kept_spanned`] frame and waits: the device's
+    /// time between its timestamps, ns (`None` where it writes none).
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
+        self.replay(None)?.wait()?;
+        self.inner.span_ns()
     }
 
     pub fn replay(

@@ -58,7 +58,7 @@ fn loads(retime: bool) -> Option<(f64, Vec<Submitted>)> {
         vector: 0,
         wide: false,
     };
-    let probe = Probe::<Api>::new(&gpu.device, tactic).expect("the probe lays");
+    let mut probe = Probe::<Api>::new(&gpu.device, tactic).expect("the probe lays");
     // The probe first: the one fire before anything is measured.
     let first = probe.fire(&gpu.device).expect("the probe fires");
     let mut clock = Clock::new(first);
@@ -94,7 +94,7 @@ fn loads(retime: bool) -> Option<(f64, Vec<Submitted>)> {
         if load == 1 {
             // The device idled and its clock dropped.
             slow.set(SLOW);
-            probe.slow(SLOW);
+            probe.slow(&gpu.device, SLOW).expect("the probe re-recorded");
         }
         // The device is idle before each frame: re-timed first.
         let retimed = |clock: &mut Clock| {

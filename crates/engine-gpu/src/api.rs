@@ -389,6 +389,12 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
         }
+        // The submit-bound probes, apart from the model's fires: recorded at
+        // load where the backend keeps recordings.
+        let probed = self.shell.as_mut().map_or(0, Shell::probed_serving);
+        if probed > 0 {
+            self.live.tally(engine::live::Tally::Probed, probed);
+        }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
             let tally = if B::RECORDS {

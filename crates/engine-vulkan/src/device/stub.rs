@@ -140,6 +140,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -215,6 +219,10 @@ impl Frame {
     pub fn into_kept(self) -> Result<Kept> {
         match self.never {}
     }
+
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        match self.never {}
+    }
 }
 
 #[derive(Debug)]
@@ -225,6 +233,10 @@ pub struct Kept {
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 

@@ -67,6 +67,11 @@ pub trait Serve: Backend {
     /// The key a walked step is kept under to replay.
     type Keep;
 
+    /// The submit bound's probe as the backend holds it between fires
+    /// ([`crate::submit::Probe`]): recorded at load where the backend keeps
+    /// recordings, so no serving fire of it is unrecorded.
+    type Probed;
+
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
@@ -165,6 +170,25 @@ pub trait Serve: Backend {
 
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
+
+    /// The probe's work (`record`, its dispatches into a frame) laid for
+    /// [`Serve::replay_probe`]: recorded once into a spanned frame kept to
+    /// replay, where the backend keeps recordings.
+    fn record_probe(
+        device: &Self::Context,
+        record: &dyn Fn(&Self::Frame) -> Result<()>,
+    ) -> Result<Self::Probed>;
+
+    /// The probe fired and waited for: the device's time across its work,
+    /// ns (`None` where the device writes no timestamps). A backend that
+    /// keeps recordings replays what [`Serve::record_probe`] recorded; one
+    /// that keeps none (eager by design) records `record` into a spanned
+    /// frame now.
+    fn replay_probe(
+        device: &Self::Context,
+        probed: &Self::Probed,
+        record: &dyn Fn(&Self::Frame) -> Result<()>,
+    ) -> Result<Option<u64>>;
 
     /// Whether the backend builds what a dispatch binds for each set of
     /// views it binds and keeps it (wgpu's bind groups): its load then
@@ -750,6 +774,8 @@ pub struct Shell<B: Serve> {
     /// device re-times its clock by, and the clock it last read
     /// ([`Shell::retime`]).
     probe: Option<(crate::submit::Probe<B>, crate::submit::Clock)>,
+    /// The probes fired since the last count ([`Shell::probed_serving`]).
+    probed: u64,
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
@@ -2060,6 +2086,7 @@ impl<B: Serve> Shell<B> {
             weighed,
             submit_bound,
             probe,
+            probed: 0,
             split_next: false,
             pipelines,
             asks,
@@ -2693,6 +2720,12 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// The submit-bound probes fired since the last count
+    /// ([`engine::live::Tally::Probed`]): apart from every model fire.
+    pub fn probed_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.probed)
     }
 
     /// The tier moves through the host since the last count that waited
@@ -3663,6 +3696,7 @@ impl<B: Serve> Shell<B> {
             });
         }
         let took = probe.fire(&self.device)?;
+        self.probed += 1;
         clock.probed(took);
         held.scale = clock.scale();
         tracing::debug!(

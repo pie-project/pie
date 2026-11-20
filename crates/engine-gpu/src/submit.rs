@@ -53,7 +53,7 @@ use engine::load::{FireEstimate, RungFacts};
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::backend::{Buffer as _, Context as _, Frame as _};
+use crate::backend::Buffer as _;
 use crate::error::Fault;
 use crate::handles::Handles;
 use crate::serve::Serve;
@@ -233,11 +233,15 @@ pub struct Probe<B: Serve> {
     tactic: kernels_slang::linear::gemm::Tactic,
     /// A device slowed by this factor, for a test: each fire runs the
     /// matmul this many times (1 serving).
-    slowed: std::cell::Cell<u32>,
+    slowed: u32,
+    /// Its work as the backend holds it: recorded at load where the backend
+    /// keeps recordings ([`Serve::record_probe`]).
+    probed: B::Probed,
 }
 
 impl<B: Serve> Probe<B> {
-    /// The probe laid on `device` under `tactic` (the curve's at its rows),
+    /// The probe laid on `device` under `tactic` (the curve's at its rows):
+    /// its operands, its work recorded where the backend keeps recordings,
     /// and fired once.
     pub fn new(
         device: &B::Context,
@@ -263,53 +267,72 @@ impl<B: Serve> Probe<B> {
         let act = lay(m, k, true)?;
         let weight = lay(n, k, true)?;
         let out = lay(m, n, false)?;
+        let pipelines = B::Pipelines::default();
+        let probed = B::record_probe(device, &|frame| {
+            Self::encode(device, frame, &pipelines, &handles, (tactic, act, weight, out), 1)
+        })?;
         let probe = Probe {
             handles,
-            pipelines: B::Pipelines::default(),
+            pipelines,
             _held: held,
             act,
             weight,
             out,
             tactic,
-            slowed: std::cell::Cell::new(1),
+            slowed: 1,
+            probed,
         };
-        // Fired once untimed: its pipeline built and its operands touched,
-        // so no probe's time holds either.
+        // Fired once untimed: its operands touched, so no probe's time
+        // holds that.
         probe.fire(device)?;
         Ok(probe)
     }
 
-    /// The probe fired alone, ns: the device's span where it writes
-    /// timestamps, else the host's clock around the submit and the wait.
-    pub fn fire(&self, device: &B::Context) -> crate::error::Result<f64> {
-        let started = std::time::Instant::now();
-        let frame = device.spanned()?;
-        {
-            let sink = B::sink(device, &frame, &self.pipelines, &self.handles);
-            for _ in 0..self.slowed.get().max(1) {
-                kernels_slang::linear::gemm::matmul(
-                    &sink,
-                    self.tactic,
-                    self.act,
-                    self.weight,
-                    self.out,
-                )
-                .map_err(|e| Fault::Device {
+    /// The probe's matmul, `times` over, into `frame`.
+    fn encode(
+        device: &B::Context,
+        frame: &B::Frame,
+        pipelines: &B::Pipelines,
+        handles: &Handles<B>,
+        (tactic, act, weight, out): (kernels_slang::linear::gemm::Tactic, Tensor, Tensor, Tensor),
+        times: u32,
+    ) -> crate::error::Result<()> {
+        let sink = B::sink(device, frame, pipelines, handles);
+        for _ in 0..times.max(1) {
+            kernels_slang::linear::gemm::matmul(&sink, tactic, act, weight, out).map_err(|e| {
+                Fault::Device {
                     call: "submit bound: probe",
                     why: e.to_string(),
-                })?;
-            }
+                }
+            })?;
         }
-        let span = frame.commit_spanned()?;
+        Ok(())
+    }
+
+    /// The probe fired alone, ns: the device's span where it writes
+    /// timestamps, else the host's clock around the submit and the wait. A
+    /// backend that keeps recordings replays the one laid at load.
+    pub fn fire(&self, device: &B::Context) -> crate::error::Result<f64> {
+        let started = std::time::Instant::now();
+        let work = (self.tactic, self.act, self.weight, self.out);
+        let span = B::replay_probe(device, &self.probed, &|frame| {
+            Self::encode(device, frame, &self.pipelines, &self.handles, work, self.slowed)
+        })?;
         let host = started.elapsed().as_nanos() as f64;
         Ok(span.map_or(host, |ns| ns as f64).max(1.0))
     }
 
     /// For a test: the device slowed by `factor` from here (each probe runs
-    /// its matmul `factor` times).
+    /// its matmul `factor` times), its work recorded again.
     #[doc(hidden)]
-    pub fn slow(&self, factor: u32) {
-        self.slowed.set(factor.max(1));
+    pub fn slow(&mut self, device: &B::Context, factor: u32) -> crate::error::Result<()> {
+        self.slowed = factor.max(1);
+        let work = (self.tactic, self.act, self.weight, self.out);
+        let (pipelines, handles, slowed) = (&self.pipelines, &self.handles, self.slowed);
+        self.probed = B::record_probe(device, &|frame| {
+            Self::encode(device, frame, pipelines, handles, work, slowed)
+        })?;
+        Ok(())
     }
 }
 
