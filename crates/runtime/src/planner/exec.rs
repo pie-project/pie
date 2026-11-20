@@ -1036,15 +1036,38 @@ async fn restore(
     // with room for that bind past what its own items took: else it would
     // bind short again at once. It waits, queued, as a restore short of
     // room for its roles.
+    // Refused so, it says why, and its need is the bind's runs beside what
+    // its own unpark lays at that length: read as the larger of the two
+    // (bind (7, 2), unpark (7, 2): (7, 2)), the planner's placement stood
+    // it while this check, after the unpark took its own, did not, and the
+    // head was refused with no reason and no plan, round after round (Mac
+    // Pro at 5 GiB on 4cef0c7d3: 40,098 no-step lines in 6 minutes, free
+    // runs (7, 3) to (7, 4), need [(7, 2), (2, 2)]).
     if let Some(need) = planner.pending_bind(pid)
-        && stores
+        && let Some(free) = stores
             .roles
             .as_ref()
-            .is_some_and(|roles| roles.lock().unwrap().free_runs(need.run) < need.pieces)
+            .map(|roles| roles.lock().unwrap().free_runs(need.run))
+            .filter(|&free| free < need.pieces)
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
-        tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid, (need.run, need.pieces), None);
+        let own = stores.roles.as_ref().map_or(0, |roles| {
+            roles
+                .lock()
+                .unwrap()
+                .unpark_need(pid)
+                .iter()
+                .filter(|&&(run, _)| run == need.run)
+                .map(|&(_, pieces)| pieces)
+                .sum::<u32>()
+        });
+        let why = format!(
+            "PendingBindShort {{ run: {}, pieces: {}, free_runs_after_own_unpark: {free}, own_unpark_pieces: {own} }}",
+            need.run, need.pieces
+        );
+        tracing::debug!(%pid, %why, "planner: a restore waits for room for its pending bind");
+        planner.note_roles_short_why(pid, why);
+        planner.requeue_restore_roles(pid, (need.run, need.pieces.saturating_add(own)), Some(free));
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
