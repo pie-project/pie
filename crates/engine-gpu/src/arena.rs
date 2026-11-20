@@ -44,24 +44,8 @@ pub struct Rung {
     capacity: Vec<u32>,
     /// Where the rooms start, past the carve.
     rooms_at: u64,
-    /// The recurrent buffer's planes a fire of this rung extends its rows
-    /// into, past the rooms, where the trace buffers a recurrence.
-    rs: Option<RsRoom>,
-    /// The carve, the rooms and the recurrent planes.
+    /// The carve and the rooms.
     bytes: u64,
-}
-
-/// A rung's room for the recurrent buffer's planes ([`crate::rs::Seat`]):
-/// laid for the rung's tokens of a fire's own rows and as many carried rows
-/// (`engine::fire::ActivationRows`: a fire granted the rung may carry its
-/// tokens), and the most lanes it carries, so a seat's planes lie at one
-/// place whatever the fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RsRoom {
-    /// Its first byte in the rung's bytes.
-    pub at: u64,
-    pub rows: u32,
-    pub lanes: u32,
 }
 
 /// The score rows of a load whose trace captures (`Dim::Capturing`): a
@@ -153,7 +137,6 @@ pub fn grain(map: &ArenaMap, value: ValueId) -> Option<Grain> {
 }
 
 impl Rung {
-    #[allow(clippy::too_many_arguments)]
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -162,7 +145,6 @@ impl Rung {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
-        rs: Option<&crate::rs::Layout>,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -178,27 +160,13 @@ impl Rung {
             trace, compiled, &map, budgets, tokens, paging, tuning, routers,
         );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
-        let rooms_end = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
-        let rs = rs.map(|layout| {
-            let lanes = tokens.min(budgets.tokens.max_lanes);
-            let rows = tokens.saturating_mul(2);
-            (
-                RsRoom {
-                    at: rooms_end,
-                    rows,
-                    lanes,
-                },
-                crate::rs::Seat::scratch_bytes(layout, rows, lanes),
-            )
-        });
-        let bytes = (rooms_end + rs.map_or(0, |(_, bytes)| bytes)).next_multiple_of(ALIGN);
+        let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
         Ok(Rung {
             tokens,
             capacity: capacities(&map),
             map,
             rooms,
             rooms_at,
-            rs: rs.map(|(room, _)| room),
             bytes,
         })
     }
@@ -250,17 +218,12 @@ impl<B: Backend> Span<B> {
         tokens: &[u32],
         paging: Paging,
         tuning: &B::Tuning,
-        rs: Option<&crate::rs::Layout>,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
         let capture = CaptureRows::of(trace, paging.context(), paging.page_size)?;
         let rungs = tokens
             .iter()
-            .map(|&tokens| {
-                Rung::lay(
-                    trace, compiled, budgets, tokens, paging, tuning, &routers, rs,
-                )
-            })
+            .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
             widest: (0..rungs.len()).collect(),
@@ -368,17 +331,6 @@ impl<B: Backend> Span<B> {
                     .unwrap_or(at)
             })
             .collect();
-    }
-
-    /// Rung `rung`'s recurrent planes: the span's buffer, the room's first
-    /// byte in it, and its rows and lanes; None where the trace buffers no
-    /// recurrence.
-    pub fn rs_room(&self, rung: usize) -> Result<Option<crate::rs::Room<'_, B>>> {
-        let (buffer, end) = self.placed()?;
-        let at = &self.rungs[rung];
-        Ok(at
-            .rs
-            .map(|room| (buffer, end - at.bytes + room.at, room.rows, room.lanes)))
     }
 
     /// Where rung `rung`'s carve starts in the span's buffer: the span's
