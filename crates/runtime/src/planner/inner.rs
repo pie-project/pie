@@ -370,12 +370,20 @@ impl Inner {
         // its unpark is short: read by its queue alone, it looked served
         // in that gap, and the victim's restore went first (the L40S: one
         // victim evicted 5,894 times for one restore head, never served).
+        // Or served and not fired since (restored or bound for its wait,
+        // [`super::proc::Proc::unfired`]): the victim restored then took the
+        // room back before the head ran on it, the head's next ask evicted
+        // it again, and the two went round (the L40S at 3 GiB on 4cef0c7d3:
+        // 613 evictions within 200 ms of their process's restore, about one
+        // eviction a serve).
         let unserved = |head: ProcessId| {
             waiting().contains(&head)
                 || self
                     .procs
                     .get(&head)
-                    .is_some_and(|proc| proc.state != Residency::Resident)
+                    .is_some_and(|proc| {
+                        proc.state != Residency::Resident || (proc.unfired && !proc.idle)
+                    })
         };
         let held_for_head = |pid: ProcessId| {
             self.procs

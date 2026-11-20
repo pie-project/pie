@@ -8895,3 +8895,43 @@ async fn room_there_only_by_emptying_is_made_by_the_map_s_moves() {
         "the occupant of the chunk that completes another run is moved"
     );
 }
+
+/// The L40S at 3 GiB on 4cef0c7d3: 613 evictions within 200 ms of their
+/// process's restore, about one eviction a serve. A victim was restored as
+/// soon as the head it was evicted for was served, took the room back
+/// before the head ran on it, and the head's next ask evicted it again.
+/// A victim's restore waits until its head has fired once since it was
+/// served (or the head waits on its client).
+#[test]
+fn a_victim_is_restored_only_once_its_head_has_fired_on_the_room() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
+    let (head, victim, other) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, victim, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        // The head was restored for its wait and has not fired since.
+        inner.procs.get_mut(&head).unwrap().unfired = true;
+        let proc = inner.procs.get_mut(&victim).unwrap();
+        proc.state = Residency::Evicted;
+        proc.evicted_for = Some(head);
+        inner.enqueue(
+            victim,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    let head_of = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid))
+    };
+    // Something else in flight, so no quiet fallback applies.
+    let fire = planner.fire_in_flight(other);
+    assert_eq!(head_of(&planner), None, "its head has not run on the room yet");
+    // The head fires: its victim may come back.
+    let head_fire = planner.fire_in_flight(head);
+    assert_eq!(head_of(&planner), Some(victim), "the head ran: the victim is restored");
+    drop(head_fire);
+    drop(fire);
+}
