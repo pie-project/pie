@@ -2512,7 +2512,7 @@ impl Shell {
     }
 
     /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
-    /// within a quarter of the free space.
+    /// within the free space ([`engine::disk::derived_budget`]).
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,

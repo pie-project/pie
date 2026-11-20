@@ -2133,8 +2133,9 @@ impl<B: Serve> Shell<B> {
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
     /// [`Pools::disk_division`] lay them; stated at load. Unstated
     /// `budget`: a disk chunk for each of the pool's chunks, and at least
-    /// the kv pages of `seats` sequences at `context`, within a quarter of
-    /// the free disk. The disk chunks it holds.
+    /// the kv pages of `seats` sequences at `context`, within the free disk
+    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
+    /// refused by name, stated or not. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2146,7 +2147,6 @@ impl<B: Serve> Shell<B> {
         let paging = self.pools.paging();
         let layout = *self.pools.layout();
         let chunk = self.pools.disk_chunk_bytes();
-        let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
@@ -2160,12 +2160,7 @@ impl<B: Serve> Shell<B> {
                 chunk,
             )
         });
-        if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
-            if !unstated {
-                return Err(error);
-            }
-            self.pools.unseat_disk();
-        }
+        self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();
         if chunks > 0 {
             let division = self

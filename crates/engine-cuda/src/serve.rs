@@ -629,6 +629,8 @@ impl Shell {
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
+        seats: u32,
+        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
@@ -651,12 +653,32 @@ impl Shell {
                 } else {
                     0
                 };
+                // Derived on its own ([`engine::disk::derived_budget`]): a
+                // disk chunk for each of the pool's chunks, at least the kv
+                // pages of `seats` sequences at `context`, within this
+                // rank's share of the free disk. Never four times the host
+                // tier (a host budget below one chunk seated no disk tier)
+                // nor a quarter of the disk. One that cannot be seated is
+                // refused by name.
                 let free = engine::disk::free_space(dir).saturating_add(kept);
-                let host = u64::from(self.pools.host_pages()) * self.pools.paged_page_bytes();
-                let bytes = host.saturating_mul(4).min(free / 4 / ranks);
-                if self.pools.seat_disk(dir, world.rank, bytes, keep).is_err() {
-                    self.pools.unseat_disk();
-                }
+                let paging = self.pools.paging();
+                let pages = u64::from(seats)
+                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let per_chunk = self
+                    .pools
+                    .chunk_layout()
+                    .list
+                    .as_ref()
+                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
+                let bytes = engine::disk::derived_budget(
+                    0,
+                    0,
+                    u64::from(self.pools.pool_chunks()),
+                    pages.div_ceil(per_chunk),
+                    self.pools.disk_chunk_bytes(),
+                    free / ranks,
+                );
+                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
                 Some(bytes)
             }
         };

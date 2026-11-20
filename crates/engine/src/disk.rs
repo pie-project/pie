@@ -129,6 +129,8 @@ impl SlotFile {
     }
 }
 
+/// The disk tier's bytes where none is stated: [`derived_budget`] against
+/// the free space under `dir`.
 #[must_use]
 pub fn unstated_budget(
     dir: &Path,
@@ -138,11 +140,50 @@ pub fn unstated_budget(
     seated: u64,
     page_bytes: u64,
 ) -> u64 {
+    derived_budget(rows, row_bytes, pages, seated, page_bytes, free_space(dir))
+}
+
+/// The disk tier's bytes derived on their own, from what the load holds:
+/// `rows` state rows of `row_bytes`, and kv pages of `page_bytes` for the
+/// device pool's `pages` or the `seated` sequences' pages at their
+/// context, whichever is more, each on the slot file's direct I/O
+/// boundary; within the `free` bytes the disk has. Never a share of the
+/// host tier (a host budget below one chunk seated no disk tier at all)
+/// nor a fraction of the free space.
+#[must_use]
+pub fn derived_budget(
+    rows: u64,
+    row_bytes: u64,
+    pages: u64,
+    seated: u64,
+    page_bytes: u64,
+    free: u64,
+) -> u64 {
     let slot = |bytes: u64| bytes.next_multiple_of(ALIGN as u64);
     let wanted = rows
         .saturating_mul(slot(row_bytes))
         .saturating_add(pages.max(seated).saturating_mul(slot(page_bytes)));
-    wanted.min(free_space(dir) / 4)
+    wanted.min(free)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Derived from the load alone: the pool's pages or the seated
+    /// sequences', whichever is more, and the state rows; the free space
+    /// bounds it whole, never a quarter of it.
+    #[test]
+    fn the_unstated_disk_tier_is_derived_from_the_load_within_the_free_space() {
+        let page = ALIGN as u64;
+        assert_eq!(derived_budget(2, page, 10, 4, page, u64::MAX), 12 * page);
+        assert_eq!(derived_budget(0, 0, 10, 40, page, u64::MAX), 40 * page);
+        assert_eq!(
+            derived_budget(0, 0, 10, 40, page, 20 * page),
+            20 * page,
+            "the free space whole, not a quarter of it"
+        );
+    }
 }
 
 /// Windows reads and writes at an offset through `seek_read`/`seek_write`,

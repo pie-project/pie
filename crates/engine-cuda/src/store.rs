@@ -4163,6 +4163,19 @@ impl Pools {
         self.disk.as_ref().map_or(0, |disk| disk.file.slots())
     }
 
+    /// The device pool's chunks: a disk chunk each is the disk tier's
+    /// unstated size ([`engine::disk::derived_budget`]).
+    #[must_use]
+    pub fn pool_chunks(&self) -> u32 {
+        self.chunks.total()
+    }
+
+    /// The pool's chunk layout: its chunk bytes and shapes.
+    #[must_use]
+    pub fn chunk_layout(&self) -> &crate::store::layout::Layout {
+        self.chunks.layout()
+    }
+
     /// The bytes one disk chunk takes: a pool chunk, on the slot file's
     /// direct I/O boundary, laid out as the device's.
     #[must_use]
