@@ -135,9 +135,52 @@ __device__ __forceinline__ m1_u32 m1_float_to_u32(float value) {
   return (m1_u32)value;
 }
 
+// bf16 (eta_ir::types::WIRE_BF16, dtype 5): two bytes an element, the upper
+// half of an f32's bits. Every op computes in f32: a bf16 operand is widened
+// exactly, and a bf16 result is rounded to nearest even once, on its store
+// (`m1_store_h`, eta_ir::types::bf16_bits). Its store is one 16-bit store of
+// the element's own two bytes (st.global.b16 / global_store_short), never a
+// read-modify-write of the word around it: global memory is byte-addressed,
+// so two threads storing the two halves of a word store two locations, as
+// two threads storing two bytes of a bool value already do. Every op hands
+// each element to one thread, so no two threads store one element.
+#define M1_DT_BF16 5u
+
+__device__ __forceinline__ bool m1_is_float(m1_u32 dtype) {
+  return dtype == 0u || dtype == M1_DT_BF16;
+}
+
+// The bytes an element of `dtype` takes in scratch and in a channel cell.
+__device__ __forceinline__ m1_u32 m1_elem_bytes(m1_u32 dtype) {
+  return dtype == 3u ? 1u : (dtype == M1_DT_BF16 ? 2u : 4u);
+}
+
+__device__ __forceinline__ float m1_bf16_widen(m1_u32 bits) {
+  return __uint_as_float(bits << 16);
+}
+
+// `x` rounded to bf16, round-to-nearest-even, as its 16 bits; a NaN stays a
+// quiet NaN of its sign (eta_ir::types::bf16_bits).
+__device__ __forceinline__ m1_u32 m1_bf16_bits(float x) {
+  const m1_u32 b = __float_as_uint(x);
+  if ((b & 0x7fffffffu) > 0x7f800000u) return ((b >> 16) | 0x40u) & 0xffffu;
+  return (b + 0x7fffu + ((b >> 16) & 1u)) >> 16;
+}
+
+// `x` as a bf16 store keeps it, widened back: what a stream holds in a
+// register for a bf16 result, so its readers see the stored value.
+__device__ __forceinline__ float m1_round_bf16(float x) {
+  return m1_bf16_widen(m1_bf16_bits(x));
+}
+
+__device__ __forceinline__ float m1_load_h(const m1_u8* data, m1_u32 index) {
+  return m1_bf16_widen(reinterpret_cast<const m1_u16*>(data)[index]);
+}
+
 __device__ __forceinline__ float m1_load_f(
     const m1_u8* data, m1_u32 index, m1_u32 dtype) {
   if (dtype == 0) return reinterpret_cast<const float*>(data)[index];
+  if (dtype == M1_DT_BF16) return m1_load_h(data, index);
   if (dtype == 1) return float(reinterpret_cast<const int*>(data)[index]);
   if (dtype == 2) return float(reinterpret_cast<const m1_u32*>(data)[index]);
   return data[index] != 0 ? 1.0f : 0.0f;
@@ -147,6 +190,7 @@ __device__ __forceinline__ int m1_load_i(
     const m1_u8* data, m1_u32 index, m1_u32 dtype) {
   if (dtype == 0)
     return m1_float_to_i32(reinterpret_cast<const float*>(data)[index]);
+  if (dtype == M1_DT_BF16) return m1_float_to_i32(m1_load_h(data, index));
   if (dtype == 1) return reinterpret_cast<const int*>(data)[index];
   if (dtype == 2)
     return m1_bits_i32(reinterpret_cast<const m1_u32*>(data)[index]);
@@ -157,6 +201,7 @@ __device__ __forceinline__ m1_u32 m1_load_u(
     const m1_u8* data, m1_u32 index, m1_u32 dtype) {
   if (dtype == 0)
     return m1_float_to_u32(reinterpret_cast<const float*>(data)[index]);
+  if (dtype == M1_DT_BF16) return m1_float_to_u32(m1_load_h(data, index));
   if (dtype == 1)
     return (m1_u32)reinterpret_cast<const int*>(data)[index];
   if (dtype == 2) return reinterpret_cast<const m1_u32*>(data)[index];
@@ -167,6 +212,7 @@ __device__ __forceinline__ bool m1_load_b(
     const m1_u8* data, m1_u32 index, m1_u32 dtype) {
   if (dtype == 0)
     return reinterpret_cast<const float*>(data)[index] != 0.0f;
+  if (dtype == M1_DT_BF16) return m1_load_h(data, index) != 0.0f;
   if (dtype == 1)
     return reinterpret_cast<const int*>(data)[index] != 0;
   if (dtype == 2)
@@ -177,6 +223,22 @@ __device__ __forceinline__ bool m1_load_b(
 __device__ __forceinline__ void m1_store_f(
     m1_u8* data, m1_u32 index, float value) {
   reinterpret_cast<float*>(data)[index] = value;
+}
+
+// The one bf16 store: `value` rounded once, the element's two bytes alone.
+__device__ __forceinline__ void m1_store_h(
+    m1_u8* data, m1_u32 index, float value) {
+  reinterpret_cast<m1_u16*>(data)[index] = (m1_u16)m1_bf16_bits(value);
+}
+
+// A float result stored at its value's float dtype: f32 as it is, bf16
+// rounded once.
+__device__ __forceinline__ void m1_store_fd(
+    m1_u8* data, m1_u32 index, float value, m1_u32 dtype) {
+  if (dtype == M1_DT_BF16)
+    m1_store_h(data, index, value);
+  else
+    m1_store_f(data, index, value);
 }
 
 __device__ __forceinline__ void m1_store_i(
@@ -249,8 +311,44 @@ __device__ __forceinline__ long long m1_load_index(
   if (dtype == 2)
     return (long long)reinterpret_cast<const m1_u32*>(data)[index];
   if (dtype == 3) return data[index] != 0 ? 1ll : 0ll;
+  if (dtype == M1_DT_BF16) return (long long)m1_float_to_i32(m1_load_h(data, index));
   return (long long)m1_float_to_i32(
       reinterpret_cast<const float*>(data)[index]);
+}
+
+// A scatter into a bf16 base (`output`, already holding the base): each
+// cell an update names is summed (or set) over every update to it in f32,
+// in update order, and rounded once. One thread runs it.
+__device__ __forceinline__ void m1_scatter_bf16(
+    bool is_add,
+    const m1_u8* indices,
+    const m1_u8* updates,
+    m1_u8* output,
+    m1_u32 index_count,
+    m1_u32 index_dtype,
+    m1_u32 update_dtype,
+    m1_u32 rows,
+    m1_u32 rest,
+    bool scalar) {
+  for (m1_u32 k = 0; k < index_count; ++k) {
+    const long long row = m1_load_index(indices, k, index_dtype);
+    if (row < 0 || (m1_u64)row >= rows) continue;
+    bool seen = false;
+    for (m1_u32 prior = 0; prior < k && !seen; ++prior)
+      seen = m1_load_index(indices, prior, index_dtype) == row;
+    if (seen) continue;
+    for (m1_u32 r = 0; r < rest; ++r) {
+      const m1_u32 destination = (m1_u32)row * rest + r;
+      float acc = m1_load_h(output, destination);
+      for (m1_u32 later = k; later < index_count; ++later) {
+        if (m1_load_index(indices, later, index_dtype) != row) continue;
+        const float value =
+            m1_load_f(updates, scalar ? 0u : later * rest + r, update_dtype);
+        acc = is_add ? acc + value : value;
+      }
+      m1_store_h(output, destination, acc);
+    }
+  }
 }
 
 __device__ __forceinline__ M1ArgmaxCandidate m1_argmax_combine(
@@ -296,7 +394,7 @@ __device__ __forceinline__ void m1_fault(
 
 __device__ __forceinline__ void m1_copy_typed(
     const m1_u8* input, m1_u8* output, m1_u32 len, m1_u32 dtype) {
-  const m1_u32 bytes = dtype == 3 ? len : len * 4u;
+  const m1_u32 bytes = len * m1_elem_bytes(dtype);
   for (m1_u32 i = 0; i < bytes; ++i) output[i] = input[i];
 }
 
@@ -353,9 +451,18 @@ __device__ __forceinline__ bool m1_aligned16(const void* p) {
   return (reinterpret_cast<m1_u64>(p) & 15u) == 0u;
 }
 
+// Four bf16 elements from `index4 * 4`, eight bytes on an eight-byte
+// boundary, widened.
+__device__ __forceinline__ float4 m1_load4_h(const m1_u8* data, m1_u32 index4) {
+  const uint2 raw = reinterpret_cast<const uint2*>(data)[index4];
+  return make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+                     __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
+}
+
 __device__ __forceinline__ float4 m1_load4_f(
     const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
   if (dtype == 0) return reinterpret_cast<const float4*>(data)[index4];
+  if (dtype == M1_DT_BF16) return m1_load4_h(data, index4);
   if (dtype == 1) {
     const int4 r = reinterpret_cast<const int4*>(data)[index4];
     return make_float4(float(r.x), float(r.y), float(r.z), float(r.w));
@@ -376,6 +483,11 @@ __device__ __forceinline__ int4 m1_load4_i(
     return make_int4(m1_float_to_i32(r.x), m1_float_to_i32(r.y),
                      m1_float_to_i32(r.z), m1_float_to_i32(r.w));
   }
+  if (dtype == M1_DT_BF16) {
+    const float4 r = m1_load4_h(data, index4);
+    return make_int4(m1_float_to_i32(r.x), m1_float_to_i32(r.y),
+                     m1_float_to_i32(r.z), m1_float_to_i32(r.w));
+  }
   if (dtype == 1) return reinterpret_cast<const int4*>(data)[index4];
   if (dtype == 2) {
     const uint4 r = reinterpret_cast<const uint4*>(data)[index4];
@@ -392,6 +504,11 @@ __device__ __forceinline__ uint4 m1_load4_u(
     return make_uint4(m1_float_to_u32(r.x), m1_float_to_u32(r.y),
                       m1_float_to_u32(r.z), m1_float_to_u32(r.w));
   }
+  if (dtype == M1_DT_BF16) {
+    const float4 r = m1_load4_h(data, index4);
+    return make_uint4(m1_float_to_u32(r.x), m1_float_to_u32(r.y),
+                      m1_float_to_u32(r.z), m1_float_to_u32(r.w));
+  }
   if (dtype == 1) {
     const int4 r = reinterpret_cast<const int4*>(data)[index4];
     return make_uint4((m1_u32)r.x, (m1_u32)r.y, (m1_u32)r.z, (m1_u32)r.w);
@@ -405,6 +522,10 @@ __device__ __forceinline__ uchar4 m1_load4_b(
     const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
   if (dtype == 0) {
     const float4 r = reinterpret_cast<const float4*>(data)[index4];
+    return make_uchar4(r.x != 0.0f, r.y != 0.0f, r.z != 0.0f, r.w != 0.0f);
+  }
+  if (dtype == M1_DT_BF16) {
+    const float4 r = m1_load4_h(data, index4);
     return make_uchar4(r.x != 0.0f, r.y != 0.0f, r.z != 0.0f, r.w != 0.0f);
   }
   if (dtype == 1) {
@@ -445,6 +566,14 @@ __device__ __forceinline__ void m1_set4_b(uchar4& v, m1_u32 j, bool x) {
 }
 __device__ __forceinline__ void m1_store4_f(m1_u8* data, m1_u32 index4, float4 v) {
   reinterpret_cast<float4*>(data)[index4] = v;
+}
+// Four bf16 elements from `index4 * 4`, each rounded once: eight bytes, the
+// two whole words they fill, in one store.
+__device__ __forceinline__ void m1_store4_h(m1_u8* data, m1_u32 index4, float4 v) {
+  uint2 raw;
+  raw.x = m1_bf16_bits(v.x) | (m1_bf16_bits(v.y) << 16);
+  raw.y = m1_bf16_bits(v.z) | (m1_bf16_bits(v.w) << 16);
+  reinterpret_cast<uint2*>(data)[index4] = raw;
 }
 __device__ __forceinline__ void m1_store4_i(m1_u8* data, m1_u32 index4, int4 v) {
   reinterpret_cast<int4*>(data)[index4] = v;
@@ -516,12 +645,11 @@ __device__ __forceinline__ void m1_reduce_float(
     m1_u8* temporary,
     M1ValueDesc in_desc) {
   float* work = reinterpret_cast<float*>(temporary);
-  const float* values = reinterpret_cast<const float*>(input);
   float* result = reinterpret_cast<float*>(output);
   for (m1_u32 row = 0; row < in_desc.rows; ++row) {
     const m1_u32 base = row * in_desc.last;
     for (m1_u32 i = 0; i < in_desc.last; ++i)
-      work[i] = values[base + i];
+      work[i] = m1_load_f(input, base + i, in_desc.dtype);
     m1_u32 count = in_desc.last;
     if (count == 0) {
       result[row] =
@@ -643,7 +771,7 @@ __device__ __forceinline__ void m1_reduce_argmax(
     m1_u8* temporary,
     M1ValueDesc in_desc) {
   int* result = reinterpret_cast<int*>(output);
-  if (in_desc.dtype != 0) {
+  if (!m1_is_float(in_desc.dtype)) {
     M1IntArgmaxCandidate* work =
         reinterpret_cast<M1IntArgmaxCandidate*>(temporary);
     for (m1_u32 row = 0; row < in_desc.rows; ++row) {
@@ -678,13 +806,12 @@ __device__ __forceinline__ void m1_reduce_argmax(
     }
     return;
   }
-  const float* values = reinterpret_cast<const float*>(input);
   M1ArgmaxCandidate* work =
       reinterpret_cast<M1ArgmaxCandidate*>(temporary);
   for (m1_u32 row = 0; row < in_desc.rows; ++row) {
     const m1_u32 base = row * in_desc.last;
     for (m1_u32 i = 0; i < in_desc.last; ++i) {
-      const float value = values[base + i];
+      const float value = m1_load_f(input, base + i, in_desc.dtype);
       work[i] = {value, i, m1_isnan(value) ? 0u : 1u, 0u};
     }
     m1_u32 count = in_desc.last;

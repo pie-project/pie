@@ -437,9 +437,53 @@ pub fn plan_prefill(
     })
 }
 
-pub use crate::attn::sched_prefill::{
-    graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
-};
+/// The float workspace a captured prefill plan of `rows` rows over `lanes`
+/// lanes lays: its split's partials, or nothing where its layout runs
+/// unsplit. It is [`plan_prefill`]'s own layout of that graph form (one
+/// live request of a row, one page of keys): a captured layout's tile,
+/// split and padded grid follow from its carved rows and lanes alone,
+/// never from the keys or the live rows, so every replay of that body asks
+/// exactly this. The load sizes the prefill grant as the most of it over
+/// the compositions its lattice arms (`engine_cuda::inputs`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_graph_float_bytes(
+    rows: u32,
+    lanes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    page_size: u32,
+    window: Option<u32>,
+    device: &Device,
+    toggles: Toggles,
+) -> Result<usize, Error> {
+    const OP: &str = "attn.plan_prefill";
+    window_left(OP, window)?;
+    // The live request carries a row: the layout reads the carve's rows
+    // (`total_num_rows`), and the live rows only fill its index tables.
+    let qo_indptr = [0, 1];
+    let req = sched_prefill::Request {
+        qo_indptr: &qo_indptr,
+        kv_indptr: &[0, 1],
+        total_num_rows: rows.max(1),
+        batch_size: lanes.max(1),
+        lane_offset: 0,
+        live: Live {
+            requests: 1,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: 1,
+        },
+        num_qo_heads: num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size: page_size.max(1),
+        enable_cuda_graph: true,
+        window_left: window.map(|w| w - 1),
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
+    };
+    Ok(sched_prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(

@@ -6,10 +6,23 @@
 //! greedy. Asked for logprobs, a step also lands the sampled token's
 //! log-probability under the model's raw logits and the likeliest tokens'.
 //!
+//! The vocabulary-sized values a step computes (the penalized and masked
+//! logits, the probabilities its cuts read, the log-probabilities) are bf16
+//! (`eta_ir::types`' rules: computed in f32, each rounded once on its
+//! store, every reduction over them in f32). The draw is one
+//! `gumbel_argmax` over the logits as they are, the model's f32 row where
+//! no penalty or grammar mask changed them: temperature, the cut and the
+//! noise are applied per lane in f32 inside the reduction, so no
+//! perturbed row is rounded and no noise row is laid. Temperature has one
+//! form, in the cut and the draw alike: a multiply by `1 / T`, rounded once
+//! to f32 on the host ([`inverse_temperature`], `eta_ir::types`). A greedy
+//! step that changes no logit reads the model's f32 logits whole.
+//!
 //! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
-//! a program's regions are keyed by their text, which the knobs' values
-//! (they ride in channels, or are constants the text does not hold) do not
-//! change, so a request of one of these shapes builds nothing.
+//! every knob's value, the temperature's reciprocal among them, rides in a
+//! channel the stage reads, so no value is in a program's text, its hash or
+//! its launch package, by which the engines key what they compile, and a
+//! request of one of these shapes builds nothing.
 
 use crate::channel::Channel;
 use crate::dtype;
@@ -20,8 +33,8 @@ use crate::value::*;
 /// request's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shape {
-    /// A program constant; `None` samples greedily.
-    pub temperature: Option<f32>,
+    /// A draw at a temperature; `false` samples greedily.
+    pub temperature: bool,
     pub top_p: bool,
     pub top_k: bool,
     pub min_p: bool,
@@ -34,7 +47,7 @@ pub struct Shape {
 
 impl Shape {
     pub const GREEDY: Shape = Shape {
-        temperature: None,
+        temperature: false,
         top_p: false,
         top_k: false,
         min_p: false,
@@ -53,14 +66,14 @@ pub const STANDARD: [(&str, Shape); 5] = [
     (
         "gumbel-max",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             ..Shape::GREEDY
         },
     ),
     (
         "top-p",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             top_p: true,
             ..Shape::GREEDY
         },
@@ -68,7 +81,7 @@ pub const STANDARD: [(&str, Shape); 5] = [
     (
         "top-k + top-p",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             top_p: true,
             top_k: true,
             ..Shape::GREEDY
@@ -85,9 +98,9 @@ pub const STANDARD: [(&str, Shape); 5] = [
 
 /// The sampler's knob values as scalars.
 pub struct Knobs {
-    /// A program constant: a channel-fed divisor costs the fused sampler
-    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
-    pub temperature: Option<f32>,
+    /// The temperature's reciprocal ([`inverse_temperature`]), an f32 the
+    /// cut and the draw multiply by; `None` samples greedily.
+    pub temperature: Option<Tensor>,
     pub top_p: Option<Tensor>,
     pub top_k: Option<Tensor>,
     pub min_p: Option<Tensor>,
@@ -95,6 +108,14 @@ pub struct Knobs {
     pub frequency: Option<Tensor>,
     pub presence: Option<Tensor>,
     pub logprobs: Option<u32>,
+}
+
+/// The value a request's temperature `t` rides in its channel as: `1 / t`,
+/// rounded once to f32 on the host, which the cut and the draw multiply by
+/// (a multiply is correctly rounded on every backend, a divide is not).
+#[must_use]
+pub fn inverse_temperature(t: f32) -> f32 {
+    1.0 / t
 }
 
 /// What a step lands beside its token when asked for logprobs: the sampled
@@ -194,39 +215,56 @@ pub fn sample(
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
-    let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| logits.clone());
+    let model = reshape(intrinsics::output(0, "logits"), [vocab]);
+    let raw = k.logprobs.map(|_| shifted(&model));
+    // A step that changes the logits works on a bf16 copy of them; one
+    // that does not (greedy, or a draw) reads the model's f32 row.
+    let changes = histogram.is_some() || mask.is_some();
+    let mut logits = if changes {
+        cast(&model, dtype::bf16)
+    } else {
+        model
+    };
+    // A knob is one value, an f32 scalar every op mixes in unrounded.
+    let knob = |t: &Tensor| {
+        if t.shape().is_scalar() {
+            t.clone()
+        } else {
+            reshape(t, [])
+        }
+    };
     if let Some((counts, present)) = histogram {
-        let zero = broadcast(0.0f32, [vocab]);
-        let seen_out = gt(counts, &zero);
-        let seen_prompt = gt(present, broadcast(0.5f32, [vocab]));
+        let seen_out = gt(counts, 0.0f32);
+        let seen_prompt = gt(present, 0.5f32);
         let seen = or(&seen_out, &seen_prompt);
         if let Some(rep) = &k.repetition {
-            let rp = broadcast(rep, [vocab]);
-            let positive = gt(&logits, &zero);
+            let rp = knob(rep);
+            let positive = gt(&logits, 0.0f32);
             let repenalized = select(&positive, &logits / &rp, &logits * &rp);
             logits = select(&seen, &repenalized, &logits);
         }
         if let Some(freq) = &k.frequency {
-            logits = &logits - broadcast(freq, [vocab]) * counts;
+            logits = &logits - cast(counts, dtype::bf16) * knob(freq);
         }
         if let Some(pres) = &k.presence {
-            logits = &logits - broadcast(pres, [vocab]) * cast(&seen_out, dtype::f32);
+            logits = &logits - cast(&seen_out, dtype::bf16) * knob(pres);
         }
     }
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = match k.temperature {
+    let token = match &k.temperature {
         None => reduce_argmax(&logits),
-        Some(temperature) => {
-            let scaled = &logits / temperature;
+        Some(inverse) => {
+            // The temperature's one form: a multiply by its reciprocal.
+            let inverse = knob(inverse);
             let mut keep: Option<Tensor> = None;
             if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
-                let probs = softmax(&scaled);
+                // The cuts read bf16 probabilities of the scaled row.
+                let probs = cut_probabilities(&logits, &inverse);
                 if let Some(min_p) = &k.min_p {
-                    let floor = reduce_max(&probs) * min_p;
-                    keep = Some(ge(&probs, broadcast(&floor, [vocab])));
+                    let floor = reduce_max(&probs) * knob(min_p);
+                    keep = Some(ge(&probs, floor));
                 }
                 if let Some(top_k) = &k.top_k {
                     let ranked = pivot_threshold(&probs, rank_le(top_k));
@@ -243,17 +281,19 @@ pub fn sample(
                     });
                 }
             }
-            let truncated = match keep {
-                Some(keep) => mask_apply(&scaled, keep),
-                None => scaled,
-            };
-            gumbel_max(&truncated, r)
+            match keep {
+                Some(keep) => gumbel_argmax(&logits, keep, &inverse, r),
+                None => gumbel_argmax(&logits, true, &inverse, r),
+            }
         }
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
     let landed = raw.zip(k.logprobs).map(|(raw, top)| {
         let lp = log_softmax(&raw);
-        let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
+        let chosen = cast(
+            reshape(scalar_gather(&lp, reshape(&token, [1])), [1]),
+            dtype::f32,
+        );
         if top == 0 {
             return Landed {
                 logprobs: chosen,
@@ -261,12 +301,31 @@ pub fn sample(
             };
         }
         let (values, ids) = top_k(&lp, top);
+        let values = cast(&values, dtype::f32);
         Landed {
             logprobs: concat_f32(&chosen, &values, top),
             ids: Some(cast(&ids, dtype::i32)),
         }
     });
     (token, next, landed)
+}
+
+/// `row` less its max rounded to bf16, as a bf16 row: a softmax and a
+/// log-softmax do not see the shift, and the row's largest values, which
+/// decide them, round near zero, where a bf16 is finest (a logit of 20
+/// rounded alone is 1/16 off, its shifted value a few thousandths).
+fn shifted(row: &Tensor) -> Tensor {
+    row - cast(reduce_max(row), dtype::bf16)
+}
+
+/// The probabilities the cuts read, `softmax(logits * inverse)` with
+/// `inverse` the temperature's reciprocal, as a bf16 row: the exponent is
+/// the row less its max rounded to bf16, times `inverse`, so its largest
+/// values round near zero and no lane overflows; the one max the row needs
+/// is that shift.
+fn cut_probabilities(logits: &Tensor, inverse: &Tensor) -> Tensor {
+    let e = exp(shifted(logits) * inverse);
+    &e / reduce_sum(&e)
 }
 
 /// `[1]` and `[n]` f32 rows as one `[1 + n]` row.

@@ -634,6 +634,48 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let y = p.op(Op::ReduceArgmax(s));
             p.output(y, &[r], Dtype::I32, exact, "gumbel-max");
         }
+        tags::GUMBEL_ARGMAX => {
+            // A masked draw at a divisor, over f32 and bf16 rows: every lane
+            // made in f32 in the reduction.
+            let state = p.input_dims(&[2], Dtype::U32, Gen::Below(u32::MAX));
+            let x = p.input_dims(&plane, f, Gen::Signed);
+            let keep = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let divisor = p.input_dims(&[1], f, Gen::Positive);
+            let divisor = p.op(Op::Reshape {
+                value: divisor,
+                shape: scalar(),
+            });
+            let y = p.op(Op::GumbelArgmax {
+                logits: x,
+                keep,
+                scale: divisor,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "f32, masked");
+            let h = p.op(Op::Cast {
+                value: x,
+                dtype: Dtype::Bf16,
+            });
+            let y = p.op(Op::GumbelArgmax {
+                logits: h,
+                keep,
+                scale: divisor,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "bf16, masked");
+            // Over the logits, every lane kept at a divisor of one: the draw
+            // that scans the model's row itself.
+            let l = p.logits(r, w);
+            let every = p.op(Op::Const(Literal::Bool(true)));
+            let one = p.op(Op::Const(Literal::F32(1.0)));
+            let y = p.op(Op::GumbelArgmax {
+                logits: l,
+                keep: every,
+                scale: one,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "logits");
+        }
         tags::CONST => {
             for (literal, dtype) in [
                 (Literal::F32(-0.0), f),

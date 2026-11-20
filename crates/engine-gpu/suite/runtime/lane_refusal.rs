@@ -3,10 +3,12 @@
 //! frame's first step the frame is refused naming it and nothing ran; at a
 //! later step the frame stops there, its ticket naming it, and the steps
 //! before it land whole. The plain lanes beside it fire on, and read out
-//! their own rows.
+//! their own rows. Each refusal is counted (`Tally::Refused`), a clean
+//! frame not.
 
 use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step};
+use engine::live::Tally;
 use poem::Request;
 
 use super::outputs::{Loaded, Rows, WIDTH, loaded};
@@ -75,6 +77,8 @@ fn a_refused_lane_is_refused_alone() {
         vec![1],
         "lane 1 alone: {refused}"
     );
+    let live = engine.live();
+    assert_eq!(live.tallied(Tally::Refused), 1, "the refused frame is counted");
 
     // At the second step: the first lands whole, and the ticket names the
     // second's lane 1.
@@ -92,6 +96,11 @@ fn a_refused_lane_is_refused_alone() {
         ticket.refused.iter().map(|fault| fault.lane).collect::<Vec<_>>(),
         vec![1]
     );
+    assert_eq!(
+        live.tallied(Tally::Refused),
+        2,
+        "a frame stopped at a refusing step is counted"
+    );
     engine.settle_frame(&mut ticket).expect("the frame settles");
     for (readout, token) in ticket.steps[0].readouts.iter().zip([3, 11]) {
         reads(table, token, &readout.values);
@@ -104,6 +113,7 @@ fn a_refused_lane_is_refused_alone() {
     engine.settle_frame(&mut ticket).expect("the frame settles");
     reads(table, 5, &ticket.steps[0].readouts[0].values);
     assert!(ticket.refused.is_empty());
+    assert_eq!(live.tallied(Tally::Refused), 2, "a clean frame is not");
 
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);

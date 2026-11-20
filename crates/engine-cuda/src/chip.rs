@@ -271,6 +271,16 @@ impl Engine {
             fire_lanes: profile.get::<FireLanes>().0,
         }
     }
+
+    /// The lanes one fire of a load seating `max_lanes` carries
+    /// (`Shell::fire_lanes`): every one, or `engine.fire_lanes` where fewer.
+    #[must_use]
+    pub fn fire_lanes_of(&self, max_lanes: u32) -> u32 {
+        match self.fire_lanes {
+            0 => max_lanes,
+            cap => max_lanes.min(cap),
+        }
+    }
 }
 
 /// The name and facts of GPU `ordinal`, read without opening a context:
@@ -1182,7 +1192,13 @@ mod hip {
             want.gemm_turn_from = 3;
             want.gemm_turn_wide_until = 32;
             want.ssm_gdn_wide_from = 512;
-            assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
+            // The rates are the device's own file's (the norm fold's pricing
+            // reads them), not the family's: not what this checks.
+            let got = kernels_cuda::tuning::Tuning::of(&profile);
+            want.launch_ns = got.launch_ns;
+            want.hbm_gbps = got.hbm_gbps;
+            want.cached_gbps = got.cached_gbps;
+            assert_eq!(got, want, "{gpu}");
         }
     }
 

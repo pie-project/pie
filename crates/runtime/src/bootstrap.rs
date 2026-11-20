@@ -324,6 +324,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .wasm_max_memory_mb
             .saturating_mul(1024 * 1024),
     );
+    // The built-ins compiled and linked beside the model's load: a request
+    // that launches one compiles and links nothing.
+    let builtins_ready = {
+        let names: Vec<&'static str> = config.builtin_programs.iter().map(|b| b.name).collect();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crate::rt::spawn(async move {
+            let _ = tx.send(prepare_builtins(names).await);
+        });
+        rx
+    };
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::init(max_upload_bytes, config.runtime.allow_upload);
     let bound_port = config.port;
@@ -892,6 +902,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let room = rooms.get_mut(engine).and_then(Option::take);
         crate::governor::run::start(steered, memory_yield, room, source.clone());
     }
+    let builtins = match builtins_ready.await {
+        Ok(prepared) => prepared,
+        Err(_) => Err(anyhow::anyhow!("preparing the built-in programs ended unanswered")),
+    };
+    if let Err(error) = builtins {
+        scheduler_shutdown.shutdown().await.ok();
+        return Err(error);
+    }
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
@@ -900,6 +918,19 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine_ids: engines,
         }),
     })
+}
+
+/// What each built-in's name runs for the system (the operator's install of
+/// that name, else the built-in), compiled and linked.
+async fn prepare_builtins(names: Vec<&'static str>) -> Result<()> {
+    for name in names {
+        let reference = program::ProgramRef::parse(name)?;
+        let built = program::resolve(None, &reference).await?;
+        program::load(&built)
+            .await
+            .with_context(|| format!("the built-in program {name}"))?;
+    }
+    Ok(())
 }
 
 /// Engine `engine`'s governor target where its pools are pinned (they never

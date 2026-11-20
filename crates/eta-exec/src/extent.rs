@@ -43,6 +43,14 @@ impl Extents {
     }
 }
 
+/// The bytes an element of `dtype` takes in a guest's device scratch, the
+/// one layout every backend's kernels read: its width rounded up to a
+/// byte, so a bool a byte, a 16-bit float two, a 32-bit value a word.
+#[must_use]
+pub const fn element_bytes(dtype: Dtype) -> u64 {
+    dtype.bytes_ceil()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct ValueDesc {
@@ -75,15 +83,13 @@ impl Default for ValueDesc {
 }
 
 impl ValueDesc {
+    /// The bytes the value takes in a guest's device scratch: its elements
+    /// at their dtype's width ([`element_bytes`]), at least a word.
     #[must_use]
     pub fn device_bytes(&self) -> u64 {
-        let len = u64::from(self.len);
-        let bytes = if self.dtype() == Dtype::Bool {
-            len
-        } else {
-            len * 4
-        };
-        bytes.max(4)
+        u64::from(self.len)
+            .saturating_mul(element_bytes(self.dtype()))
+            .max(4)
     }
 
     #[must_use]
@@ -148,4 +154,33 @@ pub fn describe(value: &LaunchPlanValue, extents: &Extents) -> Result<ValueDesc,
         descriptor.dims[rank - 1]
     };
     Ok(descriptor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn of(dtype: Dtype, len: u32) -> ValueDesc {
+        ValueDesc {
+            len,
+            dtype: u32::from(wire_dtype(dtype)),
+            ..ValueDesc::default()
+        }
+    }
+
+    /// A value's device bytes are its elements at its dtype's width: a word
+    /// a 32-bit element, a byte a bool, never less than a word in all.
+    #[test]
+    fn a_value_takes_its_dtype_s_width_an_element() {
+        for dtype in [Dtype::F32, Dtype::I32, Dtype::U32] {
+            assert_eq!(of(dtype, 151_936).device_bytes(), 151_936 * 4, "{dtype:?}");
+        }
+        assert_eq!(of(Dtype::Bool, 151_936).device_bytes(), 151_936);
+        assert_eq!(of(Dtype::Bool, 3).device_bytes(), 4, "at least a word");
+        assert_eq!(of(Dtype::F32, 1).device_bytes(), 4);
+        assert_eq!(element_bytes(Dtype::Bf16), 2);
+        assert_eq!(element_bytes(Dtype::F16), 2);
+        assert_eq!(element_bytes(Dtype::I8), 1);
+        assert_eq!(element_bytes(Dtype::I64), 8);
+    }
 }

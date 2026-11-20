@@ -4,8 +4,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
-    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
-    Rebind, RingFacts,
+    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
+    RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -146,6 +146,11 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     library: Option<Arc<crate::guest::session::Library>>,
 
+    /// The ring of host room every pass takes its berth of, which the
+    /// load's shelf laid (`Programs::load`).
+    #[cfg(feature = "vulkan")]
+    ring: Option<crate::serve::GuestRing>,
+
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
 
@@ -177,7 +182,11 @@ impl Plane {
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
-        if self.instances.values().any(|instance| instance.program == id) {
+        if self
+            .instances
+            .values()
+            .any(|instance| instance.program == id)
+        {
             return Err(Refusal::Program(format!(
                 "program {id} still has an instance bound"
             )));
@@ -323,9 +332,11 @@ impl Plane {
         #[cfg(not(feature = "vulkan"))]
         let _ = layout;
         #[cfg(feature = "vulkan")]
-        let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
-            Refusal::Program(format!("program {} does not bind: {why}", binding.program))
-        })?;
+        let session = self
+            .build_session(place, binding, &plan, layout)
+            .map_err(|why| {
+                Refusal::Program(format!("program {} does not bind: {why}", binding.program))
+            })?;
         // The instance's room is fresh, its pair's where none holds that
         // taking: both are another owner's bytes until cleared.
         #[cfg(feature = "vulkan")]
@@ -436,11 +447,16 @@ impl Plane {
             what: "program",
             id: program.0,
         })?;
-        if self.forms.get(program).is_none() {
-            // Registration refuses a program with no device form.
+        // Registration refuses a program with no device form.
+        let Some(compiled) = self.forms.get(program) else {
             return Ok(ProgramFacts::default());
-        }
-        let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
+        };
+        let stride = engine_gpu::guest::session::step_stride(place.device.table_align());
+        let sizes = engine_gpu::guest::session::instance_table_sizes(
+            &plan.package.plans,
+            compiled.all(),
+            stride,
+        );
         let instance =
             engine_gpu::guest::held::table_footprint(place.pools, INSTANCE, &sizes, place.align)
                 .map_err(|fault| Refusal::Program(fault.to_string()))?;
@@ -916,6 +932,9 @@ impl Plane {
         let inputs = PassInputs::none();
 
         #[cfg(feature = "vulkan")]
+        offered_read(seat, instance, &seats)?;
+
+        #[cfg(feature = "vulkan")]
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
@@ -1031,6 +1050,7 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        offered_read(seat, instance, &seats)?;
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
@@ -1068,7 +1088,7 @@ impl Plane {
 
         let crate::guest::run::Deferral {
             frame,
-            landing,
+            pass,
             landings,
         } = deferral;
         let Some(frame) = frame else {
@@ -1098,9 +1118,7 @@ impl Plane {
             Arc::clone(&seat.faulted),
             owed.clone(),
         );
-        let status = seat.session.status_cell();
-        let spare = seat.session.landings();
-        let landing = Mutex::new(landing);
+        let pass = Mutex::new(pass);
         let owing = Arc::clone(&seat.landing);
         let faulted = Arc::clone(&seat.faulted);
         let on_done = move |refused: Option<String>| {
@@ -1109,18 +1127,21 @@ impl Plane {
             // and landing say is its lanes'.
             let lost = refused.clone();
             let mut fault = refused;
+            // The pass's berth goes back to the ring as this returns.
+            let lent = pass.lock().expect("pass lock poisoned").take();
             if fault.is_none() {
-                let mut word = [0u8; 4];
-                fault = match status.read(0, &mut word) {
-                    Ok(()) if word == [0; 4] => None,
-                    Ok(()) => Some(format!(
-                        "instance {instance} (program {program}) faulted on the device with                          code {}",
-                        u32::from_le_bytes(word)
+                fault = match lent.as_ref().map(crate::guest::session::Pass::status) {
+                    None => Some(format!(
+                        "instance {instance} (program {program}): a pass landed with no berth"
                     )),
-                    Err(why) => Some(why.to_string()),
+                    Some(Ok(None)) => None,
+                    Some(Ok(Some(code))) => Some(format!(
+                        "instance {instance} (program {program}) faulted on the device with \
+                         code {code}"
+                    )),
+                    Some(Err(why)) => Some(why.to_string()),
                 };
             }
-            let lent = landing.lock().expect("landing lock poisoned").take();
             if fault.is_none()
                 && let Some(lent) = lent.as_ref()
             {
@@ -1138,9 +1159,7 @@ impl Plane {
                 faulted.store(true, Ordering::Release);
             }
             owing.land(&owed);
-            if let Some(lent) = lent {
-                spare.lock().expect("spare lock poisoned").push(lent);
-            }
+            drop(lent);
             if let Some(done) = done.as_ref() {
                 if lost.is_some() {
                     done.tell(lost, "vulkan guest pass");
@@ -1199,6 +1218,10 @@ impl Plane {
             .library
             .clone()
             .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
+        let ring = self
+            .ring
+            .clone()
+            .ok_or_else(|| "the load laid no guest ring".to_owned())?;
         let extents = engine_gpu::guest::state::extents_of(&binding.extents);
         // The instance's state and its pair's, at the places the runtime
         // took for them.
@@ -1209,7 +1232,7 @@ impl Plane {
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
+            &plan.package,
             compiled.all(),
             &extents,
             &library,
@@ -1222,6 +1245,7 @@ impl Plane {
             },
             [instance, pair],
             layout,
+            ring,
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -1265,6 +1289,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 "every guest step's pipeline is built"
             );
             self.library = Some(Arc::new(library));
+            self.ring = Some(Arc::clone(&place.shelf.guest));
             let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
                 Refusal::Program(format!("the readout widen did not build: {why}"))
             })?;
@@ -1405,16 +1430,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         })?;
         #[cfg(feature = "vulkan")]
         {
-            let session = &seat.session;
-            let unread = engine_gpu::guest::run::unread_seat(
-                &seat.plan.package,
-                |at, local| session.span(at, local).map(|(_, held)| held),
-                &seats,
-            )
-            .map_err(|fault| Refusal::Program(fault.to_string()))?;
-            if let Some((output, lane)) = unread {
-                return Err(engine_gpu::program::unread(instance, &output, lane));
-            }
+            let _ = seat;
             self.fire(instance, Stage::Epilogue, Some(device), seats)?;
             self.instances.get_mut(&instance).map_or(Ok(()), |seat| {
                 seat.session
@@ -1442,18 +1458,15 @@ fn puts_into(plan: &ExecPlan, channel: u32) -> bool {
 
 /// The bytes a channel's cell takes on the device, where a pass may keep one
 /// there: a channel the host does not read (`guest::run`). A value lies in a
-/// guest heap a word an element, a byte a bool (`ValueDesc::device_bytes`).
+/// guest heap at its dtype's width an element (`eta_exec::element_bytes`,
+/// as `ValueDesc::device_bytes` lays it).
 fn device_cell_bytes(shape: &[u32], dtype: ChanDType, host_role: HostRole) -> Option<u64> {
     if host_role == HostRole::Reader {
         return None;
     }
     let numel = numel_of(shape) as u64;
-    let bytes = if eta_exec::concrete_dtype(dtype) == eta_ir::Dtype::Bool {
-        numel
-    } else {
-        numel * 4
-    };
-    Some(bytes.max(4))
+    let element = eta_exec::element_bytes(eta_exec::concrete_dtype(dtype));
+    Some(numel.saturating_mul(element).max(4))
 }
 
 /// A channel's device cell as `Channel` slots: a slot where the cell fits
@@ -1616,5 +1629,27 @@ mod registration_tests {
         assert!(why.contains("emits no WGSL for"), "{why}");
         assert_eq!(plane.forms.tally(), (0, 0), "the refusal is not kept");
         assert!(plane.programs.is_empty());
+    }
+}
+
+/// What a pass is offered it reads: every seat the fire read out for its
+/// lanes (the arm's seat, or rows where they lie in the fire's span) is a
+/// row of an output the program reads, else the pass is refused by name.
+#[cfg(feature = "vulkan")]
+fn offered_read(
+    seat: &Instance,
+    instance: InstanceId,
+    seats: &[Vec<crate::guest::run::Readout<'_>>],
+) -> Result<(), Refusal> {
+    let session = &seat.session;
+    let unread = engine_gpu::guest::run::unread_seat(
+        &seat.plan.package,
+        |at, local| session.span(at, local).map(|(_, held)| held),
+        seats,
+    )
+    .map_err(|fault| Refusal::Program(fault.to_string()))?;
+    match unread {
+        Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
+        None => Ok(()),
     }
 }

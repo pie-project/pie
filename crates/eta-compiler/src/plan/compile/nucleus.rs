@@ -23,7 +23,9 @@ pub(crate) fn recognize_library_dataflows(
     let mut claimed = BTreeSet::new();
     let mut matches = Vec::new();
     for final_node in (0..stage.ops.len() as u32).map(NodeIndex) {
-        let Some(candidate) = match_nucleus_dataflow(stage, final_node, index) else {
+        let Some(candidate) = match_nucleus_dataflow(stage, final_node, index)
+            .or_else(|| match_draw_dataflow(stage, final_node, index))
+        else {
             continue;
         };
         if candidate.nodes.iter().any(|node| claimed.contains(node)) {
@@ -32,8 +34,8 @@ pub(crate) fn recognize_library_dataflows(
         claimed.extend(candidate.nodes.iter().copied());
         matches.push(candidate);
     }
-    // A top-p or top-k cut outside a sampler chain, over f32 rows a
-    // vocabulary wide: the lane cut (its row on several blocks).
+    // A top-p or top-k cut outside a sampler chain, over f32 or bf16 rows
+    // a vocabulary wide: the lane cut (its row on several blocks).
     for node in (0..stage.ops.len() as u32).map(NodeIndex) {
         if claimed.contains(&node) {
             continue;
@@ -52,7 +54,9 @@ pub(crate) fn recognize_library_dataflows(
             input_type.dims.last(),
             Some(Dimension::Static(width)) if *width >= LANE_CUT_WIDTH
         );
-        if input_type.dtype != Dtype::F32 || !wide || !(1..=2).contains(&input_type.rank()) {
+        // A bf16 row's cut reads it as f32 (`eta_ir::types`), as an f32 row's.
+        let float = matches!(input_type.dtype, Dtype::F32 | Dtype::Bf16);
+        if !float || !wide || !(1..=2).contains(&input_type.rank()) {
             continue;
         }
         let Some(output) = index.base(node) else {
@@ -72,6 +76,178 @@ pub(crate) fn recognize_library_dataflows(
 /// The narrowest row a lane cut takes: below it one block walks the row as
 /// fast as a lane's blocks meet.
 const LANE_CUT_WIDTH: u32 = 1024;
+
+/// The standard sampler's bf16 draw (`eta_dsl::sampler`): the cut's
+/// probabilities a bf16 softmax of the f32 logits less their max rounded to
+/// bf16, over a constant temperature, one top-p or top-k cut of them, and
+/// a gumbel_argmax of the logits under the cut at that temperature, which
+/// both apply as a multiply by its reciprocal `r`. The lane sampler draws
+/// it on several blocks, reading the logits where the model left them:
+///
+/// `m = max(x); s = x - bf16(m); d = s * r; e = exp(d); q = e / sum(e);
+/// keep = pivot(q); token = gumbel_argmax(x, keep, r, state)`.
+fn match_draw_dataflow(
+    stage: &NormalizedStage,
+    final_node: NodeIndex,
+    index: &StageIndex,
+) -> Option<LibraryMatch> {
+    let op = |node: NodeIndex| stage.ops.get(node.index());
+    let made = |value: ValueId| {
+        index
+            .producer(value)
+            .and_then(|node| Some((node, op(node)?)))
+    };
+    let Op::GumbelArgmax {
+        logits,
+        keep,
+        scale: divisor,
+        state,
+    } = *op(final_node)?
+    else {
+        return None;
+    };
+    let (
+        pivot_node,
+        &Op::PivotThreshold {
+            input: probs,
+            predicate,
+        },
+    ) = made(keep)?
+    else {
+        return None;
+    };
+    let (threshold, rank) = match predicate {
+        Predicate::CummassLe(value) => (value, false),
+        Predicate::RankLe(value) => (value, true),
+        Predicate::ProbGe(_) => return None,
+    };
+    let (q_node, &Op::Div(exps, sum)) = made(probs)? else {
+        return None;
+    };
+    let (sum_node, &Op::ReduceSum(summed)) = made(sum)? else {
+        return None;
+    };
+    let (exp_node, &Op::Exp(scaled)) = made(exps)? else {
+        return None;
+    };
+    // The temperature's one form: a multiply by its reciprocal.
+    let (scale_node, &Op::Mul(shifted, temperature)) = made(scaled)? else {
+        return None;
+    };
+    let (shift_node, &Op::Sub(row, narrow)) = made(shifted)? else {
+        return None;
+    };
+    let (
+        cast_node,
+        &Op::Cast {
+            value: maximum,
+            dtype: Dtype::Bf16,
+        },
+    ) = made(narrow)?
+    else {
+        return None;
+    };
+    let (max_node, &Op::ReduceMax(maxed)) = made(maximum)? else {
+        return None;
+    };
+    if summed != exps || row != logits || maxed != logits {
+        return None;
+    }
+    // One reciprocal temperature scales both: the same value (data the
+    // stage reads, as the sampler's knob is), or one constant.
+    let constant = |value: ValueId| match made(value) {
+        Some((_, Op::Const(Literal::F32(t)))) => Some(t.to_bits()),
+        _ => None,
+    };
+    let same = temperature == divisor
+        || constant(temperature).is_some_and(|t| constant(divisor) == Some(t));
+    let scalar_f32 = |value: ValueId| {
+        stage
+            .value_types
+            .get(value as usize)
+            .is_some_and(|t| t.dtype == Dtype::F32 && t.is_scalar())
+    };
+    if !same || !scalar_f32(temperature) {
+        return None;
+    }
+    let ty = |value: ValueId| stage.value_types.get(value as usize);
+    let logits_type = ty(logits)?;
+    let width = match logits_type.dims.last()? {
+        Dimension::Static(width) if *width >= LANE_CUT_WIDTH => *width,
+        _ => return None,
+    };
+    let _ = width;
+    // The model's f32 row, or a bf16 row a penalty or mask made of it.
+    if !matches!(logits_type.dtype, Dtype::F32 | Dtype::Bf16) || logits_type.rank() != 1 {
+        return None;
+    }
+    for value in [shifted, scaled, exps, probs] {
+        let t = ty(value)?;
+        if t.dtype != Dtype::Bf16 || t.dims != logits_type.dims {
+            return None;
+        }
+    }
+    let keep_type = ty(keep)?;
+    if keep_type.dtype != Dtype::Bool || keep_type.dims != logits_type.dims {
+        return None;
+    }
+    let threshold_type = ty(threshold)?;
+    let threshold_ok = if rank {
+        matches!(threshold_type.dtype, Dtype::I32 | Dtype::U32)
+    } else {
+        threshold_type.dtype == Dtype::F32
+    };
+    if !threshold_ok || !threshold_type.is_scalar() {
+        return None;
+    }
+    let state_type = ty(state)?;
+    if state_type.dtype != Dtype::U32 || state_type.dims.as_slice() != [Dimension::Static(2)] {
+        return None;
+    }
+    // Every value between the logits and the token is the chain's own.
+    let nodes = [
+        max_node, cast_node, shift_node, scale_node, exp_node, sum_node, q_node, pivot_node,
+        final_node,
+    ];
+    let own = |value: ValueId, readers: &[NodeIndex]| {
+        let mut actual = index
+            .consumers(value)
+            .map(<[NodeIndex]>::to_vec)
+            .unwrap_or_default();
+        let mut expected = readers.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        actual == expected
+    };
+    if !(own(maximum, &[cast_node])
+        && own(narrow, &[shift_node])
+        && own(shifted, &[scale_node])
+        && own(scaled, &[exp_node])
+        && own(exps, &[sum_node, q_node])
+        && own(sum, &[q_node])
+        && own(probs, &[pivot_node])
+        && own(keep, &[final_node]))
+    {
+        return None;
+    }
+    let token = index.base(final_node)?;
+    let mut ordered = nodes.to_vec();
+    ordered.sort_unstable();
+    Some(LibraryMatch {
+        library: if rank {
+            LibraryOp::RankSample
+        } else {
+            LibraryOp::NucleusSample
+        },
+        nodes: ordered,
+        inputs: if divisor == temperature {
+            vec![logits, threshold, state, temperature]
+        } else {
+            vec![logits, threshold, state, temperature, divisor]
+        },
+        outputs: vec![token],
+    })
+}
 
 fn match_nucleus_dataflow(
     stage: &NormalizedStage,

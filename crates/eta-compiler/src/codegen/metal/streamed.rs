@@ -153,6 +153,9 @@ pub fn op_step_kind(tag: u8, pred_tag: u8, argmax_over_f32: bool) -> StepKind {
                 StepKind::Single
             }
         }
+        // A draw over the whole grid, as an f32 argmax: its lanes are made
+        // from its operands in the first level.
+        tags::GUMBEL_ARGMAX => StepKind::Argmax,
         tags::CUMSUM
         | tags::CUMPROD
         | tags::SORT_DESC
@@ -190,9 +193,19 @@ fn length_key(value_types: &[SymbolicType], value: u32) -> Vec<Dimension> {
         .unwrap_or_default()
 }
 
+/// The wire tag of a bf16 value: computed as a float, stored two bytes an
+/// element, rounded to nearest even where it is defined (a register holding
+/// one holds the rounded f32).
+const BF16: u8 = eta_ir::types::WIRE_BF16;
+
+/// The dtype a value's arithmetic runs in: a bf16 value's is f32.
+fn computed(dtype: u8) -> u8 {
+    if dtype == BF16 { 0 } else { dtype }
+}
+
 fn msl_type(dtype: u8) -> &'static str {
     match dtype {
-        0 => "float",
+        0 | BF16 => "float",
         1 => "int",
         2 => "uint",
         _ => "bool",
@@ -201,7 +214,7 @@ fn msl_type(dtype: u8) -> &'static str {
 
 fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
     let load = match want {
-        0 => "m1_load_f",
+        0 | BF16 => "m1_load_f",
         1 => "m1_load_i",
         2 => "m1_load_u",
         _ => "m1_load_b",
@@ -211,12 +224,12 @@ fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
 
 fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
     let as_own = match own {
-        0 => format!("as_type<float>({bits})"),
+        0 | BF16 => format!("as_type<float>({bits})"),
         1 => format!("int({bits})"),
         2 => format!("({bits})"),
         _ => format!("(({bits}) != 0u)"),
     };
-    if want == own {
+    if want == own || (want == BF16 && own == 0) || (want == 0 && own == BF16) {
         return as_own;
     }
     match (want, own) {
@@ -224,7 +237,7 @@ fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
         (1, 3) => format!("({as_own} ? 1 : 0)"),
         (2, 3) => format!("({as_own} ? 1u : 0u)"),
         (3, _) => format!("({as_own} != 0)"),
-        (0, _) => format!("float({as_own})"),
+        (0 | BF16, _) => format!("float({as_own})"),
         (1, _) => format!("int({as_own})"),
         _ => format!("uint({as_own})"),
     }
@@ -233,6 +246,7 @@ fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
 fn bits_of(ty: u8, value: &str) -> String {
     match ty {
         0 => format!("as_type<uint>({value})"),
+        BF16 => format!("as_type<uint>(m1_round_bf16({value}))"),
         1 => format!("uint({value})"),
         2 => value.to_string(),
         _ => format!("({value} ? 1u : 0u)"),
@@ -295,6 +309,7 @@ fn direct_wide(
     let decl = format!("      {} {v} = {}(0);\n", msl_type(dout), msl_type(dout));
     let store_fn = match dout {
         0 => "m1_store_f",
+        BF16 => "m1_store_h",
         1 => "m1_store_i",
         2 => "m1_store_u",
         _ => "m1_store_b",
@@ -318,12 +333,13 @@ fn direct_wide(
             let _ = writeln!(compute, "{v} = {expr};");
         }
         tags::NEG | tags::ABS | tags::SIGN => {
-            let d0 = d0?;
-            if d0 == 3 {
+            let own = d0?;
+            if own == 3 {
                 return None;
             }
+            let d0 = computed(own);
             let s0 = stride(0, &mut pre);
-            let x = load(0, d0, d0, &s0);
+            let x = load(0, d0, own, &s0);
             let expr = match (d0, op.tag) {
                 (0, tags::NEG) => "-x",
                 (0, tags::ABS) => "abs(x)",
@@ -353,13 +369,15 @@ fn direct_wide(
         | tags::MAX_ELEM
         | tags::MIN_ELEM
         | tags::REM => {
-            let (d0, d1) = (d0?, d1?);
-            if d0 == 3 {
+            let (own, d1) = (d0?, d1?);
+            if own == 3 {
                 return None;
             }
+            // Float operands mix f32 and bf16 and compute in f32.
+            let d0 = computed(own);
             let s0 = stride(0, &mut pre);
             let s1 = stride(1, &mut pre);
-            let x = load(0, d0, d0, &s0);
+            let x = load(0, d0, own, &s0);
             let y = load(1, d0, d1, &s1);
             let expr = match (d0, op.tag) {
                 (0, tags::ADD) => "x + y",
@@ -394,7 +412,7 @@ fn direct_wide(
             let (d0, d1) = (d0?, d1?);
             let s0 = stride(0, &mut pre);
             let s1 = stride(1, &mut pre);
-            let ty = if d0 == 3 { 2 } else { d0 };
+            let ty = if d0 == 3 { 2 } else { computed(d0) };
             let x = load(0, ty, d0, &s0);
             let y = load(1, ty, d1, &s1);
             let cmp = match op.tag {
@@ -621,6 +639,10 @@ enum Plan {
         text: String,
         value: u32,
         len: Vec<Dimension>,
+        /// The value is bool: the put packs eight of its cells a byte, so a
+        /// thread reads cells other threads write, and it reads them only
+        /// once the step that writes them has ended.
+        packs: bool,
     },
     Single(String),
     Select {
@@ -1224,6 +1246,13 @@ pub fn emit_streamed_region(
             ));
             continue;
         }
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`: the op
+            // has one result.
+            slots.o1 = value_ptr(alias.resolve(state));
+        }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             slots.a0 = format!("current_{}", op.chan);
         } else if op.tag == tags::CHAN_PUT {
@@ -1266,6 +1295,10 @@ pub fn emit_streamed_region(
                 ),
                 value: reads.first().copied().unwrap_or(base),
                 len: reads.first().map_or_else(Vec::new, |&v| key_of(v)),
+                packs: reads
+                    .first()
+                    .and_then(|&v| wire_dtype(value_types, v))
+                    .is_some_and(|dtype| dtype == 3),
             },
             StepKind::Wide => {
                 let probe = BTreeMap::new();
@@ -1338,6 +1371,13 @@ pub fn emit_streamed_region(
                     two_level,
                 }
             }
+            StepKind::Argmax if op.tag == tags::GUMBEL_ARGMAX => Plan::Argmax {
+                text: format!(
+                    "    if (step.level == 0u) m4_gumbel_partial({}, {}, {}, {}, temporary, descriptors[lane_params[{node}].a0], descriptors[lane_params[{node}].a1], descriptors[lane_params[{node}].a2], descriptors[lane_params[{node}].imm], m4_group.x, m4_groups.x, m3_tid, m3_threads, m3_tgbuf);\n    else {{ if (m4_group.x != 0) return; m4_argmax_final(temporary, {}, descriptors[lane_params[{node}].a0], step.groups, m3_tid, m3_threads, m3_tgbuf); }}\n",
+                    slots.a0, slots.a1, slots.a2, slots.o1, slots.o0
+                ),
+                input: reads.first().copied().unwrap_or(base),
+            },
             StepKind::Argmax => Plan::Argmax {
                 text: format!(
                     "    if (step.level == 0u) m4_argmax_partial({}, temporary, descriptors[lane_params[{node}].a0], m4_group.x, m4_groups.x, m3_tid, m3_threads, m3_tgbuf);\n    else {{ if (m4_group.x != 0) return; m4_argmax_final(temporary, {}, descriptors[lane_params[{node}].a0], step.groups, m3_tid, m3_threads, m3_tgbuf); }}\n",
@@ -1483,9 +1523,20 @@ pub fn emit_streamed_region(
                 o.writes.insert(*writes);
                 o.nodes.push(node);
             }
-            Plan::Put { text, value, len } => {
+            Plan::Put {
+                text,
+                value,
+                len,
+                packs,
+            } => {
+                // A packing put reads cells across threads: never in the
+                // step whose threads write them (a grid has no barrier).
+                if *packs && sched.open.as_ref().is_some_and(|o| o.writes.contains(value)) {
+                    sched.flush_open();
+                }
                 sched.ensure_open(*value, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len || len.is_empty())
+                        && !(*packs && o.writes.contains(value))
                 });
                 sched.close_loop();
                 let o = sched.open.as_mut().expect("opened");

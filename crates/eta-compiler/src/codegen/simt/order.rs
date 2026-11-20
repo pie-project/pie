@@ -27,6 +27,33 @@ pub const TOP_K_SELECT_POOL: u32 = 4096;
 /// at 32 it spills); past that the radix select (`BODY_SELECT`) runs.
 pub const TOP_K_SELECT_REGISTERS: u32 = 16;
 
+/// The widest select a lane's one row may split across blocks: at least two
+/// blocks' candidates, padded to the select's power of two, merge in the
+/// pool.
+pub const TOP_K_SPLIT_MAX: u32 = TOP_K_SELECT_POOL / 2;
+
+/// The most blocks a select of `width` over a lane's one row splits across:
+/// as many as the merge pool holds their candidates (each block's land in
+/// the lane's first arena, which holds the pool's).
+#[must_use]
+pub const fn top_k_split_blocks(width: u32) -> u32 {
+    TOP_K_SELECT_POOL / select_cap(width)
+}
+
+/// Whether a select of `width` over a lane's one row runs split across the
+/// lane's blocks (`BODY_SELECT`): each block selects over its stretch of
+/// the row into its lane arena, and the last block to finish merges them.
+#[must_use]
+pub const fn top_k_splits(width: u32) -> bool {
+    width >= 1 && select_cap(width) <= TOP_K_SPLIT_MAX
+}
+
+/// A select's candidate count: `width` to a power of two, at least 2.
+const fn select_cap(width: u32) -> u32 {
+    let cap = width.next_power_of_two();
+    if cap < 2 { 2 } else { cap }
+}
+
 const BODY: &str = r#"
   (void)channels;
   (void)params;
@@ -49,6 +76,9 @@ const BODY: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -140,10 +170,11 @@ const BODY: &str = r#"
       }
       for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
         const m1_u32 index = order_in[at];
-        m1_store_f(
+        m1_store_fd(
             order_values,
             order_row * order_width + at,
-            m1_load_f(order_input, order_base + index, order_input_desc.dtype));
+            m1_load_f(order_input, order_base + index, order_input_desc.dtype),
+            order_values_dtype);
         m1_store_u(order_indices, order_row * order_width + at, index);
       }
       __syncthreads();
@@ -167,6 +198,9 @@ const BODY_SELECT: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -187,7 +221,9 @@ const BODY_SELECT: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u32 sel_hist[256];
@@ -203,10 +239,20 @@ const BODY_SELECT: &str = r#"
   const m1_u32 sel_lane = threadIdx.x & 31u;
   const m1_u32 sel_warp_id = threadIdx.x >> 5u;
   const m1_u32 sel_warps = (blockDim.x + 31u) >> 5u;
+  // A lane's one row on several blocks: each selects over its stretch, and
+  // the last to finish merges every block's candidates (`sel_merge`).
+  const bool sel_split = kSplit != 0u && lane_blocks > 1u && order_rows == 1u;
+  const m1_u32 sel_lo =
+      sel_split ? (m1_u32)(((m1_u64)order_len * lane_row) / lane_blocks) : 0u;
+  const m1_u32 sel_hi =
+      sel_split ? (m1_u32)(((m1_u64)order_len * (lane_row + 1u)) / lane_blocks) : order_len;
+  const m1_u32 sel_n = sel_hi - sel_lo;
+  const m1_u32 sel_count = order_count < sel_n ? order_count : sel_n;
   if (order_count != 0u) {
-    for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
+    for (m1_u32 order_row = sel_split ? 0u : lane_row; order_row < order_rows;
+         order_row += sel_split ? order_rows : lane_blocks) {
       m1_u32 prefix = 0u;
-      m1_u32 want = order_count;
+      m1_u32 want = sel_count;
       m1_u32 pooled = 0xFFFFFFFFu;
       if (threadIdx.x == 0u) {
         sel_fill = 0u;
@@ -219,8 +265,8 @@ const BODY_SELECT: &str = r#"
         for (m1_u32 b = threadIdx.x; b < 256u; b += blockDim.x) sel_hist[b] = 0u;
         __syncthreads();
         if (pooled == 0xFFFFFFFFu) {
-          for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
-            const m1_u32 key = m1_desc_key(order_value(order_row, i));
+          for (m1_u32 i = threadIdx.x; i < sel_n; i += blockDim.x) {
+            const m1_u32 key = m1_desc_key(order_value(order_row, sel_lo + i));
             if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
           }
         } else {
@@ -248,15 +294,15 @@ const BODY_SELECT: &str = r#"
         const m1_u32 in_bin = sel_in_bin;
         __syncthreads();
         if (pass == 1u && in_bin <= kSelectPool) {
-          for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
-            const m1_u32 key = m1_desc_key(order_value(order_row, i));
+          for (m1_u32 i = threadIdx.x; i < sel_n; i += blockDim.x) {
+            const m1_u32 key = m1_desc_key(order_value(order_row, sel_lo + i));
             const m1_u32 high = key & 0xFFFF0000u;
             if (high < prefix) {
               const m1_u32 at = atomicAdd(&sel_fill, 1u);
-              if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
+              if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)(sel_lo + i);
             } else if (high == prefix) {
               const m1_u32 at = atomicAdd(&sel_pool_fill, 1u);
-              if (at < kSelectPool) sel_pool[at] = ((m1_u64)key << 32) | (m1_u64)i;
+              if (at < kSelectPool) sel_pool[at] = ((m1_u64)key << 32) | (m1_u64)(sel_lo + i);
             }
           }
           __syncthreads();
@@ -265,22 +311,22 @@ const BODY_SELECT: &str = r#"
         }
       }
       const m1_u32 threshold = prefix;
-      const m1_u32 less_count = order_count - want;
+      const m1_u32 less_count = sel_count - want;
       const m1_u32 equal_take = want;
       if (threadIdx.x == 0u) {
         sel_equal_seen = 0u;
       }
       __syncthreads();
       if (pooled == 0xFFFFFFFFu) {
-        for (m1_u32 window = 0u; window < order_len; window += blockDim.x) {
+        for (m1_u32 window = 0u; window < sel_n; window += blockDim.x) {
           const m1_u32 i = window + threadIdx.x;
-          const bool valid = i < order_len;
+          const bool valid = i < sel_n;
           const m1_u32 key = valid
-              ? m1_desc_key(order_value(order_row, i))
+              ? m1_desc_key(order_value(order_row, sel_lo + i))
               : 0xFFFFFFFFu;
           if (valid && key < threshold) {
             const m1_u32 at = atomicAdd(&sel_fill, 1u);
-            if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
+            if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)(sel_lo + i);
           }
           const bool equal = valid && key == threshold;
           const unsigned ballot = m1_chunk_ballot(equal);
@@ -298,7 +344,8 @@ const BODY_SELECT: &str = r#"
           __syncthreads();
           if (equal) {
             const m1_u32 rank = sel_warp[sel_warp_id] + __popc(ballot & ((1u << sel_lane) - 1u));
-            if (rank < equal_take) sel_cand[less_count + rank] = ((m1_u64)key << 32) | (m1_u64)i;
+            if (rank < equal_take)
+              sel_cand[less_count + rank] = ((m1_u64)key << 32) | (m1_u64)(sel_lo + i);
           }
           __syncthreads();
         }
@@ -321,7 +368,7 @@ const BODY_SELECT: &str = r#"
         }
         __syncthreads();
       }
-      for (m1_u32 at = order_count + threadIdx.x; at < kSelectCap; at += blockDim.x)
+      for (m1_u32 at = sel_count + threadIdx.x; at < kSelectCap; at += blockDim.x)
         sel_cand[at] = 0xFFFFFFFFFFFFFFFFull;
       __syncthreads();
       for (m1_u32 size = 2u; size <= kSelectCap; size <<= 1u) {
@@ -341,13 +388,79 @@ const BODY_SELECT: &str = r#"
           __syncthreads();
         }
       }
-      for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
-        const m1_u32 index = (m1_u32)(sel_cand[at] & 0xFFFFFFFFull);
-        m1_store_f(
-            order_values,
-            order_row * order_width + at,
-            order_value(order_row, index));
-        m1_store_u(order_indices, order_row * order_width + at, index);
+      const m1_u64* sel_sorted = sel_cand;
+      bool sel_lands = true;
+      if (sel_split) {
+        // Each block's candidates, sorted, into its arena past its line;
+        // the last block to count itself in merges them all, in the same
+        // (key, index) order a one-block select keeps.
+        m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u);
+        m1_u64* sel_out = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) +
+            (m1_u64)lane_row * kSelectCap;
+        for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
+          M1_LANE_PUT64(sel_out + at, sel_cand[at]);
+        M1_LANE_RELEASE();
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+          m1_u32* sel_counter = reinterpret_cast<m1_u32*>(sel_span);
+          sel_digit = atomicAdd(sel_counter, 1u) + 1u == lane_blocks ? 1u : 0u;
+        }
+        __syncthreads();
+        sel_lands = sel_digit != 0u;
+        if (sel_lands) {
+          M1_LANE_ACQUIRE();
+          const m1_u32 merged = lane_blocks * kSelectCap;
+          for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x)
+            sel_pool[at] = at < merged
+                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
+                : 0xFFFFFFFFFFFFFFFFull;
+          __syncthreads();
+          if (merged <= blockDim.x) {
+            // A thread an entry: its rank is how many entries come before
+            // it (no two are equal, their indices differ), and the first
+            // `order_count` ranks are the select's, in order.
+            if (threadIdx.x < merged) {
+              const m1_u64 entry = sel_pool[threadIdx.x];
+              m1_u32 rank = 0u;
+              for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
+              if (rank < order_count) sel_cand[rank] = entry;
+            }
+            __syncthreads();
+            sel_sorted = sel_cand;
+          } else {
+          m1_u32 sel_merge = 2u;
+          while (sel_merge < merged) sel_merge <<= 1u;
+          for (m1_u32 size = 2u; size <= sel_merge; size <<= 1u) {
+            for (m1_u32 stride = size >> 1u; stride > 0u; stride >>= 1u) {
+              for (m1_u32 i = threadIdx.x; i < sel_merge; i += blockDim.x) {
+                const m1_u32 partner = i ^ stride;
+                if (partner > i) {
+                  const m1_u64 a = sel_pool[i];
+                  const m1_u64 b = sel_pool[partner];
+                  const bool ascending = (i & size) == 0u;
+                  if ((a > b) == ascending) {
+                    sel_pool[i] = b;
+                    sel_pool[partner] = a;
+                  }
+                }
+              }
+              __syncthreads();
+            }
+          }
+          sel_sorted = sel_pool;
+          }
+        }
+      }
+      if (sel_lands) {
+        for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
+          const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
+          m1_store_fd(
+              order_values,
+              order_row * order_width + at,
+              order_value(order_row, index),
+              order_values_dtype);
+          m1_store_u(order_indices, order_row * order_width + at, index);
+        }
       }
       __syncthreads();
     }
@@ -445,10 +558,12 @@ const BODY_SELECT_REGISTERS: &str = r#"
   (void)temporary;
   (void)kOrderWorkerCap;
   (void)kOrderFullRow;
-  (void)kSelectPool;
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -469,27 +584,107 @@ const BODY_SELECT_REGISTERS: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u64 sel_lists[32u * kSelectCap];
   __shared__ m1_u64 sel_cand[kSelectCap];
+  __shared__ m1_u64 sel_pool[kSelectPool];
+  __shared__ m1_u32 sel_digit;
+  // A lane's one row on several blocks: each selects over its stretch, and
+  // the last to finish merges every block's candidates.
+  const bool sel_split = kSplit != 0u && lane_blocks > 1u && order_rows == 1u;
+  const m1_u32 sel_lo =
+      sel_split ? (m1_u32)(((m1_u64)order_len * lane_row) / lane_blocks) : 0u;
+  const m1_u32 sel_hi =
+      sel_split ? (m1_u32)(((m1_u64)order_len * (lane_row + 1u)) / lane_blocks) : order_len;
+  const m1_u32 sel_n = sel_hi - sel_lo;
+  const m1_u32 sel_count = order_count < sel_n ? order_count : sel_n;
   if (order_count != 0u) {
-    for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
+    for (m1_u32 order_row = sel_split ? 0u : lane_row; order_row < order_rows;
+         order_row += sel_split ? order_rows : lane_blocks) {
       m1_u64 sel_top[kSelectCap];
 #pragma unroll
       for (m1_u32 j = 0u; j < kSelectCap; ++j) sel_top[j] = 0xFFFFFFFFFFFFFFFFull;
-      for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x)
+      for (m1_u32 i = sel_lo + threadIdx.x; i < sel_hi; i += blockDim.x)
         m1_select_keep<kSelectCap>(
             sel_top, ((m1_u64)m1_desc_key(order_value(order_row, i)) << 32) | (m1_u64)i);
-      m1_select_block<kSelectCap>(sel_top, order_count, sel_cand, sel_lists);
-      for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
-        const m1_u32 index = (m1_u32)(sel_cand[at] & 0xFFFFFFFFull);
-        m1_store_f(
-            order_values,
-            order_row * order_width + at,
-            order_value(order_row, index));
-        m1_store_u(order_indices, order_row * order_width + at, index);
+      m1_select_block<kSelectCap>(sel_top, sel_count, sel_cand, sel_lists);
+      const m1_u64* sel_sorted = sel_cand;
+      bool sel_lands = true;
+      if (sel_split) {
+        // Each block's candidates, sorted, into its arena past its line;
+        // the last block to count itself in merges them all, in the same
+        // (key, index) order a one-block select keeps.
+        m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u);
+        m1_u64* sel_out = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) +
+            (m1_u64)lane_row * kSelectCap;
+        for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
+          M1_LANE_PUT64(sel_out + at, sel_cand[at]);
+        M1_LANE_RELEASE();
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+          m1_u32* sel_counter = reinterpret_cast<m1_u32*>(sel_span);
+          sel_digit = atomicAdd(sel_counter, 1u) + 1u == lane_blocks ? 1u : 0u;
+        }
+        __syncthreads();
+        sel_lands = sel_digit != 0u;
+        if (sel_lands) {
+          M1_LANE_ACQUIRE();
+          const m1_u32 merged = lane_blocks * kSelectCap;
+          for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x)
+            sel_pool[at] = at < merged
+                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
+                : 0xFFFFFFFFFFFFFFFFull;
+          __syncthreads();
+          if (merged <= blockDim.x) {
+            // A thread an entry: its rank is how many entries come before
+            // it (no two are equal, their indices differ), and the first
+            // `order_count` ranks are the select's, in order.
+            if (threadIdx.x < merged) {
+              const m1_u64 entry = sel_pool[threadIdx.x];
+              m1_u32 rank = 0u;
+              for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
+              if (rank < order_count) sel_cand[rank] = entry;
+            }
+            __syncthreads();
+            sel_sorted = sel_cand;
+          } else {
+          m1_u32 sel_merge = 2u;
+          while (sel_merge < merged) sel_merge <<= 1u;
+          for (m1_u32 size = 2u; size <= sel_merge; size <<= 1u) {
+            for (m1_u32 stride = size >> 1u; stride > 0u; stride >>= 1u) {
+              for (m1_u32 i = threadIdx.x; i < sel_merge; i += blockDim.x) {
+                const m1_u32 partner = i ^ stride;
+                if (partner > i) {
+                  const m1_u64 a = sel_pool[i];
+                  const m1_u64 b = sel_pool[partner];
+                  const bool ascending = (i & size) == 0u;
+                  if ((a > b) == ascending) {
+                    sel_pool[i] = b;
+                    sel_pool[partner] = a;
+                  }
+                }
+              }
+              __syncthreads();
+            }
+          }
+          sel_sorted = sel_pool;
+          }
+        }
+      }
+      if (sel_lands) {
+        for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
+          const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
+          m1_store_fd(
+              order_values,
+              order_row * order_width + at,
+              order_value(order_row, index),
+              order_values_dtype);
+          m1_store_u(order_indices, order_row * order_width + at, index);
+        }
       }
       __syncthreads();
     }
@@ -545,6 +740,12 @@ pub fn emit_order_region(
         && (1..=TOP_K_SELECT_MAX).contains(&width)
         && width.next_power_of_two().max(2) <= TOP_K_SELECT_REGISTERS;
     let mut source = runtime_source(dialect);
+    // A select may split its row across the lane's blocks, meeting in the
+    // lane arenas (`BODY_SELECT`, `BODY_SELECT_REGISTERS`).
+    if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
+        source.push_str(dialect.lane);
+        source.push_str(super::sampler::LANE_ARENA);
+    }
     if registers {
         source.push_str(SELECT_REGISTER_HELPERS);
     }
@@ -570,8 +771,13 @@ pub fn emit_order_region(
     );
     let _ = writeln!(source, "  constexpr m1_u32 kWidth = {width}u;");
     if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
-        let cap = width.next_power_of_two().max(2);
+        let cap = select_cap(width);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kSplit = {}u;",
+            u32::from(top_k_splits(width))
+        );
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;"
@@ -594,10 +800,19 @@ pub fn emit_order_region(
         );
         let _ = writeln!(
             source,
+            "  constexpr bool kDirectScales = {};",
+            direct.is_some_and(|d| d.scales)
+        );
+        let _ = writeln!(
+            source,
             "  constexpr m1_u32 kIntrinsicSlots = {}u;",
             super::fused::output_pitch(stage)
         );
-        source.push_str(if registers { BODY_SELECT_REGISTERS } else { BODY_SELECT });
+        source.push_str(if registers {
+            BODY_SELECT_REGISTERS
+        } else {
+            BODY_SELECT
+        });
     } else {
         source.push_str(BODY);
     }

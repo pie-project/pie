@@ -197,9 +197,10 @@ impl Sampling {
     }
 }
 
-/// The channels a pass's knobs are seeded in.
+/// The channels a pass's knobs are seeded in: the temperature as its
+/// reciprocal (`sampler::inverse_temperature`).
 struct KnobChannels {
-    temperature: Option<f32>,
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
     min_p: Option<Channel>,
@@ -215,7 +216,8 @@ impl KnobChannels {
         let sampled = s.temperature > 0.0;
         let penalized = s.penalized();
         Self {
-            temperature: sampled.then(|| s.temperature.max(1e-4)),
+            temperature: sampled
+                .then(|| Channel::from([sampler::inverse_temperature(s.temperature.max(1e-4))])),
             top_p: f(sampled && s.top_p < 1.0, s.top_p),
             top_k: (sampled && s.top_k > 0).then(|| Channel::from([s.top_k])),
             min_p: f(sampled && s.min_p > 0.0, s.min_p),
@@ -233,7 +235,7 @@ impl KnobChannels {
     fn read(&self) -> Knobs {
         let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
         Knobs {
-            temperature: self.temperature,
+            temperature: t(&self.temperature),
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
             min_p: t(&self.min_p),

@@ -367,6 +367,140 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
     (p.container(), outs)
 }
 
+/// A beam's pick: the top-k over every row of the logits as one vector (a
+/// beam inferlet's top-b of b x vocab scores), at three widths.
+fn flat_top_k() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let flat = p.op(Op::Reshape {
+        value: logits,
+        shape: Shape::vector(ROWS * VOCAB),
+    });
+    let four = p.op(Op::TopK { input: flat, k: 4 });
+    let nine = p.op(Op::TopK { input: flat, k: 9 });
+    let one = p.op(Op::TopK { input: flat, k: 1 });
+    let outs = vec![
+        p.output(Shape::vector(4), Dtype::U32, four + 1),
+        p.output(Shape::vector(4), Dtype::F32, four),
+        p.output(Shape::vector(9), Dtype::U32, nine + 1),
+        p.output(Shape::vector(9), Dtype::F32, nine),
+        p.output(Shape::vector(1), Dtype::U32, one + 1),
+        p.output(Shape::vector(1), Dtype::F32, one),
+    ];
+    (p.container(), outs)
+}
+
+/// A Gumbel draw fused (`gumbel_argmax`) and unfused (a multiply by the
+/// scale, `select`, `add` of `rng_keyed`'s noise, `reduce_argmax`) over f32
+/// logits, and fused over their bf16 rounding; `keep` masks the lanes at or
+/// under `floor`.
+fn gumbel_draws() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let (_, scale) = p.input(Shape::vector(1), Dtype::F32);
+    let scale = p.op(Op::Reshape {
+        value: scale,
+        shape: Shape::new(&[]).unwrap(),
+    });
+    let (_, state) = p.input(Shape::vector(2), Dtype::U32);
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let floor = p.f(-3.0);
+    let keep = p.op(Op::Gt(logits, floor));
+    let fused = p.op(Op::GumbelArgmax {
+        logits,
+        keep,
+        scale,
+        state,
+    });
+    let scaled = p.op(Op::Mul(logits, scale));
+    let ninf = p.f(f32::NEG_INFINITY);
+    let masked = p.op(Op::Select {
+        cond: keep,
+        a: scaled,
+        b: ninf,
+    });
+    let noise = p.op(Op::RngKeyed {
+        state,
+        shape: Shape::matrix(ROWS, VOCAB),
+        kind: RngKind::Gumbel,
+    });
+    let perturbed = p.op(Op::Add(masked, noise));
+    let unfused = p.op(Op::ReduceArgmax(perturbed));
+    let half = p.op(Op::Cast {
+        value: logits,
+        dtype: Dtype::Bf16,
+    });
+    let fused_half = p.op(Op::GumbelArgmax {
+        logits: half,
+        keep,
+        scale,
+        state,
+    });
+    let outs = vec![
+        p.output(Shape::vector(ROWS), Dtype::I32, fused),
+        p.output(Shape::vector(ROWS), Dtype::I32, unfused),
+        p.output(Shape::vector(ROWS), Dtype::I32, fused_half),
+    ];
+    (p.container(), outs)
+}
+
+/// The bf16 rules over a bf16 rounding of the logits: an elementwise op's
+/// bf16 result (rounded once), a row sum (f32), a scan (bf16, each prefix
+/// rounded once), a top-k (the input's values, exact, and their ids).
+fn bf16_rules() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let half = p.op(Op::Cast {
+        value: logits,
+        dtype: Dtype::Bf16,
+    });
+    let third = p.f(0.333_333_34);
+    let scaled = p.op(Op::Mul(half, third));
+    let sum = p.op(Op::ReduceSum(half));
+    let scan = p.op(Op::CumSum(scaled));
+    let top = p.op(Op::TopK { input: half, k: 4 });
+    let outs = vec![
+        p.output(Shape::matrix(ROWS, VOCAB), Dtype::Bf16, scaled),
+        p.output(Shape::vector(ROWS), Dtype::F32, sum),
+        p.output(Shape::matrix(ROWS, VOCAB), Dtype::Bf16, scan),
+        p.output(Shape::matrix(ROWS, 4), Dtype::U32, top + 1),
+        p.output(Shape::matrix(ROWS, 4), Dtype::Bf16, top),
+    ];
+    (p.container(), outs)
+}
+
+/// The logits cast to bf16 and put out as they are: the cast's rounding
+/// alone.
+fn bf16_cast() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let half = p.op(Op::Cast {
+        value: logits,
+        dtype: Dtype::Bf16,
+    });
+    let outs = vec![p.output(Shape::matrix(ROWS, VOCAB), Dtype::Bf16, half)];
+    (p.container(), outs)
+}
+
 /// The compat sampler over one row: penalties over a carried histogram, a
 /// grammar mask (bools and packed words), temperature, top-k, top-p and a
 /// keyed Gumbel draw; plus the greedy token and the next histogram.
@@ -1050,6 +1184,11 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     let mut stages = Stages::default();
 
     the_statistics_agree(device, &mut stages);
+    a_flat_top_k_agrees(device, &mut stages);
+    the_gumbel_draws_agree(device, &mut stages);
+    the_bf16_rules_agree(device, &mut stages);
+    a_near_tie_draws_evenly(device, &mut stages);
+    a_cast_rounds_a_plane_by_what_it_may_hold(device, &mut stages);
     the_acceptance_rule_agrees(device, &mut stages);
     the_corners_agree(device, &mut stages);
     the_sampler_agrees(device, &mut stages, VOCAB);
@@ -1091,6 +1230,7 @@ fn registration_compiles_every_pass(device: &Device) {
         read.layers,
         read.readout,
         read.dtype,
+        read.normal,
     )];
     // A program registers on a served model, its load's ladder sealed:
     // registration compiles are no ladder misses.
@@ -1215,6 +1355,226 @@ fn the_statistics_agree(device: &Device, stages: &mut Stages) {
     close(&got[3], &want[3], 1e-5, "top-4 values");
     close(&got[4], &want[4], 1e-4, "softmax row mass");
     close(&got[5], &want[5], 1e-5, "probability at the argmax");
+}
+
+/// A flat top-k breaks its ties as the interpreter's order does: equal
+/// values in index order, -0 equal to +0 (each keeping its own bits), NaN
+/// after every number.
+fn a_flat_top_k_agrees(device: &Device, stages: &mut Stages) {
+    let (container, outs) = flat_top_k();
+    let plan = plan_of(container, VOCAB);
+    let mut plane = logits_plane(ROWS, VOCAB, 11);
+    let n = plane.len();
+    for x in &mut plane {
+        *x -= 20.0;
+    }
+    // ties at the top across rows, a signed-zero pair above them, NaNs
+    for at in [n - 3, 5, 3 * VOCAB as usize + 1, 9, 6 * VOCAB as usize] {
+        plane[at] = -1.5;
+    }
+    plane[2 * VOCAB as usize + 7] = 0.0;
+    plane[VOCAB as usize + 3] = -0.0;
+    for at in [0, 4 * VOCAB as usize + 2, n - 1] {
+        plane[at] = f32::NAN;
+    }
+    let want = host(&plan, &[], &plane, ROWS, &outs);
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&kept),
+        bound(&plan, &kept, 0),
+        &outs,
+    );
+    exact(&got[0], &want[0], "flat top-4 ids");
+    exact(&got[1], &want[1], "flat top-4 values");
+    exact(&got[2], &want[2], "flat top-9 ids");
+    exact(&got[3], &want[3], "flat top-9 values");
+    exact(&got[4], &want[4], "flat top-1 id");
+    exact(&got[5], &want[5], "flat top-1 value");
+}
+
+/// `gumbel_argmax` answers the unfused draw over f32 logits bit for bit, on
+/// the device and in the interpreter, at every seed and scale (the host's
+/// rounded 1 / T, 1.0 / 0.7 among them); over bf16 logits it answers the
+/// interpreter.
+fn the_gumbel_draws_agree(device: &Device, stages: &mut Stages) {
+    let (container, outs) = gumbel_draws();
+    let plan = plan_of(container, VOCAB);
+    let plane = logits_plane(ROWS, VOCAB, 23);
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    for seed in 0..12u32 {
+        let seeds = vec![
+            (0, Value::F32(vec![1.0 / (0.6 + 0.1 * (seed % 5) as f32)])),
+            (1, Value::U32(vec![0x9E37_79B9 ^ (seed * 7919), seed])),
+        ];
+        let want = host(&plan, &seeds, &plane, ROWS, &outs);
+        let got = on_device(
+            device,
+            stages,
+            &plan,
+            &seeds,
+            Some(&kept),
+            bound(&plan, &kept, 0),
+            &outs,
+        );
+        exact(
+            &want[0],
+            &want[1],
+            "the interpreter's fused and unfused draws",
+        );
+        exact(&got[0], &want[0], "the fused draw");
+        exact(&got[1], &want[1], "the unfused draw");
+        exact(&got[2], &want[2], "the fused draw over bf16 logits");
+    }
+}
+
+fn the_bf16_rules_agree(device: &Device, stages: &mut Stages) {
+    let (container, outs) = bf16_rules();
+    let plan = plan_of(container, VOCAB);
+    let plane = logits_plane(ROWS, VOCAB, 29);
+    let want = host(&plan, &[], &plane, ROWS, &outs);
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&kept),
+        bound(&plan, &kept, 0),
+        &outs,
+    );
+    exact(&got[0], &want[0], "a bf16 product, rounded once");
+    close(&got[1], &want[1], 1e-2, "a bf16 row's f32 sum");
+    // each prefix the f32 running sum rounded once: an f32 order apart at
+    // most one bf16 step
+    let half = |v: &Value| -> Vec<f32> {
+        match v {
+            Value::Bf16(h) => h
+                .iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect(),
+            other => panic!("a bf16 scan answered {other:?}"),
+        }
+    };
+    let (g, w) = (half(&got[2]), half(&want[2]));
+    for (i, (a, b)) in g.iter().zip(&w).enumerate() {
+        assert!(
+            (a - b).abs() <= b.abs() / 128.0 + 1e-3,
+            "scan lane {i}: {a} against {b}"
+        );
+    }
+    exact(&got[3], &want[3], "a bf16 top-4's ids");
+    exact(&got[4], &want[4], "a bf16 top-4's values");
+}
+
+/// Four exactly equal largest logits a row (bf16, where a bf16 store of the
+/// perturbed lane would collapse them onto the lowest id) are drawn evenly.
+fn a_near_tie_draws_evenly(device: &Device, stages: &mut Stages) {
+    let (container, outs) = gumbel_draws();
+    let plan = plan_of(container, VOCAB);
+    let mut plane = vec![-8.0f32; (ROWS * VOCAB) as usize];
+    let tied = [11usize, 1000, 2047, 3999];
+    for row in 0..ROWS as usize {
+        for &t in &tied {
+            plane[row * VOCAB as usize + t] = 16.0;
+        }
+    }
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let mut counts = [0u32; 4];
+    for seed in 0..64u32 {
+        let seeds = vec![
+            (0, Value::F32(vec![1.0])),
+            (1, Value::U32(vec![seed.wrapping_mul(2_654_435_761), 1])),
+        ];
+        let got = on_device(
+            device,
+            stages,
+            &plan,
+            &seeds,
+            Some(&kept),
+            bound(&plan, &kept, 0),
+            &outs,
+        );
+        let Value::I32(ids) = &got[2] else {
+            panic!("ids")
+        };
+        for &id in ids {
+            let at = tied
+                .iter()
+                .position(|&t| t == id as usize)
+                .expect("a tied id");
+            counts[at] += 1;
+        }
+    }
+    // 512 draws over 4 ties: 128 each, sd ~9.8
+    assert!(
+        counts.iter().all(|&c| (96..=160).contains(&c)),
+        "near-tie draws {counts:?}"
+    );
+}
+
+/// A bf16 cast of a plane rounds as `bf16_bits` does whichever form the
+/// lowering takes: a plane the engine does not state free of denormals
+/// (host-written here, denormals of both signs and at the bf16 halfway
+/// among them) takes the bit form and keeps them; a plane it states free
+/// of them (a matmul's) takes `reduce_precision`.
+fn a_cast_rounds_a_plane_by_what_it_may_hold(device: &Device, stages: &mut Stages) {
+    let (container, outs) = bf16_cast();
+    let plan = plan_of(container, VOCAB);
+    let mut plane = logits_plane(ROWS, VOCAB, 41);
+    let free = plane.clone();
+    for (i, x) in [
+        1e-40f32,
+        -3.0e-39,
+        5.877_472e-39,
+        f32::from_bits(0x0000_8000),
+        -1.0e-45,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        plane[i * 997 + 3] = x;
+    }
+    let want = host(&plan, &[], &plane, ROWS, &outs);
+    let may = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&may),
+        bound(&plan, &may, 0),
+        &outs,
+    );
+    exact(
+        &got[0],
+        &want[0],
+        "a bf16 cast of a plane that may hold denormals",
+    );
+    let want = host(&plan, &[], &free, ROWS, &outs);
+    let mut stated = kept(device, &free, ROWS, vec![(0, ROWS)]);
+    stated.planes = stated
+        .planes
+        .into_iter()
+        .map(|p| p.with_normal(true))
+        .collect();
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&stated),
+        bound(&plan, &stated, 0),
+        &outs,
+    );
+    exact(
+        &got[0],
+        &want[0],
+        "a bf16 cast of a plane stated free of denormals",
+    );
 }
 
 fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {

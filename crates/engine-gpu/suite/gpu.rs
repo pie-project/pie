@@ -256,6 +256,90 @@ impl Gpu {
 
 /// The tiers a kernel with a subgroup form is checked at: its subgroup form
 /// is SPIR-V's.
+/// A window's query CSR at int `at` of a table whose other ints are zero
+/// (a scan blind to `at` reads empty requests there): `at` 0 is the CSR
+/// alone, a later one a window's cut of the fire's packed table.
+pub fn csr_at(gpu: &mut Gpu, indptr: &[i32], at: usize) -> kernels_slang::ssm::Csr {
+    let mut table = vec![0i32; at];
+    table.extend_from_slice(indptr);
+    table.extend_from_slice(&[0; 3]);
+    let buf = gpu.up_i32(&table);
+    kernels_slang::ssm::Csr {
+        table: kernels_slang::Tensor::new(buf, table.len() as u32, 1, poem_ir::Dtype::I32),
+        at: at as u32,
+        lanes: indptr.len() as u32 - 1,
+    }
+}
+
+/// The ints a scan's CSR is placed at in the suite: alone, and as a
+/// window's cut of a packed table.
+pub const CSR_AT: [usize; 2] = [0, 5];
+
+/// A fire's `rows` walked whole, and cut in two windows over the same
+/// planes (the second from a third of the rows on), as a fire whose lanes
+/// lie in two runs of a region takes them.
+#[must_use]
+pub fn row_cuts(rows: u32) -> Vec<Vec<kernels_slang::ssm::RowSpan>> {
+    let whole = kernels_slang::ssm::RowSpan { row0: 0, rows };
+    let cut = (rows / 3).max(1);
+    let mut cuts = vec![vec![whole]];
+    if rows > 1 {
+        cuts.push(vec![
+            kernels_slang::ssm::RowSpan { row0: 0, rows: cut },
+            kernels_slang::ssm::RowSpan {
+                row0: cut,
+                rows: rows - cut,
+            },
+        ]);
+    }
+    cuts
+}
+
+/// A committed scan's dispatches over `lanes` lanes of a work plane holding
+/// `batch` (the engine's `committed_batches`): each one's first lane, its
+/// lanes, and the extended row its first lane starts at, past the rows the
+/// lanes before it replay (`replay[lane0 + lane]`).
+#[must_use]
+pub fn committed_batches(
+    lanes: u32,
+    batch: u32,
+    replay: &[i32],
+    lane0: u32,
+) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    let (mut first, mut row0) = (0u32, 0u32);
+    while first < lanes {
+        let n = batch.min(lanes - first);
+        out.push((first, n, row0));
+        for lane in first..first + n {
+            row0 += replay[(lane0 + lane) as usize].max(0) as u32;
+        }
+        first += n;
+    }
+    out
+}
+
+/// A fire's requests (`indptr`) walked whole, and cut in two windows at a
+/// lane: each window's first row and its own CSR, rebased to it, as a
+/// window states them.
+#[must_use]
+pub fn lane_cuts(indptr: &[i32]) -> Vec<Vec<(u32, Vec<i32>)>> {
+    let lanes = indptr.len() - 1;
+    let mut cuts = vec![vec![(0, indptr.to_vec())]];
+    if lanes > 1 {
+        let at = lanes / 2;
+        let first = indptr[at];
+        cuts.push(vec![
+            (0, indptr[..=at].to_vec()),
+            (
+                first as u32,
+                indptr[at..].iter().map(|&b| b - first).collect(),
+            ),
+        ]);
+    }
+    cuts
+}
+
 pub fn tiers() -> &'static [kernels_slang::Tier] {
     if crate::backend::SPIRV {
         &[kernels_slang::Tier::Baseline, kernels_slang::Tier::Subgroup]

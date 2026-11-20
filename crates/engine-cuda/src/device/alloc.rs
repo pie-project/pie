@@ -119,6 +119,19 @@ unsafe fn landed_zero(at: *mut core::ffi::c_void, len: usize) -> Result<()> {
 
 impl Buffer {
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
+        Buffer::zeroed_with(bytes, true)
+    }
+
+    /// [`Buffer::zeroed`], never a cell of the device heap, whose chunks
+    /// the process keeps: dropped, it goes to the idle store
+    /// [`crate::device::held::release_idle`] gives back to the driver. For
+    /// a step that lays buffers of many sizes once and is gone before the
+    /// load reads the card (the rates measured at load).
+    pub fn zeroed_apart(bytes: usize) -> Result<Buffer> {
+        Buffer::zeroed_with(bytes, false)
+    }
+
+    fn zeroed_with(bytes: usize, carve: bool) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer {
                 ptr: 0,
@@ -130,7 +143,14 @@ impl Buffer {
         }
         #[cfg(feature = "device")]
         {
-            let (base, carved) = alloc(bytes)?;
+            let (base, carved) = if carve {
+                alloc(bytes)?
+            } else {
+                (
+                    crate::device::held::recycle::alloc(bytes)? as *mut core::ffi::c_void,
+                    None,
+                )
+            };
             // SAFETY: `base` is the allocation just made, of `bytes` bytes;
             // the set lands before any stream is handed the buffer.
             unsafe { landed_zero(base, bytes)? };
@@ -144,6 +164,7 @@ impl Buffer {
         }
         #[cfg(not(feature = "device"))]
         {
+            let _ = carve;
             Err(Fault::Runtimeless)
         }
     }

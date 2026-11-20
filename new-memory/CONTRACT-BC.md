@@ -108,11 +108,15 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at
-    `SlotShape::tier_offset(chunk_bytes, ref)`, laid out exactly as the device slot. `ChunkFacts.disk_chunks`: chunks
-    of kv-list slots; disk ref r = slot r of the engine's kv slot file; no other shape goes to disk;
+    `SlotShape::tier_offset(chunk_bytes, ref)`, laid out exactly as the device slot. `ChunkFacts.disk_chunks`: disk chunks,
+    one id space beside the host's; the disk tier's byte budget covers every state shape, divided into chunks of
+    `chunk_bytes` (each rounded up to the slot file's direct I/O boundary), ids from 0, none reserved, no table, any
+    state shape (weights excepted) taking any chunk; a disk ref of shape s is `chunk * s.slots_per_chunk + index`,
+    laid out in its disk chunk exactly as the device slot (as a host ref is). The engine states the division at load
+    (budget, chunks, chunk bytes, each shape's slots a chunk); no per-shape constants.
     `disk_persistent` / `disk_kept` keep their meaning and the runtime journals disk refs as it journaled pages.
     `Engine::copy_slots(SlotCopy { shape, src, dst, slots, runs: [] })` moves whole slots of one shape device <->
-    HostPinned, device <-> LocalDisk, HostPinned <-> LocalDisk (kv list only); device refs logical; token runs device
+    HostPinned, device <-> LocalDisk, HostPinned <-> LocalDisk, every state shape; device refs logical; token runs device
     only; a record moves as one copy per fixed shape, pieces paired in order. Ordering: a copy reads what every
     earlier fire wrote and lands before every later fire; copies run in submission order; the runtime may reuse a
     source / name a destination again once the call returns. The runtime parks only settled, private slots (sharing

@@ -25,10 +25,10 @@ pub fn value_matches(v: &Value, dtype: ChanDType, dims: &[u32]) -> bool {
 
 #[must_use]
 pub fn wire_cell_bytes(dtype: Dtype, numel: usize) -> usize {
-    if dtype == Dtype::Bool {
-        numel.div_ceil(8)
-    } else {
-        numel * 4
+    match dtype {
+        Dtype::Bool => numel.div_ceil(8),
+        Dtype::Bf16 => numel * 2,
+        _ => numel * 4,
     }
 }
 
@@ -67,6 +67,14 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
+        Dtype::Bf16 => Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         _ => return None,
     })
 }
@@ -87,6 +95,7 @@ pub fn encode_wire(v: &Value, dst: &mut [u8]) {
         Value::I32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
         Value::U32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
         Value::F32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
+        Value::Bf16(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
     }
 }
 

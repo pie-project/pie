@@ -411,6 +411,13 @@ impl Context {
         self.ctx.set_tuning(tuning);
     }
 
+    /// Lay the device's measured product times on this context
+    /// (`kernels_cuda::linear::routes`).
+    #[cfg(feature = "rocm")]
+    pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
+        self.ctx.set_routes(routes);
+    }
+
     #[must_use]
     pub fn capability(&self) -> (i32, i32) {
         self.capability

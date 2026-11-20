@@ -1,6 +1,6 @@
 //! What a device that shares the host's memory has for a load: what the
 //! host's memory has available, less what Android's lmkd keeps free past
-//! that, less the floor.
+//! that, capped at what the process's cgroups leave it, less the floor.
 //!
 //! A phone's GPU, an integrated GPU, or one whose largest device-local heap
 //! the host maps takes its memory from the host's RAM: a reservation is part
@@ -10,7 +10,11 @@
 //! is what the kernel counts available (`MemAvailable` in `/proc/meminfo`),
 //! less any reserve lmkd (Android's low-memory killer daemon) defends beyond
 //! it. Taking that reserve would make lmkd kill processes to win it back:
-//! the user's apps, or this process.
+//! the user's apps, or this process. A cgroup capping the process below
+//! the host (a systemd slice's `MemoryMax`, a container) kills it at that
+//! cap however much the host has free, so what this process may take is
+//! also no more than what each capped cgroup ancestor leaves
+//! ([`engine::host_memory`]).
 //!
 //! Each reserve counts once. The kernel's `MemAvailable` already leaves out
 //! its `totalreserve`: every zone's high watermark plus its largest lowmem
@@ -36,27 +40,37 @@ use crate::error::{Fault, Result};
 
 /// The user's stated safety margin ([`engine::SAFETY_FLOOR_BYTES`]).
 pub use engine::SAFETY_FLOOR_BYTES;
+/// What the host has available to the process ([`engine::host_memory`]).
+pub use engine::host_memory::Available;
 
 /// What the host had for a load when read, and how that was reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Room {
     /// `MemAvailable` from `/proc/meminfo`.
     pub available: u64,
+    /// The least any capped cgroup ancestor of the process leaves, `None`
+    /// where none is capped.
+    pub cgroup: Option<u64>,
     /// The bytes lmkd keeps free by killing beyond what `available`
     /// already leaves out.
     pub defended: u64,
-    /// What a load may take: `available` less `defended`, less the floor.
+    /// What a load may take: `available` less `defended`, capped at
+    /// `cgroup`, less the floor.
     pub room: u64,
 }
 
 impl Room {
     /// What the host can still give, signed: negative by what it is short
-    /// once what it has available falls under the defended line and the
-    /// floor, which a process holding memory gives back to keep it there.
+    /// once what it has available (past the defended line, under the
+    /// cgroups' caps) falls under the floor, which a process holding memory
+    /// gives back to keep it there.
     #[must_use]
     pub fn net(&self) -> i64 {
-        let net =
-            i128::from(self.available) - i128::from(self.defended) - i128::from(SAFETY_FLOOR_BYTES);
+        let host = i128::from(self.available) - i128::from(self.defended);
+        let open = self
+            .cgroup
+            .map_or(host, |cgroup| host.min(i128::from(cgroup)));
+        let net = open - i128::from(SAFETY_FLOOR_BYTES);
         i64::try_from(net).unwrap_or(if net < 0 { i64::MIN } else { i64::MAX })
     }
 }
@@ -74,14 +88,19 @@ pub enum Killer<'a> {
     Minfree { levels: &'a str, zoneinfo: &'a str },
 }
 
-/// The room `/proc/meminfo`'s text leaves under `killer`, in pages of
-/// `page` bytes: the one rule every host that shares its memory sizes by.
+/// The room what the host has `available` leaves under `killer`, in pages
+/// of `page` bytes: the one rule every host that shares its memory sizes
+/// by.
 ///
 /// # Errors
 ///
 /// Names the reading the rule needed and could not take.
-pub fn room_of(meminfo: &str, killer: Killer<'_>, page: u64) -> std::result::Result<Room, String> {
-    room_within(meminfo, defended_by(killer, page)?)
+pub fn room_of(
+    available: Available,
+    killer: Killer<'_>,
+    page: u64,
+) -> std::result::Result<Room, String> {
+    Ok(room_within(available, defended_by(killer, page)?))
 }
 
 /// The bytes `killer` defends past `MemAvailable`, in pages of `page`
@@ -111,30 +130,19 @@ pub fn defended_by(killer: Killer<'_>, page: u64) -> std::result::Result<u64, St
     })
 }
 
-/// The room `/proc/meminfo`'s text leaves past `defended` bytes.
-///
-/// # Errors
-///
-/// Names `MemAvailable` where the text states none.
-pub fn room_within(meminfo: &str, defended: u64) -> std::result::Result<Room, String> {
-    let available =
-        mem_available(meminfo).ok_or_else(|| "/proc/meminfo states no MemAvailable".to_string())?;
-    Ok(Room {
-        available,
+/// The room what the host has `available` leaves past `defended` bytes:
+/// lmkd defends its line against the host's `MemAvailable`, and the
+/// cgroups' caps bind past that.
+#[must_use]
+pub fn room_within(available: Available, defended: u64) -> Room {
+    let host = available.host.saturating_sub(defended);
+    let open = available.cgroup.map_or(host, |cgroup| cgroup.min(host));
+    Room {
+        available: available.host,
+        cgroup: available.cgroup,
         defended,
-        room: available
-            .saturating_sub(defended)
-            .saturating_sub(SAFETY_FLOOR_BYTES),
-    })
-}
-
-/// `MemAvailable` in bytes, from `/proc/meminfo`'s text.
-fn mem_available(meminfo: &str) -> Option<u64> {
-    meminfo.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemAvailable:")?;
-        let kib: u64 = rest.trim().strip_suffix("kB")?.trim().parse().ok()?;
-        kib.checked_mul(1024)
-    })
+        room: open.saturating_sub(SAFETY_FLOOR_BYTES),
+    }
 }
 
 /// The kernel's `totalreserve`, in pages, from `/proc/zoneinfo`'s text:
@@ -226,7 +234,7 @@ pub fn room() -> Result<Room> {
 
 /// A reader of the host's room: what lmkd defends past `MemAvailable` is
 /// read once, when it is made; each reading after takes only
-/// `/proc/meminfo`.
+/// `/proc/meminfo` and the process's cgroups.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Clone, Copy, Debug)]
 pub struct Reader {
@@ -241,7 +249,7 @@ fn refuse(why: String) -> Fault {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "android")]
 fn read(path: &str) -> Result<String> {
     std::fs::read_to_string(path).map_err(|e| refuse(format!("{path}: {e}")))
 }
@@ -287,20 +295,22 @@ pub fn reader() -> Result<Reader> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl Reader {
-    /// The host's room now: `/proc/meminfo`, past the line read once.
+    /// The host's room now: `/proc/meminfo` and the process's cgroups,
+    /// past the line read once.
     ///
     /// # Errors
     ///
     /// Refuses by name when `/proc/meminfo` cannot be read or states no
-    /// `MemAvailable`.
+    /// `MemAvailable`, or a capped cgroup's usage cannot be read.
     pub fn read(&self) -> Result<Room> {
-        room_within(&read("/proc/meminfo")?, self.defended).map_err(refuse)
+        let available = engine::host_memory::available().map_err(refuse)?;
+        Ok(room_within(available, self.defended))
     }
 }
 
 /// What the host can still give the process now ([`Room::net`]), for a
 /// device that shares the host's memory: lmkd's line is read once, here,
-/// and each call reads only `/proc/meminfo`.
+/// and each call reads only `/proc/meminfo` and the process's cgroups.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn room_reader() -> engine::HostRoom {
@@ -345,9 +355,11 @@ mod tests {
     const MIB: u64 = 1 << 20;
 
     /// An SM8850's, abridged.
-    const MEMINFO: &str = "MemTotal:       11350976 kB\nMemFree:          569636 kB\n\
-                           MemAvailable:    3692416 kB\nCached:          2551384 kB\n";
     const AVAILABLE: u64 = 3_692_416 * 1024;
+    const MEMINFO: Available = Available {
+        host: AVAILABLE,
+        cgroup: None,
+    };
 
     /// An SM8850's, abridged: only Normal manages pages; its reserve is
     /// 31150 pages.
@@ -404,8 +416,6 @@ mod tests {
 
     #[test]
     fn a_reading_the_rule_needs_is_refused_by_name() {
-        let err = room_of("MemTotal: 1 kB\n", Killer::None, PAGE).unwrap_err();
-        assert!(err.contains("MemAvailable"), "{err}");
         let err = room_of(
             MEMINFO,
             Killer::Minfree {
@@ -430,12 +440,50 @@ mod tests {
 
     #[test]
     fn the_room_saturates_and_its_net_says_the_shortfall() {
-        let room = room_of("MemAvailable: 1024 kB\n", Killer::None, PAGE).unwrap();
+        let tight = Available {
+            host: 1024 * 1024,
+            cgroup: None,
+        };
+        let room = room_of(tight, Killer::None, PAGE).unwrap();
         assert!(room.available < 64 * MIB);
         assert_eq!(room.room, 0);
         assert_eq!(room.net(), -(63 * MIB as i64));
         let room = room_of(MEMINFO, Killer::Pressure, PAGE).unwrap();
         assert_eq!(room.net(), (AVAILABLE - SAFETY_FLOOR_BYTES) as i64);
+    }
+
+    #[test]
+    fn a_cgroup_cap_binds_past_what_lmkd_defends() {
+        let killer = Killer::Minfree {
+            levels: "81150:0",
+            zoneinfo: ZONEINFO,
+        };
+        let open = AVAILABLE - 50_000 * PAGE;
+        // A cap tighter than the host past lmkd's line binds alone: lmkd's
+        // line is the host's, not the cgroup's.
+        let capped = Available {
+            host: AVAILABLE,
+            cgroup: Some(open / 2),
+        };
+        let room = room_of(capped, killer, PAGE).unwrap();
+        assert_eq!(room.cgroup, Some(open / 2));
+        assert_eq!(room.room, open / 2 - SAFETY_FLOOR_BYTES);
+        assert_eq!(room.net(), (open / 2 - SAFETY_FLOOR_BYTES) as i64);
+        // A looser cap leaves the host's room.
+        let loose = Available {
+            host: AVAILABLE,
+            cgroup: Some(AVAILABLE),
+        };
+        let room = room_of(loose, killer, PAGE).unwrap();
+        assert_eq!(room.room, open - SAFETY_FLOOR_BYTES);
+        // A cap its group has reached leaves the floor short.
+        let full = Available {
+            host: AVAILABLE,
+            cgroup: Some(0),
+        };
+        let room = room_of(full, Killer::None, PAGE).unwrap();
+        assert_eq!(room.room, 0);
+        assert_eq!(room.net(), -(SAFETY_FLOOR_BYTES as i64));
     }
 
     #[test]

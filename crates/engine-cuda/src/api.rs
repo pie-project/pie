@@ -899,6 +899,7 @@ impl Engine for Cuda {
             frames_in_flight: u32::from(
                 engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
             ),
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -1184,6 +1185,14 @@ impl Engine for Cuda {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
+        }
         self.refused(submitted)
     }
 

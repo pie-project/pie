@@ -574,8 +574,10 @@ pub struct Pools {
     rs: Option<RsRows>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<TablePaging>,
+    /// The disk tier (CONTRACT-BC 22): one slot file of disk chunks, each a
+    /// pool chunk on the direct I/O boundary, any shape's slots in any
+    /// chunk, laid out as on the device.
     disk: Option<Spill>,
-    parked: Option<Spill>,
     /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
     tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
@@ -768,7 +770,6 @@ impl Pools {
             pool,
             layout,
             disk: None,
-            parked: None,
             tier: None,
             weight_caches: Vec::new(),
             weights_stale: None,
@@ -998,11 +999,7 @@ impl Pools {
             .iter()
             .map(super::streamed::Cache::facts)
             .collect();
-        facts.disk_chunks = self.layout.list.map_or(0, |list| {
-            Spill::slots(self.disk.as_ref())
-                .checked_div(list.per_chunk)
-                .unwrap_or(0)
-        });
+        facts.disk_chunks = self.disk_chunks();
         facts
     }
 
@@ -1484,6 +1481,23 @@ impl Pools {
         let mut out = vec![0u8; usize::try_from(bytes).unwrap_or(0)];
         self.pool.read(at, &mut out)?;
         Ok(out)
+    }
+
+    /// Writes `bytes` (one slot's) into slot ref `slot` of shape `id` on
+    /// the host. The caller has drained every frame that reads it.
+    pub fn write_slot_bytes(&mut self, id: ShapeId, slot: u32, bytes: &[u8]) -> Result<()> {
+        let want = self.shape(id)?.slot_bytes;
+        if bytes.len() as u64 != want {
+            return Err(Fault::Ceiling {
+                what: "bytes of one slot",
+                need: bytes.len() as u64,
+                have: want,
+            });
+        }
+        let at = self.slot_offset(id, slot)?;
+        self.pool
+            .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+        self.pool.write(at, bytes)
     }
 
     /// The state rows of the record whose physical pieces are `record`,
@@ -2089,6 +2103,14 @@ impl Pools {
                 let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(copy.shape, false, &ids, &slots)
             }
+            (MemoryDomain::HostPinned, MemoryDomain::LocalDisk) => {
+                let (hosts, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, true, &hosts, &slots)
+            }
+            (MemoryDomain::LocalDisk, MemoryDomain::HostPinned) => {
+                let (slots, hosts): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, false, &hosts, &slots)
+            }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
                     "a slot copy from {src:?} to {dst:?}: this pool moves within itself, to \
@@ -2098,21 +2120,44 @@ impl Pools {
         }
     }
 
-    /// Copies whole slots of `id` (slot refs `ids`) and the slot file's
-    /// `slots` the way `to_disk` says. The caller has drained every frame.
+    /// The bytes one disk chunk takes: a pool chunk, on the slot file's
+    /// direct I/O boundary (CONTRACT-BC 22).
+    #[must_use]
+    pub fn disk_chunk_bytes(&self) -> u64 {
+        self.layout.chunk_bytes.next_multiple_of(engine::disk::ALIGN as u64)
+    }
+
+    /// The disk tier's chunks.
+    #[must_use]
+    pub fn disk_chunks(&self) -> u32 {
+        Spill::slots(self.disk.as_ref())
+    }
+
+    /// The byte of the slot file disk ref `slot` of shape `id` starts at:
+    /// slot `index` of disk chunk `chunk`, as on the device.
+    fn disk_place(&self, id: ShapeId, slot: u32) -> Result<u64> {
+        let shape = *self.shape(id)?;
+        let per_chunk = shape.per_chunk.max(1);
+        let (chunk, index) = (slot / per_chunk, slot % per_chunk);
+        let have = self.disk_chunks();
+        if chunk >= have {
+            return Err(Fault::Ceiling {
+                what: "chunks of the disk tier",
+                need: u64::from(chunk) + 1,
+                have: u64::from(have),
+            });
+        }
+        Ok(u64::from(chunk) * self.disk_chunk_bytes() + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// Copies whole slots of `id` (slot refs `ids`) and disk refs `slots`
+    /// the way `to_disk` says. The caller has drained every frame.
     fn spill(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
-        let (what, bytes) = match id {
-            LIST => ("disk kv pages", self.shape(LIST)?.slot_bytes),
-            FIXED => ("parked rs rows", self.shape(FIXED)?.slot_bytes),
-            other => {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a slot file for slot shape {other}: only kv pages (list) and parked rs \
-                         rows (fixed) go to disk, and a role slot moves to the host tier"
-                    ),
-                });
-            }
-        };
+        let bytes = self.shape(id)?.slot_bytes;
+        let places = slots
+            .iter()
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
         let offsets = ids
             .iter()
             .map(|&slot| self.slot_offset(id, slot))
@@ -2121,54 +2166,64 @@ impl Pools {
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
         }
-        let file = match id {
-            LIST => &mut self.disk,
-            _ => &mut self.parked,
-        };
-        Spill::room(file.as_ref(), what, slots)?;
-        let Some(spill) = file.as_mut() else {
+        let Some(spill) = self.disk.as_mut() else {
             return Ok(());
         };
-        for (&at, &slot) in offsets.iter().zip(slots) {
-            let staged = &mut spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
-            if to_disk {
-                self.pool.read(at, staged)?;
-                spill
-                    .file
-                    .write(slot, spill.stage.as_mut_slice())
-                    .map_err(super::slot_file)?;
-            } else {
-                spill
-                    .file
-                    .read(slot, spill.stage.as_mut_slice())
-                    .map_err(super::slot_file)?;
-                let staged = &spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
-                self.pool.write(at, staged)?;
-            }
+        let pool = &mut self.pool;
+        for (&at, &disk_at) in offsets.iter().zip(&places) {
+            spill.copy(disk_at, bytes, to_disk, |slot, out| {
+                if out {
+                    pool.read(at, slot)
+                } else {
+                    pool.write(at, slot)
+                }
+            })?;
         }
         Ok(())
     }
 
-    /// Opens the slot files under `dir` within `budget` bytes: parked
-    /// record pieces first, as many as the seats' records, then kv pages;
-    /// the kv pages they hold.
-    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
-        let stride = |bytes: u64| bytes.next_multiple_of(engine::disk::ALIGN as u64);
-        let state = self.layout.fixed.map_or(0, |f| f.slot_bytes);
-        let rows = if state == 0 {
-            0
-        } else {
-            (u64::from(self.paging.slots) * u64::from(self.layout.pieces))
-                .min(budget.checked_div(stride(state)).unwrap_or(0))
+    /// Copies whole slots of `id` between the host tier (host refs
+    /// `hosts`) and disk refs `slots` the way `to_disk` says: the host
+    /// tier's idle state going on down to disk, and back.
+    fn spill_host(&mut self, id: ShapeId, to_disk: bool, hosts: &[u32], slots: &[u32]) -> Result<()> {
+        let shape = *self.shape(id)?;
+        let places = slots
+            .iter()
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(spill) = self.disk.as_mut() else {
+            return Ok(());
         };
-        if state > 0 {
-            self.parked = Spill::open(dir, "r0.rs", state, rows * stride(state))?;
+        let Some(tier) = self.tier.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: 1,
+                have: 0,
+            });
+        };
+        for (&host, &disk_at) in hosts.iter().zip(&places) {
+            spill.copy(disk_at, shape.slot_bytes, to_disk, |slot, out| {
+                if out {
+                    tier.read(&shape, host, slot)
+                } else {
+                    tier.slot(&shape, host)?.copy_from_slice(slot);
+                    Ok(())
+                }
+            })?;
         }
-        let kv = self.page_bytes()?;
-        if kv > 0 {
-            self.disk = Spill::open(dir, "r0.kv", kv, budget - rows * stride(state))?;
+        Ok(())
+    }
+
+    /// Opens the slot file under `dir` within `budget` bytes: disk chunks of
+    /// [`Self::disk_chunk_bytes`], any shape's slots in any chunk, laid out
+    /// as on the device. The disk chunks it holds.
+    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
+        let chunk = self.disk_chunk_bytes();
+        let widest = self.layout.shapes().map(|shape| shape.slot_bytes).max().unwrap_or(0);
+        if chunk > 0 && widest > 0 {
+            self.disk = Spill::open(dir, "r0.state", chunk, super::cover_room(widest), budget)?;
         }
-        Ok(Spill::slots(self.disk.as_ref()))
+        Ok(self.disk_chunks())
     }
 
     /// Checks the chunk kv list page id `id` names backed.

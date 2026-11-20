@@ -170,10 +170,10 @@ pub fn root_bytes(root: &LaunchValue, value: &Value, span: u64) -> Vec<u8> {
     if root.source != ValueOrigin::Const {
         return bytes;
     }
-    let lane = if matches!(value, Value::Bool(_)) {
-        1
-    } else {
-        4
+    let lane = match value {
+        Value::Bool(_) => 1,
+        Value::Bf16(_) => 2,
+        _ => 4,
     };
     let span = usize::try_from(span).unwrap_or(0);
     if bytes.len() != lane || span <= lane || !span.is_multiple_of(lane) {
@@ -188,6 +188,7 @@ pub fn to_heap(value: &Value) -> Vec<u8> {
         Value::I32(cells) => cells.iter().flat_map(|x| x.to_le_bytes()).collect(),
         Value::U32(cells) => cells.iter().flat_map(|x| x.to_le_bytes()).collect(),
         Value::Bool(cells) => cells.iter().map(|&b| u8::from(b)).collect(),
+        Value::Bf16(cells) => cells.iter().flat_map(|x| x.to_le_bytes()).collect(),
     }
 }
 
@@ -200,10 +201,16 @@ pub fn from_heap(raw: &[u8], dtype: Dtype, held: u64) -> Value {
         Dtype::Bool => Value::Bool(raw.iter().map(|&b| b != 0).collect()),
         Dtype::I32 => Value::I32((0..(held / 4) as usize).map(|i| word(i) as i32).collect()),
         Dtype::U32 => Value::U32((0..(held / 4) as usize).map(word).collect()),
-        _ => Value::F32(
+        Dtype::Bf16 => Value::Bf16(
+            (0..(held / 2) as usize)
+                .map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
+                .collect(),
+        ),
+        Dtype::F32 => Value::F32(
             (0..(held / 4) as usize)
                 .map(|i| f32::from_bits(word(i)))
                 .collect(),
         ),
+        other => panic!("{other:?} is not a dtype a guest heap holds"),
     }
 }

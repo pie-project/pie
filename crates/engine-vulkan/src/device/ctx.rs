@@ -443,14 +443,30 @@ pub struct Context {
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
 /// build marks it changed, and it reaches its file shortly after rather
-/// than at shutdown: a phone kills an app's process more often than the app
-/// shuts down.
+/// than at shutdown (a phone kills an app's process more often than the app
+/// shuts down), written by a thread of its own once builds have paused: no
+/// submission waits on the driver's serialization of the cache or on the
+/// file.
 pub struct PipelineCache {
     core: Arc<Core>,
     cache: vk::PipelineCache,
     path: Option<std::path::PathBuf>,
-    changed: std::sync::atomic::AtomicBool,
-    written: Mutex<std::time::Instant>,
+    signal: Arc<CacheSignal>,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// What a build tells the cache's writer: when the cache last changed, and
+/// that it is to stop (writing what changed first).
+#[derive(Default)]
+struct CacheSignal {
+    state: Mutex<CacheState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CacheState {
+    changed_at: Option<std::time::Instant>,
+    stop: bool,
 }
 
 /// How long a changed cache waits for more builds before it is written.
@@ -473,12 +489,20 @@ impl PipelineCache {
         let cache = make(&initial)
             .or_else(|_| make(&[]))
             .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
+        let signal = Arc::new(CacheSignal::default());
+        let writer = path.clone().map(|path| {
+            let (core, signal) = (Arc::clone(core), Arc::clone(&signal));
+            std::thread::Builder::new()
+                .name("pipeline cache".into())
+                .spawn(move || write_settled(&core, cache, &path, &signal))
+                .expect("a pipeline cache writer thread")
+        });
         Ok(PipelineCache {
             core: Arc::clone(core),
             cache,
             path,
-            changed: std::sync::atomic::AtomicBool::new(false),
-            written: Mutex::new(std::time::Instant::now()),
+            signal,
+            writer: Mutex::new(writer),
         })
     }
 
@@ -492,59 +516,89 @@ impl PipelineCache {
         self.path.as_deref()
     }
 
-    /// Marks the cache changed by a build.
+    /// Marks the cache changed by a build: its writer writes it once builds
+    /// have paused for [`PIPELINE_CACHE_SETTLE`].
     pub fn built(&self) {
-        self.changed.store(true, Ordering::Release);
+        let mut state = self.signal.state.lock().expect("cache signal poisoned");
+        state.changed_at = Some(std::time::Instant::now());
+        self.signal.wake.notify_one();
     }
+}
 
-    /// Writes a changed cache once builds have paused for a moment.
-    pub fn settle(&self) {
-        let due = self.changed.load(Ordering::Acquire)
-            && self
-                .written
-                .lock()
-                .expect("written lock poisoned")
-                .elapsed()
-                >= PIPELINE_CACHE_SETTLE;
-        if due && let Err(fault) = self.persist() {
-            tracing::warn!(%fault, "writing the pipeline cache");
-        }
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        if !self.changed.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        // SAFETY: `self.cache` is a live cache of `self.core.device`; reading
-        // its data may race pipeline builds that use it, which Vulkan allows,
-        // as `vkGetPipelineCacheData` does not need it externally synchronized.
-        let bytes = unsafe { self.core.device.get_pipeline_cache_data(self.cache) }
-            .map_err(|e| self.core.fault("vkGetPipelineCacheData", e))?;
-        let io = |call: &'static str| {
-            move |e: std::io::Error| Fault::Device {
-                call,
-                why: e.to_string(),
+/// The cache's writer: waits for a change, then for builds to pause for
+/// [`PIPELINE_CACHE_SETTLE`], and writes the cache to `path`; on stop, writes
+/// what changed and returns.
+fn write_settled(
+    core: &Core,
+    cache: vk::PipelineCache,
+    path: &std::path::Path,
+    signal: &CacheSignal,
+) {
+    let mut state = signal.state.lock().expect("cache signal poisoned");
+    loop {
+        match state.changed_at {
+            None if state.stop => return,
+            None => {
+                state = signal.wake.wait(state).expect("cache signal poisoned");
             }
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+            Some(at) if !state.stop && at.elapsed() < PIPELINE_CACHE_SETTLE => {
+                let left = PIPELINE_CACHE_SETTLE - at.elapsed();
+                state = signal
+                    .wake
+                    .wait_timeout(state, left)
+                    .expect("cache signal poisoned")
+                    .0;
+            }
+            Some(_) => {
+                state.changed_at = None;
+                drop(state);
+                if let Err(fault) = write_cache(core, cache, path) {
+                    tracing::warn!(%fault, "writing the pipeline cache");
+                }
+                state = signal.state.lock().expect("cache signal poisoned");
+            }
         }
-        // Whole or not at all: a reader never meets a half-written file.
-        let partial = path.with_extension("partial");
-        std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
-        std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
     }
+}
+
+/// The cache's data, written whole to `path`.
+fn write_cache(core: &Core, cache: vk::PipelineCache, path: &std::path::Path) -> Result<()> {
+    // SAFETY: `cache` is a live cache of `core.device` (its owner joins this
+    // thread before destroying it); reading its data may race pipeline
+    // builds that use it, which Vulkan allows, as `vkGetPipelineCacheData`
+    // does not need it externally synchronized.
+    let bytes = unsafe { core.device.get_pipeline_cache_data(cache) }
+        .map_err(|e| core.fault("vkGetPipelineCacheData", e))?;
+    let io = |call: &'static str| {
+        move |e: std::io::Error| Fault::Device {
+            call,
+            why: e.to_string(),
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+    }
+    // Whole or not at all: a reader never meets a half-written file.
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
+    std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
-        let _ = self.persist();
-        // SAFETY: this is the last `Arc<PipelineCache>`, so no build is using
-        // the cache; pipelines made from it do not depend on it.
+        // The writer writes what changed and returns before the cache goes.
+        self.signal
+            .state
+            .lock()
+            .expect("cache signal poisoned")
+            .stop = true;
+        self.signal.wake.notify_one();
+        if let Some(writer) = self.writer.lock().expect("writer lock poisoned").take() {
+            let _ = writer.join();
+        }
+        // SAFETY: this is the last `Arc<PipelineCache>` and its writer has
+        // returned, so nothing uses the cache; pipelines made from it do not
+        // depend on it.
         unsafe { self.core.device.destroy_pipeline_cache(self.cache, None) };
     }
 }
@@ -618,11 +672,13 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
         device = name,
         available = room.available,
         defended = room.defended,
+        cgroup = ?room.cgroup,
         floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
         "read at bind: the device shares the host's memory, so the load takes what it has \
-         available, less what lmkd keeps free past it, less the floor"
+         available, less what lmkd keeps free past it, capped at what \
+         its cgroups leave, less the floor"
     );
     Ok(Some(room.room.saturating_add(held)))
 }
@@ -1226,6 +1282,14 @@ impl Context {
         Ok(())
     }
 
+    /// Lays the slab every host write to device memory stages through
+    /// (a guest bind's tables among them), where nothing has made it yet:
+    /// a load lays it, so serving reserves none.
+    pub fn lay_staging(&self) -> Result<()> {
+        let mut transfer = self.core.transfer.lock().expect("transfer lock poisoned");
+        self.core.staging(&mut transfer).map(|_| ())
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
     }
@@ -1309,6 +1373,8 @@ impl Context {
                 core: Arc::clone(core),
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
+                segments: Mutex::new(Vec::new()),
+                segmented: std::sync::atomic::AtomicBool::new(false),
                 cmd_pool: pool,
                 fence,
                 pools: Mutex::new(Vec::new()),
@@ -1351,6 +1417,14 @@ pub(crate) struct Inner {
     /// expert stage); a replay submits each, waits, and lets its caller do
     /// that host work before the next.
     cuts: Mutex<Vec<vk::CommandBuffer>>,
+    /// A split step's segments before its last, submitted unawaited
+    /// ([`Frame::submit_segment`]): each held until the frame is dropped,
+    /// whose last segment's fence lands after them (it begins with a barrier
+    /// on every command before it on the queue).
+    segments: Mutex<Vec<vk::CommandBuffer>>,
+    /// A segment was submitted: a frame dropped unsubmitted waits for the
+    /// queue before it frees them.
+    segmented: std::sync::atomic::AtomicBool,
 
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
@@ -1396,6 +1470,9 @@ impl Drop for Inner {
         unsafe {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
+            } else if self.segmented.load(Ordering::Acquire) {
+                let queue = self.core.queue.lock().expect("queue lock poisoned");
+                let _ = d.queue_wait_idle(*queue);
             }
             for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
                 d.destroy_descriptor_pool(pool, None);
@@ -1411,6 +1488,9 @@ impl Drop for Inner {
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
+            buffers.extend(std::mem::take(
+                self.segments.get_mut().expect("segments lock poisoned"),
+            ));
             buffers.push(self.cmd());
             if owned {
                 d.free_command_buffers(self.cmd_pool, &buffers);
@@ -1754,6 +1834,75 @@ impl Frame {
         // SAFETY: the queue is this device's, and its lock is the external
         // sync `vkQueueWaitIdle` needs.
         unsafe { core.device.queue_wait_idle(*queue) }.map_err(|e| core.fault("vkQueueWaitIdle", e))
+    }
+
+    /// [`engine_gpu::backend::Frame::submit_segment`]: what the frame holds
+    /// submitted unawaited, recording on in a new buffer from the same
+    /// (this thread's) pool that begins with a barrier on every command
+    /// submitted before it, as every frame begins. A kept frame's segment is
+    /// a cut its replays wait on ([`Frame::flush`]).
+    pub fn submit_segment(&self) -> Result<()> {
+        if self.kept {
+            return self.flush();
+        }
+        let core = &self.inner.core;
+        let d = &core.device;
+        let cmd = self.inner.cmd();
+        // SAFETY: as in `flush`: this frame's `cmd` is recording and only
+        // `&self` records into it.
+        unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        {
+            let bufs = [cmd];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            let queue = core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: `cmd` is executable and submitted once, with no
+            // fence; the queue is held under its lock.
+            unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        }
+        self.inner.segmented.store(true, Ordering::Release);
+        self.inner
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .push(cmd);
+        // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
+        let next = unsafe {
+            d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.inner.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        self.inner
+            .cmd
+            .store(vk::Handle::as_raw(next), Ordering::Release);
+        // SAFETY: `next` was just allocated, in the initial state; the
+        // barrier records into it while only this frame holds it.
+        unsafe {
+            d.begin_command_buffer(
+                next,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            let all = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(
+                next,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[all],
+                &[],
+                &[],
+            );
+        }
+        self.hazards_settled();
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -2159,6 +2308,33 @@ mod tests {
     use std::time::Instant;
 
     use super::{Context, Ordering};
+
+    /// A build marks the cache changed and returns without writing it (no
+    /// submission or build waits on the file); the cache's writer writes it,
+    /// at the latest when the cache goes.
+    #[test]
+    fn a_built_cache_is_written_off_the_build_and_by_the_time_it_goes() {
+        let dir = std::env::temp_dir().join(format!("pie-vk-cache-{}", std::process::id()));
+        let path = dir.join("pipelines.bin");
+        let _ = std::fs::remove_file(&path);
+        let boot = crate::api::DeviceBoot {
+            pipeline_cache: Some(path.clone()),
+            ..crate::api::DeviceBoot::default()
+        };
+        let bound = Context::bind(&boot, engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        context.pipeline_cache().built();
+        assert!(!path.exists(), "the build wrote the cache itself");
+        drop(context);
+        assert!(
+            path.exists(),
+            "the cache went without its writer writing it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A replayed frame's fence has one waiter, the watcher that runs its
     /// `on_done`; the caller's wait returns when that watcher releases it,

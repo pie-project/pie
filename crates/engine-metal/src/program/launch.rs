@@ -66,6 +66,7 @@ pub(crate) fn published_launches<'a>(
                 row_value: None,
                 row_alias: None,
                 held: Vec::new(),
+                keeps: None,
             }));
             idle.extend_from_slice(&published.views);
             // A folded node's step computes it in another form: its results
@@ -645,8 +646,8 @@ impl Grouped {
             return Err(Fault::program(
                 "program::launch",
                 format!(
-                    "this bind reads {readout_rows} readout rows a lane, and the load lays \
-                     the rows of {} (the readouts a lane may take in one fire)",
+                    "this bind reads {readout_rows} readout rows a lane, and its tables are \
+                     laid for {} (the rows its extents state, `Plane::rows_for`)",
                     rows_bound.max(1)
                 ),
             ));

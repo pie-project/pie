@@ -404,6 +404,14 @@ pub fn decode(
         Dtype::I32 => eta_exec::Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => eta_exec::Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => eta_exec::Value::F32(words().map(f32::from_le_bytes).collect()),
+        Dtype::Bf16 => eta_exec::Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         _ => return None,
     })
 }

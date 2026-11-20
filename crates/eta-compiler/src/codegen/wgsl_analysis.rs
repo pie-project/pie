@@ -124,15 +124,6 @@ pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
     let types = symbolic_types(&plan.value_types);
     let bases = result_bases(plan);
     let uses = uses(plan, &bases);
-    let bound: Vec<bool> = {
-        let mut bound = alloc::vec![false; plan.value_types.len()];
-        for &value in &plan.channel_bindings {
-            if let Some(slot) = bound.get_mut(value as usize) {
-                *slot = true;
-            }
-        }
-        bound
-    };
 
     let mut table = AliasTable::new();
     let mut fusion = StageFusion::default();
@@ -143,9 +134,6 @@ pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
         }
         let result = bases[node];
         let source = op.args[0];
-        if bound.get(result as usize).copied().unwrap_or(true) {
-            continue;
-        }
         if !covers(&types, source, result) {
             continue;
         }
@@ -270,7 +258,7 @@ mod tests {
     #[test]
     fn wgsl_analysis_every_case() {
         a_plain_reshape_is_elided();
-        a_reshape_that_does_not_cover_or_that_escapes_is_not_elided();
+        a_reshape_is_elided_where_it_covers_its_source_whatever_the_channel_slots();
         a_chain_of_reshapes_resolves_to_the_root();
         an_argmax_of_the_logits_is_reported();
         an_argmax_through_an_op_that_is_not_a_reshape_is_refused();
@@ -309,7 +297,7 @@ mod tests {
                 },
             ],
         );
-        stage.channel_bindings = vec![8];
+        stage.channel_bindings = vec![1, 0];
         let fusion = analyze_stage(&stage);
         assert_eq!(fusion.elided, [1, 3], "both reshapes cover their source");
         assert_eq!(
@@ -342,7 +330,7 @@ mod tests {
         assert!(fusion.emits_node(0) && fusion.emits_node(2));
     }
 
-    fn a_reshape_that_does_not_cover_or_that_escapes_is_not_elided() {
+    fn a_reshape_is_elided_where_it_covers_its_source_whatever_the_channel_slots() {
         let widening = plan(
             vec![op(tags::IOTA, 0, &[]), op(tags::RESHAPE, 1, &[0])],
             vec![
@@ -355,6 +343,8 @@ mod tests {
             "a reshape to a wider value must keep its own bytes"
         );
 
+        // A stage's channel bindings are its channel slots, not values: a
+        // slot numbered as a reshape's result keeps no reshape its own bytes.
         let mut bound = plan(
             vec![op(tags::IOTA, 0, &[]), op(tags::RESHAPE, 1, &[0])],
             vec![
@@ -362,11 +352,8 @@ mod tests {
                 value(&[Dimension::Static(32)]),
             ],
         );
-        bound.channel_bindings = vec![1];
-        assert!(
-            analyze_stage(&bound).elided.is_empty(),
-            "a bound value is one the shell may write; it keeps its own bytes"
-        );
+        bound.channel_bindings = vec![1, 0];
+        assert_eq!(analyze_stage(&bound).aliases, [(1, 0)]);
     }
 
     fn a_chain_of_reshapes_resolves_to_the_root() {

@@ -233,6 +233,15 @@ pub struct FireBindings {
     pub capture: Option<Tensor>,
 }
 
+/// A step submitted a layer at a time: the layer whose work the frame holds
+/// unsubmitted, the step it is (for the per-layer line), and when the last
+/// layer's submission returned.
+struct Split {
+    layer: Option<u32>,
+    step: Option<engine::StepDone>,
+    since: std::time::Instant,
+}
+
 pub struct Run<'c, B: Backend> {
     pub ctx: &'c Ctx<'c>,
 
@@ -282,7 +291,7 @@ pub struct Run<'c, B: Backend> {
 
     /// The layer whose work the frame holds unsubmitted, when the step is
     /// submitted a layer at a time.
-    split: Option<Option<u32>>,
+    split: Option<Split>,
 
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
@@ -359,14 +368,18 @@ impl<'c, B: Backend> Run<'c, B> {
     }
 
     /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self) {
-        self.split = Some(None);
+    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>) {
+        self.split = Some(Split {
+            layer: None,
+            step,
+            since: std::time::Instant::now(),
+        });
     }
 
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
     pub fn split_at(&mut self, node: &Node) {
-        let Some(held) = self.split.as_mut() else {
+        let Some(split) = self.split.as_mut() else {
             return;
         };
         let Some(layer) = node.layer else {
@@ -379,12 +392,31 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             return;
         };
-        if held.is_some_and(|held| held != layer)
-            && let Err(fault) = B::flush_recording()
-        {
-            tracing::warn!(%fault, "submitting a layer of a split step");
+        if let Some(held) = split.layer.filter(|&held| held != layer) {
+            let at = std::time::Instant::now();
+            let flushed = B::submit_recording();
+            let done = std::time::Instant::now();
+            // Each layer's submission said where the platform's bound is
+            // held (`crate::submit`): the wall from the last submission's
+            // return to this one's (the host's encoding of the layer, or
+            // the queue's backpressure), and the submit alone. A layer's
+            // submission is queued unawaited: the bound wants each short,
+            // not waited on.
+            tracing::debug!(
+                target: "engine_gpu::api",
+                frame = split.step.map(|s| s.frame.0),
+                step = split.step.map(|s| s.step),
+                layer = held,
+                wall_ms = done.duration_since(split.since).as_secs_f64() * 1e3,
+                submit_ms = done.duration_since(at).as_secs_f64() * 1e3,
+                "submit bound: a layer's submission landed"
+            );
+            split.since = done;
+            if let Err(fault) = flushed {
+                tracing::warn!(%fault, "submitting a layer of a split step");
+            }
         }
-        *held = Some(layer);
+        split.layer = Some(layer);
     }
 
     pub fn window(&self) -> &'c Window {
@@ -398,6 +430,18 @@ impl<'c, B: Backend> Run<'c, B> {
 
     pub fn qo_indptr(&self) -> Tensor {
         self.window().indptr
+    }
+
+    /// The window's query CSR as the scans bind it: the fire's packed
+    /// windows table whole (one view whatever window a fire cuts), the
+    /// window's boundaries from their int in it.
+    pub fn csr(&self) -> kernels_slang::ssm::Csr {
+        let window = self.window();
+        kernels_slang::ssm::Csr {
+            table: self.windows.table(),
+            at: window.indptr_at,
+            lanes: u32::try_from(window.indptr_host.len().saturating_sub(1)).unwrap_or(u32::MAX),
+        }
     }
 
     pub fn qo_indptr_host(&self) -> &'c [i32] {
@@ -421,6 +465,54 @@ impl<'c, B: Backend> Run<'c, B> {
         }
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
+    }
+
+    /// A row-shaped value as attention binds it: in a window of the fire's
+    /// own rows, the fire's whole value, the window's rows from
+    /// [`Self::row0`] on (so its views are the ones the load bound, whatever
+    /// window a fire cuts); in a gathered window, its compacted column.
+    pub fn attended(&self, id: ValueId) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.tensor(id)
+        } else {
+            self.uncut(id)
+        }
+    }
+
+    /// A fire table as attention binds it, as [`Self::attended`]: whole, or
+    /// a gathered window's own.
+    pub fn attended_rows(&self, handle: Tensor) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.cut_rows(handle)
+        } else {
+            handle
+        }
+    }
+
+    /// The row of what [`Self::attended`] binds the window's first row is.
+    pub fn row0(&self) -> u32 {
+        if self.window().gathered.is_some() {
+            0
+        } else {
+            self.window().span.row_offset
+        }
+    }
+
+    /// The window's rows of what [`Self::attended`] binds, from
+    /// [`Self::row0`].
+    pub fn row_span(&self) -> kernels_slang::ssm::RowSpan {
+        kernels_slang::ssm::RowSpan {
+            row0: self.row0(),
+            rows: self.window_rows(),
+        }
+    }
+
+    /// The window's rows.
+    pub fn window_rows(&self) -> u32 {
+        match &self.window().gathered {
+            Some(gathered) => gathered.positions.rows,
+            None => self.window().span.rows,
+        }
     }
 
     pub fn at_region(&self) -> u32 {
@@ -1164,7 +1256,7 @@ impl<'c, B: Backend> Run<'c, B> {
     pub fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => RecurrentPool {
-                slots: self.cut_rows(pool.slots),
+                slots: self.attended_rows(pool.slots),
                 ..*pool
             },
             CachePool::Kv(_) => panic!(

@@ -57,6 +57,7 @@ pub async fn add(namespace: Namespace, file: &str, binary: Vec<u8>) -> Result<Pr
         response: tx,
     })?;
     rx.await??;
+    super::linker::prepare(&identity.program).await?;
     Ok(identity.program)
 }
 
@@ -72,15 +73,18 @@ pub async fn resolve(tenant: Option<&str>, reference: &ProgramRef) -> Result<Pro
     rx.await?
 }
 
-/// Compile `program`, unless it already is: once per hash, whoever runs
-/// it and under whatever name.
+/// Compile `program` and link it, unless it already is: once per hash,
+/// whoever runs it and under whatever name.
 pub async fn load(program: &Program) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Load {
         program: program.clone(),
         response: tx,
     })?;
-    rx.await?
+    if rx.await?? {
+        super::linker::prepare(program).await?;
+    }
+    Ok(())
 }
 
 pub async fn get_wasm_component(program: &Program) -> Option<InstalledComponent> {
@@ -307,14 +311,15 @@ impl ProgramService {
         super::linker::forget(unnamed);
     }
 
-    async fn load(&mut self, program: &Program) -> Result<()> {
+    /// Whether it compiled `program` now.
+    async fn load(&mut self, program: &Program) -> Result<bool> {
         if self.loaded.contains_key(&program.hash) {
-            return Ok(());
+            return Ok(false);
         }
         let (binary, language) = self.repository.fetch(&program.hash).await?;
         let loaded = self.compile(program, binary, language).await?;
         self.loaded.insert(program.hash.clone(), loaded);
-        Ok(())
+        Ok(true)
     }
 
     async fn compile(
@@ -370,7 +375,7 @@ enum Message {
 
     Load {
         program: Program,
-        response: oneshot::Sender<Result<()>>,
+        response: oneshot::Sender<Result<bool>>,
     },
 
     GetWasmComponent {
@@ -439,7 +444,18 @@ fn deserialize_component(engine: &WasmEngine, precompiled: &[u8]) -> Result<Comp
     // wasmtime cannot verify the code inside. They come from the host that
     // embeds this runtime (the page, in a browser), which is trusted as much
     // as the runtime itself: it supplies the language component's source too.
-    unsafe { Component::deserialize(engine, precompiled) }.map_err(|e| anyhow!("{e}"))
+    let component =
+        unsafe { Component::deserialize(engine, precompiled) }.map_err(|e| anyhow!("{e}"))?;
+    initialize_images(&component)?;
+    Ok(component)
+}
+
+/// The memory images a component's instances start from, made as it is
+/// compiled rather than by its first instance.
+fn initialize_images(component: &Component) -> Result<()> {
+    component
+        .initialize_copy_on_write_image()
+        .map_err(|e| anyhow!("the component's memory images: {e}"))
 }
 
 pub async fn compile_wasm_component(
@@ -447,7 +463,13 @@ pub async fn compile_wasm_component(
     wasm_binary: Vec<u8>,
 ) -> Result<Component> {
     let engine = engine.clone();
-    match crate::rt::spawn_blocking(move || Component::from_binary(&engine, &wasm_binary)).await {
+    let compile = move || {
+        let component =
+            Component::from_binary(&engine, &wasm_binary).map_err(|e| anyhow!("{e}"))?;
+        initialize_images(&component)?;
+        Ok::<_, anyhow::Error>(component)
+    };
+    match crate::rt::spawn_blocking(compile).await {
         Ok(Ok(component)) => Ok(component),
         Ok(Err(e)) => Err(anyhow!("Failed to compile WASM: {}", e)),
         Err(e) => Err(anyhow!("Compilation task failed: {}", e)),

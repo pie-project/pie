@@ -559,6 +559,13 @@ impl Device {
         self.disk.is_some()
     }
 
+    /// Whether `text`'s program is had without a compile: held
+    /// ([`Self::holds`]), or in the disk cache.
+    #[must_use]
+    pub fn has_without_compile(&self, text: &str) -> bool {
+        self.holds(text) || self.on_disk(text)
+    }
+
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
     pub fn on_disk(&self, text: &str) -> bool {
@@ -898,13 +905,15 @@ fn free_bytes(dir: &std::path::Path) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-/// The host memory free for new allocations (`MemAvailable`), where the host
-/// says.
+/// The host memory free for new allocations, where the host says: the least
+/// of `MemAvailable` and what each capped cgroup ancestor of the process
+/// leaves ([`engine::host_memory`]). A cap the host's `MemAvailable` does
+/// not see OOM-kills a load or a registration whose compiles fit the host
+/// but not the cap.
 pub(crate) fn available_memory() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib << 10)
+    engine::host_memory::available()
+        .ok()
+        .map(|available| available.bytes())
 }
 
 /// The host memory a compiled program holds: ~64 bytes a byte of its text,

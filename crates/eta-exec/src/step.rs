@@ -401,6 +401,7 @@ fn const_root_value(root: &LaunchValue) -> Value {
         eta_ir::Dtype::U32 => Value::U32(vec![root.literal_bits]),
         eta_ir::Dtype::Bool => Value::Bool(vec![root.literal_bits != 0]),
         eta_ir::Dtype::F32 => Value::F32(vec![f32::from_bits(root.literal_bits)]),
+        // No literal is bf16 (`eta_ir::types`): a constant is an f32.
         other => crate::value::no_lane(other),
     }
 }

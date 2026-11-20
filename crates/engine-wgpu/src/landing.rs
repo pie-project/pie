@@ -48,7 +48,7 @@ fn read_seat(
 ) {
     let end = layout
         .iter()
-        .filter(|span| span.host)
+        .filter(|span| span.hosted)
         .map(|span| span.at + span.bytes())
         .max()
         .unwrap_or(0);

@@ -1,8 +1,6 @@
 #![allow(unsafe_code)]
 use kernels_cuda::Tensor;
-use kernels_cuda::attn::plan::{
-    Device, Toggles, Workspace, prefill_graph_padding, prefill_partial_rows,
-};
+use kernels_cuda::attn::plan::{Device, Toggles, Workspace, prefill_graph_float_bytes};
 use poem_compiler::Budget;
 use poem_ir::{Dtype, StructKind};
 
@@ -18,27 +16,51 @@ const GRANT_INT_BYTES: u64 = 1 << 20;
 
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
+/// The most float workspace a captured prefill plan reading `facts` asks
+/// over `shapes`, each a body's (rows, lanes) carve: each shape's ask is
+/// the plan's own layout of it ([`prefill_graph_float_bytes`]). The ask is
+/// no function of one corner: the CTA tile narrows as the lanes thin each
+/// lane's rows, and a split shows only below half the grid in tiles, so the
+/// widest rung over the most lanes can ask less than a middle rung over
+/// fewer (on an L40S a 512-row rung of Qwen3-0.6B splits over 256 lanes on
+/// 128-row tiles, 132 MiB of partials, half that over 128 lanes, and over
+/// 512 lanes its 16-row tiles run unsplit and ask nothing).
 fn prefill_float_bytes(
     facts: &SpaceFacts,
-    rows: u32,
-    lanes: u32,
+    page_size: u32,
+    shapes: impl Iterator<Item = (u32, u32)>,
     device: &Device,
     toggles: Toggles,
-) -> u64 {
-    let (tile, padded) = prefill_graph_padding(
-        rows,
-        lanes,
-        facts.q_heads,
-        facts.kv_heads,
-        facts.head_dim,
-        device,
-        toggles.prefill_ctas_per_sm,
-    );
-    let heads = u64::from(facts.q_heads);
-    let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);
-    let v = heads * padded * rows * u64::from(facts.head_dim) * 4;
-    let s = heads * padded * rows * 4;
-    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+) -> Result<u64> {
+    let mut most = 0usize;
+    for (rows, lanes) in shapes {
+        let asked = prefill_graph_float_bytes(
+            rows,
+            lanes,
+            facts.q_heads,
+            facts.kv_heads,
+            facts.head_dim,
+            page_size,
+            facts.window,
+            device,
+            toggles,
+        )
+        .map_err(|refused| crate::error::Fault::Unbound {
+            what: format!(
+                "the prefill workspace grant: the graph form of {rows} rows over {lanes} \
+                 lanes ({} query heads over {} kv heads, {} wide, window {:?}, pages of \
+                 {page_size}, {} SMs at {} CTAs an SM) refused: {refused}",
+                facts.q_heads,
+                facts.kv_heads,
+                facts.head_dim,
+                facts.window,
+                device.num_sm,
+                toggles.prefill_ctas_per_sm,
+            ),
+        })?;
+        most = most.max(asked);
+    }
+    Ok((most as u64).next_multiple_of(ALIGN) + 2 * ALIGN)
 }
 
 /// A floor on the decode room, well past what the decode grid uses: the token
@@ -69,39 +91,68 @@ fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
 }
 
 /// The float workspace each attention plan's launches need, sized for the
-/// budget's widest fire: a prefill plan for `max_tokens` rows over
-/// `max_lanes`, a decode plan for `max_lanes` rows, on this device's SMs.
+/// budget's widest fire: a prefill plan for the most any body the lattice
+/// arms asks (each bucket's rows over up to `fire_lanes` lanes, the most a
+/// body carves: `Shell::lane_ceiling`), a decode plan for `max_lanes` rows,
+/// on this device's SMs.
 fn plan_floats(
     budget: &Budget,
+    fire_lanes: u32,
+    page_size: u32,
     facts: &Facts,
     device: &Device,
     toggles: Toggles,
-) -> Vec<Option<u64>> {
+) -> Result<Vec<Option<u64>>> {
+    let lanes = fire_lanes.max(1);
+    let buckets: Vec<u32> = if budget.buckets.is_empty() {
+        vec![budget.max_tokens]
+    } else {
+        budget.buckets.clone()
+    };
+    // Plans reading the same space ask the same: each is swept once.
+    let mut swept: Vec<((SpaceFacts, bool), u64)> = Vec::new();
+    let mut prefill = |reading: SpaceFacts, rows_a_lane: bool| -> Result<u64> {
+        if let Some((_, bytes)) = swept.iter().find(|(key, _)| *key == (reading, rows_a_lane)) {
+            return Ok(*bytes);
+        }
+        let bytes = if rows_a_lane {
+            // Read only by decoders (a grouped decode on the prefill
+            // kernel): a row a lane.
+            prefill_float_bytes(
+                &reading,
+                page_size,
+                (1..=lanes).map(|lanes| (lanes, lanes)),
+                device,
+                toggles,
+            )?
+        } else {
+            prefill_float_bytes(
+                &reading,
+                page_size,
+                buckets
+                    .iter()
+                    .flat_map(|&rows| (1..=lanes).map(move |lanes| (rows, lanes))),
+                device,
+                toggles,
+            )?
+        };
+        swept.push(((reading, rows_a_lane), bytes));
+        Ok(bytes)
+    };
     facts
         .plans
         .iter()
         .map(|seat| {
             seat.map(|seat| {
-                match seat.kind {
-                    // A prefill plan only decoders read (a grouped decode on
-                    // the prefill kernel) sees a row a lane at most.
-                    StructKind::AttnPrefillPlan => prefill_float_bytes(
-                        &seat.reading,
-                        if seat.rows_a_lane {
-                            crate::window::lane_capacity(budget.max_lanes)
-                        } else {
-                            budget.buckets.last().copied().unwrap_or(budget.max_tokens)
-                        },
-                        budget.max_lanes,
-                        device,
-                        toggles,
-                    ),
+                Ok(match seat.kind {
+                    StructKind::AttnPrefillPlan => prefill(seat.reading, seat.rows_a_lane)?,
                     StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                         .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
                     StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, device.num_sm),
                 }
-                .max(GRANT_FLOAT_BYTES)
+                .max(GRANT_FLOAT_BYTES))
             })
+            .transpose()
         })
         .collect()
 }
@@ -111,15 +162,16 @@ fn plan_floats(
 /// plan holds its own. This is the lane- and token-scaled part of the
 /// inputs, and on a wide model at a long envelope it is gigabytes, so the
 /// boot sizes the token budget against it before anything is allocated.
-#[must_use]
 pub fn attention_workspace_bytes(
     budget: &Budget,
+    fire_lanes: u32,
+    page_size: u32,
     facts: &Facts,
     device: &Device,
     toggles: Toggles,
     schedule_streams: &[Option<u32>],
-) -> u64 {
-    let floats_of = plan_floats(budget, facts, device, toggles);
+) -> Result<u64> {
+    let floats_of = plan_floats(budget, fire_lanes, page_size, facts, device, toggles)?;
     let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut own = 0u64;
     for (plan, floats) in floats_of.iter().enumerate() {
@@ -132,9 +184,9 @@ pub fn attention_workspace_bytes(
             _ => own = own.saturating_add(*floats),
         }
     }
-    per_stream
+    Ok(per_stream
         .values()
-        .fold(own, |sum, floats| sum.saturating_add(*floats))
+        .fold(own, |sum, floats| sum.saturating_add(*floats)))
 }
 
 const ALIGN: u64 = 256;
@@ -807,6 +859,7 @@ impl Inputs {
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         budget: &Budget,
+        fire_lanes: u32,
         paging: Paging,
         page_tables: usize,
         facts: &Facts,
@@ -966,7 +1019,14 @@ impl Inputs {
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let runs = runs.max(1);
-        let floats_of = plan_floats(budget, facts, &device, toggles);
+        let floats_of = plan_floats(
+            budget,
+            fire_lanes,
+            paging.page_size,
+            facts,
+            &device,
+            toggles,
+        )?;
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();
         for (plan, floats) in floats_of.iter().enumerate() {
@@ -2018,5 +2078,120 @@ mod rs_lane_table_tests {
         );
         let last = std::ptr::addr_of!(lanes[66].ext) as usize - lanes.as_ptr() as usize;
         assert!(last + 4 <= rs_lane_table_bytes(lanes.len() as u64) as usize);
+    }
+}
+
+#[cfg(test)]
+mod prefill_grant_tests {
+    use super::{GRANT_INT_BYTES, plan_floats};
+    use crate::store::kv::{Facts, ScheduleFacts, SpaceFacts};
+    use kernels_cuda::attn::plan::{Device, Live, Shape, Toggles, Workspace, plan_prefill};
+    use kernels_cuda::tuning::Tuning;
+    use poem_compiler::Budget;
+    use poem_ir::StructKind;
+
+    /// Qwen3-0.6B's attention: 16 query heads over 8 kv heads, 128 wide.
+    fn qwen3_0_6b() -> Facts {
+        Facts {
+            rows: Vec::new(),
+            plans: vec![Some(ScheduleFacts {
+                kind: StructKind::AttnPrefillPlan,
+                reading: SpaceFacts {
+                    head_dim: 128,
+                    kv_heads: 8,
+                    q_heads: 16,
+                    window: None,
+                },
+                rows_a_lane: false,
+            })],
+        }
+    }
+
+    /// Every body a lattice arms plans its graph form inside the prefill
+    /// grant: each bucket's rows over every lane count a fire carries,
+    /// the rows on one long lane or spread a row a lane, through the plan
+    /// the capture calls. At a 4 GiB budget of Qwen3-0.6B on an L40S (a
+    /// 512-row top rung, 512 lanes seated, 256 a fire) the grant was sized
+    /// at the top rung over the 512 seated lanes, whose 16-row tiles run
+    /// unsplit (the 64 MiB floor), while the 280..512-row rungs over 256
+    /// lanes split on 64- and 128-row tiles and asked up to 132 MiB:
+    /// every such prefill, mixed and wide body walked eagerly for the load.
+    #[test]
+    fn every_armed_prefill_body_plans_its_graph_form_inside_the_grant() {
+        let facts = qwen3_0_6b();
+        let device = Device::L40S;
+        let toggles = Toggles::of(Tuning::DEFAULT);
+        for (top, max_lanes) in [(512, 512), (2048, 512), (2048, 128)] {
+            let budget = Budget {
+                max_lanes,
+                max_tokens: top,
+                buckets: crate::api::default_lattice(top, 1, 256, 8),
+                max_adapters: 0,
+                readouts_per_lane: 1,
+            };
+            let lanes = crate::chip::Engine::of(&crate::chip::profile("")).fire_lanes_of(max_lanes);
+            let grant =
+                plan_floats(&budget, lanes, 16, &facts, &device, toggles).unwrap()[0].unwrap();
+            for &rows in &budget.buckets {
+                for lanes in 1..=lanes {
+                    let live = lanes.min(rows);
+                    for spread in [false, true] {
+                        let mut qo = vec![0i32];
+                        for lane in 0..live {
+                            let len = if spread || lane > 0 {
+                                1
+                            } else {
+                                rows - (live - 1)
+                            };
+                            qo.push(qo[lane as usize] + len as i32);
+                        }
+                        if spread {
+                            *qo.last_mut().unwrap() = rows as i32;
+                        }
+                        let kv: Vec<i32> = (0..=live as i32).map(|lane| lane * 128).collect();
+                        let plan = plan_prefill(
+                            &qo,
+                            &kv,
+                            &[],
+                            rows,
+                            Shape {
+                                num_requests: lanes,
+                                lane_offset: 0,
+                                num_q_heads: 16,
+                                num_kv_heads: 8,
+                                head_dim: 128,
+                                page_size: 16,
+                                hnd_layout: false,
+                            },
+                            Live {
+                                requests: live,
+                                lane_offset: 0,
+                                row_offset: 0,
+                                rows,
+                            },
+                            None,
+                            true,
+                            true,
+                            None,
+                            &device,
+                            toggles,
+                            Workspace {
+                                int_ptr: 0,
+                                int_bytes: GRANT_INT_BYTES as usize,
+                                float_ptr: 0,
+                                float_bytes: grant as usize,
+                            },
+                        )
+                        .unwrap();
+                        assert!(
+                            plan.graph_capturable,
+                            "top {top} over {max_lanes} lanes: b{rows} over {lanes} lanes \
+                             declines its graph form in a {grant}-byte grant: {:?}",
+                            plan.graph_refusal
+                        );
+                    }
+                }
+            }
+        }
     }
 }

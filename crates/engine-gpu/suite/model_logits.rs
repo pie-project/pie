@@ -2188,3 +2188,313 @@ fn two_trimmed_window_lists_read_as_the_whole_ones() {
     );
     trimmed_window_of(&fixture, MODEL, 32, 1024, 700);
 }
+
+/// Every shape a parked set carries comes back bit for bit through the
+/// tiers below the device: kv list pages, the hybrid's records and its
+/// rs-list rows, device -> host -> device, device -> disk -> device and
+/// host -> disk -> host (kv pages host -> disk -> device too), the disk
+/// budget divided into disk chunks laid out as the device's, as the load
+/// states it. Words no bf16 holds (every one's low half set, NaN
+/// payloads among them); two sets parked in one copy, in a disk order not
+/// their own; their device pages taken by another owner and overwritten
+/// between park and restore, so the restores land in other pages, two of
+/// them issued back to back.
+#[test]
+fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
+    use engine::chunk::{SlotCopy, SlotShape};
+    use engine::transfer::MemoryDomain;
+    use engine_gpu::backend::Buffer as _;
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        None,
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "pie-{}-tier-exact-{}",
+        backend::NAME,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the slot file's dir");
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&crate::gpu::device_boot());
+    let (host, disk) = (MemoryDomain::HostPinned, MemoryDomain::LocalDisk);
+    const BUDGET: u64 = 64 << 20;
+    let chunks = shell
+        .seat_disk_kv(Some(BUDGET), Some(&dir), SEATS, CONTEXT)
+        .expect("the slot file opens");
+    // The budget divides into disk chunks of a pool chunk each (on a direct
+    // I/O boundary), laid out as the device's: any shape's slots take any
+    // chunk, packed as there.
+    let chunk_bytes = shell.pools().disk_chunk_bytes();
+    let pool_chunk = shell.pool_chunk_facts().chunk_bytes;
+    assert_eq!(chunk_bytes, pool_chunk.next_multiple_of(4096));
+    assert!(
+        shell
+            .pools()
+            .disk_division()
+            .iter()
+            .all(|&(_, per, slot)| u64::from(per) * slot <= pool_chunk)
+    );
+    assert_eq!(u64::from(chunks), BUDGET / chunk_bytes);
+    assert!(chunks >= 12, "the slot file holds {chunks} chunks");
+    let facts = shell.pool_chunk_facts();
+    assert_eq!(facts.disk_chunks, chunks, "the facts state the disk chunks");
+    shell
+        .commit_segments(facts.segments.max)
+        .expect("the segments commit");
+    assert!(facts.host_chunks >= 58, "{} host chunks", facts.host_chunks);
+    let shape = |id| -> SlotShape {
+        facts
+            .shapes
+            .iter()
+            .find(|shape| shape.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("the hybrid states shape {id}"))
+    };
+    let (list, fixed, rs) = (
+        shape(LIST),
+        shape(FIXED),
+        shape(engine_gpu::store::layout::RS),
+    );
+    // Slots `n` of chunk `chunk` (device chunk 0 is the null chunk; the
+    // test fires nothing, so any other chunk is the test's).
+    let refs = |shape: &SlotShape, chunk: u32, n: u32| -> Vec<u32> {
+        assert!(shape.pinned.is_none(), "shape {} shares the pool", shape.id);
+        assert!(
+            n <= shape.slots_per_chunk,
+            "shape {} holds {n} a chunk",
+            shape.id
+        );
+        (0..n).map(|i| chunk * shape.slots_per_chunk + i).collect()
+    };
+    // A slot's words, every one's low half set: no bf16 (nor a narrowing
+    // of f32 to one) keeps them. Some are NaNs with payloads, some
+    // denormals.
+    let pattern = |seed: u32, bytes: u64| -> Vec<u8> {
+        (0..bytes / 4)
+            .flat_map(|at| {
+                let x = (at as u32 ^ seed.wrapping_mul(0x9e37_79b9)).wrapping_mul(0x85eb_ca6b);
+                let word = match at % 7 {
+                    0 => 0x7fc0_0000 | (x & 0x003f_ffff) | 1,
+                    1 => x & 0x007f_ffff | 1,
+                    _ => x ^ (x >> 15) | 0x0001_0001,
+                };
+                word.to_le_bytes()
+            })
+            .collect()
+    };
+    let write = |shell: &Shell, id, slot: u32, bytes: &[u8]| {
+        let (buffer, at) = shell.pools().slot_place(id, slot).expect("a slot's place");
+        buffer
+            .write_shared(at, bytes)
+            .expect("the slot takes its bytes");
+    };
+    let read = |shell: &mut Shell, id, slot: u32, len: u64| -> Vec<u8> {
+        shell.settle_copies().expect("every copy settles");
+        let (buffer, at) = shell.pools().slot_place(id, slot).expect("a slot's place");
+        let mut out = vec![0u8; len as usize];
+        buffer.read(at, &mut out).expect("the slot reads");
+        out
+    };
+    let copy = |id, src, dst, slots: Vec<(u32, u32)>| SlotCopy {
+        shape: id,
+        src,
+        dst,
+        slots,
+        runs: Vec::new(),
+    };
+    let zip = |a: &[u32], b: &[u32]| -> Vec<(u32, u32)> {
+        a.iter().copied().zip(b.iter().copied()).collect()
+    };
+    let check = |what: &str, got: &[u8], want: &[u8]| {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+            panic!(
+                "{what}: byte {at} of {} differs ({:#04x} for {:#04x}); {} bytes differ",
+                want.len(),
+                got[at],
+                want[at],
+                got.iter().zip(want).filter(|(a, b)| a != b).count()
+            );
+        }
+    };
+
+    // Device -> disk -> device: two sets, parked in one copy.
+    let n = list.slots_per_chunk.min(3);
+    let set_a = refs(&list, 1, n);
+    let set_b: Vec<u32> = refs(&list, 2, n.min(2));
+    let mut held = Vec::new();
+    for (k, &slot) in set_a.iter().chain(&set_b).enumerate() {
+        let bytes = pattern(100 + k as u32, list.slot_bytes);
+        write(&shell, LIST, slot, &bytes);
+        held.push(bytes);
+    }
+    let parked: Vec<u32> = set_a.iter().chain(&set_b).copied().collect();
+    // Disk slots out of order, past the first.
+    let disk_refs: Vec<u32> = (0..parked.len() as u32).rev().map(|i| 3 + 2 * i).collect();
+    shell
+        .copy_slots(&copy(LIST, device, disk, zip(&parked, &disk_refs)))
+        .expect("both sets park to disk");
+    // Their pages go to another owner, which writes them.
+    for &slot in &parked {
+        write(&shell, LIST, slot, &vec![0xa5; list.slot_bytes as usize]);
+    }
+    // Restored into other pages, in another order: two restores back to
+    // back, one a set each.
+    let (from_a, from_b) = disk_refs.split_at(set_a.len());
+    let into_a: Vec<u32> = refs(&list, 3, n).into_iter().rev().collect();
+    let into_b: Vec<u32> = refs(&list, 4, n.min(2));
+    shell
+        .copy_slots(&copy(LIST, disk, device, zip(from_a, &into_a)))
+        .expect("set a restores");
+    shell
+        .copy_slots(&copy(LIST, disk, device, zip(from_b, &into_b)))
+        .expect("set b restores");
+    for (k, &slot) in into_a.iter().chain(&into_b).enumerate() {
+        let got = read(&mut shell, LIST, slot, list.slot_bytes);
+        check(
+            &format!("kv page {k} device -> disk -> device"),
+            &got,
+            &held[k],
+        );
+    }
+    // Both sets back in one copy too, onto the pages they left.
+    shell
+        .copy_slots(&copy(LIST, disk, device, zip(&disk_refs, &parked)))
+        .expect("both sets restore in one copy");
+    for (k, &slot) in parked.iter().enumerate() {
+        let got = read(&mut shell, LIST, slot, list.slot_bytes);
+        check(&format!("kv page {k} restored in one copy"), &got, &held[k]);
+    }
+
+    // The host tier's way down: host -> disk, then disk -> device and
+    // disk -> host.
+    let host_in: Vec<u32> = (0..parked.len() as u32).collect();
+    let seeded: Vec<u8> = (0..parked.len() as u32)
+        .flat_map(|k| pattern(200 + k, list.slot_bytes))
+        .collect();
+    shell
+        .write_tier_slots(&[(LIST, host_in.clone())], &seeded)
+        .expect("the host slots take the pattern");
+    let spilled: Vec<u32> = (0..parked.len() as u32).map(|i| 20 + 3 * i).rev().collect();
+    shell
+        .copy_slots(&copy(LIST, host, disk, zip(&host_in, &spilled)))
+        .expect("the host slots go on down to disk");
+    // The host slots go back and are written over.
+    shell
+        .write_tier_slots(&[(LIST, host_in.clone())], &vec![0x3c; seeded.len()])
+        .expect("the host slots are written over");
+    let into: Vec<u32> = refs(&list, 5, n)
+        .into_iter()
+        .chain(refs(&list, 6, n.min(2)))
+        .collect();
+    shell
+        .copy_slots(&copy(LIST, disk, device, zip(&spilled, &into)))
+        .expect("the spilled pages come up to the device");
+    let page = list.slot_bytes as usize;
+    for (k, &slot) in into.iter().enumerate() {
+        let got = read(&mut shell, LIST, slot, list.slot_bytes);
+        check(
+            &format!("kv page {k} host -> disk -> device"),
+            &got,
+            &seeded[k * page..(k + 1) * page],
+        );
+    }
+    let host_back: Vec<u32> = (0..parked.len() as u32).map(|i| 40 + i).collect();
+    shell
+        .copy_slots(&copy(LIST, disk, host, zip(&spilled, &host_back)))
+        .expect("the spilled pages come up to the host");
+    let got = shell
+        .read_tier_slots(&[(LIST, host_back)])
+        .expect("the host slots read");
+    check("kv pages host -> disk -> host", &got, &seeded);
+
+    // The hybrid's records and rs rows, which park with the kv pages: to the
+    // host tier and to disk, and from the host tier down to disk.
+    for (k, shape) in [fixed, rs].into_iter().enumerate() {
+        let id = shape.id;
+        let per = shape.slots_per_chunk;
+        let m = per.min(2);
+        for (t, tier) in [host, disk].into_iter().enumerate() {
+            let chunk = 8 + 8 * k as u32 + 4 * t as u32;
+            let (a, b) = (refs(&shape, chunk, m), refs(&shape, chunk + 1, m));
+            let sets: Vec<u32> = a.iter().chain(&b).copied().collect();
+            let held: Vec<Vec<u8>> = sets
+                .iter()
+                .enumerate()
+                .map(|(i, &slot)| {
+                    let seed = 300 + 32 * k as u32 + 16 * t as u32 + i as u32;
+                    let bytes = pattern(seed, shape.slot_bytes);
+                    write(&shell, id, slot, &bytes);
+                    bytes
+                })
+                .collect();
+            // Tier refs out of order, in chunks of their own.
+            let base = if tier == host { 50 } else { 4 } + 4 * k as u32;
+            let tier_refs: Vec<u32> = (0..sets.len() as u32)
+                .rev()
+                .map(|i| base * per + i)
+                .collect();
+            shell
+                .copy_slots(&copy(id, device, tier, zip(&sets, &tier_refs)))
+                .expect("both sets park");
+            for &slot in &sets {
+                write(&shell, id, slot, &vec![0x5a; shape.slot_bytes as usize]);
+            }
+            let into: Vec<u32> = refs(&shape, chunk + 2, m)
+                .into_iter()
+                .rev()
+                .chain(refs(&shape, chunk + 3, m))
+                .collect();
+            let (tier_a, tier_b) = tier_refs.split_at(a.len());
+            let (into_a, into_b) = into.split_at(a.len());
+            shell
+                .copy_slots(&copy(id, tier, device, zip(tier_a, into_a)))
+                .expect("set a restores");
+            shell
+                .copy_slots(&copy(id, tier, device, zip(tier_b, into_b)))
+                .expect("set b restores");
+            for (i, &slot) in into.iter().enumerate() {
+                let got = read(&mut shell, id, slot, shape.slot_bytes);
+                check(
+                    &format!("shape {id} slot {i} device -> {tier:?} -> device"),
+                    &got,
+                    &held[i],
+                );
+            }
+        }
+        // Host -> disk -> host.
+        let host_in: Vec<u32> = (0..2).map(|i| (50 + 4 * k as u32) * per + i).collect();
+        let seeded: Vec<u8> = (0..2)
+            .flat_map(|i| pattern(500 + 2 * k as u32 + i, shape.slot_bytes))
+            .collect();
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &seeded)
+            .expect("the host slots take the pattern");
+        let down: Vec<u32> = (0..2).rev().map(|i| (5 + 4 * k as u32) * per + i).collect();
+        shell
+            .copy_slots(&copy(id, host, disk, zip(&host_in, &down)))
+            .expect("the host slots go down to disk");
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &vec![0x3c; seeded.len()])
+            .expect("the host slots are written over");
+        let back: Vec<u32> = (0..2).map(|i| (51 + 4 * k as u32) * per + i).collect();
+        shell
+            .copy_slots(&copy(id, disk, host, zip(&down, &back)))
+            .expect("the disk slots come up to the host");
+        let got = shell
+            .read_tier_slots(&[(id, back)])
+            .expect("the host slots read");
+        check(&format!("shape {id} host -> disk -> host"), &got, &seeded);
+    }
+    shell.settle_copies().expect("every copy settles");
+    drop(shell);
+    let _ = std::fs::remove_dir_all(&dir);
+}

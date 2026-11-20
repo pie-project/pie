@@ -130,6 +130,61 @@ pub struct Capabilities {
     /// request's depth is what the runtime asks for; this is what the
     /// engine runs.
     pub frames_in_flight: u32,
+
+    /// The mixed fires (prompt rows beside one-row decode lanes) the load
+    /// serves without building a program: the runtime's cutter composes no
+    /// other ([`MixedLanes::fits`]).
+    pub mixed_lanes: MixedLanes,
+}
+
+/// Which mixed fires a load lays: every one within its fire limits
+/// ([`MixedLanes::Any`]), or the prompt-lane rungs it lays, each with the
+/// decode lanes beside it ([`MixedLanes::Laid`], ascending by
+/// `prompt_lanes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MixedLanes {
+    Any,
+    Laid(Vec<MixedRung>),
+}
+
+/// One laid mixed shape: at most `prompt_lanes - 1` prompts (the engine
+/// adds one lane of its own, the rest of the rows) beside at most
+/// `decode_lanes` decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MixedRung {
+    pub prompt_lanes: u32,
+    pub decode_lanes: u32,
+}
+
+impl MixedLanes {
+    /// Whether a fire of `prompts` prompt lanes holding `prompt_rows` rows
+    /// beside `decodes` one-row decode lanes is one the load lays, within
+    /// `limits`: the first rung holding the prompts and its rest lane takes
+    /// the decodes, and its padded rows (the prompts' pad lanes, the
+    /// decodes' pad lanes, the rest lane) fit `max_tokens`. A fire of only
+    /// prompts or only decodes is not a mixed one and fits.
+    #[must_use]
+    pub fn fits(&self, limits: &FireLimits, prompts: u32, prompt_rows: u32, decodes: u32) -> bool {
+        let within =
+            prompts + decodes <= limits.max_lanes && prompt_rows + decodes <= limits.max_tokens;
+        match self {
+            _ if prompts == 0 || decodes == 0 => within,
+            Self::Any => within,
+            Self::Laid(rungs) => {
+                within
+                    && rungs
+                        .iter()
+                        .find(|r| r.prompt_lanes > prompts)
+                        .is_some_and(|r| {
+                            decodes <= r.decode_lanes
+                                && u64::from(prompt_rows)
+                                    + u64::from(r.prompt_lanes - prompts)
+                                    + u64::from(r.decode_lanes)
+                                    <= u64::from(limits.max_tokens)
+                        })
+            }
+        }
+    }
 }
 
 /// What bounds a guest stage's time on a device: the bound it states on one
@@ -171,5 +226,68 @@ pub fn stated_frames(depth: usize) -> Result<u32, crate::error::Error> {
         Err(_) => Err(crate::error::Error::Program(format!(
             "this load keeps {depth} frames in flight, past what a u32 states"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod mixed_lanes {
+    use super::*;
+
+    /// qwen3-0.6b's census load on v6e: 64 lanes and 2608 rows a fire;
+    /// prompts at 16, 32 and 64 lanes beside 64, 32 and 16 decodes (the
+    /// engine's lanes, past the fire's own).
+    fn census() -> (MixedLanes, FireLimits) {
+        let rung = |prompt_lanes, decode_lanes| MixedRung {
+            prompt_lanes,
+            decode_lanes,
+        };
+        (
+            MixedLanes::Laid(vec![rung(16, 64), rung(32, 32), rung(64, 16)]),
+            FireLimits {
+                max_lanes: 64,
+                max_tokens: 2608,
+                max_page_refs: 0,
+                max_context: 0,
+                prefill_rows: 0,
+                prefill_lanes: 0,
+                max_readouts: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn a_mixed_fire_fits_the_first_rung_holding_its_prompts() {
+        let (laid, limits) = census();
+        // 35 three-row prompts beside 17 decodes: the 64-lane rung holds
+        // 16 decodes, so no laid shape; 31 prompts take the 32-lane rung.
+        assert!(!laid.fits(&limits, 35, 105, 17));
+        assert!(laid.fits(&limits, 31, 93, 17));
+        assert!(
+            !laid.fits(&limits, 32, 96, 17),
+            "32 prompts and the rest lane pass 32 lanes"
+        );
+        assert!(laid.fits(&limits, 15, 45, 49));
+        assert!(
+            !laid.fits(&limits, 15, 45, 50),
+            "the fire's own lanes past 64"
+        );
+        assert!(laid.fits(&limits, 48, 144, 16));
+        assert!(
+            !laid.fits(&limits, 64, 192, 1),
+            "no rung holds 64 prompts and a rest lane"
+        );
+        // the padded rows: prompts, their pad lanes, the decode lanes, the rest lane
+        assert!(laid.fits(&limits, 1, 2608 - 15 - 64, 1));
+        assert!(!laid.fits(&limits, 1, 2608 - 15 - 64 + 1, 1));
+    }
+
+    #[test]
+    fn a_fire_of_one_kind_and_any_load_fit_within_the_limits() {
+        let (laid, limits) = census();
+        assert!(laid.fits(&limits, 40, 2000, 0));
+        assert!(laid.fits(&limits, 0, 0, 64));
+        assert!(!laid.fits(&limits, 0, 0, 65));
+        assert!(MixedLanes::Any.fits(&limits, 35, 105, 17));
+        assert!(!MixedLanes::Any.fits(&limits, 60, 120, 11));
     }
 }

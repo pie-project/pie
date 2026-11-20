@@ -3726,8 +3726,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
-            if p.host_geometry {
-                host_geometry::count_fire();
+            if let Some(fires) = &p.host_geometry {
+                fires.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let accesses = p.instance.program.channel_accesses.clone();
             (
@@ -6236,6 +6236,66 @@ pub(crate) mod lifecycle_tests {
                 .resolve_from_terminal()
                 .expect("publish successful completion");
         }
+    }
+
+    /// Without run-ahead (`frame_dispatch_depth = 1`) a fire's last handle
+    /// goes as soon as it lands, before its settled hooks run off the
+    /// resolving stack. The rows it placed stay written: the next fire,
+    /// which reads them, is not refused as reading slots never written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_landed_fire_dropped_before_its_hooks_run_keeps_its_rows_written() {
+        use crate::inferlet::host::working_set::Cursor;
+        let cell: CursorCell = std::sync::Arc::new(std::sync::Mutex::new(Cursor {
+            reserved: 64,
+            ..Cursor::default()
+        }));
+        // The prompt, 31 rows at 0..31, host-placed.
+        let fire = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        advance_cursor(&cell, Some(31), None);
+        host_wrote(&cell, &fire, 0, 31);
+        resolve_test_completion(&fire, false);
+        drop(fire);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let now = cell.lock().unwrap().clone();
+        assert_eq!((now.readable(), now.readable_known()), (31, true));
+        // The next fire appends its one row at 31.
+        let place = geometry::Place {
+            folded: 0,
+            folded_exact: true,
+            tail: now.tail,
+            shared: false,
+            spans: Vec::new(),
+            readable: now.readable(),
+            readable_known: now.readable_known(),
+            set: 1,
+        };
+        let next = geometry::ReqGeometry {
+            token_ids: vec![7],
+            qo_indptr: vec![0, 1],
+            ..geometry::ReqGeometry::default()
+        };
+        let (_, landings) = next.lanes(&[place], 16).expect("reads only what was written");
+        assert_eq!(landings, vec![geometry::Landing { start: 31, rows: 1 }]);
+
+        // A fire that failed still unwrites its rows, dropped or not.
+        let failed = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        host_wrote(&cell, &failed, 31, 32);
+        resolve_test_completion(&failed, true);
+        drop(failed);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cell.lock().unwrap().readable(), 31);
+        // One never resolved, its last handle gone, landed nothing.
+        let unresolved = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        host_wrote(&cell, &unresolved, 31, 32);
+        drop(unresolved);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cell.lock().unwrap().readable(), 31);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -28,6 +28,16 @@ pub enum Fault {
         why: String,
     },
 
+    /// The device was lost (Vulkan's `VK_ERROR_DEVICE_LOST`; on wgpu its
+    /// lost callback, or a mapping refused once a submission faulted):
+    /// `what` first saw it, and every call after fails by this name. The
+    /// device is not recovered.
+    DeviceLost {
+        what: &'static str,
+
+        why: String,
+    },
+
     NoDevice {
         detail: String,
     },
@@ -279,6 +289,11 @@ impl fmt::Display for Fault {
                 write!(f, "`{what}` returned VkResult {code}")
             }
             Self::Wgpu { what, why } => write!(f, "`{what}` refused: {why}"),
+            Self::DeviceLost { what, why } => write!(
+                f,
+                "DeviceLost: the device was lost (seen at `{what}`: {why}); every call on it fails \
+                 from here, and it is not recovered"
+            ),
             Self::NoDevice { detail } => write!(f, "no GPU device to bind: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
             Self::Shader {

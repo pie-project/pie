@@ -1088,6 +1088,7 @@ impl ProcessCtx {
             )
         };
         {
+            let t0 = crate::rt::Instant::now();
             let prog = match crate::pipeline::program::register(
                 container_bytes,
                 readouts,
@@ -1096,6 +1097,7 @@ impl ProcessCtx {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
+            let t_register = t0.elapsed();
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
             let decls = prog.bound.container.channels.clone();
@@ -1256,19 +1258,21 @@ impl ProcessCtx {
                         qo_indptr.last().copied().unwrap_or(0)
                     );
                 }
-                if let Some(host) = &bound.host {
+                let counted = bound.host.as_ref().map(|host| {
                     tracing::info!("{}", host.bind_message(prog.hash));
-                }
-                (
-                    bound.devgeo,
-                    bound.decode_envelope,
-                    bound.class,
-                    bound.host.is_some(),
-                )
+                    host_geometry::counter(host_geometry::FireKey {
+                        engine,
+                        kind: spec.kind,
+                        reason: host.reason(),
+                        program: prog.hash,
+                    })
+                });
+                (bound.devgeo, bound.decode_envelope, bound.class, counted)
             } else {
-                (None, None, GeometryClass::Host, false)
+                (None, None, GeometryClass::Host, None)
             };
 
+            let t_geometry = t0.elapsed();
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
                 let extern_binding = extern_bindings[dense]
@@ -1317,6 +1321,7 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
+            let t_launch = t0.elapsed();
             let pricing_rows = prog.pricing.rows;
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
@@ -1363,7 +1368,7 @@ impl ProcessCtx {
                     seed_values,
                     geometry_class,
                     ::engine::BindExtents {
-                        sampled_rows: pricing_rows.max(1),
+                        sampled_rows: bind_rows(decode_envelope, pricing_rows),
                         ..::engine::BindExtents::default()
                     },
                     // The ports the program computes on the device: the
@@ -1384,6 +1389,7 @@ impl ProcessCtx {
                     return Ok(Err(format!("pipeline: register+bind: {error:#}")));
                 }
             };
+            let t_bind = t0.elapsed();
             if registered.len() != missing_dense.len() {
                 let _ = scheduler
                     .close_instance(bound_instance.instance_id, bound_instance.pacing_wait_id);
@@ -1425,6 +1431,17 @@ impl ProcessCtx {
                 &instance.program.bound,
                 instance.program.shadow_plan(),
                 &instance.seeds,
+            );
+            tracing::debug!(
+                target: "pie::launch",
+                process = %process_id,
+                program = format_args!("0x{:016x}", instance.program.hash),
+                register_us = t_register.as_micros() as u64,
+                geometry_us = (t_geometry - t_register).as_micros() as u64,
+                launch_us = (t_launch - t_geometry).as_micros() as u64,
+                bind_us = (t_bind - t_launch).as_micros() as u64,
+                shadow_us = (t0.elapsed() - t_bind).as_micros() as u64,
+                "pass bound"
             );
             let bound = BoundForwardPass {
                 instance,
@@ -1823,5 +1840,36 @@ mod tests {
             ..forks
         };
         assert_eq!(state_rebind_diff(&bound, &moved), Some("positions"));
+    }
+}
+
+/// The readout rows a lane of a pass reads, as its bind states them: a beam
+/// group's pass (`parents`) runs each beam as a lane of its own reading one
+/// row, so the group's rows count against the fire's readout seats as its
+/// lanes, never as one lane's (the interleaved beam, one lane reading the
+/// whole group, read them so); any other pass reads the rows its program
+/// prices.
+fn bind_rows(envelope: Option<PortMask>, pricing_rows: u32) -> u32 {
+    if envelope.is_some_and(|ports| ports.contains(eta_ir::registry::Port::Parents)) {
+        1
+    } else {
+        pricing_rows.max(1)
+    }
+}
+
+#[cfg(test)]
+mod bind_rows_tests {
+    use super::{PortMask, bind_rows};
+
+    #[test]
+    fn a_beam_group_of_eight_binds_one_readout_row_a_lane() {
+        let parents = PortMask::NONE.with(eta_ir::registry::Port::Parents);
+        // Eight beams, each its own lane: one row a lane, whatever the
+        // program prices for the group (a load laying fewer rows a lane
+        // than the beams, Metal's 5, binds them).
+        assert_eq!(bind_rows(Some(parents), 8), 1);
+        // A pass of no beam group reads what its program prices.
+        assert_eq!(bind_rows(Some(PortMask::NONE), 8), 8);
+        assert_eq!(bind_rows(None, 0), 1);
     }
 }

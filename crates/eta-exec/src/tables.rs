@@ -1,7 +1,8 @@
 //! A guest stage's bind-time tables, as every backend lays them: each
 //! value's descriptor ([`desc_words`], [`DESC_WORDS`] u32s), each op's
-//! params ([`OpParams`], `PARAM_WORDS` u32s), each value's word offset in
-//! the stage's scratch, and the stage's config ([`Cfg`]). A step of the
+//! params ([`OpParams`], `PARAM_WORDS` u32s), each value's byte offset in
+//! the stage's scratch, and the stage's config ([`Cfg`]); and each op's
+//! temporary area, which its steps' records carry. A step of the
 //! closed set (`eta_compiler::codegen::steps`) finds its node's operands
 //! here: the node's params name its argument and result values, whose
 //! descriptors and offsets these tables hold. [`stage_tables`] writes them
@@ -13,8 +14,7 @@ use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
 use crate::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, TemporaryNeed, TemporaryRefused,
-    ValueDesc, describe, lay_out, stage_temporaries,
+    Extents, Keeps, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
 };
 
 pub const DESC_WORDS: usize = 9;
@@ -23,13 +23,13 @@ pub const DESC_WORDS: usize = 9;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cfg {
     pub value_count: u32,
-    pub temporary: u32,
+    /// The words of the stage's heap, past which the runtime refuses any
+    /// access (its `OUT_OF_BOUNDS` fault): word `CFG_HEAP_WORDS` of the
+    /// runtime's config table.
+    pub heap_words: u32,
     pub op_count: u32,
     pub lane: u32,
-    /// The words of the stage's heap, past which the runtime refuses any
-    /// access (its `OUT_OF_BOUNDS` fault).
-    pub heap_words: u32,
-    pub pad: [u32; 3],
+    pub pad: [u32; 4],
 }
 
 const _: () = assert!(size_of::<Cfg>() == 32);
@@ -56,13 +56,13 @@ impl Cfg {
     pub fn to_le_bytes(self) -> Vec<u8> {
         words_le(&[
             self.value_count,
-            self.temporary,
+            self.heap_words,
             self.op_count,
             self.lane,
-            self.heap_words,
             self.pad[0],
             self.pad[1],
             self.pad[2],
+            self.pad[3],
         ])
     }
 }
@@ -75,6 +75,9 @@ impl Cfg {
 pub struct Stepping {
     /// The nodes the WGSL launches ([`wgsl::launched_nodes`]).
     pub launched: Vec<u32>,
+    /// Each launched node's tag and first argument, what it keeps in the
+    /// temporary area is stated over ([`wgsl::temporary_bytes`]).
+    pub runs: Vec<(u8, Option<u32>)>,
     /// The other nodes: boundary ops and reshapes their source covers.
     pub idle: Vec<u32>,
     /// What the host may write before the first launch: an output's, a
@@ -116,28 +119,46 @@ impl Stepping {
             .into_iter()
             .map(|(result, _)| result)
             .collect();
+        stepping.runs = launched
+            .iter()
+            .filter_map(|&node| plan.ops.get(node as usize))
+            .map(|op| (op.tag, op.args.first().copied()))
+            .collect();
         stepping.launched = launched;
         stepping
     }
 
-    /// The launches `descriptors` are laid over: below the temporary area
-    /// the one-row select's state, in it the widest of what a launch that
-    /// sorts or reduces a whole value takes and what each region's emitter
-    /// publishes it takes (`needs`, [`stage_temporaries`]).
-    pub fn launches(
-        &self,
-        descriptors: &[ValueDesc],
-        needs: &[TemporaryNeed],
-    ) -> Result<Launches<'_>, TemporaryRefused> {
-        Ok(Launches {
-            each: self.launched.iter().map(Launch::of_node).collect(),
+    /// The launches `descriptors` are laid over, a launched node each, a
+    /// node that keeps something in the temporary area keeping an area of
+    /// its own, alive while it runs: what the runtime keeps there for it
+    /// ([`wgsl::temporary_bytes`] of its first argument), with the one-row
+    /// select's state below it where it runs the select ([`wgsl::selects`]).
+    /// No area is the stage's.
+    #[must_use]
+    pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
+        let keeps = |&(tag, argument): &(u8, Option<u32>)| {
+            let bytes = argument
+                .and_then(|argument| descriptors.get(argument as usize))
+                .map_or(0, |argument| {
+                    wgsl::temporary_bytes(tag, u64::from(argument.len), u64::from(argument.rows))
+                });
+            let reserve = if wgsl::selects(tag) { SELECT_RESERVE } else { 0 };
+            (bytes > 0 || reserve > 0).then_some(Keeps { reserve, bytes })
+        };
+        Launches {
+            each: self
+                .launched
+                .iter()
+                .zip(&self.runs)
+                .map(|(node, run)| Launch::of_node(node, keeps(run)))
+                .collect(),
             idle: self.idle.clone(),
             staged: self.staged.clone(),
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
-            reserve: SELECT_RESERVE,
-            temporary: stage_temporaries(descriptors, needs)?,
-        })
+            reserve: 0,
+            temporary: 0,
+        }
     }
 }
 
@@ -177,6 +198,9 @@ pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
 pub struct StageTables {
     pub descriptors: Vec<ValueDesc>,
     pub offsets: Vec<u64>,
+    /// Each op's temporary area's first word in the heap, 0 where it keeps
+    /// none: what its steps' uniforms carry (`StepUniform::area`).
+    pub areas: Vec<u32>,
     pub scratch: u64,
     pub tables: [Vec<u8>; 4],
 }
@@ -193,9 +217,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stepping = Stepping::of(plan);
-    let launches = stepping
-        .launches(&descriptors, wgsl::TEMPORARY_NEEDS)
-        .map_err(|why| format!("a guest pass's temporaries are refused: {why}"))?;
+    let launches = stepping.launches(&descriptors);
     let mut scratch = lay_out(plan, &descriptors, &launches)
         .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);
@@ -222,20 +244,35 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             .checked_add(u32::from(op.result_count))
             .ok_or_else(|| "a guest stage's result ids past a u32".to_string())?;
     }
+    // Each node's area where it keeps one ([`Stepping::launches`]), else
+    // none: a node that keeps none reads no area. Its steps' records carry
+    // it (`StepUniform::area`).
+    let mut areas = vec![0u64; plan.ops.len()];
+    let keeping = launches
+        .each
+        .iter()
+        .filter(|launch| launch.keeps.is_some())
+        .flat_map(|launch| launch.nodes.iter().copied());
+    for (node, &at) in keeping.zip(&scratch.areas) {
+        areas[node as usize] = at;
+    }
     let offsets: Vec<u32> = scratch
         .values
         .iter()
         .map(|&at| word("value offset", at))
         .collect::<Result<_, _>>()?;
+    let area_words: Vec<u32> = areas
+        .iter()
+        .map(|&at| word("area word", at / 4))
+        .collect::<Result<_, _>>()?;
     // The heap the stage binds, which its runtime bounds every access by.
     let heap = scratch.total.max(256);
     let config = Cfg {
         value_count: word("value count", plan.value_types.len() as u64)?,
-        temporary: word("temporary words", scratch.temporary / 4)?,
         op_count: word("op count", plan.ops.len() as u64)?,
         lane: 0,
         heap_words: word("heap words", heap / 4)?,
-        pad: [0; 3],
+        pad: [0; 4],
     };
     Ok(StageTables {
         descriptors,
@@ -246,6 +283,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             sized(config.to_le_bytes(), 3)?,
         ],
         offsets: scratch.values,
+        areas: area_words,
         scratch: heap,
     })
 }

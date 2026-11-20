@@ -7,6 +7,10 @@ use super::launch::slice_bytes;
 
 const ALIGN: usize = 8;
 
+/// A lane's live commit words: the verdict and the word beside it the pull
+/// clears.
+const COMMIT_BYTES: usize = 2 * size_of::<u32>();
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Span {
     taken_at: usize,
@@ -32,6 +36,8 @@ pub struct Wave {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Regions {
+    /// Each lane's live commit words (two `u32`s a lane, as the pull writes).
+    commits: usize,
     tickets: usize,
     taken: usize,
     put: usize,
@@ -83,6 +89,11 @@ impl Wave {
         self.pull.len()
     }
 
+    /// Where lane `lane`'s live commit word lies, once the wave has flown.
+    pub(super) fn commit_at(&self, lane: usize) -> u64 {
+        self.arena + (self.regions().commits + lane * COMMIT_BYTES) as u64
+    }
+
     /// Stages the wave's tables at `base`, in a carried pair's state.
     pub(super) fn fly(&mut self, context: &Context, base: u64) -> Result<()> {
         let lanes = self.pull.len();
@@ -91,6 +102,19 @@ impl Wave {
         }
         let regions = self.regions();
         self.arena = base;
+
+        // Each pass's verdict lives in the wave's own device tables, where
+        // every region reads it without a trip to the host; the settle hands
+        // it to the host word each lane was staged with.
+        for lane in 0..lanes {
+            let live = base + (regions.commits + lane * COMMIT_BYTES) as u64;
+            let host = self.settle[lane].commit;
+            self.pull[lane].pass_commit = live;
+            self.bump[lane].commit = live;
+            self.publish[lane].commit = live;
+            self.settle[lane].commit = live;
+            self.settle[lane].commit_host = host;
+        }
 
         for (lane, span) in self.spans.iter().enumerate() {
             let bump = &mut self.bump[lane];
@@ -167,6 +191,7 @@ impl Wave {
             at += bytes.div_ceil(ALIGN) * ALIGN;
             offset
         };
+        let commits = place(self.pull.len() * COMMIT_BYTES);
         let tickets = place(self.tickets.len() * size_of::<Ticket>());
         let taken = place(self.taken.len() * size_of::<u32>());
         let put = place(self.put.len() * size_of::<u32>());
@@ -175,6 +200,7 @@ impl Wave {
         let publish = place(self.publish.len() * size_of::<PublishLane>());
         let settle = place(self.settle.len() * size_of::<SettleLane>());
         Regions {
+            commits,
             tickets,
             taken,
             put,
@@ -200,11 +226,12 @@ impl Wave {
     /// each of them is aligned in.
     pub(super) fn lane_bytes(channels: usize) -> (u64, u64) {
         let lane = channels * (size_of::<Ticket>() + 2 * size_of::<u32>())
+            + COMMIT_BYTES
             + size_of::<PullLane>()
             + size_of::<BumpLane>()
             + size_of::<PublishLane>()
             + size_of::<SettleLane>();
-        (lane as u64, (8 * ALIGN) as u64)
+        (lane as u64, (9 * ALIGN) as u64)
     }
 }
 

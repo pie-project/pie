@@ -23,15 +23,25 @@ pub enum Value {
     I32(Vec<i32>),
     U32(Vec<u32>),
     Bool(Vec<bool>),
+    /// Each element's bf16 bits (`eta_ir::types::bf16_bits`): what a `bf16`
+    /// value holds on every backend, two bytes an element.
+    Bf16(Vec<u16>),
 }
 
 impl Value {
+    /// `x` rounded to bf16 an element, round-to-nearest-even: the value a
+    /// `bf16` store of `x` keeps.
+    pub fn bf16_of(x: &[f32]) -> Value {
+        Value::Bf16(x.iter().map(|&a| eta_ir::types::bf16_bits(a)).collect())
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Value::F32(v) => v.len(),
             Value::I32(v) => v.len(),
             Value::U32(v) => v.len(),
             Value::Bool(v) => v.len(),
+            Value::Bf16(v) => v.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -43,6 +53,7 @@ impl Value {
             Value::I32(_) => Dtype::I32,
             Value::U32(_) => Dtype::U32,
             Value::Bool(_) => Dtype::Bool,
+            Value::Bf16(_) => Dtype::Bf16,
         }
     }
 
@@ -54,6 +65,7 @@ impl Value {
             Dtype::I32 => Value::I32(vec![0; n]),
             Dtype::U32 => Value::U32(vec![0; n]),
             Dtype::Bool => Value::Bool(vec![false; n]),
+            Dtype::Bf16 => Value::Bf16(vec![0; n]),
             _ => no_interpreter_lane(dtype),
         }
     }
@@ -61,6 +73,15 @@ impl Value {
     pub fn from_le_bytes(dtype: Dtype, bytes: &[u8]) -> Option<Value> {
         match dtype {
             Dtype::Bool => Some(Value::Bool(bytes.iter().map(|&b| b != 0).collect())),
+            Dtype::Bf16 if !bytes.len().is_multiple_of(2) => None,
+            Dtype::Bf16 => Some(Value::Bf16(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            )),
             Dtype::F32 | Dtype::I32 | Dtype::U32 if !bytes.len().is_multiple_of(4) => None,
             Dtype::F32 => Some(Value::F32(
                 bytes
@@ -96,6 +117,7 @@ impl Value {
             Value::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             Value::U32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             Value::Bool(v) => v.iter().map(|&b| b as u8).collect(),
+            Value::Bf16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
         }
     }
 }
@@ -541,6 +563,14 @@ pub(crate) fn const_value(dtype: Dtype, shape: Shape, data: &[u8]) -> Value {
     let n = shape.numel() as usize;
     match dtype {
         Dtype::Bool => Value::Bool(data.iter().take(n).map(|&b| b != 0).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .take(n)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         Dtype::F32 => Value::F32(
             data.as_chunks::<4>()
                 .0

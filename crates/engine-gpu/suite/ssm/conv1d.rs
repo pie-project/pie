@@ -4,10 +4,10 @@
 //! with no slot), at dilations 1 and 2. Both the SiLU'd rows and the rolled
 //! history are compared.
 
-use kernels_slang::{RaggedTensor, Tensor};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, landed, noise};
+use crate::gpu::{CSR_AT, Gpu, Out, csr_at, landed, lane_cuts, noise, row_cuts};
 
 const C: usize = 6;
 const W: usize = 4;
@@ -94,25 +94,31 @@ fn the_conv1d_answers_the_reference() {
             want_s[s * slab..][..slab].copy_from_slice(&kept);
         }
         let x = t(xb, 2, C, Dtype::Bf16);
-        landed(
-            &mut gpu,
-            &format!("conv1d step, dilation {dil}"),
-            &fresh(2),
-            &[want_y, want_s],
-            &|g, o| {
-                g.run(|c| {
-                    kernels_slang::ssm::conv1d::conv1d(
-                        c,
-                        x,
-                        wt,
-                        &pool(o[1].0, sb, 2),
-                        W as u32,
-                        dil as u32,
-                        t(o[0].0, 2, C, Dtype::Bf16),
-                    )
-                })
-            },
-        );
+        for spans in row_cuts(2) {
+            landed(
+                &mut gpu,
+                &format!("conv1d step, dilation {dil}, {} window(s)", spans.len()),
+                &fresh(2),
+                &[want_y.clone(), want_s.clone()],
+                &|g, o| {
+                    g.run(|c| {
+                        for &span in &spans {
+                            kernels_slang::ssm::conv1d::conv1d(
+                                c,
+                                x,
+                                wt,
+                                &pool(o[1].0, sb, 2),
+                                W as u32,
+                                dil as u32,
+                                t(o[0].0, 2, C, Dtype::Bf16),
+                                span,
+                            )?;
+                        }
+                        Ok(())
+                    })
+                },
+            );
+        }
 
         // The chunked walk: requests of 3, 0 and 4 rows on slots 1 and 2.
         let indptr = [0i32, 3, 3, 7];
@@ -120,7 +126,7 @@ fn the_conv1d_answers_the_reference() {
         let slot_rows = [1u32, 1, 1, 2, 2, 2, 2];
         let (xb, xr) = gpu.up(&noise(20 + dil as u64, rows * C));
         let xr: Vec<f64> = xr.iter().map(|v| f64::from(*v)).collect();
-        let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+        let sb = gpu.up_u32(&slot_rows);
         let mut want_y = vec![0.0; rows * C];
         let mut want_s = bank64.clone();
         for r in 0..3 {
@@ -139,32 +145,42 @@ fn the_conv1d_answers_the_reference() {
             want_y[b * C..e * C].copy_from_slice(&y);
             want_s[s * slab..][..slab].copy_from_slice(&kept);
         }
-        let x = RaggedTensor {
-            data: t(xb, rows, C, Dtype::Bf16),
-            indptr: t(ib, 4, 1, Dtype::I32),
-        };
-        landed(
-            &mut gpu,
-            &format!("conv1d chunked, dilation {dil}"),
-            &fresh(rows),
-            &[want_y, want_s],
-            &|g, o| {
-                g.run(|c| {
-                    kernels_slang::ssm::conv1d::conv1d_chunked(
-                        c,
-                        kernels_slang::RaggedTensor {
-                            data: x.data,
-                            indptr: x.indptr,
-                        },
-                        wt,
-                        &pool(o[1].0, sb, rows),
-                        W as u32,
-                        dil as u32,
-                        t(o[0].0, rows, C, Dtype::Bf16),
-                    )
-                })
-            },
-        );
+        let x = t(xb, rows, C, Dtype::Bf16);
+        for at in CSR_AT {
+            for cuts in lane_cuts(&indptr) {
+                let windows: Vec<_> = cuts
+                    .iter()
+                    .map(|(row0, csr)| (*row0, csr_at(&mut gpu, csr, at)))
+                    .collect();
+                landed(
+                    &mut gpu,
+                    &format!(
+                        "conv1d chunked, dilation {dil}, csr at {at}, {} window(s)",
+                        windows.len()
+                    ),
+                    &fresh(rows),
+                    &[want_y.clone(), want_s.clone()],
+                    &|g, o| {
+                        g.run(|c| {
+                            for &(row0, csr) in &windows {
+                                kernels_slang::ssm::conv1d::conv1d_chunked(
+                                    c,
+                                    x,
+                                    csr,
+                                    wt,
+                                    &pool(o[1].0, sb, rows),
+                                    W as u32,
+                                    dil as u32,
+                                    t(o[0].0, rows, C, Dtype::Bf16),
+                                    row0,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    },
+                );
+            }
+        }
 
         // The committed window, lanes 1..4: 2 own rows after 1 replayed, kept
         // as of row 2 on slot 2; 1 after 2, kept whole on slot 0; 2 after 0
@@ -177,7 +193,6 @@ fn the_conv1d_answers_the_reference() {
         let rows = 2 + 1 + 1 + 2 + 2;
         let (xb, xr) = gpu.up(&noise(30 + dil as u64, rows * C));
         let xr: Vec<f64> = xr.iter().map(|v| f64::from(*v)).collect();
-        let ib = gpu.up_i32(&indptr);
         let (rb, cb, sb) = (gpu.up_i32(&replay), gpu.up_i32(&commit), gpu.up_i32(&slots));
         let mut want_y = vec![0.0; rows * C];
         let mut want_s = bank64.clone();
@@ -208,27 +223,29 @@ fn the_conv1d_answers_the_reference() {
             lane0: lane0 as u32,
         };
         let x = t(xb, rows, C, Dtype::Bf16);
-        let window = i32s(ib, 4);
-        landed(
-            &mut gpu,
-            &format!("conv1d committed, dilation {dil}"),
-            &fresh(rows),
-            &[want_y, want_s],
-            &|g, o| {
-                g.run(|c| {
-                    kernels_slang::ssm::conv1d::conv1d_committed(
-                        c,
-                        x,
-                        window,
-                        &committed,
-                        wt,
-                        &pool(o[1].0, sb, 4),
-                        W as u32,
-                        dil as u32,
-                        t(o[0].0, rows, C, Dtype::Bf16),
-                    )
-                })
-            },
-        );
+        for at in CSR_AT {
+            let csr = csr_at(&mut gpu, &indptr, at);
+            landed(
+                &mut gpu,
+                &format!("conv1d committed, dilation {dil}, csr at {at}"),
+                &fresh(rows),
+                &[want_y.clone(), want_s.clone()],
+                &|g, o| {
+                    g.run(|c| {
+                        kernels_slang::ssm::conv1d::conv1d_committed(
+                            c,
+                            x,
+                            csr,
+                            &committed,
+                            wt,
+                            &pool(o[1].0, sb, 4),
+                            W as u32,
+                            dil as u32,
+                            t(o[0].0, rows, C, Dtype::Bf16),
+                        )
+                    })
+                },
+            );
+        }
     }
 }
