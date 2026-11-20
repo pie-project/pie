@@ -1419,6 +1419,8 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
         pages: 3,
         ..RsUnits::default()
     };
+    // The seated lane decodes: a fire of its in flight.
+    let decoding = planner.fire_in_flight(seated);
     planner.with_inner(|inner| {
         inner.procs.get_mut(&seated).unwrap().seated = true;
         let roomy = RsUnits {
@@ -1498,6 +1500,7 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
         victims.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
         [younger]
     );
+    drop(decoding);
 }
 
 /// A window ring alone, its room read a moment before it is handed back,
@@ -1620,10 +1623,13 @@ fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
             ..RsUnits::default()
         },
     };
-    let start = std::sync::Barrier::new(pids.len());
-    let grants = parking_lot::Mutex::new(Vec::new());
+    // One lane seated and decoding before the rest arrive together.
+    let first = planner.grant_now(pids[0], demand).expect("the ring seats one");
+    let decoding = planner.fire_in_flight(pids[0]);
+    let start = std::sync::Barrier::new(pids.len() - 1);
+    let grants = parking_lot::Mutex::new(vec![first]);
     std::thread::scope(|scope| {
-        for &pid in &pids {
+        for &pid in &pids[1..] {
             let (planner, start, grants) = (&planner, &start, &grants);
             scope.spawn(move || {
                 start.wait();
@@ -1633,6 +1639,7 @@ fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
             });
         }
     });
+    drop(decoding);
     let seated = u32::try_from(grants.lock().len()).expect("a few lanes");
     let free = pool.free.load(Ordering::SeqCst);
     let held_back = (2 * seated.saturating_sub(1)).min(RING);
@@ -7393,4 +7400,60 @@ async fn a_stuck_head_costs_a_bounded_number_of_passes() {
     assert!(more <= 2, "a hundred answers of nothing freed planned {more} passes");
     assert!(!task.is_finished());
     task.abort();
+}
+
+/// The M1's allocation head with 38 free runs not granted: only the seated
+/// lanes whose next step needs room now are held back for. A seated lane
+/// waiting in the queue (blocked, asking for its room there) holds back
+/// nothing, and with nothing in flight no lane grows before the claim.
+#[test]
+fn the_seated_lanes_reserve_counts_only_lanes_that_grow_now() {
+    let planner = Arc::new(
+        ResidencyPlanner::new(Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>).seated_first(true),
+    );
+    let claimant = ProcessId::new_v4();
+    let lanes: Vec<ProcessId> = (0..10).map(|_| ProcessId::new_v4()).collect();
+    for &pid in lanes.iter().chain([&claimant]) {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let units = |pages: u32| RsUnits {
+        slots: 0,
+        pages,
+        ..RsUnits::default()
+    };
+    let decoding = planner.fire_in_flight(lanes[0]);
+    planner.with_inner(|inner| {
+        for pid in &lanes {
+            inner.procs.get_mut(pid).unwrap().seated = true;
+        }
+        // Ten lanes growing two pages each, a fire in flight.
+        let reserve = inner.seating_reserve(claimant, units(2), units(3), units(64));
+        assert_eq!(reserve, units(20), "every running lane grows: {reserve:?}");
+        // Eight of them wait in the queue: two grow before the claim.
+        for &pid in &lanes[2..] {
+            inner.enqueue(pid, allocation(units_demand(1)));
+        }
+        let reserve = inner.seating_reserve(claimant, units(2), units(3), units(64));
+        assert_eq!(reserve, units(4), "the waiting lanes hold back nothing: {reserve:?}");
+        // The M1: 38 free, a claim of 3, the waiting lanes' growth not kept.
+        assert!(units(38).covers(units(3).add(reserve)), "the claim is granted");
+    });
+    drop(decoding);
+    planner.with_inner(|inner| {
+        assert!(inner.nothing_in_flight());
+        assert!(
+            inner
+                .seating_reserve(claimant, units(2), units(3), units(64))
+                .is_zero(),
+            "nothing in flight: nothing held back"
+        );
+    });
+}
+
+fn units_demand(pages: u32) -> Demand {
+    Demand {
+        kv_pages: pages,
+        rs: RsUnits::default(),
+    }
 }

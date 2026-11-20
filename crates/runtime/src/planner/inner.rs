@@ -139,22 +139,40 @@ impl Inner {
         need: RsUnits,
         capacity: RsUnits,
     ) -> RsUnits {
+        // Nothing in flight: no seated lane grows before the claim.
         if need.is_zero()
             || growth.is_zero()
             || self.procs.get(&pid).is_none_or(|proc| proc.seated)
-            || self.fleet_stalled()
+            || self.nothing_in_flight()
         {
             return RsUnits::default();
         }
+        // The seated lanes whose next step needs room now: seated, running
+        // and resident, not waiting in the queue (one waiting asks for its
+        // room there, and grows before nothing). Counting every seated lane,
+        // or yielding only once the fleet read stalled by its waiters'
+        // kinds, held back the growth of lanes that were all blocked, and an
+        // allocation with 38 free runs was not granted (the M1).
+        let waiting: HashSet<ProcessId> = self
+            .queue
+            .values()
+            .filter(|waiter| waiter.is_unmet())
+            .map(|waiter| waiter.pid)
+            .collect();
         let seated = u32::try_from(
             self.procs
-                .values()
-                .filter(|proc| proc.seated && !proc.idle && proc.state == Residency::Resident)
+                .iter()
+                .filter(|(lane, proc)| {
+                    proc.seated
+                        && !proc.idle
+                        && proc.state == Residency::Resident
+                        && !waiting.contains(*lane)
+                })
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        // One growth for each seated lane, no fraction of the pool in its
-        // place: what the lanes' next pages take, never more than the pool.
+        // One growth for each seated lane that needs room now (its next
+        // step's pages), never more than the pool.
         RsUnits {
             slots: growth.slots.saturating_mul(seated).min(capacity.slots),
             pages: growth.pages.saturating_mul(seated).min(capacity.pages),
